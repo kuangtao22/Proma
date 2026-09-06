@@ -718,6 +718,9 @@ export class DesignJobManager {
         projectId: queued.projectId,
         mode: queued.contextMode,
         originalRequest: queued.originalRequest,
+        /** Canvas 直接入边已在创建阶段解析并固化，可满足 auto 模式的上下文准入。 */
+        hasTrustedInputContext: queued.target.kind === 'canvas-image'
+          && (queued.canvasInputReferences?.length ?? 0) > 0,
       })
       const userMessage = this.buildPrompt(queued)
       /** 图片工具执行前捕获的真实结构化参数，不从自然语言或 trace 反推。 */

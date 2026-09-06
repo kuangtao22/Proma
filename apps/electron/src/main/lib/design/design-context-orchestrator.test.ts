@@ -156,6 +156,19 @@ describe('DesignContextOrchestrator', () => {
     expect(() => standaloneRun.assertReadyForImageCall()).not.toThrow()
   })
 
+  test('Given auto 模式已有可信 Canvas 输入 When 要求保持角色一致 Then 不强制重复读取项目文本', () => {
+    const { orchestrator } = createFixture({ projectFiles: { 'src/App.tsx': 'homepage' } })
+    const run = orchestrator.createRun({
+      projectId: 'project-1',
+      mode: 'auto',
+      originalRequest: '保持当前角色和场景一致，生成下一帧',
+      hasTrustedInputContext: true,
+    })
+
+    expect(() => run.assertReadyForImageCall()).not.toThrow()
+    expect(run.getReferences()).toEqual([])
+  })
+
   test('Given auto 模式 When Agent 读取项目文件 Then 记录唯一审计引用并允许图片调用', async () => {
     const { orchestrator } = createFixture({ projectFiles: { 'src/App.tsx': 'export const App = "首页"' } })
     const run = orchestrator.createRun({

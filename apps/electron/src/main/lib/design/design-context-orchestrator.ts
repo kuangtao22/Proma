@@ -34,6 +34,8 @@ export interface CreateDesignContextRunInput {
   projectId: string
   mode: DesignContextMode
   originalRequest?: string
+  /** 当前任务是否已携带由主进程固化的 Canvas 直接输入上下文。 */
+  hasTrustedInputContext?: boolean
 }
 
 /** 单次 Design 运行向 Job Manager 暴露的工具与审计状态。 */
@@ -321,6 +323,7 @@ export class DesignContextOrchestrator {
         }
         if (input.mode === 'auto'
           && requestRequiresProjectContext(input.originalRequest)
+          && input.hasTrustedInputContext !== true
           && references.size === 0) {
           throw new Error('当前要求依赖项目上下文，但 Agent 尚未成功读取资料')
         }

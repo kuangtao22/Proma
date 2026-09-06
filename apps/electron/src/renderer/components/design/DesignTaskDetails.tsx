@@ -19,6 +19,9 @@ import {
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { cn } from '@/lib/utils'
 
+/** Design 图片工具沿用的内部兼容名称，不应直接作为用户可见模型名。 */
+const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
+
 /** 任务详情控制器只依赖两个延迟读取 API。 */
 type DesignTaskDetailsAdapter = Pick<DesignAdapter, 'getTaskDetails' | 'getTaskTrace'>
 
@@ -164,11 +167,20 @@ export interface PartitionedDesignTrace {
 }
 
 /** 把原始 Thinking 与可操作执行事件分开，避免混在同一长列表。 */
-export function partitionDesignTrace(trace: DesignTraceEntry[] | undefined): PartitionedDesignTrace {
+export function partitionDesignTrace(
+  trace: DesignTraceEntry[] | undefined,
+  imageModelSnapshot?: DesignJobRecord['imageModelSnapshot'],
+): PartitionedDesignTrace {
   const entries = trace ?? []
+  /** 历史 trace 保持原样，仅在展示阶段把兼容工具名替换为本次任务的真实模型。 */
+  const visibleEntries = imageModelSnapshot
+    ? entries.map((entry) => entry.toolName === DESIGN_IMAGE_TOOL
+        ? { ...entry, toolName: `图片模型：${imageModelSnapshot.name} · ${imageModelSnapshot.modelId}` }
+        : entry)
+    : entries
   return {
-    thinking: entries.filter((entry) => entry.type === 'thinking'),
-    logs: entries.filter((entry) => entry.type !== 'thinking'),
+    thinking: visibleEntries.filter((entry) => entry.type === 'thinking'),
+    logs: visibleEntries.filter((entry) => entry.type !== 'thinking'),
   }
 }
 
@@ -298,7 +310,7 @@ export function DesignTaskDetailsView({
   const currentAttempt = details?.attempts.find((attempt) => attempt.jobId === details.currentJobId)
   const designSummary = currentAttempt?.designSummary ?? job.designSummary
   const finalImagePrompt = currentAttempt?.finalImagePrompt ?? job.finalImagePrompt
-  const trace = partitionDesignTrace(details?.trace)
+  const trace = partitionDesignTrace(details?.trace, job.imageModelSnapshot)
   const thinkingMessage = getDesignThinkingMessage(detailsState)
   const retryable = job.status === 'failed' || job.status === 'cancelled' || job.status === 'interrupted'
 

@@ -106,6 +106,19 @@ describe('Design 任务详情', () => {
     expect(partitionDesignTrace(detailsState.details?.trace).thinking).toEqual([])
   })
 
+  test('Given 执行日志使用历史图片工具名 When 节点选择 GPT Image 2 Then 展示实际生图模型', () => {
+    const job = createJob()
+    const trace = partitionDesignTrace([{
+      timestamp: 200,
+      type: 'image',
+      title: '工具执行失败',
+      toolName: 'mcp__nano_banana__generate_image',
+      isError: true,
+    }], job.imageModelSnapshot)
+
+    expect(trace.logs[0]?.toolName).toBe('图片模型：GPT Image 2 · gpt-image-2')
+  })
+
   test('Given Canvas 复用任务详情视图 When 隐藏旧 Design 动作 Then 仍展示提示词与延迟详情入口', () => {
     const html = renderToStaticMarkup(
       <DesignTaskDetailsView

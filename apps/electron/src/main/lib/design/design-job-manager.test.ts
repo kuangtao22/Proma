@@ -522,6 +522,35 @@ describe('Design Job Manager', () => {
     )
   })
 
+  test('Given auto Canvas 任务已有图片参考 When 调用生图工具 Then 上下文守卫允许使用可信输入', async () => {
+    harness.canvasInputReferences = [{
+      nodeId: 'image-reference', kind: 'image', revision: 2,
+      summary: '当前采用角色三视图', summaryHash: 'a'.repeat(64),
+      assetId: 'asset-reference', sourcePort: 'image.asset', targetPort: 'image.reference',
+    }]
+    /** 捕获图片调用前守卫结果，证明任务无需重复读取项目文本。 */
+    let imageGuardError: unknown
+    harness.runHeadless = async (callbacks, extensions) => {
+      try {
+        extensions.beforeToolCall?.(NANO_BANANA_TOOL, {
+          designSummary: '保持角色一致并生成下一帧。',
+          prompt: 'Create the next consistent character frame.',
+        })
+      } catch (error) {
+        imageGuardError = error
+      }
+      callbacks.onComplete([])
+    }
+    const job = await harness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'),
+      prompt: '保持当前角色和场景一致，生成下一帧',
+    })
+
+    await harness.manager.run(job.id)
+
+    expect(imageGuardError).toBeUndefined()
+  })
+
   test('Given 未 recover 的 Manager When 重复按完整 Canvas 图片目标查询 Then journal 只扫描一次并返回稳定防御副本', async () => {
     const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
     const reloaded = createHarness()
