@@ -1,11 +1,18 @@
 import {
+  parseListCanvasImageActivityInput,
+  parseCanvasImageJobActivities,
   parseCanvasArtifactRevisionSummary,
   parseCanvasImageCandidateBatch,
   parseCanvasImageModuleSnapshot,
   parseCanvasTextArtifactSnapshot,
+  parseCanvasRunWorkflowResult,
+  parseCanvasWorkflowRun,
+  parseCanvasWorkflowRunPage,
   parseCanvasWorkspaceSnapshot,
 } from '@proma/shared'
 import type {
+  CanvasImageJobActivity,
+  ListCanvasImageActivityInput,
   AdoptCanvasTextArtifactRevisionInput,
   AgentCanvasBindingChangeEvent,
   CanvasArtifactRevisionSummary,
@@ -34,6 +41,12 @@ import type {
   CanvasTrashEntry,
   CanvasSessionChangeEvent,
   CanvasWorkspaceSnapshot,
+  CanvasRunWorkflowResult,
+  CanvasWorkflowRun,
+  CanvasWorkflowRunChangedEvent,
+  CanvasWorkflowRunListInput,
+  CanvasWorkflowRunPage,
+  CanvasWorkflowRunTarget,
   CanvasWebviewSnapshot,
   CanvasWebviewTarget,
   CanvasWebviewPreviewSnapshot,
@@ -110,6 +123,7 @@ export interface DesignAdapter {
   exportCanvasArtifact: (input: ExportCanvasArtifactInput) => Promise<void>
   /** 加载单个 Canvas 生图模块公开快照。 */
   loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasImageModuleSnapshot>
+  listCanvasImageActivity: (input: ListCanvasImageActivityInput) => Promise<CanvasImageJobActivity[]>
   /** 加载一个完整图片候选批次。 */
   getCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasImageCandidateBatch>
   /** 补齐批次中未成功的候选任务。 */
@@ -166,6 +180,19 @@ export interface DesignAdapter {
     target: CanvasTarget,
     listener: (event: CanvasChangeEvent) => void,
   ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
+  /** 分页读取当前普通 Agent 的工作流历史。 */
+  listCanvasWorkflowRuns: (input: CanvasWorkflowRunListInput) => Promise<CanvasWorkflowRunPage>
+  /** 读取当前普通 Agent 拥有的单个工作流运行。 */
+  getCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasWorkflowRun>
+  /** 继续当前普通 Agent 的旧工作流。 */
+  resumeCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasRunWorkflowResult>
+  /** 停止当前普通 Agent 的非终态工作流。 */
+  cancelCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasWorkflowRun>
+  /** 只向监听器传递当前项目与 Canvas 的工作流变化。 */
+  onCanvasWorkflowRunChanged: (
+    target: CanvasTarget,
+    listener: (event: CanvasWorkflowRunChangedEvent) => void,
+  ) => ReturnType<DesignPreloadApi['onCanvasWorkflowRunChanged']>
   /** 使用单个底层 Renderer listener 分派同项目内的 Canvas 集合事件。 */
   onCanvasChanges: (
     projectId: string,
@@ -271,6 +298,7 @@ const CANVAS_ADAPTER_FALLBACKS = {
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
   bindingList: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
   binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
+  workflow: { code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
 
 /** 判断未知值是否为普通对象。 */
@@ -436,6 +464,22 @@ async function loadCanvasImageCandidateBatch(
   }
 }
 
+/** 调用工作流 API，并在 Renderer 边界再次严格重建返回值。 */
+async function loadCanvasWorkflowValue<T>(
+  call: () => Promise<CanvasInvokeResult<unknown>>,
+  parse: (value: unknown) => T,
+): Promise<T> {
+  try {
+    return parse(await callCanvasApi(call, CANVAS_ADAPTER_FALLBACKS.workflow))
+  } catch (error) {
+    if (error instanceof CanvasPublicOperationError) throw error
+    throw new CanvasPublicOperationError(
+      CANVAS_ADAPTER_FALLBACKS.workflow.code,
+      CANVAS_ADAPTER_FALLBACKS.workflow.message,
+    )
+  }
+}
+
 /** 创建负责 Canvas 安全解包与 legacy Design 原样适配的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   /** 只合并相同精确目标的在途正文读取，settle 后立即清理。 */
@@ -573,6 +617,15 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       () => requireMethod(api, 'exportCanvasArtifact')(input),
       CANVAS_ADAPTER_FALLBACKS.artifactExport,
     ),
+    listCanvasImageActivity: async (input) => {
+      try {
+        const target = parseListCanvasImageActivityInput(input)
+        return parseCanvasImageJobActivities(await callCanvasApi(() => requireMethod(api, 'listCanvasImageActivity')(target), CANVAS_ADAPTER_FALLBACKS.imageLoad), target)
+      } catch (error) {
+        if (error instanceof CanvasPublicOperationError) throw error
+        throw new CanvasPublicOperationError(CANVAS_ADAPTER_FALLBACKS.imageLoad.code, CANVAS_ADAPTER_FALLBACKS.imageLoad.message)
+      }
+    },
     loadCanvasImageModule: async (input) => {
       try {
         /** Renderer 再次重建完整快照，避免测试注入或旧 Preload 绕过边界。 */
@@ -691,6 +744,24 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       new Set([target.canvasId]),
       listener,
     ),
+    listCanvasWorkflowRuns: (input) => loadCanvasWorkflowValue(
+      () => requireMethod(api, 'listCanvasWorkflowRuns')(input), parseCanvasWorkflowRunPage,
+    ),
+    getCanvasWorkflowRun: (input) => loadCanvasWorkflowValue(
+      () => requireMethod(api, 'getCanvasWorkflowRun')(input), parseCanvasWorkflowRun,
+    ),
+    resumeCanvasWorkflowRun: (input) => loadCanvasWorkflowValue(
+      () => requireMethod(api, 'resumeCanvasWorkflowRun')(input), parseCanvasRunWorkflowResult,
+    ),
+    cancelCanvasWorkflowRun: (input) => loadCanvasWorkflowValue(
+      () => requireMethod(api, 'cancelCanvasWorkflowRun')(input), parseCanvasWorkflowRun,
+    ),
+    onCanvasWorkflowRunChanged: (target, listener) => {
+      const release = requireMethod(api, 'onCanvasWorkflowRunChanged')((event) => {
+        if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)
+      })
+      return makeIdempotentAdapterRelease(release)
+    },
     onCanvasChanges: subscribeCanvasChanges,
     listAgentCanvasBindings: (input) => callCanvasApi(
       () => requireMethod(api, 'listAgentCanvasBindings')(input),

@@ -5,6 +5,7 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageModuleConfig,
+  CanvasImageJobActivity,
   CanvasImageModuleSnapshot,
   CanvasNodeLifecycleResult,
   CanvasMutation,
@@ -86,6 +87,7 @@ import {
   commitCanvasImageDraftAndCreateJob,
   exportCanvasImageArtifact,
   createCanvasNodeReferencesFromSnapshot,
+  createNativeCanvasImageCandidateNodeIds,
   createNativeCanvasNodeActivityStates,
   createNativeCanvasJobActivityController,
   commitNativeCanvasArrangeMutation,
@@ -126,9 +128,12 @@ describe('Agent Canvas 共享图与独立视图', () => {
     }]
     /** 使用集合模拟真实事件总线，并验证释放时移除监听器。 */
     const listeners = new Set<(change: DesignChangeEvent) => void>()
-    const snapshots: DesignJobRecord[][] = []
+    const snapshots: Array<Array<Pick<DesignJobRecord, keyof CanvasImageJobActivity>>> = []
+    /** 显式推进事件合批窗口，不使用真实等待。 */
+    const scheduler = new ManualScheduler()
     const controller = createNativeCanvasJobActivityController({
       projectId: 'project-1',
+      scheduler,
       listJobs: async () => jobs,
       onChanged: (nextListener) => {
         listeners.add(nextListener)
@@ -138,16 +143,150 @@ describe('Agent Canvas 共享图与独立视图', () => {
     })
 
     controller.start()
-    await controller.refresh()
+    await controller.whenIdle()
     expect(snapshots.at(-1)?.[0]?.status).toBe('queued')
 
     jobs = [{ ...jobs[0]!, status: 'running', updatedAt: 101 }]
     for (const listener of listeners) {
       listener({ projectId: 'project-1', revision: 1, cause: 'job' })
     }
+    scheduler.runAll()
     await controller.whenIdle()
     expect(snapshots.at(-1)?.[0]?.status).toBe('running')
 
+    controller.dispose()
+    expect(listeners.size).toBe(0)
+  })
+
+  test('Given 成功图片候选已被删除 When 收到同项目 asset 事件 Then 刷新任务快照并移除候选状态', async () => {
+    /** 当前画布包含候选任务所指向的图片节点。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'image-1', kind: 'image', title: '候选图', imageModuleId: 'module-1', position: { x: 0, y: 0 },
+    }]
+    /** 删除素材前仍存在的成功候选任务。 */
+    let jobs: DesignJobRecord[] = [{
+      id: 'job-1', creativeTaskId: 'task-1', attemptNumber: 1, projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+      action: 'generate', status: 'succeeded', prompt: '首页', originalRequest: '首页', contextMode: 'none',
+      outputAssetId: 'asset-1', createdAt: 100, updatedAt: 100,
+    }]
+    /** 记录实际任务列表读取次数，验证跨项目事件不会触发刷新。 */
+    let listCalls = 0
+    /** 使用集合模拟项目级 Design 事件。 */
+    const listeners = new Set<(change: DesignChangeEvent) => void>()
+    /** 每次任务快照刷新后派生的候选节点集合。 */
+    const candidateSnapshots: string[][] = []
+    /** 候选刷新与任务刷新共用同一个有界事件窗口。 */
+    const scheduler = new ManualScheduler()
+    /** 被测画布任务同步器。 */
+    const controller = createNativeCanvasJobActivityController({
+      projectId: 'project-1',
+      scheduler,
+      listJobs: async () => {
+        listCalls += 1
+        return jobs
+      },
+      onChanged: (listener) => {
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+      onJobsChange: (nextJobs) => {
+        candidateSnapshots.push([...createNativeCanvasImageCandidateNodeIds(document, nextJobs)])
+      },
+    })
+
+    controller.start()
+    await controller.whenIdle()
+    expect(candidateSnapshots.at(-1)).toEqual(['image-1'])
+    expect(listCalls).toBe(1)
+
+    /** 主进程删除素材时同步清理对应成功 Job。 */
+    jobs = []
+    for (const listener of listeners) {
+      listener({ projectId: 'project-2', revision: 2, cause: 'asset' })
+    }
+    await controller.whenIdle()
+    expect(listCalls).toBe(1)
+    expect(candidateSnapshots.at(-1)).toEqual(['image-1'])
+
+    for (const listener of listeners) {
+      listener({ projectId: 'project-1', revision: 2, cause: 'asset' })
+    }
+    scheduler.runAll()
+    await controller.whenIdle()
+    expect(listCalls).toBe(2)
+    expect(candidateSnapshots.at(-1)).toEqual([])
+
+    controller.dispose()
+  })
+
+  test('Given 百条任务事件与慢速列表读取 When 事件突发 Then 同时最多一个读取且最终状态不会丢失', async () => {
+    /** 手动触发合批窗口并控制主进程响应时机。 */
+    const scheduler = new ManualScheduler()
+    const requests: Array<Deferred<DesignJobRecord[]>> = []
+    const listeners = new Set<(change: DesignChangeEvent) => void>()
+    const snapshots: Array<Array<Pick<DesignJobRecord, keyof CanvasImageJobActivity>>> = []
+    const controller = createNativeCanvasJobActivityController({
+      projectId: 'project-1', scheduler,
+      listJobs: () => {
+        const request = createDeferred<DesignJobRecord[]>()
+        requests.push(request)
+        return request.promise
+      },
+      onChanged: (listener) => {
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+      onJobsChange: (jobs) => snapshots.push(jobs),
+    })
+    controller.start()
+    for (let index = 0; index < 100; index += 1) {
+      for (const listener of listeners) listener({ projectId: 'project-1', revision: index, cause: 'job' })
+    }
+    expect(requests).toHaveLength(1)
+    requests[0]!.resolve([])
+    await flushPromises()
+    scheduler.runAll()
+    expect(requests).toHaveLength(2)
+    requests[1]!.resolve([])
+    await controller.whenIdle()
+    expect(snapshots.at(-1)).toEqual([])
+
+    /** 空闲时收到的多次事件也只安排一次读取；释放后禁止迟到工作。 */
+    for (let index = 0; index < 100; index += 1) {
+      for (const listener of listeners) listener({ projectId: 'project-1', revision: index, cause: 'asset' })
+    }
+    expect(requests).toHaveLength(2)
+    controller.dispose()
+    scheduler.runAll()
+    await controller.whenIdle()
+    expect(requests).toHaveLength(2)
+  })
+
+  test('Given 按画布读取活动摘要 When 进度事件和显式恢复刷新 Then 只有首次和恢复重扫历史', async () => {
+    /** 固定调度器和请求记录区分增量刷新与跨进程重同步。 */
+    const scheduler = new ManualScheduler()
+    const requests: Array<{ projectId: string; canvasId: string; resync?: boolean }> = []
+    const listeners = new Set<(change: DesignChangeEvent) => void>()
+    const listJobs = mock(async () => [])
+    const controller = createNativeCanvasJobActivityController({
+      projectId: 'project-1', canvasId: 'canvas-1', scheduler, listJobs,
+      listActivity: async (input) => { requests.push(input); return [] },
+      onChanged: (listener) => { listeners.add(listener); return () => { listeners.delete(listener) } },
+      onJobsChange: () => undefined,
+    })
+    controller.start()
+    await controller.whenIdle()
+    for (const listener of listeners) listener({ projectId: 'project-1', revision: 1, cause: 'job' })
+    scheduler.runAll()
+    await controller.whenIdle()
+    await controller.refresh()
+    for (const listener of listeners) listener({ projectId: 'project-1', revision: 0, cause: 'recovery' })
+    await controller.whenIdle()
+    expect(requests.map((request) => request.resync)).toEqual([true, false, true, true])
+    expect(requests.every((request) => request.projectId === 'project-1' && request.canvasId === 'canvas-1')).toBe(true)
+    expect(listJobs).not.toHaveBeenCalled()
     controller.dispose()
     expect(listeners.size).toBe(0)
   })
@@ -197,6 +336,40 @@ describe('Agent Canvas 共享图与独立视图', () => {
     }] satisfies DesignJobRecord[]
 
     expect([...createNativeCanvasNodeActivityStates(document, new Set(), jobs)]).toEqual([])
+  })
+
+  test('Given 多项目和多画布存在同名生图任务 When 聚合成功候选 Then 只命中完整目标身份', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = [{
+      id: 'image-1', kind: 'image', title: '生图', imageModuleId: 'module-1',
+      position: { x: 0, y: 0 },
+    }]
+    const createJob = (
+      id: string,
+      overrides: Partial<DesignJobRecord>,
+    ): DesignJobRecord => ({
+      id, creativeTaskId: `task-${id}`, attemptNumber: 1, projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-1' },
+      action: 'generate', status: 'succeeded', prompt: '首页', originalRequest: '首页', contextMode: 'none',
+      outputAssetId: `asset-${id}`, createdAt: 100, updatedAt: 100, ...overrides,
+    })
+    const jobs = [
+      createJob('matching', {}),
+      createJob('wrong-project', { projectId: 'project-2' }),
+      createJob('wrong-canvas', {
+        target: { kind: 'canvas-image', canvasId: 'canvas-2', nodeId: 'image-1', imageModuleId: 'module-1' },
+      }),
+      createJob('wrong-node', {
+        target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-2', imageModuleId: 'module-1' },
+      }),
+      createJob('wrong-module', {
+        target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'image-1', imageModuleId: 'module-2' },
+      }),
+      createJob('failed', { status: 'failed' }),
+      createJob('missing-output', { outputAssetId: undefined }),
+    ]
+
+    expect([...createNativeCanvasImageCandidateNodeIds(document, jobs)]).toEqual(['image-1'])
   })
 
   test('Given 视口只覆盖部分动态节点 When 计算可见范围 Then 使用真实卡片尺寸判断相交', () => {
@@ -3331,6 +3504,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     expect(html).toContain('可编辑标题')
     expect(html).toContain('工作区动作')
     expect(html).toContain('aria-label="打开回收区"')
+    expect(html).toContain('aria-label="打开工作流运行记录"')
     expect(html).not.toContain('原始标题')
   })
 })

@@ -5,6 +5,7 @@ import type {
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
+  CanvasWorkflowRun,
   DesignJobRecord,
   SaveDesignMutationsInput,
 } from '@proma/shared'
@@ -14,7 +15,83 @@ import {
   type PartialDesignApi,
 } from './design-adapter'
 
+/** 创建 Renderer 工作流合同测试使用的最小持久运行。 */
+function createWorkflowRun(): CanvasWorkflowRun {
+  return {
+    schemaVersion: 1, id: 'a'.repeat(48), revision: 0,
+    projectId: 'project-1', canvasId: 'canvas-1', operationId: 'operation-1',
+    owner: { sessionId: 'session-1', runStartedAt: 10 }, status: 'running',
+    initialCanvasRevision: 1, observedCanvasRevision: 1, rootNodeIds: ['root'], goal: '执行',
+    nodes: [{
+      nodeId: 'root', kind: 'agent', identityHash: 'b'.repeat(64), plannedArtifactHash: null,
+      mediaConfigRevision: null, inputBindings: [], dependencyNodeIds: [], status: 'ready',
+      errorCode: null, execution: null, completedArtifactHash: null, completedAt: null,
+    }],
+    budget: {
+      maxMediaRuns: 0, consumedMediaRuns: 0, remainingMediaRuns: 0,
+      maxDurationMs: 900_000, remainingDurationMs: 900_000, activeStartedAt: 10,
+    },
+    autoResumeAfterAdoption: false, cancelRequestedAt: null, cancelledAt: null,
+    createdAt: 10, updatedAt: 10,
+  }
+}
+
 describe('Design renderer adapter', () => {
+  test('Given 工作流 Preload 合同 When 调用与订阅 Then 严格重建并按 Canvas 过滤事件', async () => {
+    const run = createWorkflowRun()
+    const target = {
+      projectId: run.projectId, canvasId: run.canvasId, sessionId: run.owner.sessionId, runId: run.id,
+    }
+    const received: unknown[] = []
+    let eventListener: ((event: { projectId: string; canvasId: string; runId: string; revision: number }) => void) | undefined
+    let releaseCalls = 0
+    const adapter = createDesignAdapter({
+      listCanvasWorkflowRuns: async () => ({ ok: true, value: { runs: [run], nextCursor: null } }),
+      getCanvasWorkflowRun: async () => ({ ok: true, value: run }),
+      resumeCanvasWorkflowRun: async () => ({
+        ok: true,
+        value: {
+          runId: run.id, status: 'partial', initialRevision: 1, finalRevision: 1,
+          nodes: [{ nodeId: 'root', status: 'started', errorCode: null }],
+          imageSummary: null, requiresReview: false, errorCode: null,
+        },
+      }),
+      cancelCanvasWorkflowRun: async () => ({ ok: true, value: { ...run, status: 'cancelled', cancelRequestedAt: 11, cancelledAt: 11 } }),
+      onCanvasWorkflowRunChanged: (listener) => {
+        eventListener = listener
+        return () => { releaseCalls += 1 }
+      },
+    })
+
+    expect((await adapter.listCanvasWorkflowRuns({ ...target, limit: 20 })).runs[0]).not.toBe(run)
+    expect((await adapter.getCanvasWorkflowRun(target)).id).toBe(run.id)
+    expect((await adapter.resumeCanvasWorkflowRun(target)).runId).toBe(run.id)
+    expect((await adapter.cancelCanvasWorkflowRun(target)).status).toBe('cancelled')
+    const release = adapter.onCanvasWorkflowRunChanged(run, (event) => received.push(event))
+    eventListener?.({ projectId: 'project-2', canvasId: run.canvasId, runId: run.id, revision: 1 })
+    eventListener?.({ projectId: run.projectId, canvasId: run.canvasId, runId: run.id, revision: 1 })
+    release()
+    release()
+
+    expect(received).toEqual([{ projectId: run.projectId, canvasId: run.canvasId, runId: run.id, revision: 1 }])
+    expect(releaseCalls).toBe(1)
+  })
+
+  test('Given 工作流返回夹带未知字段 When Renderer adapter 接收 Then 转为固定公开错误', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', sessionId: 'session-1', runId: 'a'.repeat(48),
+    }
+    const adapter = createDesignAdapter({
+      getCanvasWorkflowRun: async () => ({
+        ok: true, value: { ...createWorkflowRun(), internalPath: '/Users/private/run.json' } as never,
+      }),
+    })
+
+    await expect(adapter.getCanvasWorkflowRun(target)).rejects.toMatchObject({
+      code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。',
+    })
+  })
+
   test('Given 四类候选批次调用 When Preload 返回 Then 严格重建批次并拒绝私有字段', async () => {
     const input = { projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1' }
     const batch: CanvasImageCandidateBatch = {

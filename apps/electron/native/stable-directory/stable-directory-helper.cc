@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <memory>
 #include <random>
 #include <set>
@@ -61,12 +63,25 @@ struct Config {
   std::string destination_child_name;
   std::string destination_entry_id;
   std::string file_name;
+  std::string expected_source_sha256;
+  std::size_t expected_source_size = 0;
+  bool overwrite = false;
+  bool create_only = false;
 };
 
 struct EntryBudget {
   std::size_t entries = 0;
   std::size_t output_bytes = 0;
 };
+
+// 前置声明固定事务文件名校验，供参数协议同时复用到归档叶子。
+bool IsCanvasIntentCandidateName(const std::string& name);
+
+// 外部导出只接受单层叶子，路径解析必须在主进程完成。
+bool IsSafeExportLeaf(const std::string& name) {
+  return !name.empty() && name != "." && name != ".."
+      && name.find('/') == std::string::npos && name.find('\\') == std::string::npos;
+}
 
 // 转义 UTF-8 JSON 字符串；输入原始文本，返回可安全嵌入 JSON 的内容。
 std::string JsonEscape(const std::string& value) {
@@ -123,10 +138,12 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     const std::string value = args[++index];
     if (key == "--mode") {
       if (value != "list" && value != "scan"
-          && value != "canvas-intent-scan" && value != "canvas-intent-write"
+          && value != "canvas-intent-scan" && value != "canvas-intent-read" && value != "canvas-intent-write"
+          && value != "canvas-intent-remove"
           && value != "canvas-content-write" && value != "canvas-content-read"
           && value != "canvas-content-list" && value != "canvas-content-move"
-          && value != "canvas-content-remove-marker") {
+          && value != "canvas-content-remove-marker"
+          && value != "artifact-export-write" && value != "artifact-export-copy") {
         *error = "unsupported mode";
         return false;
       }
@@ -164,6 +181,25 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
       config->destination_entry_id = value;
     } else if (key == "--file-name") {
       config->file_name = value;
+    } else if (key == "--expected-source-sha256") {
+      config->expected_source_sha256 = value;
+    } else if (key == "--expected-source-size") {
+      if (!ParseUnsigned(value, &config->expected_source_size)) {
+        *error = "invalid expected source size";
+        return false;
+      }
+    } else if (key == "--overwrite") {
+      if (value != "true" && value != "false") {
+        *error = "invalid overwrite value";
+        return false;
+      }
+      config->overwrite = value == "true";
+    } else if (key == "--create-only") {
+      if (value != "true" && value != "false") {
+        *error = "invalid create only value";
+        return false;
+      }
+      config->create_only = value == "true";
     } else {
       *error = "unknown argument: " + key;
       return false;
@@ -173,23 +209,48 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
     *error = "at least one root is required";
     return false;
   }
-  const bool canvas_mode = config->mode == "canvas-intent-scan" || config->mode == "canvas-intent-write";
+  const bool export_write = config->mode == "artifact-export-write";
+  const bool export_copy = config->mode == "artifact-export-copy";
+  if ((export_write || export_copy)
+      && (config->roots.size() != (export_copy ? 2U : 1U)
+          || !IsSafeExportLeaf(config->file_name)
+          || (export_copy && (config->expected_source_size > 64U * 1024U * 1024U
+              || config->expected_source_sha256.size() != 64U)))) {
+    *error = "invalid artifact export contract";
+    return false;
+  }
+  if (export_copy) {
+    for (unsigned char value : config->expected_source_sha256) {
+      if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'))) {
+        *error = "invalid artifact export source hash";
+        return false;
+      }
+    }
+  }
+  const bool canvas_mode = config->mode == "canvas-intent-scan" || config->mode == "canvas-intent-read"
+      || config->mode == "canvas-intent-write" || config->mode == "canvas-intent-remove";
   if (canvas_mode && (config->roots.size() != 1 || config->child_name != "transactions")) {
     *error = "invalid canvas intent directory contract";
     return false;
   }
-  if (config->mode == "canvas-intent-write"
+  if ((config->mode == "canvas-intent-read" || config->mode == "canvas-intent-write" || config->mode == "canvas-intent-remove")
       && (config->file_name.empty()
+          || !IsCanvasIntentCandidateName(config->file_name)
           || config->file_name.find('/') != std::string::npos
           || config->file_name.find('\\') != std::string::npos)) {
     *error = "invalid canvas intent file contract";
+    return false;
+  }
+  if (config->create_only && config->mode != "canvas-intent-write") {
+    *error = "create only requires canvas intent write";
     return false;
   }
   const bool content_mode = config->mode.rfind("canvas-content-", 0) == 0;
   const bool safe_child = config->child_name == "nodes"
       || config->child_name == "trash"
       || config->child_name == "revisions"
-      || config->child_name == "agent-configs";
+      || config->child_name == "agent-configs"
+      || config->child_name == "transaction-archive";
   const bool move_child = config->child_name == "nodes" || config->child_name == "trash";
   const bool move_destination = config->destination_child_name == "nodes"
       || config->destination_child_name == "trash";
@@ -197,7 +258,9 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
   const bool needs_file = config->mode == "canvas-content-write"
       || config->mode == "canvas-content-read";
   // Agent 配置目录只接受 config.json；其它内容根保持既有文件集合。
-  const bool safe_file = config->child_name == "agent-configs"
+  const bool safe_file = config->child_name == "transaction-archive"
+      ? IsCanvasIntentCandidateName(config->file_name)
+      : config->child_name == "agent-configs"
       ? config->file_name == "config.json"
       : config->file_name == "config.json" || config->file_name == "meta.json"
           || config->file_name == "content.md" || config->file_name == "index.html"
@@ -214,6 +277,8 @@ bool ParseArguments(const std::vector<std::string>& args, Config* config, std::s
                 && config->destination_entry_id.empty() && config->file_name.empty()
           : config->file_name.empty();
   if (content_mode && (config->roots.size() != 1 || !safe_child
+      || (config->child_name == "transaction-archive"
+          && config->mode != "canvas-content-write" && config->mode != "canvas-content-read")
       || (config->mode == "canvas-content-remove-marker" && config->child_name != "trash")
       || config->max_entries == 0 || config->max_entries > 512 || !fields_match_mode
       || (needs_entry && (config->entry_id.empty() || config->entry_id.size() > 128))
@@ -284,7 +349,7 @@ bool IsHexDigit(char value) {
       || (value >= 'A' && value <= 'F');
 }
 
-// 只接受固定 Agent、内容、批量与图片候选事务文件名。
+// 只接受固定 Agent、内容、批量、图片候选与产物导出事务文件名。
 bool IsCanvasIntentCandidateName(const std::string& name) {
   constexpr std::size_t kAgentRebuildPrefixLength = 19;
   constexpr std::size_t kAgentPrefixLength = 11;
@@ -292,6 +357,7 @@ bool IsCanvasIntentCandidateName(const std::string& name) {
   constexpr std::size_t kBatchPrefixLength = 13;
   constexpr std::size_t kImageCandidateBatchPrefixLength = 22;
   constexpr std::size_t kImageCandidateAdoptionPrefixLength = 25;
+  constexpr std::size_t kArtifactExportPrefixLength = 16;
   constexpr std::size_t kAgentCanvasPrefixLength = 13;
   constexpr std::size_t kSha256Length = 64;
   constexpr std::size_t kUuidLength = 36;
@@ -321,6 +387,8 @@ bool IsCanvasIntentCandidateName(const std::string& name) {
   } else if (name.compare(0, kImageCandidateAdoptionPrefixLength,
                           "image-candidate-adoption-") == 0) {
     prefix_length = kImageCandidateAdoptionPrefixLength;
+  } else if (name.compare(0, kArtifactExportPrefixLength, "artifact-export-") == 0) {
+    prefix_length = kArtifactExportPrefixLength;
   } else {
     return false;
   }
@@ -396,15 +464,99 @@ std::string CanvasContentEntryJson(const std::string& name) {
 
 // 解析 ALLOW 或 ALLOW\t<Base64> 决策；写模式返回已解码正文。
 bool ParseAuthorization(const Config& config, const std::string& decision, std::string* payload) {
-  if (config.mode != "canvas-intent-write" && config.mode != "canvas-content-write") {
+  if (config.mode != "canvas-intent-write" && config.mode != "canvas-intent-remove"
+      && config.mode != "canvas-content-write" && config.mode != "artifact-export-write") {
     return decision == "ALLOW";
   }
   constexpr char kPrefix[] = "ALLOW\t";
   if (decision.rfind(kPrefix, 0) != 0) return false;
-  const std::size_t limit = config.mode == "canvas-content-write"
+  const std::size_t limit = config.mode == "canvas-content-write" || config.mode == "artifact-export-write"
       ? kCanvasContentMaxFileBytes : 64 * 1024;
   return DecodeBase64(decision.substr(sizeof(kPrefix) - 1), limit, payload);
 }
+
+// 小型增量 SHA-256，仅用于分块导出时核对受管图片内容。
+class Sha256 {
+ public:
+  Sha256() : state_{0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+                   0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U} {}
+
+  void Update(const unsigned char* data, std::size_t size) {
+    total_size_ += size;
+    while (size > 0) {
+      const std::size_t count = std::min<std::size_t>(size, block_.size() - block_size_);
+      std::memcpy(block_.data() + block_size_, data, count);
+      block_size_ += count;
+      data += count;
+      size -= count;
+      if (block_size_ == block_.size()) { Transform(); block_size_ = 0; }
+    }
+  }
+
+  std::string FinalHex() {
+    const std::uint64_t bit_size = static_cast<std::uint64_t>(total_size_) * 8U;
+    block_[block_size_++] = 0x80U;
+    if (block_size_ > 56U) {
+      std::fill(block_.begin() + static_cast<std::ptrdiff_t>(block_size_), block_.end(), 0U);
+      Transform();
+      block_size_ = 0;
+    }
+    std::fill(block_.begin() + static_cast<std::ptrdiff_t>(block_size_), block_.begin() + 56, 0U);
+    for (int index = 0; index < 8; ++index) block_[63 - index] = static_cast<unsigned char>(bit_size >> (index * 8));
+    Transform();
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (std::uint32_t value : state_) out << std::setw(8) << value;
+    return out.str();
+  }
+
+ private:
+  static std::uint32_t Rotate(std::uint32_t value, std::uint32_t bits) {
+    return (value >> bits) | (value << (32U - bits));
+  }
+
+  void Transform() {
+    static constexpr std::array<std::uint32_t, 64> constants = {
+      0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,
+      0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,
+      0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,
+      0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,
+      0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,
+      0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,
+      0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,
+      0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U,
+    };
+    std::array<std::uint32_t, 64> words {};
+    for (std::size_t index = 0; index < 16; ++index) {
+      words[index] = (static_cast<std::uint32_t>(block_[index * 4]) << 24)
+          | (static_cast<std::uint32_t>(block_[index * 4 + 1]) << 16)
+          | (static_cast<std::uint32_t>(block_[index * 4 + 2]) << 8)
+          | static_cast<std::uint32_t>(block_[index * 4 + 3]);
+    }
+    for (std::size_t index = 16; index < words.size(); ++index) {
+      const std::uint32_t s0 = Rotate(words[index - 15], 7) ^ Rotate(words[index - 15], 18) ^ (words[index - 15] >> 3);
+      const std::uint32_t s1 = Rotate(words[index - 2], 17) ^ Rotate(words[index - 2], 19) ^ (words[index - 2] >> 10);
+      words[index] = words[index - 16] + s0 + words[index - 7] + s1;
+    }
+    std::uint32_t a=state_[0],b=state_[1],c=state_[2],d=state_[3],e=state_[4],f=state_[5],g=state_[6],h=state_[7];
+    for (std::size_t index = 0; index < words.size(); ++index) {
+      const std::uint32_t s1 = Rotate(e,6)^Rotate(e,11)^Rotate(e,25);
+      const std::uint32_t choice = (e&f)^((~e)&g);
+      const std::uint32_t t1 = h+s1+choice+constants[index]+words[index];
+      const std::uint32_t s0 = Rotate(a,2)^Rotate(a,13)^Rotate(a,22);
+      const std::uint32_t majority = (a&b)^(a&c)^(b&c);
+      const std::uint32_t t2 = s0+majority;
+      h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    state_[0]+=a; state_[1]+=b; state_[2]+=c; state_[3]+=d;
+    state_[4]+=e; state_[5]+=f; state_[6]+=g; state_[7]+=h;
+  }
+
+  std::array<std::uint32_t, 8> state_;
+  std::array<unsigned char, 64> block_ {};
+  std::size_t block_size_ = 0;
+  std::size_t total_size_ = 0;
+};
 
 // 提取跨平台路径末段；输入完整路径，返回文件或目录名。
 std::string BaseName(const std::string& path) {
@@ -1079,6 +1231,51 @@ bool CheckCanvasIntentCapacity(const Config& config, int transactions_fd, std::s
   return true;
 }
 
+// 在 transactions fd 内精确读取单个 intent，并绑定路径与 fd 的完整稳定状态。
+std::string ReadCanvasIntent(const Config& config, int transactions_fd) {
+  CanvasIntentLock lock;
+  std::string error;
+  if (!lock.Acquire(transactions_fd, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  struct stat listed {};
+  if (fstatat(transactions_fd, config.file_name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
+    return errno == ENOENT
+        ? CanvasContentReadResultJson("missing", "", 0, "", "", "")
+        : CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot stat canvas intent file");
+  }
+  if (!S_ISREG(listed.st_mode) || listed.st_nlink != 1 || listed.st_size < 0
+      || listed.st_size > 64 * 1024) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas intent file is unsafe");
+  }
+  UniqueFd file(openat(transactions_fd, config.file_name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+  struct stat opened {};
+  if (file.Get() < 0 || fstat(file.Get(), &opened) != 0
+      || !SameCanvasContentFileState(listed, opened)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas intent changed before read");
+  }
+  std::string content(static_cast<std::size_t>(opened.st_size), '\0');
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    const ssize_t count = read(file.Get(), content.data() + offset, content.size() - offset);
+    if (count <= 0) {
+      return CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot read canvas intent");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  struct stat final_file {};
+  struct stat final_path {};
+  if (fstat(file.Get(), &final_file) != 0
+      || fstatat(transactions_fd, config.file_name.c_str(), &final_path, AT_SYMLINK_NOFOLLOW) != 0
+      || !SameCanvasContentFileState(opened, final_file)
+      || !SameCanvasContentFileState(opened, final_path)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas intent changed during read");
+  }
+  return CanvasContentReadResultJson("ok", content, static_cast<std::size_t>(opened.st_size),
+      std::to_string(static_cast<unsigned long long>(opened.st_dev)),
+      std::to_string(static_cast<unsigned long long>(opened.st_ino)), "");
+}
+
 // 在 transactions fd 内创建临时文件、落盘并相对 rename，返回精确提交阶段。
 CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, int transactions_fd,
                                                  const std::string& payload) {
@@ -1086,6 +1283,17 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, int trans
   CanvasIntentLock lock;
   if (!lock.Acquire(transactions_fd, &outcome.error)) return outcome;
   if (!CheckCanvasIntentCapacity(config, transactions_fd, &outcome.error)) return outcome;
+  if (config.create_only) {
+    struct stat existing {};
+    if (fstatat(transactions_fd, config.file_name.c_str(), &existing, AT_SYMLINK_NOFOLLOW) == 0) {
+      outcome.error = "canvas intent destination exists";
+      return outcome;
+    }
+    if (errno != ENOENT) {
+      outcome.error = "cannot inspect canvas intent destination";
+      return outcome;
+    }
+  }
   std::string temporary_name;
   UniqueFd temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
@@ -1108,15 +1316,74 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, int trans
     outcome.error = "cannot persist canvas intent temporary file";
     return outcome;
   }
-  if (renameat(transactions_fd, temporary_name.c_str(), transactions_fd, config.file_name.c_str()) != 0) {
+  const bool renamed = config.create_only
+      ? RenameDirectoryNoReplace(transactions_fd, temporary_name, transactions_fd, config.file_name)
+      : renameat(transactions_fd, temporary_name.c_str(), transactions_fd, config.file_name.c_str()) == 0;
+  if (!renamed) {
     unlinkat(transactions_fd, temporary_name.c_str(), 0);
-    outcome.error = "cannot commit canvas intent file";
+    outcome.error = errno == EEXIST
+        ? "canvas intent destination exists" : "cannot commit canvas intent file";
     return outcome;
   }
   outcome.commit_visible = true;
   if (fsync(transactions_fd) != 0) {
     outcome.durability_uncertain = true;
     outcome.error = "cannot persist canvas transactions directory";
+  }
+  return outcome;
+}
+
+// 在 intent 锁内按稳定文件名删除 active 事务；缺失表示前次已成功收敛。
+CanvasIntentWriteOutcome RemoveCanvasIntent(const Config& config, int transactions_fd,
+                                            const std::string& expected_content) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasIntentLock lock;
+  if (!lock.Acquire(transactions_fd, &outcome.error)) return outcome;
+  struct stat listed {};
+  if (fstatat(transactions_fd, config.file_name.c_str(), &listed, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) { outcome.commit_visible = true; return outcome; }
+    outcome.error = "cannot inspect canvas intent removal target";
+    return outcome;
+  }
+  if (!S_ISREG(listed.st_mode) || listed.st_nlink != 1) {
+    outcome.error = "canvas intent removal target is unsafe";
+    return outcome;
+  }
+  UniqueFd opened(openat(transactions_fd, config.file_name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+  struct stat identity {};
+  if (opened.Get() < 0 || fstat(opened.Get(), &identity) != 0
+      || identity.st_dev != listed.st_dev || identity.st_ino != listed.st_ino) {
+    outcome.error = "canvas intent removal target changed";
+    return outcome;
+  }
+  if (identity.st_size < 0
+      || static_cast<std::size_t>(identity.st_size) != expected_content.size()) {
+    outcome.error = "canvas intent removal content changed";
+    return outcome;
+  }
+  std::string content(expected_content.size(), '\0');
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    const ssize_t count = read(opened.Get(), content.data() + offset, content.size() - offset);
+    if (count <= 0) { outcome.error = "cannot read canvas intent removal target"; return outcome; }
+    offset += static_cast<std::size_t>(count);
+  }
+  struct stat final_path {};
+  if (content != expected_content
+      || fstatat(transactions_fd, config.file_name.c_str(), &final_path, AT_SYMLINK_NOFOLLOW) != 0
+      || !S_ISREG(final_path.st_mode)
+      || final_path.st_dev != identity.st_dev || final_path.st_ino != identity.st_ino) {
+    outcome.error = "canvas intent removal content changed";
+    return outcome;
+  }
+  if (unlinkat(transactions_fd, config.file_name.c_str(), 0) != 0) {
+    outcome.error = "cannot remove canvas intent";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (fsync(transactions_fd) != 0) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas intent removal";
   }
   return outcome;
 }
@@ -1233,6 +1500,99 @@ std::string OpenedJson(const std::vector<StableRoot>& roots) {
   return out.str();
 }
 
+// 在 helper 持有的目标目录句柄内原子写入文本或分块复制受管图片。
+CanvasIntentWriteOutcome ExportArtifactAtomic(const Config& config,
+                                              const std::vector<StableRoot>& roots,
+                                              const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  const StableRoot& destination = roots.back();
+  if (!S_ISDIR(destination.identity.st_mode)) {
+    outcome.error = "artifact export destination is not a directory";
+    return outcome;
+  }
+  struct stat existing {};
+  const bool target_exists = fstatat(destination.descriptor.Get(), config.file_name.c_str(),
+      &existing, AT_SYMLINK_NOFOLLOW) == 0;
+  if (target_exists && (!S_ISREG(existing.st_mode) || !config.overwrite)) {
+    outcome.error = !S_ISREG(existing.st_mode)
+        ? "artifact export destination is unsafe" : "artifact export destination exists";
+    return outcome;
+  }
+  if (!target_exists && errno != ENOENT) {
+    outcome.error = "cannot inspect artifact export destination";
+    return outcome;
+  }
+  std::string temporary_name;
+  UniqueFd temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    temporary_name = ".proma-export-" + std::to_string(getpid()) + "-"
+        + std::to_string(static_cast<unsigned long long>(std::random_device{}())) + ".tmp";
+    temporary.Reset(openat(destination.descriptor.Get(), temporary_name.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (temporary.Get() >= 0) break;
+    if (errno != EEXIST) { outcome.error = "cannot create artifact export temporary file"; return outcome; }
+  }
+  if (temporary.Get() < 0) { outcome.error = "cannot allocate artifact export temporary file"; return outcome; }
+  bool valid = true;
+  if (config.mode == "artifact-export-write") {
+    valid = WriteAndSync(temporary.Get(), payload);
+  } else {
+    const StableRoot& source = roots.front();
+    if (!S_ISREG(source.identity.st_mode)
+        || static_cast<std::size_t>(source.identity.st_size) != config.expected_source_size
+        || lseek(source.descriptor.Get(), 0, SEEK_SET) < 0) {
+      valid = false;
+    } else {
+      std::array<unsigned char, 64 * 1024> buffer {};
+      Sha256 hash;
+      std::size_t total = 0;
+      while (valid && total < config.expected_source_size) {
+        const std::size_t remaining = config.expected_source_size - total;
+        const ssize_t count = read(source.descriptor.Get(), buffer.data(), std::min(buffer.size(), remaining));
+        if (count <= 0) { valid = false; break; }
+        hash.Update(buffer.data(), static_cast<std::size_t>(count));
+        std::size_t offset = 0;
+        while (offset < static_cast<std::size_t>(count)) {
+          const ssize_t written = write(temporary.Get(), buffer.data() + offset,
+              static_cast<std::size_t>(count) - offset);
+          if (written <= 0) { valid = false; break; }
+          offset += static_cast<std::size_t>(written);
+        }
+        total += static_cast<std::size_t>(count);
+      }
+      unsigned char extra = 0;
+      struct stat final_source {};
+      valid = valid && total == config.expected_source_size
+          && read(source.descriptor.Get(), &extra, 1) == 0
+          && fstat(source.descriptor.Get(), &final_source) == 0
+          && final_source.st_dev == source.identity.st_dev
+          && final_source.st_ino == source.identity.st_ino
+          && final_source.st_size == source.identity.st_size
+          && hash.FinalHex() == config.expected_source_sha256
+          && fsync(temporary.Get()) == 0;
+    }
+  }
+  if (!valid) {
+    unlinkat(destination.descriptor.Get(), temporary_name.c_str(), 0);
+    outcome.error = "artifact export source or temporary file validation failed";
+    return outcome;
+  }
+  const bool renamed = config.overwrite
+      ? renameat(destination.descriptor.Get(), temporary_name.c_str(), destination.descriptor.Get(), config.file_name.c_str()) == 0
+      : RenameDirectoryNoReplace(destination.descriptor.Get(), temporary_name, destination.descriptor.Get(), config.file_name);
+  if (!renamed) {
+    unlinkat(destination.descriptor.Get(), temporary_name.c_str(), 0);
+    outcome.error = errno == EEXIST ? "artifact export destination exists" : "cannot commit artifact export";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (fsync(destination.descriptor.Get()) != 0) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist artifact export destination";
+  }
+  return outcome;
+}
+
 // 执行 POSIX 两阶段协议；输入解析后的配置，返回进程退出码。
 int RunPlatform(const Config& config) {
   std::vector<StableRoot> roots(config.roots.size());
@@ -1248,6 +1608,13 @@ int RunPlatform(const Config& config) {
   std::string decision;
   std::string payload;
   if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (config.mode == "artifact-export-write" || config.mode == "artifact-export-copy") {
+    const CanvasIntentWriteOutcome outcome = ExportArtifactAtomic(config, roots, payload);
+    if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   if (config.mode.rfind("canvas-content-", 0) == 0) {
     std::string error;
     if (config.mode == "canvas-content-write") {
@@ -1271,16 +1638,22 @@ int RunPlatform(const Config& config) {
     done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
     return EmitLine(done.str(), config, &budget) ? 0 : 4;
   }
-  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
+  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-read" || config.mode == "canvas-intent-write"
+      || config.mode == "canvas-intent-remove") {
     UniqueFd transactions;
     std::string error;
     if (!OpenCanvasTransactions(config, roots.front(), &transactions, &error)) {
       std::cerr << error << '\n';
       return 4;
     }
-    if (config.mode == "canvas-intent-write") {
+    if (config.mode == "canvas-intent-read") {
+      if (!EmitLine(ReadCanvasIntent(config, transactions.Get()), config, &budget)) return 4;
+    } else if (config.mode == "canvas-intent-write") {
       const CanvasIntentWriteOutcome outcome = WriteCanvasIntentAtomic(
           config, transactions.Get(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-intent-remove") {
+      const CanvasIntentWriteOutcome outcome = RemoveCanvasIntent(config, transactions.Get(), payload);
       if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
     } else {
       if (!ScanCanvasIntents(config, transactions.Get(), &budget, &error)) {
@@ -2130,6 +2503,20 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE tr
   CanvasIntentLock lock;
   if (!lock.Acquire(transactions, &outcome.error)) return outcome;
   if (!CheckCanvasIntentCapacity(config, transactions, &outcome.error)) return outcome;
+  if (config.create_only) {
+    UniqueHandle existing;
+    std::string existing_error;
+    if (OpenRelativeWindows(transactions, Utf8ToWide(config.file_name),
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+        &existing, &existing_error)) {
+      outcome.error = "canvas intent destination exists";
+      return outcome;
+    }
+    if (!IsCanvasWindowsMissingError(GetLastError())) {
+      outcome.error = "cannot inspect canvas intent destination";
+      return outcome;
+    }
+  }
   UniqueHandle temporary;
   for (int attempt = 0; attempt < 32; ++attempt) {
     const std::wstring temporary_name = L".intent-" + std::to_wstring(GetCurrentProcessId())
@@ -2159,9 +2546,11 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE tr
     return outcome;
   }
   const std::wstring target = Utf8ToWide(config.file_name);
-  if (!RenameRelativeWindows(temporary.Get(), transactions, target, true)) {
+  if (!RenameRelativeWindows(temporary.Get(), transactions, target, !config.create_only)) {
+    const DWORD rename_error = GetLastError();
     DeleteTemporaryWindowsFile(temporary.Get());
-    outcome.error = "cannot commit canvas intent file";
+    outcome.error = rename_error == ERROR_FILE_EXISTS || rename_error == ERROR_ALREADY_EXISTS
+        ? "canvas intent destination exists" : "cannot commit canvas intent file";
     return outcome;
   }
   outcome.commit_visible = true;
@@ -2172,6 +2561,65 @@ CanvasIntentWriteOutcome WriteCanvasIntentAtomic(const Config& config, HANDLE tr
       outcome.durability_uncertain = true;
       outcome.error = "cannot persist canvas transactions directory";
     }
+  }
+  return outcome;
+}
+
+// 在 intent 锁内通过 no-reparse HANDLE 删除 active 事务；缺失视为幂等成功。
+CanvasIntentWriteOutcome RemoveCanvasIntent(const Config& config, HANDLE transactions,
+                                            const std::string& expected_content) {
+  CanvasIntentWriteOutcome outcome;
+  CanvasIntentLock lock;
+  if (!lock.Acquire(transactions, &outcome.error)) return outcome;
+  UniqueHandle target;
+  std::string open_error;
+  if (!OpenRelativeWindows(transactions, Utf8ToWide(config.file_name),
+      DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_OPEN, FILE_NON_DIRECTORY_FILE, &target, &open_error)) {
+    if (IsCanvasWindowsMissingError(GetLastError())) { outcome.commit_visible = true; return outcome; }
+    outcome.error = "cannot open canvas intent removal target";
+    return outcome;
+  }
+  BY_HANDLE_FILE_INFORMATION identity {};
+  if (!GetFileInformationByHandle(target.Get(), &identity)
+      || (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+      || identity.nNumberOfLinks != 1) {
+    outcome.error = "canvas intent removal target is unsafe";
+    return outcome;
+  }
+  const std::uint64_t size = (static_cast<std::uint64_t>(identity.nFileSizeHigh) << 32)
+      | identity.nFileSizeLow;
+  if (size != expected_content.size()) {
+    outcome.error = "canvas intent removal content changed";
+    return outcome;
+  }
+  std::string content(expected_content.size(), '\0');
+  std::size_t offset = 0;
+  while (offset < content.size()) {
+    DWORD read_bytes = 0;
+    const DWORD remaining = static_cast<DWORD>(content.size() - offset);
+    if (!ReadFile(target.Get(), content.data() + offset, remaining, &read_bytes, nullptr)
+        || read_bytes == 0) {
+      outcome.error = "cannot read canvas intent removal target";
+      return outcome;
+    }
+    offset += read_bytes;
+  }
+  if (content != expected_content) {
+    outcome.error = "canvas intent removal content changed";
+    return outcome;
+  }
+  FILE_DISPOSITION_INFO disposition {};
+  disposition.DeleteFile = TRUE;
+  if (!SetFileInformationByHandle(target.Get(), FileDispositionInfo, &disposition, sizeof(disposition))) {
+    outcome.error = "cannot remove canvas intent";
+    return outcome;
+  }
+  target.Reset();
+  outcome.commit_visible = true;
+  if (!FlushCanvasDirectoryWindows(transactions)) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist canvas intent removal";
   }
   return outcome;
 }
@@ -2221,6 +2669,37 @@ bool ReadCanvasIntentWindows(HANDLE transactions, const std::wstring& name,
     return false;
   }
   return true;
+}
+
+// 在 transactions HANDLE 内精确读取单个 intent，不枚举或输出其它事务。
+std::string ReadCanvasIntent(const Config& config, HANDLE transactions) {
+  CanvasIntentLock lock;
+  std::string error;
+  if (!lock.Acquire(transactions, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  const std::wstring name = Utf8ToWide(config.file_name);
+  UniqueHandle listed;
+  if (!OpenRelativeWindows(transactions, name,
+      FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, FILE_NON_DIRECTORY_FILE,
+      &listed, &error)) {
+    return IsCanvasWindowsMissingError(GetLastError())
+        ? CanvasContentReadResultJson("missing", "", 0, "", "", "")
+        : CanvasContentReadResultJson("corrupt", "", 0, "", "", "cannot inspect canvas intent file");
+  }
+  BY_HANDLE_FILE_INFORMATION identity {};
+  if (!GetFileInformationByHandle(listed.Get(), &identity)
+      || (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0
+      || identity.nNumberOfLinks != 1) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", "canvas intent file is unsafe");
+  }
+  std::string content;
+  std::uint64_t size = 0;
+  if (!ReadCanvasIntentWindows(transactions, name, WindowsFileId(identity), &content, &size, &error)) {
+    return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
+  }
+  return CanvasContentReadResultJson("ok", content, static_cast<std::size_t>(size),
+      std::to_string(WindowsVolumeId(identity)), std::to_string(WindowsFileId(identity)), "");
 }
 
 // 直接枚举 transactions HANDLE，并把相对读取的 intent 正文放入协议内存结果。
@@ -2344,6 +2823,103 @@ std::string OpenedJson(const std::vector<StableRoot>& roots) {
   return out.str();
 }
 
+// Windows 使用已打开目标目录 HANDLE 原子写入文本或分块复制图片。
+CanvasIntentWriteOutcome ExportArtifactAtomic(const Config& config,
+                                              const std::vector<StableRoot>& roots,
+                                              const std::string& payload) {
+  CanvasIntentWriteOutcome outcome;
+  const StableRoot& destination = roots.back();
+  if ((destination.identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    outcome.error = "artifact export destination is not a directory";
+    return outcome;
+  }
+  UniqueHandle existing;
+  std::string existing_error;
+  if (OpenRelativeWindows(destination.handle.Get(), Utf8ToWide(config.file_name),
+      FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_OPEN, 0, &existing, &existing_error)) {
+    BY_HANDLE_FILE_INFORMATION identity {};
+    if (!GetFileInformationByHandle(existing.Get(), &identity)
+        || (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+      outcome.error = "artifact export destination is unsafe";
+      return outcome;
+    }
+    if (!config.overwrite) { outcome.error = "artifact export destination exists"; return outcome; }
+  } else if (!IsCanvasWindowsMissingError(GetLastError())) {
+    outcome.error = "cannot inspect artifact export destination";
+    return outcome;
+  }
+  UniqueHandle temporary;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    const std::wstring name = L".proma-export-" + std::to_wstring(GetCurrentProcessId()) + L"-"
+        + std::to_wstring(static_cast<unsigned long long>(std::random_device{}())) + L".tmp";
+    if (OpenRelativeWindows(destination.handle.Get(), name,
+        FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, &temporary, &outcome.error)) break;
+  }
+  if (temporary.Get() == INVALID_HANDLE_VALUE) {
+    outcome.error = "cannot allocate artifact export temporary file";
+    return outcome;
+  }
+  bool valid = true;
+  if (config.mode == "artifact-export-write") {
+    std::size_t offset = 0;
+    while (offset < payload.size()) {
+      DWORD written = 0;
+      const DWORD count = static_cast<DWORD>(std::min<std::size_t>(payload.size() - offset, MAXDWORD));
+      if (!WriteFile(temporary.Get(), payload.data() + offset, count, &written, nullptr) || written == 0) { valid = false; break; }
+      offset += written;
+    }
+  } else {
+    const StableRoot& source = roots.front();
+    const std::uint64_t source_size = (static_cast<std::uint64_t>(source.identity.nFileSizeHigh) << 32) | source.identity.nFileSizeLow;
+    LARGE_INTEGER zero {};
+    valid = (source.identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0
+        && source_size == config.expected_source_size
+        && SetFilePointerEx(source.handle.Get(), zero, nullptr, FILE_BEGIN) != FALSE;
+    std::array<unsigned char, 64 * 1024> buffer {};
+    Sha256 hash;
+    std::size_t total = 0;
+    while (valid && total < config.expected_source_size) {
+      DWORD read_bytes = 0;
+      const DWORD wanted = static_cast<DWORD>(std::min<std::size_t>(buffer.size(), config.expected_source_size - total));
+      if (!ReadFile(source.handle.Get(), buffer.data(), wanted, &read_bytes, nullptr) || read_bytes == 0) { valid = false; break; }
+      hash.Update(buffer.data(), read_bytes);
+      DWORD offset = 0;
+      while (offset < read_bytes) {
+        DWORD written = 0;
+        if (!WriteFile(temporary.Get(), buffer.data() + offset, read_bytes - offset, &written, nullptr) || written == 0) { valid = false; break; }
+        offset += written;
+      }
+      total += read_bytes;
+    }
+    BY_HANDLE_FILE_INFORMATION final_source {};
+    valid = valid && total == config.expected_source_size
+        && GetFileInformationByHandle(source.handle.Get(), &final_source)
+        && WindowsFileId(final_source) == WindowsFileId(source.identity)
+        && final_source.nFileSizeHigh == source.identity.nFileSizeHigh
+        && final_source.nFileSizeLow == source.identity.nFileSizeLow
+        && hash.FinalHex() == config.expected_source_sha256;
+  }
+  if (!valid || !FlushFileBuffers(temporary.Get())) {
+    DeleteTemporaryWindowsFile(temporary.Get());
+    outcome.error = "artifact export source or temporary file validation failed";
+    return outcome;
+  }
+  if (!RenameRelativeWindows(temporary.Get(), destination.handle.Get(), Utf8ToWide(config.file_name), config.overwrite)) {
+    const DWORD rename_error = GetLastError();
+    DeleteTemporaryWindowsFile(temporary.Get());
+    outcome.error = rename_error == ERROR_FILE_EXISTS || rename_error == ERROR_ALREADY_EXISTS
+        ? "artifact export destination exists" : "cannot commit artifact export";
+    return outcome;
+  }
+  outcome.commit_visible = true;
+  if (!FlushCanvasDirectoryWindows(destination.handle.Get())) {
+    outcome.durability_uncertain = true;
+    outcome.error = "cannot persist artifact export destination";
+  }
+  return outcome;
+}
+
 // 执行 Windows 两阶段协议；输入解析后的配置，返回进程退出码。
 int RunPlatform(const Config& config) {
   std::vector<StableRoot> roots(config.roots.size());
@@ -2355,7 +2931,9 @@ int RunPlatform(const Config& config) {
       || config.mode == "canvas-content-remove-marker";
   for (std::size_t index = 0; index < config.roots.size(); ++index) {
     std::string error;
-    if (!OpenStableRoot(config.roots[index], &roots[index], &error, content_mutation)) {
+    const bool export_destination = (config.mode == "artifact-export-write" || config.mode == "artifact-export-copy")
+        && index + 1 == config.roots.size();
+    if (!OpenStableRoot(config.roots[index], &roots[index], &error, content_mutation || export_destination)) {
       std::cerr << error << '\n';
       return 2;
     }
@@ -2365,6 +2943,13 @@ int RunPlatform(const Config& config) {
   std::string decision;
   std::string payload;
   if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
+  if (config.mode == "artifact-export-write" || config.mode == "artifact-export-copy") {
+    const CanvasIntentWriteOutcome outcome = ExportArtifactAtomic(config, roots, payload);
+    if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    std::ostringstream done;
+    done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
+    return EmitLine(done.str(), config, &budget) ? 0 : 4;
+  }
   if (content_mode) {
     std::string error;
     if (config.mode == "canvas-content-write") {
@@ -2388,16 +2973,22 @@ int RunPlatform(const Config& config) {
     done << "{\"type\":\"done\",\"entryCount\":" << budget.entries << '}';
     return EmitLine(done.str(), config, &budget) ? 0 : 4;
   }
-  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-write") {
+  if (config.mode == "canvas-intent-scan" || config.mode == "canvas-intent-read" || config.mode == "canvas-intent-write"
+      || config.mode == "canvas-intent-remove") {
     UniqueHandle transactions;
     std::string error;
     if (!OpenCanvasTransactions(config, roots.front(), &transactions, &error)) {
       std::cerr << error << '\n';
       return 4;
     }
-    if (config.mode == "canvas-intent-write") {
+    if (config.mode == "canvas-intent-read") {
+      if (!EmitLine(ReadCanvasIntent(config, transactions.Get()), config, &budget)) return 4;
+    } else if (config.mode == "canvas-intent-write") {
       const CanvasIntentWriteOutcome outcome = WriteCanvasIntentAtomic(
           config, transactions.Get(), payload);
+      if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
+    } else if (config.mode == "canvas-intent-remove") {
+      const CanvasIntentWriteOutcome outcome = RemoveCanvasIntent(config, transactions.Get(), payload);
       if (!EmitLine(CanvasIntentWriteResultJson(outcome), config, &budget)) return 4;
     } else if (!ScanCanvasIntents(config, transactions.Get(), &budget, &error)) {
       std::cerr << error << '\n';

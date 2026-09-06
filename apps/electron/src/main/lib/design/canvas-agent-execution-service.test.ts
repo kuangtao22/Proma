@@ -3,7 +3,7 @@ import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument, SkillMeta } from '@proma/shared'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasAgentConfig } from './canvas-agent-config-store'
-import type { CanvasToolRun } from './canvas-tool-provider'
+import type { CanvasToolRun, CanvasToolRunContext } from './canvas-tool-provider'
 import {
   createCanvasAgentExecutionService,
   type CanvasAgentExecutionServiceDependencies,
@@ -57,6 +57,8 @@ function createFixture(options: {
   let activeRun: { sessionId: string; startedAt: number } | undefined
   let commitCount = 0
   let prepareHeld = false
+  /** 记录每轮工具上下文，验证交互窗口身份不会泄漏到后台运行。 */
+  const runContexts: CanvasToolRunContext[] = []
   const dependencies: CanvasAgentExecutionServiceDependencies = {
     reconcile: async () => { calls.push('reconcile'); return { document, nodeIssues: [] } },
     getSession: (sessionId) => {
@@ -102,6 +104,7 @@ function createFixture(options: {
       return () => { calls.push('release') }
     },
     createCanvasRun: (context) => {
+      runContexts.push(context)
       calls.push(`tools:${context.canvasAgentMode}:${context.explicitReferences.map((reference) => reference.nodeId).join(',')}`)
       return options.canvasRun ?? {
         systemPromptAppend: 'tools-prompt', piCustomTools: [],
@@ -161,7 +164,7 @@ function createFixture(options: {
     },
     now: () => 100,
   }
-  return { service: createCanvasAgentExecutionService(dependencies), calls }
+  return { service: createCanvasAgentExecutionService(dependencies), calls, runContexts }
 }
 
 describe('Canvas Agent 统一执行服务', () => {
@@ -177,6 +180,7 @@ describe('Canvas Agent 统一执行服务', () => {
       'tools:renderer-manual:input-1', 'reserve', 'listen', 'renderer:channel-live/model-live:pro-plan',
       'commit:completed:1', 'unlisten', 'release', 'release-generation:child-1:1',
     ])
+    expect(fixture.runContexts[0]?.dialogOwnerWebContentsId).toBe(1)
   })
 
   test('Given Renderer 明确错误且锚点后已有旧正文 When 运行结束 Then 不调用输出提交', async () => {
@@ -200,6 +204,7 @@ describe('Canvas Agent 统一执行服务', () => {
     expect(fixture.calls).toContain('headless:design:parent-1:external')
     expect(fixture.calls).toContain('tools:parent-orchestrated:input-1')
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
+    expect(fixture.runContexts[0]?.dialogOwnerWebContentsId).toBeUndefined()
   })
 
   test('Given 父 Agent 初检后图 revision 已变化 When 最终启动 Then 在 reserve 前拒绝且不运行模型', async () => {

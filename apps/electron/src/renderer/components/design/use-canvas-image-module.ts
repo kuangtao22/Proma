@@ -235,6 +235,10 @@ export function createCanvasImageModuleController(
   let instanceEpoch = 0
   /** 只有新 LOAD 会淘汰旧 LOAD。 */
   let loadGeneration = 0
+  /** 后台任务事件只允许一个模块读取在途，避免重复创建媒体 lease。 */
+  let loadInFlight = false
+  /** 在途读取期间的任意多个事件合并为一次后续权威读取。 */
+  let reloadRequested = false
   /** 只有新 SAVE 会淘汰旧 SAVE。 */
   let saveGeneration = 0
   /** 创建、取消和重试共享任务控制通道，只有后发任务命令可淘汰前一条。 */
@@ -360,12 +364,19 @@ export function createCanvasImageModuleController(
   /** 读取完整模块权威快照，事件刷新与手动重试共用同一代次门禁。 */
   const load = (): void => {
     if (disposed || lifecycleLease?.isCurrent() !== true) return
+    if (loadInFlight) {
+      reloadRequested = true
+      return
+    }
+    loadInFlight = true
+    reloadRequested = false
     /** 当前 LOAD 同时捕获实例代次和 LOAD 通道代次。 */
     const epoch = instanceEpoch
     const generation = ++loadGeneration
     const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'load', generation }
     beginErrorOperation(owner)
-    dependencies.updateState(key, { phase: 'loading' })
+    /** 后台刷新保留已展示的图片与控件，避免整个工作台反复卸载。 */
+    if (!dependencies.getState(key)?.snapshot) dependencies.updateState(key, { phase: 'loading' })
     void dependencies.adapter.loadCanvasImageModule(dependencies.target).then((snapshot) => {
       if (!isCurrentInstance(epoch) || generation !== loadGeneration) {
         releaseSnapshotMedia(snapshot)
@@ -376,7 +387,11 @@ export function createCanvasImageModuleController(
     }).catch((error: unknown) => {
       if (!isCurrentInstance(epoch) || generation !== loadGeneration) return
       setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
-      dependencies.updateState(key, { phase: 'error' })
+      /** 后台读取失败只显示行内错误，保留当前图片与未保存草稿。 */
+      dependencies.updateState(key, { phase: dependencies.getState(key)?.snapshot ? 'ready' : 'error' })
+    }).finally(() => {
+      loadInFlight = false
+      if (isCurrentInstance(epoch) && reloadRequested) load()
     })
   }
 

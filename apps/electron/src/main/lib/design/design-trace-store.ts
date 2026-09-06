@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type {
   DesignJobTraceSummary,
@@ -23,6 +23,23 @@ const TRACE_ENTRY_TYPES = new Set<DesignTraceEntry['type']>([
 export interface DesignTraceWriteResult {
   summary: DesignJobTraceSummary
   entryCount: number
+}
+
+/** Design trace 单页有界读取参数。 */
+export interface DesignTracePageOptions {
+  cursor?: string
+  limit: number
+  maxBytes: number
+  /** 在计算页预算和 cursor 前把磁盘条目转换为最终公开结构。 */
+  transformEntry?: (entry: DesignTraceEntry) => DesignTraceEntry
+}
+
+/** Design trace 单页读取结果。 */
+export interface DesignTracePage {
+  entries: DesignTraceEntry[]
+  nextCursor?: string
+  truncated: boolean
+  omittedEntryCount: number
 }
 
 /** Design trace store 依赖，只接受可信项目路径解析器。 */
@@ -184,6 +201,156 @@ export class DesignTraceStore {
       })
     } catch (error) {
       throw new Error('Design trace 文件损坏或不可读', { cause: error })
+    }
+  }
+
+  /**
+   * 从字节游标开始有界读取 trace，避免先加载完整 JSONL 再截断。
+   * @param projectId 已登记 Design 项目 ID。
+   * @param jobId 当前单次执行 ID。
+   * @param options 页大小、响应字节预算与后续游标。
+   * @returns 最多 50 条公开 trace、后续字节游标和超大行省略计数。
+   */
+  readPage(projectId: string, jobId: string, options: DesignTracePageOptions): DesignTracePage {
+    const tracePath = resolveTracePath(this.dependencies.pathResolver, projectId, jobId)
+    /** 对外页大小始终收敛到合同允许范围。 */
+    const limit = Number.isFinite(options.limit)
+      ? Math.max(1, Math.min(50, Math.floor(options.limit)))
+      : 50
+    /** 字节预算限制单页内存；服务层还会校验完整响应大小。 */
+    const maxBytes = Number.isFinite(options.maxBytes)
+      ? Math.max(256, Math.min(60 * 1024, Math.floor(options.maxBytes)))
+      : 60 * 1024
+    /** 游标是下一行起始字节偏移，禁止负数、小数或任意字符串。 */
+    const startOffset = options.cursor === undefined
+      ? 0
+      : /^\d+$/.test(options.cursor) ? Number(options.cursor) : Number.NaN
+    if (!Number.isSafeInteger(startOffset) || startOffset < 0) {
+      throw new Error('Design trace 游标无效')
+    }
+
+    let descriptor: number | undefined
+    try {
+      descriptor = openSync(tracePath, 'r')
+      const fileSize = fstatSync(descriptor).size
+      if (startOffset > fileSize) throw new Error('trace cursor beyond end')
+      if (startOffset > 0) {
+        /** 公开游标只能指向换行后的完整记录边界。 */
+        const previousByte = Buffer.allocUnsafe(1)
+        if (readSync(descriptor, previousByte, 0, 1, startOffset - 1) !== 1 || previousByte[0] !== 0x0a) {
+          throw new Error('trace cursor is not at line boundary')
+        }
+      }
+      if (startOffset === fileSize) {
+        return { entries: [], truncated: false, omittedEntryCount: 0 }
+      }
+
+      /** 固定小块读取，单条异常大日志只扫描而不会进入进程内存结果。 */
+      const chunk = Buffer.allocUnsafe(4 * 1024)
+      /** 当前行在文件中的起始偏移，用于页满时返回可重放游标。 */
+      let lineStart = startOffset
+      /** 当前文件读取位置。 */
+      let position = startOffset
+      /** 未超过预算时暂存当前行片段。 */
+      let lineParts: Buffer[] = []
+      /** 当前行总字节数，包括已因超限丢弃的片段。 */
+      let lineBytes = 0
+      /** 当前行是否已超过单页预算。 */
+      let skippingOversizedLine = false
+      /** 已返回条目的 JSON 字节近似总量。 */
+      let returnedBytes = 2
+      /** 当前页公开条目。 */
+      const entries: DesignTraceEntry[] = []
+      /** 因单行过大而省略的条数。 */
+      let omittedEntryCount = 0
+
+      /** 完成一行校验并决定返回、延后或省略。 */
+      const finishLine = (nextLineStart: number): DesignTracePage | undefined => {
+        if (skippingOversizedLine || lineBytes > maxBytes) {
+          omittedEntryCount += 1
+        } else {
+          const line = Buffer.concat(lineParts, lineBytes).toString('utf8')
+          if (!line) throw new Error('empty trace line')
+          const value: unknown = JSON.parse(line)
+          if (!isDesignTraceEntry(value)) throw new Error('invalid trace entry')
+          /** 页预算必须基于调用方最终返回的公开条目，避免后置转换破坏 cursor。 */
+          const publicEntry = options.transformEntry?.(value) ?? value
+          if (!isDesignTraceEntry(publicEntry)) throw new Error('invalid transformed trace entry')
+          const entryBytes = Buffer.byteLength(JSON.stringify(publicEntry), 'utf8') + 1
+          if (entries.length >= limit || returnedBytes + entryBytes > maxBytes) {
+            if (entries.length === 0) {
+              /** 单条记录连同 JSON 数组开销超限时跳过，避免游标永远停在同一行。 */
+              omittedEntryCount += 1
+              lineParts = []
+              lineBytes = 0
+              skippingOversizedLine = false
+              lineStart = nextLineStart
+              return undefined
+            }
+            return {
+              entries,
+              nextCursor: String(lineStart),
+              truncated: true,
+              omittedEntryCount,
+            }
+          }
+          entries.push(publicEntry)
+          returnedBytes += entryBytes
+        }
+        lineParts = []
+        lineBytes = 0
+        skippingOversizedLine = false
+        lineStart = nextLineStart
+        if (entries.length >= limit && lineStart < fileSize) {
+          return {
+            entries,
+            nextCursor: String(lineStart),
+            truncated: true,
+            omittedEntryCount,
+          }
+        }
+        return undefined
+      }
+
+      while (position < fileSize) {
+        const bytesRead = readSync(descriptor, chunk, 0, Math.min(chunk.length, fileSize - position), position)
+        if (bytesRead <= 0) break
+        /** 当前 chunk 内尚未归入行的起点。 */
+        let segmentStart = 0
+        for (let index = 0; index < bytesRead; index += 1) {
+          if (chunk[index] !== 0x0a) continue
+          const segment = chunk.subarray(segmentStart, index)
+          lineBytes += segment.length
+          if (!skippingOversizedLine && lineBytes <= maxBytes) lineParts.push(Buffer.from(segment))
+          else {
+            skippingOversizedLine = true
+            lineParts = []
+          }
+          const nextLineStart = position + index + 1
+          const page = finishLine(nextLineStart)
+          if (page) return page
+          segmentStart = index + 1
+        }
+        const remainder = chunk.subarray(segmentStart, bytesRead)
+        lineBytes += remainder.length
+        if (!skippingOversizedLine && lineBytes <= maxBytes) lineParts.push(Buffer.from(remainder))
+        else {
+          skippingOversizedLine = true
+          lineParts = []
+        }
+        position += bytesRead
+      }
+
+      /** 兼容没有末尾换行的最后一条合法 JSONL。 */
+      if (lineBytes > 0 || skippingOversizedLine) {
+        const page = finishLine(fileSize)
+        if (page) return page
+      }
+      return { entries, truncated: false, omittedEntryCount }
+    } catch (error) {
+      throw new Error('Design trace 文件损坏或不可读', { cause: error })
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor)
     }
   }
 

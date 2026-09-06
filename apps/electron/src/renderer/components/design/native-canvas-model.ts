@@ -189,6 +189,8 @@ export interface NativeCanvasProjectionOptions {
   nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
   /** 工作区共享的素材预览索引，节点投影不得自行加载图片模块。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
+  /** 已有成功生成结果但尚未正式采用的生图节点，仅用于准确展示候选状态。 */
+  imageCandidateNodeIds?: ReadonlySet<string>
   canCreateChild: boolean
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onReferenceNode?: (nodeId: string) => void
@@ -433,6 +435,9 @@ export function toNativeCanvasFlowNodes(
       const preview = node.adoptedAssetId
         ? options.imagePreviews?.get(node.adoptedAssetId)
         : undefined
+      /** 候选只改变状态文案，正式采用前不得注入缩略图或素材身份。 */
+      const hasPendingCandidate = !node.adoptedAssetId
+        && options.imageCandidateNodeIds?.has(node.id) === true
       return {
         ...base,
         type: 'canvasImage',
@@ -444,8 +449,10 @@ export function toNativeCanvasFlowNodes(
           activityState,
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
           ...(preview ? { previewUrl: preview.previewUrl, nodeHeight: nodeSize.height } : {}),
-          statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
-          summary: node.adoptedAssetId ? '已采用画布素材' : '尚未生成图片',
+          statusLabel: node.adoptedAssetId ? '已有素材' : hasPendingCandidate ? '待采用' : '待创作',
+          summary: node.adoptedAssetId
+            ? '已采用画布素材'
+            : hasPendingCandidate ? '已生成，尚未设为默认' : '尚未生成图片',
           canOpenWorkbench: true,
           onOpenWorkbench: options.onWorkbenchNodeChange,
           canCreateChild: options.canCreateChild,

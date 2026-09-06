@@ -21,6 +21,78 @@ function createRecordingIpc() {
 }
 
 describe('Design preload', () => {
+  test('Given 工作流历史 API When 调用 Then 只向固定通道发送 session 绑定的公开字段', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const target = {
+      projectId: 'p1', canvasId: 'canvas-1', sessionId: 'session-1', runId: 'a'.repeat(48),
+      credential: 'secret',
+    }
+
+    await api.listCanvasWorkflowRuns({ ...target, cursor: `${10}-${'b'.repeat(48)}`, limit: 20 })
+    await api.getCanvasWorkflowRun(target)
+    await api.resumeCanvasWorkflowRun(target)
+    await api.cancelCanvasWorkflowRun(target)
+
+    const publicTarget = {
+      projectId: 'p1', canvasId: 'canvas-1', sessionId: 'session-1', runId: 'a'.repeat(48),
+    }
+    expect(recorded.invokes).toEqual([
+      { channel: CANVAS_IPC_CHANNELS.LIST_WORKFLOW_RUNS, args: [{
+        projectId: 'p1', canvasId: 'canvas-1', sessionId: 'session-1',
+        cursor: `${10}-${'b'.repeat(48)}`, limit: 20,
+      }] },
+      { channel: CANVAS_IPC_CHANNELS.GET_WORKFLOW_RUN, args: [publicTarget] },
+      { channel: CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN, args: [publicTarget] },
+      { channel: CANVAS_IPC_CHANNELS.CANCEL_WORKFLOW_RUN, args: [publicTarget] },
+    ])
+  })
+
+  test('Given 工作流返回夹带私有字段或 invoke 拒绝 When Preload 接收 Then 返回固定公开失败', async () => {
+    const target = {
+      projectId: 'p1', canvasId: 'canvas-1', sessionId: 'session-1', runId: 'a'.repeat(48),
+    }
+    const invalidApi = createDesignPreloadApi({
+      invoke: async () => ({ ok: true, value: { internalPath: '/Users/private/run.json' } }),
+      on: () => undefined,
+      removeListener: () => undefined,
+    })
+    const rejectedApi = createDesignPreloadApi({
+      invoke: async () => { throw new Error('/Users/private token=secret') },
+      on: () => undefined,
+      removeListener: () => undefined,
+    })
+
+    expect(await invalidApi.getCanvasWorkflowRun(target)).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。' },
+    })
+    expect(await rejectedApi.resumeCanvasWorkflowRun(target)).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。' },
+    })
+  })
+
+  test('Given 工作流变化订阅 When 推送合法与未知字段事件并重复取消 Then 严格接收且幂等解绑', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const received: unknown[] = []
+    const release = api.onCanvasWorkflowRunChanged((event) => received.push(event))
+    const change = {
+      projectId: 'p1', canvasId: 'canvas-1', runId: 'a'.repeat(48), revision: 2,
+    }
+
+    recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    recorded.added[0]?.listener({} as IpcRendererEvent, { ...change, internalPath: '/tmp/private' })
+    release()
+    release()
+
+    expect(received).toEqual([change])
+    expect(recorded.added[0]?.channel).toBe(CANVAS_IPC_CHANNELS.WORKFLOW_RUN_CHANGED)
+    expect(recorded.removed).toHaveLength(1)
+    expect(recorded.removed[0]?.listener).toBe(recorded.added[0]?.listener)
+  })
+
   test('Given 主进程图片快照夹带私有字段 When Preload 接收 Then 返回固定公开失败', async () => {
     const api = createDesignPreloadApi({
       invoke: async () => ({ ok: true, value: { internalPath: '/Users/private/module.json' } }),

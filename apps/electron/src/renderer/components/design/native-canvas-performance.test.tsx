@@ -6,7 +6,10 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import {
   NativeCanvasEdgeRelationMenu,
   NativeCanvasGraph,
+  createNativeCanvasFlowEdgeProjector,
+  createNativeCanvasProjectionCallbackBridge,
   createNativeCanvasTransientGeometryStore,
+  reconcileNativeCanvasFlowNodes,
   resolveNativeCanvasWorkbenchNodeRect,
   reduceNativeCanvasViewportState,
 } from './NativeCanvasGraph'
@@ -17,6 +20,7 @@ import {
   NATIVE_CANVAS_NODE_GAP,
   NATIVE_CANVAS_NODE_HEIGHT,
   NATIVE_CANVAS_NODE_WIDTH,
+  toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
 
@@ -51,6 +55,164 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(new Set(nodes.map((node) => node.type))).toEqual(new Set([
       'canvasAgent', 'canvasImage', 'canvasDocument', 'canvasWebview',
     ]))
+  })
+
+  test('Given 1,000 节点与 999 条边 When 单个图片任务状态变化 Then 只替换对应节点并复用边投影', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = Array.from({ length: 1_000 }, (_, index) => ({
+      id: `image-${index}`,
+      kind: 'image' as const,
+      title: `生图 ${index}`,
+      imageModuleId: `image-module-${index}`,
+      position: { x: (index % 40) * 320, y: Math.floor(index / 40) * 180 },
+    }))
+    document.edges = Array.from({ length: 999 }, (_, index) => ({
+      id: `edge-${index}`,
+      sourceNodeId: `image-${index}`,
+      sourcePort: 'unbound',
+      targetNodeId: `image-${index + 1}`,
+      targetPort: 'unbound',
+      relation: 'association' as const,
+    }))
+    const firstCallbackCalls: string[] = []
+    const latestCallbackCalls: string[] = []
+    /** 模拟 Workspace 每次 render 新建行内回调，由桥接层保持节点数据入口稳定。 */
+    const callbackBridge = createNativeCanvasProjectionCallbackBridge({
+      onCreateChild: (nodeId) => { firstCallbackCalls.push(nodeId) },
+      onReferenceNode: (nodeId) => { firstCallbackCalls.push(nodeId) },
+      onWorkbenchNodeChange: (nodeId) => { firstCallbackCalls.push(nodeId) },
+    })
+    const stableCreateChild = callbackBridge.onCreateChild
+    const stableWorkbenchNodeChange = callbackBridge.onWorkbenchNodeChange
+    /** 固定投影入口，只让单个节点活动态成为两次投影的唯一数据差异。 */
+    const projectionOptions = {
+      nodeIssues: [],
+      runningSessionIds: new Set<string>(),
+      nodeActivityStates: new Map<string, 'running'>(),
+      canCreateChild: false,
+      onCreateChild: callbackBridge.onCreateChild,
+      onReferenceNode: callbackBridge.onReferenceNode,
+      onWorkbenchNodeChange: callbackBridge.onWorkbenchNodeChange,
+    }
+    /** 首版纯投影代表 Graph 上一次接收的权威展示字段。 */
+    const previousProjection = toNativeCanvasFlowNodes(document, projectionOptions)
+    /** 当前节点模拟 XYFlow 已附加局部运行状态，未变化节点应原样保留。 */
+    const currentNodes = previousProjection.map((node, index) => (
+      index === 500
+        ? {
+            ...node,
+            position: { x: node.position.x + 48, y: node.position.y + 24 },
+            measured: { width: node.width, height: node.height },
+            dragging: true,
+          }
+        : index === 700 ? { ...node, dragging: true } : node
+    ))
+    callbackBridge.update({
+      onCreateChild: (nodeId) => { latestCallbackCalls.push(nodeId) },
+      onReferenceNode: (nodeId) => { latestCallbackCalls.push(nodeId) },
+      onWorkbenchNodeChange: (nodeId) => { latestCallbackCalls.push(nodeId) },
+    })
+    const nextProjection = toNativeCanvasFlowNodes(document, {
+      ...projectionOptions,
+      nodeActivityStates: new Map([['image-500', 'running']]),
+    })
+
+    const nextNodes = reconcileNativeCanvasFlowNodes(
+      currentNodes,
+      previousProjection,
+      nextProjection,
+    )
+    const projectEdges = createNativeCanvasFlowEdgeProjector()
+    const firstEdges = projectEdges(document)
+    const repeatedEdges = Array.from({ length: 100 }, () => projectEdges(document))
+
+    /** 旧全量替换路径的对象抖动作为同夹具基线，便于与合并结果直接比较。 */
+    expect(nextProjection.filter((node, index) => node !== previousProjection[index])).toHaveLength(1_000)
+    expect(toNativeCanvasFlowEdges(document)).not.toBe(toNativeCanvasFlowEdges(document))
+
+    expect(nextNodes.filter((node, index) => node !== currentNodes[index])).toHaveLength(1)
+    expect(nextNodes[500]?.data.activityState).toBe('running')
+    expect(nextNodes[500]?.position).toEqual(currentNodes[500]?.position)
+    expect(nextNodes[500]?.measured).toEqual(currentNodes[500]?.measured)
+    expect(nextNodes[500]?.dragging).toBe(true)
+    expect(nextNodes[700]).toBe(currentNodes[700])
+    expect(nextNodes[700]?.dragging).toBe(true)
+    expect(firstEdges).toHaveLength(999)
+    expect(repeatedEdges.every((edges) => edges === firstEdges)).toBe(true)
+    expect(callbackBridge.onCreateChild).toBe(stableCreateChild)
+    expect(callbackBridge.onWorkbenchNodeChange).toBe(stableWorkbenchNodeChange)
+    callbackBridge.onCreateChild('image-500', 'image')
+    callbackBridge.onReferenceNode('image-500')
+    callbackBridge.onWorkbenchNodeChange('image-500')
+    expect(firstCallbackCalls).toEqual([])
+    expect(latestCallbackCalls).toEqual(['image-500', 'image-500', 'image-500'])
+
+    /** 同 revision 乐观位置 mutation 会替换 nodes 数组，必须让缓存立即失效。 */
+    const optimisticDocument = {
+      ...document,
+      nodes: document.nodes.map((node, index) => index === 10
+        ? { ...node, position: { x: node.position.x + 16, y: node.position.y } }
+        : node),
+    }
+    const optimisticEdges = projectEdges(optimisticDocument)
+    const optimisticProjection = toNativeCanvasFlowNodes(optimisticDocument, projectionOptions)
+    const optimisticNodes = reconcileNativeCanvasFlowNodes(
+      nextNodes,
+      nextProjection,
+      optimisticProjection,
+    )
+
+    expect(optimisticDocument.revision).toBe(document.revision)
+    expect(optimisticEdges).not.toBe(firstEdges)
+    expect(optimisticNodes[10]).not.toBe(nextNodes[10])
+    expect(optimisticNodes[10]?.position.x).toBe(document.nodes[10]!.position.x + 16)
+
+    /** 同一活动节点的权威位置后来变化时，必须覆盖仍在内存里的拖动坐标。 */
+    const movedActiveDocument = {
+      ...document,
+      nodes: document.nodes.map((node, index) => index === 500
+        ? { ...node, position: { x: node.position.x + 96, y: node.position.y + 32 } }
+        : node),
+    }
+    const movedActiveProjection = toNativeCanvasFlowNodes(movedActiveDocument, {
+      ...projectionOptions,
+      nodeActivityStates: new Map([['image-500', 'running']]),
+    })
+    const movedActiveNodes = reconcileNativeCanvasFlowNodes(
+      nextNodes,
+      nextProjection,
+      movedActiveProjection,
+    )
+    expect(movedActiveNodes[500]?.position).toEqual(movedActiveDocument.nodes[500]?.position)
+    expect(movedActiveNodes[500]?.measured).toEqual(currentNodes[500]?.measured)
+  })
+
+  test('Given WebView 回调每次 render 都更新 When 通过稳定桥调用 Then 使用最新预览与设备实现', async () => {
+    const calls: string[] = []
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'webview-1',
+      prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' as const,
+    }
+    const callbackBridge = createNativeCanvasProjectionCallbackBridge({
+      onCreateChild: () => undefined,
+      loadCanvasWebviewPreview: async () => ({ target, previewUrl: 'old', width: 1, height: 1 }),
+      onWebviewDevicePresetChange: () => { calls.push('old') },
+    })
+    const stableLoader = callbackBridge.loadCanvasWebviewPreview
+    const stableDeviceChange = callbackBridge.onWebviewDevicePresetChange
+    callbackBridge.update({
+      onCreateChild: () => undefined,
+      loadCanvasWebviewPreview: async (nextTarget) => ({
+        target: nextTarget, previewUrl: 'latest', width: 320, height: 180,
+      }),
+      onWebviewDevicePresetChange: (_nodeId, preset) => { calls.push(preset) },
+    })
+
+    expect(callbackBridge.loadCanvasWebviewPreview).toBe(stableLoader)
+    expect(callbackBridge.onWebviewDevicePresetChange).toBe(stableDeviceChange)
+    expect(await callbackBridge.loadCanvasWebviewPreview(target)).toMatchObject({ previewUrl: 'latest' })
+    callbackBridge.onWebviewDevicePresetChange('webview-1', 'mobile')
+    expect(calls).toEqual(['mobile'])
   })
 
   test('Given 1,024 个多环密集节点 When 查找落点 Then 保持固定尺寸与间距', () => {

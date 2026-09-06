@@ -84,7 +84,9 @@ test('Given stable directory helper 的 Canvas intent 模式 When 检查三平�
   expect(source).toContain('kWindowsFileRenameReplaceIfExists | kWindowsFileRenamePosixSemantics')
   expect(source).toContain('RenameRelativeWindows(temporary.Get(), entry.Get(), target, true)')
   expect(source).toContain('RenameRelativeWindows(source.Get(), destination_root.Get(), target, false)')
-  expect(source).toContain('RenameRelativeWindows(temporary.Get(), transactions, target, true)')
+  expect(source).toContain('RenameRelativeWindows(temporary.Get(), transactions, target, !config.create_only)')
+  expect(source).toContain('RenameDirectoryNoReplace(transactions_fd, temporary_name, transactions_fd, config.file_name)')
+  expect(source).toContain('ReadCanvasIntent(config, transactions.Get())')
   expect(source).not.toContain('SetFileInformationByHandle(temporary.Get(), FileRenameInfo')
   expect(source).toContain('CanvasIntentWriteResultJson(outcome)')
   /** Windows scan 必须先排除目录/reparse，再让真实普通 intent 消耗容量。 */
@@ -111,9 +113,19 @@ test('Given agent-configs 受管目录 When 检查跨平台参数合同 Then 只
   const source = readFileSync(resolve(import.meta.dir, '../native/stable-directory/stable-directory-helper.cc'), 'utf8')
 
   expect(source).toContain('config->child_name == "agent-configs"')
-  expect(source).toContain('const bool safe_file = config->child_name == "agent-configs"')
+  expect(source).toContain(': config->child_name == "agent-configs"')
   expect(source).toContain('? config->file_name == "config.json"')
   expect(source).toContain(': config->file_name == "config.json" || config->file_name == "meta.json"')
   expect(source).toContain('const bool move_child = config->child_name == "nodes" || config->child_name == "trash";')
   expect(source).toContain('config->mode == "canvas-content-remove-marker" && config->child_name != "trash"')
+})
+
+test('Given Canvas 事务归档 When 检查跨平台 helper 合同 Then 归档目录与 active 删除保持句柄相对安全', () => {
+  const source = readFileSync(resolve(import.meta.dir, '../native/stable-directory/stable-directory-helper.cc'), 'utf8')
+
+  expect(source).toContain('config->child_name == "transaction-archive"')
+  expect(source).toContain('config.mode == "canvas-intent-remove"')
+  expect(source).toContain('unlinkat(transactions_fd, config.file_name.c_str(), 0)')
+  expect(source).toContain('FILE_DISPOSITION_INFO')
+  expect(source).toContain('FILE_OPEN_REPARSE_POINT')
 })

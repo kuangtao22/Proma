@@ -140,6 +140,51 @@ describe('原生 Canvas 纯投影', () => {
     expect(serialized).not.toContain('data:image')
   })
 
+  test('Given 生图节点没有正式采用素材但已有成功候选 When 投影 Then 显示待采用而不是待创作', () => {
+    const document = createDocument()
+    const imageNode = document.nodes.find((node) => node.id === 'image-1')
+    if (!imageNode || imageNode.kind !== 'image') throw new Error('测试夹具缺少生图节点')
+    delete imageNode.adoptedAssetId
+    const options = {
+      nodeIssues: [],
+      runningSessionIds: new Set<string>(),
+      imageCandidateNodeIds: new Set(['image-1']),
+      canCreateChild: false,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
+    }
+
+    const imageFlowNode = toNativeCanvasFlowNodes(document, options)
+      .find((node) => node.id === 'image-1')
+
+    expect(imageFlowNode?.data).toMatchObject({
+      statusLabel: '待采用',
+      summary: '已生成，尚未设为默认',
+    })
+    expect(imageFlowNode?.data).not.toHaveProperty('previewUrl')
+    expect(imageFlowNode?.data).not.toHaveProperty('adoptedAssetId')
+  })
+
+  test('Given 生图节点已有正式采用素材和成功候选 When 投影 Then 正式素材状态保持优先', () => {
+    const options = {
+      nodeIssues: [],
+      runningSessionIds: new Set<string>(),
+      imageCandidateNodeIds: new Set(['image-1']),
+      canCreateChild: false,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
+    }
+
+    const imageFlowNode = toNativeCanvasFlowNodes(createDocument(), options)
+      .find((node) => node.id === 'image-1')
+
+    expect(imageFlowNode?.data).toMatchObject({
+      adoptedAssetId: 'asset-1',
+      statusLabel: '已有素材',
+      summary: '已采用画布素材',
+    })
+  })
+
   test('Given WebView 设备预设 When 计算节点几何 Then 返回稳定网页与手机卡片尺寸', () => {
     expect(resolveNativeCanvasNodeSize({ kind: 'webview', devicePreset: 'desktop' }))
       .toEqual({ width: 384, height: 316 })

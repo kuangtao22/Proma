@@ -5,6 +5,7 @@ import type { AgentSessionMeta, CanvasDocument, CanvasNode, SDKMessage } from '@
 import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 import {
   createCanvasAgentOutputService,
+  inspectCanvasAgentOutputRecovery,
   type CanvasAgentCompletionInput,
   type CanvasAgentOutputServiceDependencies,
 } from './canvas-agent-output-service'
@@ -18,6 +19,21 @@ const anchorUuid = '123e4567-e89b-42d3-a456-426614174099'
 /** replacement session 使用独立锚点和回复，证明不会复用旧会话 run。 */
 const replacementAnchorUuid = '123e4567-e89b-42d3-a456-426614174095'
 const replacementMessageUuid = '123e4567-e89b-42d3-a456-426614174094'
+
+test('Given 原运行工具结果和后续用户消息 When 恢复输出 Then 工具结果不切分运行且后续正式输出要求重规划', () => {
+  /** 工具结果沿用 SDK 的 user envelope，但不是新用户请求。 */
+  const toolResult = { type: 'user', uuid: 'tool-result', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'done' }] } } as unknown as SDKMessage
+  const pointer = { messageUuid: firstUuid, completedAt: 30, contentSha256: createHash('sha256').update('原正文').digest('hex') }
+  const messages = [user(anchorUuid), toolResult, assistant(firstUuid, [{ type: 'text', text: '原正文' }])]
+  expect(inspectCanvasAgentOutputRecovery(messages, anchorUuid, 20, pointer)).toEqual({ status: 'completed', latestRun: true })
+  messages.push(user(replacementAnchorUuid), assistant(lastUuid, [{ type: 'text', text: '新正文' }]))
+  expect(inspectCanvasAgentOutputRecovery(messages, anchorUuid, 20, pointer)).toEqual({ status: 'completed', latestRun: false })
+  expect(inspectCanvasAgentOutputRecovery(messages, anchorUuid, 20, {
+    messageUuid: lastUuid, completedAt: 50, contentSha256: createHash('sha256').update('新正文').digest('hex'),
+  })).toEqual({ status: 'changed', latestRun: false })
+  expect(inspectCanvasAgentOutputRecovery(messages, anchorUuid, 20)).toEqual({ status: 'missing', latestRun: false })
+  expect(() => inspectCanvasAgentOutputRecovery([...messages, user(anchorUuid)], anchorUuid, 20, pointer)).toThrow('CANVAS_AGENT_OUTPUT_INVALID')
+})
 
 /** 创建完整 Canvas 内部会话归属。 */
 function createSession(overrides: Partial<AgentSessionMeta> = {}): AgentSessionMeta {

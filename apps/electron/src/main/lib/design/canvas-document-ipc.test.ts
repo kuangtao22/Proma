@@ -14,6 +14,7 @@ import type {
   CanvasWorkspaceSnapshot,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
+  CanvasImageJobActivity,
   CanvasImageCandidateBatch,
   CanvasImageTarget,
   CanvasWebviewSnapshot,
@@ -33,7 +34,9 @@ import type { CanvasBatchPublication } from './canvas-agent-batch-operation'
 import { createCanvasOperationSerializer, getCanvasToolProviderRuntime, registerCanvasDocumentIpcHandlers } from './canvas-document-ipc'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasImageRunService } from './canvas-image-run-service'
+import type { CanvasImageCandidateAdoptionReconciliation } from './canvas-image-candidate-batch-service'
 import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
+import type { CanvasTaskOperationService } from './canvas-task-operation-service'
 import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   IMAGE_ARTIFACT_DESCRIPTOR,
@@ -207,6 +210,8 @@ function createContext(options: {
   authorized?: TestWebContents[]
   readOnlyReason?: string
   loadResult?: CanvasWorkspaceSnapshot
+  /** 可选纯读入口；缺失时验证旧 Store mock 仍回退 load。 */
+  readSnapshot?: (target: CanvasTarget) => CanvasWorkspaceSnapshot
   mutateResult?: CanvasDocument
   guardError?: Error
   loadError?: Error
@@ -246,6 +251,7 @@ function createContext(options: {
     internalInvalidRuns: Array<{ sessionId: string; startedAt: number; valid: false }>
   }
   contentOperationError?: Error
+  contentLoadError?: Error
   contentOperationPublication?: CanvasDocument
   contentReconciliationPublication?: CanvasDocument
   contentResultFactory?: (selectedNodeId?: string) => CanvasNodeLifecycleResult
@@ -260,6 +266,8 @@ function createContext(options: {
   webviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
   imageSave?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   imageJobsList?: (projectId: string) => DesignJobRecord[]
+  /** 窄活动快照模拟真实 Manager 索引，读取不能触发事务恢复。 */
+  imageActivity?: (target: CanvasTarget, options?: { resync?: boolean }) => CanvasImageJobActivity[]
   imageTargetAssert?: (projectId: string, target: Omit<CanvasImageTarget, 'projectId'>) => Promise<void>
   imagePreflight?: (input: CreateDesignJobInput) => Promise<void>
   imageCreateOnce?: (input: CreateDesignJobInput, jobId: string) => Promise<{ job: DesignJobRecord; created: boolean }>
@@ -274,6 +282,7 @@ function createContext(options: {
   imageCandidateAdoptExisting?: (
     input: import('./canvas-image-candidate-batch-service').AdoptExistingCanvasImageAssetInput,
   ) => Promise<CanvasImageCandidateBatch>
+  imageCandidateReconcile?: (target: CanvasTarget) => Promise<CanvasImageCandidateAdoptionReconciliation>
   imageExport?: (projectId: string, assetId: string, targetPath: string) => Promise<void>
   imageThumbnail?: (projectId: string, assetId: string) => { bytes: Buffer; mediaType: DesignAsset['mediaType'] }
   pickArtifactExportPath?: () => Promise<string | null>
@@ -281,8 +290,14 @@ function createContext(options: {
   batchReconcileError?: Error
   batchPublications?: CanvasBatchPublication[]
   enableToolProviderRuntime?: boolean
+  /** 测试新任务入口是否调用唯一领域服务。 */
+  taskOperations?: CanvasTaskOperationService
+  /** 精确单项与批量导出使用同一实例。 */
+  artifactExport?: import('./canvas-artifact-export-service').CanvasArtifactExportService
   imageRunService?: CanvasImageRunService
-  workflowExecution?: Pick<CanvasWorkflowExecutionService, 'execute'>
+  workflowExecution?: Pick<CanvasWorkflowExecutionService, 'execute'> & Partial<Omit<CanvasWorkflowExecutionService, 'execute'>>
+  /** 工作流 UI 只允许当前真实会话，不能借用运行记录中的 owner。 */
+  resolveWorkflowUiContext?: import('./canvas-document-ipc').CanvasDocumentIpcOptions['resolveWorkflowUiContext']
   agentOutput?: (target: CanvasAgentTarget) => Promise<string>
 } = {}) {
   /** 当前注册的 invoke handler。 */
@@ -382,6 +397,7 @@ function createContext(options: {
       }
     },
     adopt: async (input: import('@proma/shared').AdoptCanvasTextArtifactRevisionInput) => {
+      if (options.loadResult && options.loadResult.document.revision !== input.expectedCanvasRevision) throw new Error('CANVAS_REVISION_CONFLICT')
       calls.push('artifact:adopt')
       /** 测试采用沿用 update 的权威结果结构。 */
       const nestedCallIndex = calls.length
@@ -425,6 +441,13 @@ function createContext(options: {
     },
     store: {
       loadWithDirectoryCapability: () => { throw new Error('测试未配置目录读取') },
+      ...(options.readSnapshot ? {
+        readSnapshot: (target: CanvasTarget) => {
+          calls.push('store:read-snapshot')
+          storeInputs.push(target)
+          return options.readSnapshot!(target)
+        },
+      } : {}),
       load: (target) => {
         calls.push('store:load')
         storeInputs.push(target)
@@ -466,6 +489,7 @@ function createContext(options: {
       },
     },
     ...(options.enableToolProviderRuntime ? { toolAccess: createToolAccess() } : {}),
+    ...(options.taskOperations ? { taskOperations: options.taskOperations } : {}),
     artifacts: {
       create: async (input) => {
         artifactCalls.push(structuredClone(input))
@@ -572,7 +596,9 @@ function createContext(options: {
           },
         }
       },
-      rebuildReconciled: async (input) => {
+      rebuildReconciled: async (input, validateNewOperation) => {
+        validateNewOperation?.(options.reconcileResult?.snapshot ?? options.loadResult
+          ?? { document: createDocument(4), writable: true, nodeIssues: [] })
         calls.push('creation:rebuild')
         storeInputs.push(input)
         if (options.rebuildError) throw options.rebuildError
@@ -599,6 +625,7 @@ function createContext(options: {
     contentLifecycle: {
       load: async () => {
         calls.push('content:load')
+        if (options.contentLoadError) throw options.contentLoadError
         return { snapshot: options.loadResult ?? { document: createDocument(4), writable: true as const, nodeIssues: [] }, documentChanged: false }
       },
       createReconciled: async (input) => {
@@ -663,6 +690,7 @@ function createContext(options: {
       },
     },
     imageJobs: {
+      ...(options.imageActivity ? { listCanvasImageActivity: options.imageActivity } : {}),
       preflightCanvasImage: async (input) => {
         imageCalls.push({ type: 'preflight', value: input })
         await options.imagePreflight?.(input)
@@ -727,6 +755,10 @@ function createContext(options: {
       },
     },
     imageCandidateBatches: {
+      reconcileLocked: async (target) => {
+        calls.push('image-adoption:reconcile')
+        return options.imageCandidateReconcile?.(target) ?? { publications: [] }
+      },
       createBatchLocked: async (input) => {
         imageCalls.push({ type: 'candidate-create', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
@@ -751,7 +783,8 @@ function createContext(options: {
           ?? options.imageCandidateBatch
           ?? createImageCandidateBatch(input.batchId)
       },
-      adopt: async (input) => {
+      adopt: async (input, execution) => {
+        execution?.validateAccess()
         imageCalls.push({ type: 'candidate-adopt', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
@@ -762,6 +795,8 @@ function createContext(options: {
     },
     ...(options.imageRunService ? { imageRunService: options.imageRunService } : {}),
     ...(options.workflowExecution ? { workflowExecution: options.workflowExecution } : {}),
+    ...(options.artifactExport ? { artifactExport: options.artifactExport } : {}),
+    ...(options.resolveWorkflowUiContext ? { resolveWorkflowUiContext: options.resolveWorkflowUiContext } : {}),
     imageAssets: {
       list: () => options.imageAssets ?? [createImageAsset('asset-a', 'job-a')],
       readStoredThumbnail: (projectId, assetId) => options.imageThumbnail?.(projectId, assetId) ?? {
@@ -1061,7 +1096,7 @@ describe('原生 Canvas 文档 IPC', () => {
       projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [],
     })
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile', 'batch:reconcile', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
       'store:mutate-batch',
     ])
@@ -1092,7 +1127,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.calls).toEqual([
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'content:create',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:create',
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'creation:rebuild',
+      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile', 'readonly:project-1', 'creation:rebuild',
     ])
   })
 
@@ -2434,9 +2469,206 @@ describe('原生 Canvas 文档 IPC', () => {
     const context = createContext()
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, { projectId: 'project-1', canvasId: 'canvas-1' })
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile', 'batch:reconcile', 'content:load', 'creation:reconcile',
     ])
   })
+
+  test('Given LOAD 恢复未完成图片采用 When 串行器与 lease 释放 Then 广播权威图和模块并返回最终快照', async () => {
+    const recoveredDocument = createDocument(5)
+    const secondTarget: CanvasImageTarget = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-image-2', imageModuleId: 'module-image-2',
+    }
+    let reconcileCount = 0
+    const context = createContext({
+      reconcileResult: {
+        snapshot: { document: recoveredDocument, writable: true, nodeIssues: [] },
+        documentChanged: false,
+      },
+      imageCandidateReconcile: async () => {
+        reconcileCount += 1
+        return reconcileCount === 1
+          ? { publications: [{ document: recoveredDocument, imageTargets: [imageTargetA, secondTarget] }] }
+          : { publications: [] }
+      },
+    })
+
+    const first = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    }) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+    const second = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    }) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+
+    expect(first).toMatchObject({ ok: true, value: { document: { revision: 5 } } })
+    expect(second).toMatchObject({ ok: true, value: { document: { revision: 5 } } })
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'recovery' },
+      },
+      { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: imageTargetA },
+      { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: secondTarget },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false, false])
+  })
+
+  test('Given LOAD 先恢复一项后遇到不可证明漂移 When 恢复 Then 发布可信事实并稳定拒绝后续图事务', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const recoveredDocument = createDocument(5)
+    const context = createContext({
+      imageCandidateReconcile: async () => ({
+        publications: [{ document: recoveredDocument, imageTargets: [imageTargetA] }],
+        error: new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED'),
+      }),
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED',
+        message: '图片版本采用状态无法安全恢复，请保留当前数据并重试。',
+      },
+    })
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile',
+    ])
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'recovery' },
+      },
+      { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: imageTargetA },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false])
+    errorSpy.mockRestore()
+  })
+
+  test('Given LOAD 图片恢复成功且 batch 恢复携带 publication 后失败 When 锁释放 Then 两类事实均发布再返回失败', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const imageDocument = createDocument(5)
+    const batchDocument = createDocument(6)
+    const batchPublication: CanvasBatchPublication = {
+      document: batchDocument,
+      source: { sessionId: 'source-session', runStartedAt: 99, toolCallId: 'source-tool' },
+    }
+    const batchError = Object.assign(new Error('CANVAS_BATCH_RECOVERY_REQUIRED'), {
+      name: 'CanvasBatchReconciliationError',
+      causeError: new Error('CANVAS_BATCH_RECOVERY_REQUIRED'),
+      publications: [batchPublication],
+    })
+    const context = createContext({
+      imageCandidateReconcile: async () => ({
+        publications: [{ document: imageDocument, imageTargets: [imageTargetA] }],
+      }),
+      batchReconcileError: batchError,
+    })
+
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+    })
+    expect(context.calls).toEqual([
+      'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile', 'batch:reconcile',
+    ])
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'recovery' },
+      },
+      { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: imageTargetA },
+      {
+        channel: CANVAS_IPC_CHANNELS.CHANGED,
+        value: {
+          projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph',
+          source: batchPublication.source,
+        },
+      },
+    ])
+    expect(context.broadcastLeaseStates).toEqual([false, false, false])
+    errorSpy.mockRestore()
+  })
+
+  test.each([
+    [CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT, { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', kind: 'document', contentId: 'content-1', contentRevision: 1 }],
+    [CANVAS_IPC_CHANNELS.LIST_TRASH, { projectId: 'project-1', canvasId: 'canvas-1' }],
+    [CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, { projectId: 'project-1', canvasId: 'canvas-1', expectedRevision: 4, mutations: [] }],
+    [CANVAS_IPC_CHANNELS.REBUILD_AGENT_NODE, { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', operationId: '11111111-1111-4111-8111-111111111111' }],
+  ] as const)('Given 批恢复已提交后归档失败 When %s 进入对账 Then 锁外发布原图事实再报错', async (channel, input) => {
+    /** 归档异常携带已经提交的事实，任意入口都必须保留。 */
+    const publication: CanvasBatchPublication = {
+      document: createDocument(6),
+      source: { sessionId: 'source-session', runStartedAt: 99, toolCallId: 'source-tool' },
+    }
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const context = createContext({ batchReconcileError: Object.assign(new Error('CANVAS_BATCH_RECOVERY_REQUIRED'), {
+      name: 'CanvasBatchReconciliationError', causeError: new Error('CANVAS_BATCH_RECOVERY_REQUIRED'), publications: [publication],
+    }) })
+    try {
+      expect(await invoke(context.handlers, channel, context.sender, input)).toMatchObject({ ok: false })
+      expect(context.sender.sent).toEqual([{ channel: CANVAS_IPC_CHANNELS.CHANGED, value: {
+        projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph', source: publication.source,
+      } }])
+      expect(context.broadcastLeaseStates).toEqual([false])
+    } finally { errorSpy.mockRestore(); context.registration.dispose() }
+  })
+
+  test.each(['content', 'creation'] as const)(
+    'Given LOAD 图片与 batch 已恢复 When %s 直接失败 Then 已知提交事实仍在锁外发布',
+    async (failureStage) => {
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+      const imageDocument = createDocument(5)
+      const batchPublication: CanvasBatchPublication = {
+        document: createDocument(6),
+        source: { sessionId: 'source-session', runStartedAt: 99, toolCallId: 'source-tool' },
+      }
+      const context = createContext({
+        imageCandidateReconcile: async () => ({
+          publications: [{ document: imageDocument, imageTargets: [imageTargetA] }],
+        }),
+        batchPublications: [batchPublication],
+        ...(failureStage === 'content'
+          ? { contentLoadError: new Error('内容恢复失败') }
+          : { reconcileError: new Error('Agent 创建恢复失败') }),
+      })
+
+      const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.LOAD, context.sender, {
+        projectId: 'project-1', canvasId: 'canvas-1',
+      }) as CanvasInvokeResult<CanvasWorkspaceSnapshot>
+
+      expect(result).toEqual({
+        ok: false,
+        error: { code: 'CANVAS_LOAD_FAILED', message: '画布暂时无法加载。' },
+      })
+      expect(context.sender.sent).toEqual([
+        {
+          channel: CANVAS_IPC_CHANNELS.CHANGED,
+          value: { projectId: 'project-1', canvasId: 'canvas-1', revision: 5, cause: 'recovery' },
+        },
+        { channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, value: imageTargetA },
+        {
+          channel: CANVAS_IPC_CHANNELS.CHANGED,
+          value: {
+            projectId: 'project-1', canvasId: 'canvas-1', revision: 6, cause: 'graph',
+            source: batchPublication.source,
+          },
+        },
+      ])
+      expect(context.broadcastLeaseStates).toEqual([false, false, false])
+      expect(context.calls).toEqual([
+        'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile', 'batch:reconcile',
+        'content:load', ...(failureStage === 'creation' ? ['creation:reconcile'] : []),
+      ])
+      errorSpy.mockRestore()
+    },
+  )
 
   test('Given schema v1 文档已规范化 When 经 IPC 加载并执行下一次写入 Then 公开文档始终为 v4', async () => {
     /** 迁移解析与 IPC 调用共享的稳定双身份。 */
@@ -2662,6 +2894,7 @@ describe('原生 Canvas 文档 IPC', () => {
       'guard:project-1',
       'batch:reconcile',
       'creation:reconcile',
+      'readonly:project-1',
       'creation:rebuild',
     ])
     expect(context.storeInputs.at(-1)).toEqual(input)
@@ -2914,7 +3147,7 @@ describe('原生 Canvas 文档 IPC', () => {
     await invoke(context.handlers, CANVAS_IPC_CHANNELS.SAVE_MUTATIONS, context.sender, saveInput)
 
     expect(context.calls).toEqual([
-      'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'content:load', 'creation:reconcile',
+      'readonly:project-1', 'guard:project-1', 'image-adoption:reconcile', 'batch:reconcile', 'content:load', 'creation:reconcile',
       'readonly:project-1', 'guard:project-1', 'batch:reconcile', 'creation:reconcile',
       'store:mutate-batch',
     ])
@@ -3433,6 +3666,11 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
+      CANVAS_IPC_CHANNELS.LIST_WORKFLOW_RUNS,
+      CANVAS_IPC_CHANNELS.GET_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.CANCEL_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY,
     ])
     context.removed.length = 0
 
@@ -3470,6 +3708,11 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
+      CANVAS_IPC_CHANNELS.LIST_WORKFLOW_RUNS,
+      CANVAS_IPC_CHANNELS.GET_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.CANCEL_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY,
     ])
   })
 
@@ -3657,6 +3900,7 @@ describe('原生 Canvas 文档 IPC', () => {
         adoptOutput: async () => undefined,
       },
       imageCandidateBatches: {
+        reconcileLocked: async () => ({ publications: [] }),
         createBatchLocked: async (input: import('./canvas-image-candidate-batch-service').CreateCanvasImageCandidateBatchInput) => createImageCandidateBatch(input.batchId),
         listActiveSummaries: async () => [],
         load: async (input: CanvasTarget & { batchId: string }) => createImageCandidateBatch(input.batchId),
@@ -3753,10 +3997,265 @@ describe('原生 Canvas 文档 IPC', () => {
       CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES,
       CANVAS_IPC_CHANNELS.SEND_AGENT_MESSAGE,
       CANVAS_IPC_CHANNELS.STOP_AGENT,
+      CANVAS_IPC_CHANNELS.LIST_WORKFLOW_RUNS,
+      CANVAS_IPC_CHANNELS.GET_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.CANCEL_WORKFLOW_RUN,
+      CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY,
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(30)
+    expect(removed).toHaveLength(35)
+  })
+
+  test('Given 生产任务服务已装配 When Agent 查询和停止 Then 权威解析模块身份并复用同一服务', async () => {
+    /** 模型只提供节点与任务，imageModuleId 从文档解析。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: imageTargetA.nodeId, kind: 'image', title: '主视觉', position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId }]
+    const calls: unknown[] = []
+    const taskOperations: CanvasTaskOperationService = {
+      getTaskLocked: async (input) => {
+        calls.push(input)
+        return { jobId: input.jobId, creativeTaskId: 'creative-1', attemptNumber: 1, status: 'running', traceState: 'unavailable', attempts: [], attemptsTruncated: false }
+      },
+      cancelTaskLocked: async (input) => {
+        calls.push(input)
+        return { jobId: input.jobId, status: 'cancelled', stopRequested: true, remoteCancellation: 'unconfirmed' }
+      },
+      retryTaskLocked: async () => { throw new Error('测试不应重试') },
+    }
+    const context = createContext({ enableToolProviderRuntime: true, taskOperations, loadResult: { document, writable: true, nodeIssues: [] } })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const query = run.piCustomTools.find((tool) => tool.name === 'canvas_get_task')
+      expect(query).toBeDefined()
+      await query!.execute('get-1', { canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, jobId: 'job-a' } as never, undefined as never, undefined as never, undefined as never)
+      const cancel = run.piCustomTools.find((tool) => tool.name === 'canvas_cancel_task')!
+      const result = await cancel.execute('stop-1', { canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, jobId: 'job-a', intent: 'explicit' } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ status: 'cancelled', remoteCancellation: 'unconfirmed' })
+      expect(calls).toEqual([{ ...imageTargetA, jobId: 'job-a' }, { ...imageTargetA, jobId: 'job-a' }])
+      await invoke(context.handlers, CANVAS_IPC_CHANNELS.CANCEL_IMAGE_JOB, context.sender, { ...imageTargetA, jobId: 'job-a' })
+      expect(calls).toHaveLength(3)
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given 活动索引含旧节点或旧模块 When 读取画布活动 Then 只返回当前图身份且不进行生命周期对账', async () => {
+    /** 索引允许保留历史目标，IPC 必须按当前图过滤失效身份。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: imageTargetA.nodeId, kind: 'image', title: '主视觉', position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId }]
+    const activity: CanvasImageJobActivity = { id: 'job-current', projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, imageModuleId: imageTargetA.imageModuleId },
+      status: 'running', createdAt: 1, updatedAt: 2 }
+    const context = createContext({ loadResult: { document, writable: true, nodeIssues: [] }, imageActivity: (target, options) => {
+      expect(target).toMatchObject({ projectId: 'project-1', canvasId: 'canvas-1' })
+      expect(options).toEqual({ resync: true })
+      return [activity, { ...activity, id: 'job-deleted', target: { ...activity.target, nodeId: 'removed' } },
+        { ...activity, id: 'job-rebound', target: { ...activity.target, imageModuleId: 'old-module' } }]
+    } })
+    expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', resync: true,
+    })).toEqual({ ok: true, value: [activity] })
+    expect(context.calls).not.toContain('batch:reconcile')
+    expect(context.calls).not.toContain('creation:reconcile')
+    context.registration.dispose()
+  })
+
+  test('Given 项目只读 When 读取画布活动 Then 仍返回纯读任务摘要', async () => {
+    const document = createDocument(4)
+    document.nodes = [{ id: imageTargetA.nodeId, kind: 'image', title: '主视觉', position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId }]
+    const activity: CanvasImageJobActivity = { id: 'job-current', projectId: 'project-1',
+      target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, imageModuleId: imageTargetA.imageModuleId },
+      status: 'running', createdAt: 1, updatedAt: 2 }
+    const context = createContext({
+      readOnlyReason: '项目只读',
+      loadError: new Error('纯读活动不应调用可恢复 LOAD'),
+      readSnapshot: () => ({ document, writable: true, nodeIssues: [] }),
+      imageActivity: () => [activity],
+    })
+
+    expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toEqual({ ok: true, value: [activity] })
+    expect(context.calls).not.toContain('readonly:project-1')
+    expect(context.calls).toContain('store:read-snapshot')
+    expect(context.calls).not.toContain('store:load')
+    context.registration.dispose()
+  })
+
+  test('Given Canvas 仅有恢复候选 When 读取画布活动 Then 保留恢复并不读取任务索引', async () => {
+    let activityReads = 0
+    const context = createContext({
+      readSnapshot: () => { throw new Error('CANVAS_RECOVERY_REQUIRED: recoveredFrom=tmp') },
+      imageActivity: () => {
+        activityReads += 1
+        return []
+      },
+    })
+
+    expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_IMAGE_LOAD_FAILED', message: '生图节点暂时无法加载。' },
+    })
+    expect(activityReads).toBe(0)
+    expect(context.calls).toContain('store:read-snapshot')
+    expect(context.calls).not.toContain('store:load')
+    context.registration.dispose()
+  })
+
+  test('Given 超过一百个历史图片版本 When Agent 翻页并采用最旧版本 Then 精确查询任务且不被 UI 列表截断', async () => {
+    /** 不同创建时间保证第 121 个版本始终落在 UI 最近 100 条之外。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: imageTargetA.nodeId, kind: 'image', title: '主视觉', position: { x: 0, y: 0 }, imageModuleId: imageTargetA.imageModuleId }]
+    const jobs = Array.from({ length: 121 }, (_, index) => createImageJob(imageTargetA, `job-${index}`, `asset-${index}`))
+    const assets = jobs.map((job, index) => ({ ...createImageAsset(job.outputAssetId!, job.id), createdAt: index + 1 }))
+    let config = createImageConfig(imageTargetA)
+    const context = createContext({ enableToolProviderRuntime: true, imageJobs: jobs, imageAssets: assets,
+      loadResult: { document, writable: true, nodeIssues: [] }, imageLoad: async () => config,
+      imageCandidateAdoptExisting: async (input) => {
+        config = { ...config, revision: config.revision + 1, adoptedAssetId: input.assetId }
+        return createImageCandidateBatch(input.batchId)
+      },
+    })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const list = run.piCustomTools.find((tool) => tool.name === 'canvas_list_versions')!
+      let cursor: string | undefined
+      const seen: string[] = []
+      do {
+        const result = await list.execute('history-list', { canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, limit: 50,
+          ...(cursor ? { cursor } : {}) } as never, undefined as never, undefined as never, undefined as never)
+        const page = result.details as { versions: Array<{ version: { jobId: string } }>; nextCursor: string | null; total: number }
+        expect(page.total).toBe(121)
+        seen.push(...page.versions.map((entry) => entry.version.jobId))
+        cursor = page.nextCursor ?? undefined
+      } while (cursor)
+      expect(seen).toHaveLength(121)
+      expect(seen.at(-1)).toBe('job-0')
+      const adopt = run.piCustomTools.find((tool) => tool.name === 'canvas_adopt_version')!
+      const result = await adopt.execute('history-adopt', { canvasId: 'canvas-1', nodeId: imageTargetA.nodeId,
+        version: { kind: 'image', jobId: 'job-0' }, expectedVersion: 3, expectedCanvasRevision: 4, intent: 'explicit',
+      } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ adopted: true, currentVersion: 4 })
+      expect(config.adoptedAssetId).toBe('asset-0')
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given 普通 Agent 明确整批采用 When 生产工具执行 Then 复用已有批次模式并不自动续跑', async () => {
+    const batch = createImageCandidateBatch('batch-1')
+    batch.status = 'adopted'
+    batch.adoption = { mode: 'all', adoptedNodeIds: [imageTargetA.nodeId], keptNodeIds: [], invalidatedDownstreamNodeIds: [], committedAt: 3 }
+    const context = createContext({ enableToolProviderRuntime: true, imageCandidateBatch: batch })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_adopt_candidate_batch')!
+      const result = await tool.execute('adopt-batch-1', { canvasId: 'canvas-1', batchId: 'batch-1', mode: 'all', intent: 'explicit' } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ status: 'adopted', continued: false, adoption: { adoptedNodeIds: [imageTargetA.nodeId] } })
+      expect(context.imageCalls).toContainEqual({ type: 'candidate-adopt', value: { projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1', mode: 'all' } })
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given 单项与批量导出请求 When Agent 经生产入口执行 Then 各自调用唯一领域服务', async () => {
+    /** 同一工具根据严格输入形态分派，不将批量请求误发到单项服务。 */
+    const calls: string[] = []
+    const context = createContext({ enableToolProviderRuntime: true, artifactExport: {
+      export: async (_input, execution) => { execution.validateAccess(); calls.push('single'); return { status: 'cancelled' } },
+      exportBatch: async (_input, execution) => { execution.validateAccess(); calls.push('batch'); return { status: 'cancelled', files: [] } },
+    } })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_export_artifact')!
+      const version = { kind: 'document', revision: 1 }
+      for (const input of [
+        { canvasId: 'canvas-1', nodeId: 'doc-1', version, intent: 'explicit' },
+        { canvasId: 'canvas-1', items: [{ nodeId: 'doc-1', version }], intent: 'explicit' },
+      ]) await tool.execute('export-test', input as never, undefined as never, undefined as never, undefined as never)
+      expect(calls).toEqual(['single', 'batch'])
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given 生产运行含历史正文 When Agent 列出并读取指定版本 Then 返回准确版本而不采用', async () => {
+    /** 历史正文与当前图采用版本不同，必须保持只读。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 }]
+    const context = createContext({ enableToolProviderRuntime: true, loadResult: { document, writable: true, nodeIssues: [] } })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const list = run.piCustomTools.find((tool) => tool.name === 'canvas_list_versions')
+      expect(list).toBeDefined()
+      const versions = await list!.execute('list-1', { canvasId: 'canvas-1', nodeId: 'doc-1' } as never, undefined as never, undefined as never, undefined as never)
+      expect(versions.details).toMatchObject({ versions: [{ version: { kind: 'document', revision: 1 }, adopted: false }], currentVersion: 2 })
+      const read = run.piCustomTools.find((tool) => tool.name === 'canvas_read_version')!
+      const result = await read.execute('read-1', { canvasId: 'canvas-1', nodeId: 'doc-1', version: { kind: 'document', revision: 1 } } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ version: { kind: 'document', revision: 1 }, content: '<main>首页</main>' })
+      expect(context.calls).not.toContain('artifact:adopt')
+      expect(JSON.stringify(versions.details)).not.toContain('content-1')
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given 生产图正文基线已经变化 When Agent 采用历史版本 Then 在正文服务前拒绝', async () => {
+    const document = createDocument(4)
+    document.nodes = [{ id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 2 }]
+    const context = createContext({ enableToolProviderRuntime: true, loadResult: { document, writable: true, nodeIssues: [] } })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_adopt_version')
+      expect(tool).toBeDefined()
+      await expect(tool!.execute('adopt-1', {
+        canvasId: 'canvas-1', nodeId: 'doc-1', expectedCanvasRevision: 3,
+        expectedVersion: 2, version: { kind: 'document', revision: 1 }, intent: 'explicit',
+      } as never, undefined as never, undefined as never, undefined as never)).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+      expect(context.calls).not.toContain('artifact:adopt')
+    } finally { context.registration.dispose() }
+  })
+
+  test('Given Agent 重建入口 When 节点正常、损坏或忙碌 Then 只重建已诊断且空闲的节点', async () => {
+    for (const state of ['healthy', 'broken', 'busy'] as const) {
+      /** 同一目标只改变诊断和运行态，验证操作不会误换绑正常节点。 */
+      const document = createDocument(4)
+      document.nodes = [{ id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 }, agentSessionId: '22222222-2222-4222-8222-222222222222' }]
+      const snapshot: CanvasWorkspaceSnapshot = { document, writable: true, nodeIssues: state === 'healthy' ? [] : [{ nodeId: 'node-1', code: 'AGENT_SESSION_UNAVAILABLE', allowedActions: ['rebuild-agent-session', 'remove-node'] }] }
+      const context = createContext({ enableToolProviderRuntime: true, loadResult: snapshot,
+        ...(state === 'busy' ? { activeRunSnapshot: { owners: [{ sessionId: '22222222-2222-4222-8222-222222222222', projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', title: '首页 Agent' }], internalInvalidRuns: [] } } : {}),
+      })
+      try {
+        const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+        const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_rebuild_agent')
+        expect(tool).toBeDefined()
+        const execution = tool!.execute('rebuild-1', { canvasId: 'canvas-1', nodeId: 'node-1', expectedRevision: 4, intent: 'explicit' } as never, undefined as never, undefined as never, undefined as never)
+        if (state === 'broken') {
+          expect((await execution).details).toMatchObject({ nodeId: 'node-1', rebuilt: true, revision: 5 })
+          expect(context.calls).toContain('creation:rebuild')
+          expect(context.broadcastLeaseStates.every((held) => !held)).toBe(true)
+        } else {
+          await expect(execution).rejects.toThrow(state === 'healthy' ? 'CANVAS_AGENT_REBUILD_NOT_REQUIRED' : 'AGENT_SESSION_BUSY')
+          expect(context.calls).not.toContain('creation:rebuild')
+        }
+      } finally { context.registration.dispose() }
+    }
+  })
+
+  test('Given 生产回收区入口 When Agent 查询 Then 复用内容生命周期且不暴露内部素材身份', async () => {
+    const context = createContext({ enableToolProviderRuntime: true })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_list_trash')
+      expect(tool).toBeDefined()
+      const result = await tool!.execute('trash-1', { canvasId: 'canvas-1' } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ entries: [], nextCursor: null })
+      expect(context.calls).toContain('content:list-trash')
+      expect(context.broadcastLeaseStates.every((held) => !held)).toBe(true)
+    } finally { context.registration.dispose() }
   })
 
   test('Given 生产 Canvas Tool Provider runtime When Agent 创建 WebView 产物 Then 调用注入的原子产物服务', async () => {
@@ -3819,6 +4318,41 @@ describe('原生 Canvas 文档 IPC', () => {
     } finally {
       context.registration.dispose()
     }
+  })
+
+  test('Given 持久工作流已接入 When UI 和下一轮 Agent 继续 Then 使用当前授权会话和同一服务', async () => {
+    /** UI 与 Agent 必须只传当前调用身份，不从历史 run 借用 owner。 */
+    const calls: Array<{ sessionId: string; runStartedAt: number; runId?: string }> = []
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      resolveWorkflowUiContext: (input) => {
+        if (input.sessionId !== 'agent-session-1') throw new Error('CANVAS_AGENT_ACCESS_DENIED')
+        return { projectId: input.projectId, sessionId: input.sessionId, runStartedAt: 200, explicitReferences: [], permissionCeiling: 'execute' }
+      },
+      workflowExecution: {
+        execute: async () => { throw new Error('不得新建工作流') },
+        list: async (current) => { calls.push(current); return { runs: [], nextCursor: null } },
+        get: async () => { throw new Error('未请求详情') },
+        cancel: async () => { throw new Error('未请求停止') },
+        resume: async (current, input) => {
+          calls.push({ sessionId: current.sessionId, runStartedAt: current.runStartedAt, runId: input.runId })
+          return { runId: input.runId, status: 'completed', initialRevision: 4, finalRevision: 5, nodes: [], imageSummary: null, requiresReview: false, errorCode: null }
+        },
+      },
+    })
+    try {
+      const target = { projectId: 'project-1', canvasId: 'canvas-1', sessionId: 'agent-session-1', runId: 'a'.repeat(48) }
+      expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN, context.sender, target)).toMatchObject({ ok: true, value: { runId: target.runId } })
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 300, explicitReferences: [], permissionCeiling: 'execute' })
+      const resume = run.piCustomTools.find((tool) => tool.name === 'canvas_resume_workflow')!
+      expect(resume).toBeDefined()
+      expect((await resume.execute('continue-1', { canvasId: 'canvas-1', runId: target.runId, intent: 'explicit' } as never, undefined as never, undefined as never, undefined as never)).details).toMatchObject({ runId: target.runId })
+      expect(calls).toEqual([{ sessionId: 'agent-session-1', runStartedAt: 200, runId: target.runId }, { sessionId: 'agent-session-1', runStartedAt: 300, runId: target.runId }])
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+      try { expect(await invoke(context.handlers, CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN, context.sender, { ...target, sessionId: 'other-session' })).toMatchObject({ ok: false }) }
+      finally { errorSpy.mockRestore() }
+      expect(calls).toHaveLength(2)
+    } finally { context.registration.dispose() }
   })
 
   test('Given 生产 Canvas Tool Provider runtime When 运行工作流 Then 复用 IPC 注册的唯一调度服务实例', async () => {
@@ -4058,6 +4592,66 @@ describe('原生 Canvas 文档 IPC', () => {
         nodeId: 'image-1', contentRevision: 4, requiresRun: true,
       })
       expect(context.imageCalls.map((call) => call.type)).not.toContain('run')
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
+  test('Given 生产 runtime 中候选未采用 When 精确预览任务 Then 只有同节点成功且来源匹配的素材可读', async () => {
+    /** 真实 Registry 需要同时证明节点、任务和素材三方归属。 */
+    const document = createDocument(4)
+    document.nodes = [{
+      id: imageTargetA.nodeId, kind: 'image', title: '候选预览', position: { x: 0, y: 0 },
+      imageModuleId: imageTargetA.imageModuleId,
+    }]
+    const readAssets: string[] = []
+    const context = createContext({
+      enableToolProviderRuntime: true,
+      loadResult: { document, writable: true, nodeIssues: [] },
+      imageConfig: { ...createImageConfig(imageTargetA), adoptedAssetId: null },
+      imageJobs: [
+        createImageJob(imageTargetA, 'job-candidate', 'asset-candidate'),
+        createImageJob(imageTargetB, 'job-foreign', 'asset-foreign'),
+        { ...createImageJob(imageTargetA, 'job-failed', 'asset-failed'), status: 'failed' },
+        createImageJob(imageTargetA, 'job-wrong-source', 'asset-wrong-source'),
+        createImageJob(imageTargetA, 'job-missing', 'asset-missing'),
+      ],
+      imageAssets: [
+        createImageAsset('asset-candidate', 'job-candidate'),
+        createImageAsset('asset-foreign', 'job-foreign'),
+        createImageAsset('asset-failed', 'job-failed'),
+        createImageAsset('asset-wrong-source', 'another-job'),
+      ],
+      imageThumbnail: (_projectId, assetId) => {
+        readAssets.push(assetId)
+        return {
+          bytes: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lwqSmQAAAABJRU5ErkJggg==', 'base64'),
+          mediaType: 'image/png',
+        }
+      },
+    })
+    try {
+      const runtime = getCanvasToolProviderRuntime()!
+      const run = runtime.createRun({
+        projectId: imageTargetA.projectId, sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      const inspect = run.piCustomTools.find((tool) => tool.name === 'canvas_inspect_images')!
+      for (const jobId of ['job-candidate', 'job-foreign', 'job-failed', 'job-wrong-source', 'job-missing']) {
+        const result = await inspect.execute(`inspect-${jobId}`, {
+          canvasId: imageTargetA.canvasId, nodeIds: [imageTargetA.nodeId], expectedRevision: 4,
+          versions: [{ nodeId: imageTargetA.nodeId, jobId }],
+        } as never, undefined as never, undefined as never, undefined as never)
+        expect(result.content.map((block) => block.type)).toEqual(jobId === 'job-candidate'
+          ? ['text', 'image']
+          : ['text'])
+        expect(result.details).toMatchObject({ inspections: [{
+          status: jobId === 'job-candidate' ? 'ready' : 'version-unavailable', jobId,
+        }] })
+      }
+      expect(readAssets).toEqual(['asset-candidate'])
+      expect(context.imageCalls.map((call) => call.type)).not.toContain('adopt-config')
+      expect(context.imageCalls.map((call) => call.type)).not.toContain('start')
     } finally {
       context.registration.dispose()
     }

@@ -39,9 +39,15 @@ import type {
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasTrustedDirectoryCapability } from './canvas-document-store'
 import { isSafeDesignStableId } from './design-paths'
+import {
+  createNativeCanvasTransactionArchive,
+  type CanvasTransactionArchive,
+} from './canvas-transaction-archive'
 
 /** 单个 Canvas 最多保留的 Agent 创建事务，阻断无界目录扫描。 */
 const MAX_AGENT_NODE_INTENTS = 512
+/** 兼容旧版本或外部恢复留下的超额历史，扫描仍保持固定上界。 */
+const MAX_AGENT_NODE_SCAN_ENTRIES = 4096
 /** 单个 intent JSON 的最大字节数。 */
 const MAX_AGENT_NODE_INTENT_BYTES = 64 * 1024
 /** 节点与会话标题的最大长度。 */
@@ -177,6 +183,8 @@ export interface CanvasAgentNodeCreationDependencies {
     intent: CanvasAgentNodeDurableIntent,
     options?: SecureAtomicJsonWriteOptions,
   ) => void | StableDirectoryNativeWriteOutcome | Promise<void | StableDirectoryNativeWriteOutcome>
+  /** 测试注入的终态归档器；生产绑定本次 transactions capability。 */
+  archive?: CanvasTransactionArchive
   /** 测试可替换 native helper，生产使用模块级受限 host。 */
   runStableDirectoryNative?: (
     request: StableDirectoryNativeRequest,
@@ -193,7 +201,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** 已提交图需要发布后再向 IPC 传播的持久性错误。 */
-class CanvasAgentNodePublishedError extends Error {
+export class CanvasAgentNodePublishedError extends Error {
   constructor(readonly causeError: Error, readonly document: CanvasDocument) {
     super(causeError.message)
     this.name = 'CanvasAgentNodePublishedError'
@@ -834,6 +842,31 @@ export class CanvasAgentNodeCreationService {
     return null
   }
 
+  /** 取得测试归档器，或按生产目录 capability 创建精确分片访问。 */
+  private archiveFor(directory: CanvasTrustedDirectoryCapability): CanvasTransactionArchive | null {
+    if (this.dependencies.archive) return this.dependencies.archive
+    if (this.readTransactionsDirectory || this.writeIntentFile) return null
+    return createNativeCanvasTransactionArchive(directory, { run: this.runNative })
+  }
+
+  /** 按 operationId 精确读取已归档创建 tombstone。 */
+  private async loadArchivedCreationIntent(
+    target: CanvasTarget & { operationId: string },
+    directory: CanvasTrustedDirectoryCapability,
+  ): Promise<CanvasAgentNodeCreationIntent | null> {
+    const content = await this.archiveFor(directory)?.load(`agent-node-${target.operationId}.json`)
+    return content ? parseIntentJson(content, target, target.operationId) : null
+  }
+
+  /** 按 operationId 精确读取已归档重建 tombstone。 */
+  private async loadArchivedRebuildIntent(
+    target: CanvasTarget & { operationId: string },
+    directory: CanvasTrustedDirectoryCapability,
+  ): Promise<CanvasAgentNodeRebuildIntent | null> {
+    const content = await this.archiveFor(directory)?.load(`agent-node-rebuild-${target.operationId}.json`)
+    return content ? parseRebuildIntentJson(content, target, target.operationId) : null
+  }
+
   /** 单次扫描目标 Canvas 的有限 transactions 目录并分类两种 intent。 */
   private async readIntents(
     target: CanvasTarget,
@@ -848,10 +881,10 @@ export class CanvasAgentNodeCreationService {
         roots: [directoryIdentity.rootPath],
         childName: 'transactions',
         maxDepth: 0,
-        maxEntries: MAX_AGENT_NODE_INTENTS,
+        maxEntries: MAX_AGENT_NODE_SCAN_ENTRIES,
         maxOutputBytes: 40 * 1024 * 1024,
       }, directoryIdentity.authorizeOpenedRoots)
-      if (result.entries.length > MAX_AGENT_NODE_INTENTS) {
+      if (result.entries.length > MAX_AGENT_NODE_SCAN_ENTRIES) {
         throw new Error('Canvas Agent 创建事务过多，已停止对账')
       }
       for (const entry of result.entries.sort((left, right) => left.name.localeCompare(right.name))) {
@@ -871,7 +904,7 @@ export class CanvasAgentNodeCreationService {
     }
     /** 测试兼容边界仍从 no-follow fd 读取，以覆盖 Node 状态绑定回归。 */
     const entries = this.readTransactionsDirectory(directoryIdentity.path)
-    if (entries.length > MAX_AGENT_NODE_INTENTS) {
+    if (entries.length > MAX_AGENT_NODE_SCAN_ENTRIES) {
       throw new Error('Canvas Agent 创建事务过多，已停止对账')
     }
     /** 文件名排序保证相同事实下的扫描结果稳定。 */
@@ -1273,6 +1306,68 @@ export class CanvasAgentNodeCreationService {
       }
       intents.push(intent)
     }
+    /** 归档后通过当前 sessionId 的精确别名恢复所有权证据，不扫描历史分片。 */
+    const archive = this.archiveFor(identity)
+    for (const node of document.nodes) {
+      if (node.kind !== 'agent' || nodeIssues.some((issue) => issue.nodeId === node.id)) continue
+      const activeCreation = intents.find((intent) => intent.sessionId === node.agentSessionId)
+      const activeRebuild = rebuildIntents.find((intent) => intent.replacementSessionId === node.agentSessionId)
+      let archivedCreation: CanvasAgentNodeCreationIntent | null = null
+      let archivedRebuild: CanvasAgentNodeRebuildIntent | null = null
+      if (!activeCreation && !activeRebuild && archive) {
+        const creationContent = await archive.load(`agent-node-${node.agentSessionId}.json`)
+        if (creationContent) {
+          const value = JSON.parse(creationContent) as unknown
+          if (!isRecord(value) || typeof value.operationId !== 'string') {
+            throw new Error('Canvas Agent 创建事务损坏：schema 字段无效')
+          }
+          archivedCreation = parseIntent(value, target, value.operationId)
+        } else {
+          const rebuildContent = await archive.load(`agent-node-rebuild-${node.agentSessionId}.json`)
+          if (rebuildContent) {
+            const value = JSON.parse(rebuildContent) as unknown
+            if (!isRecord(value) || typeof value.operationId !== 'string') {
+              throw new Error('Canvas Agent 重建事务损坏：schema 字段无效')
+            }
+            archivedRebuild = parseRebuildIntent(value, target, value.operationId)
+          }
+        }
+      }
+      /** 没有事务证据的手工/旧图节点继续交给兼容路径，不凭空标坏。 */
+      if (!activeCreation && !activeRebuild && !archivedCreation && !archivedRebuild) continue
+      const session = this.dependencies.getSession(node.agentSessionId)
+      if (!session
+        || !hasValidCanvasAgentOwnership(session)
+        || session.id !== node.agentSessionId
+        || session.title !== node.title
+        || session.workspaceId !== target.projectId
+        || session.sourceCanvasProjectId !== target.projectId
+        || session.sourceCanvasId !== target.canvasId
+        || session.sourceCanvasNodeId !== node.id) {
+        nodeIssues.push(createUnavailableSessionIssue(node.id))
+      }
+    }
+    if (!reconciliationError) {
+      try {
+        await archive?.archiveEntries([
+          ...intents.map((intent) => ({
+            name: `agent-node-${intent.operationId}.json`,
+            aliases: [
+              ...(intent.state === 'committed' ? [`agent-node-${intent.sessionId}.json`] : []),
+            ],
+            content: `${JSON.stringify(intent, null, 2)}\n`,
+          })),
+          ...rebuildIntents.map((intent) => ({
+            name: `agent-node-rebuild-${intent.operationId}.json`,
+            aliases: [`agent-node-rebuild-${intent.replacementSessionId}.json`],
+            content: `${JSON.stringify(intent, null, 2)}\n`,
+          })),
+        ])
+      } catch (error) {
+        /** 归档属于提交后的整理；失败不能丢失本轮已经形成的图 publication。 */
+        reconciliationError = error instanceof Error ? error : new Error(String(error))
+      }
+    }
     return {
       snapshot: { ...snapshot, document, nodeIssues },
       documentChanged,
@@ -1298,10 +1393,11 @@ export class CanvasAgentNodeCreationService {
   private async rebuildAfterReconciliation(
     input: RebuildCanvasAgentNodeInput,
     reconciled: CanvasAgentNodeReconciledState,
+    validateNewOperation?: (snapshot: CanvasWorkspaceSnapshot) => void,
   ): Promise<CanvasAgentNodeRebuildServiceResult> {
     const existing = reconciled.rebuildIntents.find((intent) => (
       intent.operationId === input.operationId
-    ))
+    )) ?? await this.loadArchivedRebuildIntent(input, reconciled.directory)
     if (existing) {
       if (existing.nodeId !== input.nodeId) {
         throw new Error('Canvas operationId 已被不同重建请求占用')
@@ -1313,7 +1409,12 @@ export class CanvasAgentNodeCreationService {
         .filter((intent) => intent.nodeId === existing.nodeId)
         .sort((left, right) => right.createdAt - left.createdAt
           || right.operationId.localeCompare(left.operationId))[0]
-      if (latestForNode?.operationId !== existing.operationId) {
+      if (latestForNode && latestForNode.operationId !== existing.operationId) {
+        throw new Error('Canvas Agent 重建操作已被后续会话替代')
+      }
+      const currentNode = reconciled.snapshot.document.nodes.find((node) => node.id === existing.nodeId)
+      if (!currentNode || currentNode.kind !== 'agent'
+        || currentNode.agentSessionId !== existing.replacementSessionId) {
         throw new Error('Canvas Agent 重建操作已被后续会话替代')
       }
       const session = this.dependencies.getSession(existing.replacementSessionId)
@@ -1325,6 +1426,8 @@ export class CanvasAgentNodeCreationService {
       }
     }
 
+    /** 新请求验证当前基线；已完成重放由原 receipt 与当前 session 共同证明，不受旧 CAS 影响。 */
+    validateNewOperation?.(reconciled.snapshot)
     const node = reconciled.snapshot.document.nodes.find((candidate) => candidate.id === input.nodeId)
     if (!node || node.kind !== 'agent') throw new Error('Canvas Agent 节点不存在')
     if (!reconciled.snapshot.nodeIssues.some((issue) => issue.nodeId === node.id)) {
@@ -1395,14 +1498,21 @@ export class CanvasAgentNodeCreationService {
   /** 显式把坏节点换绑到新的空白 Canvas Agent session。 */
   async rebuildReconciled(
     input: RebuildCanvasAgentNodeInput,
+    /** 仅首次准备事务时执行的主进程准入，入参为同轮权威图快照。 */
+    validateNewOperation?: (snapshot: CanvasWorkspaceSnapshot) => void,
   ): Promise<CanvasAgentNodeRebuildServiceResult> {
     assertRebuildCanvasAgentNodeInput(input)
     const reconciled = await this.reconcileWithDirectory({
       projectId: input.projectId,
       canvasId: input.canvasId,
     })
-    if (reconciled.error) throw reconciled.error
-    return this.rebuildAfterReconciliation(input, reconciled)
+    if (reconciled.error) {
+      if (reconciled.documentChanged) throw new CanvasAgentNodePublishedError(
+        reconciled.error instanceof Error ? reconciled.error : new Error(String(reconciled.error)), reconciled.snapshot.document,
+      )
+      throw reconciled.error
+    }
+    return this.rebuildAfterReconciliation(input, reconciled, validateNewOperation)
   }
 
   /** 基于同次对账结果首次准备或幂等重放用户创建 operation。 */
@@ -1412,6 +1522,7 @@ export class CanvasAgentNodeCreationService {
   ): Promise<CanvasAgentNodeCreationServiceResult> {
     const identity = reconciled.directory
     const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+      ?? await this.loadArchivedCreationIntent(input, reconciled.directory)
     if (existing) {
       if (existing.nodeId !== input.nodeId
         || existing.title !== input.title
@@ -1424,7 +1535,10 @@ export class CanvasAgentNodeCreationService {
       if (existing.state !== 'committed') {
         throw new Error('Canvas Agent 创建事务未完成对账')
       }
-      if (reconciled.rebuildIntents.some((intent) => intent.nodeId === existing.nodeId)) {
+      const currentNode = reconciled.snapshot.document.nodes.find((node) => node.id === existing.nodeId)
+      if (!currentNode || currentNode.kind !== 'agent'
+        || currentNode.agentSessionId !== existing.sessionId
+        || reconciled.rebuildIntents.some((intent) => intent.nodeId === existing.nodeId)) {
         throw new Error('Canvas Agent 创建操作已被重建会话替代')
       }
       const session = this.dependencies.getSession(existing.sessionId)

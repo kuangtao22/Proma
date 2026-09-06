@@ -5,6 +5,7 @@ import {
   createCanvasAgentBatchOperationService,
   type CanvasBatchOperationIntent,
 } from './canvas-agent-batch-operation'
+import { createCanvasTransactionArchive } from './canvas-transaction-archive'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 
@@ -24,9 +25,14 @@ function createFixture(options: {
   busySessionId?: string
   /** 指定 revision 的发布失败，验证后续事实仍继续广播。 */
   publishFailsAtRevision?: number
+  /** 启用内存终态归档，覆盖跨重启 replay。 */
+  enableArchive?: boolean
+  /** 首次移除 active intent 时失败，验证归档错误保留已提交 publication。 */
+  failArchiveRemoveOnce?: boolean
 } = {}) {
   let document: CanvasDocument = { ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 7 }
   const intents = new Map<string, CanvasBatchOperationIntent>()
+  const archived = new Map<string, string>()
   const intentWrites: CanvasBatchOperationIntent[] = []
   const events: string[] = []
   const contents = new Set<string>()
@@ -108,6 +114,20 @@ function createFixture(options: {
       }
       return { commitVisible: true, durabilityUncertain: false }
     },
+    ...(options.enableArchive ? {
+      archive: createCanvasTransactionArchive({
+        writeArchived: async (fileName, content) => { archived.set(fileName, content) },
+        readArchived: async (fileName) => archived.get(fileName) ?? null,
+        removeActive: async (fileName) => {
+          if (options.failArchiveRemoveOnce) {
+            options.failArchiveRemoveOnce = false
+            throw new Error('ARCHIVE_REMOVE_FAILED')
+          }
+          const match = /^canvas-batch-([0-9a-f-]{36})\.json$/i.exec(fileName)
+          if (match) intents.delete(match[1]!)
+        },
+      }),
+    } : {}),
     contentLifecycle: {
       inspectBatchContent: async (_target, input) => ({ exists: contents.has(input.contentId) }),
       prepareBatchContent: async (_target, input) => {
@@ -168,6 +188,7 @@ function createFixture(options: {
     service,
     createService,
     intents,
+    archived,
     intentWrites,
     events,
     contents,
@@ -252,6 +273,41 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.getMutateCalls()).toBe(1)
   })
 
+  test('Given committed 批次已归档 When fresh service 重放同一 source Then 返回原 operation 且不重复 revision', async () => {
+    const fixture = createFixture({ enableArchive: true })
+    const first = await fixture.service.execute(batch())
+
+    const replayed = await fixture.createService().execute(batch())
+
+    expect(fixture.intents.size).toBe(0)
+    expect(replayed.operationId).toBe(first.operationId)
+    expect(fixture.getMutateCalls()).toBe(1)
+    expect(fixture.archived.size).toBe(2)
+  })
+
+  test('Given active 或 archived committed receipt When 按完整 source 查询 Then 精确返回且拒绝同 toolCall 漂移身份', async () => {
+    const fixture = createFixture({ enableArchive: true })
+    const envelope = batch()
+    await fixture.service.execute(envelope)
+    const source = {
+      sessionId: envelope.sourceSessionId,
+      runStartedAt: envelope.sourceRunStartedAt,
+      toolCallId: envelope.sourceToolCallId,
+    }
+
+    const active = await fixture.service.findReplayLocked(target, source)
+    await fixture.service.reconcile(target)
+    const archived = await fixture.createService().findReplayLocked(target, source)
+    const forged = await fixture.createService().findReplayLocked(target, {
+      ...source,
+      runStartedAt: source.runStartedAt + 1,
+    })
+
+    expect(active?.state).toBe('committed')
+    expect(archived).toEqual(active)
+    expect(forged).toBeNull()
+  })
+
   test('Given 同 Canvas 两个批次并发 When 执行 Then 串行进入提交区', async () => {
     const fixture = createFixture()
     const first = fixture.service.execute(batch())
@@ -315,6 +371,25 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(result.document.revision).toBe(8)
     expect(fixture.getMutateCalls()).toBe(1)
     expect([...fixture.intents.values()][0]?.state).toBe('committed')
+  })
+
+  test('Given 恢复图已提交但终态归档失败 When 当前调用退出 Then 仍发布已提交 revision', async () => {
+    const fixture = createFixture({
+      uncertainState: 'resources-created',
+      enableArchive: true,
+      failArchiveRemoveOnce: true,
+    })
+    await expect(fixture.service.execute(batch())).rejects.toThrow('CANVAS_BATCH_RECOVERY_REQUIRED')
+
+    await expect(fixture.service.execute({
+      ...batch(),
+      baseRevision: 8,
+      sourceToolCallId: 'tool-after-archive-failure',
+      operations: [{ type: 'set-viewport', viewport: { x: 8, y: 9, zoom: 1.25 } }],
+    })).rejects.toThrow('ARCHIVE_REMOVE_FAILED')
+
+    expect(fixture.getDocument().revision).toBe(8)
+    expect(fixture.publishedRevisions).toEqual([8])
   })
 
   test('Given 旧 resources-created intent When 新 tool call 执行 Then 先收敛旧批次再创建新 intent', async () => {

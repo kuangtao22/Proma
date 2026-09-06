@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -43,6 +44,8 @@ function createHarness(options: {
   writeIntentOutcome?: (intent: CanvasAgentNodeDurableIntent) => StableDirectoryNativeWriteOutcome | undefined
   hideUncertainIntent?: boolean
   sessionIds?: string[]
+  /** 首次非空终态归档失败，用于验证已提交 revision 仍随对账结果返回。 */
+  failArchiveOnce?: boolean
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -157,6 +160,18 @@ function createHarness(options: {
       if (!sessionId) throw new Error('测试 session ID 未配置')
       return sessionId
     },
+    ...(options.failArchiveOnce ? {
+      archive: {
+        load: async () => null,
+        archiveEntries: async (entries: readonly unknown[]) => {
+          if (entries.length > 0 && options.failArchiveOnce) {
+            options.failArchiveOnce = false
+            throw new Error('AGENT_ARCHIVE_FAILED')
+          }
+          return { archivedCount: 0, archivedBytes: 0 }
+        },
+      },
+    } : {}),
     ...(options.nativeIntentIo
       ? {
           runStableDirectoryNative: (request, authorize) => runStableDirectoryNative(
@@ -302,7 +317,13 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(first.session.id).toBe(SESSION_ID)
     expect(replayed.document).toEqual(first.document)
     expect(harness.createdInputs).toHaveLength(1)
-    expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
+    expect(existsSync(harness.intentPath)).toBe(false)
+    const archiveRoot = join(harness.canvasRoot, 'transaction-archive')
+    const archivedIntent = readdirSync(archiveRoot)
+      .map((shard) => join(archiveRoot, shard, 'agent-node-11111111-1111-4111-8111-111111111111.json'))
+      .find((path) => existsSync(path))
+    expect(archivedIntent).toBeDefined()
+    expect(JSON.parse(readFileSync(archivedIntent!, 'utf8'))).toMatchObject({ state: 'committed' })
   }, 30_000)
 
   test('Given intent 在 lstat 后被同名新 inode 替换 When 打开读取 Then 拒绝 replacement', async () => {
@@ -524,6 +545,19 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(JSON.parse(readFileSync(harness.intentPath, 'utf8'))).toMatchObject({ state: 'committed' })
   })
 
+  test('Given 恢复节点已提交但终态归档失败 When 对账返回 Then 保留 publication 与归档错误', async () => {
+    const harness = createHarness({ failIntentState: 'committed', failArchiveOnce: true })
+    await expect(harness.createService().create(createInput(harness.target)))
+      .rejects.toThrow('模拟 committed intent 写失败')
+    harness.setFailedState(undefined)
+
+    const reconciled = await harness.createService().reconcile(harness.target)
+
+    expect(reconciled.snapshot.document.revision).toBe(1)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.error).toHaveProperty('message', 'AGENT_ARCHIVE_FAILED')
+  })
+
   test('Given committed 节点后来被用户删除 When 对账 Then 写 detached 且永不重建', async () => {
     const harness = createHarness()
     const service = harness.createService()
@@ -685,8 +719,8 @@ describe('Canvas Agent 节点创建事务', () => {
     expect(harness.sessions.has(SESSION_ID)).toBe(true)
   })
 
-  test('Given 重建已 committed When 相同 operation 重试 Then 返回同一新 session 且不重复创建', async () => {
-    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID] })
+  test.each([false, true])('Given 重建已 committed 且 native=%s When 相同 operation 重试 Then 返回同一新 session 且不重复创建', async (nativeIntentIo) => {
+    const harness = createHarness({ sessionIds: [SESSION_ID, REPLACEMENT_SESSION_ID], nativeIntentIo })
     const service = harness.createService()
     await service.create(createInput(harness.target))
     const oldSession = harness.sessions.get(SESSION_ID)
@@ -699,6 +733,7 @@ describe('Canvas Agent 节点创建事务', () => {
     }
 
     const first = await service.rebuildReconciled(input)
+    await service.reconcile(harness.target)
     const second = await service.rebuildReconciled(input)
 
     expect(second.session.id).toBe(first.session.id)

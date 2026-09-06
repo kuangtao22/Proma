@@ -1,12 +1,20 @@
 import {
+  parseListCanvasImageActivityInput,
+  parseCanvasImageJobActivities,
   CANVAS_IPC_CHANNELS,
   DESIGN_IPC_CHANNELS,
   parseAgentCanvasBindingChangeEvent,
   parseCanvasChangeEvent,
   parseCanvasImageCandidateBatch,
   parseCanvasImageModuleSnapshot,
+  parseCanvasRunWorkflowResult,
+  parseCanvasWorkflowRun,
+  parseCanvasWorkflowRunChangedEvent,
+  parseCanvasWorkflowRunPage,
 } from '@proma/shared'
 import type {
+  CanvasImageJobActivity,
+  ListCanvasImageActivityInput,
   AgentCanvasBindingChangeEvent,
   ClearAgentCanvasBindingsInput,
   ClearAgentCanvasBindingsResult,
@@ -26,6 +34,12 @@ import type {
   CanvasSessionChangeEvent,
   CanvasSessionMeta,
   CanvasWorkspaceSnapshot,
+  CanvasRunWorkflowResult,
+  CanvasWorkflowRun,
+  CanvasWorkflowRunChangedEvent,
+  CanvasWorkflowRunListInput,
+  CanvasWorkflowRunPage,
+  CanvasWorkflowRunTarget,
   CanvasTextArtifactIdentity,
   CanvasTextArtifactMutationResult,
   CanvasTextArtifactSnapshot,
@@ -124,6 +138,7 @@ export interface DesignPreloadApi {
   exportCanvasArtifact: (input: ExportCanvasArtifactInput) => Promise<CanvasInvokeResult<void>>
   /** 加载单个 Canvas 生图模块及其媒体授权快照。 */
   loadCanvasImageModule: (input: CanvasImageTarget) => Promise<CanvasInvokeResult<CanvasImageModuleSnapshot>>
+  listCanvasImageActivity: (input: ListCanvasImageActivityInput) => Promise<CanvasInvokeResult<CanvasImageJobActivity[]>>
   /** 按批次稳定身份加载完整候选事实。 */
   getCanvasImageCandidateBatch: (input: GetCanvasImageCandidateBatchInput) => Promise<CanvasInvokeResult<CanvasImageCandidateBatch>>
   /** 重新运行批次中尚未成功的图片任务。 */
@@ -176,6 +191,16 @@ export interface DesignPreloadApi {
   stopCanvasAgent: (input: StopCanvasAgentInput) => Promise<CanvasInvokeResult<void>>
   /** 订阅所有原生 Canvas 变化，双身份过滤由 Renderer adapter 执行。 */
   onCanvasChanged: (listener: (event: CanvasChangeEvent) => void) => () => void
+  /** 分页读取当前普通 Agent 在目标 Canvas 的工作流历史。 */
+  listCanvasWorkflowRuns: (input: CanvasWorkflowRunListInput) => Promise<CanvasInvokeResult<CanvasWorkflowRunPage>>
+  /** 读取当前普通 Agent 拥有的单个工作流运行。 */
+  getCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasInvokeResult<CanvasWorkflowRun>>
+  /** 在当前普通 Agent 的新一轮授权上下文中继续旧工作流。 */
+  resumeCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasInvokeResult<CanvasRunWorkflowResult>>
+  /** 停止当前普通 Agent 拥有的非终态工作流。 */
+  cancelCanvasWorkflowRun: (input: CanvasWorkflowRunTarget) => Promise<CanvasInvokeResult<CanvasWorkflowRun>>
+  /** 订阅工作流关键事实变化，Renderer 按当前身份决定是否刷新。 */
+  onCanvasWorkflowRunChanged: (listener: (event: CanvasWorkflowRunChangedEvent) => void) => () => void
   /** 列出当前项目内全部普通 Agent-Canvas 关联。 */
   listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<CanvasInvokeResult<ListAgentCanvasBindingsResult>>
   /** 建立普通 Agent 与项目 Canvas 的关联。 */
@@ -255,7 +280,25 @@ const CANVAS_PRELOAD_FALLBACKS = {
   stop: { code: 'CANVAS_AGENT_STOP_FAILED', message: '停止 Agent 失败，请重试。' },
   bindingList: { code: 'CANVAS_BINDING_LIST_FAILED', message: '画布关联列表暂时无法加载。' },
   binding: { code: 'CANVAS_BINDING_FAILED', message: '画布关联失败，请重试。' },
+  workflow: { code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。' },
 } as const satisfies Record<string, CanvasPublicError>
+
+/** 从 Renderer 输入中只拣选工作流运行公开目标。 */
+function selectCanvasWorkflowRunTarget(input: CanvasWorkflowRunTarget): CanvasWorkflowRunTarget {
+  return {
+    projectId: input.projectId, canvasId: input.canvasId,
+    sessionId: input.sessionId, runId: input.runId,
+  }
+}
+
+/** 从 Renderer 输入中只拣选工作流历史分页字段。 */
+function selectCanvasWorkflowRunListInput(input: CanvasWorkflowRunListInput): CanvasWorkflowRunListInput {
+  return {
+    projectId: input.projectId, canvasId: input.canvasId, sessionId: input.sessionId,
+    ...(input.cursor !== undefined ? { cursor: input.cursor } : {}),
+    ...(input.limit !== undefined ? { limit: input.limit } : {}),
+  }
+}
 
 /** 从 Renderer 输入中只拣选文本产物稳定身份。 */
 function selectCanvasTextArtifactIdentity(input: CanvasTextArtifactIdentity): CanvasTextArtifactIdentity {
@@ -428,6 +471,24 @@ async function invokeCanvasSafely<T>(
   }
 }
 
+/** 调用工作流 IPC，并在 Preload 边界严格重建成功值。 */
+async function invokeCanvasWorkflowSafely<T>(
+  ipc: DesignPreloadIpc,
+  channel: string,
+  input: CanvasWorkflowRunTarget | CanvasWorkflowRunListInput,
+  parse: (value: unknown) => T,
+): Promise<CanvasInvokeResult<T>> {
+  const result = await invokeCanvasSafely<T>(
+    ipc, channel, input, CANVAS_PRELOAD_FALLBACKS.workflow,
+  )
+  if (!result.ok) return result
+  try {
+    return { ok: true, value: parse(result.value) }
+  } catch {
+    return { ok: false, error: { ...CANVAS_PRELOAD_FALLBACKS.workflow } }
+  }
+}
+
 /** 在 Preload 跨进程入口严格重建图片模块成功快照。 */
 async function invokeCanvasImageSnapshotSafely(
   ipc: DesignPreloadIpc,
@@ -482,6 +543,13 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
       CANVAS_PRELOAD_FALLBACKS.artifactExport,
     ),
     loadCanvasImageModule: (input) => invokeCanvasImageSnapshotSafely(ipc, input),
+    listCanvasImageActivity: async (input) => {
+      try {
+        const target = parseListCanvasImageActivityInput(input)
+        const result = await invokeCanvasSafely<CanvasImageJobActivity[]>(ipc, CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY, target, CANVAS_PRELOAD_FALLBACKS.imageLoad)
+        return result.ok ? { ok: true, value: parseCanvasImageJobActivities(result.value, target) } : result
+      } catch { return { ok: false, error: { ...CANVAS_PRELOAD_FALLBACKS.imageLoad } } }
+    },
     getCanvasImageCandidateBatch: (input) => invokeCanvasImageCandidateBatchSafely(
       ipc, CANVAS_IPC_CHANNELS.GET_IMAGE_CANDIDATE_BATCH, input,
     ),
@@ -649,7 +717,39 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
         listener(event)
       }
       ipc.on(CANVAS_IPC_CHANNELS.CHANGED, handler)
-      return () => ipc.removeListener(CANVAS_IPC_CHANNELS.CHANGED, handler)
+      return makeIdempotentRelease(() => ipc.removeListener(CANVAS_IPC_CHANNELS.CHANGED, handler))
+    },
+    listCanvasWorkflowRuns: (input) => invokeCanvasWorkflowSafely(
+      ipc, CANVAS_IPC_CHANNELS.LIST_WORKFLOW_RUNS,
+      selectCanvasWorkflowRunListInput(input), parseCanvasWorkflowRunPage,
+    ),
+    getCanvasWorkflowRun: (input) => invokeCanvasWorkflowSafely(
+      ipc, CANVAS_IPC_CHANNELS.GET_WORKFLOW_RUN,
+      selectCanvasWorkflowRunTarget(input), parseCanvasWorkflowRun,
+    ),
+    resumeCanvasWorkflowRun: (input) => invokeCanvasWorkflowSafely(
+      ipc, CANVAS_IPC_CHANNELS.RESUME_WORKFLOW_RUN,
+      selectCanvasWorkflowRunTarget(input), parseCanvasRunWorkflowResult,
+    ),
+    cancelCanvasWorkflowRun: (input) => invokeCanvasWorkflowSafely(
+      ipc, CANVAS_IPC_CHANNELS.CANCEL_WORKFLOW_RUN,
+      selectCanvasWorkflowRunTarget(input), parseCanvasWorkflowRun,
+    ),
+    onCanvasWorkflowRunChanged: (listener) => {
+      const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        let event: CanvasWorkflowRunChangedEvent
+        try {
+          event = parseCanvasWorkflowRunChangedEvent(value)
+        } catch {
+          /** 非法、未知字段或过度暴露的事件不得进入 Renderer。 */
+          return
+        }
+        listener(event)
+      }
+      ipc.on(CANVAS_IPC_CHANNELS.WORKFLOW_RUN_CHANGED, handler)
+      return makeIdempotentRelease(() => {
+        ipc.removeListener(CANVAS_IPC_CHANNELS.WORKFLOW_RUN_CHANGED, handler)
+      })
     },
     listAgentCanvasBindings: (input) => invokeCanvasSafely(
       ipc,

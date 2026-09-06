@@ -5,6 +5,7 @@ import {
   parseCanvasImageCandidateAdoptionIntent,
   type CanvasImageCandidateAdoptionIntent,
 } from './canvas-image-candidate-batch-store'
+import { createCanvasTransactionArchive } from './canvas-transaction-archive'
 
 /** 创建 Store 测试使用的完整批次。 */
 function batch(id: string, status: CanvasImageCandidateBatch['status'], updatedAt: number): CanvasImageCandidateBatch {
@@ -103,5 +104,78 @@ describe('Canvas 图片候选批次 Store', () => {
     })
 
     await expect(store.saveAdoptionIntent(value)).rejects.toThrow('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+  })
+
+  test('Given 终态批次已离开 active When 按 batchId 加载 Then 精确读取归档且不扫描其它分片', async () => {
+    const value = batch('11111111-1111-4111-8111-111111111111', 'abandoned', 3)
+    const archived = new Map<string, string>()
+    let active = [value]
+    const archive = createCanvasTransactionArchive({
+      writeArchived: async (fileName, content) => { archived.set(fileName, content) },
+      readArchived: async (fileName) => archived.get(fileName) ?? null,
+      removeActive: async () => { active = [] },
+    })
+    const store = createCanvasImageCandidateBatchStore({
+      scanBatches: async () => active,
+      writeBatch: async () => ({ commitVisible: true, durabilityUncertain: false }),
+      archive,
+    })
+
+    await store.listActiveSummaries(value)
+    await expect(store.load(value, value.batchId)).resolves.toEqual(value)
+    expect(active).toEqual([])
+  })
+
+  test('Given 归档批次正文属于其它 Canvas When 精确加载或按任务恢复 Then fail closed', async () => {
+    const requestedBatchId = '11111111-1111-4111-8111-111111111111'
+    const archivedValue = {
+      ...batch(requestedBatchId, 'abandoned', 3),
+      canvasId: 'canvas-other',
+    }
+    const archive = createCanvasTransactionArchive({
+      writeArchived: async () => {},
+      readArchived: async () => `${JSON.stringify(archivedValue)}\n`,
+      removeActive: async () => {},
+    })
+    const store = createCanvasImageCandidateBatchStore({
+      scanBatches: async () => [],
+      writeBatch: async () => ({ commitVisible: true, durabilityUncertain: false }),
+      archive,
+    })
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+
+    await expect(store.load(target, requestedBatchId))
+      .rejects.toThrow('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    await expect(store.findByJobId(target, `job-${requestedBatchId}`, requestedBatchId))
+      .rejects.toThrow('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  })
+
+  test('Given batch-committed 采用事务已归档 When 按 operationId 重放 Then 返回原采用证据', async () => {
+    const value: CanvasImageCandidateAdoptionIntent = {
+      ...adoptionIntent('operation-archive'),
+      state: 'batch-committed',
+      entries: [{
+        ...adoptionIntent().entries[0]!,
+        committedConfigRevision: 2,
+      }],
+    }
+    const archived = new Map<string, string>()
+    let active = [value]
+    const archive = createCanvasTransactionArchive({
+      writeArchived: async (fileName, content) => { archived.set(fileName, content) },
+      readArchived: async (fileName) => archived.get(fileName) ?? null,
+      removeActive: async () => { active = [] },
+    })
+    const store = createCanvasImageCandidateBatchStore({
+      scanBatches: async () => [],
+      writeBatch: async () => ({ commitVisible: true, durabilityUncertain: false }),
+      scanAdoptionIntents: async () => active,
+      writeAdoptionIntent: async () => ({ commitVisible: true, durabilityUncertain: false }),
+      archive,
+    })
+
+    await store.scanAdoptionIntents(value)
+    await expect(store.loadAdoptionIntent(value, value.operationId)).resolves.toEqual(value)
+    expect(active).toEqual([])
   })
 })

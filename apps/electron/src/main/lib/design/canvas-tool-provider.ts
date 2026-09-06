@@ -10,6 +10,7 @@ import type {
   CanvasDocument,
   CanvasEdgeRelation,
   CanvasImageTarget,
+  CanvasImageArtifactVersion,
   CanvasImageModuleConfig,
   CanvasMutation,
   CanvasNode,
@@ -43,6 +44,7 @@ import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
 import type { CanvasImageRunService } from './canvas-image-run-service'
 import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
+import { createCanvasOperationTools, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import {
   canvasNodeCapabilityRegistry,
   type CanvasNodeCapability,
@@ -57,6 +59,8 @@ const MAX_INSPECT_IMAGE_NODES = 4
 const MAX_INSPECT_IMAGE_BYTES = 512 * 1024
 const MAX_INSPECT_BATCH_BYTES = 2 * 1024 * 1024
 const MAX_INSPECT_IMAGE_PIXELS = 64_000_000
+/** 多图启动和运行跨进程调用使用相同的十五分钟有界窗口。 */
+const MAX_IMAGE_RUN_START_MS = 15 * 60_000
 /** 父 Agent 单次指令与正式输出摘要的上下文预算。 */
 const MAX_AGENT_RUN_INSTRUCTION_LENGTH = 8_192
 const MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES = 4_096
@@ -77,6 +81,9 @@ const RENDERER_MANUAL_CANVAS_AGENT_TOOL_NAMES = new Set([
   'canvas_update_artifact',
   'canvas_update_image_config',
   'canvas_run_nodes',
+  'canvas_get_task', 'canvas_cancel_task', 'canvas_retry_task',
+  'canvas_list_versions', 'canvas_read_version', 'canvas_adopt_version',
+  'canvas_export_artifact', 'canvas_list_trash', 'canvas_restore_node',
 ])
 /** 父 Agent 编排模式禁止 Canvas Agent 再启动任何付费图片任务。 */
 const PARENT_ORCHESTRATED_CANVAS_AGENT_TOOL_NAMES = new Set([
@@ -89,6 +96,7 @@ const PARENT_ORCHESTRATED_CANVAS_AGENT_TOOL_NAMES = new Set([
   'canvas_create_artifact',
   'canvas_update_artifact',
   'canvas_update_image_config',
+  'canvas_get_task', 'canvas_list_versions', 'canvas_read_version',
 ])
 
 /** 按 UTF-8 原始字节预算截断文本，并保持完整 Unicode 字符。 */
@@ -133,7 +141,11 @@ interface CanvasImageInspectionSummary {
   nodeId: string
   title: string
   status: 'ready' | 'node-not-found' | 'invalid-node-kind' | 'missing-adopted-asset'
-    | 'adopted-asset-mismatch' | 'image-unavailable' | 'image-too-large'
+    | 'adopted-asset-mismatch' | 'image-unavailable' | 'image-too-large' | 'version-unavailable'
+  /** 显式查看的成功任务版本；缺省时仍表示当前正式图片。 */
+  jobId?: string
+  /** 请求版本是否同时是当前正式采用版本，不改变采用状态。 */
+  adopted?: boolean
 }
 
 /** 判断未知值是否为 Canvas 固定节点类型。 */
@@ -241,7 +253,7 @@ function applyCanvasReadBudget(
   details: CanvasReadBudgetDetails,
   fullContents: string[],
 ): CanvasReadBudgetDetails {
-  /** 先移除可选历史、边和图片配置，最小节点与 revision 摘要始终保留。 */
+  /** 先移除可选历史、边和节点配置，最小节点与 revision 摘要始终保留。 */
   while (canvasReadJsonLength(details) > MAX_READ_RESPONSE_CHARS) {
     const history = [...details.nodes].reverse()
       .map((entry) => readArtifactArray(entry.artifact, 'jobHistory'))
@@ -283,7 +295,9 @@ function applyCanvasReadBudget(
   /** 正文按节点顺序使用剩余预算；二分避免逐字符反复序列化。 */
   for (const [index, entry] of details.nodes.entries()) {
     const fullContent = fullContents[index] ?? ''
-    const imageConfig = entry.artifact?.config as CanvasImageModuleConfig | undefined
+    const imageConfig = entry.artifact?.kind === 'image'
+      ? entry.artifact.config as CanvasImageModuleConfig | undefined
+      : undefined
     if (!fullContent || (entry.artifact?.kind === 'image' && !imageConfig)) continue
     let lower = 0
     let upper = fullContent.length
@@ -350,6 +364,8 @@ export interface CanvasToolRunContext {
   runStartedAt: number
   explicitReferences: CanvasNodeReference[]
   permissionCeiling: CanvasToolPermissionCeiling
+  /** 仅交互式 Renderer 运行绑定保存窗口；后台运行缺省后禁止隐式弹窗。 */
+  dialogOwnerWebContentsId?: number
   /** Canvas 内部 Agent 只能访问自身所属画布，不能管理普通 Agent 的画布关联。 */
   canvasAgentTarget?: CanvasAgentTarget
   /** 由统一执行服务注入的可信 Canvas Agent 运行模式，用于第二层能力收缩。 */
@@ -386,6 +402,8 @@ export interface CanvasToolImageImportInput extends CanvasTarget {
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
 export interface CanvasToolProviderDependencies {
+  /** UI 与 Agent 共用的任务、版本、恢复和持久工作流操作。 */
+  operations?: CanvasOperationToolHandlers
   access: Pick<CanvasToolAccessFacade,
     | 'authorizeRead'
     | 'getBinding'
@@ -410,6 +428,8 @@ export interface CanvasToolProviderDependencies {
   textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update'>
   images: {
     loadConfig: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
+    /** 复用图片 Registry，只返回目标模块可由成功任务与现存素材证明的版本。 */
+    listVersions: (target: CanvasImageTarget) => Promise<CanvasImageArtifactVersion[]>
     load: (target: CanvasImageTarget) => Promise<{
       config: CanvasImageModuleConfig
       jobs: DesignJobRecord[]
@@ -671,7 +691,7 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_inspect_images', label: '检查画布图片',
-      description: '按节点读取同一画布 revision 下当前正式采用的受限缩略图；只用于视觉核对，不修改提示词、不生图、不采用候选。',
+      description: '读取受限缩略图供视觉核对。默认检查正式采用图片；检查候选或历史图片时，先从 canvas_read 的 jobHistory 取得成功任务 id，再通过 versions 指定 nodeId 与 jobId。不会采用、修改或生成图片。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
@@ -679,8 +699,13 @@ export function createCanvasToolRun(
           maxItems: MAX_INSPECT_IMAGE_NODES,
         }),
         expectedRevision: Type.Integer({ minimum: 0 }),
+        versions: Type.Optional(Type.Array(Type.Object({
+          nodeId: Type.String({ minLength: 1, maxLength: 128 }),
+          jobId: Type.String({ minLength: 1, maxLength: 128 }),
+        }), { maxItems: MAX_INSPECT_IMAGE_NODES })),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (_toolCallId, params, signal) => {
+        signal?.throwIfAborted()
         dependencies.access.authorizeRead(context)
         dependencies.access.requireLinkedCanvas(context, params.canvasId)
         if (params.nodeIds.length < 1 || params.nodeIds.length > MAX_INSPECT_IMAGE_NODES) {
@@ -691,15 +716,30 @@ export function createCanvasToolRun(
         /** revision 必须在任何图片模块或缩略图读取前复核，避免混合新旧正式状态。 */
         if (document.revision !== params.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
         const nodeIds = [...new Set(params.nodeIds)]
+        /** 一个节点最多指定一个版本，选择范围不得越过本次节点集合。 */
+        const versionByNode = new Map<string, string>()
+        if ((params.versions?.length ?? 0) > MAX_INSPECT_IMAGE_NODES) {
+          throw new Error('CANVAS_IMAGE_VERSION_SELECTION_INVALID')
+        }
+        for (const version of params.versions ?? []) {
+          if (!version.jobId || !nodeIds.includes(version.nodeId) || versionByNode.has(version.nodeId)) {
+            throw new Error('CANVAS_IMAGE_VERSION_SELECTION_INVALID')
+          }
+          versionByNode.set(version.nodeId, version.jobId)
+        }
         const content: Array<TextContent | ImageContent> = []
         const inspections: CanvasImageInspectionSummary[] = []
         let totalImageBytes = 0
         /** 公开失败只描述节点级状态，底层素材身份和磁盘错误不得进入工具结果。 */
         const appendStatus = (summary: CanvasImageInspectionSummary): void => {
-          inspections.push(summary)
-          content.push({ type: 'text', text: JSON.stringify(summary) })
+          /** 即使配置或媒体读取失败，也保留调用方显式选择的任务版本。 */
+          const jobId = versionByNode.get(summary.nodeId)
+          const inspection = { ...summary, ...(jobId ? { jobId } : {}) }
+          inspections.push(inspection)
+          content.push({ type: 'text', text: JSON.stringify(inspection) })
         }
         for (const nodeId of nodeIds) {
+          signal?.throwIfAborted()
           const node = document.nodes.find((candidate) => candidate.id === nodeId)
           if (!node) {
             appendStatus({ nodeId, title: '', status: 'node-not-found' })
@@ -716,17 +756,37 @@ export function createCanvasToolRun(
             appendStatus({ nodeId, title: node.title, status: 'image-unavailable' })
             continue
           }
-          if (!node.adoptedAssetId && !config.adoptedAssetId) {
+          /** 显式版本由 Host 按完整节点身份解析，模型提供的任务 ID 不是媒体授权。 */
+          const jobId = versionByNode.get(node.id)
+          let assetId = node.adoptedAssetId
+          if (jobId) {
+            try {
+              const versions = await dependencies.images.listVersions({
+                ...target, nodeId: node.id, imageModuleId: node.imageModuleId,
+              })
+              assetId = versions.find((version) => version.jobId === jobId)?.assetId
+            } catch {
+              appendStatus({ nodeId, title: node.title, status: 'image-unavailable', jobId })
+              continue
+            }
+            if (!assetId) {
+              appendStatus({ nodeId, title: node.title, status: 'version-unavailable', jobId })
+              continue
+            }
+          } else if (!node.adoptedAssetId && !config.adoptedAssetId) {
             appendStatus({ nodeId, title: node.title, status: 'missing-adopted-asset' })
             continue
-          }
-          if (!node.adoptedAssetId || node.adoptedAssetId !== config.adoptedAssetId) {
+          } else if (!node.adoptedAssetId || node.adoptedAssetId !== config.adoptedAssetId) {
             appendStatus({ nodeId, title: node.title, status: 'adopted-asset-mismatch' })
             continue
           }
+          if (!assetId) throw new Error('CANVAS_IMAGE_VERSION_SELECTION_INVALID')
+          signal?.throwIfAborted()
+          dependencies.access.authorizeRead(context)
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
           let thumbnail: CanvasInspectionThumbnail
           try {
-            thumbnail = await dependencies.images.readThumbnail(context.projectId, node.adoptedAssetId)
+            thumbnail = await dependencies.images.readThumbnail(context.projectId, assetId)
           } catch {
             appendStatus({ nodeId, title: node.title, status: 'image-unavailable' })
             continue
@@ -741,13 +801,23 @@ export function createCanvasToolRun(
             continue
           }
           totalImageBytes += prepared.thumbnail.bytes.byteLength
-          const summary: CanvasImageInspectionSummary = { nodeId, title: node.title, status: 'ready' }
+          const summary: CanvasImageInspectionSummary = {
+            nodeId, title: node.title, status: 'ready',
+            ...(jobId ? { jobId, adopted: assetId === node.adoptedAssetId && assetId === config.adoptedAssetId } : {}),
+          }
           appendStatus(summary)
           content.push({
             type: 'image',
             data: prepared.thumbnail.bytes.toString('base64'),
             mimeType: prepared.thumbnail.mediaType,
           })
+        }
+        /** 异步媒体读取期间的取消、撤权和图变更不得返回旧图片事实。 */
+        signal?.throwIfAborted()
+        dependencies.access.authorizeRead(context)
+        dependencies.access.requireLinkedCanvas(context, params.canvasId)
+        if (dependencies.documents.load(target).document.revision !== params.expectedRevision) {
+          throw new Error('CANVAS_REVISION_CONFLICT')
         }
         return {
           content,
@@ -763,7 +833,7 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_read', label: '读取画布节点',
-      description: '按 ID 权威读取当前会话已关联画布的有限节点、正文与必要邻接。',
+      description: '按 ID 权威读取当前会话已关联画布的有限节点、正文与必要邻接。Agent 节点另返回 artifact.configRevision 和长期 config；修改配置时使用顶层 revision 与 configRevision，configOmitted 表示需缩小读取范围。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }),
@@ -800,6 +870,19 @@ export function createCanvasToolRun(
           if (node.kind === 'agent') {
             /** Agent 正文只从节点正式 outputPointer 经权威服务校验后读取。 */
             fullContent = await dependencies.agentOutputs.read({ ...target, nodeId: node.id })
+            /** 配置读取复用受管 Store 的身份验证；只返回可编辑字段及独立 CAS 基线。 */
+            const config = await dependencies.agentConfigs.load({ ...target, nodeId: node.id })
+            artifact = {
+              nodeId: node.id,
+              kind: 'agent',
+              configRevision: config.revision,
+              config: {
+                instruction: config.instruction,
+                skillNames: [...config.skillNames],
+                channelId: config.channelId,
+                modelId: config.modelId,
+              },
+            }
           } else if (node.kind === 'document' || node.kind === 'webview') {
             /** 节点类别决定稳定正文 ID。 */
             const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
@@ -859,6 +942,8 @@ export function createCanvasToolRun(
           /** 能力只用于发现；各工具仍在执行时独立完成 Host 身份与 revision 校验。 */
           const capabilities = canvasNodeCapabilityRegistry.list(node, {
             availability: unavailableNodeIds.has(node.id) ? 'unavailable' : 'available',
+            availableToolNames,
+            permissionCeiling: context.permissionCeiling,
           })
           entries.push({ node, capabilities, content: '', contentLength: fullContent.length, ...(artifact ? { artifact } : {}) })
         }
@@ -1357,10 +1442,12 @@ export function createCanvasToolRun(
       name: 'canvas_run_nodes', label: '运行画布节点',
       description: '运行已有生图节点并生成图片，调用图片模型时可能产生模型费用。',
       parameters: Type.Object({ canvasId: Type.String({ minLength: 1, maxLength: 128 }), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: MAX_READ_NODES }) }),
-      execute: async (toolCallId, params) => {
+      execute: async (toolCallId, params, signal) => {
+        signal?.throwIfAborted()
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
         return dependencies.access.runWrite(context, async () => {
+          signal?.throwIfAborted()
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
           const target = { projectId: context.projectId, canvasId: params.canvasId }
           const document = dependencies.documents.load(target).document
@@ -1374,7 +1461,10 @@ export function createCanvasToolRun(
             return node
           })
           /** 目标预检、journal 建立和统一启动由生产批量边界一次完成。 */
-          const result = await dependencies.imageRuns.run(context, target, nodes, toolCallId)
+          const result = await dependencies.imageRuns.run(context, target, nodes, toolCallId, {
+            signal: signal ?? new AbortController().signal,
+            deadlineAt: Date.now() + MAX_IMAGE_RUN_START_MS,
+          })
           return toolResult({
             canvasId: params.canvasId,
             revision: document.revision,
@@ -1386,11 +1476,41 @@ export function createCanvasToolRun(
     }),
   ] as ToolDefinition[]
 
+  /** 仅向模型开放已完成生产装配的新操作，保持旧嵌入调用方兼容。 */
+  tools.push(...createCanvasOperationTools(
+    dependencies.operations ?? {}, context, dependencies.access,
+    (toolCallId) => createArtifactOperationId(context, toolCallId),
+  ))
   /** Canvas Agent 的可信模式只缩减能力；普通 Agent 继续保留既有工具与审批。 */
   const isCanvasAgent = context.canvasAgentTarget !== undefined
   const availableTools = isCanvasAgent
     ? filterCanvasAgentToolsForMode(tools, context.canvasAgentMode ?? 'renderer-manual')
     : tools
+  /** 能力发现和返回的实际工具名单共享同一运行模式结果。 */
+  const availableToolNames = new Set(availableTools.map((tool) => tool.name))
+  /** 新操作提示只列出本轮真实装配并经运行模式过滤后的工具，避免 fallback 声称不存在的能力。 */
+  const availableOperationNames = availableTools
+    .map((tool) => tool.name)
+    .filter((name) => name === 'canvas_get_task'
+      || name === 'canvas_cancel_task'
+      || name === 'canvas_retry_task'
+      || name === 'canvas_list_versions'
+      || name === 'canvas_read_version'
+      || name === 'canvas_adopt_version'
+      || name === 'canvas_adopt_candidate_batch'
+      || name === 'canvas_export_artifact'
+      || name === 'canvas_list_trash'
+      || name === 'canvas_restore_node'
+      || name === 'canvas_rebuild_agent'
+      || name === 'canvas_list_workflows'
+      || name === 'canvas_get_workflow'
+      || name === 'canvas_resume_workflow'
+      || name === 'canvas_cancel_workflow')
+  const operationPrompt = availableOperationNames.length > 0
+    ? `
+
+本轮实际可用的任务、版本、导出、恢复或工作流操作工具仅为：${availableOperationNames.map((name) => `\`${name}\``).join('、')}。canvas_read 返回的 capabilities 已按这份真实清单和 permissionCeiling 收缩；不要调用未列出的操作，也不要把只读查询当成采用、重试、恢复或继续授权。`
+    : ''
   /** 直接入边由 SEND 对账快照转换为权威引用，标题只作为 JSON 数据展示。 */
   const canvasAgentPrompt = context.canvasAgentTarget
     ? `\n\n## Canvas Agent 固定作用域
@@ -1415,12 +1535,12 @@ export function createCanvasToolRun(
 
 创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，图片画幅、尺寸、模型或上下文通过 canvas_update_image_config 局部修改，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
 
-用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
+用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。检查未采用候选或历史版本时，先用 canvas_read 获取 jobHistory 中成功任务的 id，再用 canvas_inspect_images 的 versions=[{nodeId,jobId}] 精确看图，无需先采用或要求用户截图。不存在的版本不得用正式图替代。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
 
-Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构且禁止运行、产物创建、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。${canvasAgentPrompt}`,
+Host 只提供 permissionCeiling 权限上限：plan 仅允许新增 idle 结构和只读操作，禁止运行、产物创建、采用、重试、导出、恢复、覆盖、删除和移动；execute 表示工具可执行，不代表用户已授权任意操作。删除或覆盖必须有用户明确意图，并传入 destructiveIntent=explicit。${operationPrompt}${canvasAgentPrompt}`,
     piCustomTools: availableTools,
     allowedToolNames: availableTools.map((tool) => tool.name),
-    singleApprovalToolNames: ['canvas_run_nodes', 'canvas_run_workflow']
+    singleApprovalToolNames: ['canvas_run_nodes', 'canvas_run_workflow', 'canvas_retry_task', 'canvas_resume_workflow']
       .filter((name) => availableTools.some((tool) => tool.name === name)),
     allowedToolNamesMode: 'extend',
   }

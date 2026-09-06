@@ -21,6 +21,7 @@ export const CANVAS_IPC_CHANNELS = {
   ADOPT_ARTIFACT_REVISION: 'canvas:adopt-artifact-revision',
   EXPORT_ARTIFACT: 'canvas:export-artifact',
   LOAD_IMAGE_MODULE: 'canvas:load-image-module',
+  LIST_IMAGE_ACTIVITY: 'canvas:list-image-activity',
   SAVE_IMAGE_MODULE: 'canvas:save-image-module',
   CREATE_IMAGE_JOB: 'canvas:create-image-job',
   CANCEL_IMAGE_JOB: 'canvas:cancel-image-job',
@@ -49,8 +50,55 @@ export const CANVAS_IPC_CHANNELS = {
   SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
   CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
   AGENT_BINDINGS_CHANGED: 'canvas:agent-bindings-changed',
+  LIST_WORKFLOW_RUNS: 'canvas:list-workflow-runs',
+  GET_WORKFLOW_RUN: 'canvas:get-workflow-run',
+  RESUME_WORKFLOW_RUN: 'canvas:resume-workflow-run',
+  CANCEL_WORKFLOW_RUN: 'canvas:cancel-workflow-run',
+  WORKFLOW_RUN_CHANGED: 'canvas:workflow-run-changed',
   CHANGED: 'canvas:changed',
 } as const
+
+/** 卡片任务快照只携带状态与精确归属，历史正文、模型和日志不跨 IPC。 */
+export interface CanvasImageJobActivity extends Pick<DesignJobRecord, 'id' | 'projectId' | 'target' | 'status' | 'createdAt' | 'updatedAt' | 'outputAssetId'> {
+  target: Extract<NonNullable<DesignJobRecord['target']>, { kind: 'canvas-image' }>
+}
+
+/** 初次打开、窗口重获焦点或事件缺口时显式重建磁盘索引。 */
+export interface ListCanvasImageActivityInput extends CanvasTarget {
+  resync?: boolean
+}
+
+/** 严格重建画布活动请求，拒绝模型或 Renderer 提供任意任务路径。 */
+export function parseListCanvasImageActivityInput(value: unknown): ListCanvasImageActivityInput {
+  if (!isCanvasRecord(value)) throw new Error('CANVAS_IMAGE_ACTIVITY_INVALID')
+  const input = value
+  if (!hasExactCanvasKeys(input, ['projectId', 'canvasId', ...(Object.hasOwn(input, 'resync') ? ['resync'] : [])])
+    || !isCanvasLifecycleId(input.projectId) || !isCanvasLifecycleId(input.canvasId)
+    || (Object.hasOwn(input, 'resync') && typeof input.resync !== 'boolean')) throw new Error('CANVAS_IMAGE_ACTIVITY_INVALID')
+  return { projectId: input.projectId, canvasId: input.canvasId, ...(input.resync === undefined ? {} : { resync: input.resync as boolean }) }
+}
+
+/** 校验完整活动页并逐字段重建，防止大任务正文或其它画布数据误入 Renderer。 */
+export function parseCanvasImageJobActivities(value: unknown, target: CanvasTarget): CanvasImageJobActivity[] {
+  if (!Array.isArray(value) || value.length > 20_000) throw new Error('CANVAS_IMAGE_ACTIVITY_INVALID')
+  return value.map((entry) => {
+    if (!isCanvasRecord(entry) || !isCanvasRecord(entry.target)) throw new Error('CANVAS_IMAGE_ACTIVITY_INVALID')
+    const record = entry
+    const identity = entry.target
+    if (!hasExactCanvasKeys(record, ['id', 'projectId', 'target', 'status', 'createdAt', 'updatedAt', ...(Object.hasOwn(record, 'outputAssetId') ? ['outputAssetId'] : [])])
+      || !hasExactCanvasKeys(identity, ['kind', 'canvasId', 'nodeId', 'imageModuleId'])
+      || !isCanvasLifecycleId(record.id) || record.projectId !== target.projectId
+      || identity.kind !== 'canvas-image' || identity.canvasId !== target.canvasId
+      || !isCanvasLifecycleId(identity.nodeId) || !isCanvasLifecycleId(identity.imageModuleId)
+      || !['queued', 'running', 'succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(record.status))
+      || !isCanvasNonNegativeInteger(record.createdAt) || !isCanvasNonNegativeInteger(record.updatedAt)
+      || (Object.hasOwn(record, 'outputAssetId') && !isCanvasLifecycleId(record.outputAssetId))) throw new Error('CANVAS_IMAGE_ACTIVITY_INVALID')
+    return { id: record.id, projectId: target.projectId, target: { kind: 'canvas-image', canvasId: target.canvasId,
+      nodeId: identity.nodeId, imageModuleId: identity.imageModuleId }, status: record.status as DesignJobRecord['status'],
+      createdAt: record.createdAt as number, updatedAt: record.updatedAt as number,
+      ...(record.outputAssetId === undefined ? {} : { outputAssetId: record.outputAssetId as string }) }
+  })
+}
 
 /** 独立 Canvas 图文档的当前 schema 版本。 */
 export const CANVAS_DOCUMENT_VERSION = 4
@@ -153,9 +201,14 @@ const CANVAS_TRASH_TITLE_MAX_LENGTH = 120
 /** 文本产物正文最大 UTF-8 字节数，与受管文件写入边界保持一致。 */
 export const CANVAS_TEXT_ARTIFACT_CONTENT_MAX_BYTES = 256 * 1024
 
+/** 判断未知值是否为普通记录。 */
+function isCanvasRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
 /** 判断未知值是否为无未知字段的普通记录。 */
 function hasExactCanvasKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (!isCanvasRecord(value)) return false
   /** 实际字段排序后用于与固定合同逐项比较。 */
   const actualKeys = Object.keys(value).sort()
   /** 期望字段排序后避免调用方顺序影响判断。 */
@@ -1350,6 +1403,8 @@ export type CanvasWorkflowNodeResult = CanvasWorkflowNodeResultBase & (
 
 /** 一次 Canvas 工作流结果的公共字段。 */
 interface CanvasRunWorkflowResultBase {
+  /** 持久工作流运行 ID；旧 volatile 路径可以省略。 */
+  runId?: string | null
   initialRevision: number
   finalRevision: number
   nodes: CanvasWorkflowNodeResult[]
@@ -1498,10 +1553,16 @@ function parseCanvasWorkflowImageSummary(value: unknown): CanvasWorkflowImageSum
  */
 export function parseCanvasRunWorkflowResult(value: unknown): CanvasRunWorkflowResult {
   try {
-    const keys = [
+    const requiredKeys = [
       'status', 'initialRevision', 'finalRevision', 'nodes', 'imageSummary', 'requiresReview', 'errorCode',
     ] as const
-    if (!hasExactCanvasKeys(value, keys)
+    const keys = Object.keys(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+    const allowedKeys = [...requiredKeys, 'runId'] as const
+    if (!isCanvasRecord(value)
+      || requiredKeys.some((key) => !keys.includes(key))
+      || keys.some((key) => !allowedKeys.includes(key as typeof allowedKeys[number]))
+      || (value.runId !== undefined && value.runId !== null
+        && (typeof value.runId !== 'string' || !/^[a-f0-9]{48}$/.test(value.runId)))
       || !isCanvasWorkflowStatus(value.status)
       || !isCanvasNonNegativeInteger(value.initialRevision)
       || !isCanvasNonNegativeInteger(value.finalRevision)
@@ -1547,6 +1608,7 @@ export function parseCanvasRunWorkflowResult(value: unknown): CanvasRunWorkflowR
             : true
     if (!validTerminalState) throw new Error('CANVAS_RUN_WORKFLOW_RESULT_INVALID')
     const base = {
+      ...(value.runId !== undefined ? { runId: value.runId as string | null } : {}),
       initialRevision: value.initialRevision,
       finalRevision: value.finalRevision,
       nodes,
@@ -1620,6 +1682,7 @@ export type CanvasPublicErrorCode =
   | 'CANVAS_ARTIFACT_EXPORT_FAILED'
   | 'CANVAS_BINDING_LIST_FAILED'
   | 'CANVAS_BINDING_FAILED'
+  | 'CANVAS_WORKFLOW_FAILED'
 
 /** 不含内部路径、UUID、通道或堆栈的公开错误。 */
 export interface CanvasPublicError {

@@ -169,6 +169,36 @@ function findUniqueRunAnchor(messages: SDKMessage[], userMessageUuid: string): n
   return anchorIndex
 }
 
+/**
+ * 按真实用户消息边界检查崩溃前输出；工具结果不切分运行，后续输出不能冒充原提交。
+ * @param messages 当前 owner 的权威 SDK 消息。
+ * @param userMessageUuid 原运行的精确用户锚点。
+ * @param startedAt 原运行开始时间。
+ * @param pointer 当前图中已经提交的正式输出证明。
+ * @returns 当前指针是否属于原运行、是否被新运行替代，以及原运行是否仍是最新。
+ */
+export function inspectCanvasAgentOutputRecovery(
+  messages: SDKMessage[], userMessageUuid: string, startedAt: number, pointer?: CanvasAgentOutputPointer,
+): { status: 'completed' | 'changed' | 'missing'; latestRun: boolean } {
+  const anchorIndex = findUniqueRunAnchor(messages, userMessageUuid)
+  let end = messages.length
+  for (let index = anchorIndex + 1; index < messages.length; index += 1) {
+    if (isUserRunAnchor(messages[index]!)) { end = index; break }
+  }
+  const latestRun = end === messages.length
+  if (!pointer || pointer.completedAt < startedAt) return { status: 'missing', latestRun }
+  /** exact UUID 必须唯一且正文哈希一致，不能只凭曾有 assistant 文本推断提交成功。 */
+  const matches = messages.flatMap((message, index) => (
+    isCompletedAssistant(message) && message.uuid === pointer.messageUuid ? [{ message, index }] : []
+  ))
+  if (matches.length !== 1 || contentSha256(extractAssistantText(matches[0]!.message)) !== pointer.contentSha256) {
+    return { status: 'missing', latestRun }
+  }
+  const index = matches[0]!.index
+  if (index > anchorIndex && index < end) return { status: 'completed', latestRun }
+  return { status: index > end ? 'changed' : 'missing', latestRun }
+}
+
 /** 从 fresh 图与会话索引解析唯一内部 Agent owner，并统一隐藏内部错误。 */
 function requireOwner(
   dependencies: CanvasAgentOutputServiceDependencies,

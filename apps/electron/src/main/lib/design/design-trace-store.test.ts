@@ -139,6 +139,84 @@ describe('DesignTraceStore', () => {
     expect(() => store.read('project-1', 'job-1')).toThrow('Design trace 文件损坏')
   })
 
+  test('Given trace 超过单页上限 When 按游标读取 Then 每页最多 50 条并返回后续游标', () => {
+    const tracePath = join(paths.tracesDir, 'job-1.jsonl')
+    const lines = Array.from({ length: 75 }, (_, index) => JSON.stringify({
+      timestamp: index,
+      type: 'status',
+      title: `状态 ${index}`,
+    }))
+    writeFileSync(tracePath, `${lines.join('\n')}\n`, 'utf8')
+
+    const first = store.readPage('project-1', 'job-1', { limit: 80, maxBytes: 64 * 1024 })
+    const second = store.readPage('project-1', 'job-1', {
+      cursor: first.nextCursor,
+      limit: 50,
+      maxBytes: 64 * 1024,
+    })
+
+    expect(first.entries).toHaveLength(50)
+    expect(first.entries[0]?.title).toBe('状态 0')
+    expect(first.nextCursor).toBeString()
+    expect(first.truncated).toBe(true)
+    expect(second.entries).toHaveLength(25)
+    expect(second.entries[0]?.title).toBe('状态 50')
+    expect(second.nextCursor).toBeUndefined()
+    expect(second.truncated).toBe(false)
+  })
+
+  test('Given 条目映射后尺寸扩大 When 按最终公开尺寸分页 Then cursor 不越过未返回日志', () => {
+    const tracePath = join(paths.tracesDir, 'job-1.jsonl')
+    const lines = Array.from({ length: 5 }, (_, index) => JSON.stringify({
+      timestamp: index,
+      type: 'status',
+      title: `状态 ${index}`,
+    }))
+    writeFileSync(tracePath, `${lines.join('\n')}\n`, 'utf8')
+    /** 模拟服务层白名单重建后增加固定公开正文，预算必须使用最终条目。 */
+    const transformEntry = (entry: ReturnType<typeof store.read>[number]) => ({
+      ...entry,
+      content: 'x'.repeat(300),
+    })
+
+    const first = store.readPage('project-1', 'job-1', {
+      limit: 5,
+      maxBytes: 700,
+      transformEntry,
+    })
+    const second = store.readPage('project-1', 'job-1', {
+      cursor: first.nextCursor,
+      limit: 5,
+      maxBytes: 700,
+      transformEntry,
+    })
+
+    expect(first.entries.map((entry) => entry.title)).toEqual(['状态 0'])
+    expect(second.entries[0]?.title).toBe('状态 1')
+  })
+
+  test('Given 单条 trace 超过字节预算 When 有界读取 Then 跳过超大行且内存结果不携带正文', () => {
+    const tracePath = join(paths.tracesDir, 'job-1.jsonl')
+    writeFileSync(tracePath, [
+      JSON.stringify({ timestamp: 1, type: 'thinking', title: '超大', content: 'x'.repeat(70_000) }),
+      JSON.stringify({ timestamp: 2, type: 'status', title: '完成' }),
+    ].join('\n') + '\n', 'utf8')
+
+    const page = store.readPage('project-1', 'job-1', { limit: 50, maxBytes: 1024 })
+
+    expect(page.entries).toEqual([expect.objectContaining({ title: '完成' })])
+    expect(page.omittedEntryCount).toBe(1)
+    expect(JSON.stringify(page).length).toBeLessThan(2_000)
+  })
+
+  test('Given trace 游标落在 JSON 行中间 When 读取 Then 拒绝伪造游标', () => {
+    store.writeFromMessages('project-1', 'job-1', createSdkMessages())
+
+    expect(() => store.readPage('project-1', 'job-1', {
+      cursor: '3', limit: 10, maxBytes: 1024,
+    })).toThrow('Design trace 文件损坏或不可读')
+  })
+
   test('Given trace 已存在 When 删除两次 Then 幂等完成', () => {
     store.writeFromMessages('project-1', 'job-1', createSdkMessages())
 

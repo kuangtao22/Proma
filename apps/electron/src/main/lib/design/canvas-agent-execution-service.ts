@@ -238,6 +238,9 @@ export function createCanvasAgentExecutionService(
           runStartedAt: request.startedAt,
           explicitReferences: inputReferences,
           permissionCeiling: currentOwner.session.permissionMode === 'plan' ? 'plan' : 'execute',
+          ...(request.mode === 'renderer-manual'
+            ? { dialogOwnerWebContentsId: request.sender.id }
+            : {}),
           canvasAgentTarget: request.target,
           canvasAgentMode: request.mode,
         })

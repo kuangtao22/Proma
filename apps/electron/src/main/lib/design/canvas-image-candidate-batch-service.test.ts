@@ -12,6 +12,23 @@ import { createCanvasImageCandidateBatchService } from './canvas-image-candidate
 import type { CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
 import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 
+test('Given Agent 明确整批采用 When 同 operation 重放或变更模式 Then 不重复提交且不同参数被拒绝', async () => {
+  const fixture = createFixture()
+  await fixture.service.createBatch({ ...fixture.target, batchId: 'batch-replay', source: 'single',
+    sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!] })
+  await fixture.service.recordJobTerminal({ ...fixture.target, jobId: 'job-0', status: 'succeeded', outputAssetId: 'new-0', error: null })
+  const input = { ...fixture.target, batchId: 'batch-replay', mode: 'all' as const }
+  let allowed = true
+  const execution = { operationId: 'adoption-replay', validateAccess: () => { if (!allowed) throw new Error('ACCESS_REVOKED') } }
+  const first = await fixture.service.adopt(input, execution)
+  expect(await fixture.service.adopt(input, execution)).toEqual(first)
+  expect(fixture.adopted).toEqual(['node-0'])
+  await expect(fixture.service.adopt({ ...input, mode: 'succeeded' }, execution)).rejects.toThrow('CANVAS_IMAGE_BATCH_CONFLICT')
+  allowed = false
+  await expect(fixture.service.adopt(input, execution)).rejects.toThrow('ACCESS_REVOKED')
+  expect(fixture.adopted).toEqual(['node-0'])
+})
+
 /** 创建 14 节点候选批次 Service 内存夹具。 */
 function createFixture() {
   const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
@@ -23,6 +40,8 @@ function createFixture() {
   const started: string[] = []
   /** 依赖投影调用数用于证明候选阶段不会提前传播。 */
   let dependencyProjectionCalls = 0
+  /** 公开入口获取串行器的次数，用于证明 locked 恢复入口不会重入。 */
+  let exclusiveCalls = 0
   /** fixture 复用真实纯服务，仅在入口外记录调用次数。 */
   const dependencyState = createCanvasDependencyStateService()
   const entries = Array.from({ length: 14 }, (_, index) => {
@@ -88,7 +107,10 @@ function createFixture() {
         return dependencyState.consumeAndPropagate(input)
       },
     },
-    runExclusive: async (_target, effect) => effect(),
+    runExclusive: async (_target, effect) => {
+      exclusiveCalls += 1
+      return effect()
+    },
     loadConfig: async (imageTarget) => structuredClone(configs.get(imageTarget.nodeId)!),
     adoptAsset: async (imageTarget, _revision, assetId) => {
       adopted.push(imageTarget.nodeId)
@@ -122,10 +144,19 @@ function createFixture() {
     get canvas() { return canvas },
     set canvas(value: CanvasDocument) { canvas = value },
     get dependencyProjectionCalls() { return dependencyProjectionCalls },
+    get exclusiveCalls() { return exclusiveCalls },
   }
 }
 
 describe('Canvas 图片候选批次 Service', () => {
+  test('Given 调用方已持 Canvas 串行权 When reconcileLocked Then 不重复获取非重入锁', async () => {
+    const fixture = createFixture()
+
+    await expect(fixture.service.reconcileLocked(fixture.target)).resolves.toEqual({ publications: [] })
+
+    expect(fixture.exclusiveCalls).toBe(0)
+  })
+
   test('Given 首个批次监听器抛错 When Job 终态完成登记 Then 持久化成功且继续通知后续监听器', async () => {
     const fixture = createFixture()
     await fixture.service.createBatch({
@@ -493,6 +524,84 @@ describe('Canvas 图片候选批次 Service', () => {
     })
   })
 
+  test('Given 历史素材采用已提交且用户后来改动节点 When 同 batchId 重放 Then 返回原 receipt 且不回退当前事实', async () => {
+    const fixture = createFixture()
+    const input = {
+      ...fixture.target,
+      nodeId: 'node-0',
+      imageModuleId: 'module-0',
+      jobId: 'job-history',
+      assetId: 'asset-history',
+      currentAssetId: 'old-0',
+      currentConfigRevision: 1,
+      batchId: 'batch-history-replay',
+    }
+    const first = await fixture.service.adoptExistingAssetLocked(input)
+    /** 模拟原操作完成后用户又采用了其它素材，重放不得写回旧值。 */
+    fixture.configs.set('node-0', {
+      ...fixture.configs.get('node-0')!,
+      revision: 3,
+      adoptedAssetId: 'asset-later',
+    })
+    fixture.canvas = {
+      ...fixture.canvas,
+      revision: fixture.canvas.revision + 1,
+      nodes: fixture.canvas.nodes.map((node) => node.id === 'node-0' && node.kind === 'image'
+        ? { ...node, adoptedAssetId: 'asset-later' }
+        : node),
+    }
+    const beforeReplayCanvas = structuredClone(fixture.canvas)
+    const beforeReplayConfig = structuredClone(fixture.configs.get('node-0'))
+
+    const replay = await fixture.service.adoptExistingAssetLocked({
+      ...input,
+      /** IPC 重放时只能读取当前素材，但必须继续传原请求的 expected revision。 */
+      currentAssetId: 'asset-later',
+    })
+
+    expect(replay).toEqual(first)
+    expect(fixture.configs.get('node-0')).toEqual(beforeReplayConfig)
+    expect(fixture.canvas).toEqual(beforeReplayCanvas)
+    expect(fixture.adopted).toEqual(['node-0'])
+  })
+
+  test('Given 历史素材批次已保存 ready 但采用响应中断 When 同 batchId 重放 Then 从原候选继续提交', async () => {
+    const fixture = createFixture()
+    const batchId = 'batch-history-ready'
+    await fixture.service.createBatchLocked({
+      ...fixture.target,
+      batchId,
+      source: 'single',
+      sourceSessionId: null,
+      sourceToolCallId: null,
+      entries: [{
+        nodeId: 'node-0', imageModuleId: 'module-0',
+        initialAdoptedAssetId: 'old-0', initialConfigRevision: 1,
+        jobId: 'job-history',
+      }],
+    })
+    const created = fixture.batches.get(batchId)!
+    fixture.batches.set(batchId, {
+      ...created,
+      status: 'ready',
+      entries: [{
+        ...created.entries[0]!,
+        candidateAssetId: 'asset-history',
+        status: 'candidate',
+      }],
+    })
+
+    const result = await fixture.service.adoptExistingAssetLocked({
+      ...fixture.target,
+      nodeId: 'node-0', imageModuleId: 'module-0', jobId: 'job-history',
+      assetId: 'asset-history', currentAssetId: 'old-0', currentConfigRevision: 1,
+      batchId,
+    })
+
+    expect(result.status).toBe('adopted')
+    expect(fixture.adopted).toEqual(['node-0'])
+  })
+
   test('Given 下游已有 128 个来源 When 正式采用新增来源 Then 在 intent 和模块写入前稳定拒绝', async () => {
     const fixture = createFixture()
     const downstream: CanvasNode = {
@@ -681,7 +790,7 @@ describe('Canvas 图片候选批次 Service', () => {
         })
       }
 
-      await expect(fixture.service.reconcile(fixture.target)).resolves.toBeUndefined()
+      const reconciliation = await fixture.service.reconcile(fixture.target)
 
       expect([...fixture.configs.values()].slice(0, 2).map((config) => config.revision)).toEqual([2, 2])
       expect(fixture.batches.get('batch-1')?.status).toBe('adopted')
@@ -692,6 +801,52 @@ describe('Canvas 图片候选批次 Service', () => {
       expect(fixture.canvas.nodes.find((node) => node.id === 'downstream-recovery')?.upstreamChange).toEqual({
         sourceNodeIds: ['node-0', 'node-1', 'pending-source'], changedAt: 100,
       })
+      expect(reconciliation.publications).toEqual([{
+        document: fixture.canvas,
+        imageTargets: fixture.entries.slice(0, 2).map((entry) => ({
+          ...fixture.target,
+          nodeId: entry.nodeId,
+          imageModuleId: entry.imageModuleId,
+        })),
+      }])
+      await expect(fixture.service.reconcile(fixture.target)).resolves.toEqual({ publications: [] })
+      expect(fixture.canvas.revision).toBe(4)
     },
   )
+
+  test('Given 未完成 intent 的模块事实已漂移 When locked 恢复 Then fail closed 且不覆盖现有事实', async () => {
+    const fixture = createFixture()
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-drift', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    const beforeCanvas = structuredClone(fixture.canvas)
+    fixture.configs.set('node-0', {
+      ...fixture.configs.get('node-0')!, revision: 7, adoptedAssetId: 'foreign-asset',
+    })
+    fixture.intents.set('operation-drift', {
+      schemaVersion: 1,
+      operationId: 'operation-drift',
+      batchId: 'batch-drift',
+      ...fixture.target,
+      mode: 'all',
+      baseCanvasRevision: fixture.canvas.revision,
+      entries: [{
+        nodeId: 'node-0', imageModuleId: 'module-0', oldAssetId: 'old-0',
+        candidateAssetId: 'new-0', expectedConfigRevision: 1, committedConfigRevision: null,
+      }],
+      expectedGraphSha256: '0'.repeat(64),
+      state: 'prepared',
+      createdAt: 100,
+      updatedAt: 100,
+    })
+
+    const reconciliation = await fixture.service.reconcileLocked(fixture.target)
+
+    expect(reconciliation.publications).toEqual([])
+    expect(reconciliation.error?.message).toBe('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+    expect(fixture.canvas).toEqual(beforeCanvas)
+    expect(fixture.configs.get('node-0')).toMatchObject({ revision: 7, adoptedAssetId: 'foreign-asset' })
+    expect(fixture.intents.get('operation-drift')?.state).toBe('prepared')
+  })
 })

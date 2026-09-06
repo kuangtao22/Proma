@@ -10,6 +10,8 @@ import {
   parseCanvasWebviewPreviewSnapshot,
   parseCanvasWebviewPreviewTarget,
   parseCanvasImageJobControlInput,
+  parseListCanvasImageActivityInput,
+  parseCanvasImageJobActivities,
   parseCanvasWebviewTarget,
   parseCanvasImageModuleConfig,
   parseCanvasImageModuleSnapshot,
@@ -1105,6 +1107,24 @@ describe('Canvas 图共享合同', () => {
     })).toThrow('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   })
 
+  test('Given 画布活动摘要 When 解析输入和输出 Then 拒绝跨画布记录和完整任务私有字段', () => {
+    /** 活动读取只接收图身份和显式磁盘重同步开关。 */
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const activity = {
+      id: 'job-1', projectId: target.projectId,
+      target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: 'node-1', imageModuleId: 'module-1' },
+      status: 'running', createdAt: 1, updatedAt: 2,
+    } as const
+    expect(parseListCanvasImageActivityInput({ ...target, resync: true })).toEqual({ ...target, resync: true })
+    expect(() => parseListCanvasImageActivityInput({ ...target, resync: 'true' })).toThrow()
+    expect(() => parseListCanvasImageActivityInput({ ...target, nodeId: 'node-1' })).toThrow()
+    expect(parseCanvasImageJobActivities([activity], target)).toEqual([activity])
+    expect(() => parseCanvasImageJobActivities([{ ...activity, prompt: 'private' }], target)).toThrow()
+    expect(() => parseCanvasImageJobActivities([{ ...activity, projectId: 'project-2' }], target)).toThrow()
+    expect(() => parseCanvasImageJobActivities([{ ...activity, target: { ...activity.target, canvasId: 'canvas-2' } }], target)).toThrow()
+    expect(() => parseCanvasImageJobActivities([{ ...activity, updatedAt: -1 }], target)).toThrow()
+  })
+
   test('Given 图片任务控制输入 When 严格解析 Then 绑定完整模块身份并拒绝未知字段', () => {
     /** 合法任务控制输入必须携带完整图片模块身份。 */
     const input = {
@@ -1346,6 +1366,7 @@ describe('Canvas 图共享合同', () => {
       LOAD_WEBVIEW: 'canvas:load-webview',
       LOAD_WEBVIEW_PREVIEW: 'canvas:load-webview-preview',
       LOAD_IMAGE_MODULE: 'canvas:load-image-module',
+      LIST_IMAGE_ACTIVITY: 'canvas:list-image-activity',
       SAVE_IMAGE_MODULE: 'canvas:save-image-module',
       CREATE_IMAGE_JOB: 'canvas:create-image-job',
       CANCEL_IMAGE_JOB: 'canvas:cancel-image-job',
@@ -1374,6 +1395,11 @@ describe('Canvas 图共享合同', () => {
       SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
       CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
       AGENT_BINDINGS_CHANGED: 'canvas:agent-bindings-changed',
+      LIST_WORKFLOW_RUNS: 'canvas:list-workflow-runs',
+      GET_WORKFLOW_RUN: 'canvas:get-workflow-run',
+      RESUME_WORKFLOW_RUN: 'canvas:resume-workflow-run',
+      CANCEL_WORKFLOW_RUN: 'canvas:cancel-workflow-run',
+      WORKFLOW_RUN_CHANGED: 'canvas:workflow-run-changed',
       CHANGED: 'canvas:changed',
     })
     expect(loadInput).toEqual({ projectId: 'project-1', canvasId: 'canvas-1' })

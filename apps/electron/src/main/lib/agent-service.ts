@@ -112,6 +112,7 @@ const unavailableCanvasReferenceResolver: CanvasNodeReferenceResolver = {
 export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInput>(
   input: T,
   extensions: AgentRunExtensions = {},
+  dialogOwnerWebContentsId?: number,
 ): PreparedAgentCanvasMessage<T> {
   /** runtime 同时提供唯一引用解析器和工具 facade；缺失时仅允许无引用消息继续。 */
   const runtime = getCanvasToolProviderRuntime()
@@ -142,6 +143,7 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
       ((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'
         ? 'plan'
         : 'execute',
+    ...(dialogOwnerWebContentsId !== undefined ? { dialogOwnerWebContentsId } : {}),
   })
   return {
     ...prepared,
@@ -416,7 +418,7 @@ export async function runAgent(
   terminalObserver?: AgentRunTerminalObserver,
 ): Promise<void> {
   /** 引用解析位于 IPC 接管完成前，失败必须直接拒绝调用方。 */
-  const prepared = prepareAgentRun(input, extensions)
+  const prepared = prepareAgentRun(input, extensions, webContents.id)
   return runPreparedAgent(prepared, webContents, terminalObserver)
 }
 
@@ -978,7 +980,8 @@ export async function submitOrEnqueueAgentMessage(
 ): Promise<AgentSubmitOrEnqueueResult> {
   return routeAgentSubmitOrEnqueue(input, {
     isActive: (sessionId) => orchestrator.isActive(sessionId),
-    prepareNow: (candidate) => prepareAgentRun(createAgentQueueNowInput(candidate)),
+    /** 立即注入仍属于当前可见 Renderer 交互，保存窗口必须绑定本次 IPC sender。 */
+    prepareNow: (candidate) => prepareAgentRun(createAgentQueueNowInput(candidate), {}, webContents.id),
     injectPrepared: async (prepared) => {
       registerWebContents(input.sessionId, webContents)
       await queuePreparedAgentMessage(prepared)

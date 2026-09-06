@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { AGENT_RUNTIME_METHODS } from '@proma/shared'
 import {
-  ASK_USER_QUESTION_TIMEOUT_MS,
   CANVAS_EXECUTION_TOOL_TIMEOUT_MS,
   DESIGN_IMAGE_TOOL_TIMEOUT_MS,
   getParentRequestTimeoutMs,
@@ -31,9 +30,21 @@ describe('Agent utility 主进程请求超时', () => {
     })).toBe(CANVAS_EXECUTION_TOOL_TIMEOUT_MS)
   })
 
-  test('Given AskUserQuestion When 等待用户输入 Then 保留交互长时限', () => {
+  test('Given AskUserQuestion When 等待用户输入 Then 不设置墙钟时限', () => {
     expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL, {
       toolName: 'AskUserQuestion',
-    })).toBe(ASK_USER_QUESTION_TIMEOUT_MS)
+    })).toBeUndefined()
+  })
+
+  test('Given 普通工具等待用户审批 When 解析超时 Then 由运行生命周期负责终结而不设置墙钟时限', () => {
+    expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL, {
+      toolName: 'Write',
+    })).toBeUndefined()
+  })
+
+  test('Given canvas_run_nodes 批量排队并启动图片任务 When 解析超时 Then 使用十五分钟长时限', () => {
+    expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL, {
+      toolName: 'canvas_run_nodes',
+    })).toBe(CANVAS_EXECUTION_TOOL_TIMEOUT_MS)
   })
 })

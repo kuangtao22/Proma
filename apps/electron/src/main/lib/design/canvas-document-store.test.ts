@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   CANVAS_DOCUMENT_VERSION,
   CANVAS_UPSTREAM_CHANGE_MAX_SOURCE_IDS,
@@ -885,6 +885,53 @@ describe('CanvasDocumentStore', () => {
     const stable = fixture.store.load({ projectId: 'project-1', canvasId: 'canvas-1' })
     expect(stable.recoveredFrom).toBeUndefined()
     expect(stable.document).toEqual(recovered.document)
+  })
+
+  test.each([
+    ['tmp', '.tmp'],
+    ['backup', '.bak'],
+  ] as const)('Given 主文件损坏且合法 %s 候选 When 只读快照 Then 要求恢复且候选零改动', (source, suffix) => {
+    let writeCalls = 0
+    let removeCalls = 0
+    const fixture = createFixture({
+      writeJsonFileAtomicSecure: () => { writeCalls += 1 },
+      removeFileAtomic: () => { removeCalls += 1 },
+    })
+    writeDocument(fixture.documentPath, { broken: true })
+    writeDocument(`${fixture.documentPath}${suffix}`, createConnectedDocument())
+    const mainBefore = readFileSync(fixture.documentPath, 'utf8')
+    const recoveryBefore = readFileSync(`${fixture.documentPath}${suffix}`, 'utf8')
+
+    expect(() => fixture.store.readSnapshot({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toThrow(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${source}`)
+    expect(readFileSync(fixture.documentPath, 'utf8')).toBe(mainBefore)
+    expect(readFileSync(`${fixture.documentPath}${suffix}`, 'utf8')).toBe(recoveryBefore)
+    expect(writeCalls).toBe(0)
+    expect(removeCalls).toBe(0)
+  })
+
+  test('Given 主文件合法且 tmp 更新 When 只读快照 Then 仍返回主文件且不消费 tmp', () => {
+    const fixture = createFixture()
+    writeDocument(fixture.documentPath, createConnectedDocument(2))
+    writeDocument(`${fixture.documentPath}.tmp`, createConnectedDocument(4))
+    const temporaryBefore = readFileSync(`${fixture.documentPath}.tmp`, 'utf8')
+
+    const snapshot = fixture.store.readSnapshot({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(snapshot.document.revision).toBe(2)
+    expect(readFileSync(`${fixture.documentPath}.tmp`, 'utf8')).toBe(temporaryBefore)
+  })
+
+  test('Given Canvas 根尚未创建 When 只读快照 Then 返回内存空文档且不创建目录', () => {
+    const fixture = createFixture()
+    const canvasRoot = dirname(fixture.documentPath)
+    expect(existsSync(canvasRoot)).toBe(false)
+
+    const snapshot = fixture.store.readSnapshot({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(snapshot.document.revision).toBe(0)
+    expect(snapshot.document.nodes).toEqual([])
+    expect(existsSync(canvasRoot)).toBe(false)
   })
 
   test('Given 候选读取后同 inode 被原地改写 When load Then 内容状态变化 fail closed', () => {

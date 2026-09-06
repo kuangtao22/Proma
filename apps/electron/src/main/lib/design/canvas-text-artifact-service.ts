@@ -28,7 +28,10 @@ import type {
   CanvasArtifactRevisionSnapshot,
   CanvasArtifactRevisionStore,
 } from './canvas-artifact-revision-store'
-import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
+import type {
+  CanvasBatchOperationIntent,
+  CanvasBatchOperationResult,
+} from './canvas-agent-batch-operation'
 import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   WEBVIEW_ARTIFACT_DESCRIPTOR,
@@ -47,6 +50,11 @@ export interface CanvasTextArtifactServiceUpdateInput extends UpdateCanvasTextAr
   source: CanvasTextArtifactChangeSource
 }
 
+/** 文本历史采用可携带 Host 验证后的 Agent source，旧 UI 调用保持缺省。 */
+export interface CanvasTextArtifactServiceAdoptInput extends AdoptCanvasTextArtifactRevisionInput {
+  source?: Extract<CanvasTextArtifactChangeSource, { type: 'agent' }>
+}
+
 /** 单节点图提交使用的内部严格输入。 */
 export interface CanvasTextArtifactGraphCommitInput extends CanvasTarget {
   operationId: string
@@ -60,6 +68,13 @@ export interface CanvasTextArtifactGraphCommitInput extends CanvasTarget {
 /** 文本产物服务依赖的单节点图写边界。 */
 export interface CanvasTextArtifactGraphWriter {
   commit: (input: CanvasTextArtifactGraphCommitInput) => Promise<CanvasDocument>
+  /** 调用方已持有 Canvas serializer 与 workspace lease 时提交 Agent batch。 */
+  commitLocked: (input: CanvasTextArtifactGraphCommitInput) => Promise<CanvasDocument>
+  /** 在任何当前图 CAS 前按可信 source 查询原 batch receipt。 */
+  findReplayLocked: (
+    target: CanvasTarget,
+    source: CanvasChangeSource,
+  ) => Promise<CanvasBatchOperationIntent | null>
 }
 
 /** 用户图写与 Agent batch 分支使用的依赖。 */
@@ -68,6 +83,11 @@ export interface CanvasTextArtifactGraphWriterDependencies {
   dependencyState: CanvasDependencyStateService
   batch: {
     execute: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
+    executeLocked?: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
+    findReplayLocked?: (
+      target: CanvasTarget,
+      source: CanvasChangeSource,
+    ) => Promise<CanvasBatchOperationIntent | null>
   }
   now?: () => number
 }
@@ -75,6 +95,11 @@ export interface CanvasTextArtifactGraphWriterDependencies {
 /** 经过 save dialog 授权后的文本产物导出输入。 */
 export interface ExportCanvasTextArtifactToPathInput extends CanvasTextArtifactTarget {
   targetPath: string
+}
+
+/** Agent 精确版本导出额外携带显式覆盖决策。 */
+export interface ExportCanvasTextArtifactVersionToPathInput extends ExportCanvasTextArtifactToPathInput {
+  overwrite: boolean
 }
 
 /** 文本产物事务服务的窄依赖。 */
@@ -92,8 +117,9 @@ export interface CanvasTextArtifactService {
   read: (target: CanvasTextArtifactTarget) => Promise<CanvasTextArtifactSnapshot>
   listVersions: (identity: CanvasTextArtifactIdentity) => Promise<CanvasArtifactRevisionSummary[]>
   update: (input: CanvasTextArtifactServiceUpdateInput) => Promise<CanvasTextArtifactMutationResult>
-  adopt: (input: AdoptCanvasTextArtifactRevisionInput) => Promise<CanvasTextArtifactMutationResult>
+  adopt: (input: CanvasTextArtifactServiceAdoptInput) => Promise<CanvasTextArtifactMutationResult>
   export: (input: ExportCanvasTextArtifactToPathInput) => Promise<void>
+  exportVersion: (input: ExportCanvasTextArtifactVersionToPathInput) => Promise<void>
 }
 
 /** 固定类别的文本产物适配器，供 Registry 路由真实业务方法。 */
@@ -236,8 +262,8 @@ function assertExpectedExtension(filePath: string, kind: CanvasTextArtifactKind)
 export function createCanvasTextArtifactGraphWriter(
   dependencies: CanvasTextArtifactGraphWriterDependencies,
 ): CanvasTextArtifactGraphWriter {
-  return {
-    commit: async (input) => {
+  /** 构建单次正文 revision 与下游提示的原子节点 mutation。 */
+  const createMutation = (input: CanvasTextArtifactGraphCommitInput) => {
       /** 依赖投影与 producer 正式 revision 在同一批节点中提交。 */
       const dependencyProjection = dependencies.dependencyState.consumeAndPropagate({
         document: input.document,
@@ -256,7 +282,15 @@ export function createCanvasTextArtifactGraphWriter(
       const nodes = dependencyProjection.nodes.map((node) => (
         node.id === producerNode.id ? producerNode : node
       ))
-      const mutation = { type: 'upsert-nodes' as const, nodes }
+      return { type: 'upsert-nodes' as const, nodes }
+  }
+
+  /** 根据锁所有权选择 Agent batch 入口，用户写始终直接提交 DocumentStore。 */
+  const commit = async (
+    input: CanvasTextArtifactGraphCommitInput,
+    locked: boolean,
+  ): Promise<CanvasDocument> => {
+      const mutation = createMutation(input)
       if (!input.source) {
         return dependencies.documents.mutate(
           { projectId: input.projectId, canvasId: input.canvasId },
@@ -275,9 +309,43 @@ export function createCanvasTextArtifactGraphWriter(
         sourceToolCallId: input.source.toolCallId,
       })
       /** batch 返回的文档是本次 Agent 图提交的权威结果。 */
-      const result = await dependencies.batch.execute(envelope)
+      const result = locked
+        ? await dependencies.batch.executeLocked?.(envelope)
+        : await dependencies.batch.execute(envelope)
+      if (!result) throw new Error('CANVAS_BATCH_LOCKED_EXECUTION_UNAVAILABLE')
       return result.document
-    },
+  }
+
+  return {
+    commit: (input) => commit(input, false),
+    commitLocked: (input) => commit(input, true),
+    findReplayLocked: (target, source) => (
+      dependencies.batch.findReplayLocked?.(target, source) ?? Promise.resolve(null)
+    ),
+  }
+}
+
+/** 校验 committed batch 确实是同一文本采用，而非 source 下的其它图操作。 */
+function requireTextAdoptionReplay(
+  intent: CanvasBatchOperationIntent,
+  input: CanvasTextArtifactServiceAdoptInput,
+): void {
+  const operation = intent.operations[0]
+  if (intent.state !== 'committed'
+    || intent.baseRevision !== input.expectedCanvasRevision
+    || intent.operations.length !== 1
+    || operation?.type !== 'upsert-nodes') {
+    throw new Error('CANVAS_TEXT_ARTIFACT_REPLAY_CONFLICT')
+  }
+  const matchingNodes = operation.nodes.filter((node) => node.id === input.nodeId)
+  const node = matchingNodes[0]
+  if (matchingNodes.length !== 1
+    || !node
+    || !isTextNode(node)
+    || node.kind !== input.kind
+    || getNodeContentId(node) !== input.contentId
+    || node.contentRevision !== input.revision) {
+    throw new Error('CANVAS_TEXT_ARTIFACT_REPLAY_CONFLICT')
   }
 }
 
@@ -289,7 +357,7 @@ export function createCanvasTextArtifactService(
   const atomicWrite = dependencies.writeTextFileAtomic ?? writeTextFileAtomic
 
   /** 加载权威图并校验目标节点身份，允许只读历史 revision。 */
-  const loadAuthoritativeTarget = (target: CanvasTextArtifactTarget): {
+  const loadAuthoritativeTarget = (target: CanvasTextArtifactIdentity): {
     snapshot: CanvasWorkspaceSnapshot
     node: CanvasTextNode
   } => {
@@ -392,7 +460,7 @@ export function createCanvasTextArtifactService(
       }
       /** 图只切换当前节点的采用 revision。 */
       const nextNode = replaceNodeContentRevision(currentNode, prepared.record.revision)
-      await dependencies.graph.commit({
+      const graphInput: CanvasTextArtifactGraphCommitInput = {
         projectId: input.projectId,
         canvasId: input.canvasId,
         operationId: input.operationId,
@@ -402,7 +470,9 @@ export function createCanvasTextArtifactService(
         ...(input.source.type === 'agent'
           ? { source: toCanvasChangeSource(input.source) }
           : {}),
-      })
+      }
+      if (input.source.type === 'agent') await dependencies.graph.commitLocked(graphInput)
+      else await dependencies.graph.commit(graphInput)
       /** 图提交后使用完整节点身份构造采用目标。 */
       const target: CanvasTextArtifactTarget = {
         projectId: input.projectId,
@@ -423,6 +493,29 @@ export function createCanvasTextArtifactService(
       return { snapshot, artifact: toArtifactSnapshot(target, committedRevision) }
     },
     adopt: async (input) => {
+      /** Agent durable source 必须在当前图基线判断前查询，避免成功重放覆盖后续编辑。 */
+      if (input.source) {
+        const source = toCanvasChangeSource(input.source)
+        const replay = await dependencies.graph.findReplayLocked(input, source)
+        if (replay) {
+          requireTextAdoptionReplay(replay, input)
+          const { snapshot } = loadAuthoritativeTarget(input)
+          const selected = await dependencies.revisions.read(input, {
+            kind: input.kind,
+            contentId: input.contentId,
+            revision: input.revision,
+          })
+          const target: CanvasTextArtifactTarget = {
+            projectId: input.projectId,
+            canvasId: input.canvasId,
+            nodeId: input.nodeId,
+            kind: input.kind,
+            contentId: input.contentId,
+            contentRevision: input.revision,
+          }
+          return { snapshot, artifact: toArtifactSnapshot(target, selected) }
+        }
+      }
       /** 采用也必须建立在权威图与当前正文双重基线上。 */
       const current = dependencies.documents.load(input)
       const currentNode = requireMutationBaseline(
@@ -448,14 +541,17 @@ export function createCanvasTextArtifactService(
       }
       requireRevisionSnapshot(selected, target)
       /** 图只切换采用 revision，不创建新历史版本。 */
-      await dependencies.graph.commit({
+      const graphInput: CanvasTextArtifactGraphCommitInput = {
         projectId: input.projectId,
         canvasId: input.canvasId,
         operationId: input.operationId,
         expectedCanvasRevision: input.expectedCanvasRevision,
         document: current.document,
         node: replaceNodeContentRevision(currentNode, input.revision),
-      })
+        ...(input.source ? { source: toCanvasChangeSource(input.source) } : {}),
+      }
+      if (input.source) await dependencies.graph.commitLocked(graphInput)
+      else await dependencies.graph.commit(graphInput)
       /** prepared 恢复候选被采用后同样进入 committed 状态。 */
       const snapshot = await finalizeRevision(target)
       /** reconcile 后重新读取，确保返回正文与最终版本事实一致。 */
@@ -470,6 +566,12 @@ export function createCanvasTextArtifactService(
       assertExpectedExtension(input.targetPath, input.kind)
       /** 导出只能消费节点当前采用版本，历史版本需先显式采用。 */
       const artifact = await readCommittedTarget(input, true)
+      atomicWrite(input.targetPath, artifact.content)
+    },
+    exportVersion: async (input) => {
+      assertExpectedExtension(input.targetPath, input.kind)
+      /** 精确版本导出只读取已提交 revision，不改变节点当前采用版本。 */
+      const artifact = await readCommittedTarget(input, false)
       atomicWrite(input.targetPath, artifact.content)
     },
   }

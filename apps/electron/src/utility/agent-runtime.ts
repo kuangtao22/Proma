@@ -12,6 +12,10 @@ import {
   type AgentRuntimeState,
 } from '@proma/shared'
 import { PiAgentAdapter, type PiAgentQueryOptions } from '../main/lib/adapters/pi-agent-adapter'
+import {
+  createCapabilityCancelRequest,
+  ParentRequestRegistry,
+} from './agent-runtime-parent-request-registry'
 import { getParentRequestTimeoutMs } from './agent-runtime-request-timeout'
 
 type MessagePortLike = {
@@ -27,12 +31,6 @@ type ParentPortLike = {
 }
 
 type RuntimeRequest = AgentRuntimeRequest & { payload?: Record<string, unknown> }
-type PendingParentRequest = {
-  resolve: (value: unknown) => void
-  reject: (reason: unknown) => void
-  timer: ReturnType<typeof setTimeout>
-  cleanup: () => void
-}
 type ActiveQuery = {
   queryId: string
   sessionId: string
@@ -45,7 +43,7 @@ const bootId = randomUUID()
 let runtimePort: MessagePortLike | undefined
 let status: AgentRuntimeState['status'] = 'starting'
 let activeQuery: ActiveQuery | undefined
-const parentRequests = new Map<string, PendingParentRequest>()
+const parentRequests = new ParentRequestRegistry()
 const capabilityAbortControllers = new Map<string, AbortController>()
 const piAdapter = new PiAgentAdapter()
 const parentPort = (process as typeof process & { parentPort?: ParentPortLike }).parentPort
@@ -298,11 +296,7 @@ async function handleShutdown(request: RuntimeRequest): Promise<void> {
   status = 'stopping'
   if (activeQuery) piAdapter.abort(activeQuery.sessionId)
   piAdapter.dispose()
-  for (const pending of parentRequests.values()) {
-    pending.cleanup()
-    pending.reject(new Error('Agent runtime is shutting down'))
-  }
-  parentRequests.clear()
+  parentRequests.rejectAll(new Error('Agent runtime is shutting down'))
   emitState()
   respond(request, { accepted: true })
   setTimeout(() => {
@@ -325,61 +319,21 @@ function requestParent<Result = unknown>(
     queryId: activeQuery?.queryId,
   }, bootId)
 
-  return new Promise<Result>((resolve, reject) => {
-    let removeAbortListener = (): void => {}
-    const cleanup = (): void => {
-      clearTimeout(timer)
-      removeAbortListener()
-    }
-    const timer = setTimeout(() => {
-      if (!parentRequests.delete(request.requestId)) return
-      cleanup()
-      port.postMessage(createAgentRuntimeRequest(
-        AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
-        { requestId: request.requestId },
-        { sessionId: activeQuery?.sessionId, queryId: activeQuery?.queryId },
-        bootId,
-      ))
-      reject(new Error(`Main runtime request timed out: ${method}`))
-    }, timeoutMs)
-    parentRequests.set(request.requestId, {
-      resolve: (value) => resolve(value as Result),
-      reject,
-      timer,
-      cleanup,
-    })
-    if (signal) {
-      const abort = (): void => {
-        if (!parentRequests.delete(request.requestId)) return
-        cleanup()
-        port.postMessage(createAgentRuntimeRequest(
-          AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
-          { requestId: request.requestId },
-          { sessionId: activeQuery?.sessionId, queryId: activeQuery?.queryId },
-          bootId,
-        ))
-        reject(new Error(`Main runtime request aborted: ${method}`))
-      }
-      if (signal.aborted) {
-        abort()
-        return
-      }
-      signal.addEventListener('abort', abort, { once: true })
-      removeAbortListener = () => signal.removeEventListener('abort', abort)
-    }
-    port.postMessage(request)
+  return parentRequests.wait<Result>({
+    requestId: request.requestId,
+    method,
+    timeoutMs,
+    signal,
+    sendRequest: () => port.postMessage(request),
+    sendCancel: () => port.postMessage(createCapabilityCancelRequest(request)),
   })
 }
 
 function resolveParentRequest(response: AgentRuntimeResponse): void {
-  const pending = parentRequests.get(response.requestId)
-  if (!pending) return
-  parentRequests.delete(response.requestId)
-  pending.cleanup()
-  if (response.ok) pending.resolve(response.payload)
+  if (response.ok) parentRequests.resolve(response.requestId, response.payload)
   else {
     const error = response.error ?? { code: 'runtime.parent_request_failed', message: `Main request failed: ${response.method}` }
-    pending.reject(Object.assign(new Error(error.message), error))
+    parentRequests.reject(response.requestId, Object.assign(new Error(error.message), error))
   }
 }
 

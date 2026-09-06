@@ -2,7 +2,7 @@
 name: canvas-production
 description: Proma 画布生产与 Agent 编排 Skill。用户希望创建或迭代网页原型、图片设计稿、文档、产品套图、整套交互视觉稿、漫剧分镜、程序规划或其他需要多个可关联产物的任务时使用。负责判断是否进入画布、规划节点与关系、按需读取和局部更新产物，并通过 Proma 内置 canvas_* 工具执行；普通代码修改、一次性文本回答或不需要长期产物图的任务不要强行转入画布。
 group: proma
-version: "1.0.6"
+version: "1.0.10"
 ---
 
 # 画布生产
@@ -44,7 +44,7 @@ version: "1.0.6"
 
 任务需要独立角色长期承接分镜、视觉、文案或其它分支时，普通 Agent 自行调用 `canvas_create_agent` 创建 Canvas Agent 节点，并根据真实输入建立关系；不得声称没有创建能力，也不得把这一步转交给用户手工完成。当前会话位于 Canvas Agent 节点时，不再创建下级 Agent，由当前 Canvas Agent 直接完成自身分支。
 
-普通 Agent 可以使用 `canvas_update_agent_config` 为 Canvas Agent 设置长期职责、模型和已安装的专业 Skill，再读取配置确认版本。需要专业分工时，优先复用用户已启用且与任务匹配的 Skill；Skill 负责方法和领域质量，节点关系、运行权限与正式产物仍由 Host 合同控制。
+普通 Agent 先用 `canvas_read` 读取 Canvas Agent 的 `artifact.config` 与 `artifact.configRevision`，再用 `canvas_update_agent_config` 局部更新长期职责、模型和已安装的专业 Skill；`expectedGraphRevision` 使用读取结果的顶层 `revision`，`expectedConfigRevision` 使用 `artifact.configRevision`。配置因响应预算被省略而返回 `configOmitted` 时，缩小到单个节点重新读取，不猜测旧配置或版本。需要专业分工时，优先复用用户已启用且与任务匹配的 Skill；Skill 负责方法和领域质量，节点关系、运行权限与正式产物仍由 Host 合同控制。
 
 Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入节点，再用 `canvas_read` 读取真实内容和关系。不得把连线只当作视觉装饰，也不得仅凭节点标题猜测正文。任务要求生成脚本、首尾帧配置、文档或原型时，由当前 Canvas Agent 直接创建或更新下游产物，并建立准确关系；不得只输出一份“建议用户之后创建”的清单。
 
@@ -77,6 +77,8 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 2. 对存在当前正式采用图片的节点，再使用 `canvas_inspect_images` 每批最多读取四张缩略图。
 3. 从表现媒介、人物外观、服装道具、场景时间、色调光线、镜头构图、文字和品牌元素等维度汇总一致、异常与无法判断节点。
 4. 全部页面和批次完成后才能声称“已核对所有图片”；中途失败时说明已检查数量、未检查数量和原因。
+
+检查新生成但尚未采用的候选，或检查某个历史版本时，先用 `canvas_read` 读取目标节点的 `jobHistory`，从 `status=succeeded` 条目取任务 `id`，再调用 `canvas_inspect_images` 并传入 `versions: [{nodeId, jobId}]`。`nodeIds` 包含本次全部检查节点；未在 `versions` 中指定的节点继续读取正式图片，每批合计最多四张。返回的 `jobId` 标明实际检查版本，`adopted` 表示它是否已正式采用。`version-unavailable` 表示该任务没有可验证的现存输出，不得改读另一版本后冒充检查成功。只读预览不要求先采用，也不要求用户手动提供截图；视觉检查完成与设为默认是两个独立步骤。
 
 不得只比较提示词后声称已经看过图片，也不得使用画布截图或当前可见节点推断全量结论。用户未明确要求修正时，不更新提示词、不调用 `canvas_run_nodes`、不采用候选，也不自动创建报告文档。模型不能消费图片内容时，明确说明只能检查提示词与配置，不能冒充视觉核对。
 
@@ -131,9 +133,32 @@ WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存
 
 图片生成成功后先形成待验收候选。未获得采用授权时只汇报“候选已生成”，不得描述为已经正式替换；当前卡片和下游任务继续以已采用版本为准。用户明确采用后，再汇报采用数量、保留旧版数量和需要重新检查的下游节点。
 
+用户明确要求采用同一候选批次时，普通 Agent 使用 `canvas_adopt_candidate_batch`。`mode=all` 只适用于全部条目均已成功的整批采用；批次部分失败且用户明确接受全部现有成功候选时使用 `mode=succeeded`。任意单个历史或候选版本仍使用 `canvas_adopt_version`，不得把部分节点列表伪装成原子批次采用。批次采用不会自动继续工作流或再次生成图片。
+
 ### 6. 复读与继续迭代
 
 创建、更新或运行后，按需再次读取受影响节点，确认版本和关系。后续修改优先针对用户指出的节点和局部内容，不自动重做用户已经接受的其它产物。
+
+### 6.1 任务、版本、导出与恢复
+
+图片任务失败、卡住或需要核对执行事实时，先用 `canvas_get_task` 查看指定 `jobId`；只有用户明确要求停止或按原快照重试时，才分别使用 `canvas_cancel_task` 或 `canvas_retry_task`。重试可能产生模型费用，响应丢失后复用原调用身份，不自行创建另一条等价任务。
+
+产物历史统一先用 `canvas_list_versions` 分页发现精确版本。文档和 WebView 历史正文使用 `canvas_read_version`；图片版本继续使用 `canvas_inspect_images` 看真实缩略图。用户明确选择单个版本后才用 `canvas_adopt_version` 采用，并使用读取结果中的 Canvas revision 与版本 revision；用户明确选择整批时才用 `canvas_adopt_candidate_batch`。不能把“读取过”解释为允许采用。
+
+导出精确版本使用 `canvas_export_artifact`。单项导出可指定项目内相对文件；批量导出最多十六项，只选择一次项目内相对目录或外部目录，并逐项核对 `saved`、`failed`、`cancelled` 结果。项目外选择窗口只适用于当前可见交互会话，后台运行不能借用其它窗口。覆盖已有文件需要明确 `overwrite`，历史版本不可用时不得改导当前版本；相同工具调用重放必须复用原结果，不再次弹窗或重复写文件。
+
+回收区使用 `canvas_list_trash` 分页读取；用户明确要求恢复时才用 `canvas_restore_node`，并传入最新图 revision。异常 Canvas Agent 先从节点诊断确认允许重建，再由普通 Agent 使用 `canvas_rebuild_agent`；不能指定新旧 session ID，也不能重建仍在运行的 Agent。
+
+持久工作流先用 `canvas_list_workflows` 和 `canvas_get_workflow` 区分等待采用、可继续、完成和取消状态。只有用户明确要求继续或停止原运行时，才调用 `canvas_resume_workflow` 或 `canvas_cancel_workflow`；继续必须消费原预算和原身份，取消后不得因迟到事件重新启动。
+
+分页游标只属于原项目、Canvas、节点、列表类型和当时历史；返回 `CANVAS_OPERATION_CURSOR_INVALID` 时从同一列表首页重新读取，不把游标换到其它节点。工具响应达到预算时缩小节点、日志或分页范围，不能要求 Host 返回无限正文。
+
+工具可用范围以本轮实际 schema 和 `canvas_read.capabilities` 为准：
+
+- 普通 Agent 可使用当前已装配的全部任务、版本、导出、回收、重建和工作流操作。
+- 手动运行的 Canvas Agent 只可在固定画布内查询、停止或重试图片任务，读取或采用单个版本，导出产物，以及查看或恢复回收项；不能采用候选批次，不能重建自身，也不能控制父工作流。
+- 父编排的 Canvas Agent 只可读取任务状态、版本列表和历史正文；不能停止、重试、采用、导出、恢复、重建或继续工作流。
+- `plan` 模式只发现并执行只读操作：`canvas_get_task`、`canvas_list_versions`、`canvas_read_version`、`canvas_list_trash`、`canvas_list_workflows`、`canvas_get_workflow`。其它操作即使来自旧上下文也必须由 Host 拒绝。
 
 ## 节点关系语义
 

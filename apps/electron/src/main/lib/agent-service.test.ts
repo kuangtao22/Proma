@@ -58,6 +58,9 @@ describe('Agent service 迁移准入', () => {
   test('Given 普通项目、无项目与 Design 内部会话 When 准备运行 Then 仅普通项目在引用解析后注入 Canvas 单轮工具', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     expect(source).toContain('runtime.createRun(')
+    expect(source).toContain('prepareAgentRun(input, extensions, webContents.id)')
+    expect(source).toContain('prepareAgentRun(createAgentQueueNowInput(candidate), {}, webContents.id)')
+    expect(source).toContain('...(dialogOwnerWebContentsId !== undefined ? { dialogOwnerWebContentsId } : {})')
     expect(source).toContain('prepared.references')
     expect(source).toContain('isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)')
     expect(source).toContain("((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'")

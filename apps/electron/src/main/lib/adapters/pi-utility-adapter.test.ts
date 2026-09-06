@@ -3,6 +3,7 @@ import { AGENT_RUNTIME_METHODS, createAgentRuntimeRequest } from '@proma/shared'
 import type { AgentRuntimeEvent } from '@proma/shared'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
 import { createRunToolCallLimiter } from '../agent-run-tool-policy'
+import type { CanUseToolOptions } from '../agent-permission-service'
 
 /** 创建可控 Promise，用于模拟 utility runtime 的真实关闭耗时。 */
 function createDeferred(): {
@@ -90,6 +91,108 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 }
 
 describe('Pi utility 强制关闭合同', () => {
+  test('Given 主进程权限请求仍等待 When utility 取消对应 capability Then AbortSignal 终结审批且不影响 query', async () => {
+    /** 权限回调是否已进入等待。 */
+    let permissionEntered = false
+    /** 带可观察取消信号的 query 输入。 */
+    const input = {
+      ...createQueryInput('session-permission-cancel'),
+      canUseTool: async (_toolName: string, _toolInput: Record<string, unknown>, options: CanUseToolOptions) => (
+        new Promise((resolve) => {
+          permissionEntered = true
+          options.signal.addEventListener('abort', () => {
+            resolve({ behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID })
+          }, { once: true })
+        })
+      ),
+    } as PiAgentQueryOptions
+    /** 启动 query 以注册 capability 上下文。 */
+    const adapter = new PiUtilityAdapter()
+    /** 真实 async generator iterator。 */
+    const iterator = adapter.query(input, 'query-permission-cancel')[Symbol.asyncIterator]()
+    /** 等待 query 事件队列。 */
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    /** utility 发起的待审批能力请求。 */
+    const permissionRequest = createAgentRuntimeRequest(
+      AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL,
+      {
+        queryId: 'query-permission-cancel', sessionId: 'session-permission-cancel',
+        toolName: 'Write', input: { file_path: 'result.txt' }, options: { toolUseID: 'tool-permission-cancel' },
+      },
+      { queryId: 'query-permission-cancel', sessionId: 'session-permission-cancel' },
+    )
+    /** 主进程中仍在等待用户响应的权限结果。 */
+    const permissionResult = adapter.handleRuntimeRequest(permissionRequest)
+    await waitUntil(() => permissionEntered)
+
+    /** utility 在运行取消时发出的精确 capability 取消请求。 */
+    const cancelRequest = createAgentRuntimeRequest(
+      AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
+      { requestId: permissionRequest.requestId },
+      { queryId: 'query-permission-cancel', sessionId: 'session-permission-cancel' },
+    )
+    await expect(adapter.handleRuntimeRequest(cancelRequest)).resolves.toEqual({ accepted: true })
+    await expect(permissionResult).resolves.toEqual({
+      behavior: 'deny', message: '操作已中止', toolUseID: 'tool-permission-cancel',
+    })
+
+    runtimeStates[0]!.stop.resolve()
+    runtimeStates[0]!.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-permission-cancel', sessionId: 'session-permission-cancel', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
+  test('Given 主进程权限请求仍等待 When 用户停止整轮 query Then AbortSignal 终结审批', async () => {
+    /** 权限回调是否已进入等待。 */
+    let permissionEntered = false
+    /** 带可观察取消信号的 query 输入。 */
+    const input = {
+      ...createQueryInput('session-query-stop'),
+      canUseTool: async (_toolName: string, _toolInput: Record<string, unknown>, options: CanUseToolOptions) => (
+        new Promise((resolve) => {
+          permissionEntered = true
+          options.signal.addEventListener('abort', () => {
+            resolve({ behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID })
+          }, { once: true })
+        })
+      ),
+    } as PiAgentQueryOptions
+    /** 启动 query 以注册 capability 上下文。 */
+    const adapter = new PiUtilityAdapter()
+    /** 真实 async generator iterator。 */
+    const iterator = adapter.query(input, 'query-stop-permission')[Symbol.asyncIterator]()
+    /** 等待 query 事件队列。 */
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    /** 主进程中仍在等待用户响应的权限结果。 */
+    const permissionResult = adapter.handleRuntimeRequest(createAgentRuntimeRequest(
+      AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL,
+      {
+        queryId: 'query-stop-permission', sessionId: 'session-query-stop',
+        toolName: 'Write', input: { file_path: 'result.txt' }, options: { toolUseID: 'tool-query-stop' },
+      },
+      { queryId: 'query-stop-permission', sessionId: 'session-query-stop' },
+    ))
+    await waitUntil(() => permissionEntered)
+
+    adapter.abort('session-query-stop')
+
+    await expect(permissionResult).resolves.toEqual({
+      behavior: 'deny', message: '操作已中止', toolUseID: 'tool-query-stop',
+    })
+    expect(runtimeStates[0]!.calls).toContain(AGENT_RUNTIME_METHODS.QUERY_ABORT)
+
+    runtimeStates[0]!.stop.resolve()
+    runtimeStates[0]!.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-stop-permission', sessionId: 'session-query-stop', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
   test('Given utility run 的付费工具上限为一 When runtime 连续请求两次准入 Then 主进程共享同一本轮计数器', async () => {
     /** 被测 utility adapter。 */
     const adapter = new PiUtilityAdapter()

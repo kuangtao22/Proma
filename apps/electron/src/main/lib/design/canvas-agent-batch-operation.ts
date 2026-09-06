@@ -15,11 +15,18 @@ import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-nati
 import type { CanvasDocumentStore, CanvasTrustedDirectoryCapability } from './canvas-document-store'
 import type { CanvasContentNodeLifecycle } from './canvas-content-node-lifecycle'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
+import {
+  createCanvasBatchReplayArchiveName,
+  createNativeCanvasTransactionArchive,
+  type CanvasTransactionArchive,
+} from './canvas-transaction-archive'
 
 const MAX_BATCH_OPERATIONS = 128
 /** operations 预算为 48 KiB，为 64 KiB intent 协议保留元数据空间。 */
 const MAX_BATCH_BYTES = 48 * 1024
 const MAX_BATCH_INTENTS = 512
+/** 旧目录整理读取上界；新增事务容量仍固定为 512。 */
+const MAX_BATCH_INTENT_SCAN_ENTRIES = 4096
 const BATCH_INTENT_PATTERN = /^canvas-batch-([0-9a-f-]{36})\.json$/i
 
 export type CanvasBatchOperationState = 'prepared' | 'resources-created' | 'cleanup-pending' | 'rolled-back' | 'committed'
@@ -65,6 +72,8 @@ export interface CanvasAgentBatchOperationDependencies {
   publish: (target: CanvasTarget, document: CanvasDocument, source: CanvasChangeSource) => void | Promise<void>
   scanIntents?: (target: CanvasTarget) => Promise<CanvasBatchOperationIntent[]>
   writeIntent?: (intent: CanvasBatchOperationIntent) => Promise<StableDirectoryNativeWriteOutcome>
+  /** 测试注入的终态归档器；生产绑定目标 Canvas 根。 */
+  archive?: CanvasTransactionArchive
   contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletions' | 'restoreBatchDeletions' | 'assertBatchAgentNodeIdle'>
   agentNodeCreation: Pick<CanvasAgentNodeCreationService, 'inspectBatchSession' | 'prepareBatchSession' | 'cleanupBatchSession'>
 }
@@ -199,7 +208,7 @@ interface CanvasBatchLockedExecutionResult extends CanvasBatchOperationResult {
 }
 
 /** 锁内执行失败时保留已提交恢复事实与可选当前事实。 */
-class CanvasBatchExecutionError extends Error {
+export class CanvasBatchExecutionError extends Error {
   constructor(
     readonly causeError: Error,
     readonly reconciliationPublications: CanvasBatchPublication[],
@@ -216,6 +225,20 @@ class CanvasBatchReconciliationError extends Error {
     super(causeError.message, { cause: causeError })
     this.name = 'CanvasBatchReconciliationError'
   }
+}
+
+/** 跨主进程入口提取批恢复异常里的已提交事实；仅消费可信领域服务异常。 */
+export function unwrapCanvasBatchReconciliationError(error: unknown): {
+  error: Error
+  publications: CanvasBatchPublication[]
+} {
+  if (error instanceof Error && error.name === 'CanvasBatchReconciliationError') {
+    const candidate = error as Error & { causeError?: unknown; publications?: unknown }
+    if (candidate.causeError instanceof Error && Array.isArray(candidate.publications)) {
+      return { error: candidate.causeError, publications: candidate.publications as CanvasBatchPublication[] }
+    }
+  }
+  return { error: error instanceof Error ? error : new Error(String(error)), publications: [] }
 }
 
 /** 把未知异常规范化为可重抛的 Error。 */
@@ -446,6 +469,30 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   const randomUUID = dependencies.randomUUID ?? createRandomUUID
   const now = dependencies.now ?? Date.now
 
+  /** 取得测试归档器，或为生产目录创建精确分片访问。 */
+  const archiveFor = (target: CanvasTarget): CanvasTransactionArchive | null => {
+    if (dependencies.archive) return dependencies.archive
+    if (dependencies.scanIntents || dependencies.writeIntent) return null
+    const loaded = dependencies.store.loadWithDirectoryCapability?.(target)
+    return loaded
+      ? createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'))
+      : null
+  }
+
+  /** 按完整 source 身份精确读取历史 replay tombstone。 */
+  const loadArchivedReplay = async (
+    target: CanvasTarget,
+    source: CanvasBatchOperationIntent['source'],
+  ): Promise<CanvasBatchOperationIntent | null> => {
+    const content = await archiveFor(target)?.load(createCanvasBatchReplayArchiveName(source))
+    if (!content) return null
+    const value = JSON.parse(content) as unknown
+    if (!isRecord(value) || typeof value.operationId !== 'string') {
+      throw new Error('CANVAS_BATCH_INTENT_INVALID')
+    }
+    return parseIntent(value, target, value.operationId)
+  }
+
   /** 从可信基线重建磁盘 intent 的不可变计划，任何不一致都禁止进入资源副作用。 */
   const assertAuthoritativeIntentPlan = (intent: CanvasBatchOperationIntent): void => {
     try {
@@ -494,7 +541,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     const loaded = dependencies.store.loadWithDirectoryCapability?.(target)
     if (!loaded) throw new Error('CANVAS_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_BATCH_INTENTS, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
+    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_BATCH_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
     const intents: CanvasBatchOperationIntent[] = []
     for (const entry of result.entries) {
       const match = BATCH_INTENT_PATTERN.exec(entry.name)
@@ -504,6 +551,28 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     }
     directory.assertValid()
     return intents
+  }
+
+  /** 按完整 Agent source 精确查询 active 或 archive 中的原批次 receipt。 */
+  const findReplayLocked = async (
+    target: CanvasTarget,
+    source: CanvasChangeSource,
+  ): Promise<CanvasBatchOperationIntent | null> => {
+    /** source 三元组必须全部一致，同 toolCallId 的其它运行不构成重放。 */
+    const matches = (await scan(target)).filter((intent) => (
+      intent.source.sessionId === source.sessionId
+      && intent.source.runStartedAt === source.runStartedAt
+      && intent.source.toolCallId === source.toolCallId
+    ))
+    if (matches.length > 1) throw new Error('CANVAS_BATCH_OPERATION_CONFLICT')
+    if (matches[0]) return matches[0]
+    const archived = await loadArchivedReplay(target, source)
+    if (archived && (archived.source.sessionId !== source.sessionId
+      || archived.source.runStartedAt !== source.runStartedAt
+      || archived.source.toolCallId !== source.toolCallId)) {
+      throw new Error('CANVAS_BATCH_OPERATION_CONFLICT')
+    }
+    return archived
   }
 
   /** 通过稳定目录原子写 intent；rename 可见但不确定时只允许后续恢复。 */
@@ -713,6 +782,12 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
           throw error
         }
       }
+      const terminal = await scan(target)
+      await archiveFor(target)?.archiveEntries(terminal.map((intent) => ({
+        name: `canvas-batch-${intent.operationId}.json`,
+        aliases: [createCanvasBatchReplayArchiveName(intent.source)],
+        content: `${JSON.stringify(intent, null, 2)}\n`,
+      })))
     } catch (error) {
       const causeError = error instanceof CanvasBatchOperationPublishedError
         ? error.causeError : asError(error)
@@ -738,7 +813,12 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       if (envelope.operations.length === 0 || envelope.operations.length > MAX_BATCH_OPERATIONS || Buffer.byteLength(JSON.stringify(envelope.operations)) > MAX_BATCH_BYTES) {
         throw new Error('CANVAS_BATCH_OPERATION_LIMIT_EXCEEDED')
       }
-      const existing = (await scan(target)).find((intent) => intent.source.toolCallId === envelope.sourceToolCallId)
+      const replaySource = {
+        sessionId: envelope.sourceSessionId,
+        runStartedAt: envelope.sourceRunStartedAt,
+        toolCallId: envelope.sourceToolCallId,
+      }
+      const existing = await findReplayLocked(target, replaySource)
       if (existing) {
         if (existing.source.sessionId !== envelope.sourceSessionId || existing.source.runStartedAt !== envelope.sourceRunStartedAt
           || existing.baseRevision !== envelope.baseRevision || JSON.stringify(existing.operations) !== JSON.stringify(envelope.operations)) {
@@ -829,6 +909,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   }
 
   return {
+    findReplayLocked,
     executeLocked,
     reconcileLocked,
     execute,

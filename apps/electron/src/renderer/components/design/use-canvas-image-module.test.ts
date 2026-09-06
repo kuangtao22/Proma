@@ -205,6 +205,28 @@ function createFixture() {
 }
 
 describe('Canvas 生图模块 controller', () => {
+  test('Given 已显示图片且刷新尚未返回 When 连续收到百条任务事件 Then 保留工作台且只串行补读一次', async () => {
+    /** 初次加载完成后再模拟后台任务事件，避免混淆首屏加载。 */
+    const fixture = createFixture()
+    const moduleTarget = target('burst')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]!.resolve(snapshot(moduleTarget, 1))
+    await flush()
+
+    for (let index = 0; index < 100; index += 1) fixture.emit(moduleTarget)
+    expect(fixture.state(moduleTarget).phase).toBe('ready')
+    expect(fixture.loadCalls).toHaveLength(2)
+    fixture.loadQueue[1]!.resolve(snapshot(moduleTarget, 2))
+    await flush()
+    expect(fixture.loadCalls).toHaveLength(3)
+    fixture.loadQueue[2]!.resolve(snapshot(moduleTarget, 3))
+    await flush()
+    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(3)
+    expect(fixture.state(moduleTarget).phase).toBe('ready')
+    controller.dispose()
+  })
+
   test('Given A 与 B 已加载 When A 事件到达 Then 只刷新 A', async () => {
     const fixture = createFixture()
     const targetA = target('a')
@@ -224,6 +246,32 @@ describe('Canvas 生图模块 controller', () => {
 
     expect(fixture.state(targetA).snapshot?.config.revision).toBe(2)
     expect(fixture.state(targetB).snapshot?.config.revision).toBe(1)
+  })
+
+  test('Given 后台刷新失败且已有图片 When 继续补读 Then 保留图片与草稿并在原位显示错误', async () => {
+    /** 后台失败不应卸载已经打开的图片工作台。 */
+    const fixture = createFixture()
+    const moduleTarget = target('refresh-error')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]!.resolve(snapshot(moduleTarget, 1))
+    await flush()
+    controller.updateDraft({ prompt: '尚未保存的新提示词' })
+    fixture.emit(moduleTarget)
+    fixture.emit(moduleTarget)
+    fixture.loadQueue[1]!.reject(new Error('临时读取失败'))
+    await flush()
+    expect(fixture.state(moduleTarget).phase).toBe('ready')
+    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(1)
+    expect(fixture.state(moduleTarget).draft?.prompt).toBe('尚未保存的新提示词')
+    expect(fixture.loadCalls).toHaveLength(3)
+    fixture.loadQueue[2]!.resolve(snapshot(moduleTarget, 2))
+    await flush()
+    expect(fixture.state(moduleTarget).phase).toBe('ready')
+    expect(fixture.state(moduleTarget).error).toBeNull()
+    expect(fixture.state(moduleTarget).snapshot?.config.revision).toBe(2)
+    expect(fixture.state(moduleTarget).draft?.dirty).toBe(true)
+    controller.dispose()
   })
 
   test('Given A LOAD 在途 When 切换 B 后 A 返回 Then A 迟到结果零副作用并释放媒体', async () => {

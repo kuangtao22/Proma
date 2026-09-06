@@ -10,7 +10,7 @@ const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 const DEFAULT_MAX_ACTIVE_HELPERS = 4
 const DEFAULT_MAX_QUEUED_REQUESTS = 16
 const DEFAULT_MAX_ROOTS_PER_REQUEST = 32
-const CANVAS_INTENT_FILE_PATTERN = /^(?:(?:agent-node(?:-rebuild)?|content-node|canvas-batch|image-candidate-(?:batch|adoption))-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|image-candidate-batch-agent-canvas-[0-9a-f]{64})\.json$/i
+const CANVAS_INTENT_FILE_PATTERN = /^(?:(?:agent-node(?:-rebuild)?|content-node|canvas-batch|image-candidate-(?:batch|adoption)|artifact-export)-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|image-candidate-batch-agent-canvas-[0-9a-f]{64})\.json$/i
 const CANVAS_CONTENT_ENTRY_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 const CANVAS_CONTENT_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash', 'revisions', 'agent-configs'])
 const CANVAS_CONTENT_MOVE_CHILD_NAMES: ReadonlySet<string> = new Set(['nodes', 'trash'])
@@ -67,12 +67,16 @@ export interface StableDirectoryNativeRequest {
     | 'list'
     | 'scan'
     | 'canvas-intent-scan'
+    | 'canvas-intent-read'
     | 'canvas-intent-write'
+    | 'canvas-intent-remove'
     | 'canvas-content-write'
     | 'canvas-content-read'
     | 'canvas-content-list'
     | 'canvas-content-move'
     | 'canvas-content-remove-marker'
+    | 'artifact-export-write'
+    | 'artifact-export-copy'
   roots: string[]
   maxDepth?: number
   maxEntries?: number
@@ -80,7 +84,7 @@ export interface StableDirectoryNativeRequest {
   ignoreDirectories?: string[]
   ignoreFiles?: string[]
   /** Canvas intent 模式下固定的单级事务目录名。 */
-  childName?: 'transactions' | StableDirectoryCanvasChild
+  childName?: 'transactions' | 'transaction-archive' | StableDirectoryCanvasChild
   /** Canvas 内容模式下固定根目录内的安全稳定 ID。 */
   entryId?: string
   /** Canvas 内容 move 的目标固定根目录。 */
@@ -91,6 +95,15 @@ export interface StableDirectoryNativeRequest {
   fileName?: string
   /** 原子写正文；intent 上限 64 KiB，Canvas 内容文件上限 256 KiB。 */
   content?: string
+  /** 外部导出目标父目录中的单层文件名。 */
+  artifactFileName?: string
+  /** 图片复制时绑定的持久化大小与 SHA-256。 */
+  expectedSourceSize?: number
+  expectedSourceSha256?: string
+  /** 只有调用方显式授权时允许替换现有普通文件。 */
+  overwrite?: boolean
+  /** Canvas intent 首次 claim 要求目标不存在，避免跨实例重复执行外部副作用。 */
+  createOnly?: boolean
   signal?: AbortSignal
 }
 
@@ -166,6 +179,11 @@ function buildHelperArguments(request: StableDirectoryNativeRequest): string[] {
   if (request.destinationChildName) args.push('--destination-child-name', request.destinationChildName)
   if (request.destinationEntryId) args.push('--destination-entry-id', request.destinationEntryId)
   if (request.fileName) args.push('--file-name', request.fileName)
+  if (request.artifactFileName) args.push('--file-name', request.artifactFileName)
+  if (request.expectedSourceSize !== undefined) args.push('--expected-source-size', String(request.expectedSourceSize))
+  if (request.expectedSourceSha256) args.push('--expected-source-sha256', request.expectedSourceSha256)
+  if (request.overwrite !== undefined) args.push('--overwrite', String(request.overwrite))
+  if (request.createOnly !== undefined) args.push('--create-only', String(request.createOnly))
   return args
 }
 
@@ -393,7 +411,10 @@ function executeStableDirectoryNative(
           }
           authorized = true
           /** 写入正文只走授权后的 stdin，不进入 argv 或进程列表。 */
-          const payload = request.mode === 'canvas-intent-write' || request.mode === 'canvas-content-write'
+          const payload = request.mode === 'canvas-intent-write'
+            || request.mode === 'canvas-intent-remove'
+            || request.mode === 'canvas-content-write'
+            || request.mode === 'artifact-export-write'
             ? `\t${Buffer.from(request.content ?? '', 'utf8').toString('base64')}`
             : ''
           child.stdin.write(`ALLOW${payload}\n`)
@@ -423,8 +444,11 @@ function executeStableDirectoryNative(
       if (record?.type === 'write-result') {
         if (!authorized || authorizationPending
           || (request.mode !== 'canvas-intent-write'
+            && request.mode !== 'canvas-intent-remove'
             && request.mode !== 'canvas-content-write'
-            && request.mode !== 'canvas-content-remove-marker')
+            && request.mode !== 'canvas-content-remove-marker'
+            && request.mode !== 'artifact-export-write'
+            && request.mode !== 'artifact-export-copy')
           || writeOutcome) {
           finish(new Error('稳定目录 helper write-result 响应无效'))
           return
@@ -434,7 +458,8 @@ function executeStableDirectoryNative(
         return
       }
       if (record?.type === 'read-result') {
-        if (!authorized || authorizationPending || request.mode !== 'canvas-content-read' || readOutcome) {
+        if (!authorized || authorizationPending
+          || (request.mode !== 'canvas-content-read' && request.mode !== 'canvas-intent-read') || readOutcome) {
           finish(new Error('稳定目录 helper read-result 响应无效'))
           return
         }
@@ -456,9 +481,12 @@ function executeStableDirectoryNative(
           || !Number.isSafeInteger(record.entryCount)
           || record.entryCount !== entries.length
           || ((request.mode === 'canvas-intent-write'
+            || request.mode === 'canvas-intent-remove'
             || request.mode === 'canvas-content-write'
-            || request.mode === 'canvas-content-remove-marker') !== Boolean(writeOutcome))
-          || ((request.mode === 'canvas-content-read') !== Boolean(readOutcome))
+            || request.mode === 'canvas-content-remove-marker'
+            || request.mode === 'artifact-export-write'
+            || request.mode === 'artifact-export-copy') !== Boolean(writeOutcome))
+          || ((request.mode === 'canvas-content-read' || request.mode === 'canvas-intent-read') !== Boolean(readOutcome))
           || ((request.mode === 'canvas-content-move') !== Boolean(moveOutcome))) {
           finish(new Error('稳定目录 helper done 响应无效'))
           return
@@ -586,6 +614,9 @@ export function createStableDirectoryNativeHost(
 
   return {
     run: (request, authorize, dependencies = {}) => {
+      if (request.createOnly !== undefined && request.mode !== 'canvas-intent-write') {
+        return Promise.reject(new Error('稳定目录 createOnly 请求模式无效'))
+      }
       if (request.roots.length === 0) {
         return request.mode.startsWith('canvas-')
           ? Promise.reject(new Error('Canvas 原生请求必须绑定单个根目录'))
@@ -598,14 +629,24 @@ export function createStableDirectoryNativeHost(
         if (request.roots.length !== 1 || request.childName !== 'transactions') {
           return Promise.reject(new Error('Canvas intent 原生请求目录合同无效'))
         }
-        if (request.mode === 'canvas-intent-write'
+        if ((request.mode === 'canvas-intent-read' || request.mode === 'canvas-intent-write' || request.mode === 'canvas-intent-remove')
           && (!request.fileName
-            || !CANVAS_INTENT_FILE_PATTERN.test(request.fileName)
-            || typeof request.content !== 'string'
+            || !CANVAS_INTENT_FILE_PATTERN.test(request.fileName))) {
+          return Promise.reject(new Error('Canvas intent 原生写入合同无效'))
+        }
+        if ((request.mode === 'canvas-intent-write' || request.mode === 'canvas-intent-remove')
+          && (typeof request.content !== 'string'
             || Buffer.byteLength(request.content, 'utf8') > 64 * 1024)) {
           return Promise.reject(new Error('Canvas intent 原生写入合同无效'))
         }
-        if ((request.maxEntries ?? 512) > 512) {
+        if ((request.mode === 'canvas-intent-scan' || request.mode === 'canvas-intent-read')
+          && (request.content !== undefined || request.createOnly !== undefined)) {
+          return Promise.reject(new Error('Canvas intent 原生请求字段无效'))
+        }
+        if (request.createOnly !== undefined && request.mode !== 'canvas-intent-write') {
+          return Promise.reject(new Error('Canvas intent 原生请求字段无效'))
+        }
+        if ((request.maxEntries ?? 512) > (request.mode === 'canvas-intent-scan' ? 4096 : 512)) {
           return Promise.reject(new Error('Canvas intent 原生扫描数量超过上限'))
         }
       }
@@ -617,11 +658,13 @@ export function createStableDirectoryNativeHost(
           && request.ignoreFiles === undefined
         const childIsSafe = request.childName !== undefined
           && request.childName !== 'transactions'
-          && (request.mode === 'canvas-content-move'
+          && (request.childName === 'transaction-archive'
+            ? request.mode === 'canvas-content-write' || request.mode === 'canvas-content-read'
+            : request.mode === 'canvas-content-move'
             ? CANVAS_CONTENT_MOVE_CHILD_NAMES.has(request.childName)
             : request.mode === 'canvas-content-remove-marker'
               ? request.childName === 'trash'
-            : CANVAS_CONTENT_CHILD_NAMES.has(request.childName))
+              : CANVAS_CONTENT_CHILD_NAMES.has(request.childName))
         const needsEntry = request.mode !== 'canvas-content-list'
         const entryIsSafe = !needsEntry
           || (request.entryId !== undefined && CANVAS_CONTENT_ENTRY_ID_PATTERN.test(request.entryId))
@@ -631,7 +674,10 @@ export function createStableDirectoryNativeHost(
           ? CANVAS_AGENT_CONFIG_FILE_NAMES
           : CANVAS_CONTENT_FILE_NAMES
         const fileIsSafe = !needsFile
-          || (request.fileName !== undefined && allowedFileNames.has(request.fileName))
+          || (request.fileName !== undefined
+            && (request.childName === 'transaction-archive'
+              ? CANVAS_INTENT_FILE_PATTERN.test(request.fileName)
+              : allowedFileNames.has(request.fileName)))
         const destinationIsSafe = request.mode !== 'canvas-content-move'
           || (request.destinationChildName !== undefined
             && CANVAS_CONTENT_MOVE_CHILD_NAMES.has(request.destinationChildName)
@@ -672,6 +718,42 @@ export function createStableDirectoryNativeHost(
           || maxEntries < 1
           || maxEntries > 512) {
           return Promise.reject(new Error('Canvas 内容原生请求合同无效'))
+        }
+      }
+      if (request.mode === 'artifact-export-write' || request.mode === 'artifact-export-copy') {
+        const isCopy = request.mode === 'artifact-export-copy'
+        const leaf = request.artifactFileName
+        const traversalControlsAreAbsent = request.maxDepth === undefined
+          && request.maxEntries === undefined
+          && request.maxOutputBytes === undefined
+          && request.ignoreDirectories === undefined
+          && request.ignoreFiles === undefined
+          && request.childName === undefined
+          && request.entryId === undefined
+          && request.destinationChildName === undefined
+          && request.destinationEntryId === undefined
+          && request.fileName === undefined
+        const safeLeaf = typeof leaf === 'string' && leaf.length > 0 && leaf !== '.' && leaf !== '..'
+          && !leaf.includes('/') && !leaf.includes('\\')
+        const contentIsSafe = isCopy
+          ? request.content === undefined
+            && Number.isSafeInteger(request.expectedSourceSize)
+            && typeof request.expectedSourceSize === 'number'
+            && request.expectedSourceSize >= 0
+            && request.expectedSourceSize <= 64 * 1024 * 1024
+            && typeof request.expectedSourceSha256 === 'string'
+            && /^[0-9a-f]{64}$/.test(request.expectedSourceSha256)
+          : typeof request.content === 'string'
+            && Buffer.byteLength(request.content, 'utf8') <= CANVAS_CONTENT_MAX_FILE_BYTES
+            && request.expectedSourceSize === undefined
+            && request.expectedSourceSha256 === undefined
+        if (request.roots.length !== (isCopy ? 2 : 1)
+          || request.roots.some((root) => !isAbsolute(root))
+          || !traversalControlsAreAbsent
+          || !safeLeaf
+          || !contentIsSafe
+          || typeof request.overwrite !== 'boolean') {
+          return Promise.reject(new Error('产物导出原生请求合同无效'))
         }
       }
       const totalTimeoutMs = dependencies.totalTimeoutMs ?? DEFAULT_TOTAL_TIMEOUT_MS

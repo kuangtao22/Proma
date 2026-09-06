@@ -10,9 +10,16 @@ import type {
 import { runStableDirectoryNative } from '../stable-directory-native-host'
 import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
 import type { CanvasDocumentStore } from './canvas-document-store'
+import {
+  createNativeCanvasTransactionArchive,
+  type CanvasTransactionArchive,
+  type CanvasTransactionEntry,
+} from './canvas-transaction-archive'
 
 /** 候选批次文件数量上限，阻止项目历史无界放大单次扫描。 */
 const MAX_CANDIDATE_BATCH_FILES = 512
+/** 旧目录整理读取上界；新增事务容量继续保持 512。 */
+const MAX_CANDIDATE_BATCH_SCAN_FILES = 4096
 /** 候选批次固定文件名前缀与安全身份捕获。 */
 const CANDIDATE_BATCH_FILE = /^image-candidate-batch-([A-Za-z0-9_-]{1,128})\.json$/
 /** 整批采用恢复 intent 的固定文件名合同。 */
@@ -73,6 +80,8 @@ export interface CanvasImageCandidateBatchStoreDependencies {
   writeBatch?: (batch: CanvasImageCandidateBatch) => Promise<StableDirectoryNativeWriteOutcome>
   scanAdoptionIntents?: (target: CanvasTarget) => Promise<CanvasImageCandidateAdoptionIntent[]>
   writeAdoptionIntent?: (intent: CanvasImageCandidateAdoptionIntent) => Promise<StableDirectoryNativeWriteOutcome>
+  /** 测试注入的归档器；生产按本次 Canvas 目录 capability 创建。 */
+  archive?: CanvasTransactionArchive
 }
 
 /** 判断未知值是否为无自定义原型的普通记录。 */
@@ -97,6 +106,30 @@ function isNonNegativeInteger(value: unknown): value is number {
 /** 判断值是可选安全持久化身份。 */
 function isNullableId(value: unknown): value is string | null {
   return value === null || (typeof value === 'string' && ADOPTION_ID.test(value))
+}
+
+/**
+ * 严格解析目标 Canvas 的候选批次，阻止归档别名返回跨项目正文。
+ * @param value 磁盘或测试依赖返回的未知批次正文。
+ * @param target 调用方已授权的项目与 Canvas 身份。
+ * @param expectedBatchId 精确读取时由文件别名声明的批次身份。
+ * @returns 深度解析且归属与别名均匹配的候选批次。
+ */
+function parseCandidateBatchForTarget(
+  value: unknown,
+  target: CanvasTarget,
+  expectedBatchId?: string,
+): CanvasImageCandidateBatch {
+  if (expectedBatchId !== undefined && !ADOPTION_ID.test(expectedBatchId)) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  const batch = parseCanvasImageCandidateBatch(value)
+  if (batch.projectId !== target.projectId
+    || batch.canvasId !== target.canvasId
+    || (expectedBatchId !== undefined && batch.batchId !== expectedBatchId)) {
+    throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+  }
+  return batch
 }
 
 /** 严格解析磁盘采用 intent，未知字段或身份漂移一律拒绝恢复。 */
@@ -210,20 +243,35 @@ function summarize(batch: CanvasImageCandidateBatch): CanvasImageCandidateBatchS
 export function createCanvasImageCandidateBatchStore(
   dependencies: CanvasImageCandidateBatchStoreDependencies,
 ): CanvasImageCandidateBatchStore {
+  /** 从当前 Canvas capability 或测试注入取得精确归档访问。 */
+  const archiveFor = (target: CanvasTarget): CanvasTransactionArchive | null => {
+    if (dependencies.archive) return dependencies.archive
+    if (!dependencies.documents) return null
+    const loaded = dependencies.documents.loadWithDirectoryCapability(target)
+    return createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'))
+  }
+
   /** 扫描并严格解析目标 Canvas 的所有批次文件。 */
   const scan = async (target: CanvasTarget): Promise<CanvasImageCandidateBatch[]> => {
     if (dependencies.scanBatches) {
-      return (await dependencies.scanBatches(target)).map(parseCanvasImageCandidateBatch)
+      const batches = (await dependencies.scanBatches(target))
+        .map((batch) => parseCandidateBatchForTarget(batch, target))
+      await dependencies.archive?.archiveEntries(batches.map((batch) => ({
+        name: `image-candidate-batch-${batch.batchId}.json`,
+        content: `${JSON.stringify(batch, null, 2)}\n`,
+      })))
+      return batches
     }
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(target)
     const directory = loaded.openSingleChildDirectory('transactions')
     const result = await runStableDirectoryNative({
       mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions',
-      maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_FILES, maxOutputBytes: 40 * 1024 * 1024,
+      maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_SCAN_FILES, maxOutputBytes: 40 * 1024 * 1024,
     }, directory.authorizeOpenedRoots)
     /** 单次扫描结果只接受候选批次固定前缀，其他事务由其所有者处理。 */
     const batches: CanvasImageCandidateBatch[] = []
+    const archiveEntries: CanvasTransactionEntry[] = []
     for (const entry of result.entries) {
       const match = CANDIDATE_BATCH_FILE.exec(entry.name)
       if (!match) continue
@@ -237,8 +285,10 @@ export function createCanvasImageCandidateBatchStore(
         throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
       }
       batches.push(batch)
+      archiveEntries.push({ name: entry.name, content: entry.content })
     }
     directory.assertValid()
+    await createNativeCanvasTransactionArchive(directory).archiveEntries(archiveEntries)
     return batches
   }
 
@@ -247,19 +297,25 @@ export function createCanvasImageCandidateBatchStore(
     target: CanvasTarget,
   ): Promise<CanvasImageCandidateAdoptionIntent[]> => {
     if (dependencies.scanAdoptionIntents) {
-      return (await dependencies.scanAdoptionIntents(target)).map((intent) => (
+      const intents = (await dependencies.scanAdoptionIntents(target)).map((intent) => (
         parseCanvasImageCandidateAdoptionIntent(intent, target, intent.operationId)
       ))
+      await dependencies.archive?.archiveEntries(intents.map((intent) => ({
+        name: `image-candidate-adoption-${intent.operationId}.json`,
+        content: `${JSON.stringify(intent, null, 2)}\n`,
+      })))
+      return intents
     }
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(target)
     const directory = loaded.openSingleChildDirectory('transactions')
     const result = await runStableDirectoryNative({
       mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions',
-      maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_FILES, maxOutputBytes: 40 * 1024 * 1024,
+      maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_SCAN_FILES, maxOutputBytes: 40 * 1024 * 1024,
     }, directory.authorizeOpenedRoots)
     /** 采用 intent 只接受固定文件名与正文身份精确一致的普通文件。 */
     const intents: CanvasImageCandidateAdoptionIntent[] = []
+    const archiveEntries: CanvasTransactionEntry[] = []
     for (const entry of result.entries) {
       const match = ADOPTION_INTENT_FILE.exec(entry.name)
       if (!match) continue
@@ -273,8 +329,10 @@ export function createCanvasImageCandidateBatchStore(
         throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID')
       }
       intents.push(parseCanvasImageCandidateAdoptionIntent(value, target, match[1]!))
+      archiveEntries.push({ name: entry.name, content: entry.content })
     }
     directory.assertValid()
+    await createNativeCanvasTransactionArchive(directory).archiveEntries(archiveEntries)
     return intents
   }
 
@@ -319,9 +377,12 @@ export function createCanvasImageCandidateBatchStore(
       .sort((left, right) => right.updatedAt - left.updatedAt || left.batchId.localeCompare(right.batchId))
       .slice(0, CANVAS_IMAGE_CANDIDATE_BATCH_SUMMARY_LIMIT),
     load: async (target, batchId) => {
+      if (!ADOPTION_ID.test(batchId)) throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
       const batch = (await scan(target)).find((candidate) => candidate.batchId === batchId)
-      if (!batch) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
-      return batch
+      if (batch) return batch
+      const archived = await archiveFor(target)?.load(`image-candidate-batch-${batchId}.json`)
+      if (!archived) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
+      return parseCandidateBatchForTarget(JSON.parse(archived) as unknown, target, batchId)
     },
     save: async (rawBatch) => {
       const batch = parseCanvasImageCandidateBatch(rawBatch)
@@ -338,7 +399,16 @@ export function createCanvasImageCandidateBatchStore(
     findByJobId: async (target, jobId, candidateBatchId) => {
       /** 新 journal 直接指定批次；旧 journal 才兼容扫描定位。 */
       if (candidateBatchId) {
-        const batch = (await scan(target)).find((value) => value.batchId === candidateBatchId)
+        if (!ADOPTION_ID.test(candidateBatchId)) {
+          throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+        }
+        let batch = (await scan(target)).find((value) => value.batchId === candidateBatchId)
+        if (!batch) {
+          const archived = await archiveFor(target)?.load(`image-candidate-batch-${candidateBatchId}.json`)
+          batch = archived
+            ? parseCandidateBatchForTarget(JSON.parse(archived) as unknown, target, candidateBatchId)
+            : undefined
+        }
         if (!batch || !batch.entries.some((entry) => entry.jobId === jobId)) return null
         return batch
       }
@@ -348,8 +418,10 @@ export function createCanvasImageCandidateBatchStore(
     loadAdoptionIntent: async (target, operationId) => {
       if (!ADOPTION_ID.test(operationId)) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID')
       const intent = (await scanAdoptionIntents(target)).find((candidate) => candidate.operationId === operationId)
-      if (!intent) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_NOT_FOUND')
-      return intent
+      if (intent) return intent
+      const archived = await archiveFor(target)?.load(`image-candidate-adoption-${operationId}.json`)
+      if (!archived) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_NOT_FOUND')
+      return parseCanvasImageCandidateAdoptionIntent(JSON.parse(archived) as unknown, target, operationId)
     },
     saveAdoptionIntent: async (rawIntent) => {
       const intent = parseCanvasImageCandidateAdoptionIntent(

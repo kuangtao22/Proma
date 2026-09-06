@@ -5,6 +5,8 @@ import type {
   AgentMessage,
   AgentSendInput,
   AgentSessionMeta,
+  CanvasImageJobActivity,
+  CanvasTarget,
   CanvasImageInputReference,
   CanvasImageTarget,
   CreateDesignJobInput,
@@ -233,6 +235,8 @@ export interface DesignJobManagerDependencies {
   writeJobJournal?: (path: string, value: object) => void
   /** 读取 journal 目录项；测试注入用于验证目标索引不会重复全量扫描。 */
   readJobsDirectory?: (path: string) => string[]
+  /** 读取单个 journal 正文；测试注入用于验证活动索引不会重复访问历史文件。 */
+  readJobJournal?: (path: string) => string
   /** 单项目恢复失败时记录中文错误，默认输出到主进程错误日志。 */
   warn?: (message: string) => void
   /** 生图模型未知底层错误记录器，必须保留原始 Error 供主进程诊断。 */
@@ -304,6 +308,16 @@ export class DesignJobManager {
   private readonly canvasImageTargetKeysByProject = new Map<string, Set<string>>()
   /** 任务当前所属目标 key，用于状态覆盖和删除时增量维护。 */
   private readonly canvasImageTargetKeyByJobId = new Map<string, string>()
+  /** Canvas 到完整图片目标 key 的索引，避免整项目过滤全部历史任务。 */
+  private readonly canvasImageTargetKeysByCanvas = new Map<string, Set<string>>()
+  /** 完整图片目标 key 到 Canvas key 的反向索引，用于线性清理项目缓存。 */
+  private readonly canvasImageCanvasKeyByTargetKey = new Map<string, string>()
+  /** 每个完整图片目标的最新任务 ID。 */
+  private readonly canvasImageLatestJobIdByTarget = new Map<string, string>()
+  /** 每个完整图片目标最近成功任务 ID，保证最新失败时仍可检查旧候选。 */
+  private readonly canvasImageLatestSucceededJobIdByTarget = new Map<string, string>()
+  /** 每个完整图片目标当前 queued/running 任务 ID。 */
+  private readonly canvasImageActiveJobIdsByTarget = new Map<string, Set<string>>()
   /** 尚未写入 journal 的 Canvas 图片目标预留，封闭并发 create/retry 的扫描窗口。 */
   private readonly canvasImageReservations = new Set<string>()
   /** Agent Canvas 稳定任务 ID 的在途创建；同身份合并，不同身份拒绝。 */
@@ -570,6 +584,57 @@ export class DesignJobManager {
       .filter((job): job is StoredDesignJob => Boolean(job))
       .sort(compareDesignJobs)
       .map(clonePublicDesignJob)
+  }
+
+  /**
+   * 返回整张 Canvas 每个图片节点的最新、全部活动和最近成功任务摘要。
+   * @param target Canvas 项目与文档身份。
+   * @param options resync 为 true 时先从磁盘重建索引，用于窗口重新聚焦后的跨进程对账。
+   * @returns 按节点身份和任务新旧稳定排序的去重窄摘要。
+   */
+  listCanvasImageActivity(
+    target: CanvasTarget,
+    options: { resync?: boolean } = {},
+  ): CanvasImageJobActivity[] {
+    if (options.resync) this.invalidateCanvasImageActivity(target.projectId)
+    this.ensureCanvasImageIndex(target.projectId)
+    const canvasKey = createCanvasImageCanvasKey(target.projectId, target.canvasId)
+    const targetKeys = this.canvasImageTargetKeysByCanvas.get(canvasKey) ?? new Set<string>()
+    const sortedTargetKeys = [...targetKeys].sort((leftKey, rightKey) => {
+      const leftJob = this.jobs.get(this.canvasImageLatestJobIdByTarget.get(leftKey) ?? '')
+      const rightJob = this.jobs.get(this.canvasImageLatestJobIdByTarget.get(rightKey) ?? '')
+      if (leftJob?.target.kind !== 'canvas-image' || rightJob?.target.kind !== 'canvas-image') return 0
+      return leftJob.target.nodeId.localeCompare(rightJob.target.nodeId)
+        || leftJob.target.imageModuleId.localeCompare(rightJob.target.imageModuleId)
+    })
+    return sortedTargetKeys
+      .flatMap((targetKey) => {
+        /** Set 同时完成 latest、active、latest succeeded 三类选择的 ID 去重。 */
+        const selectedIds = new Set(this.canvasImageActiveJobIdsByTarget.get(targetKey) ?? [])
+        const latestJobId = this.canvasImageLatestJobIdByTarget.get(targetKey)
+        const latestSucceededJobId = this.canvasImageLatestSucceededJobIdByTarget.get(targetKey)
+        if (latestJobId) selectedIds.add(latestJobId)
+        if (latestSucceededJobId) selectedIds.add(latestSucceededJobId)
+        return [...selectedIds]
+          .map((jobId) => this.jobs.get(jobId))
+          .filter((job): job is StoredDesignJob & { target: CanvasImageJobTarget } => job?.target.kind === 'canvas-image')
+          .sort((left, right) => compareDesignJobs(right, left))
+          .map(createCanvasImageJobActivity)
+      })
+  }
+
+  /**
+   * 使指定项目或全部 Canvas 图片活动缓存失效。
+   * @param projectId 项目变化时传入项目 ID；Manager dispose 时省略以释放全部缓存。
+   */
+  invalidateCanvasImageActivity(projectId?: string): void {
+    const projectIds = projectId
+      ? [projectId]
+      : [...new Set([
+          ...this.indexedCanvasImageProjects,
+          ...[...this.jobs.values()].map((job) => job.projectId),
+        ])]
+    for (const currentProjectId of projectIds) this.clearCanvasImageProjectIndex(currentProjectId)
   }
 
   /** 在项目索引内按 ID 查询任务；首次建索引后存在与缺失查询均为 O(1)。 */
@@ -1980,7 +2045,8 @@ export class DesignJobManager {
   private readJobJournal(projectId: string, jobId: string): StoredDesignJob | undefined {
     try {
       const path = this.resolveJobJournalPath(projectId, jobId)
-      const value: unknown = JSON.parse(readFileSync(path, 'utf8'))
+      const readJournal = this.dependencies.readJobJournal ?? ((journalPath: string): string => readFileSync(journalPath, 'utf8'))
+      const value: unknown = JSON.parse(readJournal(path))
       const normalized = normalizeStoredDesignJob(value)
       if (!normalized || normalized.projectId !== projectId || normalized.id !== jobId) return undefined
       this.jobs.set(normalized.id, normalized)
@@ -2027,18 +2093,35 @@ export class DesignJobManager {
   /** 用一次权威 journal 扫描结果替换单项目 Canvas 图片目标索引。 */
   private rebuildCanvasImageIndex(projectId: string, jobs: StoredDesignJob[]): void {
     /** 项目级扫描是磁盘权威事实，必须同步淘汰已缺失或损坏的旧缓存。 */
-    for (const [jobId, cached] of this.jobs) {
-      if (cached.projectId === projectId) this.jobs.delete(jobId)
-    }
+    this.clearCanvasImageProjectIndex(projectId)
     for (const job of jobs) this.jobs.set(job.id, job)
-    const previousKeys = this.canvasImageTargetKeysByProject.get(projectId) ?? new Set<string>()
-    for (const key of previousKeys) this.canvasImageJobIdsByTarget.delete(key)
-    for (const [jobId, key] of this.canvasImageTargetKeyByJobId) {
-      if (previousKeys.has(key)) this.canvasImageTargetKeyByJobId.delete(jobId)
-    }
     this.canvasImageTargetKeysByProject.set(projectId, new Set())
     this.indexedCanvasImageProjects.add(projectId)
     for (const job of jobs) this.indexCanvasImageJob(job)
+  }
+
+  /** 清除单项目任务缓存与全部派生索引，下次查询将重新扫描磁盘。 */
+  private clearCanvasImageProjectIndex(projectId: string): void {
+    for (const [jobId, cached] of this.jobs) {
+      if (cached.projectId === projectId) this.jobs.delete(jobId)
+    }
+    const previousKeys = this.canvasImageTargetKeysByProject.get(projectId) ?? new Set<string>()
+    for (const key of previousKeys) {
+      this.canvasImageJobIdsByTarget.delete(key)
+      this.canvasImageLatestJobIdByTarget.delete(key)
+      this.canvasImageLatestSucceededJobIdByTarget.delete(key)
+      this.canvasImageActiveJobIdsByTarget.delete(key)
+      const canvasKey = this.canvasImageCanvasKeyByTargetKey.get(key)
+      const targetKeys = canvasKey ? this.canvasImageTargetKeysByCanvas.get(canvasKey) : undefined
+      targetKeys?.delete(key)
+      if (canvasKey && targetKeys?.size === 0) this.canvasImageTargetKeysByCanvas.delete(canvasKey)
+      this.canvasImageCanvasKeyByTargetKey.delete(key)
+    }
+    for (const [jobId, key] of this.canvasImageTargetKeyByJobId) {
+      if (previousKeys.has(key)) this.canvasImageTargetKeyByJobId.delete(jobId)
+    }
+    this.canvasImageTargetKeysByProject.delete(projectId)
+    this.indexedCanvasImageProjects.delete(projectId)
   }
 
   /** 写入或状态变化后把单条任务增量同步到目标索引。 */
@@ -2052,7 +2135,28 @@ export class DesignJobManager {
     const projectKeys = this.canvasImageTargetKeysByProject.get(job.projectId) ?? new Set<string>()
     projectKeys.add(key)
     this.canvasImageTargetKeysByProject.set(job.projectId, projectKeys)
+    const canvasKey = createCanvasImageCanvasKey(job.projectId, job.target.canvasId)
+    const canvasTargetKeys = this.canvasImageTargetKeysByCanvas.get(canvasKey) ?? new Set<string>()
+    canvasTargetKeys.add(key)
+    this.canvasImageTargetKeysByCanvas.set(canvasKey, canvasTargetKeys)
+    this.canvasImageCanvasKeyByTargetKey.set(key, canvasKey)
     this.canvasImageTargetKeyByJobId.set(job.id, key)
+    const latestJobId = this.canvasImageLatestJobIdByTarget.get(key)
+    const latestJob = latestJobId ? this.jobs.get(latestJobId) : undefined
+    if (!latestJob || compareDesignJobs(latestJob, job) <= 0) {
+      this.canvasImageLatestJobIdByTarget.set(key, job.id)
+    }
+    const latestSucceededJobId = this.canvasImageLatestSucceededJobIdByTarget.get(key)
+    const latestSucceededJob = latestSucceededJobId ? this.jobs.get(latestSucceededJobId) : undefined
+    if (job.status === 'succeeded'
+      && (!latestSucceededJob || compareDesignJobs(latestSucceededJob, job) <= 0)) {
+      this.canvasImageLatestSucceededJobIdByTarget.set(key, job.id)
+    }
+    const activeJobIds = this.canvasImageActiveJobIdsByTarget.get(key) ?? new Set<string>()
+    if (job.status === 'queued' || job.status === 'running') activeJobIds.add(job.id)
+    else activeJobIds.delete(job.id)
+    if (activeJobIds.size > 0) this.canvasImageActiveJobIdsByTarget.set(key, activeJobIds)
+    else this.canvasImageActiveJobIdsByTarget.delete(key)
   }
 
   /** 删除任务或覆盖目标前移除旧索引项，不影响同目标其它 attempt。 */
@@ -2062,9 +2166,35 @@ export class DesignJobManager {
     this.canvasImageTargetKeyByJobId.delete(job.id)
     const jobIds = this.canvasImageJobIdsByTarget.get(previousKey)
     jobIds?.delete(job.id)
+    const activeJobIds = this.canvasImageActiveJobIdsByTarget.get(previousKey)
+    activeJobIds?.delete(job.id)
+    if (activeJobIds?.size === 0) this.canvasImageActiveJobIdsByTarget.delete(previousKey)
+    if (this.canvasImageLatestJobIdByTarget.get(previousKey) === job.id) {
+      const latest = [...(jobIds ?? new Set<string>())]
+        .map((jobId) => this.jobs.get(jobId))
+        .filter((candidate): candidate is StoredDesignJob => Boolean(candidate))
+        .sort(compareDesignJobs)
+        .at(-1)
+      if (latest) this.canvasImageLatestJobIdByTarget.set(previousKey, latest.id)
+      else this.canvasImageLatestJobIdByTarget.delete(previousKey)
+    }
+    if (this.canvasImageLatestSucceededJobIdByTarget.get(previousKey) === job.id) {
+      const latestSucceeded = [...(jobIds ?? new Set<string>())]
+        .map((jobId) => this.jobs.get(jobId))
+        .filter((candidate): candidate is StoredDesignJob => candidate?.status === 'succeeded')
+        .sort(compareDesignJobs)
+        .at(-1)
+      if (latestSucceeded) this.canvasImageLatestSucceededJobIdByTarget.set(previousKey, latestSucceeded.id)
+      else this.canvasImageLatestSucceededJobIdByTarget.delete(previousKey)
+    }
     if (jobIds && jobIds.size > 0) return
     this.canvasImageJobIdsByTarget.delete(previousKey)
     this.canvasImageTargetKeysByProject.get(job.projectId)?.delete(previousKey)
+    const canvasKey = this.canvasImageCanvasKeyByTargetKey.get(previousKey)
+    const targetKeys = canvasKey ? this.canvasImageTargetKeysByCanvas.get(canvasKey) : undefined
+    targetKeys?.delete(previousKey)
+    if (canvasKey && targetKeys?.size === 0) this.canvasImageTargetKeysByCanvas.delete(canvasKey)
+    this.canvasImageCanvasKeyByTargetKey.delete(previousKey)
   }
 
   /** 从本轮已扫描和增量维护的内存事实读取项目任务，避免 recover 重复扫盘。 */
@@ -2193,6 +2323,11 @@ function createCanvasImageTargetKey(
   return JSON.stringify([projectId, target.canvasId, target.nodeId, target.imageModuleId])
 }
 
+/** 创建 Canvas 级图片活动索引键。 */
+function createCanvasImageCanvasKey(projectId: string, canvasId: string): string {
+  return JSON.stringify([projectId, canvasId])
+}
+
 /** 任务目标查询使用创建时间和稳定 ID 确保跨平台顺序一致。 */
 function compareDesignJobs(left: StoredDesignJob, right: StoredDesignJob): number {
   return left.createdAt - right.createdAt || left.id.localeCompare(right.id)
@@ -2209,6 +2344,21 @@ function clonePublicDesignJob(job: StoredDesignJob): DesignJobRecord {
   delete publicJob.retryState
   delete publicJob.deletionState
   return JSON.parse(JSON.stringify(publicJob)) as DesignJobRecord
+}
+
+/** 把完整 journal 投影为 Canvas 活动首屏所需的窄公开摘要。 */
+function createCanvasImageJobActivity(
+  job: StoredDesignJob & { target: CanvasImageJobTarget },
+): CanvasImageJobActivity {
+  return {
+    id: job.id,
+    projectId: job.projectId,
+    target: structuredClone(job.target),
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    ...(job.outputAssetId ? { outputAssetId: job.outputAssetId } : {}),
+  }
 }
 
 /** 把 journal 目标补全为 Canvas Store 使用的四重身份。 */

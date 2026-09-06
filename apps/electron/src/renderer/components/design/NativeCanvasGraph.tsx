@@ -111,12 +111,173 @@ const EMPTY_CANVAS_NODE_ISSUES: CanvasNodeIssue[] = []
 const EMPTY_RUNNING_SESSION_IDS = new Set<string>()
 /** 未提供节点活动映射时复用稳定空 Map，避免投影 effect 重复执行。 */
 const EMPTY_NODE_ACTIVITY_STATES = new Map<string, CanvasNodeActivityState>()
-/** 未接通扩展命令时使用稳定空操作。 */
-const NOOP_EXPAND = (): void => undefined
+/** 未提供图片候选索引时复用稳定空 Set，避免投影 effect 重复执行。 */
+const EMPTY_IMAGE_CANDIDATE_NODE_IDS = new Set<string>()
 /** 未接通类型化扩展命令时使用稳定空操作。 */
 const NOOP_CREATE_CHILD = (): void => undefined
 /** 浏览器交互发生时才生成边 ID，服务端静态渲染不会访问 crypto。 */
 const CREATE_NATIVE_CANVAS_EDGE_ID = (): string => globalThis.crypto.randomUUID()
+
+/**
+ * 比较纯投影字段是否保持一致。
+ * @param left 上一次权威投影字段。
+ * @param right 本次权威投影字段。
+ * @returns 结构与叶子引用全部一致时返回 true；函数仍按引用比较。
+ */
+function areNativeCanvasProjectionValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
+    return left.every((value, index) => areNativeCanvasProjectionValuesEqual(value, right[index]))
+  }
+  if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) return false
+  /** 投影对象只包含受控数据，不递归比较 XYFlow 在当前节点追加的运行时字段。 */
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftRecord)
+  if (leftKeys.length !== Object.keys(rightRecord).length) return false
+  return leftKeys.every((key) => Object.hasOwn(rightRecord, key)
+    && areNativeCanvasProjectionValuesEqual(leftRecord[key], rightRecord[key]))
+}
+
+/** Graph 每次 render 接收的最新节点命令实现。 */
+export interface NativeCanvasProjectionCallbackTargets {
+  onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
+  onReferenceNode?: (nodeId: string) => void
+  onWorkbenchNodeChange?: (nodeId: string) => void
+  loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
+}
+
+/** 节点投影使用的稳定命令入口；update 只替换背后的最新实现。 */
+export interface NativeCanvasProjectionCallbackBridge {
+  update: (targets: NativeCanvasProjectionCallbackTargets) => void
+  onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
+  onReferenceNode: (nodeId: string) => void
+  onWorkbenchNodeChange: (nodeId: string) => void
+  loadCanvasWebviewPreview: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  onWebviewDevicePresetChange: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
+}
+
+/**
+ * 创建节点数据专用的稳定回调桥。
+ * @param initialTargets 首次 render 提供的命令实现。
+ * @returns 引用固定的入口和接管后续 render 实现的 update。
+ */
+export function createNativeCanvasProjectionCallbackBridge(
+  initialTargets: NativeCanvasProjectionCallbackTargets,
+): NativeCanvasProjectionCallbackBridge {
+  let targets = initialTargets
+  return {
+    update: (nextTargets) => { targets = nextTargets },
+    onCreateChild: (nodeId, kind) => { targets.onCreateChild(nodeId, kind) },
+    onReferenceNode: (nodeId) => { targets.onReferenceNode?.(nodeId) },
+    onWorkbenchNodeChange: (nodeId) => { targets.onWorkbenchNodeChange?.(nodeId) },
+    loadCanvasWebviewPreview: (target) => {
+      const loadPreview = targets.loadCanvasWebviewPreview
+      if (!loadPreview) return Promise.reject(new Error('Canvas WebView 预览能力不可用'))
+      return loadPreview(target)
+    },
+    onWebviewDevicePresetChange: (nodeId, devicePreset) => {
+      targets.onWebviewDevicePresetChange?.(nodeId, devicePreset)
+    },
+  }
+}
+
+/**
+ * 按前后权威投影差异更新记录，同时保留当前对象上的 XYFlow 局部字段。
+ * @param current XYFlow 当前对象。
+ * @param previous 上一次权威投影对象。
+ * @param next 本次权威投影对象。
+ * @returns 只覆盖权威新增、删除或改变的字段。
+ */
+function mergeNativeCanvasProjectionRecord(
+  current: Readonly<Record<string, unknown>>,
+  previous: Readonly<Record<string, unknown>>,
+  next: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...current }
+  /** 前后字段并集确保已撤销的预览、能力等可选字段同步删除。 */
+  const projectionKeys = new Set([...Object.keys(previous), ...Object.keys(next)])
+  for (const key of projectionKeys) {
+    if (!Object.hasOwn(next, key)) {
+      delete merged[key]
+      continue
+    }
+    if (!Object.hasOwn(previous, key)
+      || !areNativeCanvasProjectionValuesEqual(previous[key], next[key])) {
+      merged[key] = next[key]
+    }
+  }
+  return merged
+}
+
+/** 合并单个变化节点，并对 data 执行同样的字段级三方合并。 */
+function mergeNativeCanvasFlowNodeProjection(
+  current: NativeCanvasFlowNode,
+  previous: NativeCanvasFlowNode,
+  next: NativeCanvasFlowNode,
+): NativeCanvasFlowNode {
+  if (previous.type !== next.type || current.type !== next.type) return next
+  const merged = mergeNativeCanvasProjectionRecord(
+    current as unknown as Record<string, unknown>,
+    previous as unknown as Record<string, unknown>,
+    next as unknown as Record<string, unknown>,
+  )
+  merged.data = mergeNativeCanvasProjectionRecord(
+    current.data as unknown as Record<string, unknown>,
+    previous.data as unknown as Record<string, unknown>,
+    next.data as unknown as Record<string, unknown>,
+  )
+  return merged as unknown as NativeCanvasFlowNode
+}
+
+/**
+ * 三方合并权威节点投影与 XYFlow 当前节点。
+ * @param currentNodes XYFlow 当前节点，可能带拖动、测量等局部字段。
+ * @param previousProjection 上一次用于同步的纯权威投影。
+ * @param nextProjection 本次新计算的纯权威投影。
+ * @returns 只替换真实投影发生变化的节点；完全无变化时复用原数组。
+ */
+export function reconcileNativeCanvasFlowNodes(
+  currentNodes: NativeCanvasFlowNode[],
+  previousProjection: NativeCanvasFlowNode[],
+  nextProjection: NativeCanvasFlowNode[],
+): NativeCanvasFlowNode[] {
+  /** ID 索引允许节点增删或排序变化时仍精确复用未变化节点。 */
+  const currentById = new Map(currentNodes.map((node) => [node.id, node]))
+  const previousById = new Map(previousProjection.map((node) => [node.id, node]))
+  let changed = currentNodes.length !== nextProjection.length
+  const reconciled = nextProjection.map((nextNode, index) => {
+    const currentNode = currentById.get(nextNode.id)
+    const previousNode = previousById.get(nextNode.id)
+    const node = currentNode && previousNode
+      ? areNativeCanvasProjectionValuesEqual(previousNode, nextNode)
+        ? currentNode
+        : mergeNativeCanvasFlowNodeProjection(currentNode, previousNode, nextNode)
+      : nextNode
+    if (node !== currentNodes[index]) changed = true
+    return node
+  })
+  return changed ? reconciled : currentNodes
+}
+
+/**
+ * 创建 Graph 私有的边投影缓存。
+ * @returns 按节点与边数组身份缓存的投影函数；不依赖 revision，兼容同 revision 乐观 mutation。
+ */
+export function createNativeCanvasFlowEdgeProjector(): (document: CanvasDocument) => Edge[] {
+  let previousNodes: CanvasDocument['nodes'] | null = null
+  let previousEdges: CanvasDocument['edges'] | null = null
+  let projectedEdges: Edge[] = []
+  return (document) => {
+    if (document.nodes === previousNodes && document.edges === previousEdges) return projectedEdges
+    previousNodes = document.nodes
+    previousEdges = document.edges
+    projectedEdges = toNativeCanvasFlowEdges(document)
+    return projectedEdges
+  }
+}
 
 /** 用户可为刚创建的稳定边选择的四种长期关系。 */
 const NATIVE_CANVAS_EDGE_RELATION_OPTIONS: ReadonlyArray<{
@@ -294,6 +455,8 @@ export interface NativeCanvasGraphProps {
   runningSessionIds?: ReadonlySet<string>
   /** 按节点 ID 聚合的结构化活动态，优先于节点展示文案。 */
   nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
+  /** 成功生成但尚未正式采用的生图节点索引。 */
+  imageCandidateNodeIds?: ReadonlySet<string>
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   /** WebView 卡片仅请求受管静态 WebP，不在折叠态加载 HTML。 */
@@ -397,6 +560,7 @@ export function NativeCanvasGraph({
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
   nodeActivityStates = EMPTY_NODE_ACTIVITY_STATES,
+  imageCandidateNodeIds = EMPTY_IMAGE_CANDIDATE_NODE_IDS,
   imagePreviews,
   loadCanvasWebviewPreview,
   pendingWebviewDeviceNodeIds,
@@ -446,27 +610,60 @@ export function NativeCanvasGraph({
     () => new Set(controlledSelectedNodeIds),
     [controlledSelectedNodeIds],
   )
-  /** 未接通工作台状态前仍渲染稳定入口，Task 8 可直接注入真实切换命令。 */
-  const workbenchNodeChange = onWorkbenchNodeChange ?? NOOP_EXPAND
-  /** 首帧投影只使用 Canvas 文档内存数据，不读取 Agent 消息。 */
-  const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(() => (
-    toNativeCanvasFlowNodes(document, {
+  /** 父级可使用行内回调；节点数据只接收固定入口并在调用时读取最新实现。 */
+  const projectionCallbackBridgeRef = React.useRef<NativeCanvasProjectionCallbackBridge | null>(null)
+  if (!projectionCallbackBridgeRef.current) {
+    projectionCallbackBridgeRef.current = createNativeCanvasProjectionCallbackBridge({
+      onCreateChild,
+      onReferenceNode,
+      onWorkbenchNodeChange,
+      loadCanvasWebviewPreview,
+      onWebviewDevicePresetChange,
+    })
+  }
+  const projectionCallbackBridge = projectionCallbackBridgeRef.current
+  projectionCallbackBridge.update({
+    onCreateChild,
+    onReferenceNode,
+    onWorkbenchNodeChange,
+    loadCanvasWebviewPreview,
+    onWebviewDevicePresetChange,
+  })
+  /** 可选能力保持原有 presence 合同；存在时使用桥接后的稳定函数。 */
+  const referenceNode = onReferenceNode ? projectionCallbackBridge.onReferenceNode : undefined
+  const webviewPreviewLoader = loadCanvasWebviewPreview
+    ? projectionCallbackBridge.loadCanvasWebviewPreview
+    : undefined
+  const webviewDevicePresetChange = onWebviewDevicePresetChange
+    ? projectionCallbackBridge.onWebviewDevicePresetChange
+    : undefined
+  const workbenchNodeChange = projectionCallbackBridge.onWorkbenchNodeChange
+  /** 首帧纯投影只创建一次，并作为后续三方合并的权威比较基线。 */
+  const initialFlowNodeProjectionRef = React.useRef<NativeCanvasFlowNode[] | null>(null)
+  if (!initialFlowNodeProjectionRef.current) {
+    initialFlowNodeProjectionRef.current = toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
+      imageCandidateNodeIds,
       imagePreviews,
-      loadCanvasWebviewPreview,
+      loadCanvasWebviewPreview: webviewPreviewLoader,
       pendingWebviewDeviceNodeIds,
-      onWebviewDevicePresetChange,
+      onWebviewDevicePresetChange: webviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
-      onCreateChild,
-      onReferenceNode,
+      onCreateChild: projectionCallbackBridge.onCreateChild,
+      onReferenceNode: referenceNode,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
       selected: controlledSelectedNodeIdSet.has(node.id),
     }))
-  ))
+  }
+  /** 上一次纯投影不含 XYFlow 局部字段，用于判断哪些权威展示字段真实变化。 */
+  const projectedFlowNodesRef = React.useRef(initialFlowNodeProjectionRef.current)
+  /** 画布切换时禁止把同名节点的局部几何带入另一个 Canvas。 */
+  const projectedCanvasIdRef = React.useRef(document.canvasId)
+  const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(initialFlowNodeProjectionRef.current)
   /** 最新局部节点用于在同一批 React 更新内连续应用 XYFlow change。 */
   const flowNodesRef = React.useRef(flowNodes)
   flowNodesRef.current = flowNodes
@@ -507,21 +704,31 @@ export function NativeCanvasGraph({
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
+      imageCandidateNodeIds,
       imagePreviews,
-      loadCanvasWebviewPreview,
+      loadCanvasWebviewPreview: webviewPreviewLoader,
       pendingWebviewDeviceNodeIds,
-      onWebviewDevicePresetChange,
+      onWebviewDevicePresetChange: webviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
-      onCreateChild,
-      onReferenceNode,
+      onCreateChild: projectionCallbackBridge.onCreateChild,
+      onReferenceNode: referenceNode,
       onWorkbenchNodeChange: workbenchNodeChange,
     }).map((node) => ({
       ...node,
       selected: controlledSelectedNodeIdSet.has(node.id),
     }))
-    flowNodesRef.current = nextNodes
-    setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, imagePreviews, loadCanvasWebviewPreview, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
+    const reconciledNodes = projectedCanvasIdRef.current === document.canvasId
+      ? reconcileNativeCanvasFlowNodes(
+          flowNodesRef.current,
+          projectedFlowNodesRef.current,
+          nextNodes,
+        )
+      : nextNodes
+    projectedCanvasIdRef.current = document.canvasId
+    projectedFlowNodesRef.current = nextNodes
+    flowNodesRef.current = reconciledNodes
+    setFlowNodes(reconciledNodes)
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateNodeIds, imagePreviews, nodeActivityStates, nodeIssues, pendingWebviewDeviceNodeIds, referenceNode, runningSessionIds, webviewDevicePresetChange, webviewPreviewLoader, workbenchNodeChange, writable, projectionCallbackBridge])
 
   React.useEffect(() => {
     /** 几何 Store 复用 reducer 结果，手势中不会被迟到的远端 viewport 覆盖。 */
@@ -667,10 +874,14 @@ export function NativeCanvasGraph({
     onConversationNodeChange(null)
   }, [activeTool, onConversationNodeChange, syncSelectedNodeIds])
 
+  /** 边只依赖节点类别与持久边；任务活动态等 Graph 重渲染直接复用投影。 */
+  const edgeProjectorRef = React.useRef<ReturnType<typeof createNativeCanvasFlowEdgeProjector> | null>(null)
+  if (!edgeProjectorRef.current) edgeProjectorRef.current = createNativeCanvasFlowEdgeProjector()
+  const flowEdges = edgeProjectorRef.current(document)
   /** 受控 Flow 属性集中声明选择工具下的可写连线合同。 */
   const flowProps: NativeCanvasFlowProps = {
     nodes: flowNodes,
-    edges: toNativeCanvasFlowEdges(document),
+    edges: flowEdges,
     nodeTypes: NATIVE_CANVAS_NODE_TYPES,
     viewport: viewportState.viewport,
     minZoom: 0.05,

@@ -10,6 +10,7 @@ import type {
 } from '@proma/shared'
 import { createCanvasContentNodeLifecycle, parseCanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 import type { CanvasContentNodeIntent } from './canvas-content-node-lifecycle'
+import { createCanvasTransactionArchive } from './canvas-transaction-archive'
 
 /** 创建可观察的内存生命周期环境，避免测试依赖真实磁盘正文。 */
 function createFixture(options: {
@@ -21,11 +22,16 @@ function createFixture(options: {
   defaultImageModelProfileId?: string | null
   /** 图片删除前可注入的任务取消行为。 */
   cancelActiveImageJobs?: (target: CanvasImageTarget) => Promise<void>
+  /** 启用内存终态归档，覆盖跨重启 operation 重放。 */
+  enableArchive?: boolean
+  /** 首次 active 删除失败，用于验证归档错误不会吞掉已提交 publication。 */
+  failArchiveRemoveOnce?: boolean
 } = {}) {
   /** 当前权威图文档。 */
   let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
   /** 按 operationId 持久化的 intent tombstone。 */
   const intents = new Map<string, CanvasContentNodeIntent>()
+  const archived = new Map<string, string>()
   /** 回收区的公开业务条目。 */
   const trash = new Map<string, CanvasTrashEntry>()
   /** 共享内容从回收区回到活动目录的真实物理移动次数。 */
@@ -106,6 +112,20 @@ function createFixture(options: {
       if (outcome.commitVisible) intents.set(intent.operationId, structuredClone(intent))
       return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
     },
+    ...(options.enableArchive ? {
+      archive: createCanvasTransactionArchive({
+        writeArchived: async (fileName, content) => { archived.set(fileName, content) },
+        readArchived: async (fileName) => archived.get(fileName) ?? null,
+        removeActive: async (fileName) => {
+          if (options.failArchiveRemoveOnce) {
+            options.failArchiveRemoveOnce = false
+            throw new Error('CONTENT_ARCHIVE_FAILED')
+          }
+          const match = /^content-node-([0-9a-f-]{36})\.json$/i.exec(fileName)
+          if (match) intents.delete(match[1]!)
+        },
+      }),
+    } : {}),
     assertAgentNodeIdle: (nodeId) => { if (running.has(nodeId)) throw new Error('AGENT_SESSION_BUSY') },
     cancelActiveImageJobs: async (imageTarget) => {
       imageDeleteCalls.push('cancel-job')
@@ -122,6 +142,7 @@ function createFixture(options: {
     service,
     restartService: createService,
     intents,
+    archived,
     trash,
     contents,
     preparedInputs,
@@ -243,6 +264,28 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(result.snapshot.document.nodes[0]?.kind).toBe(kind)
     expect(fixture.contents.has('content-1')).toBe(true)
     expect(fixture.intents.values().next().value?.state).toBe('committed')
+  })
+
+  test('Given committed 内容操作已归档 When fresh service 重放 Then 返回原结果且不重复提交图', async () => {
+    const fixture = createFixture({ enableArchive: true })
+    const input = {
+      ...target,
+      operationId: '11111111-1111-4111-8111-111111111111',
+      nodeId: 'node-archive',
+      kind: 'document' as const,
+      contentId: 'content-archive',
+      title: '归档文档',
+      position: { x: 1, y: 2 },
+      expectedRevision: 0,
+    }
+    const first = await fixture.service.create(input)
+
+    const replayed = await fixture.restartService().create(input)
+
+    expect(fixture.intents.size).toBe(0)
+    expect(replayed.snapshot.document).toEqual(first.snapshot.document)
+    expect(fixture.getDocument().revision).toBe(1)
+    expect(fixture.archived.size).toBe(1)
   })
 
   test('Given 项目有默认生图模型 When 创建图片节点 Then intent 固化模型且重放不重新解析', async () => {
@@ -429,6 +472,38 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(reconciled.documentChanged).toBe(true)
     expect(reconciled.publication?.revision).toBe(1)
     expect((await restarted.reconcile(target)).publication).toBeUndefined()
+  })
+
+  test('Given 恢复内容图已提交但终态归档失败 When 对账返回 Then 保留 publication 与归档错误', async () => {
+    let failed = false
+    const fixture = createFixture({
+      enableArchive: true,
+      failArchiveRemoveOnce: true,
+      writeOutcome: (intent) => {
+        if (intent.operation === 'create' && intent.state === 'committed' && !failed) {
+          failed = true
+          return { commitVisible: false, durabilityUncertain: false, error: 'injected' }
+        }
+        return { commitVisible: true, durabilityUncertain: false }
+      },
+    })
+    await expect(fixture.service.create({
+      ...target,
+      operationId: '31313131-3131-4131-8131-313131313131',
+      nodeId: 'node-31',
+      kind: 'document',
+      contentId: 'content-31',
+      title: '文档',
+      position: { x: 0, y: 0 },
+      expectedRevision: 0,
+    })).rejects.toHaveProperty('document.revision', 1)
+
+    const reconciled = await fixture.restartService().reconcile(target)
+
+    expect(reconciled.snapshot.document.revision).toBe(1)
+    expect(reconciled.documentChanged).toBe(true)
+    expect(reconciled.publication?.revision).toBe(1)
+    expect(reconciled.error).toHaveProperty('message', 'CONTENT_ARCHIVE_FAILED')
   })
 
   test('Given 内容节点 When 删除恢复再删除 Then 内容身份稳定且 trashId 每次独立', async () => {

@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.6"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.10"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -46,6 +46,21 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
     'canvas_run_agent',
     'canvas_run_workflow',
     'canvas_run_nodes',
+    'canvas_get_task',
+    'canvas_cancel_task',
+    'canvas_retry_task',
+    'canvas_list_versions',
+    'canvas_read_version',
+    'canvas_adopt_version',
+    'canvas_adopt_candidate_batch',
+    'canvas_export_artifact',
+    'canvas_list_trash',
+    'canvas_restore_node',
+    'canvas_rebuild_agent',
+    'canvas_list_workflows',
+    'canvas_get_workflow',
+    'canvas_resume_workflow',
+    'canvas_cancel_workflow',
   ]) {
     expect(skill).toContain(toolName)
   }
@@ -60,6 +75,9 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   expect(skill).toContain('先建立并验证新链路')
   expect(skill).toContain('再删除旧节点')
   expect(skill).toContain('图片提示词、画幅、尺寸、模型或上下文')
+  expect(skill).toContain('`mode=all`')
+  expect(skill).toContain('`mode=succeeded`')
+  expect(skill).toContain('不得把部分节点列表伪装成原子批次采用')
 })
 
 test('Given 用户只要求核对全部图片 When 读取 canvas-production Then 先枚举再看当前采用缩略图且保持只读', () => {
@@ -109,7 +127,10 @@ test('Given Agent 已有授权本地参考图 When 读取 canvas-production Then
 test('Given 普通 Agent 需要专业分工 When 读取 canvas-production Then 可配置并运行单个 Canvas Agent 且不会推进下游', () => {
   const skill = readCanvasProductionSkill()
 
-  expect(skill).toContain('使用 `canvas_update_agent_config`')
+  expect(skill).toContain('`canvas_update_agent_config`')
+  expect(skill).toContain('`artifact.configRevision`')
+  expect(skill).toContain('`expectedGraphRevision` 使用读取结果的顶层 `revision`')
+  expect(skill).toContain('`configOmitted`')
   expect(skill).toContain('已安装的专业 Skill')
   expect(skill).toContain('使用 `canvas_run_agent`')
   expect(skill).toContain('只运行一个 Canvas Agent')
@@ -139,4 +160,18 @@ test('Given 使用第三方专业 Skill When 编排画布 Then Skill 只影响�
   expect(skill).toContain('不能修改项目代码')
   expect(skill).toContain('不能绕过审批')
   expect(skill).toContain('不能自动采用媒体候选')
+})
+
+test('Given 四类 Agent 运行范围 When 读取 canvas-production Then 十五个操作与权限发现保持一致', () => {
+  const skill = readCanvasProductionSkill()
+
+  expect(skill).toContain('普通 Agent 可使用当前已装配的全部任务')
+  expect(skill).toContain('手动运行的 Canvas Agent')
+  expect(skill).toContain('不能重建自身，也不能控制父工作流')
+  expect(skill).toContain('父编排的 Canvas Agent 只可读取任务状态、版本列表和历史正文')
+  expect(skill).toContain('`plan` 模式只发现并执行只读操作')
+  expect(skill).toContain('CANVAS_OPERATION_CURSOR_INVALID')
+  expect(skill).toContain('等待采用、可继续、完成和取消状态')
+  expect(skill).toContain('批量导出最多十六项')
+  expect(skill).toContain('相同工具调用重放必须复用原结果')
 })

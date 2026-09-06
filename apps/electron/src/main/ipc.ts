@@ -215,6 +215,7 @@ import {
 } from './lib/design/agent-canvas-binding-ipc'
 import { AgentCanvasBindingStore } from './lib/design/agent-canvas-binding-store'
 import { createCanvasToolAccessFacade } from './lib/design/canvas-tool-access-facade'
+import { createCanvasTaskOperationService } from './lib/design/canvas-task-operation-service'
 import {
   createCanvasOperationSerializer,
   getCanvasToolProviderRuntime,
@@ -236,6 +237,8 @@ import {
 import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { createCanvasImageRunService } from './lib/design/canvas-image-run-service'
 import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
+import { createCanvasWorkflowRunStore } from './lib/design/canvas-workflow-run-store'
+import { createCanvasArtifactExportService } from './lib/design/canvas-artifact-export-service'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasAgentConfigStore } from './lib/design/canvas-agent-config-store'
 import {
@@ -249,8 +252,9 @@ import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-
 import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-candidate-batch-store'
 import { createCanvasImageCandidateBatchService } from './lib/design/canvas-image-candidate-batch-service'
 import { createCanvasDependencyStateService } from './lib/design/canvas-dependency-state-service'
-import { createCanvasAgentOutputService } from './lib/design/canvas-agent-output-service'
+import { createCanvasAgentOutputService, inspectCanvasAgentOutputRecovery } from './lib/design/canvas-agent-output-service'
 import { createCanvasAgentExecutionService } from './lib/design/canvas-agent-execution-service'
+import { createCanvasAgentReconciliation } from './lib/design/canvas-agent-reconciliation'
 import {
   createCanvasWebviewPreviewService,
   createElectronCanvasWebviewOffscreenRenderer,
@@ -2391,93 +2395,32 @@ export function registerIpcHandlers(): void {
       }
     },
   })
+  /** 查询与启动共用恢复事实捕获器，所有广播都在写 lease 释放后发生。 */
+  const reconcileCanvasAgent = createCanvasAgentReconciliation({
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
+      workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
+    )),
+    loadSnapshot: (target) => canvasDocumentStore.load(target),
+    reconcileBatch: (target) => canvasAgentBatchOperation.reconcileLocked(target),
+    reconcileAgent: (target) => canvasAgentNodeCreation.reconcile(target),
+    publish: (target, publication) => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+            projectId: target.projectId, canvasId: target.canvasId,
+            revision: publication.document.revision, cause: publication.cause,
+            ...(publication.source ? { source: publication.source } : {}),
+          })
+        } catch (error) {
+          console.error('[Canvas Agent 执行] 对账图事实广播失败:', error)
+        }
+      }
+    },
+  })
   /** Renderer 与父 Agent 共用的 Canvas Agent 生命周期，不依赖工作台挂载状态。 */
   const canvasAgentExecutionService = createCanvasAgentExecutionService({
-    reconcile: async (target) => {
-      /** batch 与 Agent intent 必须在同一 Canvas 串行器和 workspace lease 中完成对账。 */
-      const guarded = await canvasOperationSerializer.run(target, () => (
-        workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => ({
-          batch: await canvasAgentBatchOperation.reconcileLocked(target),
-          agent: await canvasAgentNodeCreation.reconcile(target),
-        }))
-      ))
-      /** 对账提交已可见且 lease 已释放后再广播，单窗口失败不击穿运行。 */
-      const publications = [
-        ...guarded.batch.publications,
-        ...(guarded.agent.documentChanged ? [{ document: guarded.agent.snapshot.document }] : []),
-      ]
-      /** 同一恢复 revision 只发布一次，并保留 batch 原始 source 路由。 */
-      const publishedRevisions = new Set<number>()
-      for (const publication of publications) {
-        if (publishedRevisions.has(publication.document.revision)) continue
-        publishedRevisions.add(publication.document.revision)
-        for (const contents of listAuthorizedDesignWebContents()) {
-          try {
-            contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
-              projectId: target.projectId,
-              canvasId: target.canvasId,
-              revision: publication.document.revision,
-              cause: 'graph',
-              ...('source' in publication ? { source: publication.source } : {}),
-            })
-          } catch (error) {
-            console.error('[Canvas Agent 执行] 对账图事实广播失败:', error)
-          }
-        }
-      }
-      if (guarded.agent.error) throw guarded.agent.error
-      return guarded.agent.snapshot
-    },
-    prepareStart: async (target, effect) => {
-      /** 最终 owner、输入和启动槽在同一图串行写边界完成，运行本身不持锁。 */
-      const guarded = await canvasOperationSerializer.run(target, () => (
-        workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => {
-          const batch = await canvasAgentBatchOperation.reconcileLocked(target)
-          const agent = await canvasAgentNodeCreation.reconcile(target)
-          /** effect 失败也先带出已提交 publication，锁外广播后再恢复原错误。 */
-          let prepared: { ok: true; value: ReturnType<typeof effect> } | { ok: false; error: unknown } | undefined
-          if (!agent.error) {
-            try {
-              prepared = { ok: true, value: effect(agent.snapshot) }
-            } catch (error) {
-              prepared = { ok: false, error }
-            }
-          }
-          return {
-            batch,
-            agent,
-            prepared,
-          }
-        })
-      ))
-      /** 对账产生的恢复事实仍在 lease 外广播，不能把运行扩展进临界区。 */
-      const publications = [
-        ...guarded.batch.publications,
-        ...(guarded.agent.documentChanged ? [{ document: guarded.agent.snapshot.document }] : []),
-      ]
-      const publishedRevisions = new Set<number>()
-      for (const publication of publications) {
-        if (publishedRevisions.has(publication.document.revision)) continue
-        publishedRevisions.add(publication.document.revision)
-        for (const contents of listAuthorizedDesignWebContents()) {
-          try {
-            contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
-              projectId: target.projectId,
-              canvasId: target.canvasId,
-              revision: publication.document.revision,
-              cause: 'graph',
-              ...('source' in publication ? { source: publication.source } : {}),
-            })
-          } catch (error) {
-            console.error('[Canvas Agent 执行] 最终对账图事实广播失败:', error)
-          }
-        }
-      }
-      if (guarded.agent.error) throw guarded.agent.error
-      if (!guarded.prepared) throw new Error('CANVAS_AGENT_OWNER_INVALID')
-      if (!guarded.prepared.ok) throw guarded.prepared.error
-      return guarded.prepared.value
-    },
+    reconcile: (target) => reconcileCanvasAgent(target, (snapshot) => snapshot),
+    prepareStart: reconcileCanvasAgent,
     validateParentAccess: ({ target, parentSessionId, startedAt }) => {
       /** 父会话与 binding 在 prepareStart 的同一写临界区 fresh-read。 */
       canvasToolAccess.requireLinkedCanvas({
@@ -2852,7 +2795,12 @@ export function registerIpcHandlers(): void {
     candidateBatches: canvasImageCandidateBatchService,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
-  /** 显式工作流只在主进程存活，直接复用唯一 Agent 与图片执行服务。 */
+  /** 持久工作流复用现有项目写守卫，重启后保留原预算与子任务身份。 */
+  const canvasWorkflowRuns = createCanvasWorkflowRunStore({
+    pathResolver: designPathResolver,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
+  /** 显式工作流直接复用唯一 Agent、图片执行与持久记录服务。 */
   const canvasWorkflowExecutionService = createCanvasWorkflowExecutionService({
     load: (target) => canvasDocumentStore.load(target).document,
     validateAccess: (context, canvasId) => {
@@ -2861,8 +2809,114 @@ export function registerIpcHandlers(): void {
     isAgentBusy: (node) => isAgentSessionBusy(node.agentSessionId),
     agentExecution: canvasAgentExecutionService,
     imageRuns: canvasImageRunService,
+    workflowRuns: canvasWorkflowRuns,
+    isImageCandidateAdopted: async (input) => {
+      /** 原 batch/task 和当前正式模块必须双向一致，迟到的其它候选不能推进工作流。 */
+      const batch = await canvasImageCandidateBatchService.load(input)
+      const entry = batch.entries.find((candidate) => candidate.nodeId === input.nodeId && candidate.jobId === input.taskId)
+      const node = canvasDocumentStore.load(input).document.nodes.find((candidate) => candidate.id === input.nodeId)
+      if (!entry || !entry.candidateAssetId || entry.status !== 'adopted'
+        || node?.kind !== 'image' || node.imageModuleId !== entry.imageModuleId
+        || node.adoptedAssetId !== entry.candidateAssetId) return { adopted: false, artifactHash: null, committedAt: null }
+      const config = await canvasImageModuleStore.load({ ...input, imageModuleId: node.imageModuleId })
+      if (config.adoptedAssetId !== entry.candidateAssetId) return { adopted: false, artifactHash: null, committedAt: null }
+      return { adopted: true,
+        artifactHash: createHash('sha256').update(JSON.stringify(['image-asset', entry.candidateAssetId])).digest('hex'),
+        committedAt: batch.adoption?.committedAt ?? batch.updatedAt }
+    },
+    recoverAgentExecution: async (input) => {
+      /** 正式输出必须位于原 user anchor 与下一条 user 消息之间，不能误用后续轮次。 */
+      const document = canvasDocumentStore.load(input).document
+      const node = document.nodes.find((candidate) => candidate.id === input.nodeId)
+      if (node?.kind !== 'agent' || node.agentSessionId !== input.agentSessionId) return { status: 'missing' }
+      const messages = getAgentSessionSDKMessages(input.agentSessionId)
+      const pointer = node.outputPointer
+      const recovery = inspectCanvasAgentOutputRecovery(messages, input.expectedUserMessageUuid, input.expectedStartedAt, pointer)
+      if (recovery.status === 'changed') return { status: 'changed' }
+      if (pointer && recovery.status === 'completed') {
+        await canvasAgentOutputService.readAtPointer(input, pointer)
+        return { status: 'completed', output: { target: { projectId: input.projectId, canvasId: input.canvasId, nodeId: node.id },
+          revision: document.revision, pointer, downstreamNodeIds: [] } }
+      }
+      return { status: recovery.latestRun && isAgentSessionBusy(input.agentSessionId) ? 'running' : 'missing' }
+    },
+    onRunChanged: (event) => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try { contents.send(CANVAS_IPC_CHANNELS.WORKFLOW_RUN_CHANGED, event) }
+        catch { console.error('[Canvas 工作流] 状态广播失败') }
+      }
+    },
+  })
+  /** 每次选择目标都复核本轮交互窗口；后台或别的会话不能借用焦点窗口。 */
+  const requireCanvasExportWindow = (execution: import('./lib/design/canvas-artifact-export-service').CanvasArtifactExportExecution): BrowserWindow => {
+    execution.validateAccess()
+    const session = getAgentSessionMeta(execution.context.sessionId)
+    const ownerContents = listAuthorizedDesignWebContents().find(
+      (contents) => contents.id === execution.context.dialogOwnerWebContentsId,
+    )
+    const owner = ownerContents ? BrowserWindow.fromWebContents(ownerContents) : null
+    if (!session || session.sourceAutomationId || session.sourceDelegationId || !ownerContents || !owner
+      || owner.isDestroyed() || !owner.isVisible() || owner.webContents.id !== ownerContents.id) {
+      throw new Error('CANVAS_ARTIFACT_EXPORT_DESTINATION_REQUIRED')
+    }
+    return owner
+  }
+  /** 图片与正文导出使用精确版本事实及原生稳定目录写入边界。 */
+  const canvasArtifactExport = createCanvasArtifactExportService({
+    documents: canvasDocumentStore,
+    runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
+      workspaceOperationGuard.runWorkspaceWrite(target.projectId, effect)
+    )),
+    jobs: { getProjectJob: (projectId, jobId) => designJobManager.getProjectJob(projectId, jobId) },
+    assets: {
+      getAsset: (projectId, assetId) => {
+        const asset = designStore.requireStableAuthoritativeDocument(projectId).assets.find((candidate) => candidate.id === assetId)
+        if (!asset) throw new Error('CANVAS_IMAGE_VERSION_UNAVAILABLE')
+        return asset
+      },
+      resolveAssetPath: (projectId, assetId) => designAssetService.resolveAssetPath(projectId, assetId),
+    },
+    textArtifacts: canvasTextArtifactService,
+    getAuthorizedProjectRoot: (projectId, context) => {
+      canvasToolAccess.authorizeRead(context)
+      const session = getAgentSessionMeta(context.sessionId)
+      if (!session || session.workspaceId !== projectId) throw new Error('CANVAS_PROJECT_ACCESS_DENIED')
+      return resolveAgentCwd(getAgentWorkspace(projectId), session.id, session.agentCwdMode, session.activeWorktree) ?? undefined
+    },
+    choosePath: async (selection, execution) => {
+      const owner = requireCanvasExportWindow(execution)
+      const result = await dialog.showSaveDialog(owner, { title: '导出画布产物', defaultPath: selection.defaultName,
+        filters: [{ name: '画布产物', extensions: [selection.extension.replace(/^\./, '')] }] })
+      requireCanvasExportWindow(execution)
+      return result.canceled ? undefined : result.filePath
+    },
+    chooseDirectory: async (_selection, execution) => {
+      const owner = requireCanvasExportWindow(execution)
+      const result = await dialog.showOpenDialog(owner, {
+        title: '批量导出画布产物', properties: ['openDirectory', 'createDirectory'],
+      })
+      requireCanvasExportWindow(execution)
+      return result.canceled ? undefined : result.filePaths[0]
+    },
+  })
+  /** 图片任务详情、停止与重试在界面和 Agent 间共享同一服务。 */
+  const canvasTaskOperations = createCanvasTaskOperationService({
+    jobs: designJobManager,
+    candidateBatches: canvasImageCandidateBatchService,
+    traceStore: designTraceStore,
+    onBackgroundError: (message, error) => console.error(message, error),
   })
   registerCanvasDocumentIpcHandlers({
+    taskOperations: canvasTaskOperations,
+    artifactExport: canvasArtifactExport,
+    resolveWorkflowUiContext: (input) => {
+      /** 窗口声明的当前会话须重新通过项目和绑定校验，不借用运行记录的 owner。 */
+      const context = { projectId: input.projectId, sessionId: input.sessionId, runStartedAt: Date.now(),
+        explicitReferences: [], permissionCeiling: 'execute' as const }
+      canvasToolAccess.authorizeRead(context)
+      canvasToolAccess.requireLinkedCanvas(context, input.canvasId)
+      return context
+    },
     ipc: ipcMain,
     listAuthorizedWebContents: listAuthorizedDesignWebContents,
     guard: workspaceOperationGuard,

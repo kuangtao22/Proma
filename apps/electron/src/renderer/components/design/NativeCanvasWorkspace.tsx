@@ -22,11 +22,12 @@ import type {
   DesignChangeEvent,
   DesignPoint,
   DesignJobRecord,
+  CanvasImageJobActivity,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
-import { ArchiveRestore, LoaderCircle, RotateCcw } from 'lucide-react'
+import { ArchiveRestore, History, LoaderCircle, RotateCcw } from 'lucide-react'
 import {
   canvasAgentRunningSessionIdsAtom,
   canvasAgentOptimisticRunGenerationsAtom,
@@ -103,6 +104,14 @@ import {
   createNativeCanvasTrashController,
 } from './NativeCanvasTrashDialog'
 import type { NativeCanvasTrashController, NativeCanvasTrashState } from './NativeCanvasTrashDialog'
+import {
+  NativeCanvasWorkflowRunDialog,
+  createNativeCanvasWorkflowRunController,
+} from './NativeCanvasWorkflowRunDialog'
+import type {
+  NativeCanvasWorkflowRunController,
+  NativeCanvasWorkflowRunState,
+} from './NativeCanvasWorkflowRunDialog'
 import { NativeCanvasToolbar } from './NativeCanvasToolbar'
 import {
   CanvasAgentConversation,
@@ -190,9 +199,16 @@ export function runNativeCanvasToolbarAddNode(
 }
 /** controller 使用的最小原生 Canvas adapter 合同。 */
 export interface NativeCanvasAdapter {
+  listCanvasImageActivity?: DesignAdapter['listCanvasImageActivity']
   loadCanvas: DesignAdapter['loadCanvas']
   saveCanvas: DesignAdapter['saveCanvas']
   onCanvasChanged: DesignAdapter['onCanvasChanged']
+  /** 工作流历史仅在用户打开弹窗时按需读取和订阅。 */
+  listCanvasWorkflowRuns?: DesignAdapter['listCanvasWorkflowRuns']
+  getCanvasWorkflowRun?: DesignAdapter['getCanvasWorkflowRun']
+  resumeCanvasWorkflowRun?: DesignAdapter['resumeCanvasWorkflowRun']
+  cancelCanvasWorkflowRun?: DesignAdapter['cancelCanvasWorkflowRun']
+  onCanvasWorkflowRunChanged?: DesignAdapter['onCanvasWorkflowRunChanged']
   /** 画布卡片运行态只读取轻量任务列表，并监听项目级任务事件。 */
   listJobs?: DesignAdapter['listJobs']
   onChanged?: DesignAdapter['onChanged']
@@ -241,11 +257,18 @@ export interface NativeCanvasAdapter {
 }
 
 /** 画布卡片任务同步器依赖，只包含项目任务列表与变更事件。 */
+/** 兼容旧 Adapter 的完整任务，但卡片只消费统一活动摘要字段。 */
+type NativeCanvasActivityJob = Pick<DesignJobRecord, keyof CanvasImageJobActivity>
+
 export interface NativeCanvasJobActivityControllerDependencies {
   projectId: string
+  canvasId?: string
+  listActivity?: DesignAdapter['listCanvasImageActivity']
+  /** 以有界窗口合并任务事件，避免逐事件扫描项目任务目录。 */
+  scheduler: NativeCanvasScheduler
   listJobs: DesignAdapter['listJobs']
   onChanged: DesignAdapter['onChanged']
-  onJobsChange: (jobs: DesignJobRecord[]) => void
+  onJobsChange: (jobs: NativeCanvasActivityJob[]) => void
 }
 
 /** 画布卡片任务同步器公开的最小生命周期。 */
@@ -266,41 +289,82 @@ export function createNativeCanvasJobActivityController(
 ): NativeCanvasJobActivityController {
   /** 已释放控制器不得提交迟到任务结果。 */
   let disposed = false
-  /** 仅最后一次任务读取可以更新卡片活动态。 */
-  let requestGeneration = 0
+  /** 列表读取串行执行，避免同时堆积多个完整项目快照。 */
+  let inFlight = false
+  /** 读取期间的新事件至多触发一次补读。 */
+  let refreshRequested = false
+  /** 首次打开和显式刷新才要求重建磁盘索引，普通事件只读增量内存事实。 */
+  let resyncRequested = false
+  /** 空闲事件最多等待 50ms，同一窗口内不重复建立计时器。 */
+  let refreshTimer: number | null = null
   /** 当前事件订阅释放器，保证重复 start 不重复监听。 */
   let unsubscribe: (() => void) | null = null
-  /** 测试与收尾可等待的最近一次刷新。 */
-  let pendingRefresh = Promise.resolve()
+  /** 整个合批周期只持有一个可等待的终结点，包括期间补读。 */
+  let idle: ReturnType<typeof Promise.withResolvers<void>> | null = null
 
-  const refresh = (): Promise<void> => {
-    if (disposed) return Promise.resolve()
-    const generation = requestGeneration + 1
-    requestGeneration = generation
-    pendingRefresh = dependencies.listJobs(dependencies.projectId).then((jobs) => {
-      if (disposed || generation !== requestGeneration) return
-      dependencies.onJobsChange(jobs)
-    }).catch(() => {
+  /** 串行读取一次任务快照，期间新事件只标记下一次有界补读。 */
+  const readJobs = async (): Promise<void> => {
+    refreshTimer = null
+    if (disposed) return
+    inFlight = true
+    refreshRequested = false
+    const resync = resyncRequested
+    resyncRequested = false
+    try {
+      const jobs = dependencies.listActivity && dependencies.canvasId
+        ? await dependencies.listActivity({ projectId: dependencies.projectId, canvasId: dependencies.canvasId, resync })
+        : await dependencies.listJobs(dependencies.projectId)
+      if (!disposed) dependencies.onJobsChange(jobs)
+    } catch {
       /** 卡片运行提示是增强信息；读取失败时保留最后一次有效快照。 */
-    })
-    return pendingRefresh
+    } finally {
+      inFlight = false
+      if (!disposed && refreshRequested) {
+        refreshTimer = dependencies.scheduler.setTimeout(() => { void readJobs() }, 50)
+      } else {
+        idle?.resolve()
+        idle = null
+      }
+    }
+  }
+
+  /** 首次或手动刷新立即读取；后台事件共用合批窗口。 */
+  const requestRefresh = (immediate: boolean): Promise<void> => {
+    if (disposed) return Promise.resolve()
+    refreshRequested = true
+    resyncRequested ||= immediate
+    idle ??= Promise.withResolvers<void>()
+    const completion = idle.promise
+    if (inFlight) return completion
+    if (immediate) {
+      if (refreshTimer !== null) dependencies.scheduler.clearTimeout(refreshTimer)
+      void readJobs()
+    } else if (refreshTimer === null) {
+      refreshTimer = dependencies.scheduler.setTimeout(() => { void readJobs() }, 50)
+    }
+    return completion
   }
 
   return {
     start: () => {
       if (disposed || unsubscribe) return
       unsubscribe = dependencies.onChanged((change: DesignChangeEvent) => {
-        if (change.projectId !== dependencies.projectId || change.cause !== 'job') return
-        void refresh()
+        if (change.projectId !== dependencies.projectId
+          || (change.cause !== 'job' && change.cause !== 'asset' && change.cause !== 'recovery')) return
+        void requestRefresh(change.cause === 'recovery')
       })
-      void refresh()
+      void requestRefresh(true)
     },
-    refresh,
-    whenIdle: () => pendingRefresh,
+    refresh: () => requestRefresh(true),
+    whenIdle: () => idle?.promise ?? Promise.resolve(),
     dispose: () => {
       if (disposed) return
       disposed = true
-      requestGeneration += 1
+      if (refreshTimer !== null) dependencies.scheduler.clearTimeout(refreshTimer)
+      refreshTimer = null
+      refreshRequested = false
+      idle?.resolve()
+      idle = null
       unsubscribe?.()
       unsubscribe = null
     },
@@ -2260,6 +2324,8 @@ const NATIVE_CANVAS_ACTIVITY_PRIORITY: Readonly<Record<CanvasNodeActivityState, 
   'waiting-approval': 2,
   running: 3,
 }
+/** 项目尚无图片任务时复用稳定空快照，避免无关渲染重复派生节点索引。 */
+const EMPTY_NATIVE_CANVAS_DESIGN_JOBS: readonly NativeCanvasActivityJob[] = []
 
 /**
  * 从 Agent 运行集合与结构化图片任务建立按节点 ID 的瞬时活动映射。
@@ -2271,7 +2337,7 @@ const NATIVE_CANVAS_ACTIVITY_PRIORITY: Readonly<Record<CanvasNodeActivityState, 
 export function createNativeCanvasNodeActivityStates(
   document: CanvasDocument,
   runningSessionIds: ReadonlySet<string>,
-  jobs: readonly DesignJobRecord[],
+  jobs: readonly NativeCanvasActivityJob[],
 ): ReadonlyMap<string, CanvasNodeActivityState> {
   /** 权威节点索引同时阻止其他 Canvas 的 Job 污染当前画布。 */
   const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
@@ -2297,6 +2363,36 @@ export function createNativeCanvasNodeActivityStates(
     else if (job.status === 'queued') assign(job.target.nodeId, 'queued')
   }
   return states
+}
+
+/**
+ * 从项目级任务快照建立当前 Canvas 的成功图片候选节点索引。
+ * @param document 当前权威 Canvas 文档，用于校验项目、画布、节点与图片模块身份。
+ * @param jobs 当前项目的有界图片任务快照。
+ * @returns 仅包含成功且具有输出素材的生图节点 ID。
+ */
+export function createNativeCanvasImageCandidateNodeIds(
+  document: CanvasDocument,
+  jobs: readonly NativeCanvasActivityJob[],
+): ReadonlySet<string> {
+  /** 节点与图片模块必须同时匹配，避免跨画布同名任务污染状态。 */
+  const imageModuleIdsByNodeId = new Map(
+    document.nodes.flatMap((node) => node.kind === 'image'
+      ? [[node.id, node.imageModuleId] as const]
+      : []),
+  )
+  /** 索引只保留节点身份，不暴露候选 Asset ID 或触发任何采用行为。 */
+  const candidateNodeIds = new Set<string>()
+  for (const job of jobs) {
+    if (job.projectId !== document.projectId
+      || job.status !== 'succeeded'
+      || !job.outputAssetId
+      || job.target?.kind !== 'canvas-image'
+      || job.target.canvasId !== document.canvasId
+      || imageModuleIdsByNodeId.get(job.target.nodeId) !== job.target.imageModuleId) continue
+    candidateNodeIds.add(job.target.nodeId)
+  }
+  return candidateNodeIds
 }
 
 /** HMR 与旧测试夹具可能仍携带迁移前视图字段，只在 view atom 首次缺失时读取一次。 */
@@ -2386,13 +2482,14 @@ export function NativeCanvasWorkspace({
   /** 原生画布独立维护任务快照，不依赖旧设计工作区是否同时挂载。 */
   const [canvasActivityJobs, setCanvasActivityJobs] = React.useState<{
     projectId: string
-    jobs: DesignJobRecord[]
+    jobs: NativeCanvasActivityJob[]
   } | null>(null)
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
   const optimisticRunGenerations = useAtomValue(canvasAgentOptimisticRunGenerationsAtom)
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
   const commandRef = React.useRef<CanvasNodeCreateCommandController | null>(null)
   const trashControllerRef = React.useRef<NativeCanvasTrashController | null>(null)
+  const workflowRunControllerRef = React.useRef<NativeCanvasWorkflowRunController | null>(null)
   const rebuildCommandRef = React.useRef<CanvasAgentNodeRebuildController | null>(null)
   /** DELETE 异步回调代次，Canvas 切换后立即失效旧删除请求。 */
   const deleteGenerationRef = React.useRef(0)
@@ -2429,6 +2526,11 @@ export function NativeCanvasWorkspace({
   const [trashState, setTrashState] = React.useState<NativeCanvasTrashState>({
     entries: [], loading: false, restoringTrashId: null, error: null,
   })
+  const [workflowRunsOpen, setWorkflowRunsOpen] = React.useState(false)
+  const [workflowRunState, setWorkflowRunState] = React.useState<NativeCanvasWorkflowRunState>({
+    runs: [], nextCursor: null, loading: false, loadingMore: false,
+    operationRunId: null, error: null,
+  })
   const [workbenchSwitchSaving, setWorkbenchSwitchSaving] = React.useState(false)
   const [workbenchSwitchError, setWorkbenchSwitchError] = React.useState<string | null>(null)
   /** 已挂载重内容工作台按节点 ID 动态登记的提交器。 */
@@ -2447,13 +2549,61 @@ export function NativeCanvasWorkspace({
     /** 当前画布只在任务变化时读取轻量 journal，不轮询或加载图片正文。 */
     const activityController = createNativeCanvasJobActivityController({
       projectId: target.projectId,
+      canvasId: target.canvasId,
+      listActivity: adapter.listCanvasImageActivity,
+      scheduler: {
+        setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+        clearTimeout: (timerId) => window.clearTimeout(timerId),
+      },
       listJobs: adapter.listJobs,
       onChanged: adapter.onChanged,
       onJobsChange: (jobs) => setCanvasActivityJobs({ projectId: target.projectId, jobs }),
     })
     activityController.start()
-    return () => activityController.dispose()
-  }, [adapter.listJobs, adapter.onChanged, target.projectId])
+    /** 重连或外部进程写入后，重新进入窗口时主动同步一次权威磁盘事实。 */
+    const onFocus = (): void => { void activityController.refresh() }
+    window.addEventListener('focus', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      activityController.dispose()
+    }
+  }, [adapter.listJobs, adapter.listCanvasImageActivity, adapter.onChanged, target.projectId, target.canvasId])
+
+  React.useEffect(() => {
+    if (!workflowRunsOpen
+      || !adapter.listCanvasWorkflowRuns
+      || !adapter.getCanvasWorkflowRun
+      || !adapter.resumeCanvasWorkflowRun
+      || !adapter.cancelCanvasWorkflowRun
+      || !adapter.onCanvasWorkflowRunChanged) return
+    /** 弹窗存活期间才订阅工作流变化，关闭后立即释放底层 listener。 */
+    const controller = createNativeCanvasWorkflowRunController({
+      sessionId,
+      target,
+      listRuns: adapter.listCanvasWorkflowRuns,
+      getRun: adapter.getCanvasWorkflowRun,
+      resumeRun: adapter.resumeCanvasWorkflowRun,
+      cancelRun: adapter.cancelCanvasWorkflowRun,
+      onChanged: adapter.onCanvasWorkflowRunChanged,
+      onStateChange: setWorkflowRunState,
+    })
+    workflowRunControllerRef.current = controller
+    void controller.load()
+    return () => {
+      controller.dispose()
+      if (workflowRunControllerRef.current === controller) workflowRunControllerRef.current = null
+    }
+  }, [
+    adapter.cancelCanvasWorkflowRun,
+    adapter.getCanvasWorkflowRun,
+    adapter.listCanvasWorkflowRuns,
+    adapter.onCanvasWorkflowRunChanged,
+    adapter.resumeCanvasWorkflowRun,
+    sessionId,
+    target.canvasId,
+    target.projectId,
+    workflowRunsOpen,
+  ])
   /** 文档工作台只有在五类文本产物能力齐全时才替换占位内容。 */
   const documentWorkbenchAdapter = React.useMemo(
     () => createNativeCanvasDocumentWorkbenchAdapter(adapter),
@@ -2532,22 +2682,26 @@ export function NativeCanvasWorkspace({
   const imagePreviews = React.useMemo(() => new Map(
     (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
   ), [state.snapshot?.imagePreviews])
+  /** Job 事件与项目 Store 共用同一优先级，避免候选态和活动态读取不同快照。 */
+  const currentProjectJobs = canvasActivityJobs?.projectId === target.projectId
+    ? canvasActivityJobs.jobs
+    : designProjectStates.get(target.projectId)?.jobs ?? EMPTY_NATIVE_CANVAS_DESIGN_JOBS
   /** 四类卡片统一消费按 nodeId 聚合的结构化活动态。 */
   const nodeActivityStates = React.useMemo(() => state.snapshot
     ? createNativeCanvasNodeActivityStates(
         state.snapshot.document,
         runningSessionIds,
-        canvasActivityJobs?.projectId === target.projectId
-          ? canvasActivityJobs.jobs
-          : designProjectStates.get(target.projectId)?.jobs ?? [],
+        currentProjectJobs,
       )
     : new Map<string, CanvasNodeActivityState>(), [
-      canvasActivityJobs,
-      designProjectStates,
+      currentProjectJobs,
       runningSessionIds,
       state.snapshot,
-      target.projectId,
     ])
+  /** 成功 Job 只派生候选展示索引，不加载图片模块或改变正式采用状态。 */
+  const imageCandidateNodeIds = React.useMemo(() => state.snapshot
+    ? createNativeCanvasImageCandidateNodeIds(state.snapshot.document, currentProjectJobs)
+    : new Set<string>(), [currentProjectJobs, state.snapshot])
   /** 当前可见范围只依赖轻量节点几何，不读取工作台正文。 */
   const visibleNodeIds = React.useMemo(() => viewDocument
     ? listVisibleNativeCanvasNodeIds(viewDocument, canvasSurfaceSize)
@@ -3322,6 +3476,11 @@ export function NativeCanvasWorkspace({
     setDeleteError(null)
     setTrashOpen(false)
     setTrashState({ entries: [], loading: false, restoringTrashId: null, error: null })
+    setWorkflowRunsOpen(false)
+    setWorkflowRunState({
+      runs: [], nextCursor: null, loading: false, loadingMore: false,
+      operationRunId: null, error: null,
+    })
     setWorkbenchSwitchSaving(false)
     setWorkbenchSwitchError(null)
     return () => {
@@ -3597,6 +3756,20 @@ export function NativeCanvasWorkspace({
             type="button"
             size="icon-sm"
             variant="ghost"
+            aria-label="打开工作流运行记录"
+            disabled={!adapter.listCanvasWorkflowRuns
+              || !adapter.getCanvasWorkflowRun
+              || !adapter.resumeCanvasWorkflowRun
+              || !adapter.cancelCanvasWorkflowRun
+              || !adapter.onCanvasWorkflowRunChanged}
+            onClick={() => setWorkflowRunsOpen(true)}
+          >
+            <History aria-hidden="true" />
+          </Button>
+          <Button
+            type="button"
+            size="icon-sm"
+            variant="ghost"
             aria-label="打开回收区"
             disabled={!adapter.listCanvasTrash || !adapter.restoreCanvasNode}
             onClick={() => {
@@ -3659,6 +3832,7 @@ export function NativeCanvasWorkspace({
                 nodeIssues={state.snapshot.nodeIssues}
                 runningSessionIds={runningSessionIds}
                 nodeActivityStates={nodeActivityStates}
+                imageCandidateNodeIds={imageCandidateNodeIds}
                 imagePreviews={imagePreviews}
                 loadCanvasWebviewPreview={adapter.loadCanvasWebviewPreview}
                 pendingWebviewDeviceNodeIds={pendingWebviewDeviceNodeIds}
@@ -3768,6 +3942,14 @@ export function NativeCanvasWorkspace({
         onRestore={(entry) => {
           void trashControllerRef.current?.restore(entry)
         }}
+      />
+      <NativeCanvasWorkflowRunDialog
+        open={workflowRunsOpen}
+        state={workflowRunState}
+        onOpenChange={setWorkflowRunsOpen}
+        onLoadMore={() => { void workflowRunControllerRef.current?.loadMore() }}
+        onResume={(run) => { void workflowRunControllerRef.current?.resume(run) }}
+        onCancel={(run) => { void workflowRunControllerRef.current?.cancel(run) }}
       />
       <Dialog
         open={viewState.pendingWorkbenchSwitchNodeId !== null}

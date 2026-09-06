@@ -3,6 +3,7 @@ import type {
   CanvasDocument,
   CanvasDocumentNode,
   CanvasJsonValue,
+  CanvasMutation,
   CanvasTextArtifactKind,
   CanvasWebviewNode,
   CanvasWorkspaceSnapshot,
@@ -12,6 +13,7 @@ import type {
   CanvasArtifactRevisionStore,
   CanvasArtifactRevisionSnapshot,
 } from './canvas-artifact-revision-store'
+import type { CanvasBatchOperationIntent } from './canvas-agent-batch-operation'
 import {
   createCanvasTextArtifactAdapter,
   createCanvasTextArtifactGraphWriter,
@@ -107,6 +109,8 @@ function createFixture(options: { failCommitOnce?: boolean } = {}) {
   const graphInputs: CanvasTextArtifactGraphCommitInput[] = []
   /** 原子导出调用记录，不触碰真实文件系统。 */
   const exports: Array<{ path: string; content: string }> = []
+  /** Agent 图提交的 durable batch receipt。 */
+  const batchIntents: CanvasBatchOperationIntent[] = []
   /** 仅首次 commit 注入回执失败。 */
   let remainingCommitFailures = options.failCommitOnce ? 1 : 0
 
@@ -190,6 +194,32 @@ function createFixture(options: { failCommitOnce?: boolean } = {}) {
         const nodes = extractFixtureUpsertNodes(input.operations)
         return { document: commitNodes(input.baseRevision, nodes), operationId: 'batch-fixture' }
       },
+      executeLocked: async (input) => {
+        /** 首次锁内提交同时固化可供 source 精确查询的 committed receipt。 */
+        const nodes = extractFixtureUpsertNodes(input.operations)
+        const document = commitNodes(input.baseRevision, nodes)
+        batchIntents.push({
+          schemaVersion: 1,
+          operationId: '11111111-1111-4111-8111-111111111111',
+          target: { projectId: input.projectId, canvasId: input.canvasId },
+          baseRevision: input.baseRevision,
+          source: {
+            sessionId: input.sourceSessionId,
+            runStartedAt: input.sourceRunStartedAt,
+            toolCallId: input.sourceToolCallId,
+          },
+          state: 'committed',
+          preparedResources: [],
+          expectedGraphSha256: 'a'.repeat(64),
+          operations: structuredClone(input.operations) as unknown as CanvasMutation[],
+        })
+        return { document, operationId: 'batch-fixture' }
+      },
+      findReplayLocked: async (_target, source) => batchIntents.find((intent) => (
+        intent.source.sessionId === source.sessionId
+        && intent.source.runStartedAt === source.runStartedAt
+        && intent.source.toolCallId === source.toolCallId
+      )) ?? null,
     },
     dependencyState: createCanvasDependencyStateService(),
     now: () => 50,
@@ -200,6 +230,11 @@ function createFixture(options: { failCommitOnce?: boolean } = {}) {
       graphInputs.push(structuredClone(input))
       return graphWriter.commit(input)
     },
+    commitLocked: async (input: CanvasTextArtifactGraphCommitInput): Promise<CanvasDocument> => {
+      graphInputs.push(structuredClone(input))
+      return graphWriter.commitLocked(input)
+    },
+    findReplayLocked: graphWriter.findReplayLocked,
   }
   /** 被测文本产物服务。 */
   const service = createCanvasTextArtifactService({
@@ -217,6 +252,7 @@ function createFixture(options: { failCommitOnce?: boolean } = {}) {
     reconciledDocuments,
     graphInputs,
     exports,
+    batchIntents,
     getDocument: () => structuredClone(currentDocument),
     setDocument: (document: CanvasDocument) => { currentDocument = structuredClone(document) },
     /** 修改指定版本状态，用于验证 prepared 恢复候选的公开边界。 */
@@ -336,6 +372,53 @@ describe('Canvas Text Artifact Service', () => {
     })
   })
 
+  test('Given Agent 采用 receipt 已提交且用户后来切换版本 When 同 source 重放 Then 返回原事实且不回退当前版本', async () => {
+    const fixture = createFixture()
+    const source = { type: 'agent' as const, sessionId: 'session-1', runStartedAt: 10, toolCallId: 'tool-adopt' }
+    const input = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'web-1',
+      kind: 'webview' as const, contentId: 'prototype-1', expectedCanvasRevision: 7,
+      expectedContentRevision: 3, revision: 1,
+      operationId: '22222222-2222-4222-8222-222222222224', source,
+    }
+    const first = await fixture.service.adopt(input)
+    const later = fixture.getDocument()
+    fixture.setDocument({
+      ...later,
+      revision: later.revision + 1,
+      nodes: later.nodes.map((node) => node.id === 'web-1' && node.kind === 'webview'
+        ? { ...node, contentRevision: 3 }
+        : node),
+    })
+    const beforeReplay = fixture.getDocument()
+
+    const replay = await fixture.service.adopt(input)
+
+    expect(first.artifact.target.contentRevision).toBe(1)
+    expect(replay.artifact.target.contentRevision).toBe(1)
+    expect(replay.snapshot.document).toEqual(beforeReplay)
+    expect(fixture.getDocument()).toEqual(beforeReplay)
+    expect(fixture.graphInputs).toHaveLength(1)
+  })
+
+  test('Given 同 source receipt 的目标 revision 不匹配 When 重放 Then 在当前图 CAS 前拒绝', async () => {
+    const fixture = createFixture()
+    const source = { type: 'agent' as const, sessionId: 'session-1', runStartedAt: 10, toolCallId: 'tool-adopt' }
+    const input = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'web-1',
+      kind: 'webview' as const, contentId: 'prototype-1', expectedCanvasRevision: 7,
+      expectedContentRevision: 3, revision: 1,
+      operationId: '22222222-2222-4222-8222-222222222225', source,
+    }
+    await fixture.service.adopt(input)
+    const beforeReplay = fixture.getDocument()
+
+    await expect(fixture.service.adopt({ ...input, revision: 3 }))
+      .rejects.toThrow('CANVAS_TEXT_ARTIFACT_REPLAY_CONFLICT')
+    expect(fixture.getDocument()).toEqual(beforeReplay)
+    expect(fixture.graphInputs).toHaveLength(1)
+  })
+
   test('Given 图或正文基线过期 When 更新 Then 不创建可见新版本', async () => {
     const fixture = createFixture()
     /** 过期图 revision 的更新输入。 */
@@ -452,6 +535,22 @@ describe('Canvas Text Artifact Service', () => {
       targetPath: '/tmp/prototype.html',
     })).rejects.toThrow('CANVAS_ARTIFACT_REVISION_CONFLICT')
     expect(fixture.exports).toHaveLength(0)
+  })
+
+  test('Given 节点当前采用 revision 3 When Agent 精确导出历史 revision 1 Then 写出历史正文且不切换当前版本', async () => {
+    const fixture = createFixture()
+
+    await fixture.service.exportVersion({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'web-1',
+      kind: 'webview', contentId: 'prototype-1', contentRevision: 1,
+      targetPath: '/tmp/prototype-history.html', overwrite: false,
+    })
+
+    expect(fixture.exports).toEqual([{
+      path: '/tmp/prototype-history.html', content: '<main>第一版</main>',
+    }])
+    expect(fixture.getDocument().nodes.find((node) => node.id === 'web-1'))
+      .toMatchObject({ contentRevision: 3 })
   })
 
   test('Given 图引用的 revision 仍是 prepared When 读取或导出 Then 不泄漏恢复候选', async () => {

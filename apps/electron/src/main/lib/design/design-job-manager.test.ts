@@ -571,6 +571,148 @@ describe('Design Job Manager', () => {
     })])
   })
 
+  test('Given 5000 条历史与 12 条活动任务 When 首次加载后进程内更新 Then 只首轮扫描并读取全部 journal', async () => {
+    const seed = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    const seedJournal = JSON.parse(
+      readFileSync(join(jobsDirectory, `${seed.id}.json`), 'utf8'),
+    ) as Record<string, unknown>
+    seedJournal.status = 'succeeded'
+    seedJournal.outputAssetId = 'asset-history'
+    seedJournal.createdAt = 0
+    seedJournal.updatedAt = 0
+    seedJournal.completedAt = 0
+    writeFileSync(join(jobsDirectory, `${seed.id}.json`), JSON.stringify(seedJournal))
+    for (let index = 1; index < 5_000; index += 1) {
+      const id = `history-${index.toString().padStart(4, '0')}`
+      writeFileSync(join(jobsDirectory, `${id}.json`), JSON.stringify({
+        ...seedJournal,
+        id,
+        creativeTaskId: id,
+        status: 'succeeded',
+        createdAt: index,
+        updatedAt: index,
+      }))
+    }
+    for (let index = 0; index < 12; index += 1) {
+      const id = `active-${index.toString().padStart(2, '0')}`
+      writeFileSync(join(jobsDirectory, `${id}.json`), JSON.stringify({
+        ...seedJournal,
+        id,
+        creativeTaskId: id,
+        status: 'queued',
+        outputAssetId: undefined,
+        completedAt: undefined,
+        target: {
+          kind: 'canvas-image',
+          canvasId: 'canvas-1',
+          nodeId: `active-node-${index}`,
+          imageModuleId: `active-module-${index}`,
+        },
+        createdAt: 6_000 + index,
+        updatedAt: 6_000 + index,
+      }))
+    }
+    const reloaded = createHarness()
+
+    const first = reloaded.manager.listCanvasImageActivity({ projectId: 'project-1', canvasId: 'canvas-1' })
+    const scansAfterFirstLoad = reloaded.journalScanCount
+    const readsAfterFirstLoad = reloaded.journalReadCount
+    await reloaded.manager.cancel('project-1', 'active-00')
+    const second = reloaded.manager.listCanvasImageActivity({ projectId: 'project-1', canvasId: 'canvas-1' })
+
+    expect(first).toHaveLength(13)
+    expect(first.filter((job) => job.status === 'queued' || job.status === 'running')).toHaveLength(12)
+    expect(second.filter((job) => job.status === 'queued' || job.status === 'running')).toHaveLength(11)
+    expect(first.some((job) => job.id === 'history-4999' && job.status === 'succeeded')).toBe(true)
+    expect(scansAfterFirstLoad).toBe(1)
+    expect(readsAfterFirstLoad).toBe(5_012)
+    expect(reloaded.journalScanCount).toBe(scansAfterFirstLoad)
+    expect(reloaded.journalReadCount).toBe(readsAfterFirstLoad)
+  })
+
+  test('Given 外部进程新增更新删除 journal When 显式 resync Then 活动索引按磁盘事实替换并过滤无关 Canvas', async () => {
+    const original = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const jobsDirectory = join(cacheRoot, 'jobs')
+    const originalPath = join(jobsDirectory, `${original.id}.json`)
+    const originalJournal = JSON.parse(readFileSync(originalPath, 'utf8')) as Record<string, unknown>
+    const reloaded = createHarness()
+    expect(reloaded.manager.listCanvasImageActivity({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .toEqual([expect.objectContaining({ id: original.id, status: 'queued' })])
+
+    writeFileSync(originalPath, JSON.stringify({ ...originalJournal, status: 'failed', updatedAt: 20 }))
+    writeFileSync(join(jobsDirectory, 'previous-success.json'), JSON.stringify({
+      ...originalJournal,
+      id: 'previous-success',
+      creativeTaskId: 'previous-success',
+      status: 'succeeded',
+      outputAssetId: 'asset-previous',
+      createdAt: 5,
+      updatedAt: 5,
+    }))
+    writeFileSync(join(jobsDirectory, 'external-added.json'), JSON.stringify({
+      ...originalJournal,
+      id: 'external-added',
+      creativeTaskId: 'external-added',
+      target: {
+        kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'external-node', imageModuleId: 'external-module',
+      },
+      createdAt: 30,
+      updatedAt: 30,
+    }))
+    writeFileSync(join(jobsDirectory, 'other-canvas.json'), JSON.stringify({
+      ...originalJournal,
+      id: 'other-canvas',
+      creativeTaskId: 'other-canvas',
+      target: {
+        kind: 'canvas-image', canvasId: 'canvas-2', nodeId: 'other-node', imageModuleId: 'other-module',
+      },
+      createdAt: 40,
+      updatedAt: 40,
+    }))
+
+    const refreshed = reloaded.manager.listCanvasImageActivity(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      { resync: true },
+    )
+    expect(refreshed.map((job) => job.target?.kind === 'canvas-image' ? job.target.nodeId : '')).toEqual([
+      'external-node', 'image-node-a', 'image-node-a',
+    ])
+    expect(refreshed.find((job) => job.id === original.id)?.status).toBe('failed')
+    expect(refreshed).toContainEqual(expect.objectContaining({ id: 'previous-success', outputAssetId: 'asset-previous' }))
+    expect(refreshed.filter((job) => job.status === 'queued' || job.status === 'running').map((job) => job.id))
+      .toEqual(['external-added'])
+
+    rmSync(join(jobsDirectory, 'external-added.json'))
+    const afterDelete = reloaded.manager.listCanvasImageActivity(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      { resync: true },
+    )
+    expect(afterDelete.map((job) => job.target?.kind === 'canvas-image' ? job.target.nodeId : '')).toEqual([
+      'image-node-a', 'image-node-a',
+    ])
+    expect(reloaded.journalScanCount).toBe(3)
+  })
+
+  test('Given 项目变化或注册器 dispose When 使活动缓存失效 Then 只让对应范围下次查询重扫', async () => {
+    await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    const reloaded = createHarness()
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    reloaded.manager.listCanvasImageActivity(target)
+
+    reloaded.manager.invalidateCanvasImageActivity('project-other')
+    reloaded.manager.listCanvasImageActivity(target)
+    expect(reloaded.journalScanCount).toBe(1)
+
+    reloaded.manager.invalidateCanvasImageActivity('project-1')
+    reloaded.manager.listCanvasImageActivity(target)
+    expect(reloaded.journalScanCount).toBe(2)
+
+    reloaded.manager.invalidateCanvasImageActivity()
+    reloaded.manager.listCanvasImageActivity(target)
+    expect(reloaded.journalScanCount).toBe(3)
+  })
+
   test('Given 项目索引已建立 When 按项目和 Job ID 查询存在或缺失任务 Then O(1) 返回防御副本且不重复扫描', async () => {
     const created = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
     const reloaded = createHarness()
@@ -2045,6 +2187,8 @@ describe('Design Job Manager', () => {
     let traceReadCount = 0
     /** 记录完整 journal 目录扫描次数，目标索引建立后不得重复扫描。 */
     let journalScanCount = 0
+    /** 记录单个 journal 正文读取次数，活动索引建立后不得重复访问历史文件。 */
+    let journalReadCount = 0
     /** 记录 Canvas 创建前的目标、来源、模型与 ID 副作用边界。 */
     let targetAssertionCount = 0
     let authoritativeReadCount = 0
@@ -2108,6 +2252,10 @@ describe('Design Job Manager', () => {
       readJobsDirectory: (path) => {
         journalScanCount += 1
         return readdirSync(path)
+      },
+      readJobJournal: (path) => {
+        journalReadCount += 1
+        return readFileSync(path, 'utf8')
       },
       store,
       assetService: {
@@ -2345,6 +2493,7 @@ describe('Design Job Manager', () => {
       get retryIntentWrites() { return retryIntentWrites },
       get traceReadCount() { return traceReadCount },
       get journalScanCount() { return journalScanCount },
+      get journalReadCount() { return journalReadCount },
       get targetAssertionCount() { return targetAssertionCount },
       get authoritativeReadCount() { return authoritativeReadCount },
       get modelResolutionCount() { return modelResolutionCount },

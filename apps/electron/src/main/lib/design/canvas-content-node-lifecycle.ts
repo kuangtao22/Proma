@@ -30,9 +30,15 @@ import type {
   LegacyCanvasContentSeed,
 } from './canvas-document-store'
 import type { CanvasNodeContentStore } from './canvas-node-content-store'
+import {
+  createNativeCanvasTransactionArchive,
+  type CanvasTransactionArchive,
+} from './canvas-transaction-archive'
 
 /** 单个 Canvas 最多保留的所有合法 intent 数量。 */
 const MAX_CONTENT_INTENTS = 512
+/** 旧目录整理读取上界；写容量继续保持 512。 */
+const MAX_CONTENT_INTENT_SCAN_ENTRIES = 4096
 /** content intent 正文硬上限。 */
 const MAX_CONTENT_INTENT_BYTES = 64 * 1024
 /** content intent 固定文件名合同。 */
@@ -109,6 +115,8 @@ export interface CanvasContentNodeLifecycleDependencies {
   randomUUID?: () => string
   scanIntents?: (target: CanvasTarget) => Promise<CanvasContentNodeIntent[]>
   writeIntent?: (intent: CanvasContentNodeIntent) => Promise<StableDirectoryNativeWriteOutcome>
+  /** 测试注入的终态归档器；生产绑定本次迁移 capability。 */
+  archive?: CanvasTransactionArchive
 }
 
 /** 对外服务合同。 */
@@ -403,11 +411,18 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
   const now = dependencies.now ?? Date.now
   const randomUUID = dependencies.randomUUID ?? createRandomUUID
 
+  /** 取得与当前 Canvas 根绑定的归档器。 */
+  const archiveFor = (capability: CanvasDocumentMigrationCapability): CanvasTransactionArchive | null => {
+    if (dependencies.archive) return dependencies.archive
+    if (dependencies.scanIntents) return null
+    return createNativeCanvasTransactionArchive(capability.openSingleChildDirectory('transactions'))
+  }
+
   /** 读取全部 content intent；生产路径只解析固定前缀并忽略 Agent 文件。 */
   const scan = async (target: CanvasTarget, capability: CanvasDocumentMigrationCapability): Promise<CanvasContentNodeIntent[]> => {
     if (dependencies.scanIntents) return dependencies.scanIntents(target)
     const directory = capability.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_CONTENT_INTENTS, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
+    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_CONTENT_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
     const intents: CanvasContentNodeIntent[] = []
     for (const entry of result.entries.sort((left, right) => left.name.localeCompare(right.name))) {
       const match = CONTENT_INTENT_NAME.exec(entry.name)
@@ -583,19 +598,47 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
   const reconcileInternal = async (target: CanvasTarget): Promise<{ result: CanvasContentNodeReconciliationResult; capability: CanvasDocumentMigrationCapability; intents: CanvasContentNodeIntent[] }> => {
     const capability = dependencies.store.loadWithMigrationCapability(target)
     const intents = await scan(target, capability)
+    const finalIntents: CanvasContentNodeIntent[] = []
     let document = capability.snapshot.document
     let changed = false
     let publishRequired = false
     let error: unknown
     for (const original of [...intents].sort((left, right) => left.operationId.localeCompare(right.operationId))) {
-      if (original.state === 'committed') continue
+      if (original.state === 'committed') {
+        finalIntents.push(original)
+        continue
+      }
       const advanced = await advance(original, document, capability)
+      finalIntents.push(advanced.intent)
       document = advanced.document
       changed ||= advanced.changed
       publishRequired ||= advanced.publishRequired
       if (advanced.error) { error = advanced.error; break }
     }
-    return { result: { snapshot: snapshot(document), documentChanged: publishRequired, ...(publishRequired ? { publication: document } : {}), ...(error ? { error } : {}) }, capability, intents }
+    if (!error) {
+      try {
+        await archiveFor(capability)?.archiveEntries(finalIntents.map((intent) => ({
+          name: `content-node-${intent.operationId}.json`,
+          content: `${JSON.stringify(intent, null, 2)}\n`,
+        })))
+      } catch (archiveError) {
+        /** 归档失败仍返回已提交图与 publication，由 IPC 在锁外先发布再传播错误。 */
+        error = archiveError
+      }
+    }
+    return { result: { snapshot: snapshot(document), documentChanged: publishRequired, ...(publishRequired ? { publication: document } : {}), ...(error ? { error } : {}) }, capability, intents: finalIntents }
+  }
+
+  /** 按 operationId 精确读取归档 tombstone，避免扫描历史分片。 */
+  const loadArchivedIntent = async (
+    target: CanvasTarget,
+    capability: CanvasDocumentMigrationCapability,
+    operationId: string,
+  ): Promise<CanvasContentNodeIntent | null> => {
+    const content = await archiveFor(capability)?.load(`content-node-${operationId}.json`)
+    return content
+      ? parseCanvasContentNodeIntent(JSON.parse(content) as unknown, target, operationId)
+      : null
   }
 
   /** 将未知错误规范为 Error，供旧公开方法保持异常合同。 */
@@ -636,6 +679,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     const input = parseCreateCanvasContentNodeInput(rawInput)
     return runReconciledOperation(input, async (reconciled) => {
       const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+        ?? await loadArchivedIntent(input, reconciled.capability, input.operationId)
       if (existing) {
         if (!sameCreate(existing, input)) throw new Error('CANVAS_OPERATION_CONFLICT')
         return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id }
@@ -663,6 +707,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     const input = parseDeleteCanvasNodeInput(rawInput)
     return runReconciledOperation(input, async (reconciled) => {
       const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+        ?? await loadArchivedIntent(input, reconciled.capability, input.operationId)
       if (existing) {
         if (existing.operation !== 'delete' || existing.node.id !== input.nodeId || existing.expectedRevision !== input.expectedRevision) throw new Error('CANVAS_OPERATION_CONFLICT')
         return { snapshot: reconciled.result.snapshot, ...(existing.trashEntry ? { trashEntry: existing.trashEntry } : {}) }
@@ -707,6 +752,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     const input = parseRestoreCanvasNodeInput(rawInput)
     return runReconciledOperation(input, async (reconciled) => {
       const existing = reconciled.intents.find((intent) => intent.operationId === input.operationId)
+        ?? await loadArchivedIntent(input, reconciled.capability, input.operationId)
       if (existing) {
         if (existing.operation !== 'restore' || existing.trashId !== input.trashId || existing.expectedRevision !== input.expectedRevision || existing.node.position.x !== input.position.x || existing.node.position.y !== input.position.y) throw new Error('CANVAS_OPERATION_CONFLICT')
         return { snapshot: reconciled.result.snapshot, selectedNodeId: existing.node.id, trashEntry: existing.trashEntry }

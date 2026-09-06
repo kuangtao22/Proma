@@ -55,6 +55,8 @@ const CANVAS_NODE_TITLE_MAX_LENGTH = 120
 export interface CanvasDocumentStore {
   /** 加载文档并在必要时提升安全恢复候选。 */
   load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
+  /** 只读当前稳定主文档；需要恢复时不写盘并明确阻断。 */
+  readSnapshot: (target: CanvasTarget) => CanvasWorkspaceSnapshot
   /** 加载文档并返回绑定同一次授权目录身份的子目录 capability。 */
   loadWithDirectoryCapability: (target: CanvasTarget) => CanvasDocumentDirectoryCapability
   /** 加载并绑定一次私有 v1 内容迁移事务，路径与 CAS 身份不离开闭包。 */
@@ -1101,13 +1103,11 @@ function isSameFileState(left: AtomicFileState, right: AtomicFileState): boolean
     && left.ctimeMs === right.ctimeMs
 }
 
-/**
- * 验证 resolver 输出并创建缺失的单级 canvasRoot。
- * @param paths resolveCanvas 产生的项目和 Canvas 专属路径。
- * @param canvasesRoot resolve(projectId) 产生的可信 Canvas 集合根。
- * @returns 已复验的 canvasRoot 目录身份。
- */
-function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): CanvasDirectoryScopeIdentity {
+/** 只读打开已存在的单级 canvasRoot，并复验固定层级与目录身份。 */
+function openCanvasDirectory(
+  paths: CanvasPaths,
+  canvasesRoot: string,
+): CanvasDirectoryScopeIdentity | null {
   if (!isAbsolute(canvasesRoot)
     || !isAbsolute(paths.canvasRoot)
     || !isAbsolute(paths.documentPath)
@@ -1120,19 +1120,27 @@ function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): Canvas
   /** 集合根必须已经由会话索引创建且自身为实际目录。 */
   const rootIdentity = captureDirectoryIdentity(resolve(canvasesRoot))
   assertDirectoryIdentity(rootIdentity)
-  if (lstatOrNull(paths.canvasRoot) === null) {
-    try {
-      mkdirSync(paths.canvasRoot)
-    } catch (error) {
-      /** 并发创建只接受 EEXIST，随后仍执行 no-follow 身份校验。 */
-      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-    }
-  }
+  if (lstatOrNull(paths.canvasRoot) === null) return null
   /** 单级 Canvas 目录必须保持在集合根的物理路径之下。 */
   const canvasIdentity = captureDirectoryIdentity(paths.canvasRoot, rootIdentity.canonicalPath)
   const identity = { canvasesRoot: rootIdentity, canvasRoot: canvasIdentity }
   assertCanvasDirectoryScope(identity)
   return identity
+}
+
+/** 验证 resolver 输出并按需创建缺失的单级 canvasRoot。 */
+function ensureCanvasDirectory(paths: CanvasPaths, canvasesRoot: string): CanvasDirectoryScopeIdentity {
+  const existing = openCanvasDirectory(paths, canvasesRoot)
+  if (existing) return existing
+  try {
+    mkdirSync(paths.canvasRoot)
+  } catch (error) {
+    /** 并发创建只接受 EEXIST，随后仍执行 no-follow 身份校验。 */
+    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+  }
+  const created = openCanvasDirectory(paths, canvasesRoot)
+  if (!created) throw unsafeCanvasPath('Canvas 根创建后仍不存在')
+  return created
 }
 
 /** 使用 no-follow 稳定句柄读取单个 Canvas 文档候选。 */
@@ -1344,6 +1352,23 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
     return resolveTargetPaths(target)
   }
 
+  /** 先完成 registry 授权，再只读打开已存在的 native Canvas 目录。 */
+  function resolveAuthorizedReadTarget(target: CanvasTarget): {
+    paths: CanvasPaths
+    directoryIdentity: CanvasDirectoryScopeIdentity | null
+  } {
+    options.sessions.requireNative(target.projectId, target.canvasId)
+    const projectPaths = pathResolver.resolve(target.projectId)
+    const paths = pathResolver.resolveCanvas(target.projectId, target.canvasId)
+    if (paths.projectId !== target.projectId || paths.canvasId !== target.canvasId) {
+      throw unsafeCanvasPath('resolver 返回的 Canvas 身份不匹配')
+    }
+    return {
+      paths,
+      directoryIdentity: openCanvasDirectory(paths, projectPaths.canvasesRoot),
+    }
+  }
+
   /** 内部加载结果额外保留读取期主状态，公开接口不泄露文件系统信息。 */
   function loadWithAuthoritativeState(
     target: CanvasTarget,
@@ -1442,6 +1467,34 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
   /** 从恢复链加载文档，合法恢复候选会安全提升为主文件。 */
   function load(target: CanvasTarget): CanvasWorkspaceSnapshot {
     return loadWithAuthoritativeState(target).snapshot
+  }
+
+  /** 读取稳定主文档；恢复候选只用于判定阻断，不在纯读路径提升或消费。 */
+  function readSnapshot(target: CanvasTarget): CanvasWorkspaceSnapshot {
+    const authorized = resolveAuthorizedReadTarget(target)
+    if (!authorized.directoryIdentity) {
+      return {
+        document: createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now)),
+        writable: true,
+        nodeIssues: [],
+      }
+    }
+    const readResult = readCanvasDocument(
+      authorized.paths,
+      target,
+      authorized.directoryIdentity.canvasRoot,
+      validateDocument,
+      options.afterCandidateRead,
+    )
+    if (!readResult.parsedDocument && readResult.hasCandidate) {
+      throw new Error(`CANVAS_DOCUMENT_CORRUPT: ${target.projectId}/${target.canvasId}`)
+    }
+    if (readResult.recoveredFrom) {
+      throw new Error(`CANVAS_RECOVERY_REQUIRED: recoveredFrom=${readResult.recoveredFrom}`)
+    }
+    const document = readResult.parsedDocument?.document
+      ?? createEmptyCanvasDocument(target.projectId, target.canvasId, requireNow(now))
+    return { document, writable: true, nodeIssues: [] }
   }
 
   /** 从同一次 LOAD 授权事实派生单级子目录 capability。 */
@@ -1719,6 +1772,7 @@ export function createCanvasDocumentStore(options: CanvasDocumentStoreOptions): 
 
   return {
     load,
+    readSnapshot,
     loadWithDirectoryCapability,
     loadWithMigrationCapability,
     requireStableAuthoritativeDocument,

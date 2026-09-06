@@ -13,6 +13,7 @@ import {
   type StableDirectoryNativeHostDependencies,
   type StableDirectoryNativeRequest,
 } from './stable-directory-native-host'
+import { createNativeCanvasTransactionArchive } from './design/canvas-transaction-archive'
 
 interface FakeHelperOptions {
   canonicalPath?: string
@@ -180,6 +181,48 @@ beforeAll(() => {
 }, 30_000)
 
 describe('stable directory native host', () => {
+  test('Given 产物导出请求字段越界 When 进入 Host Then 启动 helper 前统一拒绝', async () => {
+    /** 记录原生进程启动次数，证明非法请求不会占用 helper 槽位或触碰目录。 */
+    let spawnCount = 0
+    const dependencies: StableDirectoryNativeHostDependencies = {
+      helperPath: () => '/fake/stable-directory-helper',
+      helperExists: () => true,
+      spawnProcess: () => {
+        spawnCount += 1
+        return createFakeHelper().child
+      },
+    }
+    /** 覆盖单层叶子、根数量、正文预算、图片大小和哈希的导出合同。 */
+    const invalidRequests: StableDirectoryNativeRequest[] = [
+      {
+        mode: 'artifact-export-write', roots: ['/destination'], artifactFileName: '../artifact.md',
+        content: '正文', overwrite: false,
+      },
+      {
+        mode: 'artifact-export-write', roots: ['/first', '/second'], artifactFileName: 'artifact.md',
+        content: '正文', overwrite: false,
+      },
+      {
+        mode: 'artifact-export-write', roots: ['/destination'], artifactFileName: 'artifact.md',
+        content: 'x'.repeat(256 * 1024 + 1), overwrite: false,
+      },
+      {
+        mode: 'artifact-export-copy', roots: ['/source.png', '/destination'], artifactFileName: 'artifact.png',
+        expectedSourceSize: 64 * 1024 * 1024 + 1, expectedSourceSha256: 'a'.repeat(64), overwrite: false,
+      },
+      {
+        mode: 'artifact-export-copy', roots: ['/source.png', '/destination'], artifactFileName: 'artifact.png',
+        expectedSourceSize: 1, expectedSourceSha256: 'A'.repeat(64), overwrite: false,
+      },
+    ]
+
+    for (const request of invalidRequests) {
+      await expect(createStableDirectoryNativeHost().run(request, () => true, dependencies))
+        .rejects.toThrow('产物导出原生请求合同无效')
+    }
+    expect(spawnCount).toBe(0)
+  })
+
   test('Given active=1 且 queue=1 When 第三个请求进入 Then 立即拒绝并在前项完成后依次启动', async () => {
     const host = createStableDirectoryNativeHost({ maxActiveHelpers: 1, maxQueuedRequests: 1, maxRootsPerRequest: 32 })
     const first = createFakeHelper({ autoOpen: false })
@@ -1411,6 +1454,83 @@ describe('stable directory native host', () => {
     }
   })
 
+  test.skipIf(!nativeHelperPlatformSupported)('Given 511 个终态 intent 与 workflow-runs When 写满、拒绝超额并归档 64 条 Then 可再次新增', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-archive-capacity-'))
+    const canvasRoot = join(root, 'canvas')
+    const transactions = join(canvasRoot, 'transactions')
+    const workflowRuns = join(transactions, 'workflow-runs')
+    mkdirSync(workflowRuns, { recursive: true })
+    /** 预置 511 条可归档终态记录，保留真实容量边界。 */
+    const intentEntries = Array.from({ length: 511 }, (_, index) => ({
+      name: `agent-node-00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}.json`,
+      content: `{"state":"committed","index":${index}}`,
+    }))
+    for (const entry of intentEntries) writeFileSync(join(transactions, entry.name), entry.content, 'utf8')
+    writeFileSync(join(workflowRuns, 'workflow-run-1.json'), '{"state":"running"}', 'utf8')
+    writeFileSync(join(workflowRuns, 'workflow-run-2.json'), '{"state":"completed"}', 'utf8')
+
+    try {
+      /** 使用真实 helper 写入或覆盖 active intent。 */
+      const writeIntent = (fileName: string, content: string) => runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName, content, maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      const boundary512Name = 'agent-node-00000000-0000-4000-8000-0000000001ff.json'
+      const boundary513Name = 'agent-node-00000000-0000-4000-8000-000000000200.json'
+
+      await expect(writeIntent(boundary512Name, '{"state":"committed","version":1}'))
+        .resolves.toHaveProperty('writeOutcome.commitVisible', true)
+      await expect(writeIntent(boundary512Name, '{"state":"committed","version":2}'))
+        .resolves.toHaveProperty('writeOutcome.commitVisible', true)
+      const overwritten = await runStableDirectoryNative({
+        mode: 'canvas-intent-read', roots: [canvasRoot], childName: 'transactions',
+        fileName: boundary512Name, maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(overwritten.readOutcome).toMatchObject({
+        status: 'ok',
+        content: '{"state":"committed","version":2}',
+      })
+      await expect(writeIntent(boundary513Name, '{"state":"committed"}'))
+        .resolves.toHaveProperty('writeOutcome', {
+          commitVisible: false,
+          durabilityUncertain: false,
+          error: 'canvas intent entry limit exceeded',
+        })
+
+      /** 复用生产归档器完成单轮 64 条归档、读回和 active 删除。 */
+      const archive = createNativeCanvasTransactionArchive({
+        rootPath: canvasRoot,
+        authorizeOpenedRoots: () => true,
+        assertValid: () => {},
+      }, {
+        run: (request, authorizeOpenedRoots) => runStableDirectoryNative(
+          request,
+          authorizeOpenedRoots,
+          { helperPath: () => nativeHelperPath },
+        ),
+      })
+      await expect(archive.archiveEntries(intentEntries.slice(0, 64))).resolves.toEqual({
+        archivedCount: 64,
+        archivedBytes: intentEntries.slice(0, 64).reduce(
+          (bytes, entry) => bytes + Buffer.byteLength(entry.content),
+          0,
+        ),
+      })
+      await expect(writeIntent(boundary513Name, '{"state":"committed"}'))
+        .resolves.toHaveProperty('writeOutcome.commitVisible', true)
+
+      const scanned = await runStableDirectoryNative({
+        mode: 'canvas-intent-scan', roots: [canvasRoot], childName: 'transactions',
+        maxEntries: 512, maxOutputBytes: 40 * 1024 * 1024,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(scanned.entries).toHaveLength(449)
+      expect(scanned.entries.some((entry) => entry.name === 'workflow-runs')).toBe(false)
+      expect(readdirSync(workflowRuns)).toHaveLength(2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   test.skipIf(process.platform !== 'darwin')('Given 预算为零且只有合法 UUID 名非普通项 When 扫描 Then 忽略杂项而非误报 intent limit', async () => {
     const root = mkdtempSync(join(tmpdir(), 'proma-native-intent-non-regular-budget-'))
     const canvasRoot = join(root, 'canvas')
@@ -1716,6 +1836,52 @@ describe('stable directory native host', () => {
       expect(result.roots[0]?.canonicalPath).toStartWith('\\\\')
       expect(result.roots[0]?.canonicalPath).not.toStartWith('\\\\?\\UNC\\')
       expect(result.entries.map((entry) => entry.name)).toContain('unc.txt')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(!nativeHelperPlatformSupported)('Given 终态事务已写入归档并读回 When 删除 active Then 精确归档仍可发现且 symlink 分片被拒绝', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'proma-native-transaction-archive-'))
+    const canvasRoot = join(root, 'canvas')
+    const fileName = 'content-node-11111111-1111-4111-8111-111111111111.json'
+    const content = '{"state":"committed"}'
+    mkdirSync(canvasRoot)
+    try {
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-intent-write', roots: [canvasRoot], childName: 'transactions',
+        fileName, content, maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })).resolves.toHaveProperty(
+        'writeOutcome.commitVisible', true,
+      )
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'transaction-archive',
+        entryId: 'aa', fileName, content,
+      }, () => true, { helperPath: () => nativeHelperPath })).resolves.toHaveProperty(
+        'writeOutcome.commitVisible', true,
+      )
+      const read = await runStableDirectoryNative({
+        mode: 'canvas-content-read', roots: [canvasRoot], childName: 'transaction-archive',
+        entryId: 'aa', fileName,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(read.readOutcome).toMatchObject({ status: 'ok', content })
+      await expect(runStableDirectoryNative({
+        mode: 'canvas-intent-remove', roots: [canvasRoot], childName: 'transactions',
+        fileName, content, maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })).resolves.toHaveProperty(
+        'writeOutcome.commitVisible', true,
+      )
+      expect(existsSync(join(canvasRoot, 'transactions', fileName))).toBe(false)
+
+      const outside = join(root, 'outside')
+      mkdirSync(outside)
+      symlinkSync(outside, join(canvasRoot, 'transaction-archive', 'bb'), process.platform === 'win32' ? 'junction' : 'dir')
+      const unsafe = await runStableDirectoryNative({
+        mode: 'canvas-content-write', roots: [canvasRoot], childName: 'transaction-archive',
+        entryId: 'bb', fileName, content,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(unsafe.writeOutcome?.commitVisible).toBe(false)
+      expect(readdirSync(outside)).toEqual([])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

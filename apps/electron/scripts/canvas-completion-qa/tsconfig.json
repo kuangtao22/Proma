@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "qa-renderer.tsx",
+    "vite.config.ts",
+    "../../src/renderer/vite-env.d.ts",
+    "../../src/preload/index.ts"
+  ]
+}
