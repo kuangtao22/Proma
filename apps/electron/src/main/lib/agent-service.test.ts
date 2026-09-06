@@ -233,7 +233,8 @@ describe('Agent service 迁移准入', () => {
     const end = source.indexOf('\n/**', start + 1)
     const body = source.slice(start, end)
 
-    expect(body).toContain('callbacks.onComplete(messages, buildHeadlessTerminalOptions(opts))')
+    expect(body).toContain('const terminalOptions = buildHeadlessTerminalOptions(opts)')
+    expect(body).toContain('callbacks.onComplete(messages, terminalOptions)')
     expect(body).toContain('stoppedByUser:')
     expect(body).toContain('startedAt:')
     expect(body).toContain('runGeneration:')
@@ -267,6 +268,39 @@ describe('Agent service 迁移准入', () => {
 
     expect(body).toContain('buildAuthoritativeAgentRunStartedEvent(input.sessionId, startedAt, getAgentSessionMeta)')
     expect(body).not.toContain("event: { type: 'run_started', startedAt }")
+  })
+
+  test('Given desktop run 已发布权威启动代次 When 成功完成未重复携带代次 Then run_completed 复用同一运行身份', () => {
+    /** 读取真实 service，锁定 desktop 成功终态不依赖 completion 重复回传代次。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    /** 只检查 renderer 成功回调，避免 catch 与 headless 路径干扰。 */
+    const start = source.indexOf('async function runPreparedAgent(')
+    const onCompleteStart = source.indexOf('onComplete: (messages, opts) => {', start)
+    const onRunStartedStart = source.indexOf('onRunStarted:', onCompleteStart)
+    const body = source.slice(onCompleteStart, onRunStartedStart)
+
+    expect(body).toContain("publishRunCompleted(input.sessionId, 'desktop', {")
+    expect(body).toContain('startedAt: opts?.startedAt ?? activeStartedAt')
+    expect(body).toContain('runGeneration: opts?.runGeneration ?? activeRunGeneration')
+    expect(body).not.toContain("publishRunCompleted(input.sessionId, 'desktop', opts ?? {})")
+  })
+
+  test('Given headless run 已发布权威启动代次 When 成功完成未重复携带代次 Then 外部回调与 run_completed 共用同一运行身份', () => {
+    /** 读取真实 service，锁定 headless 启动与成功终态的 startedAt/runGeneration 同源。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const start = source.indexOf('export async function runAgentHeadless(')
+    const onCompleteStart = source.indexOf('onComplete: (messages, opts) => {', start)
+    const onTitleUpdatedStart = source.indexOf('onTitleUpdated:', onCompleteStart)
+    const completionBody = source.slice(onCompleteStart, onTitleUpdatedStart)
+    const onRunStartedStart = source.indexOf('onRunStarted:', onTitleUpdatedStart)
+    const catchStart = source.indexOf("console.error('[Agent 服务] runAgentHeadless 未处理异常:'", onRunStartedStart)
+    const startedBody = source.slice(onRunStartedStart, catchStart)
+
+    expect(completionBody).toContain('const terminalOptions = buildHeadlessTerminalOptions(opts)')
+    expect(completionBody).toContain('callbacks.onComplete(messages, terminalOptions)')
+    expect(completionBody).toContain("publishRunCompleted(runInput.sessionId, callbacks.source ?? 'bridge', terminalOptions)")
+    expect(startedBody).toContain('activeStartedAt = persistedStartedAt')
+    expect(startedBody).toContain('runGeneration = persistedRunGeneration')
   })
 
   test('Given renderer 与 headless 的成功或异常完成 When 检查所有 producer Then 统一经权威 session builder', () => {

@@ -340,6 +340,30 @@ function publishRunStopped(
   })
 }
 
+/**
+ * 发布供外部通知通道消费的运行完成事件。
+ * @param sessionId 已完成运行所属的 Agent 会话 ID。
+ * @param source 运行来源；普通桌面运行使用 desktop。
+ * @param options 由 Orchestrator 提供的停止状态、启动时间与运行代次。
+ * @returns 无返回值；事件通过进程内 AgentEventBus 分发。
+ */
+function publishRunCompleted(
+  sessionId: string,
+  source: AgentExternalRunSource | 'desktop',
+  options: { stoppedByUser?: boolean; startedAt?: number; runGeneration?: number },
+): void {
+  eventBus.emit(sessionId, {
+    kind: 'proma_event',
+    event: {
+      type: 'run_completed',
+      source,
+      stoppedByUser: options.stoppedByUser ?? false,
+      ...(options.startedAt != null ? { startedAt: options.startedAt } : {}),
+      ...(options.runGeneration != null ? { runGeneration: options.runGeneration } : {}),
+    },
+  })
+}
+
 /** 记录被隔离的 Agent service 终态副作用异常。 */
 function reportAgentServiceTerminalEffectError(name: string, error: unknown): void {
   console.error(`[Agent 服务] 终态副作用执行失败: ${name}`, error)
@@ -467,6 +491,16 @@ export async function runPreparedAgent(
           {
             name: 'publish-run-stopped',
             run: () => { publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
+          },
+          {
+            name: 'publish-run-completed',
+            run: () => {
+              publishRunCompleted(input.sessionId, 'desktop', {
+                stoppedByUser: opts?.stoppedByUser,
+                startedAt: opts?.startedAt ?? activeStartedAt,
+                runGeneration: opts?.runGeneration ?? activeRunGeneration,
+              })
+            },
           },
           {
             name: 'renderer-complete',
@@ -610,6 +644,8 @@ export async function runAgentHeadless(
   // Headless 调用方不能声明交互式用户来源；只信任主进程 callback 绑定的外部来源。
   const runInput: AgentRunInput = normalizeHeadlessAgentRunInput(input, callbacks.source)
   const startedAt = runInput.startedAt!
+  /** 记录 Orchestrator 真正启动后的权威时间，供所有终态共用。 */
+  let activeStartedAt = startedAt
   let runGeneration: number | undefined
   let runErrored = false
   /** Orchestrator 完成参数归一为 headless 调用方可直接信任的明确终态。 */
@@ -628,7 +664,7 @@ export async function runAgentHeadless(
         resultSubtype: options?.resultSubtype,
       }),
       stoppedByUser: options?.stoppedByUser === true,
-      startedAt: options?.startedAt ?? startedAt,
+      startedAt: options?.startedAt ?? activeStartedAt,
       ...(terminalRunGeneration !== undefined ? { runGeneration: terminalRunGeneration } : {}),
       ...(options?.resultSubtype !== undefined ? { resultSubtype: options.resultSubtype } : {}),
     }
@@ -663,14 +699,20 @@ export async function runAgentHeadless(
         ], reportAgentServiceTerminalEffectError)
       },
       onComplete: (messages, opts) => {
+        /** 外部回调与运行事件必须共用同一份权威终态身份。 */
+        const terminalOptions = buildHeadlessTerminalOptions(opts)
         runAgentServiceTerminalEffects([
           {
             name: 'external-on-complete',
-            run: () => { callbacks.onComplete(messages, buildHeadlessTerminalOptions(opts)) },
+            run: () => { callbacks.onComplete(messages, terminalOptions) },
           },
           {
             name: 'publish-run-stopped',
             run: () => { publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration) },
+          },
+          {
+            name: 'publish-run-completed',
+            run: () => { publishRunCompleted(runInput.sessionId, callbacks.source ?? 'bridge', terminalOptions) },
           },
           {
             name: 'renderer-complete',
@@ -716,6 +758,7 @@ export async function runAgentHeadless(
         }
       },
       onRunStarted: ({ startedAt: persistedStartedAt, runGeneration: persistedRunGeneration }) => {
+        activeStartedAt = persistedStartedAt
         runGeneration = persistedRunGeneration
         const session = getAgentSessionMeta(runInput.sessionId)
         workspaceOperationGuard.runAgentServiceEffects({
@@ -733,6 +776,7 @@ export async function runAgentHeadless(
               workspaceId: session?.workspaceId ?? runInput.workspaceId,
               modelId: runInput.modelId,
               startedAt: persistedStartedAt,
+              runGeneration: persistedRunGeneration,
               ...(session ? { session } : {}),
             },
           })
@@ -751,6 +795,16 @@ export async function runAgentHeadless(
           status: 'errored', stoppedByUser: false, startedAt,
           ...(runGeneration !== undefined ? { runGeneration } : {}),
         }) },
+      },
+      {
+        name: 'publish-run-completed',
+        run: () => {
+          publishRunCompleted(runInput.sessionId, callbacks.source ?? 'bridge', {
+            stoppedByUser: false,
+            startedAt,
+            ...(runGeneration !== undefined ? { runGeneration } : {}),
+          })
+        },
       },
       {
         name: 'renderer-error',

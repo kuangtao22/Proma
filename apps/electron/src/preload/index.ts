@@ -6,7 +6,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS, SERVER_OPS_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, TERMINAL_IPC_CHANNELS, PATH_MANAGEMENT_IPC_CHANNELS, SERVER_OPS_IPC_CHANNELS } from '@proma/shared'
 import { createLanBridgePreloadApi } from './lan-bridge-preload'
 import type { LanBridgePreloadApi } from './lan-bridge-preload'
 import { createDesignPreloadApi } from './design-preload'
@@ -777,6 +777,9 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   /** 保存工作区 MCP 配置；显式关闭的条目会取消进行中的验证。 */
   saveWorkspaceMcpConfig: (workspaceSlug: string, config: WorkspaceMcpConfig, options?: import('@proma/shared').SaveWorkspaceMcpConfigOptions) => Promise<void>
 
+  /** 原子删除单个 MCP，保留其他条目的当前状态。 */
+  deleteWorkspaceMcp: (workspaceSlug: string, name: string) => Promise<WorkspaceMcpConfig>
+
   /** 刷新并持久化工作区 MCP 真实连接状态 */
   refreshMcpConnections: (workspaceSlug: string) => Promise<WorkspaceMcpConfig>
 
@@ -1261,6 +1264,18 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   stopDingTalkBot: (botId: string) => Promise<void>
   /** 获取多 Bot 状态 */
   getDingTalkMultiStatus: () => Promise<import('@proma/shared').DingTalkMultiBridgeState>
+
+  // ===== Slack 集成 =====
+
+  getSlackConfig: () => Promise<import('@proma/shared').SlackSettingsConfig>
+  saveSlackBotConfig: (input: import('@proma/shared').SlackBotConfigInput) => Promise<import('@proma/shared').SlackBotSettingsConfig>
+  removeSlackBot: (botId: string) => Promise<boolean>
+  getSlackManifest: (options?: { botName?: string }) => Promise<import('@proma/shared').SlackAppManifestResult>
+  testSlackConnection: (botToken: string) => Promise<import('@proma/shared').SlackTestResult>
+  startSlackBot: (botId: string) => Promise<void>
+  stopSlackBot: (botId: string) => Promise<void>
+  getSlackStatus: () => Promise<import('@proma/shared').SlackMultiBridgeState>
+  onSlackStatusChanged: (callback: (state: import('@proma/shared').SlackBotBridgeState) => void) => () => void
 
   // ===== 微信集成 =====
 
@@ -2188,6 +2203,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_CONFIG, workspaceSlug, config, options)
   },
 
+  deleteWorkspaceMcp: (workspaceSlug: string, name: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.DELETE_MCP, workspaceSlug, name) as Promise<WorkspaceMcpConfig>
+  },
+
   refreshMcpConnections: (workspaceSlug: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.REFRESH_MCP_CONNECTIONS, workspaceSlug) as Promise<WorkspaceMcpConfig>
   },
@@ -2855,6 +2874,32 @@ const electronAPI: ElectronAPI = {
     const listener = (_: unknown, payload: import('@proma/shared').FeishuRegisterAppStatus) => callback(payload)
     ipcRenderer.on(FEISHU_IPC_CHANNELS.REGISTER_APP_STATUS, listener)
     return () => { ipcRenderer.removeListener(FEISHU_IPC_CHANNELS.REGISTER_APP_STATUS, listener) }
+  },
+
+  // ===== Slack 集成 =====
+
+  getSlackConfig: () => ipcRenderer.invoke(SLACK_IPC_CHANNELS.GET_CONFIG),
+
+  saveSlackBotConfig: (input: import('@proma/shared').SlackBotConfigInput) =>
+    ipcRenderer.invoke(SLACK_IPC_CHANNELS.SAVE_BOT_CONFIG, input),
+
+  removeSlackBot: (botId: string) => ipcRenderer.invoke(SLACK_IPC_CHANNELS.REMOVE_BOT, botId),
+
+  getSlackManifest: (options?: { botName?: string }) =>
+    ipcRenderer.invoke(SLACK_IPC_CHANNELS.GET_MANIFEST, options),
+
+  testSlackConnection: (botToken: string) => ipcRenderer.invoke(SLACK_IPC_CHANNELS.TEST_CONNECTION, botToken),
+
+  startSlackBot: (botId: string) => ipcRenderer.invoke(SLACK_IPC_CHANNELS.START_BOT, botId),
+
+  stopSlackBot: (botId: string) => ipcRenderer.invoke(SLACK_IPC_CHANNELS.STOP_BOT, botId),
+
+  getSlackStatus: () => ipcRenderer.invoke(SLACK_IPC_CHANNELS.GET_STATUS),
+
+  onSlackStatusChanged: (callback: (state: import('@proma/shared').SlackBotBridgeState) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: import('@proma/shared').SlackBotBridgeState): void => callback(state)
+    ipcRenderer.on(SLACK_IPC_CHANNELS.STATUS_CHANGED, listener)
+    return () => { ipcRenderer.removeListener(SLACK_IPC_CHANNELS.STATUS_CHANGED, listener) }
   },
 
   // ===== 微信集成 =====

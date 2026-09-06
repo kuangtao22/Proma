@@ -191,7 +191,10 @@ export function SettingsPanel({
         pendingAction.navigation.type,
         pendingAction.navigation.sessionId,
         pendingAction.navigation.title,
-        { bypassSettingsGuard: true },
+        {
+          bypassSettingsGuard: true,
+          onOpened: pendingAction.navigation.onOpened,
+        },
       )
     } else {
       onClose?.()

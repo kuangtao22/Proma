@@ -102,6 +102,16 @@ export class AgentAskUserService {
     return sessionId
   }
 
+  /** Cancel one pending request when an external interaction expires or cannot be delivered. */
+  cancelAskUser(requestId: string, message = '用户未在有效期内回答'): string | null {
+    const pending = this.pendingRequests.get(requestId)
+    if (!pending) return null
+    const sessionId = pending.request.sessionId
+    this.pendingRequests.delete(requestId)
+    pending.resolve({ behavior: 'deny' as const, message })
+    return sessionId
+  }
+
   /**
    * 只读查询待处理 AskUser 请求所属会话。
    * @param requestId Renderer 提交的问答请求 ID。

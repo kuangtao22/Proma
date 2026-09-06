@@ -2,7 +2,7 @@
  * BotHubSettings - 多平台机器人连接设置 Hub
  *
  * 左侧平台选择栏 + 右侧配置面板。
- * 支持飞书、钉钉、微信（WeClaw）三个平台。
+ * 支持飞书、Slack、钉钉、微信（WeClaw）与局域网客户端。
  */
 
 import * as React from 'react'
@@ -11,9 +11,11 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { feishuBotStatesAtom } from '@/atoms/feishu-atoms'
 import { dingtalkBotStatesAtom } from '@/atoms/dingtalk-atoms'
+import { slackBotStatesAtom } from '@/atoms/slack-atoms'
 import { wechatBridgeStateAtom } from '@/atoms/wechat-atoms'
 import { lanBridgeStateAtom } from '@/atoms/lan-bridge-atoms'
 import { FeishuSettings } from './FeishuSettings'
+import { SlackSettings } from './SlackSettings'
 import { DingTalkSettings } from './DingTalkSettings'
 import { WeChatSettings } from './WeChatSettings'
 import { LanBridgeSettings } from './LanBridgeSettings'
@@ -21,13 +23,14 @@ import { BotDefaultSettings } from './BotDefaultSettings'
 import { PromaLogoSettings } from './PromaLogoSettings'
 import feishuLogo from '@/assets/bots/feishu.png'
 import dingtalkLogo from '@/assets/bots/dingding.png'
+import slackLogo from '@/assets/bots/slack.png'
 import wechatLogo from '@/assets/bots/wechat.png'
 import lanIcon from '@/assets/models/lan.svg'
 import promaLogo from '@/assets/models/proma.png'
 
 // ===== 类型 =====
 
-type BotPlatformId = 'feishu' | 'dingtalk' | 'wechat' | 'lan' | 'defaults' | 'logos'
+type BotPlatformId = 'feishu' | 'slack' | 'dingtalk' | 'wechat' | 'lan' | 'defaults' | 'logos'
 
 interface BotPlatformDef {
   id: BotPlatformId
@@ -48,6 +51,12 @@ const PLATFORMS: readonly BotPlatformDef[] = [
     name: '飞书',
     iconSrc: feishuLogo,
     iconBgClass: 'bg-blue-500/15',
+  },
+  {
+    id: 'slack',
+    name: 'Slack',
+    iconSrc: slackLogo,
+    iconBgClass: 'bg-violet-500/15',
   },
   {
     id: 'wechat',
@@ -99,6 +108,7 @@ const BRIDGE_STATUS_COLORS = {
 function PlatformStatusDot({ platformId }: { platformId: BotPlatformId }): React.ReactElement | null {
   const feishuBotStates = useAtomValue(feishuBotStatesAtom)
   const dingtalkBotStates = useAtomValue(dingtalkBotStatesAtom)
+  const slackBotStates = useAtomValue(slackBotStatesAtom)
   const wechatState = useAtomValue(wechatBridgeStateAtom)
   const lanState = useAtomValue(lanBridgeStateAtom)
 
@@ -107,6 +117,7 @@ function PlatformStatusDot({ platformId }: { platformId: BotPlatformId }): React
   const statusMap: Record<string, string> = {
     feishu: getPlatformStatus(feishuBotStates),
     dingtalk: getPlatformStatus(dingtalkBotStates),
+    slack: getPlatformStatus(slackBotStates),
     wechat: wechatState.status,
     lan: lanState.status,
   }
@@ -178,6 +189,8 @@ function renderPlatformPanel(id: BotPlatformId): React.ReactElement {
   switch (id) {
     case 'feishu':
       return <FeishuSettings />
+    case 'slack':
+      return <SlackSettings />
     case 'dingtalk':
       return <DingTalkSettings />
     case 'wechat':

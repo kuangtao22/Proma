@@ -96,15 +96,46 @@ export function AppShell(): React.ReactElement {
   const automationForm = useAtomValue(automationFormAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
-  /** 顶层视图只决定普通 Agent 右栏是否应保持挂载。 */
-  const activeView = useAtomValue(activeViewAtom)
-  const isRightPanelExpanded = isPanelOpen
-  /** 非 Agent 主内容不挂载右栏，避免无效订阅和布局占位。 */
-  const showRightPanel = !automationForm.open
-    && activeView !== 'planning'
-    && activeView !== 'agent-skills'
-    && appMode === 'agent'
-    && currentSessionId !== null
+  const appContentRef = React.useRef<HTMLDivElement>(null)
+
+  // Settings 覆盖原内容时，用 inert 移除后台焦点目标；不能在仍持有焦点的节点上设置 aria-hidden。
+  React.useLayoutEffect(() => {
+    appContentRef.current?.toggleAttribute('inert', settingsOpen)
+  }, [settingsOpen])
+
+  // 定时任务表单打开时隐藏右侧文件面板，让中间区域扩展到全宽（表单内含自己的右栏配置）
+  const [activeView, setActiveView] = useAtom(activeViewAtom)
+  const productivityTools = useAtomValue(productivityToolsAtom)
+  React.useEffect(() => {
+    if (!productivityTools.obsidianEnabled && activeView === 'vault') setActiveView('conversations')
+
+    const isEnabled = (tab: string): boolean => (
+      (tab !== 'todos' || productivityTools.todosEnabled)
+      && (tab !== 'calendar' || productivityTools.calendarEnabled)
+      && (tab !== 'vault' || productivityTools.obsidianEnabled)
+    )
+    setAgentSessionComponentOpenMap((previous) => {
+      let changed = false
+      const next = Object.fromEntries(Object.entries(previous).map(([sessionId, tabs]) => {
+        const enabledTabs = tabs.filter(isEnabled)
+        if (enabledTabs.length !== tabs.length) changed = true
+        return [sessionId, enabledTabs]
+      }))
+      return changed ? next : previous
+    })
+    setAgentDiffPanelTabs((previous) => {
+      let changed = false
+      const next = new Map(previous)
+      for (const [sessionId, tab] of previous) {
+        if (!isEnabled(tab)) {
+          next.set(sessionId, 'files')
+          changed = true
+        }
+      }
+      return changed ? next : previous
+    })
+  }, [activeView, productivityTools.calendarEnabled, productivityTools.obsidianEnabled, productivityTools.todosEnabled, setActiveView, setAgentDiffPanelTabs, setAgentSessionComponentOpenMap])
+  const showRightPanel = appMode === 'agent' && !!currentSessionId && !(automationForm.open && activeView !== 'conversations') && activeView !== 'planning' && activeView !== 'agent-skills'
   const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   React.useEffect(() => {
@@ -349,7 +380,10 @@ export function AppShell(): React.ReactElement {
       <WindowControls />
 
       <div className="shell-bg relative h-screen w-screen overflow-hidden bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-950 dark:to-zinc-900">
-        <div className={cn('flex h-full w-full', getWindowTitlebarContentInsetClass(isWindows), settingsOpen && 'hidden')} aria-hidden={settingsOpen}>
+        <div
+          ref={appContentRef}
+          className={cn('flex h-full w-full', getWindowTitlebarContentInsetClass(isWindows), settingsOpen && 'hidden')}
+        >
             {/* 左侧边栏：可折叠，可拖拽调整宽度 */}
             <div className="relative z-[60] crt-sidebar">
               <LeftSidebar width={clampedLeftSidebarWidth} noTransition={isDraggingLeftSidebar} />
@@ -380,7 +414,7 @@ export function AppShell(): React.ReactElement {
               >
                 <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 w-px bg-border/80 dark:bg-border/70" />
                 {/* 拖拽手柄 */}
-                {isRightPanelExpanded && (
+                {isPanelOpen && (
                   <div
                     className={cn(
                       'absolute left-0 top-0 bottom-0 w-[8px] -translate-x-1/2 cursor-col-resize active:bg-primary/50 transition-colors z-20'

@@ -128,6 +128,7 @@ describe('工作区写 IPC 守卫合同', () => {
       { channel: 'DETACH_WORKSPACE_DIRECTORY', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceDirectory(', 'releaseDirectoryWatcherIfUnreferenced('] },
       { channel: 'ATTACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['realpathSync(', 'attachWorkspaceFile(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_WORKSPACE_FILE', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(input.workspaceSlug, () =>', sideEffects: ['detachWorkspaceFile(', 'releaseDirectoryWatcherIfUnreferenced('] },
+      { channel: 'DELETE_MCP', guardCall: 'workspaceOperationGuard.runWorkspaceSlugWrite(workspaceSlug, () =>', sideEffects: ['getWorkspaceMcpConfig(', 'advanceWorkspaceMcpRefreshGeneration(', 'clearWorkspaceMcpPendingValidation(', 'saveWorkspaceMcpConfig('] },
     ]
 
     for (const contract of contracts) {
@@ -185,5 +186,18 @@ describe('工作区写 IPC 守卫合同', () => {
       const handler = source.slice(start, end === -1 ? source.length : end)
       expect(handler).not.toContain('workspaceOperationGuard')
     }
+  })
+
+  test('Given 工作区 MCP 配置写入 When 检查 manager 源码 Then 使用共享原子 JSON 写封装', () => {
+    /** 读取真实 manager 源码，防止完整 MCP 配置退回直接覆盖写入。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-workspace-manager.ts'), 'utf8')
+    /** 只截取 MCP 保存函数，避免其他非配置文件写入影响合同判断。 */
+    const start = source.indexOf('export function saveWorkspaceMcpConfig')
+    const end = source.indexOf('// ===== Skill 目录扫描 =====', start)
+    const saveFunction = source.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(saveFunction).toContain('writeJsonFileAtomic(mcpPath, normalizeWorkspaceMcpConfig(config))')
+    expect(saveFunction).not.toContain('writeFileSync(')
   })
 })

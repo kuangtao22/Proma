@@ -85,6 +85,7 @@ export const CODEX_FAST_MODE_MODEL_IDS = [
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
+  'gpt-6-astra',
 ] as const
 
 /** 模型 ID 是否可通过 ChatGPT Codex OAuth 使用 Fast Mode。 */
@@ -637,6 +638,8 @@ export type PromaEvent =
   | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta }
   /** 桌面会话已开始执行；startedAt 区分连续运行，session 提供权威轻量事件归属。 */
   | { type: 'run_started'; startedAt: number; runGeneration?: number; session?: AgentStreamSessionMeta }
+  /** 普通桌面会话已结束；供已显式配置的外部通知通道发送摘要。 */
+  | { type: 'run_completed'; source: AgentExternalRunSource | 'desktop'; stoppedByUser: boolean; startedAt?: number; runGeneration?: number }
   | { type: 'run_resumed'; sessionId: string }
   /** 用户主动停止当前执行；startedAt 防止旧运行的终态覆盖新一轮执行。 */
   | { type: 'run_stopped'; startedAt?: number; runGeneration?: number }
@@ -646,7 +649,7 @@ export type PromaEvent =
   | { type: 'automation_graduated' }
 
 /** 外部入口触发 Agent 运行的来源 */
-export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'bridge' | 'automation' | 'delegation' | 'design'
+export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'slack' | 'bridge' | 'automation' | 'delegation' | 'design'
 
 /** Pi AssistantMessageEvent 的可序列化增量；不携带累计 partial，避免跨进程复制整段输出。 */
 export type AgentAssistantDelta =
@@ -1971,6 +1974,8 @@ export const AGENT_IPC_CHANNELS = {
   GET_MCP_CONFIG: 'agent:get-mcp-config',
   /** 保存工作区 MCP 配置 */
   SAVE_MCP_CONFIG: 'agent:save-mcp-config',
+  /** 原子删除单个 MCP，保留其他条目的当前状态。 */
+  DELETE_MCP: 'agent:delete-mcp',
   /** 刷新并持久化工作区 MCP 真实连接状态 */
   REFRESH_MCP_CONNECTIONS: 'agent:refresh-mcp-connections',
   /** 原子切换 MCP 启用状态，并在启用时条件持久化真实验证结果。 */
