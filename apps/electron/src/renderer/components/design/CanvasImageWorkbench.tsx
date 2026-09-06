@@ -278,6 +278,11 @@ export function CanvasImageWorkbench({
     || imageModelLoadState !== 'ready'
     || !draft.prompt.trim()
     || !selectedModel?.available
+  /** 图片任务、素材采用和配置保存共用错误通道，主操作区必须始终给出可见反馈。 */
+  const operationError = state.error
+    ?? (state.saveState === 'failed' || state.saveState === 'conflict'
+      ? '生图配置保存失败，请重试'
+      : null)
   /** 当前展示任务固化的直接上游内容用于用户核对真实输入。 */
   const inputReferences = displayedJob?.canvasInputReferences ?? []
   /** 当前展开的详情任务必须仍存在于模块快照中。 */
@@ -567,8 +572,8 @@ export function CanvasImageWorkbench({
           >
             {state.saveState === 'saving' && <p className="text-xs text-muted-foreground">正在保存配置</p>}
             {state.saveState === 'dirty' && <p className="text-xs text-muted-foreground">配置尚未保存</p>}
-            {(state.saveState === 'failed' || state.saveState === 'conflict') && (
-              <p className="break-words text-xs text-destructive">{state.error ?? '生图配置保存失败，请重试'}</p>
+            {operationError && (
+              <p className="break-words text-xs text-destructive" role="alert">{operationError}</p>
             )}
             {state.saveState === 'conflict' && (
               <Button type="button" variant="outline" className="w-full" onClick={onRetryLoad}>

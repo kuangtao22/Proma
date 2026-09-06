@@ -6,6 +6,8 @@ import {
   hasValidDesignSessionOwnership,
   isAgentSessionUserVisible,
   isInternalDesignSession,
+  isOrdinaryTopLevelAgentSession,
+  requireOrdinaryTopLevelAgentSession,
   requireUserVisibleAgentSession,
 } from './agent-session-visibility'
 
@@ -172,5 +174,50 @@ describe('Agent 内部 Canvas 会话归属与可见性', () => {
   test('Given 普通会话 When 判断 Canvas 归属与可见性 Then 保持普通会话行为', () => {
     expect(hasValidCanvasAgentOwnership({ workspaceId: 'project-1' })).toBe(false)
     expect(isAgentSessionUserVisible({ workspaceId: 'project-1' })).toBe(true)
+  })
+})
+
+describe('普通顶层 Agent 会话资格', () => {
+  test.each([
+    ['Design 项目来源', { sourceDesignProjectId: 'project-1' }],
+    ['Design 任务来源', { sourceDesignJobId: 'job-1' }],
+    ['Canvas 项目来源', { sourceCanvasProjectId: 'project-1' }],
+    ['Canvas 来源', { sourceCanvasId: 'canvas-1' }],
+    ['Canvas 节点来源', { sourceCanvasNodeId: 'node-1' }],
+    ['Automation 来源', { sourceAutomationId: 'automation-1' }],
+    ['已毕业 Automation', { automationGraduated: true }],
+    ['父会话残留', { parentSessionId: 'parent-1' }],
+    ['根会话残留', { rootSessionId: 'root-1' }],
+    ['Delegation 来源', { sourceDelegationId: 'delegation-1' }],
+    ['Delegation 角色', { delegationRole: 'explore' as const }],
+    ['Delegation 状态', { delegationStatus: 'running' as const }],
+    ['Delegation 深度', { delegationDepth: 1 }],
+    ['Delegation 目标', { delegationGoal: '分析项目' }],
+  ])('Given 会话带有%s When 判断普通顶层资格 Then fail closed', (_label, contamination) => {
+    /** 污染会话保留完整基础元数据，确保只由目标字段触发拒绝。 */
+    const session = {
+      id: 'session-1',
+      title: '候选会话',
+      createdAt: 1,
+      updatedAt: 1,
+      ...contamination,
+    } as AgentSessionMeta
+
+    expect(isOrdinaryTopLevelAgentSession(session)).toBe(false)
+    expect(() => requireOrdinaryTopLevelAgentSession(session)).toThrow('Agent 会话不存在')
+  })
+
+  test('Given 普通会话 When 判断并收窄普通顶层资格 Then 保持允许', () => {
+    /** 不携带任何内部来源或父子残留的普通交互式会话。 */
+    const session: AgentSessionMeta = {
+      id: 'session-1',
+      title: '普通会话',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+
+    expect(isOrdinaryTopLevelAgentSession(session)).toBe(true)
+    expect(requireOrdinaryTopLevelAgentSession(session)).toBe(session)
+    expect(() => requireOrdinaryTopLevelAgentSession(undefined)).toThrow('Agent 会话不存在')
   })
 })

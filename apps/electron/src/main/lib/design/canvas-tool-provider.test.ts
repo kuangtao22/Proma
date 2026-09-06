@@ -369,7 +369,7 @@ function createFixture(options: {
 }
 
 describe('普通 Agent Canvas Tool Provider', () => {
-  test('Given 普通分析运行 When 获取上下文 Then 注入十四工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
+  test('Given 普通分析运行 When 获取上下文 Then 注入十五工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
@@ -383,6 +383,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_import_image',
       'canvas_create_artifact',
       'canvas_update_artifact',
+      'canvas_update_image_config',
       'canvas_update_agent_config',
       'canvas_run_agent',
       'canvas_run_workflow',
@@ -546,6 +547,36 @@ describe('普通 Agent Canvas Tool Provider', () => {
       selectedModelProfileId: 'model-1', aspectRatio: '16:9', imageSize: '2K', contextMode: 'project',
     })
     expect(fixture.runInputs).toHaveLength(0)
+  })
+
+  test('Given 普通 Agent 要求调整图片画幅 When 更新图片配置 Then 保留未指定字段且不自动运行', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3,
+      expectedConfigRevision: 4, aspectRatio: '3:4',
+    }, 'tool-image-config-1')
+
+    expect(result.details).toMatchObject({
+      nodeId: 'image-1', kind: 'image', configRevision: 5, requiresRun: true,
+    })
+    expect(fixture.imageSaveInputs[0]).toMatchObject({
+      nodeId: 'image-1', imageModuleId: 'image-content-1',
+      expectedConfigRevision: 4, prompt: '旧提示词', selectedModelProfileId: 'model-1',
+      aspectRatio: '3:4', imageSize: '2K', contextMode: 'project',
+    })
+    expect(fixture.runInputs).toHaveLength(0)
+  })
+
+  test('Given 普通 Agent 未提供图片配置变更 When 更新图片配置 Then 在保存前明确拒绝', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3, expectedConfigRevision: 4,
+    }, 'tool-image-config-empty')).rejects.toThrow('CANVAS_IMAGE_CONFIG_PATCH_REQUIRED')
+    expect(fixture.imageSaveInputs).toHaveLength(0)
   })
 
   test('Given 普通 Agent 局部修改专业 Agent 配置 When 双 revision 匹配 Then 保留省略字段且不接受会话归属字段', async () => {
@@ -749,6 +780,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_get_context', 'canvas_list_nodes', 'canvas_inspect_images', 'canvas_read',
       'canvas_apply_changes', 'canvas_import_image', 'canvas_create_artifact',
       'canvas_update_artifact',
+      ...(ordinary.allowedToolNames.includes('canvas_update_image_config') ? ['canvas_update_image_config'] : []),
       'canvas_run_nodes',
     ]
     const parentOrchestratedToolNames = rendererManualToolNames.filter((name) => name !== 'canvas_run_nodes')
@@ -1017,7 +1049,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(revoked.getLinkCalls()).toBe(0)
   })
 
-  test('Given 项目授权在运行后撤销 When 十三工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
+  test('Given 项目授权在运行后撤销 When 十五工具 fresh execute Then 全部在 Store、batch 与 run 前拒绝', async () => {
     const cases: Array<{ name: string; args: Record<string, unknown> }> = [
       { name: 'canvas_get_context', args: {} },
       { name: 'canvas_manage', args: { action: 'create' } },
@@ -1027,6 +1059,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
       { name: 'canvas_import_image', args: { canvasId: 'canvas-1', baseRevision: 3, title: '角色三视图', localPath: 'reference.png' } },
       { name: 'canvas_create_artifact', args: { canvasId: 'canvas-1', baseRevision: 3, artifactType: 'webview', title: '原型', content: '<!doctype html><html></html>' } },
       { name: 'canvas_update_artifact', args: { canvasId: 'canvas-1', nodeId: 'web-1', baseRevision: 3, expectedContentRevision: 1, content: '<main>新版</main>' } },
+      { name: 'canvas_update_image_config', args: { canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3, expectedConfigRevision: 4, aspectRatio: '3:4' } },
       { name: 'canvas_update_agent_config', args: { canvasId: 'canvas-1', nodeId: 'agent-1', expectedGraphRevision: 3, expectedConfigRevision: 4, patch: { instruction: '职责' } } },
       { name: 'canvas_run_agent', args: { canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '执行' } },
       { name: 'canvas_run_nodes', args: { canvasId: 'canvas-1', nodeIds: ['image-1'] } },

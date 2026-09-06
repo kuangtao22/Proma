@@ -62,7 +62,7 @@ test('Given 自定义数据根 When 构建系统提示词 Then 工作区 AGENTS 
   expect(prompt).not.toContain('/Users/test/.proma/agent-workspaces')
 })
 
-test('Given 用户提出可能是视觉稿的设计需求 When 构建系统提示词 Then Agent 必须先区分设计与代码实现', () => {
+test('Given 用户提出画布视觉需求 When 构建系统提示词 Then Agent 必须在当前会话直接使用画布能力', () => {
   const prompt = buildSystemPrompt({
     sessionId: 'session-design-intent',
     permissionMode: 'bypassPermissions',
@@ -77,7 +77,11 @@ test('Given 用户提出可能是视觉稿的设计需求 When 构建系统提�
     },
   })
 
-  expect(prompt).toContain('视觉设计与代码实现')
-  expect(prompt).toContain('未明确要求修改代码')
-  expect(prompt).toContain('先询问用户是否打开 Design')
+  expect(prompt).toContain('视觉设计、画布与代码实现')
+  expect(prompt).toContain('明确要求使用画布')
+  expect(prompt).toContain('canvas-production')
+  expect(prompt).toContain('canvas_*')
+  expect(prompt).toContain('不得要求用户切换到另一个 Design/Canvas')
+  expect(prompt).not.toContain('先询问用户是否打开 Design')
+  expect(prompt).not.toContain('用户选择 Design')
 })

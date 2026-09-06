@@ -66,6 +66,7 @@ import {
 } from './agent-headless-runner-registry'
 import type { HeadlessAgentRunCallbacks, HeadlessAgentRunTerminalOptions } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
+import { normalizeHeadlessAgentRunInput } from './agent-headless-run-source'
 import {
   buildAuthoritativeAgentRunStartedEvent,
   buildAuthoritativeAgentStreamErrorPayload,
@@ -606,17 +607,8 @@ export async function runAgentHeadless(
     callbacks.originSessionId,
     getMainRendererWebContents,
   )
-  // Headless runs originate from automation, delegation, or an external Bridge. Never
-  // treat an omitted source as an interactive desktop-user run: custom tools may grant
-  // local side effects that cannot be visibly supervised by an external sender.
-  const inferredTriggeredBy = callbacks.source === 'delegation' ? 'delegation' : 'external'
-  // Headless callers are public service clients too; discard any forged runtime identity.
-  const { runGeneration: _ignoredRunGeneration, ...publicInput } = input as AgentSendInput & { runGeneration?: unknown }
-  const runInput: AgentRunInput = {
-    ...publicInput,
-    ...(input.triggeredBy ? {} : { triggeredBy: inferredTriggeredBy }),
-    ...(input.startedAt != null ? {} : { startedAt: Date.now() }),
-  }
+  // Headless 调用方不能声明交互式用户来源；只信任主进程 callback 绑定的外部来源。
+  const runInput: AgentRunInput = normalizeHeadlessAgentRunInput(input, callbacks.source)
   const startedAt = runInput.startedAt!
   let runGeneration: number | undefined
   let runErrored = false

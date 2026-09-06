@@ -24,7 +24,7 @@ import {
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
@@ -423,11 +423,18 @@ import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHea
 import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
+import { ServerOpsAgentAccessStore } from './lib/server-ops/server-ops-agent-access-store'
+import { ServerOpsAuditStore } from './lib/server-ops/server-ops-audit-store'
+import { disposeServerOpsBeforeQuit, disposeServerOpsLifecycle, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
 import { ServerOpsHostStore } from './lib/server-ops/server-ops-host-store'
 import { ServerOpsCredentialStore } from './lib/server-ops/server-ops-credential-store'
 import { ServerOpsHostTrustStore } from './lib/server-ops/server-ops-host-trust-store'
 import { ServerOpsConnectionService, createServerOpsConnectionSystemDependencies } from './lib/server-ops/server-ops-connection-service'
+import { ServerOpsOverviewService } from './lib/server-ops/server-ops-overview-service'
+import { ServerOpsSystemdService } from './lib/server-ops/server-ops-systemd-service'
+import { ServerOpsLogService } from './lib/server-ops/server-ops-log-service'
 import { serverOpsRuntimeClient } from './lib/server-ops/server-ops-runtime-client'
+import { writeTextFileAtomic } from './lib/safe-file'
 import {
   getDefaultWorkspaceProjectRelocator,
   listWorkspacePathStates,
@@ -2031,13 +2038,94 @@ export function registerIpcHandlers(): void {
     runtime: serverOpsRuntimeClient,
     ...createServerOpsConnectionSystemDependencies(),
   })
-  registerServerOpsIpcHandlers({
-    ipc: ipcMain,
-    listAuthorizedWebContents: listAuthorizedDesignWebContents,
-    hosts: serverOpsHostStore,
+  /** Agent 服务器授权仅存在主进程内存，并复用同一运维服务实例。 */
+  const serverOpsAgentAccessStore = new ServerOpsAgentAccessStore()
+  /** Agent 远程动作审计与 Facade、IPC 共享唯一持久化实例。 */
+  const serverOpsAuditStore = new ServerOpsAuditStore()
+  /** 概览复用唯一 SSH connection generation，不创建额外连接。 */
+  const serverOpsOverviewService = new ServerOpsOverviewService({
     connections: serverOpsConnectionService,
-    credentials: serverOpsCredentialStore,
+    now: Date.now,
   })
+  /** systemd 读取、动作与审计复用唯一连接和 Store。 */
+  const serverOpsSystemdService = new ServerOpsSystemdService({
+    getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
+    exec: (hostId, connectionId, command, timeoutMs) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs),
+    audit: serverOpsAuditStore,
+    now: Date.now,
+  })
+  /** 实时日志流复用唯一连接，并仅在 main 内生成流身份。 */
+  const serverOpsLogService = new ServerOpsLogService({
+    connection: serverOpsConnectionService,
+    uuid: randomUUID,
+  })
+  /** Server Ops 初始化事务只在 IPC 与 context 全部就绪后发布注册结果。 */
+  const serverOpsLifecycle = (() => {
+    /** IPC 注册成功后用于异常路径精确回滚本轮 handler 与订阅。 */
+    let ipcRegistration: ReturnType<typeof registerServerOpsIpcHandlers> | null = null
+    try {
+      ipcRegistration = registerServerOpsIpcHandlers({
+        ipc: ipcMain,
+        listAuthorizedWebContents: listAuthorizedDesignWebContents,
+        hosts: serverOpsHostStore,
+        connections: serverOpsConnectionService,
+        credentials: serverOpsCredentialStore,
+        access: serverOpsAgentAccessStore,
+        audit: serverOpsAuditStore,
+        overview: serverOpsOverviewService,
+        systemd: serverOpsSystemdService,
+        logs: serverOpsLogService,
+        resolveOwnerWindow: (sender) => BrowserWindow.fromWebContents(sender),
+        showLogSaveDialog: async (owner, options) => {
+          /** owner 必然来自 BrowserWindow.fromWebContents，这里只恢复 Electron 的完整类型。 */
+          return dialog.showSaveDialog(owner as BrowserWindow, options)
+        },
+        writeTextFileAtomic,
+        now: () => new Date(),
+        requireUserVisibleSession: (sessionId) => requireVisibleSession(sessionId),
+      })
+      const disposeContextRegistration = registerServerOpsServiceContext({
+        hosts: serverOpsHostStore,
+        credentials: serverOpsCredentialStore,
+        trust: serverOpsHostTrustStore,
+        connections: serverOpsConnectionService,
+        access: serverOpsAgentAccessStore,
+        audit: serverOpsAuditStore,
+        overview: serverOpsOverviewService,
+        systemd: serverOpsSystemdService,
+        logs: serverOpsLogService,
+      })
+      return {
+        ipcRegistration,
+        dispose: disposeServerOpsLifecycle(() => ipcRegistration?.dispose(), disposeContextRegistration),
+      }
+    } catch (error) {
+      /** Server Ops 初始化失败时仍按 IPC、日志、连接顺序 best-effort 收口。 */
+      try { ipcRegistration?.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] IPC 初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsLogService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 日志服务初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsConnectionService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 连接服务初始化回滚失败:', cleanupError)
+      }
+      throw error
+    }
+  })()
+  /** 运维 IPC 注册结果同时承载普通 Agent 会话删除时的授权收口。 */
+  const serverOpsIpcRegistration = serverOpsLifecycle.ipcRegistration
+  /** 必须先释放日志 owner/订阅与 IPC，再停止唯一连接和 utility runtime。 */
+  let serverOpsDisposed = false
+  const disposeServerOps = (): void => {
+    if (serverOpsDisposed) return
+    serverOpsDisposed = true
+    app.removeListener('before-quit', disposeServerOps)
+    disposeServerOpsBeforeQuit(serverOpsLifecycle.dispose, (error) => {
+      console.error('[Server Ops] 退出清理失败:', error)
+    })
+  }
+  app.prependOnceListener('before-quit', disposeServerOps)
   /** 图片任务直接更新 Canvas 节点后发布准确 revision，驱动折叠节点即时刷新。 */
   const publishCanvasImageGraphChange = (event: CanvasChangeEvent): void => {
     for (const contents of listAuthorizedDesignWebContents()) {
@@ -4265,6 +4353,7 @@ export function registerIpcHandlers(): void {
       await browserController.close(id)
       closeTerminalsForSession(id)
       deleteAgentSession(id)
+      serverOpsIpcRegistration.revokeSession(id)
       /** 复用关联准入规则，只在普通顶层 Agent 删除成功后清理。 */
       cleanupDeletedAgentSessionCanvasBindings(agentCanvasBindingCleanup, deletingSession)
       releaseAttachedFileWatchers(attachedFiles)
@@ -4536,6 +4625,7 @@ export function registerIpcHandlers(): void {
           }
           closeTerminalsForSession(sessionId)
           deleteAgentSession(sessionId)
+          serverOpsIpcRegistration.revokeSession(sessionId)
           /** 每个会话主删除成功后独立 best-effort 清理，不阻断工作区删除。 */
           const deletedSession = affectedSessions.find((session) => session.id === sessionId)
           if (deletedSession) {

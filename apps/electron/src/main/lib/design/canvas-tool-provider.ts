@@ -75,6 +75,7 @@ const RENDERER_MANUAL_CANVAS_AGENT_TOOL_NAMES = new Set([
   'canvas_import_image',
   'canvas_create_artifact',
   'canvas_update_artifact',
+  'canvas_update_image_config',
   'canvas_run_nodes',
 ])
 /** 父 Agent 编排模式禁止 Canvas Agent 再启动任何付费图片任务。 */
@@ -87,6 +88,7 @@ const PARENT_ORCHESTRATED_CANVAS_AGENT_TOOL_NAMES = new Set([
   'canvas_import_image',
   'canvas_create_artifact',
   'canvas_update_artifact',
+  'canvas_update_image_config',
 ])
 
 /** 按 UTF-8 原始字节预算截断文本，并保持完整 Unicode 字符。 */
@@ -319,7 +321,7 @@ function applyCanvasReadBudget(
   return details
 }
 
-/** 普通项目 Agent 单轮可用的十三个 Canvas 工具。 */
+/** 普通项目 Agent 单轮可用的十五个 Canvas 工具。 */
 export const CANVAS_TOOL_NAMES = [
   'canvas_get_context',
   'canvas_manage',
@@ -331,6 +333,7 @@ export const CANVAS_TOOL_NAMES = [
   'canvas_import_image',
   'canvas_create_artifact',
   'canvas_update_artifact',
+  'canvas_update_image_config',
   'canvas_update_agent_config',
   'canvas_run_agent',
   'canvas_run_workflow',
@@ -1140,6 +1143,78 @@ export function createCanvasToolRun(
       },
     }),
     defineCanvasTool({
+      name: 'canvas_update_image_config', label: '更新生图节点配置',
+      description: '局部更新已有生图节点的提示词、模型、画幅、尺寸或上下文；只保存配置，不会自动生图。',
+      parameters: Type.Object({
+        canvasId: Type.String({ minLength: 1, maxLength: 128 }),
+        nodeId: Type.String({ minLength: 1, maxLength: 128 }),
+        baseRevision: Type.Integer({ minimum: 0 }),
+        expectedConfigRevision: Type.Integer({ minimum: 0 }),
+        prompt: Type.Optional(Type.String({ maxLength: 256 * 1024 })),
+        selectedModelProfileId: Type.Optional(Type.Union([
+          Type.String({ minLength: 1, maxLength: 128 }),
+          Type.Null(),
+        ])),
+        aspectRatio: Type.Optional(Type.Union([
+          Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'),
+          Type.Literal('9:16'), Type.Literal('3:4'),
+        ])),
+        imageSize: Type.Optional(Type.Union([
+          Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K'),
+        ])),
+        contextMode: Type.Optional(Type.Union([
+          Type.Literal('auto'), Type.Literal('project'), Type.Literal('none'),
+        ])),
+      }),
+      execute: async (_toolCallId, params) => {
+        dependencies.access.authorizeRead(context)
+        if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
+        return dependencies.access.runWrite(context, async () => {
+          dependencies.access.requireLinkedCanvas(context, params.canvasId)
+          if (params.prompt === undefined
+            && params.selectedModelProfileId === undefined
+            && params.aspectRatio === undefined
+            && params.imageSize === undefined
+            && params.contextMode === undefined) {
+            throw new Error('CANVAS_IMAGE_CONFIG_PATCH_REQUIRED')
+          }
+          /** fresh 图用于验证节点类别并解析可信图片模块身份。 */
+          const target = { projectId: context.projectId, canvasId: params.canvasId }
+          const document = dependencies.documents.load(target).document
+          if (document.revision !== params.baseRevision) throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+          /** 当前权威图片节点；Agent 不直接提供 imageModuleId。 */
+          const node = document.nodes.find((candidate) => candidate.id === params.nodeId)
+          if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
+          if (node.kind !== 'image') throw new Error('CANVAS_IMAGE_NODE_REQUIRED')
+          /** 当前配置为未提供字段提供基线，并由 config revision 防止并发覆盖。 */
+          const imageTarget = { ...target, nodeId: node.id, imageModuleId: node.imageModuleId }
+          const currentConfig = await dependencies.images.loadConfig(imageTarget)
+          if (currentConfig.revision !== params.expectedConfigRevision) {
+            throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+          }
+          const config = await dependencies.images.save({
+            ...imageTarget,
+            expectedConfigRevision: params.expectedConfigRevision,
+            prompt: params.prompt ?? currentConfig.prompt,
+            selectedModelProfileId: params.selectedModelProfileId === undefined
+              ? currentConfig.selectedModelProfileId
+              : params.selectedModelProfileId,
+            aspectRatio: params.aspectRatio ?? currentConfig.aspectRatio,
+            imageSize: params.imageSize ?? currentConfig.imageSize,
+            contextMode: params.contextMode ?? currentConfig.contextMode,
+          })
+          return toolResult({
+            canvasId: params.canvasId,
+            nodeId: node.id,
+            kind: 'image',
+            revision: document.revision,
+            configRevision: config.revision,
+            requiresRun: true,
+          })
+        })
+      },
+    }),
+    defineCanvasTool({
       name: 'canvas_update_agent_config', label: '更新 Canvas Agent 配置',
       description: '局部更新已有 Canvas Agent 的长期职责、Skills 或模型选择；不会运行模型、下游节点或图片任务。',
       parameters: Type.Object({
@@ -1338,7 +1413,7 @@ export function createCanvasToolRun(
 
 当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
 
-创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
+创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，图片画幅、尺寸、模型或上下文通过 canvas_update_image_config 局部修改，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成，必须提示用户进入画布验收，不得描述为已正式替换。
 
 用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
 

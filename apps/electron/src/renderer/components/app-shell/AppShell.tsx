@@ -29,6 +29,8 @@ import { getWindowTitlebarContentInsetClass } from '@/lib/window-titlebar-layout
 import { cn } from '@/lib/utils'
 import { useCanvasSessionRegistry } from '@/hooks/useCanvasSessionRegistry'
 import { Toaster } from '@/components/ui/sonner'
+import { toast } from 'sonner'
+import { createServerOpsAgentAccessSessionGuard } from '@/lib/server-ops-agent-access-session-guard'
 
 const MIN_RIGHT_PANEL_WIDTH = 300
 // 浏览器、预览、终端等工作区在窄视图中优先允许连续阅读和基础操作；需要更多空间时可继续向左拖拽并折叠左栏。
@@ -78,6 +80,14 @@ export function AppShell(): React.ReactElement {
   useCanvasSessionRegistry(workspaces.map((workspace) => workspace.id))
   const currentWorkspace = workspaces.find((workspace) => workspace.id === currentWorkspaceId)
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
+  /** 常驻于 AppShell 的会话撤权守卫，不依赖 Server Ops 工作区是否挂载。 */
+  const [serverOpsAgentAccessSessionGuard] = React.useState(() => createServerOpsAgentAccessSessionGuard({
+    revokeSession: (sessionId) => window.electronAPI.revokeServerOpsAgentAccessSession(sessionId),
+    reportError: (message) => {
+      console.error('[Server Ops] 切换会话撤销 Agent 授权失败:', message)
+      toast.error('服务器 Agent 授权撤销失败，请返回运维面板检查授权')
+    },
+  }))
   const activeRightPanelTab = useAtomValue(agentDiffPanelTabAtom).get(currentSessionId ?? '')
   const setAgentDiffPanelTabs = useSetAtom(agentDiffPanelTabAtom)
   const setAgentSessionComponentOpenMap = useSetAtom(agentSessionComponentOpenMapAtom)
@@ -96,6 +106,11 @@ export function AppShell(): React.ReactElement {
     && appMode === 'agent'
     && currentSessionId !== null
   const isWindows = React.useMemo(() => detectIsWindows(), [])
+
+  React.useEffect(() => {
+    /** 当前会话每次变化都先让常驻守卫收口上一会话授权。 */
+    serverOpsAgentAccessSessionGuard.select(currentSessionId)
+  }, [currentSessionId, serverOpsAgentAccessSessionGuard])
 
   // 左侧边栏可拖拽宽度
   const [leftSidebarWidth, setLeftSidebarWidth] = useAtom(leftSidebarWidthAtom)

@@ -3,6 +3,56 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createWorkspaceOperationGuard } from './workspace-operation-guard'
 import { isEligibleProjectAgent } from './agent-session-visibility'
+import { normalizeHeadlessAgentRunInput } from './agent-headless-run-source'
+
+describe('Headless Agent 可信运行来源', () => {
+  test.each(['feishu', 'bridge'] as const)(
+    'Given source=%s 且 input 伪造 user 来源 When 归一化运行输入 Then Orchestrator 只收到 external',
+    (source) => {
+      const runInput = normalizeHeadlessAgentRunInput({
+        sessionId: 'session-1',
+        channelId: 'channel-1',
+        userMessage: '检查服务器',
+        triggeredBy: 'user',
+      }, source, () => 123)
+
+      expect(runInput.triggeredBy).toBe('external')
+      expect(runInput.startedAt).toBe(123)
+      expect(runInput).not.toHaveProperty('runGeneration')
+    },
+  )
+
+  test.each([
+    ['automation', 'automation'],
+    ['delegation', 'delegation'],
+  ] as const)(
+    'Given 可信 source=%s 且 input 伪造 user 来源 When 归一化 Then triggeredBy=%s',
+    (source, expected) => {
+      const forgedInput = {
+        sessionId: 'session-1',
+        channelId: 'channel-1',
+        userMessage: '后台任务',
+        triggeredBy: 'user' as const,
+        runGeneration: 999,
+      }
+      const runInput = normalizeHeadlessAgentRunInput(forgedInput, source, () => 123)
+
+      expect(runInput.triggeredBy).toBe(expected)
+      expect(runInput).not.toHaveProperty('runGeneration')
+    },
+  )
+
+  test('Given Headless 归一化输入 When 检查 service 接线 Then 归一化结果进入 Orchestrator', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
+    const start = source.indexOf('export async function runAgentHeadless(')
+    const end = source.indexOf('\n/**', start + 1)
+    const body = source.slice(start, end)
+
+    expect(body).toContain('normalizeHeadlessAgentRunInput(input, callbacks.source)')
+    expect(body).toContain('prepareAgentRun(runInput, extensions)')
+    expect(body).toContain('orchestrator.sendMessage(resolved.input')
+  })
+})
 
 describe('Agent service 迁移准入', () => {
   test('Given 普通项目、无项目与 Design 内部会话 When 准备运行 Then 仅普通项目在引用解析后注入 Canvas 单轮工具', () => {

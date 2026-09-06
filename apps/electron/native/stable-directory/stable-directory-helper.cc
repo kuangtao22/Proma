@@ -1576,13 +1576,13 @@ std::uint64_t WindowsFileId(const BY_HANDLE_FILE_INFORMATION& identity) {
   return (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32) | identity.nFileIndexLow;
 }
 
-// 以禁止跟随 reparse point 的方式打开 root；返回稳定对象或错误。
+// 以禁止跟随 reparse point 的方式打开 root；内容变更仅追加目录 flush 所需的文件写权限。
 bool OpenStableRoot(const std::string& requested_path, StableRoot* root, std::string* error,
-                    bool content_access = false) {
+                    bool content_mutation = false) {
   const std::wstring requested = Utf8ToWide(ToExtendedWindowsPath(requested_path));
   if (requested.empty()) { *error = "invalid UTF-8 root"; return false; }
   const DWORD access = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY
-      | (content_access ? FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD : 0);
+      | (content_mutation ? FILE_ADD_FILE : 0);
   UniqueHandle handle(CreateFileW(requested.c_str(), access,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -2347,10 +2347,15 @@ std::string OpenedJson(const std::vector<StableRoot>& roots) {
 // 执行 Windows 两阶段协议；输入解析后的配置，返回进程退出码。
 int RunPlatform(const Config& config) {
   std::vector<StableRoot> roots(config.roots.size());
-  const bool content_access = config.mode.rfind("canvas-content-", 0) == 0;
+  // 内容模式继续走独立协议分支，读取与列表不应为授权根申请写权限。
+  const bool content_mode = config.mode.rfind("canvas-content-", 0) == 0;
+  // 只有会刷新 Canvas 根目录的变更操作需要 FILE_ADD_FILE。
+  const bool content_mutation = config.mode == "canvas-content-write"
+      || config.mode == "canvas-content-move"
+      || config.mode == "canvas-content-remove-marker";
   for (std::size_t index = 0; index < config.roots.size(); ++index) {
     std::string error;
-    if (!OpenStableRoot(config.roots[index], &roots[index], &error, content_access)) {
+    if (!OpenStableRoot(config.roots[index], &roots[index], &error, content_mutation)) {
       std::cerr << error << '\n';
       return 2;
     }
@@ -2360,7 +2365,7 @@ int RunPlatform(const Config& config) {
   std::string decision;
   std::string payload;
   if (!std::getline(std::cin, decision) || !ParseAuthorization(config, decision, &payload)) return 3;
-  if (content_access) {
+  if (content_mode) {
     std::string error;
     if (config.mode == "canvas-content-write") {
       const CanvasIntentWriteOutcome outcome = WriteCanvasContentAtomic(config, roots.front(), payload);

@@ -14,6 +14,19 @@ import type { DesignPreloadApi } from './design-preload'
 import { createNormalPathManagementPreloadApi } from './path-management-preload'
 import type { NormalPathManagementPreloadApi } from './path-management-preload'
 import { invokeAgentMessage } from './agent-message-preload'
+import { invokeServerOpsAuditList } from './server-ops-audit-preload'
+import {
+  invokeServerOpsLogAck,
+  invokeServerOpsLogExport,
+  invokeServerOpsLogStart,
+  invokeServerOpsLogStop,
+  invokeServerOpsOverview,
+  invokeServerOpsServiceAction,
+  invokeServerOpsServiceDetail,
+  invokeServerOpsServiceList,
+  subscribeServerOpsLogExit,
+  subscribeServerOpsLogOutput,
+} from './server-ops-observability-preload'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS } from '../types'
 import type {
   RuntimeStatus,
@@ -181,7 +194,10 @@ import type {
   TerminalSnapshot,
   TerminalExitEvent,
   ServerOpsHost,
-  ServerOpsUpsertHostInput,
+  ServerOpsAgentAccess,
+  ServerOpsAgentAccessChanged,
+  ServerOpsAgentAccessTarget,
+  ServerOpsSaveHostInput,
   ServerOpsConnectInput,
   ServerOpsConfirmHostKeyInput,
   ServerOpsConnectionState,
@@ -191,6 +207,24 @@ import type {
   ServerOpsTerminalOutputAck,
   ServerOpsTerminalOutputEvent,
   ServerOpsTerminalExitEvent,
+  ServerOpsAuditListInput,
+  ServerOpsAuditListResult,
+  ServerOpsLogExitEvent,
+  ServerOpsLogExportInput,
+  ServerOpsLogExportResult,
+  ServerOpsLogIdentity,
+  ServerOpsLogOutputAck,
+  ServerOpsLogOutputEvent,
+  ServerOpsLogStartInput,
+  ServerOpsLogStartResult,
+  ServerOpsOverviewInput,
+  ServerOpsOverviewResult,
+  ServerOpsServiceActionInput,
+  ServerOpsServiceActionResult,
+  ServerOpsServiceDetailInput,
+  ServerOpsServiceDetailResult,
+  ServerOpsServiceListInput,
+  ServerOpsServiceListResult,
 } from '@proma/shared'
 import type {
   UserProfile,
@@ -253,7 +287,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
 
   // ===== Linux 服务器运维资产 =====
   listServerOpsHosts: () => Promise<ServerOpsHost[]>
-  upsertServerOpsHost: (input: ServerOpsUpsertHostInput) => Promise<ServerOpsHost>
+  upsertServerOpsHost: (input: ServerOpsSaveHostInput) => Promise<ServerOpsHost>
   deleteServerOpsHost: (hostId: string) => Promise<boolean>
   connectServerOpsHost: (input: ServerOpsConnectInput) => Promise<ServerOpsConnectionState>
   confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => Promise<ServerOpsConnectionState>
@@ -265,6 +299,21 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   onServerOpsConnectionState: (callback: (state: ServerOpsConnectionState) => void) => () => void
   onServerOpsTerminalOutput: (callback: (event: ServerOpsTerminalOutputEvent) => void) => () => void
   onServerOpsTerminalExit: (callback: (event: ServerOpsTerminalExitEvent) => void) => () => void
+  getServerOpsAgentAccess: (input: ServerOpsAgentAccessTarget) => Promise<ServerOpsAgentAccess | null>
+  setServerOpsAgentAccess: (input: ServerOpsAgentAccess) => Promise<ServerOpsAgentAccess | null>
+  revokeServerOpsAgentAccessSession: (sessionId: string) => Promise<void>
+  onServerOpsAgentAccessChanged: (callback: (event: ServerOpsAgentAccessChanged) => void) => () => void
+  listServerOpsAudit: (input: ServerOpsAuditListInput) => Promise<ServerOpsAuditListResult>
+  getServerOpsOverview: (input: ServerOpsOverviewInput) => Promise<ServerOpsOverviewResult>
+  listServerOpsServices: (input: ServerOpsServiceListInput) => Promise<ServerOpsServiceListResult>
+  getServerOpsServiceDetail: (input: ServerOpsServiceDetailInput) => Promise<ServerOpsServiceDetailResult>
+  runServerOpsServiceAction: (input: ServerOpsServiceActionInput) => Promise<ServerOpsServiceActionResult>
+  startServerOpsLogStream: (input: ServerOpsLogStartInput) => Promise<ServerOpsLogStartResult>
+  stopServerOpsLogStream: (input: ServerOpsLogIdentity) => Promise<void>
+  acknowledgeServerOpsLogOutput: (input: ServerOpsLogOutputAck) => Promise<void>
+  exportServerOpsLogs: (input: ServerOpsLogExportInput) => Promise<ServerOpsLogExportResult>
+  onServerOpsLogOutput: (callback: (event: ServerOpsLogOutputEvent) => void) => () => void
+  onServerOpsLogExit: (callback: (event: ServerOpsLogExitEvent) => void) => () => void
 
   /**
    * 获取指定目录的 Git 仓库状态
@@ -1440,7 +1489,7 @@ const electronAPI: ElectronAPI = {
     return () => ipcRenderer.removeListener(TERMINAL_IPC_CHANNELS.EXIT, listener)
   },
   listServerOpsHosts: () => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.LIST_HOSTS),
-  upsertServerOpsHost: (input: ServerOpsUpsertHostInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.UPSERT_HOST, input),
+  upsertServerOpsHost: (input: ServerOpsSaveHostInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.UPSERT_HOST, input),
   deleteServerOpsHost: (hostId: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.DELETE_HOST, hostId),
   connectServerOpsHost: (input: ServerOpsConnectInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONNECT, input),
   confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONFIRM_HOST_KEY, input),
@@ -1467,6 +1516,47 @@ const electronAPI: ElectronAPI = {
     ipcRenderer.on(SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT, listener)
     return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT, listener)
   },
+  getServerOpsAgentAccess: (input: ServerOpsAgentAccessTarget) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS, input),
+  setServerOpsAgentAccess: (input: ServerOpsAgentAccess) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, input),
+  revokeServerOpsAgentAccessSession: (sessionId: string) => ipcRenderer.invoke(
+    SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION,
+    sessionId,
+  ),
+  onServerOpsAgentAccessChanged: (callback: (event: ServerOpsAgentAccessChanged) => void) => {
+    const listener = (_event: unknown, payload: ServerOpsAgentAccessChanged): void => callback(payload)
+    ipcRenderer.on(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, listener)
+    return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, listener)
+  },
+  listServerOpsAudit: (input: ServerOpsAuditListInput) => invokeServerOpsAuditList(
+    (channel, payload) => ipcRenderer.invoke(channel, payload),
+    input,
+  ),
+  getServerOpsOverview: (input: ServerOpsOverviewInput) => invokeServerOpsOverview(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  listServerOpsServices: (input: ServerOpsServiceListInput) => invokeServerOpsServiceList(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  getServerOpsServiceDetail: (input: ServerOpsServiceDetailInput) => invokeServerOpsServiceDetail(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  runServerOpsServiceAction: (input: ServerOpsServiceActionInput) => invokeServerOpsServiceAction(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  startServerOpsLogStream: (input: ServerOpsLogStartInput) => invokeServerOpsLogStart(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  stopServerOpsLogStream: (input: ServerOpsLogIdentity) => invokeServerOpsLogStop(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  acknowledgeServerOpsLogOutput: (input: ServerOpsLogOutputAck) => invokeServerOpsLogAck(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  exportServerOpsLogs: (input: ServerOpsLogExportInput) => invokeServerOpsLogExport(
+    (channel, payload) => ipcRenderer.invoke(channel, payload), input,
+  ),
+  onServerOpsLogOutput: (callback: (event: ServerOpsLogOutputEvent) => void) => subscribeServerOpsLogOutput(ipcRenderer, callback),
+  onServerOpsLogExit: (callback: (event: ServerOpsLogExitEvent) => void) => subscribeServerOpsLogExit(ipcRenderer, callback),
 
   getGitRepoStatus: (dirPath: string, access?: import('@proma/shared').FileAccessOptions) => {
     return ipcRenderer.invoke(IPC_CHANNELS.GET_GIT_REPO_STATUS, dirPath, access)

@@ -1342,7 +1342,8 @@ function appendWindowsBaseModeInstruction(systemPrompt: string, runtimeEnv: Agen
 </runtime_capabilities>`
 }
 
-function wrapCustomToolDefinitions(
+/** 让所有外部 custom tools 继续经过与内置工具一致的真实权限包装。 */
+export function wrapCustomToolDefinitions(
   tools: ToolDefinition[] | undefined,
   canUseTool: PiAgentQueryOptions['canUseTool'],
 ): ToolDefinition[] {

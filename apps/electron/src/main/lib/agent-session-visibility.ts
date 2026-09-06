@@ -41,6 +41,19 @@ const CANVAS_EXCLUSIVE_OWNERSHIP_FIELDS = [
   'delegationGoal',
 ] as const
 
+/** 普通顶层交互式 Agent 不得携带的后台任务与父子协作字段。 */
+const ORDINARY_TOP_LEVEL_EXCLUDED_FIELDS = [
+  'sourceAutomationId',
+  'automationGraduated',
+  'parentSessionId',
+  'rootSessionId',
+  'sourceDelegationId',
+  'delegationRole',
+  'delegationStatus',
+  'delegationDepth',
+  'delegationGoal',
+] as const
+
 /**
  * 判断会话是否声明了任一 Canvas 来源字段。
  * @param session 待判断的内部来源字段。
@@ -131,6 +144,31 @@ export function hasValidCanvasAgentOwnership(session: InternalSessionFields): bo
  */
 export function isAgentSessionUserVisible(session: InternalSessionFields): boolean {
   return !isInternalDesignSession(session) && !hasAnyCanvasSourceField(session)
+}
+
+/**
+ * 判断会话是否为普通顶层交互式 Agent。
+ * @param session 待判断的会话；不存在时直接拒绝。
+ * @returns 会话用户可见且不带后台任务、父子或 Delegation 残留字段时返回 true。
+ */
+export function isOrdinaryTopLevelAgentSession(
+  session: AgentSessionMeta | undefined,
+): session is AgentSessionMeta {
+  return !!session
+    && isAgentSessionUserVisible(session)
+    && ORDINARY_TOP_LEVEL_EXCLUDED_FIELDS.every((field) => session[field] === undefined)
+}
+
+/**
+ * 收窄仅允许普通顶层交互式 Agent 使用的高权限入口。
+ * @param session 会话索引中的候选记录。
+ * @returns 已验证的普通顶层 Agent 会话。
+ */
+export function requireOrdinaryTopLevelAgentSession(
+  session: AgentSessionMeta | undefined,
+): AgentSessionMeta {
+  if (!isOrdinaryTopLevelAgentSession(session)) throw new Error('Agent 会话不存在')
+  return session
 }
 
 /** 判断会话是否为目标项目可持有 Canvas 关联的普通顶层 Agent。 */

@@ -25,6 +25,8 @@ let latestAutomation: Automation | undefined
 let lastSessionMeta: AgentSessionMeta | undefined
 /** 记录实际交给 headless Agent 的会话 ID。 */
 let headlessSessionId: string | undefined
+/** 记录 scheduler 交给 Headless Agent 的可信来源。 */
+let headlessSource: string | undefined
 
 mock.module('electron', () => ({
   BrowserWindow: {
@@ -60,8 +62,9 @@ mock.module('./automation-manager', () => ({
 mock.module('./agent-session-usage', () => ({ getSessionContextUsageRatio: () => undefined }))
 
 mock.module('./agent-service', () => ({
-  runAgentHeadless: async (input: { sessionId: string }, callbacks: { onComplete: () => void }) => {
+  runAgentHeadless: async (input: { sessionId: string }, callbacks: { onComplete: () => void; source?: string }) => {
     headlessSessionId = input.sessionId
+    headlessSource = callbacks.source
     activeHeadlessCallbacks = callbacks
   },
   isAgentSessionActive: () => false,
@@ -93,6 +96,7 @@ beforeEach(() => {
   latestAutomation = undefined
   lastSessionMeta = undefined
   headlessSessionId = undefined
+  headlessSource = undefined
 })
 
 /** 创建指定工作区的最小 Automation。 */
@@ -114,6 +118,15 @@ function createAutomation(id: string, workspaceId: string): Automation {
 }
 
 describe('Automation 工作区迁移准入', () => {
+  test('Given Automation 启动 Headless Agent When 传递可信 callback Then source 明确为 automation', async () => {
+    const running = scheduler.runAutomation(createAutomation('automation-source', 'workspace-source'))
+    await Promise.resolve()
+
+    expect(headlessSource).toBe('automation')
+    activeHeadlessCallbacks?.onComplete()
+    await running
+  })
+
   test('Given Automation 所属项目正在迁移 When 触发运行 Then 记录 skipped 且不创建会话或启动 Agent', async () => {
     /** 持有目标工作区迁移锁。 */
     const release = acquireWorkspaceOperation('workspace-locked', 'relocation')

@@ -11,6 +11,7 @@ export interface ServerOpsConnectDialogProps {
   host: ServerOpsHost | null
   connecting: boolean
   error?: string
+  requireCredential?: boolean
   onOpenChange: (open: boolean) => void
   onSubmit: (credential?: ServerOpsCredentialInput) => Promise<void>
 }
@@ -21,6 +22,7 @@ export function ServerOpsConnectDialog({
   host,
   connecting,
   error,
+  requireCredential = false,
   onOpenChange,
   onSubmit,
 }: ServerOpsConnectDialogProps): React.ReactElement {
@@ -65,7 +67,7 @@ export function ServerOpsConnectDialog({
 
   /** 当前表单是否满足最小提交条件。 */
   const canSubmit = host?.authMethod === 'ssh-agent'
-    || Boolean(host?.credentialRef)
+    || (!requireCredential && Boolean(host?.credentialRef))
     || (host?.authMethod === 'password' ? password.length > 0 : keyPath.trim().length > 0)
 
   return (
@@ -73,7 +75,7 @@ export function ServerOpsConnectDialog({
       <DialogContent className="max-w-md">
         <form className="grid gap-4" onSubmit={handleSubmit}>
           <DialogHeader>
-            <DialogTitle>登录 {host?.name ?? '服务器'}</DialogTitle>
+            <DialogTitle>补录 {host?.name ?? '服务器'} 凭据</DialogTitle>
             <DialogDescription>{host ? `${host.username}@${host.address}:${host.port}` : 'SSH 登录'}</DialogDescription>
           </DialogHeader>
           {host?.authMethod === 'password' && (
@@ -85,7 +87,7 @@ export function ServerOpsConnectDialog({
                 value={password}
                 autoFocus
                 autoComplete="current-password"
-                placeholder={host.credentialRef ? '留空使用已保存密码' : '输入 SSH 密码'}
+                placeholder={host.credentialRef && !requireCredential ? '留空使用已保存密码' : '输入新的 SSH 密码'}
                 onChange={(event) => setPassword(event.target.value)}
               />
             </div>
@@ -98,7 +100,7 @@ export function ServerOpsConnectDialog({
                   id="server-ops-private-key"
                   value={keyPath}
                   autoFocus
-                  placeholder={host.credentialRef ? '留空使用已保存私钥' : '~/.ssh/id_ed25519'}
+                  placeholder={host.credentialRef && !requireCredential ? '留空使用已保存私钥' : '~/.ssh/id_ed25519'}
                   onChange={(event) => setKeyPath(event.target.value)}
                 />
               </div>

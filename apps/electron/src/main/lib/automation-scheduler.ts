@@ -301,7 +301,7 @@ export async function runAutomation(automation: Automation, manual = false): Pro
           startedAt: runAt,
         },
         {
-          source: 'bridge',
+          source: 'automation',
           onError: (error) => finish('error', error),
           onComplete: () => finish('success'),
           onTitleUpdated: () => { /* 子会话标题不需要特殊处理 */ },

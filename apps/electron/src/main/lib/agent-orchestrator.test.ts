@@ -357,17 +357,17 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body.slice(approvalIndex, bypassIndex)).toContain("currentMode === 'plan'")
   })
 
-  test('Given 单次审批等待期间权限模式变化 When 审批返回 Then Canvas、BrowserUpload、规划删除与 PowerShell 统一复核状态', () => {
+  test('Given 单次审批等待期间权限模式变化 When 审批返回 Then Canvas、BrowserUpload、Server Ops、规划删除与 PowerShell 统一复核状态', () => {
     /** 读取真实 canUseTool，约束所有单次审批工具共享同一安全收口。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
     /** 截取 canUseTool 权限函数，避免其它模块调用干扰计数。 */
     const start = source.indexOf('const canUseTool = async')
     const end = source.indexOf('// 13. 构建 Adapter 查询选项', start)
     const body = source.slice(start, end)
-    /** Canvas、BrowserUpload、规划删除与 PowerShell 都必须调用通用收口一次。 */
+    /** Canvas、BrowserUpload、Server Ops、规划删除与 PowerShell 都必须调用通用收口一次。 */
     const revalidationCalls = body.match(/revalidateSingleApprovalResult\(/g)?.length ?? 0
 
-    expect(revalidationCalls).toBe(4)
+    expect(revalidationCalls).toBe(5)
     expect(body).not.toContain('return permissionService.requestSingleApproval(sessionId, toolName, input, options')
   })
 

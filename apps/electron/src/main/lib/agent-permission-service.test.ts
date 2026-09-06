@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   AgentPermissionService,
+  isServerOpsReadOnlyCommand,
   revalidateSingleApprovalResult,
   type CanUseToolOptions,
 } from './agent-permission-service'
@@ -8,6 +9,59 @@ import {
 function permissionOptions(signal: AbortSignal, toolUseID: string): CanUseToolOptions {
   return { signal, toolUseID, displayName: '删除分组', description: '删除 Todo 分组' }
 }
+
+describe('服务器远程命令权限', () => {
+  test('Given ss 主动销毁 socket 参数 When 分类远程命令 Then 不得视为只读', () => {
+    expect(isServerOpsReadOnlyCommand('ss -K dst 10.0.0.1')).toBe(false)
+  })
+
+  test.each([
+    'uname -a', 'uptime', 'df -h', 'free -m', 'ps aux', 'ss -lntp',
+    'systemctl status nginx', 'systemctl show nginx', 'systemctl is-active nginx',
+    'journalctl -u nginx -n 50', 'docker ps', 'docker inspect web', 'docker logs web --tail 20', 'docker stats --no-stream',
+  ])('Given 窄只读命令 %s When 权限分类 Then 自动放行', async (command) => {
+    const service = new AgentPermissionService()
+    const requests: unknown[] = []
+    const result = await service.createCanUseTool('session-1', (request) => requests.push(request))(
+      'server_exec', { hostId: 'host-1', command }, permissionOptions(new AbortController().signal, 'tool-readonly'),
+    )
+    expect(result.behavior).toBe('allow')
+    expect(requests).toHaveLength(0)
+  })
+
+  test.each([
+    'uname > /tmp/out', 'echo $(id)', 'uptime; reboot', 'ps aux | kill 1', 'sudo df -h',
+    'rm -rf /tmp/x', 'systemctl restart nginx', 'docker stop web', 'apt install curl',
+    'redis-cli FLUSHALL', 'psql -c "DELETE FROM users"', 'unknown-reader --all',
+  ])('Given 非白名单或高风险命令 %s When 权限分类 Then 逐次审批且不能永久授权', async (command) => {
+    const service = new AgentPermissionService()
+    const requests: Array<{ requestId: string; allowAlways?: boolean }> = []
+    const pending = service.createCanUseTool('session-1', (request) => requests.push(request))(
+      'server_exec', { hostId: 'host-1', command }, permissionOptions(new AbortController().signal, 'tool-dangerous'),
+    )
+    expect(requests[0]?.allowAlways).toBe(false)
+    service.respondToPermission(requests[0]!.requestId, 'allow', true)
+    expect((await pending).behavior).toBe('allow')
+
+    const nextRequests: Array<{ requestId: string }> = []
+    const next = service.createCanUseTool('session-1', (request) => nextRequests.push(request))(
+      'server_exec', { hostId: 'host-1', command }, permissionOptions(new AbortController().signal, 'tool-next'),
+    )
+    expect(nextRequests).toHaveLength(1)
+    service.respondToPermission(nextRequests[0]!.requestId, 'deny', false)
+    expect((await next).behavior).toBe('deny')
+  })
+
+  test.each(['server_list', 'server_status', 'server_connect', 'server_disconnect'])(
+    'Given Server Ops 元数据工具 %s When 权限分类 Then 自动放行', async (toolName) => {
+      const service = new AgentPermissionService()
+      const result = await service.createCanUseTool('session-1', () => {
+        throw new Error('不应发起审批')
+      })(toolName, { hostId: 'host-1' }, permissionOptions(new AbortController().signal, 'tool-meta'))
+      expect(result.behavior).toBe('allow')
+    },
+  )
+})
 
 
 test('Given a destructive planning request When it is approved Then approval is single-use and cannot create a session whitelist', async () => {

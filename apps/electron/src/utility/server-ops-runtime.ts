@@ -3,14 +3,22 @@ import type { ServerOpsTerminalExitEvent } from '@proma/shared'
 import {
   acknowledgeRuntimeOutput,
   createHostKeyFingerprint,
+  createRuntimeLogStreamController,
   createRuntimeOutputState,
   enqueueRuntimeOutput,
   takeRuntimeOutput,
+  appendExecOutput,
+  createExecOutputCollector,
+  formatExecOutput,
+  type RuntimeLogChannel,
+  type RuntimeLogStreamController,
+  type ServerOpsRuntimeManagedLogStream,
 } from './server-ops/server-ops-runtime-core'
-import type {
-  ServerOpsRuntimeConnectRequest,
-  ServerOpsRuntimeMessage,
-  ServerOpsRuntimeRequest,
+import {
+  parseServerOpsRuntimeRequest,
+  type ServerOpsRuntimeConnectRequest,
+  type ServerOpsRuntimeMessage,
+  type ServerOpsRuntimeRequest,
 } from './server-ops/server-ops-runtime-protocol'
 
 /** Electron utility process MessagePort 的最小接口。 */
@@ -36,7 +44,13 @@ interface ManagedSshConnection {
   output: ReturnType<typeof createRuntimeOutputState>
   flushTimer?: ReturnType<typeof setTimeout>
   exitEvent?: ServerOpsTerminalExitEvent
+  execChannels: Set<ClientChannel>
+  logStreams: Map<string, ManagedLogStream>
+  logController: RuntimeLogStreamController
 }
+
+/** runtime 使用 Node timer 的单条日志流状态。 */
+type ManagedLogStream = ServerOpsRuntimeManagedLogStream<ReturnType<typeof setTimeout>>
 
 /** 单连接输出合批延迟。 */
 const OUTPUT_FLUSH_DELAY_MS = 16
@@ -74,34 +88,66 @@ parentPort.on('message', (event) => {
 })
 parentPort.start?.()
 
-/** 处理已经过主进程严格解析的内部 runtime 请求。 */
+/** 严格解析后处理主进程发来的内部 runtime 请求。 */
 function handleRequest(raw: unknown): void {
-  if (!isRuntimeRequest(raw)) return
-  switch (raw.type) {
+  /** 未通过 exact-key 与字段边界校验的消息不产生任何 SSH 副作用。 */
+  let request: ServerOpsRuntimeRequest
+  try {
+    request = parseServerOpsRuntimeRequest(raw)
+  } catch {
+    return
+  }
+  switch (request.type) {
     case 'server-ops.connect':
-      connect(raw.input)
+      connect(request.input)
+      return
+    case 'server-ops.exec':
+      exec(request.input)
       return
     case 'server-ops.disconnect':
-      disconnect(raw.connectionId, '用户已断开连接')
+      disconnect(request.connectionId, '用户已断开连接')
       return
     case 'server-ops.terminal-input': {
       /** 精确匹配 hostId 与 connectionId 的目标连接。 */
-      const connection = connections.get(raw.connectionId)
-      if (connection?.hostId === raw.hostId) connection.channel.write(raw.data)
+      const connection = connections.get(request.connectionId)
+      if (connection?.hostId === request.hostId) connection.channel.write(request.data)
       return
     }
     case 'server-ops.terminal-resize': {
       /** 精确匹配 hostId 与 connectionId 的目标连接。 */
-      const connection = connections.get(raw.connectionId)
-      if (connection?.hostId === raw.hostId) connection.channel.setWindow(raw.rows, raw.cols, 0, 0)
+      const connection = connections.get(request.connectionId)
+      if (connection?.hostId === request.hostId) connection.channel.setWindow(request.rows, request.cols, 0, 0)
       return
     }
     case 'server-ops.terminal-ack': {
       /** ACK 只允许释放自身连接的在途输出。 */
-      const connection = connections.get(raw.input.connectionId)
-      if (!connection || connection.hostId !== raw.input.hostId) return
-      if (acknowledgeRuntimeOutput(connection.output, raw.input.sequence)) flushOutput(connection)
+      const connection = connections.get(request.input.connectionId)
+      if (!connection || connection.hostId !== request.input.hostId) return
+      if (acknowledgeRuntimeOutput(connection.output, request.input.sequence)) flushOutput(connection)
       emitExitWhenDrained(connection)
+      return
+    }
+    case 'server-ops.log-start':
+      {
+        /** 日志启动必须匹配当前连接的完整身份。 */
+        const connection = connections.get(request.input.connectionId)
+        if (!connection || connection.hostId !== request.input.hostId) {
+          post({ type: 'server-ops.log-exit', streamId: request.input.streamId, hostId: request.input.hostId, connectionId: request.input.connectionId, reason: 'error', errorCode: 'SERVER_OPS_CONNECTION_NOT_ACTIVE' })
+          return
+        }
+        connection.logController.start(request.input)
+      }
+      return
+    case 'server-ops.log-stop': {
+      /** stop 只允许命中完整日志流身份。 */
+      const connection = connections.get(request.connectionId)
+      connection?.logController.stop(request)
+      return
+    }
+    case 'server-ops.log-ack': {
+      /** ACK 只释放同一 host、connection 与 stream 的当前序号。 */
+      const connection = connections.get(request.connectionId)
+      connection?.logController.ack(request)
       return
     }
     case 'server-ops.shutdown':
@@ -146,6 +192,23 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
         client.end()
         return
       }
+      /** 当前连接拥有且由生产控制器直接维护的日志流 Map。 */
+      const logStreams = new Map<string, ManagedLogStream>()
+      /** 通过窄 adapter 把 ssh2 channel、timer 与消息端口注入可测试控制器。 */
+      const logController = createRuntimeLogStreamController<ReturnType<typeof setTimeout>>({
+        hostId: input.hostId,
+        connectionId: input.connectionId,
+        streams: logStreams,
+        execute: (command, callback) => {
+          client.exec(command, (execError, logChannel) => {
+            if (execError) { callback(execError); return }
+            callback(undefined, createRuntimeLogChannel(logChannel))
+          })
+        },
+        post,
+        setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+        clearTimer: (timer) => clearTimeout(timer),
+      })
       /** 已完成认证且成功打开 PTY 的连接。 */
       const managed: ManagedSshConnection = {
         hostId: input.hostId,
@@ -153,6 +216,9 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
         client,
         channel,
         output: createRuntimeOutputState(),
+        execChannels: new Set(),
+        logStreams,
+        logController,
       }
       connections.set(input.connectionId, managed)
       pendingClients.delete(input.connectionId)
@@ -197,6 +263,9 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
   })
   client.once('close', () => {
     pendingClients.delete(input.connectionId)
+    /** 活跃连接的底层 SSH close 必须同步释放日志、exec 与 PTY。 */
+    const activeConnection = connections.get(input.connectionId)
+    if (activeConnection?.client === client) closeManagedConnection(activeConnection, 'SSH 连接已关闭')
     if (!settled && observedHostKey && !matchesExpectedHostKey(observedHostKey, input.expectedHostKey)) {
       finish({
         type: 'server-ops.connect-result',
@@ -219,6 +288,64 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
     /** 同步配置错误同样只映射为公开错误。 */
     const mapped = mapSshError(error)
     finish(createErrorMessage(input, mapped.code, mapped.message))
+  }
+}
+
+/** 在已认证 SSH 连接上执行无 PTY 命令，限制总输出并返回退出信息。 */
+function exec(input: import('./server-ops/server-ops-runtime-protocol').ServerOpsRuntimeExecRequest): void {
+  const connection = connections.get(input.connectionId)
+  if (!connection || connection.hostId !== input.hostId) {
+    post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code: 'SERVER_OPS_CONNECTION_NOT_ACTIVE', message: 'SSH 连接未激活' })
+    return
+  }
+  const output = createExecOutputCollector()
+  let settled = false
+  let channelRef: ClientChannel | undefined
+  const finishError = (code: string, message: string): void => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    channelRef?.close()
+    post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code, message })
+  }
+  const timer = setTimeout(() => {
+    finishError('SERVER_OPS_EXEC_TIMEOUT', '远程命令执行超时')
+  }, input.timeoutMs)
+  try {
+    connection.client.exec(input.command, (error, channel) => {
+      if (connections.get(input.connectionId) !== connection) {
+        channel?.close()
+        return
+      }
+      if (settled) {
+        channel?.close()
+        return
+      }
+      if (error) { finishError('SERVER_OPS_EXEC_FAILED', '远程命令执行失败'); return }
+      channelRef = channel
+      connection.execChannels.add(channel)
+      channel.on('data', (data: Buffer | string) => { appendExecOutput(output, 'stdout', data); if (output.truncated) channel.close() })
+      channel.stderr.on('data', (data: Buffer | string) => { appendExecOutput(output, 'stderr', data); if (output.truncated) channel.close() })
+      channel.once('close', (code?: number, signal?: string) => {
+        connection.execChannels.delete(channel)
+        if (settled) return
+        settled = true; clearTimeout(timer)
+        post({ type: 'server-ops.exec-result', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, result: { ...formatExecOutput(output), ...(typeof code === 'number' ? { exitCode: code } : {}), ...(signal ? { signal } : {}) } })
+      })
+    })
+  } catch {
+    finishError('SERVER_OPS_EXEC_FAILED', '远程命令执行失败')
+  }
+}
+
+/** 把 ssh2 ClientChannel 适配为不泄漏依赖的 core 日志 channel。 */
+function createRuntimeLogChannel(channel: ClientChannel): RuntimeLogChannel {
+  return {
+    onData: (listener) => { channel.on('data', listener) },
+    onStderrData: (listener) => { channel.stderr.on('data', listener) },
+    onceError: (listener) => { channel.once('error', listener) },
+    onceClose: (listener) => { channel.once('close', listener) },
+    close: () => { channel.close() },
   }
 }
 
@@ -278,6 +405,9 @@ function emitExitWhenDrained(connection: ManagedSshConnection): void {
 /** 收束已关闭 channel 的输出、连接和退出事件。 */
 function closeManagedConnection(connection: ManagedSshConnection, message: string): void {
   if (connections.get(connection.connectionId) !== connection) return
+  connection.logController.finishAll('connection-closed')
+  for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
+  connection.execChannels.clear()
   flushOutput(connection)
   connection.exitEvent ??= { hostId: connection.hostId, connectionId: connection.connectionId, message }
   connection.client.end()
@@ -299,7 +429,10 @@ function disconnect(connectionId: string, message: string, notify = true): void 
   }
   connections.delete(connectionId)
   if (connection.flushTimer) clearTimeout(connection.flushTimer)
+  connection.logController.finishAll('connection-closed')
   try { connection.channel.close() } catch { /* channel 已关闭时可幂等收束。 */ }
+  for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
+  connection.execChannels.clear()
   connection.client.end()
   if (notify) post({ type: 'server-ops.terminal-exit', event: { hostId: connection.hostId, connectionId, message } })
 }
@@ -324,17 +457,4 @@ function createErrorMessage(input: ServerOpsRuntimeConnectRequest, code: string,
 /** 通过专用 MessagePort 向主进程发送结构化消息。 */
 function post(message: ServerOpsRuntimeMessage): void {
   runtimePort?.postMessage(message)
-}
-
-/** runtime 只接受已知类型与基本结构完整的消息。 */
-function isRuntimeRequest(value: unknown): value is ServerOpsRuntimeRequest {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-  /** 待判定消息的类型字段。 */
-  const type = (value as { type?: unknown }).type
-  return type === 'server-ops.connect'
-    || type === 'server-ops.disconnect'
-    || type === 'server-ops.terminal-input'
-    || type === 'server-ops.terminal-resize'
-    || type === 'server-ops.terminal-ack'
-    || type === 'server-ops.shutdown'
 }

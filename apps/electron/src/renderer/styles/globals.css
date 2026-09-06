@@ -23,6 +23,45 @@
   }
 }
 
+/* 运维概览资源区在中等 Pane 中横向展开，窄 Pane 保持单列。 */
+@container (min-width: 520px) {
+  [data-server-ops-overview-resource-grid] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  [data-server-ops-overview-resource-grid] > * {
+    border-bottom-width: 0;
+  }
+
+  [data-server-ops-overview-resource-grid] > *:not(:last-child) {
+    border-right-width: 1px;
+  }
+}
+
+/* 宽 Pane 才展开高密度概览与服务详情，避免跟随整个窗口断点误判。 */
+@container (min-width: 700px) {
+  [data-server-ops-overview-grid] {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  [data-server-ops-overview-grid] > * {
+    border-right-width: 1px;
+    border-bottom-width: 0;
+  }
+
+  [data-server-ops-overview-grid] > *:last-child {
+    border-right-width: 0;
+  }
+
+  [data-server-ops-overview-system-grid] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  [data-server-ops-service-detail-grid] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 /* ===== 全局字体与渲染优化 =====
  * 优先 Inter Variable（自托管，见 main.tsx 引入） → SF Pro Text（macOS 系统） → system-ui；
  * 数字使用 tabular-nums，配合 cv11/ss01/ss03 让字形接近 Vercel / Linear 的现代感。

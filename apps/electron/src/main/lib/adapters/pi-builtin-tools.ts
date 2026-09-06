@@ -98,6 +98,7 @@ import {
 import { updateSettings } from '../settings-service'
 import { getConfiguredVaultFileSystem, getVaultConfig } from '../vault-service'
 import type { ProductivityToolsSettings } from '../../../types'
+import type { ServerOpsAgentFacade } from '../server-ops/server-ops-agent-facade'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -127,6 +128,8 @@ export interface PiBuiltinToolsContext {
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
   /** Design 可信图片工具执行前捕获真实设计摘要和精确提示词。 */
   captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
+  /** 已由 Orchestrator 绑定真实会话与运行来源的服务器运维 Facade。 */
+  serverOpsFacade?: ServerOpsAgentFacade
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1539,6 +1542,70 @@ function buildPromaCloudTools(sdk: PiSdk, _ctx: PiBuiltinToolsContext): ToolDefi
   return []
 }
 
+/** 把会话级 Server Ops Facade 注册为模型可见的五个窄工具。 */
+export function buildServerOpsTools(sdk: PiSdk, facade: ServerOpsAgentFacade): ToolDefinition[] {
+  return [
+    sdk.defineTool({
+      name: 'server_list',
+      label: '列出已授权服务器',
+      description: 'List the single server currently authorized for this Agent session, including public SSH identity and connection phase.',
+      promptSnippet: 'server_list: inspect the one server explicitly authorized by the user for this session.',
+      parameters: Type.Object({}),
+      async execute() {
+        return jsonToolResult({ hosts: facade.list() })
+      },
+    }),
+    sdk.defineTool({
+      name: 'server_status',
+      label: '查看服务器连接状态',
+      description: 'Read the public SSH connection state for the currently authorized server.',
+      promptSnippet: 'server_status: inspect the authorized server connection state without exposing connection secrets.',
+      parameters: Type.Object({ hostId: Type.String({ description: 'Server ID returned by server_list.' }) }),
+      async execute(_toolCallId, params) {
+        const args = params as { hostId: string }
+        return jsonToolResult(facade.status({ hostId: args.hostId }))
+      },
+    }),
+    sdk.defineTool({
+      name: 'server_connect',
+      label: '连接服务器',
+      description: 'Connect to the currently authorized server using credentials already saved by Proma. Unknown host keys must be confirmed by the user in the Server Ops UI.',
+      promptSnippet: 'server_connect: connect using saved credentials; ask the user to confirm an unknown fingerprint in Server Ops UI.',
+      parameters: Type.Object({ hostId: Type.String({ description: 'Server ID returned by server_list.' }) }),
+      async execute(_toolCallId, params) {
+        const args = params as { hostId: string }
+        return jsonToolResult(await facade.connect({ hostId: args.hostId }))
+      },
+    }),
+    sdk.defineTool({
+      name: 'server_exec',
+      label: '执行服务器命令',
+      description: 'Execute one bounded non-interactive command on the connected authorized server. Read-only diagnostics may run automatically; all other commands require per-use approval.',
+      promptSnippet: 'server_exec: prefer narrow read-only diagnostics; mutating or unknown commands require explicit per-use approval.',
+      parameters: Type.Object({
+        hostId: Type.String({ description: 'Server ID returned by server_list.' }),
+        command: Type.String({ minLength: 1, maxLength: 8192, description: 'One remote shell command.' }),
+        timeoutMs: Type.Optional(Type.Number({ minimum: 1000, maximum: 120000, description: 'Timeout in milliseconds. Default 30000.' })),
+      }),
+      async execute(_toolCallId, params) {
+        const args = params as { hostId: string; command: string; timeoutMs?: number }
+        return jsonToolResult(await facade.exec(args))
+      },
+    }),
+    sdk.defineTool({
+      name: 'server_disconnect',
+      label: '断开服务器',
+      description: 'Disconnect the currently authorized server and immediately revoke this Agent session authorization.',
+      promptSnippet: 'server_disconnect: disconnect the authorized server and release the session authorization.',
+      parameters: Type.Object({ hostId: Type.String({ description: 'Server ID returned by server_list.' }) }),
+      async execute(_toolCallId, params) {
+        const args = params as { hostId: string }
+        return jsonToolResult(facade.disconnect({ hostId: args.hostId }))
+      },
+    }),
+  ] as ToolDefinition[]
+}
+
 // ===== 统一入口 =====
 
 export interface PiBuiltinToolsResult {
@@ -1557,6 +1624,16 @@ export async function buildPiBuiltinTools(
   })
 
   const tools: ToolDefinition[] = []
+
+  /** 工具构建层独立复核运行来源，防止上游错误传入 Facade。 */
+  const serverOpsSourceAllowed = ctx.triggeredBy === undefined || ctx.triggeredBy === 'user'
+  if (ctx.serverOpsFacade && serverOpsSourceAllowed) {
+    try {
+      tools.push(...buildServerOpsTools(sdk, ctx.serverOpsFacade))
+    } catch (error) {
+      console.error('[Pi 桥接] 注入服务器运维工具失败:', error)
+    }
+  }
 
   if (isWebSearchEnabledForAgent()) {
     try {

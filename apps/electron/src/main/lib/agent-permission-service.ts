@@ -125,6 +125,93 @@ interface SessionWhitelist {
   allowedBashCommands: Set<string>
 }
 
+/** 远程命令禁止出现的 shell 组合、重定向、替换与转义结构。 */
+const SERVER_OPS_FORBIDDEN_SHELL_STRUCTURE = /[\r\n;&|<>`$(){}[\]\\]/
+
+/** 拆分仅含普通参数的远程命令；引号等复杂 shell 语义默认进入审批。 */
+function parseSimpleServerCommand(command: string): string[] | null {
+  const trimmed = command.trim()
+  if (!trimmed || SERVER_OPS_FORBIDDEN_SHELL_STRUCTURE.test(trimmed)) return null
+  const tokens = trimmed.split(/\s+/)
+  return tokens.every((token) => /^[A-Za-z0-9_./:@%+=,-]+$/.test(token)) ? tokens : null
+}
+
+/** 校验 journalctl 只使用显式允许的查询参数。 */
+function isReadOnlyJournalctl(tokens: string[]): boolean {
+  const noValue = new Set(['--no-pager', '--utc', '--reverse', '-r', '--quiet', '-q', '--all', '-a', '-k', '--dmesg'])
+  const withValue = new Set(['-u', '--unit', '-n', '--lines', '-p', '--priority', '-o', '--output', '--since', '--until', '-b', '--boot'])
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index]!
+    if (noValue.has(token) || /^[A-Z_][A-Z0-9_]*=/.test(token)) continue
+    if (withValue.has(token)) {
+      index += 1
+      if (index >= tokens.length || tokens[index]!.startsWith('-')) return false
+      continue
+    }
+    const equalsIndex = token.indexOf('=')
+    if (equalsIndex > 0 && withValue.has(token.slice(0, equalsIndex))) continue
+    return false
+  }
+  return true
+}
+
+/** 校验 Docker 查询子命令与其显式只读选项。 */
+function isReadOnlyDocker(tokens: string[]): boolean {
+  const subcommand = tokens[1]
+  if (!subcommand || !['ps', 'inspect', 'logs', 'stats'].includes(subcommand)) return false
+  const allowedOptions: Record<string, ReadonlySet<string>> = {
+    ps: new Set(['-a', '--all', '-q', '--quiet', '--no-trunc', '-s', '--size', '--filter', '--format', '-n', '--last']),
+    inspect: new Set(['--type', '-f', '--format', '-s', '--size']),
+    logs: new Set(['--details', '--since', '--until', '--tail', '-t', '--timestamps']),
+    stats: new Set(['-a', '--all', '--no-stream', '--no-trunc', '--format']),
+  }
+  const valueOptions = new Set(['--filter', '--format', '-n', '--last', '--type', '-f', '--since', '--until', '--tail'])
+  const allowed = allowedOptions[subcommand]!
+  for (let index = 2; index < tokens.length; index += 1) {
+    const token = tokens[index]!
+    if (!token.startsWith('-')) continue
+    const option = token.includes('=') ? token.slice(0, token.indexOf('=')) : token
+    if (!allowed.has(option)) return false
+    if (!token.includes('=') && valueOptions.has(option)) {
+      index += 1
+      if (index >= tokens.length || tokens[index]!.startsWith('-')) return false
+    }
+  }
+  return true
+}
+
+/** `ss -K/--kill` 会销毁 socket；只允许明确的查询选项与过滤条件。 */
+function isReadOnlySocketStat(tokens: string[]): boolean {
+  /** 允许的长查询选项，不包含 `--kill` 与写文件相关能力。 */
+  const longOptions = new Set([
+    '--all', '--listening', '--numeric', '--tcp', '--udp', '--raw', '--unix', '--packet',
+    '--processes', '--summary', '--extended', '--memory', '--options', '--info', '--resolve',
+    '--ipv4', '--ipv6', '--no-header', '--oneline',
+  ])
+  /** 允许组合使用的短查询 flag；显式排除会修改连接的 K 和会写文件的 D。 */
+  const shortOptionCharacters = new Set('alntruxwpsemoir46HO'.split(''))
+  return tokens.slice(1).every((token) => {
+    if (!token.startsWith('-')) return true
+    if (token.startsWith('--')) return longOptions.has(token)
+    return token.length > 1 && [...token.slice(1)].every((character) => shortOptionCharacters.has(character))
+  })
+}
+
+/** 判断远程命令是否属于显式窄只读语法；未知命令一律返回 false。 */
+export function isServerOpsReadOnlyCommand(command: string): boolean {
+  const tokens = parseSimpleServerCommand(command)
+  if (!tokens) return false
+  const [name, subcommand] = tokens
+  if (['uname', 'uptime', 'df', 'free', 'ps'].includes(name!)) return true
+  if (name === 'ss') return isReadOnlySocketStat(tokens)
+  if (name === 'systemctl') {
+    return !!subcommand && ['status', 'show', 'is-active'].includes(subcommand) && tokens.length >= 3
+  }
+  if (name === 'journalctl') return isReadOnlyJournalctl(tokens)
+  if (name === 'docker') return isReadOnlyDocker(tokens)
+  return false
+}
+
 /**
  * Agent 权限服务
  *
@@ -281,6 +368,10 @@ export class AgentPermissionService {
    * 判断工具是否为只读操作（智能模式下自动允许）
    */
   private isReadOnlyTool(toolName: string, input: Record<string, unknown>): boolean {
+    if (['server_list', 'server_status', 'server_connect', 'server_disconnect'].includes(toolName)) return true
+    if (toolName === 'server_exec') {
+      return typeof input.command === 'string' && isServerOpsReadOnlyCommand(input.command)
+    }
     // 安全工具白名单
     if (SAFE_TOOLS.includes(toolName)) return true
 
@@ -303,7 +394,7 @@ export class AgentPermissionService {
 
     // PowerShell 尚未实现命令级白名单和危险命令分类，绝不能把某次
     // 批准扩展为整个工具的会话授权。
-    if (toolName === 'PowerShell') return false
+    if (toolName === 'PowerShell' || toolName === 'server_exec') return false
 
     // 非 Bash 工具：检查工具名是否在白名单中
     if (toolName !== 'Bash') {
@@ -325,8 +416,8 @@ export class AgentPermissionService {
     const whitelist = this.getOrCreateWhitelist(sessionId)
 
     if (toolName !== 'Bash') {
-      // 防御性兜底：即使调用方错误请求“始终允许”，PowerShell 也不得进入工具级白名单。
-      if (toolName !== 'PowerShell') whitelist.allowedTools.add(toolName)
+      // 防御性兜底：远程执行与 PowerShell 即使收到伪造 alwaysAllow 也不得进入工具级白名单。
+      if (toolName !== 'PowerShell' && toolName !== 'server_exec') whitelist.allowedTools.add(toolName)
     } else {
       const command = typeof input.command === 'string' ? input.command : ''
       const baseCommand = this.extractBaseCommand(command)
@@ -393,7 +484,7 @@ export class AgentPermissionService {
       sdkTitle: options.title,
       sdkDescription: options.description,
       // PowerShell 目前没有 Bash 等价的命令级白名单和危险分类；每次都要求明确批准。
-      ...(toolName === 'PowerShell' ? { allowAlways: false } : {}),
+      ...(['PowerShell', 'server_exec'].includes(toolName) ? { allowAlways: false } : {}),
     }
   }
 

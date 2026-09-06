@@ -202,6 +202,16 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('图片导出失败')
   })
 
+  test('Given 创建图片任务被前置校验拒绝 When 配置仍已保存 Then 原位展示任务错误', () => {
+    const html = renderWorkbench(createState({
+      saveState: 'saved',
+      error: '有引用连线尚未确认用途，请先在画布中确认后再生成。',
+    }))
+
+    expect(html).toContain('有引用连线尚未确认用途，请先在画布中确认后再生成。')
+    expect(html).toMatch(/<button(?![^>]*disabled="")[^>]*>[^<]*(?:<svg[\s\S]*?<\/svg>)?生成图片<\/button>/u)
+  })
+
   test('Given 图片模块已加载 When 渲染 Then 显示完整配置、当前版本和直接上游摘要', () => {
     const html = renderWorkbench(createState())
 

@@ -35,6 +35,7 @@ import { getAgentIslandPhasePriority } from './agent-island-priority'
 import { buildVisibilityKey } from './agent-island-visibility'
 import { shouldRetainAgentIslandSession } from './agent-island-session-visibility'
 import { getWindowsAgentIslandSurface } from './windows-agent-island-surface'
+import { clampTimerDelay } from './long-timeout'
 import { listCalendarEvents, listTodos } from './planning-manager'
 import { onPlanningChanged } from './planning-events'
 import { getChannelPlanQuota, listChannels } from './channel-manager'
@@ -741,7 +742,7 @@ function scheduleNextPlanningAttention(): void {
     planningRevision += 1
     schedulePush()
     scheduleNextPlanningAttention()
-  }, Math.max(1_000, next - now + 25))
+  }, clampTimerDelay(Math.max(1_000, next - now + 25)))
 }
 
 function schedulePush(throttleMs = PUSH_THROTTLE_MS): void {

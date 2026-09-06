@@ -59,7 +59,7 @@ import { resolveProjectInstructions } from './project-instruction-resolver'
 import { combinePromaInstructionFiles } from './adapters/pi-resource-loader-overrides'
 import { MAX_CONTEXT_MESSAGES, buildContextPrompt, buildRecoveryPrompt, buildReferencedSessionsPrompt } from './agent-session-context-prompt'
 import { buildReferencedPlanningPrompt } from './planning-reference-context'
-import { permissionService, revalidateSingleApprovalResult } from './agent-permission-service'
+import { isServerOpsReadOnlyCommand, permissionService, revalidateSingleApprovalResult } from './agent-permission-service'
 import type { PermissionResult, CanUseToolOptions } from './agent-permission-service'
 import { resolvePlanningDeletionPermission } from './planning-permission-policy'
 import { askUserService } from './agent-ask-user-service'
@@ -68,6 +68,7 @@ import { createRunToolCallLimiter, denyToolOutsideRunAllowlist } from './agent-r
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
+import { createServerOpsAgentFacade } from './server-ops/server-ops-agent-facade'
 import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
 import { buildPiMcpTools } from './adapters/pi-mcp-tools'
 import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
@@ -1121,6 +1122,12 @@ export class AgentOrchestrator {
       let piMcpTools: unknown[] = []
       const piSdk = await import('@earendil-works/pi-coding-agent')
       checkpoint()
+      /** 仅已初始化 Server Ops 上下文与普通交互来源会得到非空会话级 Facade。 */
+      const serverOpsFacade = createServerOpsAgentFacade({
+        sessionId,
+        triggeredBy: input.triggeredBy,
+        getSession: getAgentSessionMeta,
+      })
       const builtinMcpResult = await buildPiBuiltinTools(piSdk, {
         sessionId,
         channelId,
@@ -1137,6 +1144,7 @@ export class AgentOrchestrator {
         trustedImageRoute: extensions.trustedImageRoute,
         resolveTrustedImageRoute: extensions.resolveTrustedImageRoute,
         captureDesignImageCall: extensions.captureDesignImageCall,
+        ...(serverOpsFacade ? { serverOpsFacade } : {}),
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools
@@ -1458,6 +1466,31 @@ export class AgentOrchestrator {
             },
           )
           return denyStaleToolRun() ?? result
+        }
+
+        // 服务器元数据、连接和断开均由 Facade 再次校验当前会话与单槽授权，可直接放行。
+        if (['server_list', 'server_status', 'server_connect', 'server_disconnect'].includes(toolName)) {
+          return { behavior: 'allow' as const, updatedInput: input }
+        }
+
+        // 远程命令使用独立窄只读语法。未知或高风险命令在 plan 中拒绝，其他模式也必须逐次审批。
+        if (toolName === 'server_exec') {
+          const command = typeof input.command === 'string' ? input.command : ''
+          if (isServerOpsReadOnlyCommand(command)) return { behavior: 'allow' as const, updatedInput: input }
+          if (currentMode === 'plan') {
+            return { behavior: 'deny' as const, message: '计划模式下仅允许只读服务器探测命令，请在计划获批后执行高风险操作。' }
+          }
+          const result = await permissionService.requestSingleApproval(
+            sessionId,
+            toolName,
+            input,
+            options,
+            (request) => {
+              if (denyStaleToolRun()) return
+              this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+            },
+          )
+          return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }
 
         // 视觉助手由用户在全局设置中显式启用并选择外发渠道；在正常会话中直接放行，
