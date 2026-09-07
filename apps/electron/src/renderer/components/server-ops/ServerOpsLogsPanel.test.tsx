@@ -125,6 +125,7 @@ function SearchProjectionProbe(props: SearchProjectionProbeProps): null {
 function createControllerHarness(options: {
   buffer?: ReturnType<typeof createServerOpsLogBuffer>
   scheduleMaterialize?: (callback: () => void) => () => void
+  initialSource?: ServerOpsLogStartInput['source']
 } = {}) {
   const starts: ServerOpsLogStartInput[] = []
   const stops: ServerOpsLogIdentity[] = []
@@ -151,6 +152,7 @@ function createControllerHarness(options: {
     publish: (projection) => { projections.push(projection) },
     notify: (kind, message) => { notices.push({ kind, message }) },
     ...(options.buffer ? { buffer: options.buffer } : {}),
+    ...(options.initialSource ? { initialSource: options.initialSource } : {}),
     scheduleMaterialize: options.scheduleMaterialize ?? ((callback) => {
       callback()
       return () => undefined
@@ -173,6 +175,17 @@ function createControllerHarness(options: {
 }
 
 describe('服务器运维实时日志面板', () => {
+  test('Given 固定容器来源 When 首次进入 Then 第一条流直接绑定目标容器且不先启动系统日志', async () => {
+    /** 固定来源使用完整容器身份。 */
+    const containerId = 'a'.repeat(64)
+    const harness = createControllerHarness({ initialSource: { kind: 'container', containerId } })
+
+    await harness.controller.select({ hostId: 'host-1', connectionId: 'connection-1', active: true, connected: true })
+
+    expect(harness.starts).toHaveLength(1)
+    expect(harness.starts[0]?.source).toEqual({ kind: 'container', containerId })
+  })
+
   test('Given 5100 行 When 写入默认缓冲 Then 只保留最新 5000 行并标记截断', () => {
     const buffer = createServerOpsLogBuffer({ maxLines: 5_000, maxBytes: 2_097_152 })
     buffer.append(Array.from({ length: 5_100 }, (_, index) => `line-${index}\n`).join(''))
@@ -1009,5 +1022,29 @@ describe('服务器运维实时日志面板', () => {
     expect(liveRegion).toContain('aria-live="polite"')
     expect(liveRegion).toContain('实时接收')
     expect(liveRegion).not.toContain('2 行')
+  })
+
+  test('Given Docker 固定来源 When 渲染 Then 隐藏无意义来源和优先级并保留有界日志工具', () => {
+    /** 固定容器日志使用完整容器身份。 */
+    const containerId = 'a'.repeat(64)
+    const html = renderToStaticMarkup(
+      <ServerOpsLogsPanelView
+        status="streaming" connected text={'api ready\n'} lines={['api ready\n']} lineCount={1} byteLength={10}
+        truncated={false} paused={false} query="" source={{ kind: 'container', containerId }} sourceLocked
+        since="15m" priority="info" tailLines={200} error={null} warning={null} hasNewLogs={false}
+        atBottom bufferRevision={0} materializedRevision={0} onSourceChange={() => undefined}
+        onUnitIdChange={() => undefined} onSinceChange={() => undefined} onPriorityChange={() => undefined}
+        onQueryChange={() => undefined} onTogglePaused={() => undefined} onClear={() => undefined}
+        onExport={() => undefined} onReturnToBottom={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('容器日志')
+    expect(html).toContain(`${containerId.slice(0, 12)}...${containerId.slice(-6)}`)
+    expect(html).not.toContain('aria-label="日志来源"')
+    expect(html).not.toContain('aria-label="日志优先级"')
+    expect(html).not.toContain('systemd 服务单元')
+    expect(html).toContain('搜索已接收日志')
+    expect(html).toContain('导出当前日志')
   })
 })

@@ -373,6 +373,20 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body.slice(approvalIndex, bypassIndex)).toContain("currentMode === 'plan'")
   })
 
+  test('Given bypass 模式的文件和容器变更 When 进入权限边界 Then 先逐次审批并复核当前运行代次', () => {
+    /** 真实编排路径必须在全局 bypass 分支之前处理高权限运维动作。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const start = source.indexOf("if (toolName === 'server_exec' || toolName === 'server_docker_action' || toolName === 'server_files_mutate')")
+    const bypass = source.indexOf("case 'bypassPermissions':", start)
+    expect(start).toBeGreaterThan(0)
+    expect(bypass).toBeGreaterThan(start)
+    const body = source.slice(start, source.indexOf('// 视觉助手', start))
+    expect(body).toContain("toolName === 'server_exec' && isServerOpsReadOnlyCommand(command)")
+    expect(body).toContain("currentMode === 'plan'")
+    expect(body).toContain('await permissionService.requestSingleApproval(')
+    expect(body).toContain('revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)')
+  })
+
   test('Given 单次审批等待期间权限模式变化 When 审批返回 Then Canvas、BrowserUpload、Server Ops、规划删除与 PowerShell 统一复核状态', () => {
     /** 读取真实 canUseTool，约束所有单次审批工具共享同一安全收口。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

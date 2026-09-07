@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   parseServerOpsServiceActionInput,
   parseServerOpsServiceActionResult,
@@ -41,13 +42,18 @@ const SERVER_OPS_SYSTEMD_SHOW_FIELDS = [
 export interface ServerOpsSystemdServiceDependencies {
   getActiveIdentity: (hostId: string) => ServerOpsActiveConnectionIdentity
   exec: (hostId: string, connectionId: string, command: string, timeoutMs: number) => Promise<ServerOpsRuntimeExecResult>
-  audit: { append: (input: ServerOpsAuditAppendInput) => unknown }
+  audit: {
+    append: (input: ServerOpsAuditAppendInput) => unknown
+    prepareForWrites?: () => Promise<void>
+  }
   now: () => number
+  /** 为每次用户动作生成可审计的唯一身份。 */
+  uuid?: () => string
 }
 
 /** 动作执行完成后的内部稳定事实。 */
 interface ServiceActionExecution {
-  outcome: 'success' | 'error'
+  outcome: 'success' | 'error' | 'unknown'
   errorCode?: 'SERVER_OPS_SERVICE_ACTION_FAILED' | 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' | 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED'
 }
 
@@ -197,7 +203,7 @@ export class ServerOpsSystemdService {
   }
 
   /** 校验用户动作，执行一次固定命令并写入开始与结果审计。 */
-  async runAction(input: ServerOpsServiceActionInput): Promise<ServerOpsServiceActionResult> {
+  async runAction(input: ServerOpsServiceActionInput, windowId: number): Promise<ServerOpsServiceActionResult> {
     /** 主进程入口再次执行 Shared exact-key、ID、unit 与动作枚举校验。 */
     const parsedInput = parseServerOpsServiceActionInput(input)
     /** 动作前捕获且贯穿全流程的连接身份。 */
@@ -218,11 +224,17 @@ export class ServerOpsSystemdService {
       const operation = `service-${parsedInput.action}` as const
       /** 动作起始时间，仅用于有界 duration。 */
       let startedAt: number
+      /** 贯穿开始与结果记录的单次操作身份。 */
+      let operationId: string
       try {
+        if (this.dependencies.audit.prepareForWrites) await this.dependencies.audit.prepareForWrites()
+        /** guard 等待期间连接可能已经切换，旧身份不得写 start 或 dispatch。 */
+        this.assertIdentityUnchanged(identity)
         startedAt = this.dependencies.now()
+        operationId = (this.dependencies.uuid ?? randomUUID)()
         this.dependencies.audit.append({
-          actor: 'user', sessionId: parsedInput.sessionId, hostId: parsedInput.hostId, unitId: parsedInput.unitId,
-          operation, phase: 'start', outcome: 'success',
+          actor: 'user', operationId, windowId, hostId: parsedInput.hostId, unitId: parsedInput.unitId,
+          operation, phase: 'start', outcome: 'pending',
         })
       } catch (error) {
         throw createPublicSystemdError(error, 'SERVER_OPS_AUDIT_WRITE_FAILED')
@@ -238,25 +250,25 @@ export class ServerOpsSystemdService {
       const warnings: string[] = []
 
       if (!this.identityIsCurrent(identity)) {
-        execution = { ...execution, outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
+        execution = { ...execution, outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
       } else {
         try {
           detail = await this.readServiceDetail(identity, parsedInput.unitId)
         } catch (error) {
           if (error instanceof Error && error.message === 'SERVER_OPS_CONNECTION_CHANGED') {
-            execution = { ...execution, outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
+            execution = { ...execution, outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
           } else {
             warnings.push('SERVER_OPS_SYSTEMD_OUTPUT_INVALID')
           }
         }
       }
       if (!this.identityIsCurrent(identity)) {
-        execution = { ...execution, outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
+        execution = { ...execution, outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
       }
 
       /** result 审计严格反映动作或身份不确定性的最终事实。 */
       const resultAudit: ServerOpsAuditAppendInput = {
-        actor: 'user', sessionId: parsedInput.sessionId, hostId: parsedInput.hostId, unitId: parsedInput.unitId,
+        actor: 'user', operationId, windowId, hostId: parsedInput.hostId, unitId: parsedInput.unitId,
         operation, phase: 'result', outcome: execution.outcome, durationMs,
         ...(execution.errorCode === undefined ? {} : { errorCode: execution.errorCode }),
       }
@@ -482,7 +494,7 @@ export class ServerOpsSystemdService {
         identity.hostId, identity.connectionId, command, SERVER_OPS_SYSTEMD_ACTION_TIMEOUT_MS,
       )
       if (!this.identityIsCurrent(identity)) {
-        return { outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
+        return { outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
       }
       if (result.exitCode === 0 && result.signal === undefined && !result.truncated) {
         return { outcome: 'success' }
@@ -496,10 +508,13 @@ export class ServerOpsSystemdService {
       const errorCode = result.exitCode === undefined || result.truncated
         ? 'SERVER_OPS_SERVICE_ACTION_UNKNOWN'
         : 'SERVER_OPS_SERVICE_ACTION_FAILED'
-      return { outcome: 'error', errorCode }
+      return {
+        outcome: errorCode === 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' ? 'unknown' : 'error',
+        errorCode,
+      }
     } catch {
       /** Promise rejection 发生在命令可能已 dispatch 之后，无法证明远程结果。 */
-      return { outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
+      return { outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' }
     }
   }
 

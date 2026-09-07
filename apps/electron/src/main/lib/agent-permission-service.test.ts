@@ -11,6 +11,21 @@ function permissionOptions(signal: AbortSignal, toolUseID: string): CanUseToolOp
 }
 
 describe('服务器远程命令权限', () => {
+  test.each(['server_docker_action', 'server_files_mutate'])(
+    'Given %s 被批准并伪造 alwaysAllow When 再次调用 Then 仍需逐次审批', async (toolName) => {
+      const service = new AgentPermissionService()
+      const requests: Array<{ requestId: string; allowAlways?: boolean }> = []
+      const canUse = service.createCanUseTool('session-1', (request) => requests.push(request))
+      const first = canUse(toolName, { hostId: 'host-1', action: 'restart' }, permissionOptions(new AbortController().signal, 'action-1'))
+      expect(requests[0]?.allowAlways).toBe(false)
+      service.respondToPermission(requests[0]!.requestId, 'allow', true)
+      await first
+      const second = canUse(toolName, { hostId: 'host-1', action: 'restart' }, permissionOptions(new AbortController().signal, 'action-2'))
+      expect(requests).toHaveLength(2)
+      service.respondToPermission(requests[1]!.requestId, 'deny', false)
+      expect((await second).behavior).toBe('deny')
+    },
+  )
   test('Given ss 主动销毁 socket 参数 When 分类远程命令 Then 不得视为只读', () => {
     expect(isServerOpsReadOnlyCommand('ss -K dst 10.0.0.1')).toBe(false)
   })

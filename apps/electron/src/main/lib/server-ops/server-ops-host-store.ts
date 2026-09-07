@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   isServerOpsHostList,
@@ -8,8 +8,13 @@ import {
 } from '@proma/shared'
 import type { ServerOpsHost, ServerOpsUpsertHostInput } from '@proma/shared'
 import { getConfigDir } from '../config-paths'
-import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
-import type { ReadJsonFileSafeOptions } from '../safe-file'
+import { readAtomicFileState, readJsonFileSafe, writeJsonFileAtomicSecure } from '../safe-file'
+import type { AtomicDestinationExpectation, ReadJsonFileSafeOptions } from '../safe-file'
+import {
+  createServerOpsConfigTransaction,
+  resolveServerOpsConfigFilePath,
+} from './server-ops-config-transaction'
+import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
 
 /** 主机资产相对业务配置根的目录名。 */
 const SERVER_OPS_DIRECTORY = 'server-ops'
@@ -21,18 +26,30 @@ export interface ServerOpsHostStoreDependencies {
   /** 使用 safe-file 候选恢复规则读取 JSON。 */
   readJson: <T>(filePath: string, options: ReadJsonFileSafeOptions<T>) => T | null
   /** 使用 safe-file 原子写入完整主机列表。 */
-  writeJson: (filePath: string, data: object) => void
+  writeJson: (
+    filePath: string,
+    data: object,
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ) => void
   /** 生成新主机的稳定唯一 ID。 */
   uuid: () => string
   /** 生成创建和更新时间戳。 */
   now: () => number
+  /** 覆盖 fresh-read 与原子提交的同步短事务。 */
+  transaction?: ServerOpsConfigTransaction
 }
 
 /** 创建生产环境使用的主机 Store 依赖。 */
 export function createServerOpsHostStoreDependencies(): ServerOpsHostStoreDependencies {
   return {
     readJson: readJsonFileSafe,
-    writeJson: writeJsonFileAtomic,
+    writeJson: (filePath, data, expectedDestination, priorBackup) => {
+      writeJsonFileAtomicSecure(filePath, data, {
+        expectedDestination,
+        ...(priorBackup ? { priorBackup: { filePath: `${filePath}.bak`, data: priorBackup } } : {}),
+      })
+    },
     uuid: randomUUID,
     now: Date.now,
   }
@@ -86,8 +103,8 @@ export class ServerOpsHostStore {
   private readonly filePath: string
   /** 可替换的安全文件、时间和 ID 边界。 */
   private readonly dependencies: ServerOpsHostStoreDependencies
-  /** 仅在写盘成功后替换的内存主机快照。 */
-  private hosts: ServerOpsHost[]
+  /** 覆盖同目录协作写入的同步短事务。 */
+  private readonly transaction: ServerOpsConfigTransaction
 
   /**
    * 创建并加载服务器资产 Store。
@@ -102,28 +119,32 @@ export class ServerOpsHostStore {
     /** 存放主机资产的固定子目录。 */
     const directoryPath = join(configDir, SERVER_OPS_DIRECTORY)
     mkdirSync(directoryPath, { recursive: true })
-    this.filePath = join(directoryPath, SERVER_OPS_HOSTS_FILENAME)
+    this.filePath = resolveServerOpsConfigFilePath(directoryPath, SERVER_OPS_HOSTS_FILENAME)
     this.dependencies = { ...createServerOpsHostStoreDependencies(), ...dependencies }
-    /** 经 safe-file schema 校验和候选恢复后的当前或旧版主机列表。 */
-    const loaded = this.dependencies.readJson(this.filePath, { validate: isServerOpsStoredHostList })
-    this.hosts = loaded?.map(migrateStoredHost).map(cloneHost) ?? []
-    if (loaded?.some((host) => 'keyPath' in host)) {
-      // 连续两次原子提交让 safe-file 的主文件与备份都替换为已脱敏 schema。
-      this.persist(this.hosts)
-      this.persist(this.hosts)
-    }
+    this.transaction = dependencies.transaction ?? createServerOpsConfigTransaction(directoryPath)
   }
 
   /** 返回当前主机资产的深层副本。 */
   list(): ServerOpsHost[] {
-    return this.hosts.map(cloneHost)
+    const loaded = this.readStoredHosts()
+    if (!loaded.hasLegacyKeyPath) return loaded.hosts.map(cloneHost)
+    return this.transaction(() => {
+      /** 迁移前在锁内重新读取，避免覆盖另一实例刚提交的变化。 */
+      const authoritative = this.readStoredHosts()
+      if (authoritative.hasLegacyKeyPath) {
+        // 连续两次原子提交让 safe-file 的主文件与备份都替换为已脱敏 schema。
+        this.persist(authoritative.hosts, authoritative.expectedDestination, authoritative.priorBackup)
+        this.persist(authoritative.hosts, this.captureDestinationExpectation(), authoritative.hosts.map(cloneHost))
+      }
+      return authoritative.hosts.map(cloneHost)
+    })
   }
 
   /** 按稳定 ID 返回单条主机副本。 */
   get(hostId: string): ServerOpsHost | undefined {
     if (!isServerOpsId(hostId)) return undefined
     /** 当前 ID 对应的内部主机记录。 */
-    const host = this.hosts.find((item) => item.id === hostId)
+    const host = this.list().find((item) => item.id === hostId)
     return host ? cloneHost(host) : undefined
   }
 
@@ -149,46 +170,42 @@ export class ServerOpsHostStore {
     const now = this.dependencies.now()
     if (!isValidTimestamp(now)) throw new Error('SERVER_OPS_HOST_TIMESTAMP_INVALID')
 
-    if (hostId !== undefined) {
-      if (!isServerOpsId(hostId)) throw new Error('SERVER_OPS_HOST_ID_INVALID')
-      /** 被编辑主机在当前快照中的位置。 */
-      const index = this.hosts.findIndex((host) => host.id === hostId)
-      if (index < 0) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
-      /** 经过索引存在性校验的当前主机。 */
-      const existing = this.hosts[index]
-      if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
-      /** 保留创建时间并更新可编辑字段的新记录。 */
-      const updated: ServerOpsHost = {
-        ...parsed,
-        id: hostId,
-        ...(existing.authMethod === parsed.authMethod && existing.credentialRef ? { credentialRef: existing.credentialRef } : {}),
-        createdAt: existing.createdAt,
-        updatedAt: Math.max(now, existing.updatedAt),
+    return this.transaction(() => {
+      /** 所有 patch 都基于锁内权威文件，避免跨实例丢更新。 */
+      const loaded = this.readStoredHosts()
+      const hosts = loaded.hosts
+      if (hostId !== undefined) {
+        if (!isServerOpsId(hostId)) throw new Error('SERVER_OPS_HOST_ID_INVALID')
+        /** 被编辑主机在当前快照中的位置。 */
+        const index = hosts.findIndex((host) => host.id === hostId)
+        if (index < 0) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+        /** 经过索引存在性校验的当前主机。 */
+        const existing = hosts[index]
+        if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+        /** 保留创建时间并更新可编辑字段的新记录。 */
+        const updated: ServerOpsHost = {
+          ...parsed,
+          id: hostId,
+          ...(existing.authMethod === parsed.authMethod && existing.credentialRef ? { credentialRef: existing.credentialRef } : {}),
+          createdAt: existing.createdAt,
+          updatedAt: Math.max(now, existing.updatedAt),
+        }
+        /** 原子写入前构造的完整下一快照。 */
+        const nextHosts = hosts.map((host, hostIndex) => hostIndex === index ? updated : host)
+        this.persistAndClearLegacyBackup(nextHosts, loaded.hasLegacyKeyPath, loaded.expectedDestination, loaded.priorBackup)
+        return cloneHost(updated)
       }
-      /** 原子写入前构造的完整下一快照。 */
-      const nextHosts = this.hosts.map((host, hostIndex) => hostIndex === index ? updated : host)
-      this.persist(nextHosts)
-      this.hosts = nextHosts
-      return cloneHost(updated)
-    }
 
-    /** 为新主机生成的稳定 ID。 */
-    const id = this.dependencies.uuid()
-    if (!isServerOpsId(id) || this.hosts.some((host) => host.id === id)) {
-      throw new Error('SERVER_OPS_HOST_ID_INVALID')
-    }
-    /** 待新增并写盘的主机记录。 */
-    const created: ServerOpsHost = {
-      ...parsed,
-      id,
-      createdAt: now,
-      updatedAt: now,
-    }
-    /** 包含新主机的完整下一快照。 */
-    const nextHosts = [...this.hosts, created]
-    this.persist(nextHosts)
-    this.hosts = nextHosts
-    return cloneHost(created)
+      /** 为新主机生成的稳定 ID。 */
+      const id = this.dependencies.uuid()
+      if (!isServerOpsId(id) || hosts.some((host) => host.id === id)) {
+        throw new Error('SERVER_OPS_HOST_ID_INVALID')
+      }
+      /** 待新增并写盘的主机记录。 */
+      const created: ServerOpsHost = { ...parsed, id, createdAt: now, updatedAt: now }
+      this.persistAndClearLegacyBackup([...hosts, created], loaded.hasLegacyKeyPath, loaded.expectedDestination, loaded.priorBackup)
+      return cloneHost(created)
+    })
   }
 
   /**
@@ -199,12 +216,22 @@ export class ServerOpsHostStore {
    */
   remove(hostId: string): boolean {
     if (!isServerOpsId(hostId)) throw new Error('SERVER_OPS_HOST_ID_INVALID')
-    if (!this.hosts.some((host) => host.id === hostId)) return false
-    /** 删除目标后的完整下一快照。 */
-    const nextHosts = this.hosts.filter((host) => host.id !== hostId)
-    this.persist(nextHosts)
-    this.hosts = nextHosts
-    return true
+    return this.transaction(() => {
+      const loaded = this.readStoredHosts()
+      if (!loaded.hosts.some((host) => host.id === hostId)) {
+        if (loaded.hasLegacyKeyPath) {
+          this.persistAndClearLegacyBackup(loaded.hosts, true, loaded.expectedDestination, loaded.priorBackup)
+        }
+        return false
+      }
+      this.persistAndClearLegacyBackup(
+        loaded.hosts.filter((host) => host.id !== hostId),
+        loaded.hasLegacyKeyPath,
+        loaded.expectedDestination,
+        loaded.priorBackup,
+      )
+      return true
+    })
   }
 
   /** 将主机绑定到已安全保存的凭据引用，或清除旧引用。 */
@@ -212,28 +239,79 @@ export class ServerOpsHostStore {
     if (!isServerOpsId(hostId) || (credentialRef !== undefined && !isServerOpsId(credentialRef))) {
       throw new Error('SERVER_OPS_CREDENTIAL_REF_INVALID')
     }
-    /** 待绑定凭据的主机索引。 */
-    const index = this.hosts.findIndex((host) => host.id === hostId)
-    if (index < 0) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
-    /** 经过存在性校验的当前主机。 */
-    const existing = this.hosts[index]
-    if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
-    /** 绑定新引用后的公开主机记录。 */
-    const updated: ServerOpsHost = {
-      ...existing,
-      ...(credentialRef === undefined ? {} : { credentialRef }),
-      updatedAt: Math.max(this.dependencies.now(), existing.updatedAt),
+    return this.transaction(() => {
+      const loaded = this.readStoredHosts()
+      /** 待绑定凭据的主机索引。 */
+      const index = loaded.hosts.findIndex((host) => host.id === hostId)
+      if (index < 0) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+      /** 经过索引存在性校验的当前主机。 */
+      const existing = loaded.hosts[index]
+      if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+      const now = this.dependencies.now()
+      if (!isValidTimestamp(now)) throw new Error('SERVER_OPS_HOST_TIMESTAMP_INVALID')
+      /** 绑定新引用后的公开主机记录。 */
+      const updated: ServerOpsHost = {
+        ...existing,
+        ...(credentialRef === undefined ? {} : { credentialRef }),
+        updatedAt: Math.max(now, existing.updatedAt),
+      }
+      if (credentialRef === undefined) delete updated.credentialRef
+      this.persistAndClearLegacyBackup(
+        loaded.hosts.map((host, hostIndex) => hostIndex === index ? updated : host),
+        loaded.hasLegacyKeyPath,
+        loaded.expectedDestination,
+        loaded.priorBackup,
+      )
+      return cloneHost(updated)
+    })
+  }
+
+  /** fresh-read 当前或旧 schema；已有坏文件不得被当作空列表覆盖。 */
+  private readStoredHosts(): {
+    hosts: ServerOpsHost[]
+    hasLegacyKeyPath: boolean
+    expectedDestination: AtomicDestinationExpectation
+    priorBackup?: object
+  } {
+    const existed = existsSync(this.filePath)
+    const loaded = this.dependencies.readJson(this.filePath, { validate: isServerOpsStoredHostList })
+    const expectedDestination = this.captureDestinationExpectation()
+    if (loaded === null) {
+      if (existed) throw new Error('SERVER_OPS_HOST_READ_FAILED')
+      return { hosts: [], hasLegacyKeyPath: false, expectedDestination }
     }
-    if (credentialRef === undefined) delete updated.credentialRef
-    /** 完整下一主机快照。 */
-    const next = this.hosts.map((host, hostIndex) => hostIndex === index ? updated : host)
-    this.persist(next)
-    this.hosts = next
-    return cloneHost(updated)
+    return {
+      hosts: loaded.map(migrateStoredHost).map(cloneHost),
+      hasLegacyKeyPath: loaded.some((host) => 'keyPath' in host),
+      expectedDestination,
+      priorBackup: loaded.map((host) => ({ ...host, tags: [...host.tags] })),
+    }
+  }
+
+  /** 写入最终快照；旧 keyPath 存在时再写一次，确保 backup 同样脱敏。 */
+  private persistAndClearLegacyBackup(
+    hosts: readonly ServerOpsHost[],
+    hadLegacyKeyPath: boolean,
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ): void {
+    const sanitized = hosts.map(cloneHost)
+    this.persist(hosts, expectedDestination, priorBackup)
+    if (hadLegacyKeyPath) this.persist(hosts, this.captureDestinationExpectation(), sanitized)
   }
 
   /** 使用 safe-file 原子边界持久化完整主机快照。 */
-  private persist(hosts: readonly ServerOpsHost[]): void {
-    this.dependencies.writeJson(this.filePath, hosts.map(cloneHost))
+  private persist(
+    hosts: readonly ServerOpsHost[],
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ): void {
+    this.dependencies.writeJson(this.filePath, hosts.map(cloneHost), expectedDestination, priorBackup)
+  }
+
+  /** 捕获 fresh-read 对应的目标身份，阻断不协作旧实例的迟到覆盖。 */
+  private captureDestinationExpectation(): AtomicDestinationExpectation {
+    const state = readAtomicFileState(this.filePath)
+    return state === null ? { kind: 'missing' } : { kind: 'state', state }
   }
 }

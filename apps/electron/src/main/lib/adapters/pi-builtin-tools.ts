@@ -1542,9 +1542,9 @@ function buildPromaCloudTools(sdk: PiSdk, _ctx: PiBuiltinToolsContext): ToolDefi
   return []
 }
 
-/** 把会话级 Server Ops Facade 注册为模型可见的五个窄工具。 */
+/** 仅注册会话 Facade 已接通的窄运维工具。 */
 export function buildServerOpsTools(sdk: PiSdk, facade: ServerOpsAgentFacade): ToolDefinition[] {
-  return [
+  const tools = [
     sdk.defineTool({
       name: 'server_list',
       label: '列出已授权服务器',
@@ -1600,10 +1600,53 @@ export function buildServerOpsTools(sdk: PiSdk, facade: ServerOpsAgentFacade): T
       parameters: Type.Object({ hostId: Type.String({ description: 'Server ID returned by server_list.' }) }),
       async execute(_toolCallId, params) {
         const args = params as { hostId: string }
-        return jsonToolResult(facade.disconnect({ hostId: args.hostId }))
+        return jsonToolResult(await facade.disconnect({ hostId: args.hostId }))
       },
     }),
   ] as ToolDefinition[]
+  if (facade.dockerResources) tools.push(sdk.defineTool({
+    name: 'server_docker_resources', label: '查看 Docker 资源',
+    description: 'Read bounded containers, images, networks and volumes on the authorized SSH server local Docker daemon.',
+    parameters: Type.Object({ hostId: Type.String() }),
+    async execute(_id, params) { return jsonToolResult(await facade.dockerResources!(params as { hostId: string })) },
+  }) as ToolDefinition)
+  if (facade.dockerDetail) tools.push(sdk.defineTool({
+    name: 'server_docker_detail', label: '查看容器详情',
+    description: 'Read sanitized container details by its full 64-character ID; environment variables and secrets are excluded.',
+    parameters: Type.Object({ hostId: Type.String(), containerId: Type.String({ pattern: '^[a-f0-9]{64}$' }) }),
+    async execute(_id, params) { return jsonToolResult(await facade.dockerDetail!(params as { hostId: string; containerId: string })) },
+  }) as ToolDefinition)
+  if (facade.dockerAction) tools.push(sdk.defineTool({
+    name: 'server_docker_action', label: '变更容器运行状态',
+    description: 'Start, stop or restart one exact full container ID after per-use approval. Rechecks identity and inspects the result; unknown outcomes must not be retried automatically.',
+    parameters: Type.Object({ hostId: Type.String(), containerId: Type.String({ pattern: '^[a-f0-9]{64}$' }), action: Type.Union([Type.Literal('start'), Type.Literal('stop'), Type.Literal('restart')]) }),
+    async execute(_id, params) { return jsonToolResult(await facade.dockerAction!(params as { hostId: string; containerId: string; action: 'start' | 'stop' | 'restart' })) },
+  }) as ToolDefinition)
+  if (facade.filesList) tools.push(sdk.defineTool({
+    name: 'server_files_list', label: '浏览远程目录',
+    description: 'Read one bounded directory page on the authorized server. Results are limited to 64 KiB; a truncated result is not a complete directory listing.',
+    parameters: Type.Object({ hostId: Type.String(), path: Type.String({ minLength: 1, maxLength: 4096 }) }),
+    async execute(_id, params) { return jsonToolResult(await facade.filesList!(params as { hostId: string; path: string })) },
+  }) as ToolDefinition)
+  if (facade.filesRead) tools.push(sdk.defineTool({
+    name: 'server_files_read', label: '读取远程文件',
+    description: 'Read a UTF-8 text preview only when requested by the user. Binary files, symlinks and oversized content are not followed or returned as text. Tool results are limited to 64 KiB.',
+    parameters: Type.Object({ hostId: Type.String(), path: Type.String({ minLength: 1, maxLength: 4096 }) }),
+    async execute(_id, params) { return jsonToolResult(await facade.filesRead!(params as { hostId: string; path: string })) },
+  }) as ToolDefinition)
+  if (facade.filesMutate) tools.push(sdk.defineTool({
+    name: 'server_files_mutate', label: '变更远程文件',
+    description: 'Perform one exact file operation after per-use approval. Existing-file save requires the unchanged editToken from server_files_read. No recursive deletion, permission changes or automatic retries.',
+    parameters: Type.Union([
+      Type.Object({ hostId: Type.String(), action: Type.Literal('mkdir'), path: Type.String() }),
+      Type.Object({ hostId: Type.String(), action: Type.Literal('rename'), path: Type.String(), destinationPath: Type.String() }),
+      Type.Object({ hostId: Type.String(), action: Type.Literal('delete'), path: Type.String(), targetKind: Type.Union([Type.Literal('file'), Type.Literal('directory'), Type.Literal('symlink')]) }),
+      Type.Object({ hostId: Type.String(), action: Type.Literal('save-as'), path: Type.String(), content: Type.String({ maxLength: 65536 }) }),
+      Type.Object({ hostId: Type.String(), action: Type.Literal('save'), path: Type.String(), content: Type.String({ maxLength: 65536 }), editToken: Type.Object({ path: Type.String(), hash: Type.String(), size: Type.Number(), mtime: Type.Number(), mode: Type.Number() }) }),
+    ]),
+    async execute(_id, params) { return jsonToolResult(await facade.filesMutate!(params as Parameters<NonNullable<ServerOpsAgentFacade['filesMutate']>>[0])) },
+  }) as ToolDefinition)
+  return tools
 }
 
 // ===== 统一入口 =====

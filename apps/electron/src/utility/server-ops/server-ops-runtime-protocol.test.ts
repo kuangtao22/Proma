@@ -25,6 +25,7 @@ function createConnectRequest(): unknown {
 
 describe('Server Ops utility runtime 请求协议', () => {
   test('严格重建所有合法请求分支', () => {
+    const consoleIdentity = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
     const requests: unknown[] = [
       createConnectRequest(),
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: 'uname -a', timeoutMs: 1_000 } },
@@ -32,6 +33,11 @@ describe('Server Ops utility runtime 请求协议', () => {
       { type: 'server-ops.terminal-input', hostId: 'host-1', connectionId: 'connection-1', data: 'pwd\n' },
       { type: 'server-ops.terminal-resize', hostId: 'host-1', connectionId: 'connection-1', cols: 80, rows: 24 },
       { type: 'server-ops.terminal-ack', input: { hostId: 'host-1', connectionId: 'connection-1', sequence: 1 } },
+      { type: 'server-ops.console-start', input: { ...consoleIdentity, cols: 80, rows: 24 } },
+      { type: 'server-ops.console-stop', input: consoleIdentity },
+      { type: 'server-ops.console-input', input: { ...consoleIdentity, data: 'pwd\n' } },
+      { type: 'server-ops.console-resize', input: { ...consoleIdentity, cols: 100, rows: 30 } },
+      { type: 'server-ops.console-ack', input: { ...consoleIdentity, sequence: 1 } },
       { type: 'server-ops.log-start', input: { streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', command: 'journalctl -f' } },
       { type: 'server-ops.log-stop', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.log-ack', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: 0 },
@@ -49,6 +55,8 @@ describe('Server Ops utility runtime 请求协议', () => {
       { type: 'server-ops.disconnect', hostId: '../host', connectionId: 'connection-1' },
       { type: 'server-ops.terminal-resize', hostId: 'host-1', connectionId: 'connection-1', cols: 0, rows: 24 },
       { type: 'server-ops.terminal-input', hostId: 'host-1', connectionId: 'connection-1', data: 'x'.repeat(65_537) },
+      { type: 'server-ops.console-start', input: { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'short', cols: 80, rows: 24 } },
+      { type: 'server-ops.console-input', input: { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64), data: 'id\n', extra: true } },
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: '', timeoutMs: 1_000 } },
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: 'x'.repeat(8_193), timeoutMs: 1_000 } },
       { type: 'server-ops.log-start', input: { streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', command: '' } },
@@ -75,6 +83,7 @@ describe('Server Ops utility runtime 请求协议', () => {
 
 describe('Server Ops utility runtime 返回协议', () => {
   test('严格重建所有合法消息分支', () => {
+    const consoleIdentity = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
     const messages: unknown[] = [
       { type: 'server-ops.ready', pid: 100 },
       { type: 'server-ops.connect-result', requestId: 'request-1', hostId: 'host-1', connectionId: 'connection-1', result: { status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } } },
@@ -84,6 +93,9 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.error', hostId: 'host-1', connectionId: 'connection-1', code: 'SERVER_OPS_CONNECTION_CLOSED', message: 'SSH 连接已关闭' },
       { type: 'server-ops.terminal-output', event: { hostId: 'host-1', connectionId: 'connection-1', sequence: 1, data: 'hello' } },
       { type: 'server-ops.terminal-exit', event: { hostId: 'host-1', connectionId: 'connection-1', exitCode: 0, message: '远程终端已退出' } },
+      { type: 'server-ops.console-started', session: consoleIdentity },
+      { type: 'server-ops.console-output', event: { ...consoleIdentity, sequence: 1, data: 'hello' } },
+      { type: 'server-ops.console-exit', event: { ...consoleIdentity, exitCode: 0, message: '容器终端已退出' } },
       { type: 'server-ops.log-started', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.log-chunk', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: 0, data: '服务\n' },
       { type: 'server-ops.log-exit', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', reason: 'stopped' },
@@ -107,6 +119,8 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.terminal-output', event: { hostId: 'host-1', connectionId: 'connection-1', sequence: 0, data: 'hello' } },
       { type: 'server-ops.terminal-output', event: { hostId: 'host-1', connectionId: 'connection-1', sequence: 1, data: 'x'.repeat(1_048_833) } },
       { type: 'server-ops.terminal-exit', event: { hostId: 'host-1', connectionId: 'connection-1', signal: {}, message: '退出' } },
+      { type: 'server-ops.console-output', event: { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64), sequence: 0, data: 'hello' } },
+      { type: 'server-ops.console-exit', event: { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'short', message: '退出' } },
       { type: 'server-ops.log-started', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', extra: true },
       { type: 'server-ops.log-chunk', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: -1, data: '日志' },
       { type: 'server-ops.log-chunk', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: Number.MAX_SAFE_INTEGER + 1, data: '日志' },

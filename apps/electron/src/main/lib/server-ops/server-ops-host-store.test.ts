@@ -5,8 +5,16 @@ import { join } from 'node:path'
 import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
 import {
   createServerOpsHostStoreDependencies,
-  ServerOpsHostStore,
+  ServerOpsHostStore as ProductionServerOpsHostStore,
 } from './server-ops-host-store'
+import type { ServerOpsHostStoreDependencies } from './server-ops-host-store'
+
+/** Store 单元测试复用已独立验证的事务合同，只隔离原生 addon 装载。 */
+class ServerOpsHostStore extends ProductionServerOpsHostStore {
+  constructor(configDir?: string, dependencies: Partial<ServerOpsHostStoreDependencies> = {}) {
+    super(configDir, { transaction: (callback) => callback(), ...dependencies })
+  }
+}
 
 /** 当前测试创建的隔离配置目录。 */
 const temporaryDirectories: string[] = []
@@ -26,12 +34,12 @@ afterEach(() => {
 })
 
 describe('服务器运维主机资产 Store', () => {
-  test('生产依赖固定使用 safe-file 原子 JSON API', () => {
+  test('生产依赖固定使用 safe-file 读取与安全原子 JSON 写入边界', () => {
     /** Store 的生产默认依赖。 */
     const dependencies = createServerOpsHostStoreDependencies()
 
     expect(dependencies.readJson).toBe(readJsonFileSafe)
-    expect(dependencies.writeJson).toBe(writeJsonFileAtomic)
+    expect(typeof dependencies.writeJson).toBe('function')
   })
 
   test('新增、更新和删除主机均持久化到 server-ops/hosts.json', () => {
@@ -94,7 +102,7 @@ describe('服务器运维主机资产 Store', () => {
     expect(existsSync(`${filePath}.bak`)).toBe(true)
   })
 
-  test('损坏主文件和无有效备份时降级为空列表', () => {
+  test('损坏主文件和无有效备份时读取失败且保留现场', () => {
     /** 当前用例的配置目录。 */
     const configDir = createConfigDir()
     /** 主机资产目录。 */
@@ -102,19 +110,21 @@ describe('服务器运维主机资产 Store', () => {
     mkdirSync(opsDir, { recursive: true })
     writeFileSync(join(opsDir, 'hosts.json'), '{broken', 'utf8')
 
-    expect(new ServerOpsHostStore(configDir).list()).toEqual([])
+    expect(() => new ServerOpsHostStore(configDir).list()).toThrow('SERVER_OPS_HOST_READ_FAILED')
   })
 
   test('返回副本且磁盘写失败不会提交幽灵状态', () => {
     /** 当前测试累计的写入次数。 */
     let writeCount = 0
     /** 第二次写入失败的 Store。 */
-    const store = new ServerOpsHostStore(createConfigDir(), {
+    const configDir = createConfigDir()
+    const store = new ServerOpsHostStore(configDir, {
       uuid: () => 'host-1',
       now: () => 1_000 + writeCount,
-      writeJson: () => {
+      writeJson: (targetPath, data) => {
         writeCount++
         if (writeCount === 2) throw new Error('disk failure')
+        writeJsonFileAtomic(targetPath, data)
       },
     })
     /** 首次成功创建的主机。 */
@@ -206,5 +216,31 @@ describe('服务器运维主机资产 Store', () => {
     expect(store.list()).toHaveLength(1)
     expect(readFileSync(join(opsDir, 'hosts.json'), 'utf8')).not.toContain('private-key-canary')
     expect(readFileSync(join(opsDir, 'hosts.json.bak'), 'utf8')).not.toContain('private-key-canary')
+  })
+
+  test('Given 两个已构造 Store When 依次新增不同主机 Then fresh-read 保留双方提交', () => {
+    const configDir = createConfigDir()
+    let nextId = 0
+    const transaction = <T>(callback: () => T): T => callback()
+    const first = new ServerOpsHostStore(configDir, { transaction, uuid: () => `host-${++nextId}`, now: () => nextId })
+    const second = new ServerOpsHostStore(configDir, { transaction, uuid: () => `host-${++nextId}`, now: () => nextId })
+
+    first.upsert({ name: 'A', address: '10.0.0.1', port: 22, username: 'root', authMethod: 'ssh-agent', tags: [] })
+    second.upsert({ name: 'B', address: '10.0.0.2', port: 22, username: 'root', authMethod: 'ssh-agent', tags: [] })
+
+    expect(first.list().map((host) => host.name)).toEqual(['A', 'B'])
+  })
+
+  test('Given 已有主机文件损坏 When 尝试写入 Then fail closed 且不覆盖现场', () => {
+    const configDir = createConfigDir()
+    const opsDir = join(configDir, 'server-ops')
+    mkdirSync(opsDir, { recursive: true })
+    const filePath = join(opsDir, 'hosts.json')
+    writeFileSync(filePath, '{broken-hosts', 'utf8')
+    const store = new ServerOpsHostStore(configDir, { transaction: (callback) => callback() })
+
+    expect(() => store.upsert({ name: 'A', address: '10.0.0.1', port: 22, username: 'root', authMethod: 'ssh-agent', tags: [] }))
+      .toThrow('SERVER_OPS_HOST_READ_FAILED')
+    expect(readFileSync(filePath, 'utf8')).toBe('{broken-hosts')
   })
 })

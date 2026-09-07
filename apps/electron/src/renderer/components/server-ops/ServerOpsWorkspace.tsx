@@ -1,10 +1,12 @@
 import * as React from 'react'
+import { isServerOpsAuditActorOperation } from '@proma/shared'
 import { useAtom } from 'jotai'
 import {
   Box,
   ClipboardList,
   Database,
   FileText,
+  Fingerprint,
   FolderOpen,
   Gauge,
   LoaderCircle,
@@ -59,6 +61,58 @@ import { ServerOpsRemoteTerminal } from './ServerOpsRemoteTerminal'
 import { ServerOpsOverviewPanel } from './ServerOpsOverviewPanel'
 import { ServerOpsServicesPanel } from './ServerOpsServicesPanel'
 import { ServerOpsLogsPanel } from './ServerOpsLogsPanel'
+import { ServerOpsTrustDialog } from './ServerOpsTrustDialog'
+import { ServerOpsDockerPanel } from './ServerOpsDockerPanel'
+import type { ServerOpsDockerPanelApi } from './ServerOpsDockerPanel'
+import { ServerOpsFilesWorkspace } from './ServerOpsFilesWorkspace'
+import { ServerOpsDockerConsole } from './ServerOpsDockerConsole'
+import { useServerOpsTransferLeave } from './useServerOpsTransferLeave'
+import type { ServerOpsFilesPreload } from '../../../preload/server-ops-files-preload'
+import type { ServerOpsConsolePreloadApi } from '../../../preload/server-ops-console-preload'
+import type { ServerOpsTransferPreload } from '../../../preload/server-ops-transfer-preload'
+
+/** 延迟读取实际 preload，允许无 Electron 的静态视图测试。 */
+const serverOpsDockerApi: ServerOpsDockerPanelApi = {
+  listServerOpsDockerResources: (input) => window.electronAPI.listServerOpsDockerResources(input),
+  getServerOpsDockerContainerDetail: (input) => window.electronAPI.getServerOpsDockerContainerDetail(input),
+  prepareServerOpsDockerAction: (input) => window.electronAPI.prepareServerOpsDockerAction(input),
+  commitServerOpsDockerAction: (input) => window.electronAPI.commitServerOpsDockerAction(input),
+  cancelServerOpsDockerAction: (input) => window.electronAPI.cancelServerOpsDockerAction(input),
+}
+
+/** 文件面板使用稳定 bridge；每次调用才取得实际 Electron API。 */
+const serverOpsFilesApi: ServerOpsFilesPreload = {
+  listServerOpsFiles: (input) => window.electronAPI.listServerOpsFiles(input),
+  previewServerOpsFile: (input) => window.electronAPI.previewServerOpsFile(input),
+  prepareServerOpsFileMutation: (input) => window.electronAPI.prepareServerOpsFileMutation(input),
+  commitServerOpsFileMutation: (input) => window.electronAPI.commitServerOpsFileMutation(input),
+  cancelServerOpsFileMutation: (input) => window.electronAPI.cancelServerOpsFileMutation(input),
+  closeServerOpsFilesOwner: (input) => window.electronAPI.closeServerOpsFilesOwner(input),
+}
+
+/** 文件选择、传输进度和取消均经由所属窗口的类型安全 bridge。 */
+const serverOpsTransferApi: ServerOpsTransferPreload = {
+  selectServerOpsUploadFile: (input) => window.electronAPI.selectServerOpsUploadFile(input),
+  selectServerOpsDownloadFile: (input) => window.electronAPI.selectServerOpsDownloadFile(input),
+  releaseServerOpsFileSelection: (input) => window.electronAPI.releaseServerOpsFileSelection(input),
+  startServerOpsTransfer: (input) => window.electronAPI.startServerOpsTransfer(input),
+  listServerOpsTransfers: (input) => window.electronAPI.listServerOpsTransfers(input),
+  cancelServerOpsTransfer: (input) => window.electronAPI.cancelServerOpsTransfer(input),
+  closeServerOpsTransferOwner: (input) => window.electronAPI.closeServerOpsTransferOwner(input),
+  onServerOpsTransferProgress: (listener) => window.electronAPI.onServerOpsTransferProgress(listener),
+}
+
+/** 容器终端的输入、快照和事件使用独立 bridge。 */
+const serverOpsConsoleApi: ServerOpsConsolePreloadApi = {
+  startServerOpsConsole: (input) => window.electronAPI.startServerOpsConsole(input),
+  closeServerOpsConsole: (input) => window.electronAPI.closeServerOpsConsole(input),
+  writeServerOpsConsole: (input) => window.electronAPI.writeServerOpsConsole(input),
+  resizeServerOpsConsole: (input) => window.electronAPI.resizeServerOpsConsole(input),
+  acknowledgeServerOpsConsoleOutput: (input) => window.electronAPI.acknowledgeServerOpsConsoleOutput(input),
+  getServerOpsConsoleSnapshot: (input) => window.electronAPI.getServerOpsConsoleSnapshot(input),
+  onServerOpsConsoleOutput: (listener) => window.electronAPI.onServerOpsConsoleOutput(listener),
+  onServerOpsConsoleExit: (listener) => window.electronAPI.onServerOpsConsoleExit(listener),
+}
 
 /** 运维控制台首批固定页签。 */
 export type ServerOpsSection = 'overview' | 'terminal' | 'services' | 'logs' | 'files' | 'docker' | 'data-services' | 'audit'
@@ -106,6 +160,10 @@ export interface ServerOpsWorkspaceViewProps {
   auditActorFilter?: ServerOpsAuditActor | 'all'
   auditOperationFilter?: ServerOpsAuditOperation | 'all'
   agentSessionId?: string | null
+  containerLog?: { hostId: string; containerId: string } | null
+  containerConsole?: { hostId: string; containerId: string } | null
+  onContainerLogChange?: (target: { hostId: string; containerId: string } | null) => void
+  onContainerConsoleChange?: (target: { hostId: string; containerId: string } | null) => void
   onOpenDrawer: () => void
   onCreateHost: () => void
   onEditHost: (host: ServerOpsHost) => void
@@ -114,6 +172,7 @@ export interface ServerOpsWorkspaceViewProps {
   onConnect?: () => void
   onDisconnect?: () => void
   onToggleAgentAccess?: () => void
+  onManageTrust?: () => void
   onRefresh?: () => void
   onAuditHostFilterChange?: (filter: 'current' | 'all') => void
   onAuditActorFilterChange?: (filter: ServerOpsAuditActor | 'all') => void
@@ -143,6 +202,18 @@ const SERVER_OPS_AUDIT_OPERATION_LABELS: Record<ServerOpsAuditOperation, string>
   'service-restart': '重启',
   'service-enable': '启用',
   'service-disable': '禁用',
+  'trust-replace': '替换服务器信任',
+  'trust-revoke': '撤销服务器信任',
+  'docker-start': '启动容器',
+  'docker-stop': '停止容器',
+  'docker-restart': '重启容器',
+  'file-mkdir': '新建目录',
+  'file-rename': '重命名文件',
+  'file-delete': '删除文件',
+  'file-save': '保存文件',
+  'file-save-as': '另存文件',
+  'file-upload': '上传文件',
+  'file-download': '下载文件',
 }
 
 /** 审计记录主体的中文标签。 */
@@ -155,6 +226,9 @@ const SERVER_OPS_AUDIT_ACTOR_LABELS: Record<ServerOpsAuditActor, string> = {
 const SERVER_OPS_AUDIT_OPERATIONS: readonly ServerOpsAuditOperation[] = [
   'connect', 'exec', 'disconnect',
   'service-start', 'service-stop', 'service-restart', 'service-enable', 'service-disable',
+  'trust-replace', 'trust-revoke',
+  'docker-start', 'docker-stop', 'docker-restart',
+  'file-mkdir', 'file-rename', 'file-delete', 'file-save', 'file-save-as', 'file-upload', 'file-download',
 ]
 
 /** 展示真实、有界且只读的 Agent 运维审计。 */
@@ -184,7 +258,7 @@ export function ServerOpsAudit({
   /** 操作选项遵守 Shared 的 actor/operation 权限矩阵，避免生成无效 IPC 查询。 */
   const availableOperations = SERVER_OPS_AUDIT_OPERATIONS.filter((operation) => (
     actorFilter === 'all'
-    || (actorFilter === 'user') === operation.startsWith('service-')
+    || isServerOpsAuditActorOperation(actorFilter, operation)
   ))
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -248,9 +322,11 @@ export function ServerOpsAudit({
                   {new Date(record.timestamp).toLocaleString()}
                 </time>
                 <span className="text-muted-foreground">{SERVER_OPS_AUDIT_ACTOR_LABELS[record.actor]}</span>
-                <span className="font-medium">{SERVER_OPS_AUDIT_OPERATION_LABELS[record.operation]}{record.phase === 'start' ? ' · 开始' : ''}</span>
-                <span className={record.outcome === 'error' ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400'}>
-                  {record.outcome === 'error' ? '失败' : '成功'}
+                <span className="font-medium">{SERVER_OPS_AUDIT_OPERATION_LABELS[record.operation]}</span>
+                <span className={record.phase === 'start' || record.outcome === 'unknown'
+                  ? 'text-muted-foreground'
+                  : record.outcome === 'error' ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400'}>
+                  {record.phase === 'start' ? '进行中' : record.outcome === 'unknown' ? '结果未知' : record.outcome === 'error' ? '失败' : '成功'}
                 </span>
                 <div className="min-w-0 break-words font-mono text-[11px] text-muted-foreground">
                   {record.operation === 'exec' ? record.command : record.unitId}
@@ -286,7 +362,7 @@ function ServerOpsDisconnectedSection({ section, connected }: { section: ServerO
 }
 
 /** 展示 PostgreSQL、MySQL 与 Redis 的连接入口和安全基线。 */
-function ServerOpsDataServices({ connected }: { connected: boolean }): React.ReactElement {
+function ServerOpsDataServices(): React.ReactElement {
   /** 首批支持的数据服务。 */
   const services = [
     { name: 'PostgreSQL', detail: '连接、容量、慢查询与复制状态' },
@@ -299,9 +375,9 @@ function ServerOpsDataServices({ connected }: { connected: boolean }): React.Rea
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-sm font-medium">数据服务</h3>
-            <p className="mt-1 text-xs text-muted-foreground">通过当前服务器的 SSH 隧道访问</p>
+            <p className="mt-1 text-xs text-muted-foreground">当前开发版本尚未提供数据库连接。</p>
           </div>
-          <Badge variant="outline" className="font-normal">默认只读</Badge>
+          <Badge variant="outline" className="font-normal">尚未接入</Badge>
         </div>
         <div className="divide-y divide-border border-y border-border">
           {services.map((service) => (
@@ -313,13 +389,10 @@ function ServerOpsDataServices({ connected }: { connected: boolean }): React.Rea
                 <div className="text-sm font-medium">{service.name}</div>
                 <div className="truncate text-xs text-muted-foreground">{service.detail}</div>
               </div>
-              <span className="shrink-0 text-[11px] text-muted-foreground">{connected ? '等待能力探测' : '等待 SSH 连接'}</span>
+              <span className="shrink-0 text-[11px] text-muted-foreground">尚未接入</span>
             </div>
           ))}
         </div>
-        <p className="mt-4 text-xs leading-5 text-muted-foreground">
-          写入、结构变更、终止连接和 Redis 高风险命令需要逐次审批，审批结果不会自动重放。
-        </p>
       </div>
     </div>
   )
@@ -346,6 +419,10 @@ export function ServerOpsWorkspaceView({
   auditActorFilter = 'all',
   auditOperationFilter = 'all',
   agentSessionId = null,
+  containerLog = null,
+  containerConsole = null,
+  onContainerLogChange,
+  onContainerConsoleChange,
   onOpenDrawer,
   onCreateHost,
   onEditHost,
@@ -354,6 +431,7 @@ export function ServerOpsWorkspaceView({
   onConnect,
   onDisconnect,
   onToggleAgentAccess,
+  onManageTrust,
   onRefresh,
   onAuditHostFilterChange,
   onAuditActorFilterChange,
@@ -444,6 +522,18 @@ export function ServerOpsWorkspaceView({
           <span className="sr-only" role="status">当前 Agent 的服务器权限同步失败：{agentAccessError}</span>
         )}
         {selectedHost && (
+          <TooltipProvider delayDuration={200}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button type="button" variant="ghost" size="icon-sm" aria-label="管理服务器信任" onClick={onManageTrust}>
+                  <Fingerprint className="size-3.5" aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">管理服务器信任</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
+        {selectedHost && (
           <>
             {connected ? (
               <Button type="button" variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-[11px]" aria-label="断开 SSH" data-server-ops-connection-action onClick={onDisconnect}>
@@ -504,7 +594,7 @@ export function ServerOpsWorkspaceView({
                     active ? 'text-foreground after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground',
                   )}
                   aria-current={active ? 'page' : undefined}
-                  onClick={() => onSectionChange(section.id)}
+                  onClick={() => { if (section.id !== 'docker') onContainerConsoleChange?.(null); onSectionChange(section.id) }}
                 >
                   <Icon className="size-3.5" aria-hidden="true" />
                   {section.label}
@@ -527,10 +617,15 @@ export function ServerOpsWorkspaceView({
             />
           </div>
           <div
-            className={activeSection === 'logs' ? 'flex min-h-0 flex-1' : 'hidden'}
+            className={activeSection === 'logs' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}
             aria-hidden={activeSection !== 'logs'}
             data-server-ops-logs-container
           >
+            {containerLog?.hostId === selectedHost.id && (
+              <Button variant="ghost" size="sm" onClick={() => onContainerLogChange?.(null)} aria-label="返回系统日志">
+                <Server className="size-3.5" aria-hidden="true" />系统日志
+              </Button>
+            )}
             <ServerOpsLogsPanel
               hostId={selectedHost.id}
               connectionId={connectionState?.hostId === selectedHost.id && connectionState.phase === 'connected'
@@ -538,6 +633,7 @@ export function ServerOpsWorkspaceView({
                 : null}
               active={activeSection === 'logs'}
               connected={connected}
+              fixedSource={containerLog?.hostId === selectedHost.id ? { kind: 'container', containerId: containerLog.containerId } : undefined}
             />
           </div>
           {activeSection === 'overview'
@@ -554,7 +650,41 @@ export function ServerOpsWorkspaceView({
             : activeSection === 'logs'
               ? null
             : activeSection === 'data-services'
-              ? <ServerOpsDataServices connected={connected} />
+              ? <ServerOpsDataServices />
+            : activeSection === 'files'
+              ? <ServerOpsFilesWorkspace
+                  key={getServerOpsOverviewInstanceKey(selectedHost.id, connectionState)}
+                  api={serverOpsFilesApi}
+                  transferApi={serverOpsTransferApi}
+                  hostId={selectedHost.id}
+                  hostLabel={selectedHost.name}
+                  hostDescription={`${selectedHost.username}@${selectedHost.address}:${selectedHost.port}`}
+                  active
+                  connected={connected}
+                />
+            : activeSection === 'docker' && connected && containerConsole?.hostId === selectedHost.id
+              ? <div className="flex min-h-0 flex-1 flex-col">
+                  <div className="flex h-9 shrink-0 items-center border-b border-border px-2">
+                    <Button variant="ghost" size="sm" onClick={() => onContainerConsoleChange?.(null)}><Box className="size-3.5" />返回容器列表</Button>
+                    <span className="truncate px-2 font-mono text-xs text-muted-foreground">{containerConsole.containerId.slice(0, 12)}</span>
+                  </div>
+                  <ServerOpsDockerConsole key={getServerOpsOverviewInstanceKey(selectedHost.id, connectionState)} api={serverOpsConsoleApi} hostId={selectedHost.id} containerId={containerConsole.containerId} active />
+                </div>
+            : activeSection === 'docker'
+              ? <ServerOpsDockerPanel
+                  key={getServerOpsOverviewInstanceKey(selectedHost.id, connectionState)}
+                  api={serverOpsDockerApi}
+                  hostId={selectedHost.id}
+                  hostLabel={selectedHost.name}
+                  hostDescription={`${selectedHost.username}@${selectedHost.address}:${selectedHost.port}`}
+                  active
+                  connected={connected}
+                  onOpenContainerConsole={(containerId) => onContainerConsoleChange?.({ hostId: selectedHost.id, containerId })}
+                  onOpenContainerLogs={(containerId) => {
+                    onContainerLogChange?.({ hostId: selectedHost.id, containerId })
+                    onSectionChange('logs')
+                  }}
+                />
             : activeSection === 'audit'
               ? <ServerOpsAudit
                   status={auditStatus}
@@ -968,6 +1098,14 @@ export function ServerOpsWorkspace(): React.ReactElement {
   const [connectError, setConnectError] = React.useState<string>()
   /** 首次 Host Key 确认是否正在 fresh reconnect。 */
   const [confirmingHostKey, setConfirmingHostKey] = React.useState(false)
+  /** 当前服务器的独立信任管理弹窗是否打开。 */
+  const [trustDialogOpen, setTrustDialogOpen] = React.useState(false)
+  /** 主机切换前等待所属窗口传输收口。 */
+  const transferLeave = useServerOpsTransferLeave(selectedHostId)
+  /** 仅在用户显式选择的主机上显示容器日志。 */
+  const [containerLog, setContainerLog] = React.useState<{ hostId: string; containerId: string } | null>(null)
+  /** 当前用户显式打开的容器终端。 */
+  const [containerConsole, setContainerConsole] = React.useState<{ hostId: string; containerId: string } | null>(null)
   /** 审计页当前服务器范围。 */
   const [auditHostFilter, setAuditHostFilter] = React.useState<'current' | 'all'>('current')
   /** 审计页当前操作主体范围。 */
@@ -1081,9 +1219,7 @@ export function ServerOpsWorkspace(): React.ReactElement {
   const handleAuditActorFilterChange = (nextActor: ServerOpsAuditActor | 'all'): void => {
     setAuditActorFilter(nextActor)
     if (auditOperationFilter === 'all' || nextActor === 'all') return
-    /** 服务操作只属于 user，其它远程动作只属于 Agent。 */
-    const operationIsService = auditOperationFilter.startsWith('service-')
-    if ((nextActor === 'user') !== operationIsService) setAuditOperationFilter('all')
+    if (!isServerOpsAuditActorOperation(nextActor, auditOperationFilter)) setAuditOperationFilter('all')
   }
 
   /** 打开空白主机表单。 */
@@ -1231,6 +1367,10 @@ export function ServerOpsWorkspace(): React.ReactElement {
         activeSection={activeSection}
         connectionState={selectedConnectionState}
         agentSessionId={currentAgentSessionId}
+        containerLog={containerLog}
+        containerConsole={containerConsole}
+        onContainerLogChange={setContainerLog}
+        onContainerConsoleChange={setContainerConsole}
         {...agentAccessViewState}
         terminalContent={selectedHost && selectedConnectionState?.phase === 'connected' && selectedConnectionState.connectionId
           ? <ServerOpsRemoteTerminal hostId={selectedHost.id} connectionId={selectedConnectionState.connectionId} />
@@ -1249,6 +1389,7 @@ export function ServerOpsWorkspace(): React.ReactElement {
         onConnect={handleOpenConnect}
         onDisconnect={() => { void handleDisconnect() }}
         onToggleAgentAccess={() => { void agentAccessController.toggle() }}
+        onManageTrust={() => setTrustDialogOpen(true)}
         onRefresh={() => void loadHosts()}
         onAuditHostFilterChange={setAuditHostFilter}
         onAuditActorFilterChange={handleAuditActorFilterChange}
@@ -1260,7 +1401,10 @@ export function ServerOpsWorkspace(): React.ReactElement {
         hosts={hosts}
         selectedHostId={selectedHost?.id ?? null}
         onOpenChange={setDrawerOpen}
-        onSelect={setSelectedHostId}
+        onSelect={(hostId) => {
+          if (hostId === selectedHost?.id) return
+          transferLeave.requestLeave(() => { setContainerConsole(null); setContainerLog(null); setSelectedHostId(hostId) })
+        }}
         onCreate={handleCreateHost}
         onEdit={handleEditHost}
         onDelete={setPendingDeleteHost}
@@ -1272,6 +1416,7 @@ export function ServerOpsWorkspace(): React.ReactElement {
         onOpenChange={setDialogOpen}
         onSubmit={handleSaveHost}
       />
+      {transferLeave.dialog}
       <ServerOpsConnectDialog
         open={connectDialogOpen}
         host={selectedHost}
@@ -1280,6 +1425,15 @@ export function ServerOpsWorkspace(): React.ReactElement {
         requireCredential={Boolean(connectError)}
         onOpenChange={setConnectDialogOpen}
         onSubmit={handleConnect}
+      />
+      <ServerOpsTrustDialog
+        open={trustDialogOpen}
+        hostId={selectedHost?.id ?? null}
+        onOpenChange={setTrustDialogOpen}
+        onCommitted={(result) => {
+          toast.success(result.action === 'replace' ? '服务器信任已替换' : '服务器信任已撤销')
+          if (activeSection === 'audit') void auditController.refresh()
+        }}
       />
       <AlertDialog
         open={selectedConnectionState?.phase === 'host-key-required'}
@@ -1304,7 +1458,7 @@ export function ServerOpsWorkspace(): React.ReactElement {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      <AlertDialog open={selectedConnectionState?.phase === 'blocked'} onOpenChange={(open) => { if (!open) void handleDisconnect() }}>
+      <AlertDialog open={selectedConnectionState?.phase === 'blocked' && !trustDialogOpen} onOpenChange={(open) => { if (!open && !trustDialogOpen) void handleDisconnect() }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>服务器指纹已变化</AlertDialogTitle>
@@ -1316,7 +1470,17 @@ export function ServerOpsWorkspace(): React.ReactElement {
             <div><div className="mb-1 text-muted-foreground">原指纹</div><div className="break-all font-mono">{selectedConnectionState?.previousHostKey?.fingerprint}</div></div>
             <div><div className="mb-1 text-muted-foreground">新指纹</div><div className="break-all font-mono text-destructive">{selectedConnectionState?.hostKey?.fingerprint}</div></div>
           </div>
-          <AlertDialogFooter><AlertDialogAction onClick={() => { void handleDisconnect() }}>关闭</AlertDialogAction></AlertDialogFooter>
+          <AlertDialogFooter>
+            <AlertDialogCancel>关闭</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault()
+                setTrustDialogOpen(true)
+              }}
+            >
+              <Fingerprint className="size-3.5" aria-hidden="true" />管理服务器信任
+            </AlertDialogAction>
+          </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
       <AlertDialog open={pendingDeleteHost !== null} onOpenChange={(open) => { if (!open && !deleting) setPendingDeleteHost(null) }}>

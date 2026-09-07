@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type {
   ServerOpsConnectionState,
+  ServerOpsConsoleExitEvent,
+  ServerOpsConsoleOutputEvent,
   ServerOpsHost,
   ServerOpsTerminalExitEvent,
   ServerOpsTerminalOutputEvent,
@@ -8,8 +10,10 @@ import type {
 import { ServerOpsConnectionService } from './server-ops-connection-service'
 import type { ServerOpsResolvedCredential } from './server-ops-credential-store'
 import type { ServerOpsRuntimeConnectionInput } from './server-ops-runtime-client'
+import type { ServerOpsSftpCall } from './server-ops-runtime-client'
 import type { ServerOpsRuntimeLogExitEvent, ServerOpsRuntimeLogOutputEvent } from './server-ops-runtime-client'
 import type { ServerOpsRuntimeConnectResult } from '../../../utility/server-ops/server-ops-runtime-protocol'
+import type { ServerOpsSftpResult } from '../../../utility/server-ops/server-ops-sftp-runtime'
 
 /** 创建连接测试使用的公开主机。 */
 function createHost(overrides: Partial<ServerOpsHost> = {}): ServerOpsHost {
@@ -32,6 +36,11 @@ function createDependencies(
   results: Array<ServerOpsRuntimeConnectResult | Promise<ServerOpsRuntimeConnectResult>>,
   host = createHost(),
   initialTrustedKey?: { algorithm: string; fingerprint: string },
+  options: {
+    acquireMutationGuard?: () => Promise<() => void>
+    sftp?: (input: ServerOpsSftpCall) => Promise<ServerOpsSftpResult>
+    console?: boolean
+  } = {},
 ) {
   /** runtime 收到的真实连接请求。 */
   const connects: ServerOpsRuntimeConnectionInput[] = []
@@ -61,8 +70,13 @@ function createDependencies(
   let logOutputListener: ((event: ServerOpsRuntimeLogOutputEvent) => void) | undefined
   /** runtime 日志退出监听器。 */
   let logExitListener: ((event: ServerOpsRuntimeLogExitEvent) => void) | undefined
+  let consoleOutputListener: ((event: ServerOpsConsoleOutputEvent) => void) | undefined
+  let consoleExitListener: ((event: ServerOpsConsoleExitEvent) => void) | undefined
+  const consoleCalls: Array<{ type: string; input: unknown }> = []
   /** 连续生成 connection/candidate ID 的计数。 */
   let nextId = 0
+  /** 由用例控制远程命令终态，验证变更期间 busy 门禁。 */
+  let pendingExec: Promise<{ stdout: string; stderr: string; truncated: boolean }> | undefined
 
   const service = new ServerOpsConnectionService({
     hosts: {
@@ -86,7 +100,8 @@ function createDependencies(
     },
     runtime: {
       connect: async (input) => { connects.push(input); return results.shift() ?? { status: 'connected', hostKey: trustedKey! } },
-      exec: async () => ({ stdout: '', stderr: '', truncated: false }),
+      exec: async () => pendingExec ?? { stdout: '', stderr: '', truncated: false },
+      ...(options.sftp ? { sftp: options.sftp } : {}),
       startLog: async (hostId, connectionId, streamId, command) => { logStarts.push({ hostId, connectionId, streamId, command }) },
       stopLog: (hostId, connectionId, streamId) => { logStops.push({ hostId, connectionId, streamId }) },
       acknowledgeLog: (hostId, connectionId, streamId, sequence) => { logAcks.push({ hostId, connectionId, streamId, sequence }) },
@@ -98,10 +113,20 @@ function createDependencies(
       onExit: (listener) => { exitListener = listener; return () => { exitListener = undefined } },
       onLogOutput: (listener) => { logOutputListener = listener; return () => { logOutputListener = undefined } },
       onLogExit: (listener) => { logExitListener = listener; return () => { logExitListener = undefined } },
+      ...(options.console ? {
+        startConsole: async (input) => { consoleCalls.push({ type: 'start', input }) },
+        stopConsole: async (input) => { consoleCalls.push({ type: 'stop', input }) },
+        inputConsole: (input) => { consoleCalls.push({ type: 'input', input }) },
+        resizeConsole: (input) => { consoleCalls.push({ type: 'resize', input }) },
+        acknowledgeConsole: (input) => { consoleCalls.push({ type: 'ack', input }) },
+        onConsoleOutput: (listener) => { consoleOutputListener = listener; return () => { consoleOutputListener = undefined } },
+        onConsoleExit: (listener) => { consoleExitListener = listener; return () => { consoleExitListener = undefined } },
+      } : {}),
     },
     uuid: () => `id-${++nextId}`,
     resolveSshAgent: () => '/tmp/agent.sock',
     readPrivateKey: () => Buffer.from('private-key'),
+    acquireMutationGuard: options.acquireMutationGuard ?? (async () => () => undefined),
   })
 
   return {
@@ -111,8 +136,13 @@ function createDependencies(
     logStarts,
     logStops,
     logAcks,
+    consoleCalls,
     writes,
+    emitConsoleOutput: (event: ServerOpsConsoleOutputEvent) => consoleOutputListener?.(event),
+    emitConsoleExit: (event: ServerOpsConsoleExitEvent) => consoleExitListener?.(event),
     getTrustedKey: () => trustedKey,
+    setTrustedKey: (key: typeof trustedKey) => { trustedKey = key },
+    setPendingExec: (value: typeof pendingExec) => { pendingExec = value },
     deleteHost: () => { hostExists = false },
     emitOutput: (event: ServerOpsTerminalOutputEvent) => outputListener?.(event),
     emitExit: (event: ServerOpsTerminalExitEvent) => exitListener?.(event),
@@ -131,6 +161,68 @@ function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void
 }
 
 describe('服务器运维连接 Service', () => {
+  test('Given 旧地址观测到变化密钥 When 主机改到新 endpoint Then 不把旧观测作为新地址的替换候选', async () => {
+    const oldKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:old' }
+    const newKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:new' }
+    const host = createHost({ authMethod: 'ssh-agent' })
+    const fixture = createDependencies([{ status: 'host-key-rejected', observedHostKey: newKey }], host, oldKey)
+    try {
+      expect((await fixture.service.connect({ hostId: host.id, cols: 80, rows: 24 })).phase).toBe('blocked')
+      host.port = 2222
+      expect(fixture.service.getState(host.id).phase).toBe('disconnected')
+    } finally { fixture.service.dispose() }
+  })
+  test('Given 信任监听失效 When 旧连接输入或用户重连 Then 立即拒绝且不产生新认证', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' }
+    const fixture = createDependencies([{ status: 'connected', hostKey }], createHost({ authMethod: 'ssh-agent' }), hostKey)
+    try {
+      const state = await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24 })
+      fixture.service.blockUnavailableTrustMonitoring()
+      expect(() => fixture.service.writeTerminal({ hostId: 'host-1', connectionId: state.connectionId!, data: 'pwd\n' })).toThrow()
+      expect((await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24 })).errorCode).toBe('SERVER_OPS_TRUST_WATCH_UNAVAILABLE')
+      expect(fixture.connects).toHaveLength(1)
+      expect(fixture.disconnects).toHaveLength(1)
+    } finally { fixture.service.dispose() }
+  })
+  test('Given 另一实例撤销信任 When 当前连接发送新命令或终端输入 Then 断线并拒绝旧身份', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' }
+    const fixture = createDependencies([{ status: 'connected', hostKey }], createHost({ authMethod: 'ssh-agent' }), hostKey)
+    const state = await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24 })
+    fixture.setTrustedKey(undefined)
+    expect(() => fixture.service.writeTerminal({ hostId: 'host-1', connectionId: state.connectionId!, data: 'whoami\n' })).toThrow()
+    expect(fixture.writes).toHaveLength(0)
+    expect(fixture.service.getState('host-1').phase).toBe('disconnected')
+    await expect(fixture.service.exec('host-1', state.connectionId!, 'pwd', 1000)).rejects.toThrow()
+    fixture.service.dispose()
+  })
+
+  test('Given 信任在握手期间变更 When 旧连接迟到成功 Then 不发布 connected', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' }
+    const pending = createDeferred<ServerOpsRuntimeConnectResult>()
+    const fixture = createDependencies([pending.promise], createHost({ authMethod: 'ssh-agent' }), hostKey)
+    const connecting = fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24 })
+    fixture.setTrustedKey({ algorithm: 'ssh-ed25519', fingerprint: 'SHA256:changed' })
+    pending.resolve({ status: 'connected', hostKey })
+    expect((await connecting).phase).not.toBe('connected')
+    expect(fixture.disconnects).toHaveLength(1)
+    fixture.service.dispose()
+  })
+
+  test('Given 命令仍在执行 When 检查变更门禁 Then busy 直到精确命令结束', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' }
+    const fixture = createDependencies([{ status: 'connected', hostKey }], createHost({ authMethod: 'ssh-agent' }), hostKey)
+    const pending = createDeferred<{ stdout: string; stderr: string; truncated: boolean }>()
+    fixture.setPendingExec(pending.promise)
+    const state = await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24 })
+    const command = fixture.service.exec('host-1', state.connectionId!, 'pwd', 1000)
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(true)
+    pending.resolve({ stdout: '/', stderr: '', truncated: false })
+    await command
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(false)
+    expect(fixture.service.getGeneration('host-1')).toBeGreaterThan(0)
+    fixture.service.dispose()
+  })
+
   test('两个并发连接只接受最后一次连接并释放过期 runtime', async () => {
     /** 两次 runtime 连接共用的可信 Host Key。 */
     const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:concurrent' }
@@ -264,6 +356,63 @@ describe('服务器运维连接 Service', () => {
     expect(fixture.getTrustedKey()).toEqual(hostKey)
   })
 
+  test.each(['disconnect', 'endpoint', 'generation'] as const)(
+    'Given 首次确认等待实例 guard When %s 使候选失效 Then 不写信任且不再次认证',
+    async (reason) => {
+      const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:guarded' }
+      const gate = createDeferred<() => void>()
+      let released = 0
+      const host = createHost()
+      const fixture = createDependencies(
+        [{ status: 'host-key-rejected', observedHostKey: hostKey }],
+        host,
+        undefined,
+        { acquireMutationGuard: () => gate.promise },
+      )
+      const pending = await fixture.service.connect({
+        hostId: host.id, cols: 80, rows: 24,
+        credential: { kind: 'password', password: 'secret', remember: false },
+      })
+      const confirming = fixture.service.confirmHostKey({
+        hostId: host.id, candidateId: pending.candidate!.candidateId, cols: 80, rows: 24,
+      })
+      if (reason === 'disconnect') fixture.service.disconnect(host.id)
+      if (reason === 'endpoint') host.port = 2222
+      if (reason === 'generation') {
+        await fixture.service.connect({ hostId: host.id, cols: 80, rows: 24 })
+      }
+      gate.resolve(() => { released += 1 })
+
+      const state = await confirming
+      expect(state.errorCode).toBe('SERVER_OPS_HOST_KEY_CANDIDATE_EXPIRED')
+      expect(fixture.getTrustedKey()).toBeUndefined()
+      expect(fixture.connects).toHaveLength(reason === 'generation' ? 2 : 1)
+      expect(released).toBe(1)
+      fixture.service.dispose()
+    },
+  )
+
+  test('Given 首次信任已提交 When guard release 失败 Then 不掩盖提交并继续 fresh reconnect', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:release' }
+    const fixture = createDependencies(
+      [{ status: 'host-key-rejected', observedHostKey: hostKey }, { status: 'connected', hostKey }],
+      createHost(),
+      undefined,
+      { acquireMutationGuard: async () => () => { throw new Error('release failed') } },
+    )
+    const pending = await fixture.service.connect({
+      hostId: 'host-1', cols: 80, rows: 24,
+      credential: { kind: 'password', password: 'secret', remember: false },
+    })
+
+    const connected = await fixture.service.confirmHostKey({
+      hostId: 'host-1', candidateId: pending.candidate!.candidateId, cols: 80, rows: 24,
+    })
+    expect(connected.phase).toBe('connected')
+    expect(fixture.getTrustedKey()).toEqual(hostKey)
+    fixture.service.dispose()
+  })
+
   test('Host Key 变化直接阻断且展示旧新指纹', async () => {
     /** 已固定的旧 Host Key。 */
     const previous = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:old' }
@@ -344,7 +493,7 @@ describe('服务器运维连接 Service', () => {
   })
 
   test('exec 校验连接归属、命令长度和 timeout 边界', async () => {
-    const fixture = createDependencies([{ status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } }])
+    const fixture = createDependencies([{ status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } }], createHost(), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' })
     const connected = await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24, credential: { kind: 'password', password: 'secret', remember: false } })
     expect(connected.phase).toBe('connected')
     await expect(fixture.service.exec('host-1', connected.connectionId!, 'printf ok', 1000)).resolves.toMatchObject({ truncated: false })
@@ -353,6 +502,39 @@ describe('服务器运维连接 Service', () => {
     await expect(fixture.service.exec('host-1', connected.connectionId!, 'x'.repeat(8193), 1000)).rejects.toThrow('SERVER_OPS_EXEC_COMMAND_INVALID')
     await expect(fixture.service.exec('host-1', connected.connectionId!, 'printf ok', 999)).rejects.toThrow('SERVER_OPS_EXEC_TIMEOUT_INVALID')
     await expect(fixture.service.exec('host-1', connected.connectionId!, 'printf ok', 120001)).rejects.toThrow('SERVER_OPS_EXEC_TIMEOUT_INVALID')
+  })
+
+  test('Given SFTP 请求在途 When 信任变化 Then 结果被拒绝且 pending 门禁精确收口', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:sftp' }
+    const pending = createDeferred<ServerOpsSftpResult>()
+    const calls: ServerOpsSftpCall[] = []
+    const fixture = createDependencies(
+      [{ status: 'connected', hostKey }],
+      createHost(),
+      hostKey,
+      { sftp: async (input) => { calls.push(input); return pending.promise } },
+    )
+    const connected = await fixture.service.connect({
+      hostId: 'host-1', cols: 80, rows: 24,
+      credential: { kind: 'password', password: 'secret', remember: false },
+    })
+    const call: ServerOpsSftpCall = {
+      type: 'stat', hostId: 'host-1', connectionId: connected.connectionId!,
+      input: { ownerKey: 'window-1', deadlineAt: Date.now() + 1_000, path: '/srv/app' },
+    }
+    const request = fixture.service.sftp(call)
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(true)
+    fixture.setTrustedKey(undefined)
+    pending.resolve({
+      type: 'stat', requestId: 'request-1',
+      result: { size: 1, mtime: 1, mode: 0o644, kind: 'file' },
+    })
+
+    await expect(request).rejects.toThrow('SERVER_OPS_HOST_KEY_CHANGED')
+    expect(calls).toEqual([call])
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(false)
+    await expect(fixture.service.sftp({ ...call, connectionId: 'stale' })).rejects.toThrow('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    fixture.service.dispose()
   })
 
   test('Given 活跃连接 When 读取并修改身份副本 Then 内部身份不受污染且重连递增代次', async () => {
@@ -456,7 +638,7 @@ describe('服务器运维连接 Service', () => {
   })
 
   test('Given 当前连接身份 When 日志启停与 ACK Then runtime 只收到精确身份', async () => {
-    const fixture = createDependencies([{ status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:log' } }])
+    const fixture = createDependencies([{ status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:log' } }], createHost(), { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:log' })
     await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24, credential: { kind: 'password', password: 'secret', remember: false } })
     /** 当前连接的不可变身份快照。 */
     const identity = fixture.service.getActiveIdentity('host-1')
@@ -468,6 +650,24 @@ describe('服务器运维连接 Service', () => {
     expect(fixture.logStarts).toEqual([{ hostId: 'host-1', connectionId: 'id-1', streamId: 'stream-1', command: 'journalctl --follow' }])
     expect(fixture.logAcks).toEqual([{ hostId: 'host-1', connectionId: 'id-1', streamId: 'stream-1', sequence: 7 }])
     expect(fixture.logStops).toEqual([{ hostId: 'host-1', connectionId: 'id-1', streamId: 'stream-1' }])
+  })
+
+  test('Given Docker Console 已启动 When trust 查询 pending Then channel 退出前持续 busy 且完整身份转发', async () => {
+    const hostKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:console' }
+    const fixture = createDependencies([{ status: 'connected', hostKey }], createHost(), hostKey, { console: true })
+    await fixture.service.connect({ hostId: 'host-1', cols: 80, rows: 24, credential: { kind: 'password', password: 'secret', remember: false } })
+    const identity = fixture.service.getActiveIdentity('host-1')
+    const session = await fixture.service.startConsole(identity, 'console-1', 'a'.repeat(64), 80, 24)
+    const outputs: string[] = []
+    fixture.service.onConsoleOutput((event) => outputs.push(event.data))
+
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(true)
+    fixture.service.writeConsole({ ...session, data: 'pwd\n' })
+    fixture.emitConsoleOutput({ ...session, sequence: 1, data: 'hello' })
+    expect(outputs).toEqual(['hello'])
+    fixture.emitConsoleExit({ ...session, message: '容器终端已关闭' })
+    expect(fixture.service.hasPendingOperations('host-1')).toBe(false)
+    expect(fixture.consoleCalls.map((call) => call.type)).toEqual(['start', 'input'])
   })
 
   test('Given 旧 generation When 重连后操作或收到事件 Then 不进入新连接', async () => {

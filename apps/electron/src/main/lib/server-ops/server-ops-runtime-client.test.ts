@@ -149,6 +149,147 @@ async function connectFixture(fixture: ReturnType<typeof createFixture>): Promis
   await connecting
 }
 
+describe('SFTP RPC 生命周期', () => {
+  test('Given 已连接主机 When 收到错误身份或类型 Then 等待精确匹配的结果', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const pending = fixture.client.sftp({ type: 'list', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/' } })
+    let resolved = false
+    void pending.then(() => { resolved = true })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-2', connectionId: 'connection-1', result: { type: 'list', requestId: 'exec-1', result: { path: '/', entries: [] } } })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'close-owner', requestId: 'exec-1', result: { ok: true } } })
+    await flushRuntimeClient()
+    expect(resolved).toBe(false)
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'list', requestId: 'exec-1', result: { path: '/', entries: [] } } })
+    await expect(pending).resolves.toMatchObject({ type: 'list', result: { path: '/', entries: [] } })
+    fixture.client.stop()
+  })
+
+  test.each(['disconnect', 'crash', 'stop', 'owner-close'] as const)('Given 在途写操作 When %s Then 结果未知且不会重放', async (reason) => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const pending = fixture.client.sftp({ type: 'mkdir', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/new' } })
+    const rejection = pending.catch((error: unknown) => error)
+    if (reason === 'disconnect') fixture.client.disconnect('host-1', 'connection-1')
+    if (reason === 'crash') fixture.runtimeProcess.emit('exit')
+    if (reason === 'stop') fixture.client.stop()
+    if (reason === 'owner-close') fixture.client.closeSftpOwner('owner-1')
+    expect(await rejection).toMatchObject({ outcome: 'unknown' })
+    expect(fixture.port.messages.filter((entry) => entry.type === 'server-ops.sftp' && entry.input.type === 'mkdir')).toHaveLength(1)
+    fixture.client.stop()
+  })
+
+  test('Given SFTP deadline 到期 When 没有回复 Then 释放 owner 并返回未知写结果', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const pending = fixture.client.sftp({ type: 'mkdir', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 20, path: '/new' } })
+    await expect(pending).rejects.toMatchObject({ outcome: 'unknown', code: 'SERVER_OPS_SFTP_TIMEOUT' })
+    expect(fixture.port.messages.some((entry) => entry.type === 'server-ops.sftp' && entry.input.type === 'close-owner')).toBe(true)
+    fixture.client.stop()
+  })
+
+  test('Given owner 有远端资源 When 重复关闭 Then 复用 Promise 并只接受精确 close-owner ACK', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const listed = fixture.client.sftp({ type: 'list', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/' } })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'list', requestId: 'exec-1', result: { path: '/', entries: [] } } })
+    await listed
+
+    const first = fixture.client.closeSftpOwner('owner-1')
+    const second = fixture.client.closeSftpOwner('owner-1')
+    expect(second).toBe(first)
+    await expect(fixture.client.sftp({ type: 'list', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/' } }))
+      .rejects.toMatchObject({ code: 'SERVER_OPS_SFTP_OWNER_CLOSED' })
+    const closeRequest = fixture.port.messages.findLast((entry) => entry.type === 'server-ops.sftp' && entry.input.type === 'close-owner')
+    if (!closeRequest || closeRequest.type !== 'server-ops.sftp') throw new Error('SERVER_OPS_TEST_CLOSE_REQUEST_MISSING')
+    let resolved = false
+    void first.then(() => { resolved = true })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-2', connectionId: 'connection-1', result: { type: 'close-owner', requestId: closeRequest.input.requestId, result: { ok: true } } })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'write', requestId: closeRequest.input.requestId, result: { ok: true } } })
+    await flushRuntimeClient()
+    expect(resolved).toBe(false)
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'close-owner', requestId: closeRequest.input.requestId, result: { ok: true } } })
+    await expect(first).resolves.toBeUndefined()
+    fixture.client.stop()
+  })
+
+  test('Given close-owner 等待 ACK When runtime 退出 Then 明确返回清理未确认', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const listed = fixture.client.sftp({ type: 'list', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/' } })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'list', requestId: 'exec-1', result: { path: '/', entries: [] } } })
+    await listed
+    const closing = fixture.client.closeSftpOwner('owner-1')
+    fixture.runtimeProcess.emit('exit')
+    await expect(closing).rejects.toMatchObject({ code: 'SERVER_OPS_RUNTIME_FAILED' })
+  })
+
+  test('Given owner 资源所在连接已断开 When 后续关闭 Then 不宣称远端临时文件已清理', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const listed = fixture.client.sftp({ type: 'list', hostId: 'host-1', connectionId: 'connection-1', input: { ownerKey: 'owner-1', deadlineAt: Date.now() + 10_000, path: '/' } })
+    fixture.port.emitUnknown({ type: 'server-ops.sftp-result', hostId: 'host-1', connectionId: 'connection-1', result: { type: 'list', requestId: 'exec-1', result: { path: '/', entries: [] } } })
+    await listed
+    fixture.client.disconnect('host-1', 'connection-1')
+
+    await expect(fixture.client.closeSftpOwner('owner-1')).rejects.toMatchObject({ code: 'SERVER_OPS_SFTP_CLEANUP_UNCONFIRMED' })
+    fixture.client.stop()
+  })
+})
+
+describe('服务器运维 runtime client Docker Console', () => {
+  test('Given 活跃连接 When 启动、输出并关闭 Console Then started/exit 均按完整身份确认', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const session = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
+    const outputs: string[] = []
+    fixture.client.onConsoleOutput((event) => outputs.push(event.data))
+
+    const starting = fixture.client.startConsole({ ...session, cols: 80, rows: 24 })
+    await flushRuntimeClient()
+    expect(fixture.port.messages.at(-1)).toEqual({ type: 'server-ops.console-start', input: { ...session, cols: 80, rows: 24 } })
+    fixture.port.emit({ type: 'server-ops.console-started', session: { ...session, containerId: 'b'.repeat(64) } })
+    let started = false
+    void starting.then(() => { started = true })
+    await flushRuntimeClient()
+    expect(started).toBe(false)
+    fixture.port.emit({ type: 'server-ops.console-started', session })
+    await expect(starting).resolves.toBeUndefined()
+    fixture.port.emit({ type: 'server-ops.console-output', event: { ...session, sequence: 1, data: 'hello' } })
+    expect(outputs).toEqual(['hello'])
+
+    const closing = fixture.client.stopConsole(session)
+    expect(fixture.port.messages.at(-1)).toEqual({ type: 'server-ops.console-stop', input: session })
+    fixture.port.emit({ type: 'server-ops.console-exit', event: { ...session, message: '容器终端已关闭' } })
+    await expect(closing).resolves.toBeUndefined()
+  })
+
+  test('Given 某个 Console 订阅者抛错 When 输出和退出到达 Then 其它订阅者与关闭收口不受影响', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const session = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
+    const outputs: string[] = []
+    const exits: string[] = []
+    fixture.client.onConsoleOutput(() => { throw new Error('BROKEN_OUTPUT_LISTENER') })
+    fixture.client.onConsoleOutput((event) => outputs.push(event.data))
+    fixture.client.onConsoleExit(() => { throw new Error('BROKEN_EXIT_LISTENER') })
+    fixture.client.onConsoleExit((event) => exits.push(event.message))
+
+    const starting = fixture.client.startConsole({ ...session, cols: 80, rows: 24 })
+    await flushRuntimeClient()
+    fixture.port.emit({ type: 'server-ops.console-started', session })
+    await starting
+    fixture.port.emit({ type: 'server-ops.console-output', event: { ...session, sequence: 1, data: 'hello' } })
+    const closing = fixture.client.stopConsole(session)
+    fixture.port.emit({ type: 'server-ops.console-exit', event: { ...session, message: '容器终端已关闭' } })
+
+    await expect(closing).resolves.toBeUndefined()
+    expect(outputs).toEqual(['hello'])
+    expect(exits).toEqual(['容器终端已关闭'])
+    fixture.client.stop()
+  })
+})
+
 /** 在指定代次端口上建立测试连接。 */
 async function connectRotatingFixture(
   fixture: ReturnType<typeof createRotatingFixture>,

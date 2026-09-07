@@ -26,6 +26,7 @@ export interface ServerOpsLogsPanelProps {
   connectionId: string | null
   active: boolean
   connected: boolean
+  fixedSource?: ServerOpsLogSource
 }
 
 /** 本地日志缓冲的固定限制。 */
@@ -200,6 +201,7 @@ interface ServerOpsLogsControllerOptions {
   notify: (kind: 'success' | 'warning' | 'error' | 'info', message: string) => void
   buffer?: ServerOpsLogBuffer
   scheduleMaterialize?: (callback: () => void) => () => void
+  initialSource?: ServerOpsLogSource
 }
 
 /** 日志控制器公开操作。 */
@@ -243,16 +245,13 @@ export function useServerOpsVisibleLogText(lines: string[], text: string, query:
   }, [lines, query, text])
 }
 
-/** 默认远程筛选只读取最近少量日志，避免首次连接产生无界突发。 */
-const DEFAULT_REMOTE_FILTERS: ServerOpsLogRemoteFilters = {
-  source: { kind: 'system' },
-  since: '15m',
-  priority: 'info',
-  tailLines: 200,
+/** 创建默认远程筛选，只读取最近少量日志避免首次连接产生无界突发。 */
+function createDefaultRemoteFilters(source: ServerOpsLogSource = { kind: 'system' }): ServerOpsLogRemoteFilters {
+  return { source, since: '15m', priority: 'info', tailLines: 200 }
 }
 
 /** 为指定主机构造不携带任何历史日志或筛选的空闲投影。 */
-function createIdleServerOpsLogsProjection(hostId: string): ServerOpsLogsProjection {
+function createIdleServerOpsLogsProjection(hostId: string, source: ServerOpsLogSource = { kind: 'system' }): ServerOpsLogsProjection {
   return {
     hostId,
     streamId: null,
@@ -266,7 +265,7 @@ function createIdleServerOpsLogsProjection(hostId: string): ServerOpsLogsProject
     atBottom: true,
     bufferRevision: 0,
     materializedRevision: 0,
-    ...DEFAULT_REMOTE_FILTERS,
+    ...createDefaultRemoteFilters(source),
     text: '',
     lines: [],
     lineCount: 0,
@@ -279,8 +278,9 @@ function createIdleServerOpsLogsProjection(hostId: string): ServerOpsLogsProject
 export function projectServerOpsLogsForHost(
   projection: ServerOpsLogsProjection,
   hostId: string,
+  source: ServerOpsLogSource = { kind: 'system' },
 ): ServerOpsLogsProjection {
-  return projection.hostId === hostId ? projection : createIdleServerOpsLogsProjection(hostId)
+  return projection.hostId === hostId ? projection : createIdleServerOpsLogsProjection(hostId, source)
 }
 
 /** Electron 对日志启动 invoke rejection 添加的唯一固定前缀。 */
@@ -314,7 +314,10 @@ function classifyLogError(error: unknown): Pick<ServerOpsLogsProjection, 'status
 
 /** 比较两个日志来源是否精确相同。 */
 function isSameLogSource(left: ServerOpsLogSource, right: ServerOpsLogSource): boolean {
-  return left.kind === right.kind && (left.kind === 'system' || (right.kind === 'unit' && left.unitId === right.unitId))
+  if (left.kind !== right.kind) return false
+  if (left.kind === 'system') return true
+  if (left.kind === 'unit' && right.kind === 'unit') return left.unitId === right.unitId
+  return left.kind === 'container' && right.kind === 'container' && left.containerId === right.containerId
 }
 
 /** 创建具备精确流身份、ACK 与完整释放语义的日志控制器。 */
@@ -347,7 +350,7 @@ export function createServerOpsLogsController(options: ServerOpsLogsControllerOp
   /** 每次缓冲内容变化推进的轻量版本号。 */
   let bufferRevision = 0
   /** 远程受控筛选。 */
-  let remoteFilters: ServerOpsLogRemoteFilters = { ...DEFAULT_REMOTE_FILTERS }
+  let remoteFilters: ServerOpsLogRemoteFilters = createDefaultRemoteFilters(options.initialSource)
   /** 所有 stop/start 共用的串行屏障。 */
   let transitionBarrier = Promise.resolve()
   /** 是否已有一次待执行的 UI 文本物化。 */
@@ -554,7 +557,7 @@ export function createServerOpsLogsController(options: ServerOpsLogsControllerOp
         || previous.connected !== nextContext.connected
       if (!contextChanged) return
       /** 切换主机时恢复旧 remount 的默认筛选，避免把 host-specific unit 带到新主机。 */
-      if (hostChanged) remoteFilters = { ...DEFAULT_REMOTE_FILTERS }
+      if (hostChanged) remoteFilters = createDefaultRemoteFilters(options.initialSource)
       context = { ...nextContext, connectionId: nextContext.connectionId ?? null }
       const revision = ++requestRevision
       /** 任一远程身份或可见性变化都先同步摘除旧流。 */
@@ -739,6 +742,7 @@ export function createServerOpsLogsController(options: ServerOpsLogsControllerOp
 /** 日志面板纯展示层属性。 */
 export interface ServerOpsLogsPanelViewProps extends Omit<ServerOpsLogsProjection, 'hostId' | 'streamId' | 'requestRevision'> {
   connected?: boolean
+  sourceLocked?: boolean
   onSourceChange: (source: ServerOpsLogSource) => void
   onUnitIdChange: (unitId: string) => void
   onSinceChange: (since: ServerOpsLogSince) => void
@@ -756,6 +760,7 @@ export interface ServerOpsLogsPanelViewProps extends Omit<ServerOpsLogsProjectio
 export function ServerOpsLogsPanelView({
   status,
   connected = false,
+  sourceLocked = false,
   text,
   lines,
   lineCount,
@@ -795,10 +800,17 @@ export function ServerOpsLogsPanelView({
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-content-area">
       <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-2 py-2">
-        <Select value={source.kind} onValueChange={(value) => onSourceChange(value === 'unit' ? { kind: 'unit', unitId: source.kind === 'unit' ? source.unitId : 'ssh.service' } : { kind: 'system' })}>
-          <SelectTrigger className="h-8 w-28 text-xs" aria-label="日志来源"><SelectValue /></SelectTrigger>
-          <SelectContent><SelectItem value="system">系统日志</SelectItem><SelectItem value="unit">指定服务</SelectItem></SelectContent>
-        </Select>
+        {sourceLocked || source.kind === 'container' ? (
+          <div className="flex h-8 min-w-0 items-center gap-2 border border-border/60 bg-background/40 px-2 text-xs">
+            <span className="shrink-0">{source.kind === 'container' ? '容器日志' : source.kind === 'unit' ? '服务日志' : '系统日志'}</span>
+            {source.kind === 'container' && <span className="truncate font-mono text-[10px] text-muted-foreground">{source.containerId.slice(0, 12)}...{source.containerId.slice(-6)}</span>}
+          </div>
+        ) : (
+          <Select value={source.kind} onValueChange={(value) => onSourceChange(value === 'unit' ? { kind: 'unit', unitId: source.kind === 'unit' ? source.unitId : 'ssh.service' } : { kind: 'system' })}>
+            <SelectTrigger className="h-8 w-28 text-xs" aria-label="日志来源"><SelectValue /></SelectTrigger>
+            <SelectContent><SelectItem value="system">系统日志</SelectItem><SelectItem value="unit">指定服务</SelectItem></SelectContent>
+          </Select>
+        )}
         {source.kind === 'unit' && (
           <Input
             defaultValue={source.unitId}
@@ -814,15 +826,17 @@ export function ServerOpsLogsPanelView({
             <SelectItem value="24h">24 小时</SelectItem><SelectItem value="boot">本次启动</SelectItem>
           </SelectContent>
         </Select>
-        <Select value={priority} onValueChange={(value) => onPriorityChange(value as ServerOpsLogPriority)}>
-          <SelectTrigger className="h-8 w-24 text-xs" aria-label="日志优先级"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="emerg">系统不可用</SelectItem><SelectItem value="alert">立即处理</SelectItem>
-            <SelectItem value="crit">严重</SelectItem><SelectItem value="err">错误</SelectItem>
-            <SelectItem value="warning">警告</SelectItem><SelectItem value="notice">通知</SelectItem>
-            <SelectItem value="info">信息</SelectItem><SelectItem value="debug">调试</SelectItem>
-          </SelectContent>
-        </Select>
+        {source.kind !== 'container' && (
+          <Select value={priority} onValueChange={(value) => onPriorityChange(value as ServerOpsLogPriority)}>
+            <SelectTrigger className="h-8 w-24 text-xs" aria-label="日志优先级"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="emerg">系统不可用</SelectItem><SelectItem value="alert">立即处理</SelectItem>
+              <SelectItem value="crit">严重</SelectItem><SelectItem value="err">错误</SelectItem>
+              <SelectItem value="warning">警告</SelectItem><SelectItem value="notice">通知</SelectItem>
+              <SelectItem value="info">信息</SelectItem><SelectItem value="debug">调试</SelectItem>
+            </SelectContent>
+          </Select>
+        )}
         <div className="relative min-w-36 flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
           <Input value={query} onChange={(event) => onQueryChange(event.target.value)} className="h-8 pl-7 text-xs" aria-label="搜索已接收日志" placeholder="搜索日志" />
@@ -865,12 +879,12 @@ export function ServerOpsLogsPanelView({
   )
 }
 
-/** 绑定 React 生命周期、滚动意图与现有 Electron 日志 IPC。 */
-export function ServerOpsLogsPanel({ hostId, connectionId, active, connected }: ServerOpsLogsPanelProps): React.ReactElement {
+/** 绑定单一固定来源的 React 生命周期、滚动意图与现有 Electron 日志 IPC。 */
+function ServerOpsLogsPanelInstance({ hostId, connectionId, active, connected, fixedSource }: ServerOpsLogsPanelProps): React.ReactElement {
   /** 当前日志控制器投影。 */
-  const [projection, setProjection] = React.useState<ServerOpsLogsProjection>(() => createIdleServerOpsLogsProjection(hostId))
+  const [projection, setProjection] = React.useState<ServerOpsLogsProjection>(() => createIdleServerOpsLogsProjection(hostId, fixedSource))
   /** Renderer 提交阶段先校验主机身份，passive effect 尚未清空时也不显示旧日志。 */
-  const visibleProjection = projectServerOpsLogsForHost(projection, hostId)
+  const visibleProjection = projectServerOpsLogsForHost(projection, hostId, fixedSource)
   /** 在当前主机的系统日志与服务日志间保留最近一次有效 unit。 */
   const [unitId, setUnitId] = React.useState('ssh.service')
   React.useEffect(() => {
@@ -885,6 +899,7 @@ export function ServerOpsLogsPanel({ hostId, connectionId, active, connected }: 
     stop: (input) => window.electronAPI.stopServerOpsLogStream(input),
     acknowledge: (input) => window.electronAPI.acknowledgeServerOpsLogOutput(input),
     exportLogs: (input) => window.electronAPI.exportServerOpsLogs(input),
+    initialSource: fixedSource,
     publish: setProjection,
     notify: (kind, message) => {
       if (kind === 'success') toast.success(message)
@@ -928,6 +943,7 @@ export function ServerOpsLogsPanel({ hostId, connectionId, active, connected }: 
     <ServerOpsLogsPanelView
       {...visibleProjection}
       connected={connected}
+      sourceLocked={fixedSource !== undefined}
       viewportRef={viewportRef}
       onScroll={(event) => {
         /** 4px 容差避免亚像素滚动导致底部状态抖动。 */
@@ -954,4 +970,15 @@ export function ServerOpsLogsPanel({ hostId, connectionId, active, connected }: 
       onReturnToBottom={handleReturnToBottom}
     />
   )
+}
+
+/** 固定日志来源变化时重建 owner，保证先停止旧容器流再启动新流。 */
+export function ServerOpsLogsPanel(props: ServerOpsLogsPanelProps): React.ReactElement {
+  /** React key 只编码公开来源身份，不包含连接凭据。 */
+  const sourceKey = props.fixedSource?.kind === 'container'
+    ? `container:${props.fixedSource.containerId}`
+    : props.fixedSource?.kind === 'unit'
+      ? `unit:${props.fixedSource.unitId}`
+      : props.fixedSource?.kind ?? 'interactive'
+  return <ServerOpsLogsPanelInstance key={sourceKey} {...props} />
 }

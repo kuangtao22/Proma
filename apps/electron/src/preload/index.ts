@@ -15,6 +15,16 @@ import { createNormalPathManagementPreloadApi } from './path-management-preload'
 import type { NormalPathManagementPreloadApi } from './path-management-preload'
 import { invokeAgentMessage } from './agent-message-preload'
 import { invokeServerOpsAuditList } from './server-ops-audit-preload'
+import { createServerOpsTrustPreload } from './server-ops-trust-preload'
+import type { ServerOpsTrustPreload } from './server-ops-trust-preload'
+import { createServerOpsDockerPreload } from './server-ops-docker-preload'
+import type { ServerOpsDockerPreload } from './server-ops-docker-preload'
+import { createServerOpsFilesPreload } from './server-ops-files-preload'
+import type { ServerOpsFilesPreload } from './server-ops-files-preload'
+import { createServerOpsConsolePreload } from './server-ops-console-preload'
+import type { ServerOpsConsolePreloadApi } from './server-ops-console-preload'
+import { createServerOpsTransferPreload } from './server-ops-transfer-preload'
+import type { ServerOpsTransferPreload } from './server-ops-transfer-preload'
 import {
   invokeServerOpsLogAck,
   invokeServerOpsLogExport,
@@ -258,7 +268,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi {
+export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload {
   // ===== 运行时相关 =====
 
   /**
@@ -1465,6 +1475,16 @@ const designPreloadApi = createDesignPreloadApi(ipcRenderer)
 const pathManagementPreloadApi = createNormalPathManagementPreloadApi(ipcRenderer)
 
 const electronAPI: ElectronAPI = {
+  ...createServerOpsTrustPreload((channel, input) => ipcRenderer.invoke(channel, input)),
+  ...createServerOpsDockerPreload((channel, input) => ipcRenderer.invoke(channel, input)),
+  ...createServerOpsFilesPreload((channel, input) => ipcRenderer.invoke(channel, input)),
+  ...createServerOpsConsolePreload(ipcRenderer),
+  ...createServerOpsTransferPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
+    /** 隔离 Electron 事件对象，只向文件视图传递严格解析的进度。 */
+    const bridge = (_event: unknown, value: unknown): void => listener(value)
+    ipcRenderer.on(channel, bridge)
+    return () => ipcRenderer.removeListener(channel, bridge)
+  }),
   ...pathManagementPreloadApi,
   ...designPreloadApi,
 

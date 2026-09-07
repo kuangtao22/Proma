@@ -1,6 +1,6 @@
 # Server Ops 剩余能力实施计划
 
-> **For agentic workers:** 后续实施使用 `executing-plans` 按任务推进；独立子任务可采用 `subagent-driven-development`，但 shared/runtime/IPC 等共享文件由单一集成负责人维护。复选框只在取得对应证据后勾选。本轮只规划，不执行下面的代码任务。
+> **For agentic workers:** 使用 `executing-plans` 按任务推进；独立子任务可采用 `subagent-driven-development`，但 shared/runtime/IPC 等共享文件由单一集成负责人维护。用户已授权开始开发；复选框只在取得对应证据后勾选。
 
 **Goal:** 补齐 SSH 指纹恢复、文件管理、Docker 和 PostgreSQL/MySQL/Redis 数据服务，使每个阶段形成可观察、可批准、可取消、可验证的运维流程。
 
@@ -18,16 +18,34 @@
 - [x] 建立独立目录 `.worktrees/server-ops-completion`，不搬运主工作区未提交改动。
 - [x] 编写总体设计与本实施计划初稿。
 - [x] 完成计划交叉审查与修正；规划文档纳入本分支本次提交。
-- [ ] P0 指纹恢复与共享配置一致性。
-- [ ] P1 远程文件工作流。
-- [ ] P2 Docker 工作流。
+- [x] P0 指纹恢复与共享配置一致性实现及本地 fixture 验证。
+- [x] P1 远程文件工作流实现及本地 fixture 验证。
+- [x] P2 Docker 工作流实现及本地 fixture 验证。
 - [ ] P3a-c 三类数据服务诊断。
 - [ ] P3d 查询与受控变更。
 - [ ] 各阶段实机、压力与安装包验收。
 
 设计依据：`docs/superpowers/specs/2026-09-07-server-ops-completion-design.md`。本计划锁定任务范围、文件责任与验收条件；新增领域服务的方法签名由各阶段合同任务先定义并评审，随后才进入实现，不能边接 UI 边临时扩大协议。
 
-上次核查的 389 项测试结果属于 2026-09-06 主工作区，核心运维源码与本分支起点一致。本轮仅验证文档和 Git 状态，不重复运行未变化的代码或把历史测试冒充新分支完整基线。
+上次核查的 389 项测试结果属于 2026-09-06 主工作区，不作为本分支完成证据。当前开发仍在 `codex/server-ops-completion` 独立 worktree；用户已要求提交 P0-P2 实现与验证记录，P3 仍待开发。
+
+### 2026-09-07 开发证据
+
+- P0 配置锁、Store 一致性、审计 v3、信任候选、四层 API 与界面已实现；此前精确 P0 回归 459 pass，完整 Electron build 通过。
+- 真实 Electron utility + localhost 双 Host Key smoke 已通过换钥阻断、取消零认证、双别名撤权、显式重连、撤销再确认。
+- P0 审查补修已完成：blocked 弹窗跳转保留候选；systemd 主窗口鉴权；首次信任及审计迁移增加旧实例 guard；事务结果未知保持 unknown。
+- P1 已接通 SFTP 文件浏览/预览、mkdir/rename/delete/save/save-as、Main fd lease、传输队列、系统选择器、事件进度和页面。窗口关闭、切换主机确认、候选取消、异步迟到、no-clobber 与 unknown 均已覆盖；Agent list/read/mutate 复用同一权限与审计链。
+- P1 真实 Electron utility + localhost SSH 文件 smoke 通过；另用 localhost OpenSSH SFTP 与真实 fd 完成 65 KiB+1 二进制上传/下载 hash、双向目标不覆盖与活动取消。文件正文和本地路径不进入审计。
+- P2 已接通容器/镜像/网络/卷、脱敏详情、日志、独立 Console、start/stop/restart 与回查；UI 和 Agent 均复用领域服务，变更在 bypass 模式仍逐次审批。localhost SSH Docker 命令与 PTY Console fixture 通过，未调用用户 Docker daemon。
+- P3 驱动选型记录已建立，新增依赖的批准仍待用户回复；未安装依赖，未声称数据服务可用。
+- 最终集成回归：Server Ops、共享合同、Preload、Renderer、Agent 权限与工具共 59 文件、704 pass / 0 fail；全仓 `bun run typecheck` 通过。退出屏障、重复取消、异步 fd 清理与 SFTP owner 关闭 ACK 均已纳入回归。
+- 最终 macOS arm64 `bun run electron:build` 通过，已检查 main/preload/runtime 与 `dist/resources` 原生组件。构建保留既有 EventKit availability 警告；其它平台安装包、持续压力及用户服务器验收尚未完成。
+- Electron UI fixture 已验证文件预览/编辑、传输入口、Docker 详情/审批/日志/Console 入口和切主机取消流程；1180px/430px、深浅主题均有非空截图且无页面横向溢出。此 UI fixture 使用内存 API，不替代真实 SSH/SFTP smoke。
+- 最新 runtime 下重新执行真实 Electron + localhost OpenSSH SFTP 传输 smoke，通过双向内容 hash、no-clobber 与取消释放；远端清理 ACK 失败时保留真实终态、warning 和 unknown 恢复意图。
+- 既有静态检查问题：`check:fork-compat` 的 Bridge 生命周期组合、Agent Island Adapter 边界共 2/9 项失败，已用原始 HEAD 验证同样失败；`check:data-root` 命中未改动的 `design-context-catalog.ts` 与 `design-paths.ts`。本轮未修改这些无关模块。
+- 本 worktree 的 Vite 位于 `http://127.0.0.1:5174`；Electron 使用 `PROMA_DEV_INSTANCE=server-ops-completion` 启动，已核实进程 cwd 并打开实际运维面板，文件与 Docker 已替换占位。未连接用户服务器；本次仅创建本地 Git 提交，不推送或发布。
+
+以上勾选表示实现与列出的本地验证完成。下方组合了实机、提交或安装包要求的任务复选框仍保留未完成，不能据此宣称整个计划或 P3 已交付。
 
 ## 2. 分阶段交付与依赖
 
@@ -43,7 +61,7 @@
 
 ## 3. 现有文件与新增文件责任
 
-以下路径均相对本 worktree 根。标注“新增”的文件尚不存在，是规划的实现位置。
+以下路径均相对本 worktree 根。标注“新增”表示相对规划基线新增；P0-P2 对应实现已创建，P3 文件仍为计划位置。
 
 | 文件/目录 | 责任 |
 | --- | --- |
@@ -223,7 +241,7 @@
 
 ## 8. 验证命令与成功标准
 
-实施命令统一在本 worktree 执行，使用 Bun，不替换主工作区依赖。本轮规划不执行安装/构建。
+实施命令统一在本 worktree 执行，使用 Bun，不替换主工作区依赖。
 
 ```bash
 bun install --frozen-lockfile
@@ -257,4 +275,4 @@ git diff --check
 
 ## 10. 本轮交付与下一步
 
-本轮只提交这份计划、配套设计和分支 MEMORY 的规划记录。后续开始实施时从 Task 0.1 进入，先验证共享配置与信任恢复，再推进文件、Docker 和数据服务。依赖选型、fixture 能力和真实平台可用性都有明确闸门，不据尚未执行的验证作完成承诺。
+P0-P2 已完成代码接入、回归、独立审查、UI fixture 与开发实例启动，实际窗口已检查文件和 Docker 页。P3 在依赖批准后推进；页面明确显示“尚未接入”。本机已有 PostgreSQL 16、MySQL 与 Redis 引擎二进制，后续可创建独立临时数据目录进行真实引擎验证，不使用用户已有数据库。真实用户服务器、最大容量压力和非本机平台安装包仍未验收，不与本机 fixture 通过混为一谈。

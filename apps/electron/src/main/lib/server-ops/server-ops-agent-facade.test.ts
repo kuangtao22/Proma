@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import type { AgentSessionMeta, ServerOpsAuditAppendInput, ServerOpsAuditRecord, ServerOpsConnectionState, ServerOpsHost } from '@proma/shared'
+import type { AgentSessionMeta, ServerOpsAuditAppendInput, ServerOpsAuditRecord, ServerOpsConnectionState, ServerOpsFileListResult, ServerOpsHost } from '@proma/shared'
 import {
   createServerOpsAgentFacade,
   type ServerOpsAgentFacadeDependencies,
@@ -26,6 +26,7 @@ function dependencies(options: {
   session?: Partial<AgentSessionMeta>
   state?: ServerOpsConnectionState
   auditAppend?: (input: ServerOpsAuditAppendInput) => ServerOpsAuditRecord | void
+  prepareAudit?: () => Promise<void>
 } = {}): ServerOpsAgentFacadeDependencies {
   const savedHost = host()
   const access = options.access ?? { sessionId: 'session-1', hostId: savedHost.id }
@@ -47,6 +48,7 @@ function dependencies(options: {
         disconnect: () => ({ hostId: savedHost.id, phase: 'disconnected' }),
       },
       audit: {
+        prepareForWrites: options.prepareAudit,
         append: (input) => {
           /** 自定义审计实现未返回记录时仍提供确定时间戳。 */
           const result = options.auditAppend?.(input)
@@ -58,6 +60,107 @@ function dependencies(options: {
 }
 
 describe('Server Ops Agent Facade 安全边界', () => {
+  test('Given 目录紧凑 JSON 未超限但实际正文超过 64 KiB When Agent 读取 Then 拒绝结果并释放 owner', async () => {
+    /** 两百个长文件名模拟合法分页，缩进后的真实工具正文会越过预算。 */
+    const page: ServerOpsFileListResult = {
+      hostId: 'host-1', path: '/',
+      entries: Array.from({ length: 200 }, (_, index) => ({
+        name: `${index}-${'a'.repeat(100)}`, path: `/${index}-${'a'.repeat(100)}`,
+        kind: 'file', size: 0, mtime: 1, mode: 33188,
+      })),
+    }
+    expect(Buffer.byteLength(JSON.stringify(page), 'utf8')).toBeLessThan(65_536)
+    expect(Buffer.byteLength(JSON.stringify(page, null, 2), 'utf8')).toBeGreaterThan(65_536)
+    /** 记录无论结果是否可发送都必须释放的读取 owner。 */
+    const released: string[] = []
+    const deps = dependencies()
+    deps.services.files = {
+      list: async () => page,
+      preview: async () => { throw new Error('unused') },
+      mutateForAgent: async () => { throw new Error('unused') },
+      releaseReader: (ownerKey) => { released.push(ownerKey) },
+    }
+    const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(facade.filesList!({ hostId: 'host-1', path: '/' })).rejects.toThrow('SERVER_OPS_AGENT_RESULT_TOO_LARGE')
+    expect(released).toHaveLength(1)
+  })
+
+  test('Given 文件读取期间撤权 When 内容到达 Then 拒绝内容并释放本次读取 owner', async () => {
+    /** 模拟授权在远程读取期间失效。 */
+    const deps = dependencies()
+    let authorized = true
+    const released: string[] = []
+    deps.services.access.get = () => authorized ? { hostId: 'host-1', sessionId: 'session-1', granted: true } : undefined
+    deps.services.files = {
+      list: async () => { throw new Error('unused') },
+      preview: async () => { authorized = false; return { hostId: 'host-1', path: '/large', kind: 'too-large', bytesRead: 0, stat: { size: 2_000_000, mode: 33188, mtime: 1 } } },
+      mutateForAgent: async () => { throw new Error('unused') },
+      releaseReader: (ownerKey) => { released.push(ownerKey) },
+    }
+    const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(facade.filesRead!({ hostId: 'host-1', path: '/large' })).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    expect(released).toHaveLength(1)
+    expect(released[0]).toStartWith('agent-read:session-1:')
+  })
+  test('Given Agent 有界目录读取 When 目录存在下一页 Then 不泄漏已释放的游标并标明截断', async () => {
+    const deps = dependencies()
+    const released: string[] = []
+    deps.services.files = {
+      list: async () => ({ hostId: 'host-1', path: '/', entries: [], cursor: 'cursor-1' }),
+      preview: async () => { throw new Error('unused') },
+      mutateForAgent: async () => { throw new Error('unused') },
+      releaseReader: (ownerKey) => { released.push(ownerKey) },
+    }
+    const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(facade.filesList!({ hostId: 'host-1', path: '/' })).resolves.toEqual({ hostId: 'host-1', path: '/', entries: [], truncatedReason: 'item-limit' })
+    expect(released).toHaveLength(1)
+    await expect(facade.filesList!({ hostId: 'host-2', path: '/' })).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    expect(released).toHaveLength(1)
+  })
+  test('Given Docker 查询期间授权撤销 When 回复到达 Then 不向 Agent 返回服务器数据', async () => {
+    const deps = dependencies()
+    let authorized = true
+    deps.services.access.get = () => authorized ? { hostId: 'host-1', sessionId: 'session-1', granted: true } : undefined
+    deps.services.docker = {
+      listResources: async () => { authorized = false; return { hostId: 'host-1', capability: 'available', containers: [], images: [], networks: [], volumes: [], warnings: [] } },
+      getContainerDetail: async () => { throw new Error('unused') },
+      runAgentAction: async () => { throw new Error('unused') },
+    }
+    const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(facade.dockerResources!({ hostId: 'host-1' })).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+  })
+  test.each(['connect', 'exec', 'disconnect'] as const)(
+    'Given 审计 schema guard 等待期间授权被撤销 When Agent %s Then 不执行远程副作用',
+    async (operation) => {
+      let resolvePrepare!: () => void
+      const preparePromise = new Promise<void>((resolve) => { resolvePrepare = resolve })
+      let authorized = true
+      let remoteCalls = 0
+      const deps = dependencies({
+        state: { hostId: 'host-1', phase: 'connected', connectionId: 'connection-secret' },
+        prepareAudit: () => preparePromise,
+      })
+      deps.services.access.get = () => authorized
+        ? { sessionId: 'session-1', hostId: 'host-1', granted: true }
+        : undefined
+      deps.services.connections.connect = async () => { remoteCalls += 1; return { hostId: 'host-1', phase: 'connected' } }
+      deps.services.connections.exec = async () => { remoteCalls += 1; return { stdout: '', stderr: '', exitCode: 0, truncated: false } }
+      deps.services.connections.disconnect = () => { remoteCalls += 1; return { hostId: 'host-1', phase: 'disconnected' } }
+      const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
+
+      const pending = operation === 'connect'
+        ? facade.connect({ hostId: 'host-1' })
+        : operation === 'exec'
+          ? facade.exec({ hostId: 'host-1', command: 'true' })
+          : facade.disconnect({ hostId: 'host-1' })
+      authorized = false
+      resolvePrepare()
+
+      await expect(Promise.resolve(pending)).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+      expect(remoteCalls).toBe(0)
+    },
+  )
+
   test('Given 普通会话已授权 When 列出服务器 Then 只返回唯一主机公开字段与状态', () => {
     const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: dependencies() })
 
@@ -154,11 +257,11 @@ describe('Server Ops Agent Facade 安全边界', () => {
       stdout: 'ok', stderr: '', exitCode: 0, truncated: false,
     })
     expect(calls[0]).toEqual(['host-1', 'connection-secret', 'uname -a', 30000])
-    expect(facade.disconnect({ hostId: 'host-1' })).toEqual({ hostId: 'host-1', phase: 'disconnected' })
+    expect(await facade.disconnect({ hostId: 'host-1' })).toEqual({ hostId: 'host-1', phase: 'disconnected' })
     expect(calls[1]).toEqual(['revoke', 'session-1', 'host-1'])
   })
 
-  test('Given 底层断开抛错 When Agent 断开服务器 Then 仍撤销授权并向上抛原错误', () => {
+  test('Given 底层断开抛错 When Agent 断开服务器 Then 仍撤销授权并向上抛原错误', async () => {
     const calls: string[] = []
     const disconnectError = new Error('SSH_DISCONNECT_FAILED')
     const deps = dependencies()
@@ -172,7 +275,7 @@ describe('Server Ops Agent Facade 安全边界', () => {
     }
     const facade = createServerOpsAgentFacade({ sessionId: 'session-1', dependencies: deps })!
 
-    expect(() => facade.disconnect({ hostId: 'host-1' })).toThrow(disconnectError)
+    await expect(facade.disconnect({ hostId: 'host-1' })).rejects.toBe(disconnectError)
     expect(calls).toEqual(['disconnect', 'revoke'])
   })
 
@@ -187,16 +290,26 @@ describe('Server Ops Agent Facade 安全边界', () => {
 
     await facade.connect({ hostId: 'host-1' })
     await facade.exec({ hostId: 'host-1', command: 'echo password=secret' })
-    facade.disconnect({ hostId: 'host-1' })
+    await facade.disconnect({ hostId: 'host-1' })
 
     expect(auditCalls.map(({ actor, operation, phase, outcome }) => ({ actor, operation, phase, outcome }))).toEqual([
-      { actor: 'agent', operation: 'connect', phase: 'start', outcome: 'success' },
+      { actor: 'agent', operation: 'connect', phase: 'start', outcome: 'pending' },
       { actor: 'agent', operation: 'connect', phase: 'result', outcome: 'success' },
-      { actor: 'agent', operation: 'exec', phase: 'start', outcome: 'success' },
+      { actor: 'agent', operation: 'exec', phase: 'start', outcome: 'pending' },
       { actor: 'agent', operation: 'exec', phase: 'result', outcome: 'success' },
-      { actor: 'agent', operation: 'disconnect', phase: 'start', outcome: 'success' },
+      { actor: 'agent', operation: 'disconnect', phase: 'start', outcome: 'pending' },
       { actor: 'agent', operation: 'disconnect', phase: 'result', outcome: 'success' },
     ])
+    /** 每次操作的开始与结果共享身份，不同操作之间身份必须隔离。 */
+    const [connectStart, connectResult, execStart, execResult, disconnectStart, disconnectResult] = auditCalls
+    if (!connectStart || !connectResult || !execStart || !execResult || !disconnectStart || !disconnectResult) {
+      throw new Error('审计记录数量不完整')
+    }
+    expect(connectStart.operationId).toBe(connectResult.operationId)
+    expect(execStart.operationId).toBe(execResult.operationId)
+    expect(disconnectStart.operationId).toBe(disconnectResult.operationId)
+    expect(new Set([connectStart.operationId, execStart.operationId, disconnectStart.operationId]).size).toBe(3)
+    expect(auditCalls.every((record) => record.sessionId === 'session-1' && record.windowId === undefined)).toBe(true)
     expect(JSON.stringify(auditCalls)).not.toMatch(/Linux|connection-secret|credentialRef|stdout|stderr/)
     expect(auditCalls[3]).toMatchObject({ operation: 'exec', phase: 'result', outcome: 'success', exitCode: 0 })
     expect(auditCalls[1]).not.toHaveProperty('resultCode')

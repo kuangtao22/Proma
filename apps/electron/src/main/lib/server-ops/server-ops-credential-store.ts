@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { getConfigDir } from '../config-paths'
-import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
+import { readAtomicFileState, readJsonFileSafe, writeJsonFileAtomicSecure } from '../safe-file'
+import type { AtomicDestinationExpectation, ReadJsonFileSafeOptions } from '../safe-file'
+import {
+  createServerOpsConfigTransaction,
+  resolveServerOpsConfigFilePath,
+} from './server-ops-config-transaction'
+import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
 
 /** 主进程内部可解析的 SSH 凭据；禁止返回 Renderer。 */
 export type ServerOpsResolvedCredential =
@@ -38,6 +44,17 @@ export interface ServerOpsCredentialStoreDependencies {
   safeStorage: ServerOpsSafeStorage
   uuid: () => string
   now: () => number
+  /** 使用 safe-file 候选恢复规则读取密文文件。 */
+  readJson?: <T>(filePath: string, options: ReadJsonFileSafeOptions<T>) => T | null
+  /** 使用 safe-file 原子提交完整密文快照。 */
+  writeJson?: (
+    filePath: string,
+    data: object,
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ) => void
+  /** 覆盖 fresh-read 与原子提交的同步短事务。 */
+  transaction?: ServerOpsConfigTransaction
 }
 
 /** 判断未知值是否为有效的密文凭据文件。 */
@@ -86,8 +103,8 @@ export class ServerOpsCredentialStore {
   private readonly filePath: string
   /** 可替换的平台、加密器、时间和 ID 边界。 */
   private readonly dependencies: ServerOpsCredentialStoreDependencies
-  /** 当前已持久化凭据的内存索引。 */
-  private stored: StoredCredential[]
+  /** 覆盖同目录协作写入的同步短事务。 */
+  private readonly transaction: ServerOpsConfigTransaction
   /** 本次应用生命周期内按主机保存的短期凭据。 */
   private readonly volatileByHost = new Map<string, ServerOpsResolvedCredential>()
 
@@ -95,7 +112,7 @@ export class ServerOpsCredentialStore {
     /** 运维模块固定数据目录。 */
     const directoryPath = join(configDir, 'server-ops')
     mkdirSync(directoryPath, { recursive: true })
-    this.filePath = join(directoryPath, 'credentials.json')
+    this.filePath = resolveServerOpsConfigFilePath(directoryPath, 'credentials.json')
     /** 未注入 Electron safeStorage 时使用的 fail-closed 边界。 */
     const unavailableSafeStorage: ServerOpsSafeStorage = {
       isEncryptionAvailable: () => false,
@@ -103,8 +120,21 @@ export class ServerOpsCredentialStore {
       encryptString: () => { throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE') },
       decryptString: () => { throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE') },
     }
-    this.dependencies = { platform: process.platform, safeStorage: unavailableSafeStorage, uuid: randomUUID, now: Date.now, ...dependencies }
-    this.stored = readJsonFileSafe(this.filePath, { validate: isStoredCredentialFile })?.credentials ?? []
+    this.dependencies = {
+      platform: process.platform,
+      safeStorage: unavailableSafeStorage,
+      uuid: randomUUID,
+      now: Date.now,
+      readJson: readJsonFileSafe,
+      writeJson: (filePath, data, expectedDestination, priorBackup) => {
+        writeJsonFileAtomicSecure(filePath, data, {
+          expectedDestination,
+          ...(priorBackup ? { priorBackup: { filePath: `${filePath}.bak`, data: priorBackup } } : {}),
+        })
+      },
+      ...dependencies,
+    }
+    this.transaction = dependencies.transaction ?? createServerOpsConfigTransaction(directoryPath)
   }
 
   /** 设置只在本次主进程生命周期内存在的凭据。 */
@@ -115,20 +145,31 @@ export class ServerOpsCredentialStore {
   /** 将凭据保存为 safeStorage 密文并返回非敏感引用。 */
   remember(hostId: string, credential: ServerOpsResolvedCredential): string {
     this.assertSecureStorage()
-    /** 当前主机已有的持久化凭据。 */
-    const existing = this.stored.find((item) => item.hostId === hostId)
-    /** 写入后供主机资产引用的稳定 ID。 */
-    const ref = existing?.ref ?? this.dependencies.uuid()
-    /** 当前写入的时间戳。 */
-    const now = this.dependencies.now()
     /** safeStorage 产生且仅以 base64 编码承载的密文。 */
     const ciphertext = this.dependencies.safeStorage.encryptString(JSON.stringify(credential)).toString('base64')
-    /** 待原子提交的新记录。 */
-    const nextRecord: StoredCredential = { ref, hostId, ciphertext, createdAt: existing?.createdAt ?? now, updatedAt: now }
-    /** 完整下一凭据快照。 */
-    const next = existing ? this.stored.map((item) => item.ref === existing.ref ? nextRecord : item) : [...this.stored, nextRecord]
-    writeJsonFileAtomic(this.filePath, { version: 1, credentials: next })
-    this.stored = next
+    /** 锁内 fresh-read 后提交，并返回供主机资产引用的稳定 ID。 */
+    const ref = this.transaction(() => {
+      const authoritative = this.readStoredCredentials()
+      const stored = authoritative.credentials
+      /** 当前主机已有的持久化凭据。 */
+      const existing = stored.find((item) => item.hostId === hostId)
+      /** 写入后供主机资产引用的稳定 ID。 */
+      const nextRef = existing?.ref ?? this.dependencies.uuid()
+      /** 当前写入的时间戳。 */
+      const now = this.dependencies.now()
+      /** 待原子提交的新记录。 */
+      const nextRecord: StoredCredential = {
+        ref: nextRef,
+        hostId,
+        ciphertext,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      }
+      /** 完整下一凭据快照。 */
+      const next = existing ? stored.map((item) => item.ref === existing.ref ? nextRecord : item) : [...stored, nextRecord]
+      this.writeStoredCredentials(next, authoritative.expectedDestination, authoritative.priorBackup)
+      return nextRef
+    })
     this.setVolatile(hostId, credential)
     return ref
   }
@@ -140,7 +181,8 @@ export class ServerOpsCredentialStore {
     if (volatile) return { ...volatile }
     if (!credentialRef) return undefined
     /** 必须同时匹配 hostId 和 ref，禁止跨主机复用引用。 */
-    const stored = this.stored.find((item) => item.hostId === hostId && item.ref === credentialRef)
+    const stored = this.readStoredCredentials().credentials
+      .find((item) => item.hostId === hostId && item.ref === credentialRef)
     if (!stored) return undefined
     this.assertSecureStorage()
     try {
@@ -154,17 +196,21 @@ export class ServerOpsCredentialStore {
 
   /** 返回主机已持久化凭据的公开引用。 */
   getCredentialRef(hostId: string): string | undefined {
-    return this.stored.find((item) => item.hostId === hostId)?.ref
+    return this.readStoredCredentials().credentials.find((item) => item.hostId === hostId)?.ref
   }
 
   /** 删除主机的内存与持久化凭据。 */
   forgetHost(hostId: string): void {
+    this.transaction(() => {
+      const authoritative = this.readStoredCredentials()
+      const stored = authoritative.credentials
+      /** 删除目标主机后的密文快照。 */
+      const next = stored.filter((item) => item.hostId !== hostId)
+      if (next.length !== stored.length) {
+        this.writeStoredCredentials(next, authoritative.expectedDestination, authoritative.priorBackup)
+      }
+    })
     this.volatileByHost.delete(hostId)
-    /** 删除目标主机后的密文快照。 */
-    const next = this.stored.filter((item) => item.hostId !== hostId)
-    if (next.length === this.stored.length) return
-    writeJsonFileAtomic(this.filePath, { version: 1, credentials: next })
-    this.stored = next
   }
 
   /** 清除所有短期明文引用。 */
@@ -178,5 +224,44 @@ export class ServerOpsCredentialStore {
     if (this.dependencies.platform === 'linux' && this.dependencies.safeStorage.getSelectedStorageBackend() === 'basic_text') {
       throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE')
     }
+  }
+
+  /** 每次从权威文件读取密文；已有坏文件不得降级为空后被覆盖。 */
+  private readStoredCredentials(): {
+    credentials: StoredCredential[]
+    expectedDestination: AtomicDestinationExpectation
+    priorBackup?: object
+  } {
+    const existed = existsSync(this.filePath)
+    const loaded = this.dependencies.readJson?.(this.filePath, { validate: isStoredCredentialFile }) ?? null
+    const state = readAtomicFileState(this.filePath)
+    const expectedDestination: AtomicDestinationExpectation = state === null
+      ? { kind: 'missing' }
+      : { kind: 'state', state }
+    if (loaded === null) {
+      if (existed) throw new Error('SERVER_OPS_CREDENTIAL_READ_FAILED')
+      return { credentials: [], expectedDestination }
+    }
+    return {
+      credentials: loaded.credentials.map((credential) => ({ ...credential })),
+      expectedDestination,
+      priorBackup: { version: 1, credentials: loaded.credentials.map((credential) => ({ ...credential })) },
+    }
+  }
+
+  /** 通过注入或生产 safe-file 边界原子提交密文快照。 */
+  private writeStoredCredentials(
+    credentials: readonly StoredCredential[],
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ): void {
+    const writeJson = this.dependencies.writeJson
+    if (!writeJson) throw new Error('SERVER_OPS_CREDENTIAL_WRITE_FAILED')
+    writeJson(
+      this.filePath,
+      { version: 1, credentials: credentials.map((credential) => ({ ...credential })) },
+      expectedDestination,
+      priorBackup,
+    )
   }
 }

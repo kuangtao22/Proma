@@ -98,6 +98,14 @@
 
 ## 会话记录
 
+- 2026-09-07：macOS 直接运行 Electron 开发实例时，系统自动化仍可能以 `Electron` / `com.github.Electron` 识别它，主窗口标题也可能继续显示 `Proma`；验收版本必须同时核对进程 cwd、`PROMA_DEV_INSTANCE` 和 Renderer 端口所属目录，不能只凭 Dock 名称。为什么这样处理：共享业务数据会恢复同一会话外观，容易把旧实例或正式版误认为当前分支；对用户的影响是能准确确认新增运维模块来自待验收代码，不增加应用运行时开销。
+
+- 2026-09-07：Server Ops 退出与取消必须等待真实异步清理完成；从 owner/lease 索引摘除仅表示禁止再使用，不代表 fd、临时文件或 SSH channel 已释放。重复取消和重复退出复用清理 Promise，utility 的 SFTP owner 关闭需要明确确认；无法确认远端清理时保留待检查事实，不自动重放。为什么这样处理：避免第二次取消误删队列末项，或进程提前退出留下临时文件；对用户的影响是取消与退出结果可信。等待只发生在相关操作结束时，不增加后台轮询。
+
+- 2026-09-07：运维补全分支已从规划进入开发，信任恢复、文件与 Docker 共用同一主进程授权/审计和独立 SSH runtime；文件选择只签发窗口绑定的 fd lease，切主机或关闭面板先确认并等待活动传输收口，写入结果未知不重放。数据库驱动尚待批准，数据服务页面必须明确标为未接入。为什么这样处理：用户验收要能区分已实现工作流与占位，并避免旧窗口请求继续操作新目标；性能沿用按需读取、事件进度、有界分块与并发。真实验证脚本位于 `apps/electron/scripts/server-ops-*-smoke.ts`，只使用临时数据根及 localhost fixture，不能视作用户服务器或跨平台安装包验收。
+
+- 2026-09-07：干净运维 worktree 手动启动时，须在 bundle 生成 `dist` 后同步资源并确认 `dist/resources` 内的原生 helper 存在；本次资源先于 `dist` 复制导致路径缺失，重新同步并重启开发实例后恢复。验收实例使用 `PROMA_DEV_INSTANCE=server-ops-completion`，开发服务通过 detached 子进程持续运行，日志位于 `/private/tmp/proma-server-ops-vite.log` 与 `/private/tmp/proma-server-ops-electron-ready.log`。为什么这样处理：首次启动不能只以构建退出码判断资源就绪；对用户的影响是主窗口和运维面板可正常打开，正式版继续运行。两实例共享业务配置时，正式版已占用的 LAN Bridge 端口会让开发版 Bridge 绑定失败，不应为运维验收停掉正式版或修改共享端口。
+
 - 2026-09-07：用户要求服务器运维后续工作在分支继续并先规划；已从 `feed23c4` 建立 `codex/server-ops-completion` 与 `.worktrees/server-ops-completion`。设计与实施计划位于 `docs/superpowers/specs/2026-09-07-server-ops-completion-design.md`、`docs/superpowers/plans/2026-09-07-server-ops-completion.md`，当前是待实施草案，顺序为指纹恢复、文件管理、Docker、数据服务。为什么这样处理：先恢复可信连接并逐领域完成审批、审计、取消与验收，避免新页签停在占位或把数据库权限混入通用 Shell；对用户的影响是每阶段可单独验收，不受主工作区并发 Canvas/打包改动干扰。性能约束是复用 SSH 运行时、按页签工作、传输和查询有界，不增加全主机后台采集；本轮没有业务运行时改动，也未访问真实服务器。
 - 2026-08-18：首次建立项目记忆文件；创建时仓库 `main` 指向 `d1a131c7`，配置 `origin` 与 `upstream` 两个远端。
 - 2026-08-18：官方 `upstream/main` 停留在旧版本，发布进度应以远端 `v*` 标签为准；本次确认最新官方标签为 `v0.17.42`。
@@ -307,3 +315,5 @@
 - 2026-09-06：合并官方最新正式版 `v0.19.31`，Electron 版本更新为 `0.19.31-bone.1`，Pi SDK 升级到 `0.85.0`；接入官方 Slack Bridge、GPT-6 Astra、Gemini 思考深度、折叠侧栏、文件浏览与运行时打包修复，同时保留 Bone Canvas、Server Ops、LAN Bridge、共享业务数据根和内部会话隔离。MCP 删除必须先通过 workspace slug 写守卫，配置使用原子写；desktop/headless 的 `run_completed` 复用 `run_started` 的权威 `startedAt/runGeneration`。为什么这样处理：官方能力与 Bone 高权限边界必须取并集，避免升级后功能回退或让删除、迟到运行事件绕过当前工作区和运行代次。对用户的影响是获得官方新功能和修复，既有画布、远程运维与移动端流程保持可用，MCP 删除和运行完成状态更可靠。性能上新增 Slack/Pi 依赖会扩大安装包和按需加载成本；MCP 写入每次增加一次小型索引查询及原子 rename/fsync，不增加常驻轮询、后台扫描或数据库。
 - 2026-09-06：`v0.19.31-bone.1` 是官方 `v0.19.31` 基线上的首个 Bone 正式发布边界，发布说明统一覆盖 Slack Bridge、GPT-6 Astra、Gemini 思考深度、折叠侧栏、文件与浏览器改进，以及 Bone 的 Design 工具隔离、MCP 写守卫、运行代次一致性和 EventKit 干净 workspace 构建修复。为什么这样处理：标签、应用版本、安装包和应用内更新历史必须引用同一份可审计说明，避免用户看到版本升级却无法确认官方能力与 Bone 扩展是否同时保留。对用户的影响是可从 GitHub Release 和应用更新入口获得同一套跨平台安装包与变更说明。性能上发布元数据本身不增加运行时开销。
 - 2026-09-06：`v0.19.31-bone.1` 发布流水线在四个平台统一失败，原因是 `sync:runtime-deps` 清理了 Bun configVersion 1 安装在 Electron workspace 内的 `electron-rebuild` 可执行链接；旧锁文件将工具提升到根目录，曾偶然掩盖这一顺序错误。保留 `.1` 失败标签，不移动公开 Git 引用；`0.19.31-bone.2` 改为先重建 `node-pty`、再同步已重建的运行时依赖，并由发布合同和 fork 兼容测试锁定顺序。为什么这样处理：native rebuild 的输入是完整开发依赖，runtime 同步的输出才是精简打包目录，顺序必须符合数据流而不能依赖 hoist 布局。对用户的影响是 `.2` 可恢复 Windows、macOS 与 Linux 安装包发布，应用功能不变。性能上步骤数量不变，仅调整构建期顺序，不增加运行时资源开销。
+- 2026-09-07：Server Ops 文件能力统一通过单连接 SFTP runtime 提供有界分页、1 MiB 预览与 64 KiB 分块 I/O；Renderer、Agent 和传输分别使用独立 owner，owner 关闭或候选取消会以本地代次拒绝全部迟到结果。写操作只复用 Main 签发的五分钟候选，提交前后复核连接、源文件、审计可写状态与 Agent 授权；保存要求服务端真实声明 `fsync@openssh.com` 和 `posix-rename@openssh.com`，另存与上传 no-clobber 不跟随符号链接，临时文件只允许创建它的 owner 发布。为什么这样处理：SFTP v3 缺少通用路径 CAS 与 `O_NOFOLLOW`，必须通过打开前后 `lstat`、句柄 `fstat`、完整内容 hash 和 owner 生命周期降低路径替换与迟到写入风险；对用户的影响是可浏览、预览、编辑、另存、新建、重命名和删除远程文件，取消、切换或关页后不会继续执行旧操作，能力不足时明确拒绝安全替换。性能上目录最多每页 200 项、每 owner 总计 2000 项，预览仅增加一次路径复核，不做全目录扫描或后台轮询；真实 Electron smoke 只使用临时数据根和 localhost 内存 SSH fixture。
+- 2026-09-07：Server Ops 文件 owner 关闭复用现有 SFTP RPC 等待 utility 精确 ACK；utility 先等待资源打开落定、关闭远端 handle/cursor，再以创建或关闭时的 `fstat` 与删除前 `lstat` 复核临时文件身份。路径被替换、关闭失败或连接失联时保留文件并返回清理失败，传输任务记录待检查恢复意图；不把 SFTP 描述为支持 CAS。为什么这样处理：本地失效只阻止继续使用，不能证明远端资源已释放；对用户的影响是取消、关页和退出结果可信，不会误删外部替换的同名文件。性能上只在 owner 收口时执行每个临时文件一次身份复核和删除，无轮询；localhost Electron smoke 使用临时数据根与内存 SSH fixture，不接触真实服务器或用户数据。

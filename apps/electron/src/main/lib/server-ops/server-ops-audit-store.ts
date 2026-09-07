@@ -13,11 +13,16 @@ import type {
   ServerOpsAuditRecord,
 } from '@proma/shared'
 import { getConfigDir } from '../config-paths'
-import { readJsonFileSafe, writeJsonFileAtomic } from '../safe-file'
-import type { ReadJsonFileSafeOptions } from '../safe-file'
+import { readAtomicFileState, writeJsonFileAtomicSecure } from '../safe-file'
+import type { AtomicDestinationExpectation } from '../safe-file'
+import {
+  createServerOpsConfigTransaction,
+  resolveServerOpsConfigFilePath,
+} from './server-ops-config-transaction'
+import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
 
 /** 审计文件当前写入的 schema 版本。 */
-const SERVER_OPS_AUDIT_SCHEMA_VERSION = 2
+const SERVER_OPS_AUDIT_SCHEMA_VERSION = 3
 /** 审计文件固定保留的最近记录数量。 */
 const SERVER_OPS_AUDIT_MAX_RECORDS = 5_000
 /** 单条命令允许进入公开审计的最大字符数。 */
@@ -49,6 +54,8 @@ const SERVER_OPS_AUDIT_ERROR_CODES = new Set([
   'SERVER_OPS_SYSTEMD_OUTPUT_INVALID',
   'SERVER_OPS_SERVICE_ACTION_FAILED',
   'SERVER_OPS_SERVICE_ACTION_UNKNOWN',
+  'SERVER_OPS_DOCKER_ACTION_FAILED',
+  'SERVER_OPS_DOCKER_ACTION_UNKNOWN',
   'SERVER_OPS_AUDIT_READ_FAILED',
   'SERVER_OPS_AUDIT_WRITE_FAILED',
 ])
@@ -79,27 +86,53 @@ interface ServerOpsAuditFileV1 {
   records: ServerOpsAuditRecordV1[]
 }
 
-/** 磁盘中的当前审计文件。 */
+/** schema v2 增加 actor 和服务动作，但尚未区分窗口来源与 operation。 */
+interface ServerOpsAuditRecordV2 extends Omit<ServerOpsAuditRecordV1, 'operation'> {
+  actor: 'agent' | 'user'
+  operation: ServerOpsAuditRecordV1['operation']
+    | 'service-start' | 'service-stop' | 'service-restart' | 'service-enable' | 'service-disable'
+  unitId?: string
+}
+
+/** 磁盘中的旧版 v2 审计文件。 */
 interface ServerOpsAuditFileV2 {
   version: 2
+  records: ServerOpsAuditRecordV2[]
+}
+
+/** 磁盘中的当前审计文件。 */
+interface ServerOpsAuditFileV3 {
+  version: 3
   records: ServerOpsAuditRecord[]
 }
 
 /** 审计 Store 可替换的安全文件、ID 与时间依赖。 */
 export interface ServerOpsAuditStoreDependencies {
-  readJson: <T>(filePath: string, options: ReadJsonFileSafeOptions<T>) => T | null
-  writeJson: (filePath: string, data: object) => void
+  writeJson: (
+    filePath: string,
+    data: object,
+    expectedDestination: AtomicDestinationExpectation,
+    priorBackup?: object,
+  ) => void
   uuid: () => string
   now: () => number
+  transaction?: ServerOpsConfigTransaction
+  /** 生产入口启用后，首次创建或旧 schema 迁移必须先经过异步实例 guard。 */
+  requirePreparedSchema: boolean
 }
 
 /** 创建生产环境使用的审计 Store 依赖。 */
 export function createServerOpsAuditStoreDependencies(): ServerOpsAuditStoreDependencies {
   return {
-    readJson: readJsonFileSafe,
-    writeJson: writeJsonFileAtomic,
+    writeJson: (filePath, data, expectedDestination, priorBackup) => {
+      writeJsonFileAtomicSecure(filePath, data, {
+        expectedDestination,
+        ...(priorBackup ? { priorBackup: { filePath: `${filePath}.bak`, data: priorBackup } } : {}),
+      })
+    },
     uuid: randomUUID,
     now: Date.now,
+    requirePreparedSchema: false,
   }
 }
 
@@ -107,6 +140,11 @@ export function createServerOpsAuditStoreDependencies(): ServerOpsAuditStoreDepe
 const SERVER_OPS_AUDIT_RECORD_V1_KEYS = new Set([
   'id', 'timestamp', 'sessionId', 'hostId', 'operation', 'phase', 'outcome',
   'durationMs', 'command', 'commandTruncated', 'exitCode', 'signal', 'errorCode',
+])
+
+/** schema v2 记录允许出现的精确旧字段。 */
+const SERVER_OPS_AUDIT_RECORD_V2_KEYS = new Set([
+  ...SERVER_OPS_AUDIT_RECORD_V1_KEYS, 'actor', 'unitId',
 ])
 
 /** 判断未知值是否为仅包含指定字段的普通对象。 */
@@ -119,7 +157,16 @@ function hasOnlyKeys(value: unknown, keys: ReadonlySet<string>): value is Record
 function isServerOpsAuditRecordV1(value: unknown): value is ServerOpsAuditRecordV1 {
   if (!hasOnlyKeys(value, SERVER_OPS_AUDIT_RECORD_V1_KEYS)) return false
   if (value.operation !== 'connect' && value.operation !== 'exec' && value.operation !== 'disconnect') return false
-  return isServerOpsAuditRecord({ ...value, actor: 'agent' })
+  return isServerOpsAuditRecordV2({ ...value, actor: 'agent' })
+}
+
+/** 使用 v3 严格校验器验证 v2 字段，并只归一化旧 start=success 展示语义。 */
+function isServerOpsAuditRecordV2(value: unknown): value is ServerOpsAuditRecordV2 {
+  if (!hasOnlyKeys(value, SERVER_OPS_AUDIT_RECORD_V2_KEYS)) return false
+  return isServerOpsAuditRecord({
+    ...value,
+    ...(value.phase === 'start' && value.outcome === 'success' ? { outcome: 'pending' } : {}),
+  })
 }
 
 /** 判断磁盘值是否为严格、有界的 schema v1 文件。 */
@@ -140,15 +187,39 @@ function isServerOpsAuditFileV2(value: unknown): value is ServerOpsAuditFileV2 {
   /** 待检查的顶层审计对象。 */
   const record = value as Record<string, unknown>
   return Object.keys(record).every((key) => key === 'version' || key === 'records')
+    && record.version === 2
+    && Array.isArray(record.records)
+    && record.records.length <= SERVER_OPS_AUDIT_MAX_RECORDS
+    && record.records.every(isServerOpsAuditRecordV2)
+}
+
+/** 判断磁盘值是否为严格、有界的 schema v3 文件。 */
+function isServerOpsAuditFileV3(value: unknown): value is ServerOpsAuditFileV3 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  /** 待检查的顶层审计对象。 */
+  const record = value as Record<string, unknown>
+  return Object.keys(record).every((key) => key === 'version' || key === 'records')
     && record.version === SERVER_OPS_AUDIT_SCHEMA_VERSION
     && Array.isArray(record.records)
     && record.records.length <= SERVER_OPS_AUDIT_MAX_RECORDS
     && record.records.every(isServerOpsAuditRecord)
 }
 
+/** 旧 start=success 只表示动作已开始，读取时归一为 pending。 */
+function normalizeLegacyAuditOutcome<T extends ServerOpsAuditRecordV1 | ServerOpsAuditRecordV2>(record: T): T {
+  return record.phase === 'start' && record.outcome === 'success'
+    ? { ...record, outcome: 'pending' } as T
+    : record
+}
+
 /** 把已严格验证的旧 Agent 记录升级为当前公开记录。 */
-function migrateAuditRecord(record: ServerOpsAuditRecordV1): ServerOpsAuditRecord {
-  return { ...record, actor: 'agent' }
+function migrateAuditRecordV1(record: ServerOpsAuditRecordV1): ServerOpsAuditRecord {
+  return { ...normalizeLegacyAuditOutcome(record), actor: 'agent' }
+}
+
+/** 保留 v2 的真实 actor、sessionId 和退出语义，不猜测窗口或 operation 关联。 */
+function migrateAuditRecordV2(record: ServerOpsAuditRecordV2): ServerOpsAuditRecord {
+  return { ...normalizeLegacyAuditOutcome(record) }
 }
 
 /** 复制单条公开记录，防止调用方修改 Store 内部对象。 */
@@ -436,99 +507,138 @@ export class ServerOpsAuditStore {
   private readonly filePath: string
   /** 可替换的安全文件和确定性测试依赖。 */
   private readonly dependencies: ServerOpsAuditStoreDependencies
-  /** 仅在写盘成功后替换的内存快照。 */
-  private records: ServerOpsAuditRecord[]
-  /** 已存在文件无法读取或迁移时保持的稳定错误，避免远程操作绕过审计。 */
-  private unavailableErrorCode: 'SERVER_OPS_AUDIT_READ_FAILED' | 'SERVER_OPS_AUDIT_WRITE_FAILED' | null
+  /** 覆盖 fresh-read、校验和原子提交的同步短事务。 */
+  private readonly transaction: ServerOpsConfigTransaction
+  /** 原子替换后耐久性未知时持续阻断本实例继续覆盖。 */
+  private writeOutcomeUnknown = false
 
-  /** 创建 Store 并严格读取已存在的版本化审计文件。 */
+  /** 创建 Store；实际读取延迟到每次 list 或 append 的 fresh-read 边界。 */
   constructor(configDir = getConfigDir(), dependencies: Partial<ServerOpsAuditStoreDependencies> = {}) {
     /** 审计与主机资产共享的固定目录。 */
     const directoryPath = join(configDir, 'server-ops')
     mkdirSync(directoryPath, { recursive: true })
-    this.filePath = join(directoryPath, 'audit.json')
+    this.filePath = resolveServerOpsConfigFilePath(directoryPath, 'audit.json')
     this.dependencies = { ...createServerOpsAuditStoreDependencies(), ...dependencies }
-    /** 区分首次无文件与已有文件无法恢复，后者必须 fail closed。 */
-    const existed = existsSync(this.filePath)
-    if (!existed) {
-      this.unavailableErrorCode = null
-      this.records = []
-      return
-    }
-    /** 原始主文件版本先独立判定，禁止 safe-file 用备份掩盖损坏现场。 */
+    this.transaction = dependencies.transaction ?? createServerOpsConfigTransaction(directoryPath)
+  }
+
+  /** 每次访问都从主文件读取权威快照，禁止缓存或备份掩盖损坏现场。 */
+  private readAuthoritativeRecords(): {
+    schema: 'missing' | 1 | 2 | 3
+    records: ServerOpsAuditRecord[]
+    expectedDestination: AtomicDestinationExpectation
+    priorBackup?: object
+  } {
+    const state = readAtomicFileState(this.filePath)
+    const expectedDestination: AtomicDestinationExpectation = state === null
+      ? { kind: 'missing' }
+      : { kind: 'state', state }
+    if (!existsSync(this.filePath)) return { schema: 'missing', records: [], expectedDestination }
     let primary: unknown
     try {
       primary = JSON.parse(readFileSync(this.filePath, 'utf8'))
     } catch {
-      this.unavailableErrorCode = 'SERVER_OPS_AUDIT_READ_FAILED'
-      this.records = []
-      return
+      throw new Error('SERVER_OPS_AUDIT_READ_FAILED')
+    }
+    if (isServerOpsAuditFileV3(primary)) {
+      return { schema: 3, records: primary.records.map(cloneAuditRecord), expectedDestination, priorBackup: primary }
     }
     if (isServerOpsAuditFileV2(primary)) {
-      /** 主文件已完成严格校验，直接复用快照避免对最多 5000 条记录重复解析。 */
-      this.unavailableErrorCode = null
-      this.records = primary.records.map(cloneAuditRecord)
-      return
+      return {
+        schema: 2,
+        records: primary.records.map(migrateAuditRecordV2).map(cloneAuditRecord),
+        expectedDestination,
+        priorBackup: primary,
+      }
     }
-    if (!isServerOpsAuditFileV1(primary)) {
-      this.unavailableErrorCode = 'SERVER_OPS_AUDIT_READ_FAILED'
-      this.records = []
-      return
+    if (isServerOpsAuditFileV1(primary)) {
+      return {
+        schema: 1,
+        records: primary.records.map(migrateAuditRecordV1).map(cloneAuditRecord),
+        expectedDestination,
+        priorBackup: primary,
+      }
     }
-    /** v1 必须再次经安全读取和独立 legacy parser，避免迁移已变化的主文件。 */
-    const legacy = this.dependencies.readJson(this.filePath, { validate: isServerOpsAuditFileV1 })
-    if (legacy === null) {
-      this.unavailableErrorCode = 'SERVER_OPS_AUDIT_READ_FAILED'
-      this.records = []
-      return
-    }
-    /** 只有原子迁移和 v2 权威回读都成功，才允许后续审计读写。 */
-    const migrated = legacy.records.map(migrateAuditRecord)
+    throw new Error('SERVER_OPS_AUDIT_READ_FAILED')
+  }
+
+  /** 在旧实例 guard 内初始化或迁移审计 schema，等待结束后必须重读权威文件。 */
+  async prepareForWrites(acquireGuard: () => Promise<() => void>): Promise<void> {
+    /** 当前 v3 不需要争用旧实例 guard；损坏文件仍在此处 fail closed。 */
+    if (this.readAuthoritativeRecords().schema === SERVER_OPS_AUDIT_SCHEMA_VERSION) return
+    const release = await acquireGuard()
     try {
-      this.dependencies.writeJson(this.filePath, { version: SERVER_OPS_AUDIT_SCHEMA_VERSION, records: migrated })
-    } catch {
-      this.unavailableErrorCode = 'SERVER_OPS_AUDIT_WRITE_FAILED'
-      this.records = []
-      return
+      this.transaction(() => {
+        /** guard 等待期间文件可能已被其他实例升级，必须以锁内 fresh-read 为准。 */
+        const authoritative = this.readAuthoritativeRecords()
+        if (authoritative.schema === SERVER_OPS_AUDIT_SCHEMA_VERSION) return
+        try {
+          this.dependencies.writeJson(
+            this.filePath,
+            { version: SERVER_OPS_AUDIT_SCHEMA_VERSION, records: authoritative.records },
+            authoritative.expectedDestination,
+            authoritative.priorBackup,
+          )
+        } catch {
+          /** 原子替换可能已经可见，禁止本实例继续覆盖无法确认的提交。 */
+          this.writeOutcomeUnknown = true
+          throw new Error('SERVER_OPS_AUDIT_WRITE_FAILED')
+        }
+      })
+    } finally {
+      try { release() } catch { /* 清理故障不能覆盖已提交事实或原始迁移错误。 */ }
     }
-    const loaded = this.dependencies.readJson(this.filePath, { validate: isServerOpsAuditFileV2 })
-    this.unavailableErrorCode = loaded === null ? 'SERVER_OPS_AUDIT_READ_FAILED' : null
-    this.records = loaded?.records.map(cloneAuditRecord) ?? []
   }
 
   /** 追加一条严格公开记录，并以原子写提交最多 5000 条快照。 */
   append(input: ServerOpsAuditAppendInput): ServerOpsAuditRecord {
-    this.assertAvailable()
+    this.assertWritable()
     /** 完整命令先脱敏，随后由公开 DTO 校验 512 字符边界。 */
     const commandSummary = typeof input.command === 'string' ? summarizeServerOpsAuditCommand(input.command) : undefined
+    /** 每条审计记录拥有独立 ID；operationId 只能由业务操作显式提供。 */
+    const id = this.dependencies.uuid()
     /** Store 生成且即将严格校验的新记录。 */
     const record = {
       ...input,
-      id: this.dependencies.uuid(),
+      ...(input.phase === 'start' && input.outcome === 'success' ? { outcome: 'pending' as const } : {}),
+      id,
       timestamp: this.dependencies.now(),
       ...(commandSummary === undefined ? {} : commandSummary),
     }
     if (!isServerOpsAuditRecord(record)) throw new Error('SERVER_OPS_AUDIT_RECORD_INVALID')
-    /** rotation 只保留包含本条记录在内的最近 5000 条。 */
-    const next = [...this.records, record].slice(-SERVER_OPS_AUDIT_MAX_RECORDS)
-    try {
-      this.dependencies.writeJson(this.filePath, { version: SERVER_OPS_AUDIT_SCHEMA_VERSION, records: next })
-    } catch {
-      /** 原子替换可能已成功，内存无法判断磁盘状态时必须持续阻断后续覆盖。 */
-      this.unavailableErrorCode = 'SERVER_OPS_AUDIT_WRITE_FAILED'
-      throw new Error('SERVER_OPS_AUDIT_WRITE_FAILED')
-    }
-    this.records = next
+    this.transaction(() => {
+      /** rotation 基于锁内 fresh snapshot，避免另一实例的新记录被旧缓存覆盖。 */
+      const authoritative = this.readAuthoritativeRecords()
+      if (this.dependencies.requirePreparedSchema
+        && authoritative.schema !== SERVER_OPS_AUDIT_SCHEMA_VERSION) {
+        throw new Error('SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED')
+      }
+      const next = [...authoritative.records, record].slice(-SERVER_OPS_AUDIT_MAX_RECORDS)
+      try {
+        this.dependencies.writeJson(
+          this.filePath,
+          { version: SERVER_OPS_AUDIT_SCHEMA_VERSION, records: next },
+          authoritative.expectedDestination,
+          authoritative.priorBackup,
+        )
+      } catch {
+        /** rename 可能已可见；本实例禁止继续写入，避免把未知提交当作未提交覆盖。 */
+        this.writeOutcomeUnknown = true
+        throw new Error('SERVER_OPS_AUDIT_WRITE_FAILED')
+      }
+    })
     return cloneAuditRecord(record)
   }
 
   /** 按公开筛选返回最近记录的深拷贝。 */
   list(input: ServerOpsAuditListInput = {}): ServerOpsAuditListResult {
-    this.assertAvailable()
+    this.assertWritable()
     /** 即使主进程内部调用也沿用共享严格筛选合同。 */
     const filter = parseServerOpsAuditListInput(input)
+    /** 每次列表都重新读取当前权威文件，跨实例提交立即可见。 */
+    const records = this.readAuthoritativeRecords().records
     /** 筛选后按最近上限截取，保留时间正序便于稳定阅读。 */
-    const filtered = this.records.filter((record) => (
+    const filtered = records.filter((record) => (
       (filter.hostId === undefined || record.hostId === filter.hostId)
       && (filter.actor === undefined || record.actor === filter.actor)
       && (filter.operation === undefined || record.operation === filter.operation)
@@ -537,7 +647,7 @@ export class ServerOpsAuditStore {
   }
 
   /** 已有坏文件或迁移失败时向读取和写入持续暴露稳定错误。 */
-  private assertAvailable(): void {
-    if (this.unavailableErrorCode) throw new Error(this.unavailableErrorCode)
+  private assertWritable(): void {
+    if (this.writeOutcomeUnknown) throw new Error('SERVER_OPS_AUDIT_WRITE_FAILED')
   }
 }

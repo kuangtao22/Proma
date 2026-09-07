@@ -368,6 +368,20 @@ describe('服务器运维共享合同', () => {
     expect(() => parseServerOpsLogExportInput({ hostId: 'host-1', content: 'x', generation: 1 })).toThrow('SERVER_OPS_LOG_EXPORT_INPUT_INVALID')
   })
 
+  test('Given Docker 容器日志来源 When 解析 Then 只接受完整容器 ID 且拒绝未知字段', () => {
+    /** Docker 日志必须绑定不可混淆的完整容器身份。 */
+    const containerId = 'a'.repeat(64)
+    expect(parseServerOpsLogStartInput({
+      hostId: 'host-1', source: { kind: 'container', containerId }, since: '1h', priority: 'info', tailLines: 200,
+    })).toEqual({ hostId: 'host-1', source: { kind: 'container', containerId }, since: '1h', priority: 'info', tailLines: 200 })
+    expect(() => parseServerOpsLogStartInput({
+      hostId: 'host-1', source: { kind: 'container', containerId: 'web-1' }, since: '1h', priority: 'info', tailLines: 200,
+    })).toThrow('SERVER_OPS_LOG_START_INPUT_INVALID')
+    expect(() => parseServerOpsLogStartInput({
+      hostId: 'host-1', source: { kind: 'container', containerId, command: 'sh' }, since: '1h', priority: 'info', tailLines: 200,
+    })).toThrow('SERVER_OPS_LOG_START_INPUT_INVALID')
+  })
+
   test('Given Agent 与用户服务记录 When 校验审计 v2 Then actor、筛选和 operation 必须匹配', () => {
     /** 合法用户服务动作记录。 */
     const serviceRecord: ServerOpsAuditRecord = {
@@ -437,5 +451,73 @@ describe('服务器运维共享合同', () => {
       .toThrow('SERVER_OPS_AUDIT_LIST_RESULT_INVALID')
     expect(() => parseServerOpsAuditListResult({ records: [{ ...base, outcome: 'success', errorCode: 'REMOTE_FAILED' }] }))
       .toThrow('SERVER_OPS_AUDIT_LIST_RESULT_INVALID')
+  })
+
+  test('Given v3 Agent 与窗口用户审计 When 校验 Then operation 关联和来源字段保持互斥', () => {
+    const agentStart = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, sessionId: 'session-1', hostId: 'host-1',
+      actor: 'agent', operation: 'exec', phase: 'start', outcome: 'pending', command: 'id', commandTruncated: false,
+    } as const
+    const userResult = {
+      id: 'audit-2', operationId: 'operation-2', timestamp: 2, windowId: 7, hostId: 'host-1',
+      actor: 'user', operation: 'service-restart', unitId: 'nginx.service', phase: 'result', outcome: 'unknown',
+    } as const
+
+    expect(isServerOpsAuditRecord(agentStart)).toBe(true)
+    expect(isServerOpsAuditRecord(userResult)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...agentStart, windowId: 7 })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userResult, sessionId: 'session-1' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userResult, windowId: undefined, sessionId: 'legacy-session' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...agentStart, sessionId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userResult, windowId: 0 })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...agentStart, phase: 'result', outcome: 'pending' })).toBe(false)
+  })
+
+  test('Given 用户管理主机信任 When 校验审计 Then 强制窗口、operationId 与 host-trust 资源类别', () => {
+    const trustRecord = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, windowId: 3, hostId: 'host-1',
+      actor: 'user', operation: 'trust-replace', resourceType: 'host-trust', phase: 'start', outcome: 'pending',
+    } as const
+
+    expect(isServerOpsAuditRecord(trustRecord)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...trustRecord, operation: 'trust-revoke' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...trustRecord, actor: 'agent', sessionId: 'session-1', windowId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...trustRecord, operationId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...trustRecord, resourceType: undefined })).toBe(false)
+    expect(parseServerOpsAuditListInput({ actor: 'user', operation: 'trust-revoke' }))
+      .toEqual({ actor: 'user', operation: 'trust-revoke' })
+  })
+
+  test('Given 用户或 Agent 执行 Docker 动作 When 校验审计 Then 强制完整容器身份与来源互斥', () => {
+    /** 用户窗口触发的 Docker 动作记录。 */
+    const userRecord = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, windowId: 7, hostId: 'host-1',
+      actor: 'user', operation: 'docker-restart', resourceType: 'docker-container', containerId: 'a'.repeat(64),
+      phase: 'result', outcome: 'unknown', errorCode: 'SERVER_OPS_DOCKER_ACTION_UNKNOWN',
+    } as const
+    /** 普通 Agent 后续可复用的相同领域合同。 */
+    const agentRecord = { ...userRecord, actor: 'agent', windowId: undefined, sessionId: 'session-1' } as const
+
+    expect(isServerOpsAuditRecord(userRecord)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...userRecord, operation: 'docker-start', phase: 'start', outcome: 'pending', errorCode: undefined })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...userRecord, operation: 'docker-stop', outcome: 'error', errorCode: 'SERVER_OPS_DOCKER_ACTION_FAILED' })).toBe(true)
+    expect(isServerOpsAuditRecord(agentRecord)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...userRecord, containerId: 'web-1' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userRecord, containerId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userRecord, resourceType: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...userRecord, sessionId: 'session-1' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...agentRecord, windowId: 7 })).toBe(false)
+    expect(parseServerOpsAuditListInput({ actor: 'agent', operation: 'docker-restart' }))
+      .toEqual({ actor: 'agent', operation: 'docker-restart' })
+  })
+
+  test('Given 文件动作审计 When 缺少路径摘要或伪造资源 Then 拒绝且正文不进入合同', () => {
+    const record = { id: 'record-1', operationId: 'operation-1', timestamp: 1, hostId: 'host-1', windowId: 7,
+      actor: 'user', operation: 'file-save', resourceType: 'remote-file', resourceId: `sha256:${'a'.repeat(64)}`, phase: 'start', outcome: 'pending' }
+    expect(isServerOpsAuditRecord(record)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...record, resourceId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, resourceId: '/secret/path' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, content: 'secret' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, actor: 'agent', windowId: undefined, sessionId: 'session-1' })).toBe(true)
   })
 })
