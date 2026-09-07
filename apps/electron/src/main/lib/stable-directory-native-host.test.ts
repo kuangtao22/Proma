@@ -178,8 +178,11 @@ const nativeHelperPath = resolve(
 beforeAll(() => {
   if (!nativeHelperPlatformSupported) return
   /** MSVC 把编译错误写到 stdout，直接透传才能在 CI 失败时保留根因。 */
-  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'inherit' })
-}, 30_000)
+  /** 共享 Windows runner 的冷启动编译可能超过 30 秒，独立限时而不放宽行为测试。 */
+  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], {
+    stdio: 'inherit', timeout: 120_000,
+  })
+}, 150_000)
 
 describe('stable directory native host', () => {
   test('Given 产物导出请求字段越界 When 进入 Host Then 启动 helper 前统一拒绝', async () => {

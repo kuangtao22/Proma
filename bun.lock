@@ -38,7 +38,7 @@
     },
     "apps/electron": {
       "name": "@proma/electron",
-      "version": "0.19.31-bone.9",
+      "version": "0.19.31-bone.10",
       "dependencies": {
         "@codemirror/language": "^6.12.4",
         "@codemirror/state": "^6.7.1",
