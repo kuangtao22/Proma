@@ -39,7 +39,7 @@ jobs:
         run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
 
       - name: Prepare Electron package
-        run: bun run --filter='@proma/electron' package:prepare
+        run: bun run --filter='@proma/electron' package:prepare:win
 
       - name: Package (Windows)
         run: bun run builder --win --x64 --publish never

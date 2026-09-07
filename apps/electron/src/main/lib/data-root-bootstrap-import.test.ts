@@ -22,6 +22,20 @@ describe('数据根启动门模块隔离', () => {
     expect(source).toContain('function ensureLanBridgeAuthService()')
   })
 
+  test('Given 数据根尚未通过 normal gate When 导入 IPC 模块 Then 不构造 Agent-Canvas 业务 Store', () => {
+    /** IPC 模块会被 main 入口静态导入，顶层构造业务 Store 将提前解析活动数据根。 */
+    const source = readFileSync(join(import.meta.dir, '..', 'ipc.ts'), 'utf8')
+
+    expect(source).not.toMatch(/^const agentCanvasBindingStore = new AgentCanvasBindingStore\(\)$/m)
+    expect(source).toContain('function getAgentCanvasBindingStore(): AgentCanvasBindingStore')
+    /** Store 必须在普通 IPC 注册阶段、任何 handler 注册之前一次性取得。 */
+    const registerStart = source.indexOf('export function registerIpcHandlers(): void {')
+    const storeInit = source.indexOf('const agentCanvasBindingStore = getAgentCanvasBindingStore()', registerStart)
+    const firstHandler = source.indexOf('ipcMain.handle(', registerStart)
+    expect(storeInit).toBeGreaterThan(registerStart)
+    expect(storeInit).toBeLessThan(firstHandler)
+  })
+
   test('Given normal 数据根已取得 When 启动普通服务 Then 先恢复 committing 项目 journal', () => {
     /** 静态顺序锁定恢复发生在 runtime、LAN 与 watcher 等业务服务之前。 */
     const source = readFileSync(join(import.meta.dir, '..', 'index.ts'), 'utf8')

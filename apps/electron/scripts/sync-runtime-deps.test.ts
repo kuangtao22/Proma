@@ -44,12 +44,78 @@ describe('SSH runtime 依赖同步', () => {
     createPackage(sourceNodeModules, 'cpu-features', {}, { 'build/Release/cpufeatures.node': 'native-canary' })
     createPackage(sourceNodeModules, 'nan', {})
 
-    const result = syncRuntimeDeps({ sourceNodeModules, targetNodeModules, externalRuntimePackages: ['ssh2'] })
+    const result = syncRuntimeDeps({
+      sourceNodeModules,
+      fallbackNodeModules: [],
+      targetNodeModules,
+      externalRuntimePackages: ['ssh2'],
+    })
 
     expect(existsSync(join(targetNodeModules, 'ssh2', 'lib', 'index.js'))).toBe(true)
     expect(existsSync(join(targetNodeModules, 'ssh2', 'lib', 'protocol', 'crypto', 'build', 'Release', 'sshcrypto.node'))).toBe(false)
     expect(existsSync(join(targetNodeModules, 'cpu-features'))).toBe(false)
     expect(existsSync(join(targetNodeModules, 'nan'))).toBe(false)
     expect(result.skippedOptionalPackages).toEqual(expect.arrayContaining(['cpu-features', 'nan']))
+  })
+})
+
+describe('Sharp Windows runtime 依赖同步', () => {
+  test('Given Windows x64 目标包缺失 When 同步 Sharp Then 在生成安装包前失败', () => {
+    /** 当前用例的隔离根目录。 */
+    const root = mkdtempSync(join(tmpdir(), 'proma-sharp-win32-missing-'))
+    temporaryDirectories.push(root)
+    /** 仅包含宿主平台 Sharp 可选依赖的源目录。 */
+    const sourceNodeModules = join(root, 'source', 'node_modules')
+    /** 模拟 Electron 应用运行时依赖的目标目录。 */
+    const targetNodeModules = join(root, 'target', 'node_modules')
+    createPackage(sourceNodeModules, 'sharp', {
+      optionalDependencies: {
+        '@img/sharp-darwin-arm64': '1.0.0',
+        '@img/sharp-win32-x64': '1.0.0',
+      },
+    })
+    createPackage(sourceNodeModules, '@img/sharp-darwin-arm64', {})
+
+    expect(() => syncRuntimeDeps({
+      sourceNodeModules,
+      fallbackNodeModules: [],
+      targetNodeModules,
+      externalRuntimePackages: ['sharp'],
+      targetPlatform: 'win32',
+      targetArch: 'x64',
+    })).toThrow('Windows x64 运行时依赖缺失: @img/sharp-win32-x64')
+  })
+
+  test('Given Windows x64 目标包已安装 When 同步 Sharp Then 原生 binding 被复制到应用目录', () => {
+    /** 当前用例的隔离根目录。 */
+    const root = mkdtempSync(join(tmpdir(), 'proma-sharp-win32-present-'))
+    temporaryDirectories.push(root)
+    /** 包含 Windows Sharp 可选依赖的源目录。 */
+    const sourceNodeModules = join(root, 'source', 'node_modules')
+    /** 模拟 Electron 应用运行时依赖的目标目录。 */
+    const targetNodeModules = join(root, 'target', 'node_modules')
+    createPackage(sourceNodeModules, 'sharp', {
+      optionalDependencies: { '@img/sharp-win32-x64': '1.0.0' },
+    })
+    createPackage(sourceNodeModules, '@img/sharp-win32-x64', {}, {
+      'lib/sharp-win32-x64.node': 'windows-native-canary',
+    })
+
+    syncRuntimeDeps({
+      sourceNodeModules,
+      fallbackNodeModules: [],
+      targetNodeModules,
+      externalRuntimePackages: ['sharp'],
+      targetPlatform: 'win32',
+      targetArch: 'x64',
+    })
+
+    expect(existsSync(join(
+      targetNodeModules,
+      '@img',
+      'sharp-win32-x64',
+      'lib',
+      'sharp-win32-x64.node',
+    ))).toBe(true)
   })
 })

@@ -1976,10 +1976,20 @@ class CanvasContentAgentBusyError extends Error {
   }
 }
 
-/** Agent-Canvas 关联在主进程内只保留一个 Store 实例，避免缓存和 CAS 基线分叉。 */
-const agentCanvasBindingStore = new AgentCanvasBindingStore()
+/** Agent-Canvas 关联 Store 延迟到普通 IPC 注册阶段创建，避免模块导入提前解析数据根。 */
+let sharedAgentCanvasBindingStore: AgentCanvasBindingStore | null = null
+
+/** 返回进程级唯一关联 Store，确保 Agent、Canvas 工具和删除清理共享缓存与 CAS 基线。 */
+function getAgentCanvasBindingStore(): AgentCanvasBindingStore {
+  if (sharedAgentCanvasBindingStore === null) {
+    sharedAgentCanvasBindingStore = new AgentCanvasBindingStore()
+  }
+  return sharedAgentCanvasBindingStore
+}
 
 export function registerIpcHandlers(): void {
+  /** normal 数据根已准备完成后再取得业务 Store，并在注册任何 handler 前完成初始化。 */
+  const agentCanvasBindingStore = getAgentCanvasBindingStore()
   // ===== 本地终端（仅主 renderer 可操作，不能指定可执行文件） =====
   const assertMainTerminalRenderer = (senderId: number): void => {
     const mainWindow = getMainWindow()

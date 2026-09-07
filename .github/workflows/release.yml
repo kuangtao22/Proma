@@ -255,7 +255,7 @@ jobs:
         run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
 
       - name: 准备 Electron 打包资源
-        run: bun run --filter='@proma/electron' package:prepare
+        run: bun run --filter='@proma/electron' package:prepare:win
 
       - name: 打包 (Windows)
         env:

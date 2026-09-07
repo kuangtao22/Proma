@@ -23,18 +23,32 @@ interface RuntimeDependency {
 
 interface SyncContext {
   sourceNodeModules: string
+  fallbackNodeModules: readonly string[]
   targetNodeModules: string
   copiedPackages: Map<string, string>
   topLevelPackageSources: Map<string, string>
   skippedOptionalPackages: string[]
 }
 
+interface RuntimeTargetContract {
+  /** 面向构建日志的目标平台名称。 */
+  displayName: string
+  /** 目标平台必须进入安装包的运行时包。 */
+  requiredPackages: readonly string[]
+}
+
 export interface SyncRuntimeDepsOptions {
   sourceNodeModules?: string
+  /** 主源目录无法解析依赖时继续搜索的 node_modules；测试传空数组以保持 fixture 隔离。 */
+  fallbackNodeModules?: readonly string[]
   targetNodeModules?: string
   externalRuntimePackages?: readonly string[]
   /** 是否在同步前清空目标 node_modules；打包需要 true，开发启动使用 false 避免破坏本地调试内容。 */
   cleanTarget?: boolean
+  /** 安装包目标操作系统；与 targetArch 同时提供时启用平台依赖合同。 */
+  targetPlatform?: string
+  /** 安装包目标 CPU 架构；与 targetPlatform 同时提供时启用平台依赖合同。 */
+  targetArch?: string
 }
 
 export interface SyncRuntimeDepsResult {
@@ -59,6 +73,14 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
 
 /** ssh2 的性能型可选依赖含 native binding，跨平台打包统一走 JS fallback。 */
 const SKIPPED_OPTIONAL_RUNTIME_PACKAGES = new Set(['cpu-features', 'nan'])
+
+/** 需要在打包前强制验证的目标平台运行时依赖。 */
+const RUNTIME_TARGET_CONTRACTS = new Map<string, RuntimeTargetContract>([
+  ['win32-x64', {
+    displayName: 'Windows x64',
+    requiredPackages: ['@img/sharp-win32-x64'],
+  }],
+])
 
 const appDir = resolve(import.meta.dir, '..')
 const repoRoot = resolve(appDir, '../..')
@@ -105,7 +127,7 @@ function resolvePackageSourceDir(ctx: SyncContext, packageName: string, resolveF
     if (parentResolvedDir) return parentResolvedDir
   }
 
-  for (const nodeModulesDir of [ctx.sourceNodeModules, bunVirtualNodeModules, repoNodeModules]) {
+  for (const nodeModulesDir of [ctx.sourceNodeModules, ...ctx.fallbackNodeModules]) {
     const resolvedPackageDir = resolvePackageFromNodeModules(nodeModulesDir, packageName)
     if (resolvedPackageDir) return resolvedPackageDir
   }
@@ -232,6 +254,28 @@ function assertNoAbsoluteSymlinks(dir: string): void {
   }
 }
 
+/** 校验目标平台的可选原生包确实由本次同步复制，避免生成启动后才报错的安装包。 */
+function assertRuntimeTargetContract(ctx: SyncContext, targetPlatform?: string, targetArch?: string): void {
+  if (targetPlatform === undefined && targetArch === undefined) return
+  if (!targetPlatform || !targetArch) {
+    throw new Error('targetPlatform 与 targetArch 必须同时提供')
+  }
+
+  /** 当前目标平台与架构对应的稳定合同键。 */
+  const targetKey = `${targetPlatform}-${targetArch}`
+  /** 当前目标平台需要满足的运行时依赖合同。 */
+  const contract = RUNTIME_TARGET_CONTRACTS.get(targetKey)
+  if (!contract) return
+
+  for (const packageName of contract.requiredPackages) {
+    /** 必须由本次同步写入的应用级包路径。 */
+    const targetPackageKey = resolve(getPackageDir(ctx.targetNodeModules, packageName))
+    if (!ctx.copiedPackages.has(targetPackageKey)) {
+      throw new Error(`${contract.displayName} 运行时依赖缺失: ${packageName}`)
+    }
+  }
+}
+
 function prepareTargetNodeModules(sourceNodeModules: string, targetNodeModules: string): void {
   const source = resolve(sourceNodeModules)
   const target = resolve(targetNodeModules)
@@ -249,6 +293,7 @@ function prepareTargetNodeModules(sourceNodeModules: string, targetNodeModules: 
 export function syncRuntimeDeps(options: SyncRuntimeDepsOptions = {}): SyncRuntimeDepsResult {
   const ctx: SyncContext = {
     sourceNodeModules: options.sourceNodeModules ?? defaultSourceNodeModules,
+    fallbackNodeModules: options.fallbackNodeModules ?? [bunVirtualNodeModules, repoNodeModules],
     targetNodeModules: options.targetNodeModules ?? defaultTargetNodeModules,
     copiedPackages: new Map<string, string>(),
     topLevelPackageSources: new Map<string, string>(),
@@ -274,6 +319,7 @@ export function syncRuntimeDeps(options: SyncRuntimeDepsOptions = {}): SyncRunti
     copyPackage(ctx, packageName)
   }
 
+  assertRuntimeTargetContract(ctx, options.targetPlatform, options.targetArch)
   assertNoAbsoluteSymlinks(ctx.targetNodeModules)
 
   return {
@@ -283,8 +329,26 @@ export function syncRuntimeDeps(options: SyncRuntimeDepsOptions = {}): SyncRunti
   }
 }
 
+/** 读取形如 --name=value 的命令行参数。 */
+function readCliOption(name: string): string | undefined {
+  /** 当前参数使用的完整前缀。 */
+  const prefix = `--${name}=`
+  /** 命令行中匹配此前缀的参数。 */
+  const argument = process.argv.find((value) => value.startsWith(prefix))
+  return argument?.slice(prefix.length)
+}
+
 function main(): void {
-  const result = syncRuntimeDeps({ cleanTarget: !process.argv.includes('--no-clean') })
+  /** Windows 等跨平台打包时显式传入的目标操作系统。 */
+  const targetPlatform = readCliOption('target-platform')
+  /** Windows 等跨平台打包时显式传入的目标 CPU 架构。 */
+  const targetArch = readCliOption('target-arch')
+  /** 当前同步执行结果，用于输出可审计的依赖数量。 */
+  const result = syncRuntimeDeps({
+    cleanTarget: !process.argv.includes('--no-clean'),
+    targetPlatform,
+    targetArch,
+  })
   const skipped = result.skippedOptionalPackages.length > 0
     ? `，跳过未安装 optional 依赖 ${result.skippedOptionalPackages.length} 个`
     : ''

@@ -172,6 +172,30 @@ test('打包准备在清理运行时依赖目录前重建 node-pty', () => {
   )
 })
 
+test('Windows 打包先安装并校验 win32-x64 Sharp 运行时依赖', () => {
+  /** Electron workspace 的 Windows 专用资源准备命令。 */
+  const packagePrepareWindows = readElectronPackageMetadata().scripts?.['package:prepare:win']
+  /** Electron workspace 的 Windows 本地打包入口。 */
+  const distWindows = readElectronPackageMetadata().scripts?.['dist:win']
+  /** Windows 目标依赖安装命令。 */
+  const installWindowsDependencies = 'bun install --frozen-lockfile --os=win32 --cpu=x64'
+  /** Windows 目标依赖同步与合同校验命令。 */
+  const syncWindowsDependencies = 'bun run sync:runtime-deps --target-platform=win32 --target-arch=x64'
+
+  expect(packagePrepareWindows).toContain(installWindowsDependencies)
+  expect(packagePrepareWindows).toContain(syncWindowsDependencies)
+  expect(packagePrepareWindows?.indexOf(installWindowsDependencies))
+    .toBeLessThan(packagePrepareWindows?.indexOf(syncWindowsDependencies) ?? -1)
+  expect(distWindows).toBe('bun run package:prepare:win && bun run builder --win')
+
+  for (const source of [readReleaseWorkflow(), readWindowsBuildWorkflow()]) {
+    /** 当前工作流 Windows job 的全部 shell 命令。 */
+    const commands = workflowCommands((Bun.YAML.parse(source) as ReleaseWorkflow).jobs?.['build-windows-x64'])
+    expect(commands).toContain("bun run --filter='@proma/electron' package:prepare:win")
+    expect(commands).not.toContain("bun run --filter='@proma/electron' package:prepare")
+  }
+})
+
 test('所有打包入口使用固定版本的 Electron Builder', () => {
   /** Electron workspace 的包元数据。 */
   const metadata = readElectronPackageMetadata()
@@ -225,7 +249,7 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.5')
+  expect(metadata.version).toBe('0.19.31-bone.8')
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',
@@ -264,7 +288,7 @@ test('Windows 构建与发布在打包前执行稳定目录原生回归', () => 
   /** Windows 上必须真实运行的 helper/host 定向测试命令。 */
   const stableDirectoryTests = 'bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts'
   /** 完成应用构建并清理 workspace 开发依赖的资源准备命令。 */
-  const packagePrepare = "bun run --filter='@proma/electron' package:prepare"
+  const packagePrepare = "bun run --filter='@proma/electron' package:prepare:win"
   /** 独立 Windows 构建工作流。 */
   const buildWorkflow = Bun.YAML.parse(readWindowsBuildWorkflow()) as ReleaseWorkflow
   /** 正式发布工作流。 */
