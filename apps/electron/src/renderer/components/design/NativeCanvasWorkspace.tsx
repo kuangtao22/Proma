@@ -6,6 +6,7 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageModuleConfig,
+  CanvasLayoutRect,
   CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNode,
@@ -21,6 +22,7 @@ import type {
   DeleteCanvasNodeInput,
   DesignChangeEvent,
   DesignPoint,
+  DesignViewport,
   DesignJobRecord,
   CanvasImageJobActivity,
   RebuildCanvasAgentNodeInput,
@@ -55,6 +57,7 @@ import {
   createInitialAgentCanvasViewState,
   initializeAgentCanvasViewStateAtom,
   removeAgentCanvasViewStateAtom,
+  resolveAgentCanvasWorkbenchSize,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
 import { agentCanvasNodeReferencesAtomFamily } from '@/atoms/agent-atoms'
@@ -2423,8 +2426,10 @@ function createAgentCanvasViewFallback(graphState: NativeCanvasState): AgentCanv
     ...(legacy.selectedNodeId !== undefined ? { selectedNodeId: legacy.selectedNodeId } : {}),
     ...(legacy.selectedNodeIds ? { selectedNodeIds: legacy.selectedNodeIds } : {}),
     ...(legacy.expandedNodeId !== undefined ? { expandedNodeId: legacy.expandedNodeId } : {}),
-    ...(legacy.workbenchSize && legacy.expandedNodeId
-      ? { workbenchSizesByNodeId: { [legacy.expandedNodeId]: legacy.workbenchSize } }
+    ...(legacy.workbenchSizesByNodeId
+      ? { workbenchSizesByNodeId: legacy.workbenchSizesByNodeId, workbenchSizeSpace: legacy.workbenchSizeSpace }
+      : legacy.workbenchSize && legacy.expandedNodeId
+      ? { workbenchSizesByNodeId: { [legacy.expandedNodeId]: legacy.workbenchSize }, workbenchSizeSpace: legacy.workbenchSizeSpace }
       : {}),
     ...(legacy.isExpanded !== undefined ? { isExpanded: legacy.isExpanded } : {}),
     ...(legacy.activityRevision !== undefined ? { activityRevision: legacy.activityRevision } : {}),
@@ -3667,7 +3672,8 @@ export function NativeCanvasWorkspace({
   /** 为唯一展开节点构造轻量工作台；Agent 对话仅在这里按需挂载。 */
   const renderNodeWorkbench = React.useCallback((
     node: CanvasNode,
-    nodeScreenRect: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>,
+    nodeBounds: CanvasLayoutRect,
+    viewport: DesignViewport,
   ): React.ReactNode => {
     /** dirty 只属于当前节点，不随工作台切换复制。 */
     const dirty = viewState.workbenchDraft?.nodeId === node.id && viewState.workbenchDraft.dirty
@@ -3743,22 +3749,20 @@ export function NativeCanvasWorkspace({
     }
     return (
       <CanvasNodeWorkbenchOverlay
+        key={`${target.projectId}:${target.canvasId}:${node.id}`}
         node={node}
         dirty={dirty}
         surfaceSize={canvasSurfaceSize}
-        nodeScreenRect={nodeScreenRect}
-        offset={viewState.workbenchOffsetsByNodeId?.[node.id] ?? null}
-        size={viewState.workbenchSizesByNodeId[node.id] ?? null}
-        onOffsetChange={(offset) => updateAgentCanvasViewState({
-          key: viewStateKey,
-          update: (current) => createAgentCanvasWorkbenchGeometryUpdate(current, node.id, { offset }),
-        })}
+        nodeBounds={nodeBounds}
+        viewport={viewport}
+        size={resolveAgentCanvasWorkbenchSize(viewState, node.id)}
         onSizeChange={(size) => updateAgentCanvasViewState({
           key: viewStateKey,
           update: (current) => createAgentCanvasWorkbenchGeometryUpdate(current, node.id, { size }),
         })}
         onDirtyChange={(nextDirty) => updateWorkbenchDirty(node.id, nextDirty)}
         onClose={closeWorkbench}
+        dismissOnOutsideClick={viewState.pendingWorkbenchSwitchNodeId === null}
       >
         {content}
       </CanvasNodeWorkbenchOverlay>
@@ -3779,13 +3783,15 @@ export function NativeCanvasWorkspace({
     rebuildState.loading,
     requestSelectedNodeDelete,
     state.snapshot?.nodeIssues,
+    state.snapshot?.document.revision,
     updateAgentCanvasViewState,
     target,
     updateWorkbenchDirty,
     viewState.pendingWorkbenchSwitchNodeId,
     viewState.workbenchDraft,
-    viewState.workbenchOffsetsByNodeId,
     viewState.workbenchSizesByNodeId,
+    viewState.workbenchSizeSpace,
+    viewState.viewport.zoom,
     viewStateKey,
     workspaceWritable,
   ])

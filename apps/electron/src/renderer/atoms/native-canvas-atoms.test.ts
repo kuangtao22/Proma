@@ -34,9 +34,11 @@ import {
   createAgentCanvasWorkbenchChangeUpdate as createNativeCanvasWorkbenchChangeUpdate,
   createConvergedAgentCanvasViewUpdate,
   createInitialAgentCanvasViewState,
+  resolveAgentCanvasWorkbenchSize,
   updateAgentCanvasViewStateAtom,
   agentCanvasViewStatesAtom,
 } from './agent-canvas-atoms'
+import type { AgentCanvasViewState } from './agent-canvas-atoms'
 import {
   agentSessionStreamingStateAtomFamily,
   agentStreamErrorsAtom,
@@ -177,6 +179,70 @@ describe('原生 Canvas 状态隔离', () => {
     expect(documentUpdate.workbenchOffsetsByNodeId).toBeUndefined()
   })
 
+  test('Given HMR 保留 zoom=2 的旧屏幕尺寸 When 读取并首次更新 Then 转为画布尺寸且只换算一次', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 2 })
+    delete current.workbenchSizeSpace
+    current.workbenchSizesByNodeId = {
+      'image-1': { width: 1_000, height: 720 },
+    }
+
+    expect(resolveAgentCanvasWorkbenchSize(current, 'image-1')).toEqual({ width: 500, height: 360 })
+
+    const firstUpdate = createAgentCanvasWorkbenchGeometryUpdate(current, 'document-1', {
+      size: { width: 440, height: 330 },
+    })
+    const migrated = { ...current, ...firstUpdate }
+    const secondUpdate = createAgentCanvasWorkbenchGeometryUpdate(migrated, 'document-1', {
+      size: { width: 460, height: 350 },
+    })
+    const next = { ...migrated, ...secondUpdate }
+
+    expect(firstUpdate).toMatchObject({
+      workbenchSizeSpace: 'canvas',
+      workbenchSizesByNodeId: {
+        'image-1': { width: 500, height: 360 },
+        'document-1': { width: 440, height: 330 },
+      },
+    })
+    expect(resolveAgentCanvasWorkbenchSize(next, 'image-1')).toEqual({ width: 500, height: 360 })
+    expect(resolveAgentCanvasWorkbenchSize(next, 'document-1')).toEqual({ width: 460, height: 350 })
+  })
+
+  test('Given 旧单值尺寸属于展开节点 When 首次写入其它节点 Then 只迁给原展开节点并换算为画布尺寸', () => {
+    const current = Object.assign(
+      createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1.5 }),
+      {
+        expandedNodeId: 'agent-1',
+        workbenchSize: { width: 900, height: 600 },
+      },
+    )
+    delete current.workbenchSizeSpace
+
+    const update = createAgentCanvasWorkbenchGeometryUpdate(current, 'image-1', {
+      size: { width: 520, height: 400 },
+    })
+
+    expect(update.workbenchSizesByNodeId).toEqual({
+      'agent-1': { width: 600, height: 400 },
+      'image-1': { width: 520, height: 400 },
+    })
+  })
+
+  test('Given HMR 旧状态缺少尺寸 Map When 读取展开节点单值 Then 安全换算为画布尺寸', () => {
+    const current = Object.assign(
+      createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 2 }),
+      {
+        expandedNodeId: 'agent-1',
+        workbenchSizesByNodeId: undefined,
+        workbenchSize: { width: 900, height: 600 },
+        workbenchSizeSpace: undefined,
+      },
+    ) as unknown as AgentCanvasViewState
+
+    expect(resolveAgentCanvasWorkbenchSize(current, 'agent-1'))
+      .toEqual({ width: 450, height: 300 })
+  })
+
   test('Given 两个节点有不同详情偏移 When 依次更新 Then 偏移按节点隔离', () => {
     const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
     const imageUpdate = createAgentCanvasWorkbenchGeometryUpdate(current, 'image-1', {
@@ -194,8 +260,9 @@ describe('原生 Canvas 状态隔离', () => {
     expect(documentUpdate.workbenchSizesByNodeId).toBeUndefined()
   })
 
-  test('Given 工作台尺寸超过上限 When 新增第 65 个节点 Then 删除最早尺寸且保留已有键顺序', () => {
-    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 1 })
+  test('Given 旧屏幕尺寸缓存已满 When 新增第 65 个画布尺寸 Then 迁移后删除最早尺寸且保持上限', () => {
+    const current = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 2 })
+    delete current.workbenchSizeSpace
     current.workbenchSizesByNodeId = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
       `node-${index}`,
       { width: 600 + index, height: 500 },
@@ -207,7 +274,9 @@ describe('原生 Canvas 状态隔离', () => {
 
     expect(Object.keys(update.workbenchSizesByNodeId ?? {})).toHaveLength(64)
     expect(update.workbenchSizesByNodeId?.['node-0']).toBeUndefined()
+    expect(update.workbenchSizesByNodeId?.['node-1']).toEqual({ width: 300.5, height: 250 })
     expect(update.workbenchSizesByNodeId?.['node-64']).toEqual({ width: 900, height: 700 })
+    expect(update.workbenchSizeSpace).toBe('canvas')
   })
 
   test('Given 工作台偏移超过上限 When 新增第 65 个节点 Then 删除最早偏移且不修改原状态', () => {

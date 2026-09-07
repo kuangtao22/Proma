@@ -4,6 +4,7 @@ import type {
   CanvasEdgeRelation,
   CanvasDocument,
   CanvasImagePreview,
+  CanvasLayoutRect,
   CanvasMutation,
   CanvasNode,
   CanvasNodeActivityState,
@@ -19,6 +20,7 @@ import {
   Background,
   Controls,
   ReactFlow,
+  ViewportPortal,
   applyNodeChanges,
 } from '@xyflow/react'
 import type {
@@ -44,6 +46,7 @@ import {
   createNativeCanvasUserEdge,
   confirmNativeCanvasEdge,
   createViewportCanvasMutation,
+  resolveNativeCanvasImageNodeHeight,
   resolveNativeCanvasNodeSize,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
@@ -377,50 +380,48 @@ export function createNativeCanvasTransientGeometryStore(
   }
 }
 
-/**
- * 把节点世界坐标投影为工作台定位所需的屏幕矩形。
- * @param node 工作台所属的权威节点。
- * @param geometry XYFlow 当前瞬时 viewport 与节点坐标。
- * @returns 不缩放工作台自身尺寸的节点屏幕矩形。
- */
-export function resolveNativeCanvasWorkbenchNodeRect(
-  node: CanvasNode,
-  geometry: NativeCanvasTransientGeometrySnapshot,
-): Pick<DOMRectReadOnly, 'left' | 'right' | 'top'> {
-  /** 节点拖动帧优先使用瞬时坐标，缺失时回退权威文档位置。 */
-  const position = geometry.nodePositions.get(node.id) ?? node.position
-  /** 卡片世界尺寸随 Canvas zoom 投影，工作台像素尺寸由 Overlay 独立保持。 */
-  const size = resolveNativeCanvasNodeSize(node)
-  return {
-    left: geometry.viewport.x + position.x * geometry.viewport.zoom,
-    right: geometry.viewport.x + (position.x + size.width) * geometry.viewport.zoom,
-    top: geometry.viewport.y + position.y * geometry.viewport.zoom,
-  }
-}
-
 /** 当前展开工作台的定位输入；订阅与浮窗一起挂载、释放。 */
 interface NativeCanvasWorkbenchGeometryProps {
   /** 工作台所属的权威节点。 */
   node: CanvasNode
+  /** 投影卡片的真实宽高，包括图片比例带来的高度变化。 */
+  width: number
+  height: number
   /** 仅保存逐帧坐标的内存 Store。 */
   geometryStore: NativeCanvasTransientGeometryStore
-  /** 使用节点与屏幕矩形渲染现有工作台。 */
+  /** 使用节点与画布矩形渲染固定下挂的工作台。 */
   renderWorkbench: NonNullable<NativeCanvasGraphProps['renderWorkbench']>
 }
 
-/** 只让展开的工作台订阅瞬时坐标，避免缩放每帧同步重渲染整个 Graph。 */
+/** 只订阅所属卡片的位置，平移缩放由 ViewportPortal 处理，不重渲染详情正文。 */
 const NativeCanvasWorkbenchGeometry = React.memo(function NativeCanvasWorkbenchGeometry({
   node,
+  width,
+  height,
   geometryStore,
   renderWorkbench,
 }: NativeCanvasWorkbenchGeometryProps): React.ReactElement {
-  /** 工作台独立消费最新几何；关闭后不再保留订阅。 */
-  const geometry = React.useSyncExternalStore(
-    geometryStore.subscribe,
-    geometryStore.getSnapshot,
-    geometryStore.getSnapshot,
+  /** 视口或其他卡片变化保留同一位置对象，React 自动跳过无关渲染。 */
+  const getNodePosition = React.useCallback(
+    () => geometryStore.getSnapshot().nodePositions.get(node.id) ?? node.position,
+    [geometryStore, node.id, node.position],
   )
-  return <>{renderWorkbench(node, resolveNativeCanvasWorkbenchNodeRect(node, geometry))}</>
+  /** 当前卡片的拖动帧立即跟随，关闭后释放订阅。 */
+  const position = React.useSyncExternalStore(
+    geometryStore.subscribe,
+    getNodePosition,
+    getNodePosition,
+  )
+  /** 正文只随权威节点、尺寸或业务回调更新，卡片拖动帧复用同一 React 元素。 */
+  const content = React.useMemo(() => renderWorkbench(
+    node,
+    { id: node.id, ...node.position, width, height },
+    geometryStore.getSnapshot().viewport,
+  ), [node, width, height, geometryStore, renderWorkbench])
+  /** 拖动时只补偿相对权威坐标的位移，不重新渲染详情编辑器和对话。 */
+  return <div className="pointer-events-none absolute left-0 top-0" style={{
+    transform: `translate(${position.x - node.position.x}px, ${position.y - node.position.y}px)`,
+  }}>{content}</div>
 })
 
 /** 将关系与推导出的输入槽转换为用户可理解的菜单标签。 */
@@ -508,10 +509,11 @@ export interface NativeCanvasGraphProps {
   onWorkbenchNodeChange?: (nodeId: string) => void
   /** 当前唯一展开的工作台节点；由 Graph 使用瞬时几何就地渲染。 */
   workbenchNode?: CanvasNode | null
-  /** 根据节点实时屏幕矩形渲染固定像素工作台。 */
+  /** 根据节点实时画布矩形渲染详情；viewport 仅用于首次尺寸换算。 */
   renderWorkbench?: (
     node: CanvasNode,
-    nodeScreenRect: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>,
+    nodeBounds: CanvasLayoutRect,
+    viewport: DesignViewport,
   ) => React.ReactNode
   /** 测试或宿主可注入同一瞬时 Store；默认由 Graph 自行创建。 */
   transientGeometryStore?: NativeCanvasTransientGeometryStore
@@ -934,24 +936,39 @@ export function NativeCanvasGraph({
     onNodeDoubleClick: handleNodeDoubleClick,
     onPaneClick: handlePaneClick,
   }
-  /** 工作台与 Flow 同处 Graph 根层，但不进入 ReactFlow transform 容器。 */
-  const workbench = workbenchNode && renderWorkbench
+  /** 与 Flow 共用尺寸解析规则，只查询当前节点，不随拖动扫描全部 flowNodes。 */
+  const workbenchSize = React.useMemo(() => {
+    if (!workbenchNode) return null
+    /** 基础尺寸覆盖 Agent、文档和 WebView 的不同设备预设。 */
+    const size = resolveNativeCanvasNodeSize(workbenchNode)
+    return workbenchNode.kind === 'image'
+      ? { ...size, height: resolveNativeCanvasImageNodeHeight(
+          workbenchNode.adoptedAssetId ? imagePreviews?.get(workbenchNode.adoptedAssetId) : undefined,
+        ) }
+      : size
+  }, [workbenchNode, imagePreviews])
+  /** 节点身份变化才重建详情，普通拖动与视口变化保留正文组件。 */
+  const workbench = workbenchNode && workbenchSize && renderWorkbench
     ? <NativeCanvasWorkbenchGeometry
+        key={`${document.projectId}:${document.canvasId}:${workbenchNode.id}`}
         node={workbenchNode}
+        width={workbenchSize.width}
+        height={workbenchSize.height}
         geometryStore={geometryStore}
         renderWorkbench={renderWorkbench}
       />
     : null
 
   return (
-    <div className="design-canvas relative h-full w-full" aria-label="Canvas 画布">
+    <div className="design-canvas relative h-full w-full overflow-hidden" aria-label="Canvas 画布">
       {flowRenderer ? flowRenderer(flowProps) : (
         <ReactFlow<NativeCanvasFlowNode, Edge> {...flowProps}>
           <Background gap={24} size={1} />
           <Controls showInteractive={false} fitViewOptions={flowProps.fitViewOptions} />
+          <ViewportPortal>{workbench}</ViewportPortal>
         </ReactFlow>
       )}
-      {workbench}
+      {flowRenderer ? workbench : null}
       {pendingRelationEdge ? (
         <NativeCanvasEdgeRelationMenu
           edge={pendingRelationEdge}

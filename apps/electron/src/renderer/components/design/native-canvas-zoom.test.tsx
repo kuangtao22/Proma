@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasMutation, DesignViewport } from '@proma/shared'
+import type { CanvasLayoutRect, CanvasMutation, DesignViewport } from '@proma/shared'
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -97,6 +97,8 @@ function createGraphRoot(): {
   render: (node: React.ReactElement) => void
   unmount: () => void
   restore: () => void
+  /** 读取轻量位置壳的真实 DOM 样式，不依赖详情重渲染次数推断移动。 */
+  workbenchTransform: () => string | undefined
 } {
   const eventTarget: MinimalEventTarget = {
     addEventListener: () => undefined,
@@ -133,6 +135,7 @@ function createGraphRoot(): {
   globals.IS_REACT_ACT_ENVIRONMENT = true
   const root = createRoot(container as unknown as Element)
   return {
+    workbenchTransform: () => container.childNodes[0]?.childNodes[0]?.style.transform,
     render: (node) => { root.render(node) },
     unmount: () => { root.unmount() },
     restore: () => {
@@ -204,7 +207,7 @@ describe('原生 Canvas 缩放挂载回归', () => {
     }
   })
 
-  test('Given 工作台按需打开 When 缩放后关闭 Then 只更新工作台并释放订阅', () => {
+  test('Given 下挂工作台 When 平移缩放或拖动卡片 Then 仅位置壳移动且正文不重渲染', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [{
       id: 'agent-1', kind: 'agent', title: 'Agent',
@@ -213,15 +216,25 @@ describe('原生 Canvas 缩放挂载回归', () => {
     const geometryStore = observeGeometrySubscriptions(createNativeCanvasTransientGeometryStore(document))
     let graphRenderCount = 0
     let workbenchRenderCount = 0
-    let lastWorkbenchLeft = 0
+    /** 独立正文组件计数，证明没有通过父壳渲染间接刷新重内容。 */
+    let contentRenderCount = 0
+    /** 模拟详情保存所依赖的最新画布版本，缓存不能阻断业务更新。 */
+    let renderedRevision = document.revision
+    function DetailContent({ revision = document.revision }: { revision?: number }): null {
+      contentRenderCount += 1
+      renderedRevision = revision
+      return null
+    }
+    /** 记录世界矩形，验证瞬时卡片移动不被 viewport 重复投影。 */
+    let lastWorkbenchBounds: CanvasLayoutRect | undefined
     const graphProps = createGraphProps(geometryStore, () => undefined, () => {
       graphRenderCount += 1
       return null
     })
-    const renderWorkbench = (_node: typeof document.nodes[number], rect: Pick<DOMRectReadOnly, 'left' | 'right' | 'top'>) => {
+    const renderWorkbench = (_node: typeof document.nodes[number], rect: CanvasLayoutRect) => {
       workbenchRenderCount += 1
-      lastWorkbenchLeft = rect.left
-      return null
+      lastWorkbenchBounds = rect
+      return <DetailContent />
     }
     const host = createGraphRoot()
 
@@ -238,13 +251,35 @@ describe('原生 Canvas 缩放挂载回归', () => {
       })
       const mountedGraphRenderCount = graphRenderCount
       const mountedWorkbenchRenderCount = workbenchRenderCount
+      const mountedContentRenderCount = contentRenderCount
       expect(geometryStore.getActiveSubscriberCount()).toBe(1)
 
       act(() => { geometryStore.updateViewport({ x: 100, y: 200, zoom: 2 }) })
 
       expect(graphRenderCount).toBe(mountedGraphRenderCount)
-      expect(workbenchRenderCount).toBe(mountedWorkbenchRenderCount + 1)
-      expect(lastWorkbenchLeft).toBe(120)
+      expect(workbenchRenderCount).toBe(mountedWorkbenchRenderCount)
+      expect(lastWorkbenchBounds).toMatchObject({ x: 10, y: 20 })
+
+      act(() => { geometryStore.updateNodePositions([{ nodeId: 'other', position: { x: 800, y: 900 } }]) })
+      expect(workbenchRenderCount).toBe(mountedWorkbenchRenderCount)
+
+      act(() => { geometryStore.updateNodePositions([{ nodeId: 'agent-1', position: { x: -40, y: 70 } }]) })
+      expect(graphRenderCount).toBe(mountedGraphRenderCount)
+      expect(workbenchRenderCount).toBe(mountedWorkbenchRenderCount)
+      expect(contentRenderCount).toBe(mountedContentRenderCount)
+      expect(lastWorkbenchBounds).toMatchObject({ x: 10, y: 20 })
+      expect(host.workbenchTransform()).toBe('translate(-50px, 50px)')
+
+      /** 其他节点提交新 revision 后，Workspace 更新的正文回调应立即被采用。 */
+      const nextDocument = { ...document, revision: document.revision + 1 }
+      act(() => {
+        host.render(<NativeCanvasGraph document={nextDocument} {...graphProps}
+          workbenchNode={document.nodes[0]}
+          renderWorkbench={() => <DetailContent revision={nextDocument.revision} />}
+        />)
+      })
+      expect(renderedRevision).toBe(nextDocument.revision)
+      expect(contentRenderCount).toBe(mountedContentRenderCount + 1)
 
       act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
       expect(geometryStore.getActiveSubscriberCount()).toBe(0)
@@ -252,6 +287,38 @@ describe('原生 Canvas 缩放挂载回归', () => {
 
       act(() => { geometryStore.updateViewport({ x: 200, y: 300, zoom: 3 }) })
       expect(workbenchRenderCount).toBe(closedWorkbenchRenderCount)
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 图片卡片比例变化 When 预览尺寸更新 Then 详情使用同一投影高度而非默认卡片高度', () => {
+    /** 模拟图片成功后按素材比例显示的卡片。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{
+      id: 'image-1', kind: 'image', title: '图片', imageModuleId: 'module-1',
+      adoptedAssetId: 'asset-1', position: { x: 20, y: 30 },
+    }]
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const graphProps = createGraphProps(geometryStore, () => undefined, () => null)
+    /** 记录详情入口实际拿到的宽高，避免测试只覆盖 Overlay 的传入参数。 */
+    let bounds: CanvasLayoutRect | undefined
+    const renderWorkbench = (_node: typeof document.nodes[number], rect: CanvasLayoutRect) => {
+      bounds = rect
+      return null
+    }
+    const host = createGraphRoot()
+    try {
+      for (const [width, height, expectedHeight] of [[1200, 800, 240], [400, 1200, 368]] as const) {
+        act(() => {
+          host.render(<NativeCanvasGraph document={document} {...graphProps}
+            workbenchNode={document.nodes[0]} renderWorkbench={renderWorkbench}
+            imagePreviews={new Map([['asset-1', { assetId: 'asset-1', previewUrl: 'preview.png', width, height }]])}
+          />)
+        })
+        expect(bounds).toEqual({ id: 'image-1', x: 20, y: 30, width: 288, height: expectedHeight })
+      }
     } finally {
       act(() => { host.unmount() })
       host.restore()

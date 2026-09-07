@@ -10,7 +10,6 @@ import {
   createNativeCanvasProjectionCallbackBridge,
   createNativeCanvasTransientGeometryStore,
   reconcileNativeCanvasFlowNodes,
-  resolveNativeCanvasWorkbenchNodeRect,
   reduceNativeCanvasViewportState,
 } from './NativeCanvasGraph'
 import type { NativeCanvasFlowProps } from './NativeCanvasGraph'
@@ -474,7 +473,7 @@ describe('原生 Canvas 大画布性能预算', () => {
       />,
     )
 
-    expect(html).toContain('class="design-canvas relative h-full w-full"')
+    expect(html).toContain('class="design-canvas relative h-full w-full overflow-hidden"')
   })
 
   test('Given select 或 pan 工具 When 构造 Flow Then 手型模式保留节点选择且禁用结构编辑', () => {
@@ -571,16 +570,13 @@ describe('原生 Canvas 大画布性能预算', () => {
     )
 
     captured!.onMove?.({} as never, { x: 100, y: 200, zoom: 2 })
-    expect(resolveNativeCanvasWorkbenchNodeRect(
-      document.nodes[0]!, geometryStore.getSnapshot(),
-    )).toEqual({ left: 120, right: 696, top: 240 })
+    expect(geometryStore.getSnapshot().viewport).toEqual({ x: 100, y: 200, zoom: 2 })
+    expect(geometryStore.getSnapshot().nodePositions.get('agent-1')).toEqual({ x: 10, y: 20 })
 
     captured!.onNodesChange?.([{
       id: 'agent-1', type: 'position', position: { x: 30, y: 40 }, dragging: true,
     }])
-    expect(resolveNativeCanvasWorkbenchNodeRect(
-      document.nodes[0]!, geometryStore.getSnapshot(),
-    )).toEqual({ left: 160, right: 736, top: 280 })
+    expect(geometryStore.getSnapshot().nodePositions.get('agent-1')).toEqual({ x: 30, y: 40 })
     expect(mutations).toEqual([])
   })
 

@@ -2,10 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import { createStore } from 'jotai'
 import {
   agentCanvasViewStatesAtom,
+  createInitialAgentCanvasViewState,
   createAgentCanvasViewKey,
   initializeAgentCanvasViewStateAtom,
   navigateAgentCanvasViewAtom,
   removeAgentCanvasViewStateAtom,
+  resolveAgentCanvasWorkbenchSize,
   updateAgentCanvasViewStateAtom,
 } from './agent-canvas-atoms'
 
@@ -65,6 +67,45 @@ describe('Agent Canvas 视图状态隔离', () => {
 
     expect(store.get(agentCanvasViewStatesAtom).get(key)?.viewport)
       .toEqual({ x: 90, y: 70, zoom: 1.8 })
+  })
+
+  test('Given HMR 已有旧屏幕尺寸 When 同一视图重新初始化 Then 使用旧 zoom 固化为画布尺寸', () => {
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    const legacy = createInitialAgentCanvasViewState({ x: 10, y: 20, zoom: 2 })
+    delete legacy.workbenchSizeSpace
+    legacy.workbenchSizesByNodeId = { 'node-a': { width: 1_000, height: 720 } }
+    store.set(agentCanvasViewStatesAtom, new Map([[key, legacy]]))
+
+    store.set(initializeAgentCanvasViewStateAtom, {
+      key,
+      viewport: { x: 0, y: 0, zoom: 1 },
+    })
+
+    expect(store.get(agentCanvasViewStatesAtom).get(key)).toMatchObject({
+      viewport: { x: 10, y: 20, zoom: 2 },
+      workbenchSizeSpace: 'canvas',
+      workbenchSizesByNodeId: { 'node-a': { width: 500, height: 360 } },
+    })
+  })
+
+  test('Given 旧屏幕尺寸尚未初始化迁移 When 用户先缩放 Then 按旧 zoom 固化后再更新视口', () => {
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    const legacy = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 2 })
+    delete legacy.workbenchSizeSpace
+    legacy.workbenchSizesByNodeId = { 'node-a': { width: 1_000, height: 720 } }
+    store.set(agentCanvasViewStatesAtom, new Map([[key, legacy]]))
+
+    store.set(updateAgentCanvasViewStateAtom, {
+      key,
+      update: { viewport: { x: 30, y: 40, zoom: 4 } },
+    })
+
+    const next = store.get(agentCanvasViewStatesAtom).get(key)
+    expect(next?.viewport).toEqual({ x: 30, y: 40, zoom: 4 })
+    expect(next && resolveAgentCanvasWorkbenchSize(next, 'node-a'))
+      .toEqual({ width: 500, height: 360 })
   })
 
   test('Given Canvas 完成导航先于 LOAD When 首个权威文档初始化 Then 首次接管文档视口后应用节点导航', () => {

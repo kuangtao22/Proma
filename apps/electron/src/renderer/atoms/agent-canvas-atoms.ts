@@ -17,11 +17,11 @@ export interface AgentCanvasWorkbenchDraftState {
   dirty: boolean
 }
 
-/** Agent Canvas 工作台的屏幕像素宽高。 */
+/** Agent Canvas 工作台的画布世界坐标宽高。 */
 export interface AgentCanvasWorkbenchSize {
-  /** 工作台宽度，单位为屏幕像素。 */
+  /** 工作台宽度，单位为画布世界坐标。 */
   width: number
-  /** 工作台高度，单位为屏幕像素。 */
+  /** 工作台高度，单位为画布世界坐标。 */
   height: number
 }
 
@@ -46,6 +46,8 @@ export interface AgentCanvasViewState {
   expandedNodeId: string | null
   /** 用户调整后的尺寸按节点隔离，未出现的节点继续使用类型默认值。 */
   workbenchSizesByNodeId: Record<string, AgentCanvasWorkbenchSize>
+  /** 存在时表示工作台尺寸已使用画布世界坐标；缺失代表 HMR 遗留的屏幕像素。 */
+  workbenchSizeSpace?: 'canvas'
   /** 用户调整后的相对偏移按节点隔离，单位为屏幕像素。 */
   workbenchOffsetsByNodeId: Record<string, AgentCanvasWorkbenchPosition>
   /** Agent 右侧画布区域是否处于展开态。 */
@@ -76,6 +78,7 @@ export function createInitialAgentCanvasViewState(
     selectedNodeIds: [],
     expandedNodeId: null,
     workbenchSizesByNodeId: {},
+    workbenchSizeSpace: 'canvas',
     workbenchOffsetsByNodeId: {},
     isExpanded: false,
     activityRevision: 0,
@@ -89,6 +92,63 @@ export function createInitialAgentCanvasViewState(
 /** 迁移前会话状态可能携带的单一工作台尺寸。 */
 interface LegacyAgentCanvasWorkbenchState {
   workbenchSize?: AgentCanvasWorkbenchSize | null
+}
+
+/**
+ * 获取旧屏幕尺寸换算为画布尺寸时使用的有效缩放倍数。
+ * @param zoom 旧状态记录尺寸时的会话视口缩放。
+ * @returns 有限正数缩放；异常旧值回退为 1。
+ */
+function resolveAgentCanvasWorkbenchMigrationZoom(zoom: number): number {
+  return Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+}
+
+/**
+ * 读取目标节点的工作台画布尺寸，并兼容当前进程内 HMR 遗留的屏幕尺寸。
+ * @param current 当前会话视图状态。
+ * @param nodeId 需要读取工作台尺寸的节点 ID。
+ * @returns 目标节点的画布世界坐标尺寸；没有自定义尺寸时返回 null。
+ */
+export function resolveAgentCanvasWorkbenchSize(
+  current: AgentCanvasViewState,
+  nodeId: string,
+): AgentCanvasWorkbenchSize | null {
+  /** 旧单值尺寸只属于当时展开的节点。 */
+  const legacySize = (current as AgentCanvasViewState & LegacyAgentCanvasWorkbenchState).workbenchSize
+  /** 按节点尺寸优先，旧单值只作为 HMR 回退。 */
+  const size = current.workbenchSizesByNodeId?.[nodeId]
+    ?? (current.expandedNodeId === nodeId ? legacySize : null)
+  if (!size || current.workbenchSizeSpace === 'canvas') return size ?? null
+  /** 缺少空间标记时，旧尺寸以当前遗留视口缩放还原为画布单位。 */
+  const zoom = resolveAgentCanvasWorkbenchMigrationZoom(current.viewport.zoom)
+  return { width: size.width / zoom, height: size.height / zoom }
+}
+
+/**
+ * 将 HMR 遗留的工作台屏幕尺寸一次性固化为画布世界尺寸。
+ * @param current 当前会话视图状态。
+ * @returns 已是画布尺寸时返回空更新，否则返回完成迁移的有界尺寸缓存和空间标记。
+ */
+export function createAgentCanvasWorkbenchSizeMigrationUpdate(
+  current: AgentCanvasViewState,
+): Partial<AgentCanvasViewState> {
+  if (current.workbenchSizeSpace === 'canvas') return {}
+  /** 旧尺寸换算使用遗留状态自己的视口缩放，异常值按 1 处理。 */
+  const migrationZoom = resolveAgentCanvasWorkbenchMigrationZoom(current.viewport.zoom)
+  /** HMR 早期对象可能没有按节点尺寸 Map，按空集合安全接管。 */
+  const sizes = Object.fromEntries(Object.entries(current.workbenchSizesByNodeId ?? {}).map(([
+    savedNodeId,
+    size,
+  ]) => [savedNodeId, { width: size.width / migrationZoom, height: size.height / migrationZoom }]))
+  /** 旧单值尺寸只迁给它实际所属的展开节点，避免污染其它类型。 */
+  const legacySize = (current as AgentCanvasViewState & LegacyAgentCanvasWorkbenchState).workbenchSize
+  if (legacySize && current.expandedNodeId && sizes[current.expandedNodeId] === undefined) {
+    sizes[current.expandedNodeId] = {
+      width: legacySize.width / migrationZoom,
+      height: legacySize.height / migrationZoom,
+    }
+  }
+  return { workbenchSizesByNodeId: sizes, workbenchSizeSpace: 'canvas' }
 }
 
 /** 工作台几何更新的可选输入。 */
@@ -111,8 +171,10 @@ export function createAgentCanvasWorkbenchGeometryUpdate(
 ): Partial<AgentCanvasViewState> {
   /** 旧单值只迁给它实际所属的展开节点，避免污染其它类型。 */
   const legacySize = (current as AgentCanvasViewState & LegacyAgentCanvasWorkbenchState).workbenchSize
+  /** 几何首次写入前先固化全部旧尺寸，确保后续缩放不重复换算。 */
+  const migration = createAgentCanvasWorkbenchSizeMigrationUpdate(current)
   /** 几何更新始终从独立对象开始，避免修改 atom 中的历史状态。 */
-  const sizes = { ...current.workbenchSizesByNodeId }
+  const sizes = { ...(migration.workbenchSizesByNodeId ?? current.workbenchSizesByNodeId ?? {}) }
   /** HMR 可能保留升级前状态；缺少节点偏移 Map 时按空集合接管。 */
   const offsets = { ...(current.workbenchOffsetsByNodeId ?? {}) }
   if (legacySize && current.expandedNodeId && sizes[current.expandedNodeId] === undefined) {
@@ -137,7 +199,10 @@ export function createAgentCanvasWorkbenchGeometryUpdate(
     }
   }
   return {
-    ...(input.size || legacySize ? { workbenchSizesByNodeId: sizes } : {}),
+    workbenchSizeSpace: 'canvas',
+    ...(input.size || legacySize || migration.workbenchSizesByNodeId
+      ? { workbenchSizesByNodeId: sizes }
+      : {}),
     ...(input.offset ? { workbenchOffsetsByNodeId: offsets } : {}),
   }
 }
@@ -317,7 +382,16 @@ export const initializeAgentCanvasViewStateAtom = atom(
   (get, set, input: InitializeAgentCanvasViewStateInput): void => {
     /** 同一 view key 重载共享图时不得覆盖用户视口与选区。 */
     const states = get(agentCanvasViewStatesAtom)
-    if (states.has(input.key)) return
+    const current = states.get(input.key)
+    if (current) {
+      /** HMR 旧视图重挂载时先按其原 viewport 固化尺寸，不覆盖其它会话状态。 */
+      const migration = createAgentCanvasWorkbenchSizeMigrationUpdate(current)
+      if (migration.workbenchSizeSpace !== 'canvas') return
+      const nextStates = new Map(states)
+      nextStates.set(input.key, { ...current, ...migration })
+      set(agentCanvasViewStatesAtom, nextStates)
+      return
+    }
     const pendingNavigations = get(pendingAgentCanvasViewNavigationAtom)
     const pendingNodeId = pendingNavigations.get(input.key)
     const initial = createInitialAgentCanvasViewState(input.viewport)
@@ -359,9 +433,13 @@ export const updateAgentCanvasViewStateAtom = atom(
     const states = get(agentCanvasViewStatesAtom)
     const current = states.get(input.key)
     if (!current) return
-    const update = typeof input.update === 'function' ? input.update(current) : input.update
+    /** 在任何更新前使用旧 viewport 固化尺寸，防止先缩放导致迁移基准漂移。 */
+    const migration = createAgentCanvasWorkbenchSizeMigrationUpdate(current)
+    /** 函数更新也只接触迁移后的状态，避免调用方把旧空间标记带回。 */
+    const migratedCurrent = { ...current, ...migration }
+    const update = typeof input.update === 'function' ? input.update(migratedCurrent) : input.update
     const nextStates = new Map(states)
-    nextStates.set(input.key, { ...current, ...update })
+    nextStates.set(input.key, { ...migratedCurrent, ...update })
     set(agentCanvasViewStatesAtom, nextStates)
   },
 )
