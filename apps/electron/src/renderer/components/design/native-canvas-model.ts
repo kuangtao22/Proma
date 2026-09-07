@@ -28,6 +28,8 @@ import type { Edge, Node, NodeHandle } from '@xyflow/react'
 import { AGENT_STATUS_LABELS } from './CanvasAgentNode'
 import type { CanvasAgentFlowData, CanvasAgentFlowNode } from './CanvasAgentNode'
 import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
+import { arrangeNativeCanvasLayout } from './native-canvas-layout'
+import type { NativeCanvasLayoutEngine } from './native-canvas-layout-client'
 
 /** Canvas 语义边在画布上的稳定中文标签。 */
 const CANVAS_EDGE_RELATION_LABELS: Readonly<Record<CanvasEdgeRelation, string>> = {
@@ -600,114 +602,53 @@ export function createMoveCanvasNodesMutation(
   }
 }
 
-/** 只有衍生与依赖关系参与整理层级，引用和关联不强迫左右方向。 */
-function isDirectedCanvasLayoutRelation(relation: CanvasEdgeRelation): boolean {
-  return relation === 'derives' || relation === 'depends-on'
+/** 异步布局可取消；测试显式注入真实 Worker 引擎，生产按需加载浏览器入口。 */
+export interface NativeCanvasArrangeOptions {
+  signal?: AbortSignal
+  layoutGraph?: NativeCanvasLayoutEngine
 }
 
 /**
- * 为指定范围建立确定性紧凑位置 mutation，运行或等待审批节点保持原位。
+ * 为指定范围计算关系布局，运行或等待审批节点保持原位。
  * @param document 当前权威 Canvas 文档。
  * @param scopeNodeIds 用户明确选择的整理范围。
  * @param blockedNodeIds 当前不可移动的节点集合。
  * @param nodeSizesById Renderer 当前卡片尺寸；缺失节点回退类型默认尺寸。
- * @returns 只包含真实位置变化的单个 move-nodes mutation。
+ * @param options 生命周期取消信号及可注入的布局引擎。
+ * @returns 完成异步排版后只包含真实位置变化的单个 move-nodes mutation。
  */
-export function createArrangeCanvasNodesMutation(
+export async function createArrangeCanvasNodesMutation(
   document: CanvasDocument,
   scopeNodeIds: readonly string[],
   blockedNodeIds: ReadonlySet<string>,
   nodeSizesById: ReadonlyMap<string, NativeCanvasNodeSize> = new Map(),
-): Extract<CanvasMutation, { type: 'move-nodes' }> {
+  options: NativeCanvasArrangeOptions = {},
+): Promise<Extract<CanvasMutation, { type: 'move-nodes' }>> {
+  options.signal?.throwIfAborted()
   /** 所有排版分支统一读取当前投影尺寸，禁止移动项与固定障碍使用不同几何。 */
   const resolveLayoutSize = (node: CanvasNode): NativeCanvasNodeSize => (
     nodeSizesById.get(node.id) ?? resolveNativeCanvasNodeSize(node)
   )
-  /** 范围去重并按稳定节点 ID 排序，调用方传入顺序不影响结果。 */
+  /** 范围集合只做成员查询，稳定顺序始终来自文档。 */
   const scope = new Set(scopeNodeIds)
-  /** 真正参与移动的节点必须存在、在范围内且没有活动阻断。 */
-  const movableNodes = document.nodes
-    .filter((node) => scope.has(node.id) && !blockedNodeIds.has(node.id))
-    .sort((left, right) => left.id.localeCompare(right.id))
-  if (movableNodes.length === 0) return { type: 'move-nodes', positions: [] }
-
-  /** 范围外节点和阻断节点作为不可穿越的固定障碍。 */
-  const movableIds = new Set(movableNodes.map((node) => node.id))
-  const fixedRects: CanvasLayoutRect[] = document.nodes
-    .filter((node) => !movableIds.has(node.id))
-    .map((node) => ({ ...node.position, ...resolveLayoutSize(node), id: node.id }))
-  const index = createCanvasLayoutSpatialIndex(fixedRects, NATIVE_CANVAS_NODE_GAP)
-
-  /** 每个节点的入边列表用于计算最长前驱层级。 */
-  const incomingByNodeId = new Map<string, string[]>()
-  for (const edge of document.edges) {
-    if (!isDirectedCanvasLayoutRelation(edge.relation)
-      || !movableIds.has(edge.sourceNodeId)
-      || !movableIds.has(edge.targetNodeId)) continue
-    const incoming = incomingByNodeId.get(edge.targetNodeId) ?? []
-    incoming.push(edge.sourceNodeId)
-    incomingByNodeId.set(edge.targetNodeId, incoming)
+  const movableCount = document.nodes.filter((node) => scope.has(node.id) && !blockedNodeIds.has(node.id)).length
+  if (movableCount === 0) return { type: 'move-nodes', positions: [] }
+  /** 几何映射只有 O(n) 内存，不传递完整业务节点或素材正文。 */
+  const input = {
+    nodes: document.nodes.map((node) => ({ id: node.id, ...node.position, ...resolveLayoutSize(node) })),
+    edges: document.edges,
+    scopeNodeIds,
+    blockedNodeIds,
   }
-  /** 递归层级遇到循环时回退当前层，保证坏图也能有限完成。 */
-  const layerByNodeId = new Map<string, number>()
-  const resolving = new Set<string>()
-  const resolveLayer = (nodeId: string): number => {
-    const cached = layerByNodeId.get(nodeId)
-    if (cached !== undefined) return cached
-    if (resolving.has(nodeId)) return 0
-    resolving.add(nodeId)
-    const incoming = incomingByNodeId.get(nodeId) ?? []
-    const layer = incoming.length === 0
-      ? 0
-      : Math.max(...incoming.map((sourceNodeId) => resolveLayer(sourceNodeId) + 1))
-    resolving.delete(nodeId)
-    layerByNodeId.set(nodeId, layer)
-    return layer
-  }
-  for (const node of movableNodes) resolveLayer(node.id)
-
-  /** 以原范围左上角为锚点，整理不会把整个分组跳到远处。 */
-  const origin = {
-    x: Math.min(...movableNodes.map((node) => node.position.x)),
-    y: Math.min(...movableNodes.map((node) => node.position.y)),
-  }
-  /** 各层最大宽度决定下一层 X，保持有向关系从左到右。 */
-  const layerWidths = new Map<number, number>()
-  for (const node of movableNodes) {
-    const layer = layerByNodeId.get(node.id) ?? 0
-    layerWidths.set(layer, Math.max(layerWidths.get(layer) ?? 0, resolveLayoutSize(node).width))
-  }
-  const sortedLayers = [...new Set(layerByNodeId.values())].sort((left, right) => left - right)
-  const layerX = new Map<number, number>()
-  let nextX = origin.x
-  for (const layer of sortedLayers) {
-    layerX.set(layer, nextX)
-    nextX += (layerWidths.get(layer) ?? NATIVE_CANVAS_NODE_WIDTH) + NATIVE_CANVAS_NODE_GAP
-  }
-
-  /** 同层按 ID 稳定纵向堆叠；固定障碍只让当前项向下寻找，不移动旧节点。 */
-  const nextYByLayer = new Map<number, number>()
-  const positions: Array<{ nodeId: string; position: DesignPoint }> = []
-  for (const node of movableNodes.sort((left, right) => {
-    const layerDifference = (layerByNodeId.get(left.id) ?? 0) - (layerByNodeId.get(right.id) ?? 0)
-    return layerDifference || left.id.localeCompare(right.id)
-  })) {
-    const layer = layerByNodeId.get(node.id) ?? 0
-    const size = resolveLayoutSize(node)
-    const x = layerX.get(layer) ?? origin.x
-    let y = nextYByLayer.get(layer) ?? origin.y
-    /** 搜索次数受节点总数限制，异常密集障碍仍保持有限。 */
-    for (let attempt = 0; attempt <= document.nodes.length; attempt += 1) {
-      if (!index.overlaps({ x, y, ...size })) break
-      y += size.height + NATIVE_CANVAS_NODE_GAP
-    }
-    index.insert({ id: node.id, x, y, ...size })
-    nextYByLayer.set(layer, y + size.height + NATIVE_CANVAS_NODE_GAP)
-    if (node.position.x !== x || node.position.y !== y) {
-      positions.push({ nodeId: node.id, position: { x, y } })
-    }
-  }
-  return { type: 'move-nodes', positions }
+  /** 单个卡片只需固定障碍避让，无需加载引擎或创建 Worker。 */
+  if (movableCount === 1) return arrangeNativeCanvasLayout(input, async () => {
+    throw new Error('CANVAS_LAYOUT_ENGINE_UNEXPECTED')
+  })
+  if (options.layoutGraph) return arrangeNativeCanvasLayout(input, options.layoutGraph)
+  /** 独立 bundle 只在用户显式整理时加载，日常缩放和拖动没有计算开销。 */
+  const { withBrowserNativeCanvasLayoutEngine } = await import('./native-canvas-layout-browser')
+  options.signal?.throwIfAborted()
+  return withBrowserNativeCanvasLayoutEngine((layout) => arrangeNativeCanvasLayout(input, layout), options.signal)
 }
 
 /** 将一次视口结束事件转换为持久 mutation。 */

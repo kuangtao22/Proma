@@ -17,6 +17,7 @@
 - 凭据只记录存放位置，不记录具体值。
 - 全量测试使用 `bun test --isolate`，避免历史测试中的 `mock.module` 跨文件污染；定向测试仍可直接指定测试文件。
 - Canvas 性能证据要区分生产 JobManager 扫盘测试、隔离 Electron 的真实组件交互和已安装应用实跑；V8 内存使用 CDP 强制 GC 后的 heap 采样，不能用固定的粗粒度 `performance.memory` 声称没有泄漏。这样既能验证优化，也避免把 fixture 或单平台结果当成完整交付。
+- 用户要求 Canvas 整理按真实层级、分支和关联聚拢；共用参考素材不能混同执行依赖，也不能凭标题补造业务连线。2026-09-07 已授权并实现 ELK 独立 Worker 整理，保留显式触发与原子位置提交；原画布未自动重排。方案与验收分别见 `.omx/plans/2026-09-07-canvas-relational-layout.md`、`.omx/reports/2026-09-07-canvas-relational-layout.md`。大图验收还必须检查整理后原视口有内容：单参考源的巨大星形图仅用 layered 会拉成超高单列，应聚拢同源末端流程；Worker 完成或帧率正常不能替代几何与可见性验证。
 
 ## 架构决策
 

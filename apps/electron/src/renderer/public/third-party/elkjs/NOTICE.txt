@@ -1,0 +1,11 @@
+elkjs 0.11.1 - Eclipse Layout Kernel for JavaScript
+
+Copyright (c) 2017 Kiel University and others.
+Licensed under the Eclipse Public License 2.0 (see LICENSE.md).
+
+Proma uses the unmodified upstream elk-api and elk-worker.min.js files.
+Upstream source and build instructions:
+https://github.com/kieler/elkjs/tree/0.11.1
+https://github.com/eclipse-elk/elk
+
+The Worker is distributed as a separate renderer asset.

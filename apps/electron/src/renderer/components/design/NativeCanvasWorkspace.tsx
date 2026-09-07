@@ -130,6 +130,10 @@ import {
   resolveNativeCanvasNodeSize,
 } from './native-canvas-model'
 import {
+  createNativeCanvasArrangeCommand,
+  getNativeCanvasArrangeErrorMessage,
+} from './native-canvas-arrange-command'
+import {
   useCanvasImageModule,
   type CanvasImageModuleAdapter,
 } from './use-canvas-image-module'
@@ -2519,6 +2523,8 @@ export function NativeCanvasWorkspace({
     loading: false,
     error: null,
   })
+  /** 异步整理结束时只允许仍挂载的 Workspace 更新本地提示。 */
+  const arrangeMountedRef = React.useRef(true)
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
   const [deleteError, setDeleteError] = React.useState<string | null>(null)
@@ -3055,6 +3061,8 @@ export function NativeCanvasWorkspace({
     && state.structuralOperation === null
     && state.saveState !== 'conflict',
   )
+  const nodeActivityStatesRef = React.useRef(nodeActivityStates)
+  nodeActivityStatesRef.current = nodeActivityStates
   /** 删除要求存在完整选区和可写快照，主进程继续逐节点复核运行态。 */
   const canDeleteNode = Boolean(
     workspaceWritable
@@ -3538,78 +3546,123 @@ export function NativeCanvasWorkspace({
     })
   }, [workspaceWritable])
 
+  /** 异步整理命令统一持有结构锁，计算期间不叠加 Workspace 定时器。 */
+  const arrangeCommand = React.useMemo(() => createNativeCanvasArrangeCommand({
+    target,
+    createOperationId: () => window.crypto.randomUUID(),
+    getCurrentContext: () => {
+      const current = store.get(nativeCanvasStatesAtom).get(stateKey)
+      const document = current?.snapshot?.document
+      if (!document) return null
+      return {
+        workspaceKey: currentWorkspaceKeyRef.current,
+        document,
+        permissionWritable: Boolean(
+          current.snapshot?.writable
+          && current.authoritativeRecoveryState === 'idle'
+          && current.saveState !== 'conflict',
+        ),
+        blockedNodeIds: new Set([...nodeActivityStatesRef.current]
+          .filter(([, activity]) => activity === 'running' || activity === 'waiting-approval')
+          .map(([nodeId]) => nodeId)),
+      }
+    },
+    beginOperation: (operationId) => {
+      const started = beginStructuralOperation(operationId, 'arrange')
+      if (started) setArrangeState({ loading: true, error: null })
+      else if (arrangeMountedRef.current && currentWorkspaceKeyRef.current === viewStateKey) {
+        setArrangeState({ loading: false, error: '画布有未完成操作，稍后再整理。' })
+      }
+      return started
+    },
+    endOperation: (operationId) => {
+      endStructuralOperation(operationId)
+    },
+    calculate: (input, signal) => createArrangeCanvasNodesMutation(
+      input.document,
+      input.scopeNodeIds,
+      input.blockedNodeIds,
+      input.nodeSizesById,
+      { signal },
+    ),
+    save: adapter.saveCanvas,
+    onSuccess: (savedDocument) => {
+      if (currentWorkspaceKeyRef.current !== viewStateKey) return
+      updateNativeCanvasState({ key: stateKey, update: (currentState) => ({
+        ...(currentState.snapshot && currentState.snapshot.document.revision <= savedDocument.revision
+          ? { snapshot: { ...currentState.snapshot, document: savedDocument }, pendingMutations: [], inFlightMutations: [], saveState: 'saved' as const, error: null }
+          : {}),
+      }) })
+      setArrangeState({ loading: false, error: null })
+    },
+    onFailure: (error) => {
+      if (!arrangeMountedRef.current || currentWorkspaceKeyRef.current !== viewStateKey) return
+      setArrangeState({ loading: false, error: getNativeCanvasArrangeErrorMessage(error) })
+    },
+  }), [
+    adapter.saveCanvas,
+    beginStructuralOperation,
+    endStructuralOperation,
+    stateKey,
+    store,
+    target.canvasId,
+    target.projectId,
+    updateNativeCanvasState,
+    viewStateKey,
+  ])
+
+  React.useEffect(() => {
+    arrangeMountedRef.current = true
+    return () => {
+      arrangeMountedRef.current = false
+      /** cancel 可兼容 StrictMode effect 重放；恢复后同一命令仍可再次执行。 */
+      arrangeCommand.cancel()
+    }
+  }, [arrangeCommand])
+
+  React.useEffect(() => {
+    if (state.snapshot?.writable
+      && state.authoritativeRecoveryState === 'idle'
+      && state.saveState !== 'conflict') return
+    /** 权限或权威恢复状态失效时立即终止 Worker，结构锁由命令 finally 释放。 */
+    arrangeCommand.cancel()
+  }, [
+    arrangeCommand,
+    state.authoritativeRecoveryState,
+    state.saveState,
+    state.snapshot?.writable,
+  ])
+
   /** 按明确范围原子整理节点，运行和等待审批节点始终保持原位。 */
   const arrangeCanvasNodes = React.useCallback((scopeNodeIds: readonly string[]): void => {
-    if (!workspaceWritable || arrangeState.loading) return
+    if (arrangeState.loading) return
     const current = store.get(nativeCanvasStatesAtom).get(stateKey)
     const document = current?.snapshot?.document
     if (!document) return
-    /** 与权威文档从同一最新快照建立尺寸索引，避免通知和 React render 之间混用旧几何。 */
     const currentImagePreviews = new Map(
       (current.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
     )
-    /** 图片比例与 WebView 设备预设都按点击瞬间的当前卡片投影参与排版。 */
     const canvasNodeSizesById = createNativeCanvasNodeSizeMap(document, currentImagePreviews)
-    const blockedNodeIds = new Set([...nodeActivityStates]
+    const blockedNodeIds = new Set([...nodeActivityStatesRef.current]
       .filter(([, activity]) => activity === 'running' || activity === 'waiting-approval')
       .map(([nodeId]) => nodeId))
-    const mutation = createArrangeCanvasNodesMutation(
-      document,
+    /** Promise 只允许向启动时的会话视图反馈结果。 */
+    const operationViewStateKey = viewStateKey
+    void arrangeCommand.execute({
       scopeNodeIds,
       blockedNodeIds,
-      canvasNodeSizesById,
-    )
-    if (mutation.positions.length === 0) return
-    const operationId = window.crypto.randomUUID()
-    if (!beginStructuralOperation(operationId, 'arrange')) {
-      setArrangeState({ loading: false, error: '画布有未完成操作，稍后再整理。' })
-      return
-    }
-    const operationViewStateKey = viewStateKey
-    setArrangeState({ loading: true, error: null })
-    void commitNativeCanvasArrangeMutation({
-      target,
-      document,
-      mutation,
-      saveCanvas: adapter.saveCanvas,
-      onSuccess: (savedDocument) => {
-        if (currentWorkspaceKeyRef.current !== operationViewStateKey) return
-        updateNativeCanvasState({
-          key: stateKey,
-          update: (latest) => {
-            if (!latest.snapshot || latest.snapshot.document.revision > savedDocument.revision) return {}
-            return {
-              snapshot: { ...latest.snapshot, document: savedDocument },
-              pendingMutations: [],
-              inFlightMutations: [],
-              saveState: 'saved',
-              error: null,
-            }
-          },
-        })
-      },
-    }).then(() => {
-      if (currentWorkspaceKeyRef.current === operationViewStateKey) {
-        setArrangeState({ loading: false, error: null })
+      nodeSizesById: canvasNodeSizesById,
+    }).then((result) => {
+      if (!arrangeMountedRef.current || currentWorkspaceKeyRef.current !== operationViewStateKey) return
+      if (result === 'stale') {
+        setArrangeState({ loading: false, error: '画布状态已变化，请重试整理。' })
+        return
       }
-    }).catch(() => {
-      if (currentWorkspaceKeyRef.current === operationViewStateKey) {
-        setArrangeState({ loading: false, error: '整理布局失败，原位置已保留。' })
+      if (result !== 'failed' && result !== 'busy' && result !== 'unavailable') {
+        setArrangeState((currentState) => ({ ...currentState, loading: false }))
       }
-    }).finally(() => endStructuralOperation(operationId))
-  }, [
-    adapter.saveCanvas,
-    arrangeState.loading,
-    beginStructuralOperation,
-    endStructuralOperation,
-    nodeActivityStates,
-    stateKey,
-    store,
-    target,
-    updateNativeCanvasState,
-    viewStateKey,
-    workspaceWritable,
-  ])
+    })
+  }, [arrangeCommand, arrangeState.loading, stateKey, store, viewStateKey])
 
   /** 为唯一展开节点构造轻量工作台；Agent 对话仅在这里按需挂载。 */
   const renderNodeWorkbench = React.useCallback((

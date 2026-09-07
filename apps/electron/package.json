@@ -154,6 +154,7 @@
     "electron-builder": "25.1.8",
     "electron-updater": "^6.7.3",
     "electronmon": "^2.0.4",
+    "elkjs": "0.11.1",
     "esbuild": "^0.24.0",
     "jszip": "^3.10.1",
     "katex": "^0.16",

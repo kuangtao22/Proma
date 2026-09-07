@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'bun:test'
-import { createEmptyCanvasDocument } from '@proma/shared'
+import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
 import type { CanvasDocument, CanvasMutation } from '@proma/shared'
 import { Position } from '@xyflow/react'
+import ELK from 'elkjs/lib/elk-api'
 import {
   areNativeCanvasMutationsPositionOnly,
   coalesceNativeCanvasMutationsForSave,
-  createArrangeCanvasNodesMutation,
+  createArrangeCanvasNodesMutation as arrangeWithEngine,
   createMoveCanvasNodesMutation,
   createNativeCanvasNodeSizeMap,
   createNativeCanvasUserEdge,
@@ -24,6 +25,22 @@ import {
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
+
+/** 测试与浏览器使用同一真实 ELK Worker，仅替换 Vite 资源 URL 的解析。 */
+async function createArrangeCanvasNodesMutation(
+  ...args: Parameters<typeof arrangeWithEngine>
+): ReturnType<typeof arrangeWithEngine> {
+  const engine = new ELK({
+    workerFactory: () => new Worker(import.meta.resolve('elkjs/lib/elk-worker.min.js')),
+  })
+  try {
+    return await arrangeWithEngine(args[0], args[1], args[2], args[3], {
+      ...args[4], layoutGraph: (graph) => engine.layout(graph),
+    })
+  } finally {
+    engine.terminateWorker()
+  }
+}
 
 /** 创建覆盖四类持久节点的测试文档。 */
 function createDocument(): CanvasDocument {
@@ -380,11 +397,30 @@ describe('原生 Canvas 纯投影', () => {
 })
 
 describe('原生 Canvas mutation', () => {
-  test('Given 选区含运行节点 When 整理选中节点 Then 只移动空闲节点且不改关系', () => {
+  test('Given 两条独立依赖链的节点 ID 交错 When 整理 Then 每条链的上下游对齐而非按 ID 交叉', async () => {
+    /** 文档顺序代表两个独立流程，随机身份不应决定关联排列。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = ['source-z', 'target-a', 'source-a', 'target-z'].map((id) => ({
+      id, kind: 'document', title: id, documentId: id, contentRevision: 0,
+      position: { x: 0, y: 0 },
+    }))
+    document.edges = [['source-z', 'target-a'], ['source-a', 'target-z']].map(([source, target], index) => ({
+      id: `edge-${index}`, sourceNodeId: source!, targetNodeId: target!,
+      sourcePort: 'document.markdown', targetPort: 'context.text', relation: 'depends-on',
+    }))
+    /** 通过最终文档读取未发生位移的节点，避免遗漏零位移项。 */
+    const mutation = await createArrangeCanvasNodesMutation(document, document.nodes.map((node) => node.id), new Set())
+    const result = applyCanvasMutations(document, [mutation])
+    const positions = new Map(result.nodes.map((node) => [node.id, node.position]))
+    expect(positions.get('source-z')!.y).toBe(positions.get('target-a')!.y)
+    expect(positions.get('source-a')!.y).toBe(positions.get('target-z')!.y)
+  })
+
+  test('Given 选区含运行节点 When 整理选中节点 Then 只移动空闲节点且不改关系', async () => {
     const document = createDocument()
     const beforeEdges = structuredClone(document.edges)
 
-    const mutation = createArrangeCanvasNodesMutation(
+    const mutation = await createArrangeCanvasNodesMutation(
       document,
       ['agent-1', 'image-1', 'doc-1'],
       new Set(['agent-1']),
@@ -395,19 +431,19 @@ describe('原生 Canvas mutation', () => {
     expect(document.edges).toEqual(beforeEdges)
   })
 
-  test('Given 来源和衍生节点都可移动 When 整理布局 Then 保持左到右层级且结果确定', () => {
+  test('Given 来源和衍生节点都可移动 When 整理布局 Then 保持左到右层级且结果确定', async () => {
     const document = createDocument()
     document.edges[0] = { ...document.edges[0]!, relation: 'derives' }
 
-    const first = createArrangeCanvasNodesMutation(document, ['agent-1', 'image-1'], new Set())
-    const second = createArrangeCanvasNodesMutation(document, ['image-1', 'agent-1'], new Set())
-    const positions = new Map(first.positions.map((entry) => [entry.nodeId, entry.position]))
+    const first = await createArrangeCanvasNodesMutation(document, ['agent-1', 'image-1'], new Set())
+    const second = await createArrangeCanvasNodesMutation(document, ['image-1', 'agent-1'], new Set())
+    const positions = new Map(applyCanvasMutations(document, [first]).nodes.map((node) => [node.id, node.position]))
 
     expect(positions.get('image-1')!.x).toBeGreaterThan(positions.get('agent-1')!.x)
     expect(second).toEqual(first)
   })
 
-  test('Given 同层图片卡片高度不同 When 整理布局 Then 使用当前投影尺寸避免卡片重叠', () => {
+  test('Given 同层图片卡片高度不同 When 整理布局 Then 使用当前投影尺寸避免卡片重叠', async () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
       {
@@ -427,21 +463,22 @@ describe('原生 Canvas mutation', () => {
       ['asset-b', { assetId: 'asset-b', previewUrl: 'media://asset-b', width: 288, height: 100 }],
     ]))
 
-    const mutation = createArrangeCanvasNodesMutation(
+    const mutation = await createArrangeCanvasNodesMutation(
       document,
       document.nodes.map((node) => node.id),
       new Set(),
       nodeSizesById,
     )
-    const positions = new Map(mutation.positions.map((entry) => [entry.nodeId, entry.position]))
-
-    expect(positions.get('image-b')).toEqual({
-      x: 0,
-      y: NATIVE_CANVAS_NODE_HEADER_HEIGHT + 320 + NATIVE_CANVAS_NODE_GAP,
-    })
+    const positions = new Map(applyCanvasMutations(document, [mutation]).nodes.map((node) => [node.id, node.position]))
+    const first = positions.get('image-a')!
+    const second = positions.get('image-b')!
+    expect(second.x >= first.x + 288 + NATIVE_CANVAS_NODE_GAP
+      || first.x >= second.x + 288 + NATIVE_CANVAS_NODE_GAP
+      || second.y >= first.y + NATIVE_CANVAS_NODE_HEADER_HEIGHT + 320 + NATIVE_CANVAS_NODE_GAP
+      || first.y >= second.y + NATIVE_CANVAS_NODE_HEADER_HEIGHT + 100 + NATIVE_CANVAS_NODE_GAP).toBeTrue()
   })
 
-  test('Given 整理范围外存在高卡片 When 整理布局 Then 使用固定卡片当前尺寸进行避让', () => {
+  test('Given 整理范围外存在高卡片 When 整理布局 Then 使用固定卡片当前尺寸进行避让', async () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
     document.nodes = [
       {
@@ -459,7 +496,7 @@ describe('原生 Canvas mutation', () => {
       ['moving-image', { width: 288, height: 220 }],
     ])
 
-    const mutation = createArrangeCanvasNodesMutation(
+    const mutation = await createArrangeCanvasNodesMutation(
       document,
       ['moving-image'],
       new Set(),
@@ -468,7 +505,7 @@ describe('原生 Canvas mutation', () => {
 
     expect(mutation.positions).toEqual([{
       nodeId: 'moving-image',
-      position: { x: 0, y: (220 + NATIVE_CANVAS_NODE_GAP) * 3 },
+      position: { x: 0, y: 500 + NATIVE_CANVAS_NODE_GAP },
     }])
   })
 
