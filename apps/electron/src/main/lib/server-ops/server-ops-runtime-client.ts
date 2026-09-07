@@ -1,7 +1,24 @@
 import { randomUUID } from 'node:crypto'
+import { parseServerOpsSftpRequest, ServerOpsSftpRuntimeError } from '../../../utility/server-ops/server-ops-sftp-runtime'
+import type { ServerOpsSftpRequest, ServerOpsSftpResult } from '../../../utility/server-ops/server-ops-sftp-runtime'
+
+/** 保留每种 SFTP input 与 type 的对应关系，requestId 仅由 Main 生成。 */
+export type ServerOpsSftpCall = ServerOpsSftpRequest extends infer Request
+  ? Request extends ServerOpsSftpRequest ? Omit<Request, 'requestId'> : never : never
+
+/** 待回复的有界 SFTP 请求及其提交语义。 */
+interface PendingSftp {
+  request: ServerOpsSftpRequest
+  resolve: (result: ServerOpsSftpResult) => void
+  reject: (error: ServerOpsSftpRuntimeError) => void
+  timeout: ReturnType<typeof setTimeout>
+}
 import { join } from 'node:path'
 import type { MessagePortMain } from 'electron'
-import type { ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck, ServerOpsTerminalOutputEvent } from '@proma/shared'
+import type { ServerOpsConsoleAck, ServerOpsConsoleExitEvent, ServerOpsConsoleIdentity, ServerOpsConsoleInput,
+  ServerOpsConsoleOutputEvent, ServerOpsConsoleResizeInput, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck,
+  ServerOpsTerminalOutputEvent } from '@proma/shared'
+import type { ServerOpsConsoleRuntimeStart } from '../../../utility/server-ops/server-ops-console-runtime'
 import {
   parseServerOpsRuntimeMessage,
   type ServerOpsRuntimeConnectRequest,
@@ -73,6 +90,21 @@ interface PendingLogStart {
   timeout: ReturnType<typeof setTimeout>
 }
 
+interface PendingConsoleStart {
+  session: ServerOpsConsoleIdentity
+  resolve: () => void
+  reject: (error: ServerOpsRuntimeError) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
+interface PendingConsoleClose {
+  session: ServerOpsConsoleIdentity
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: ServerOpsRuntimeError) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
 /** 已由 utility 确认启动的日志流身份。 */
 export interface ServerOpsRuntimeLogIdentity {
   hostId: string
@@ -106,6 +138,8 @@ const STARTUP_TIMEOUT_MS = 10_000
 const CONNECT_TIMEOUT_MS = 25_000
 /** utility 确认日志流启动的默认等待上限。 */
 const LOG_START_TIMEOUT_MS = 10_000
+/** Console channel 启停确认的固定上限。 */
+const CONSOLE_LIFECYCLE_TIMEOUT_MS = 10_000
 /** 单个 runtime 代次保留的日志流墓碑上限。 */
 const MAX_USED_LOG_STREAM_IDS = 65_536
 /** 可配置日志启动超时的安全上限。 */
@@ -164,12 +198,23 @@ export class ServerOpsRuntimeClient {
   /** requestId 对应的连接请求。 */
   private readonly pendingConnects = new Map<string, PendingConnect>()
   private readonly pendingExecs = new Map<string, PendingExec>()
+  /** SFTP 在途请求最多 64 个，窗口资源归属单独保留至显式关闭。 */
+  private readonly pendingSftp = new Map<string, PendingSftp>()
+  private readonly sftpOwners = new Map<string, Map<string, string>>()
+  /** 连接或 runtime 先失联时保留 owner 清理不可确认事实。 */
+  private readonly unconfirmedSftpOwners = new Set<string>()
+  /** owner 关闭按 ownerKey 单飞并等待 utility 精确 ACK。 */
+  private readonly closingSftpOwners = new Map<string, Promise<void>>()
   /** streamId 全局唯一，避免迟到 started 接管同 ID 新代流。 */
   private readonly pendingLogStarts = new Map<string, PendingLogStart>()
   /** 已确认启动的日志流。 */
   private readonly activeLogStreams = new Map<string, ServerOpsRuntimeLogIdentity>()
   /** 本 client 生命周期内已使用的 ID，阻止迟到 started 接管同 ID 新请求。 */
   private readonly usedLogStreamIds = new Set<string>()
+  /** Console 启动与关闭都等待 utility 明确确认并设置 deadline。 */
+  private readonly pendingConsoleStarts = new Map<string, PendingConsoleStart>()
+  private readonly pendingConsoleCloses = new Map<string, PendingConsoleClose>()
+  private readonly activeConsoles = new Map<string, ServerOpsConsoleIdentity>()
   /** 当前已连接的 connectionId 到 hostId。 */
   private readonly activeConnections = new Map<string, string>()
   /** 远程输出订阅者。 */
@@ -180,6 +225,8 @@ export class ServerOpsRuntimeClient {
   private readonly logOutputListeners = new Set<(event: ServerOpsRuntimeLogOutputEvent) => void>()
   /** 日志退出订阅者。 */
   private readonly logExitListeners = new Set<(event: ServerOpsRuntimeLogExitEvent) => void>()
+  private readonly consoleOutputListeners = new Set<(event: ServerOpsConsoleOutputEvent) => void>()
+  private readonly consoleExitListeners = new Set<(event: ServerOpsConsoleExitEvent) => void>()
 
   constructor(dependencies: ServerOpsRuntimeClientDependencies = DEFAULT_RUNTIME_CLIENT_DEPENDENCIES) {
     this.dependencies = dependencies
@@ -239,8 +286,11 @@ export class ServerOpsRuntimeClient {
   /** 主动断开精确连接。 */
   disconnect(hostId: string, connectionId: string): void {
     if (this.hasConflictingConnectionOwner(hostId, connectionId)) return
+    this.rejectSftp('SERVER_OPS_CONNECTION_CLOSED', (request) => request.hostId === hostId && request.connectionId === connectionId)
+    this.forgetSftpConnection(connectionId)
     this.rejectPendingLogStartsForConnection(hostId, connectionId, new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
     this.finishLogStreamsForConnection(hostId, connectionId, 'connection-closed')
+    this.finishConsolesForConnection(hostId, connectionId, new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
     if (this.activeConnections.get(connectionId) === hostId) this.activeConnections.delete(connectionId)
     for (const [requestId, pending] of this.pendingExecs) {
       if (pending.hostId !== hostId || pending.connectionId !== connectionId) continue
@@ -311,6 +361,72 @@ export class ServerOpsRuntimeClient {
   }
 
   /** 在已连接 SSH 上执行无 PTY 命令，并返回结构化结果。 */
+  async sftp(input: ServerOpsSftpCall): Promise<ServerOpsSftpResult> {
+    if (!this.port || this.activeConnections.get(input.connectionId) !== input.hostId) throw new ServerOpsSftpRuntimeError('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    if (this.closingSftpOwners.has(input.input.ownerKey)) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_OWNER_CLOSED')
+    if (this.pendingSftp.size >= 64 || (!this.sftpOwners.has(input.input.ownerKey) && this.sftpOwners.size >= 256)) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_CAPACITY_EXCEEDED')
+    /** 在注册定时器前验证完整合同，避免无效请求留下资源。 */
+    const request = parseServerOpsSftpRequest({ ...input, requestId: this.dependencies.uuid() })
+    const remaining = request.input.deadlineAt - Date.now()
+    if (remaining <= 0 || remaining > 120_000) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_DEADLINE_INVALID')
+    if (this.pendingSftp.has(request.requestId)) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_REQUEST_CONFLICT')
+    const owners = this.sftpOwners.get(request.input.ownerKey) ?? new Map<string, string>()
+    owners.set(request.connectionId, request.hostId)
+    this.sftpOwners.set(request.input.ownerKey, owners)
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => { void this.closeSftpOwner(request.input.ownerKey, 'SERVER_OPS_SFTP_TIMEOUT').catch(() => undefined) }, remaining)
+      this.pendingSftp.set(request.requestId, { request, resolve, reject, timeout })
+      try { this.port!.postMessage({ type: 'server-ops.sftp', input: request }) }
+      catch {
+        clearTimeout(timeout)
+        this.pendingSftp.delete(request.requestId)
+        reject(new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_DISPATCH_FAILED'))
+        void this.closeSftpOwner(request.input.ownerKey).catch(() => undefined)
+      }
+    })
+  }
+
+  /** 关闭窗口拥有的全部远程 cursor/handle，并使迟到结果失效。 */
+  closeSftpOwner(ownerKey: string, code = 'SERVER_OPS_SFTP_OWNER_CLOSED'): Promise<void> {
+    const existing = this.closingSftpOwners.get(ownerKey)
+    if (existing) return existing
+    this.rejectSftp(code, (request) => request.input.ownerKey === ownerKey)
+    const owned = this.sftpOwners.get(ownerKey)
+    this.sftpOwners.delete(ownerKey)
+    const cleanupWasUnconfirmed = this.unconfirmedSftpOwners.delete(ownerKey)
+    const closing = Promise.all([...(owned ?? [])].map(async ([connectionId, hostId]) => {
+      if (!this.port || this.activeConnections.get(connectionId) !== hostId) {
+        throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_CLEANUP_UNCONFIRMED')
+      }
+      const request = parseServerOpsSftpRequest({ type: 'close-owner', requestId: this.dependencies.uuid(), hostId, connectionId, input: { ownerKey, deadlineAt: Date.now() + 10_000 } })
+      if (this.pendingSftp.has(request.requestId)) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_REQUEST_CONFLICT')
+      await new Promise<void>((resolve, reject) => {
+        const pending: PendingSftp = {
+          request,
+          resolve: (result) => result.type === 'close-owner' ? resolve() : reject(new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_RESULT_INVALID')),
+          reject,
+          timeout: setTimeout(() => {
+            if (this.pendingSftp.get(request.requestId) !== pending) return
+            this.pendingSftp.delete(request.requestId)
+            reject(new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_CLOSE_OWNER_TIMEOUT'))
+          }, 10_000),
+        }
+        this.pendingSftp.set(request.requestId, pending)
+        try { this.port!.postMessage({ type: 'server-ops.sftp', input: request }) } catch {
+          clearTimeout(pending.timeout)
+          this.pendingSftp.delete(request.requestId)
+          reject(new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_DISPATCH_FAILED'))
+        }
+      })
+    })).then(() => {
+      if (cleanupWasUnconfirmed) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_CLEANUP_UNCONFIRMED')
+    })
+    this.closingSftpOwners.set(ownerKey, closing)
+    void closing.finally(() => { if (this.closingSftpOwners.get(ownerKey) === closing) this.closingSftpOwners.delete(ownerKey) }).catch(() => undefined)
+    return closing
+  }
+
+  /** 在已连接 SSH 上执行无 PTY 命令，并返回结构化结果。 */
   async exec(hostId: string, connectionId: string, command: string, timeoutMs: number): Promise<ServerOpsRuntimeExecResult> {
     if (this.activeConnections.get(connectionId) !== hostId) {
       throw new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_NOT_ACTIVE', 'SSH 连接未激活')
@@ -342,8 +458,56 @@ export class ServerOpsRuntimeClient {
     this.port?.postMessage({ type: 'server-ops.terminal-ack', input })
   }
 
+  /** 启动绑定完整身份的独立 Docker Console channel。 */
+  async startConsole(input: ServerOpsConsoleRuntimeStart): Promise<void> {
+    if (this.activeConnections.get(input.connectionId) !== input.hostId || this.activeConsoles.has(input.consoleId)
+      || this.pendingConsoleStarts.has(input.consoleId)) throw new ServerOpsRuntimeError('SERVER_OPS_CONSOLE_START_FAILED', '容器终端无法启动')
+    await this.start()
+    return await new Promise<void>((resolve, reject) => {
+      const session = this.consoleIdentity(input)
+      const timeout = setTimeout(() => {
+        this.pendingConsoleStarts.delete(input.consoleId)
+        this.port?.postMessage({ type: 'server-ops.console-stop', input: session })
+        reject(new ServerOpsRuntimeError('SERVER_OPS_CONSOLE_START_TIMEOUT', '容器终端启动超时'))
+      }, CONSOLE_LIFECYCLE_TIMEOUT_MS)
+      this.pendingConsoleStarts.set(input.consoleId, { session, resolve, reject, timeout })
+      this.port?.postMessage({ type: 'server-ops.console-start', input })
+    })
+  }
+
+  /** 关闭 Console 并等待 utility 的精确 exit 确认。 */
+  async stopConsole(input: ServerOpsConsoleIdentity): Promise<void> {
+    const active = this.activeConsoles.get(input.consoleId)
+    if (!active || !this.sameConsole(active, input)) return
+    const existing = this.pendingConsoleCloses.get(input.consoleId)
+    if (existing) return await existing.promise
+    /** 当前关闭单飞 Promise 供重复关闭调用复用。 */
+    let resolveClose!: () => void
+    let rejectClose!: (error: ServerOpsRuntimeError) => void
+    const promise = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject })
+    const timeout = setTimeout(() => {
+      this.pendingConsoleCloses.delete(input.consoleId)
+      this.activeConsoles.delete(input.consoleId)
+      rejectClose(new ServerOpsRuntimeError('SERVER_OPS_CONSOLE_CLOSE_TIMEOUT', '容器终端关闭超时'))
+    }, CONSOLE_LIFECYCLE_TIMEOUT_MS)
+    this.pendingConsoleCloses.set(input.consoleId, {
+      session: { ...input }, promise, resolve: resolveClose, reject: rejectClose, timeout,
+    })
+    this.port?.postMessage({ type: 'server-ops.console-stop', input })
+    return await promise
+  }
+
+  inputConsole(input: ServerOpsConsoleInput): void { if (this.matchesActiveConsole(input)) this.port?.postMessage({ type: 'server-ops.console-input', input }) }
+  resizeConsole(input: ServerOpsConsoleResizeInput): void { if (this.matchesActiveConsole(input)) this.port?.postMessage({ type: 'server-ops.console-resize', input }) }
+  acknowledgeConsole(input: ServerOpsConsoleAck): void { if (this.matchesActiveConsole(input)) this.port?.postMessage({ type: 'server-ops.console-ack', input }) }
+  onConsoleOutput(listener: (event: ServerOpsConsoleOutputEvent) => void): () => void { this.consoleOutputListeners.add(listener); return () => this.consoleOutputListeners.delete(listener) }
+  onConsoleExit(listener: (event: ServerOpsConsoleExitEvent) => void): () => void { this.consoleExitListeners.add(listener); return () => this.consoleExitListeners.delete(listener) }
+
   /** 同步失效端口和本地状态，并请求 runtime 释放全部 SSH 资源。 */
   stop(): void {
+    this.markAllSftpOwnersUnconfirmed()
+    this.rejectSftp('SERVER_OPS_RUNTIME_STOPPED')
+    this.sftpOwners.clear()
     this.stopping = true
     this.runtimeEpoch += 1
     const port = this.port
@@ -360,6 +524,7 @@ export class ServerOpsRuntimeClient {
     this.rejectPendingExec(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.rejectPendingLogStarts(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.finishAllLogStreams('error', 'SERVER_OPS_RUNTIME_STOPPED')
+    this.finishAllConsoles(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.emitRuntimeExit('SSH 运行时已停止')
     this.stopping = false
   }
@@ -446,6 +611,16 @@ export class ServerOpsRuntimeClient {
       pending.resolve(message.result)
       return
     }
+    if (message.type === 'server-ops.sftp-result') {
+      const pending = this.pendingSftp.get(message.result.requestId)
+      if (!pending || pending.request.hostId !== message.hostId || pending.request.connectionId !== message.connectionId) return
+      if (message.result.type !== 'error' && message.result.type !== pending.request.type) return
+      clearTimeout(pending.timeout)
+      this.pendingSftp.delete(message.result.requestId)
+      if (message.result.type === 'error') pending.reject(new ServerOpsSftpRuntimeError(message.result.code, message.result.outcome))
+      else pending.resolve(message.result)
+      return
+    }
     if (message.type === 'server-ops.exec-result') {
       const pending = this.pendingExecs.get(message.requestId)
       if (!pending || pending.hostId !== message.hostId || pending.connectionId !== message.connectionId) return
@@ -480,6 +655,36 @@ export class ServerOpsRuntimeClient {
       pending.resolve()
       return
     }
+    if (message.type === 'server-ops.console-started') {
+      const pending = this.pendingConsoleStarts.get(message.session.consoleId)
+      if (!pending || !this.sameConsole(pending.session, message.session)
+        || this.activeConnections.get(message.session.connectionId) !== message.session.hostId) return
+      clearTimeout(pending.timeout)
+      this.pendingConsoleStarts.delete(message.session.consoleId)
+      this.activeConsoles.set(message.session.consoleId, { ...message.session })
+      pending.resolve()
+      return
+    }
+    if (message.type === 'server-ops.console-output') {
+      if (!this.matchesActiveConsole(message.event)) return
+      this.notifyConsoleOutput(message.event)
+      return
+    }
+    if (message.type === 'server-ops.console-exit') {
+      const pendingStart = this.pendingConsoleStarts.get(message.event.consoleId)
+      if (pendingStart && this.sameConsole(pendingStart.session, message.event)) {
+        clearTimeout(pendingStart.timeout); this.pendingConsoleStarts.delete(message.event.consoleId)
+        pendingStart.reject(new ServerOpsRuntimeError('SERVER_OPS_CONSOLE_START_FAILED', '容器终端无法启动'))
+        return
+      }
+      const active = this.activeConsoles.get(message.event.consoleId)
+      if (!active || !this.sameConsole(active, message.event)) return
+      this.activeConsoles.delete(message.event.consoleId)
+      const pendingClose = this.pendingConsoleCloses.get(message.event.consoleId)
+      if (pendingClose) { clearTimeout(pendingClose.timeout); this.pendingConsoleCloses.delete(message.event.consoleId); pendingClose.resolve() }
+      this.notifyConsoleExit(message.event)
+      return
+    }
     if (message.type === 'server-ops.log-chunk') {
       const active = this.activeLogStreams.get(message.streamId)
       if (!active || !this.matchesLogIdentity(active, message.hostId, message.connectionId, message.streamId)) return
@@ -509,8 +714,12 @@ export class ServerOpsRuntimeClient {
     }
     if (message.type === 'server-ops.terminal-exit') {
       if (this.activeConnections.get(message.event.connectionId) !== message.event.hostId) return
+      this.rejectSftp('SERVER_OPS_CONNECTION_CLOSED', (request) => request.connectionId === message.event.connectionId)
+      this.forgetSftpConnection(message.event.connectionId)
       this.rejectPendingLogStartsForConnection(message.event.hostId, message.event.connectionId, new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       this.finishLogStreamsForConnection(message.event.hostId, message.event.connectionId, 'connection-closed')
+      this.finishConsolesForConnection(message.event.hostId, message.event.connectionId,
+        new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       this.activeConnections.delete(message.event.connectionId)
       for (const [requestId, pending] of this.pendingExecs) {
         if (pending.connectionId !== message.event.connectionId) continue
@@ -530,6 +739,9 @@ export class ServerOpsRuntimeClient {
     port: ServerOpsRuntimePort,
   ): void {
     if (!this.isCurrentRuntime(epoch, runtimeProcess, port)) return
+    this.markAllSftpOwnersUnconfirmed()
+    this.rejectSftp(error.code)
+    this.sftpOwners.clear()
     this.runtimeEpoch += 1
     try {
       runtimeProcess.kill()
@@ -544,7 +756,72 @@ export class ServerOpsRuntimeClient {
     this.rejectPendingExec(error)
     this.rejectPendingLogStarts(error)
     this.finishAllLogStreams('error', error.code)
+    this.finishAllConsoles(error)
     this.emitRuntimeExit(error.message)
+  }
+
+  /** 拒绝并清理所有待处理连接请求。 */
+  private rejectSftp(code: string, matches: (request: ServerOpsSftpRequest) => boolean = () => true): void {
+    for (const [requestId, pending] of this.pendingSftp) {
+      if (!matches(pending.request)) continue
+      clearTimeout(pending.timeout)
+      this.pendingSftp.delete(requestId)
+      /** 已分派的变更在失联时不能证明未提交，读取类操作没有提交副作用。 */
+      const readOnly = ['list', 'preview', 'stat', 'open-read', 'read', 'close', 'cancel', 'close-owner'].includes(pending.request.type)
+      pending.reject(new ServerOpsSftpRuntimeError(code, readOnly ? 'not-committed' : 'unknown'))
+    }
+  }
+
+  /** 连接终结后清除所有 owner 的该连接资源索引。 */
+  private forgetSftpConnection(connectionId: string): void {
+    for (const [ownerKey, owned] of this.sftpOwners) {
+      if (owned.has(connectionId)) this.unconfirmedSftpOwners.add(ownerKey)
+      owned.delete(connectionId)
+      if (owned.size === 0) this.sftpOwners.delete(ownerKey)
+    }
+  }
+
+  /** runtime 整体失联前将所有仍有远端资源的 owner 标记为不可确认。 */
+  private markAllSftpOwnersUnconfirmed(): void {
+    for (const ownerKey of this.sftpOwners.keys()) this.unconfirmedSftpOwners.add(ownerKey)
+  }
+
+  private consoleIdentity(input: ServerOpsConsoleIdentity): ServerOpsConsoleIdentity {
+    return { consoleId: input.consoleId, hostId: input.hostId, connectionId: input.connectionId, containerId: input.containerId }
+  }
+
+  private sameConsole(left: ServerOpsConsoleIdentity, right: ServerOpsConsoleIdentity): boolean {
+    return left.consoleId === right.consoleId && left.hostId === right.hostId && left.connectionId === right.connectionId
+      && left.containerId === right.containerId
+  }
+
+  private matchesActiveConsole(input: ServerOpsConsoleIdentity): boolean {
+    const active = this.activeConsoles.get(input.consoleId)
+    return Boolean(active && this.sameConsole(active, input) && this.activeConnections.get(input.connectionId) === input.hostId)
+  }
+
+  private finishConsolesForConnection(hostId: string, connectionId: string, error: ServerOpsRuntimeError): void {
+    for (const [consoleId, pending] of this.pendingConsoleStarts) {
+      if (pending.session.hostId !== hostId || pending.session.connectionId !== connectionId) continue
+      clearTimeout(pending.timeout); this.pendingConsoleStarts.delete(consoleId); pending.reject(error)
+    }
+    for (const [consoleId, active] of this.activeConsoles) {
+      if (active.hostId !== hostId || active.connectionId !== connectionId) continue
+      this.activeConsoles.delete(consoleId)
+      const closing = this.pendingConsoleCloses.get(consoleId)
+      if (closing) { clearTimeout(closing.timeout); this.pendingConsoleCloses.delete(consoleId); closing.resolve() }
+      const event = { ...active, message: error.message }
+      this.notifyConsoleExit(event)
+    }
+  }
+
+  private finishAllConsoles(error: ServerOpsRuntimeError): void {
+    const connections = new Set([...this.pendingConsoleStarts.values(), ...this.activeConsoles.values()]
+      .map((entry) => 'session' in entry ? `${entry.session.hostId}\0${entry.session.connectionId}` : `${entry.hostId}\0${entry.connectionId}`))
+    for (const connection of connections) {
+      const [hostId, connectionId] = connection.split('\0')
+      if (hostId && connectionId) this.finishConsolesForConnection(hostId, connectionId, error)
+    }
   }
 
   /** 拒绝并清理所有待处理连接请求。 */
@@ -646,6 +923,20 @@ export class ServerOpsRuntimeClient {
   /** 隔离日志终态订阅者异常。 */
   private notifyLogExit(event: ServerOpsRuntimeLogExitEvent): void {
     for (const listener of this.logExitListeners) {
+      try { listener({ ...event }) } catch { /* 单个订阅者无权阻断资源收口。 */ }
+    }
+  }
+
+  /** 隔离 Console 输出订阅者异常。 */
+  private notifyConsoleOutput(event: ServerOpsConsoleOutputEvent): void {
+    for (const listener of this.consoleOutputListeners) {
+      try { listener({ ...event }) } catch { /* 单个订阅者无权阻断其它消费者。 */ }
+    }
+  }
+
+  /** 隔离 Console 终态订阅者异常。 */
+  private notifyConsoleExit(event: ServerOpsConsoleExitEvent): void {
+    for (const listener of this.consoleExitListeners) {
       try { listener({ ...event }) } catch { /* 单个订阅者无权阻断资源收口。 */ }
     }
   }

@@ -162,6 +162,7 @@ import {
 import { designAdapter } from '@/lib/design-adapter'
 import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import { ServerOpsWorkspace } from '@/components/server-ops/ServerOpsWorkspace'
+import { useServerOpsTransferLeave } from '@/components/server-ops/useServerOpsTransferLeave'
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
   createCanvasDeleteLifecycle,
@@ -504,6 +505,8 @@ interface SidePanelProps {
 }
 
 export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, width = 460 }: SidePanelProps): React.ReactElement {
+  /** 关闭运维工作区前完成当前窗口的文件传输确认与资源清理。 */
+  const transferLeave = useServerOpsTransferLeave(sessionId)
   // 按会话保存最近访问顺序。该历史仅存在于当前 renderer 进程，避免恢复失效的临时 Tab。
   const rightPanelTabHistoryRef = React.useRef(new Map<string, AgentSidePanelTab[]>())
   const workspaceTabsRef = React.useRef<WorkspacePanelTab[]>([])
@@ -1192,10 +1195,14 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [setUnviewedDelegatedCompleted])
 
   const handleCloseSidePanel = React.useCallback(() => {
-    // Closing the whole right workspace hides every auxiliary conversation.
-    rememberStopGenerationTarget({ kind: 'agent', sessionId })
-    setIsOpen(false)
-  }, [sessionId, setIsOpen])
+    /** 关闭动作延后到活动传输已收口，其他工作区仍沿用原行为。 */
+    const close = (): void => {
+      rememberStopGenerationTarget({ kind: 'agent', sessionId })
+      setIsOpen(false)
+    }
+    if (workspaceComponentTabs.includes('server-ops')) transferLeave.requestLeave(close)
+    else close()
+  }, [sessionId, setIsOpen, workspaceComponentTabs, transferLeave.requestLeave])
 
   const [canvasWorkspaceStateMap, setCanvasWorkspaceStateMap] = useAtom(agentCanvasWorkspaceStateMapAtom)
   /** 当前会话从本地存储恢复并严格清洗后的 Canvas 工作区偏好。 */
@@ -1843,6 +1850,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       return
     }
     if (isWorkspaceComponentTab(tab)) {
+      if (tab === 'server-ops') {
+        transferLeave.requestLeave(() => {
+          setWorkspaceComponentTabs((previous) => previous.filter((component) => component !== tab))
+          returnToPreviousTabAfterClose(tab)
+        })
+        return
+      }
       setWorkspaceComponentTabs((previous) => previous.filter((component) => component !== tab))
       returnToPreviousTabAfterClose(tab)
       return
@@ -1855,7 +1869,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     if (tab === 'delegation') { handleCloseDelegationTab(); return }
     const browserTabId = getBrowserTabIdFromSidePanelTab(tab)
     if (browserTabId) void handleCloseBrowserTab(browserTabId)
-  }, [canvasRegistry, exitSplitInsteadOfClosingBoundTab, forgetOpenedCanvasWorkspaceTab, handleCloseBrowserTab, handleCloseChatTab, handleCloseDelegationTab, handleCloseExplorationTab, handleClosePreviewTab, returnToPreviousTabAfterClose, sessionId, setTerminalTabsMap, setWorkspaceComponentTabs])
+  }, [canvasRegistry, exitSplitInsteadOfClosingBoundTab, forgetOpenedCanvasWorkspaceTab, handleCloseBrowserTab, handleCloseChatTab, handleCloseDelegationTab, handleCloseExplorationTab, handleClosePreviewTab, returnToPreviousTabAfterClose, sessionId, setTerminalTabsMap, setWorkspaceComponentTabs, transferLeave.requestLeave])
 
   React.useEffect(() => {
     const handleCloseActiveWorkspaceTab = (event: Event) => {
@@ -2311,6 +2325,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       )}
       style={isOpen ? { width } : undefined}
     >
+      {transferLeave.dialog}
       {/* 面板内容 */}
       <div
         className={cn(

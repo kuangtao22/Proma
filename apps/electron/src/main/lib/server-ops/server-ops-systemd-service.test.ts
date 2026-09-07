@@ -66,6 +66,8 @@ function createRealAuditStore(): ServerOpsAuditStore {
   return new ServerOpsAuditStore(mkdtempSync(join(tmpdir(), 'proma-systemd-service-')), {
     uuid: () => `audit-${++sequence}`,
     now: () => sequence,
+    /** 此测试验证真实 Store schema；原生锁由独立 transaction 测试覆盖。 */
+    transaction: (callback) => callback(),
   })
 }
 
@@ -74,6 +76,8 @@ function createFixture(options: {
   respond?: (call: ExecCall) => ServerOpsRuntimeExecResult | Promise<ServerOpsRuntimeExecResult>
   append?: (input: ServerOpsAuditAppendInput) => unknown
   now?: () => number
+  uuid?: () => string
+  prepareAudit?: () => Promise<void>
 } = {}) {
   /** 当前 fresh-read 的连接身份。 */
   let identity: ServerOpsActiveConnectionIdentity | undefined = {
@@ -83,6 +87,8 @@ function createFixture(options: {
   const execCalls: ExecCall[] = []
   /** 所有尝试写入的审计记录。 */
   const auditCalls: ServerOpsAuditAppendInput[] = []
+  /** 默认生成可预测且互不相同的操作 ID。 */
+  let operationSequence = 0
   /** 默认根据固定命令返回合法结果。 */
   const respond = options.respond ?? ((call: ExecCall) => {
     if (call.command === SERVER_OPS_SYSTEMD_CAPABILITY_COMMAND) return createExecResult('systemd\n/usr/bin/systemctl\n')
@@ -109,12 +115,14 @@ function createFixture(options: {
       return await respond(call)
     },
     audit: {
+      prepareForWrites: options.prepareAudit,
       append: (input) => {
         auditCalls.push({ ...input })
         return options.append?.(input)
       },
     },
     now: options.now ?? (() => 1_000),
+    uuid: options.uuid ?? (() => `operation-${++operationSequence}`),
   })
   return {
     service,
@@ -130,6 +138,21 @@ async function expectErrorCode(promise: Promise<unknown>, code: string): Promise
 }
 
 describe('服务器运维 systemd Service', () => {
+  test('Given 审计 schema guard 等待期间连接变化 When 执行动作 Then 不写 start 审计且不执行远程命令', async () => {
+    const prepared = createDeferred<void>()
+    const fixture = createFixture({ prepareAudit: () => prepared.promise })
+
+    const pending = fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    }, 1)
+    fixture.setIdentity({ hostId: 'host-1', connectionId: 'connection-2', generation: 2 })
+    prepared.resolve()
+
+    await expectErrorCode(pending, 'SERVER_OPS_CONNECTION_CHANGED')
+    expect(fixture.auditCalls).toHaveLength(0)
+    expect(fixture.execCalls).toHaveLength(0)
+  })
+
   test('Given PID 1 不是 systemd When 获取列表 Then 返回 unsupported 且不读取服务', async () => {
     /** 非 systemd 主机 fixture。 */
     const fixture = createFixture({ respond: () => createExecResult('init\n/usr/bin/systemctl\n') })
@@ -191,14 +214,17 @@ describe('服务器运维 systemd Service', () => {
     /** 正常动作 fixture。 */
     const fixture = createFixture({ now: () => { const current = now; now += 25; return current } })
     /** 动作后的权威结果。 */
-    const result = await fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' })
+    const result = await fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    }, 1)
 
     expect(result.service).toMatchObject({ unitId: 'nginx.service', activeState: 'active', subState: 'running', mainPid: 42 })
     expect(fixture.execCalls.filter((call) => call.command === "LC_ALL=C systemctl restart -- 'nginx.service'")).toHaveLength(1)
     expect(fixture.auditCalls).toEqual([
-      { actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart', phase: 'start', outcome: 'success' },
-      { actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart', phase: 'result', outcome: 'success', durationMs: 25 },
+      { actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart', phase: 'start', outcome: 'pending' },
+      { actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart', phase: 'result', outcome: 'success', durationMs: 25 },
     ])
+    expect(fixture.auditCalls.every((record) => record.sessionId === undefined)).toBe(true)
   })
 
   test('Given 同连接身份同 unit 动作在途 When 重复调用 Then 只 dispatch 一次且重复请求不写审计', async () => {
@@ -211,13 +237,13 @@ describe('服务器运维 systemd Service', () => {
           ? createExecResult(createShowOutput())
           : createExecResult('') })
     const input = { sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' } as const
-    const first = fixture.service.runAction(input)
+    const first = fixture.service.runAction(input, 1)
 
-    await expectErrorCode(fixture.service.runAction(input), 'SERVER_OPS_SERVICE_ACTION_IN_PROGRESS')
+    await expectErrorCode(fixture.service.runAction(input, 1), 'SERVER_OPS_SERVICE_ACTION_IN_PROGRESS')
     expect(fixture.execCalls.filter((call) => call.command.includes('systemctl restart'))).toHaveLength(1)
     expect(fixture.auditCalls).toEqual([{
-      actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service',
-      operation: 'service-restart', phase: 'start', outcome: 'success',
+      actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service',
+      operation: 'service-restart', phase: 'start', outcome: 'pending',
     }])
 
     action.resolve(createExecResult())
@@ -238,14 +264,16 @@ describe('服务器运维 systemd Service', () => {
         return createExecResult('')
       } })
       const input = { sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' } as const
-      const first = fixture.service.runAction(input)
+      const first = fixture.service.runAction(input, 1)
       if (outcome === 'resolve') firstAction.resolve(createExecResult())
       else firstAction.reject(new Error('remote secret timeout'))
       if (outcome === 'resolve') await first
       else await expectErrorCode(first, 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
 
-      await expect(fixture.service.runAction(input)).resolves.toMatchObject({ unitId: 'nginx.service' })
+      await expect(fixture.service.runAction(input, 1)).resolves.toMatchObject({ unitId: 'nginx.service' })
       expect(actionCalls).toBe(2)
+      expect(fixture.auditCalls.filter((record) => record.phase === 'start').map((record) => record.operationId))
+        .toEqual(['operation-1', 'operation-2'])
     }
   })
 
@@ -262,10 +290,10 @@ describe('服务器运维 systemd Service', () => {
       return createExecResult('')
     } })
     const input = { sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' } as const
-    const oldRequest = fixture.service.runAction(input)
+    const oldRequest = fixture.service.runAction(input, 1)
     fixture.setIdentity({ hostId: 'host-1', connectionId: 'connection-2', generation: 2 })
 
-    await expect(fixture.service.runAction(input)).resolves.toMatchObject({ unitId: 'nginx.service' })
+    await expect(fixture.service.runAction(input, 1)).resolves.toMatchObject({ unitId: 'nginx.service' })
     expect(actionCalls).toBe(2)
     oldAction.resolve(createExecResult())
     await expectErrorCode(oldRequest, 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
@@ -279,12 +307,12 @@ describe('服务器运维 systemd Service', () => {
     /** 成功动作公开结果不得因真实审计合同失败而产生 warning。 */
     const successResult = await successFixture.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-    })
+    }, 1)
     expect(successResult.warnings).toEqual([])
     expect(successStore.list({ operation: 'service-restart' }).records.map((record) => ({
       phase: record.phase, outcome: record.outcome, errorCode: record.errorCode,
     }))).toEqual([
-      { phase: 'start', outcome: 'success', errorCode: undefined },
+      { phase: 'start', outcome: 'pending', errorCode: undefined },
       { phase: 'result', outcome: 'success', errorCode: undefined },
     ])
 
@@ -303,11 +331,11 @@ describe('服务器运维 systemd Service', () => {
     })
     await expectErrorCode(failureFixture.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'stop',
-    }), 'SERVER_OPS_SERVICE_ACTION_FAILED')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_FAILED')
     expect(failureStore.list({ operation: 'service-stop' }).records.map((record) => ({
       phase: record.phase, outcome: record.outcome, errorCode: record.errorCode,
     }))).toEqual([
-      { phase: 'start', outcome: 'success', errorCode: undefined },
+      { phase: 'start', outcome: 'pending', errorCode: undefined },
       { phase: 'result', outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_FAILED' },
     ])
   })
@@ -325,11 +353,13 @@ describe('服务器运维 systemd Service', () => {
     for (const [action, command, operation] of cases) {
       /** 每个动作使用独立 fixture，避免调用次数互相污染。 */
       const fixture = createFixture()
-      await fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action })
+      await fixture.service.runAction({
+        sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action,
+      }, 1)
       expect(fixture.execCalls.filter((call) => call.command === command)).toHaveLength(1)
       expect(fixture.auditCalls).toEqual([
-        { actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation, phase: 'start', outcome: 'success' },
-        { actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation, phase: 'result', outcome: 'success', durationMs: 0 },
+        { actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation, phase: 'start', outcome: 'pending' },
+        { actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation, phase: 'result', outcome: 'success', durationMs: 0 },
       ])
     }
   })
@@ -349,9 +379,9 @@ describe('服务器运维 systemd Service', () => {
 
       await expect(fixture.service.runAction({
         sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action,
-      })).resolves.toMatchObject({ warnings: [] })
+      }, 1)).resolves.toMatchObject({ warnings: [] })
       expect(fixture.auditCalls.at(-1)).toEqual({
-        actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: `service-${action}`,
+        actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: `service-${action}`,
         phase: 'result', outcome: 'success', durationMs: 0,
       })
       expect(JSON.stringify(fixture.auditCalls)).not.toContain('Created symlink')
@@ -369,9 +399,11 @@ describe('服务器运维 systemd Service', () => {
       return createExecResult('systemd\n/usr/bin/systemctl\n')
     } })
 
-    await expectErrorCode(fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' }), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
+    await expectErrorCode(fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
     expect(fixture.execCalls.filter((call) => call.command.includes('systemctl restart'))).toHaveLength(1)
-    expect(fixture.auditCalls.at(-1)).toMatchObject({ phase: 'result', outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' })
+    expect(fixture.auditCalls.at(-1)).toMatchObject({ phase: 'result', outcome: 'unknown', errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN' })
   })
 
   test('Given unit、NUL 或 action 注入 When 执行动作 Then 在 exec 与审计前拒绝', async () => {
@@ -384,7 +416,7 @@ describe('服务器运维 systemd Service', () => {
       { sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'reload' },
     ]
     for (const input of inputs) {
-      await expect(fixture.service.runAction(input as never)).rejects.toBeInstanceOf(Error)
+      await expect(fixture.service.runAction(input as never, 1)).rejects.toBeInstanceOf(Error)
     }
     expect(fixture.execCalls).toHaveLength(0)
     expect(fixture.auditCalls).toHaveLength(0)
@@ -410,7 +442,9 @@ describe('服务器运维 systemd Service', () => {
     /** 首条审计即失败的 fixture。 */
     const fixture = createFixture({ append: () => { throw new Error('SERVER_OPS_AUDIT_WRITE_FAILED') } })
 
-    await expectErrorCode(fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' }), 'SERVER_OPS_AUDIT_WRITE_FAILED')
+    await expectErrorCode(fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    }, 1), 'SERVER_OPS_AUDIT_WRITE_FAILED')
     expect(fixture.execCalls).toHaveLength(0)
   })
 
@@ -423,7 +457,9 @@ describe('服务器运维 systemd Service', () => {
       if (appendCount === 2) throw new Error('disk path and secret')
     } })
 
-    await expect(fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart' }))
+    await expect(fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    }, 1))
       .resolves.toMatchObject({ warnings: ['SERVER_OPS_AUDIT_RESULT_WRITE_FAILED'] })
   })
 
@@ -439,7 +475,7 @@ describe('服务器运维 systemd Service', () => {
 
     await expectErrorCode(fixture.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-    }), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
     expect(fixture.execCalls.filter((call) => call.command.includes('systemctl restart'))).toHaveLength(1)
   })
 
@@ -453,9 +489,11 @@ describe('服务器运维 systemd Service', () => {
           ? createExecResult(createShowOutput())
           : createExecResult('') })
 
-    await expectErrorCode(fixture.service.runAction({ sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'stop' }), 'SERVER_OPS_SERVICE_ACTION_FAILED')
+    await expectErrorCode(fixture.service.runAction({
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'stop',
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_FAILED')
     expect(fixture.auditCalls.at(-1)).toEqual({
-      actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: 'service-stop',
+      actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: 'service-stop',
       phase: 'result', outcome: 'error', durationMs: 0, errorCode: 'SERVER_OPS_SERVICE_ACTION_FAILED',
     })
   })
@@ -475,7 +513,7 @@ describe('服务器运维 systemd Service', () => {
 
       await expectErrorCode(fixture.service.runAction({
         sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-      }), 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED')
+      }, 1), 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED')
       expect(fixture.auditCalls.at(-1)).toMatchObject({
         phase: 'result', outcome: 'error', errorCode: 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED',
       })
@@ -503,7 +541,7 @@ describe('服务器运维 systemd Service', () => {
 
       await expectErrorCode(fixture.service.runAction({
         sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-      }), 'SERVER_OPS_SERVICE_ACTION_FAILED')
+      }, 1), 'SERVER_OPS_SERVICE_ACTION_FAILED')
       expect(fixture.auditCalls.at(-1)).toMatchObject({
         phase: 'result', outcome: 'error', errorCode: 'SERVER_OPS_SERVICE_ACTION_FAILED',
       })
@@ -523,11 +561,11 @@ describe('服务器运维 systemd Service', () => {
 
     await expectErrorCode(fixture.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-    }), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
     expect(fixture.execCalls.filter((call) => call.command.includes('systemctl restart'))).toHaveLength(1)
     expect(fixture.auditCalls.at(-1)).toEqual({
-      actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart',
-      phase: 'result', outcome: 'error', durationMs: 0, errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN',
+      actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart',
+      phase: 'result', outcome: 'unknown', durationMs: 0, errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN',
     })
   })
 
@@ -546,10 +584,10 @@ describe('服务器运维 systemd Service', () => {
 
     await expectErrorCode(fixture.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-    }), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
     expect(fixture.auditCalls.filter((record) => record.phase === 'result')).toEqual([{
-      actor: 'user', sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart',
-      phase: 'result', outcome: 'error', durationMs: 0, errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN',
+      actor: 'user', operationId: 'operation-1', windowId: 1, hostId: 'host-1', unitId: 'nginx.service', operation: 'service-restart',
+      phase: 'result', outcome: 'unknown', durationMs: 0, errorCode: 'SERVER_OPS_SERVICE_ACTION_UNKNOWN',
     }])
   })
 
@@ -576,7 +614,7 @@ describe('服务器运维 systemd Service', () => {
     })
     await expectErrorCode(failed.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'stop',
-    }), 'SERVER_OPS_SERVICE_ACTION_FAILED')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_FAILED')
 
     /** 结果未知的动作 fixture。 */
     const unknown = createFixture({
@@ -591,7 +629,7 @@ describe('服务器运维 systemd Service', () => {
     })
     await expectErrorCode(unknown.service.runAction({
       sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
-    }), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
+    }, 1), 'SERVER_OPS_SERVICE_ACTION_UNKNOWN')
   })
 
   test('Given 合法详情 When 读取 Then show 使用安全 unit 且 journal 独立限制最近 100 行', async () => {

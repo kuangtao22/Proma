@@ -33,7 +33,7 @@ export const SERVER_OPS_IPC_CHANNELS = {
 /** 审计动作的发起主体。 */
 export type ServerOpsAuditActor = 'agent' | 'user'
 
-/** Agent 命令和用户 systemd 动作允许进入公开审计的操作。 */
+/** Agent 命令和用户受控动作允许进入公开审计的操作。 */
 export type ServerOpsAuditOperation =
   | 'connect'
   | 'exec'
@@ -43,25 +43,40 @@ export type ServerOpsAuditOperation =
   | 'service-restart'
   | 'service-enable'
   | 'service-disable'
+  | 'trust-replace'
+  | 'trust-revoke'
+  | 'docker-start'
+  | 'docker-stop'
+  | 'docker-restart'
+  | 'file-mkdir' | 'file-rename' | 'file-delete' | 'file-save' | 'file-save-as' | 'file-upload' | 'file-download'
 
 /** 审计记录处于远程动作开始或完成阶段。 */
 export type ServerOpsAuditPhase = 'start' | 'result'
 
 /** 审计阶段的公开结果，不携带远程错误正文。 */
-export type ServerOpsAuditOutcome = 'success' | 'error'
+export type ServerOpsAuditOutcome = 'pending' | 'success' | 'error' | 'unknown'
+
+/** 需要独立资源语义的审计对象类别。 */
+export type ServerOpsAuditResourceType = 'host-trust' | 'docker-container' | 'remote-file'
 
 /** 可跨 IPC 展示的有界审计记录。 */
 export interface ServerOpsAuditRecord {
   id: string
+  operationId?: string
   timestamp: number
-  sessionId: string
+  sessionId?: string
+  windowId?: number
   hostId: string
   actor: ServerOpsAuditActor
   operation: ServerOpsAuditOperation
+  resourceType?: ServerOpsAuditResourceType
+  /** 文件路径的 SHA-256 摘要，不记录路径和正文。 */
+  resourceId?: string
   phase: ServerOpsAuditPhase
   outcome: ServerOpsAuditOutcome
   durationMs?: number
   unitId?: string
+  containerId?: string
   command?: string
   commandTruncated?: boolean
   exitCode?: number
@@ -71,14 +86,20 @@ export interface ServerOpsAuditRecord {
 
 /** Store 追加记录时生成 ID 和时间前的公开字段。 */
 export interface ServerOpsAuditAppendInput {
-  sessionId: string
+  operationId?: string
+  sessionId?: string
+  windowId?: number
   hostId: string
   actor: ServerOpsAuditActor
   operation: ServerOpsAuditOperation
+  resourceType?: ServerOpsAuditResourceType
+  /** 文件路径的 SHA-256 摘要，不记录路径和正文。 */
+  resourceId?: string
   phase: ServerOpsAuditPhase
   outcome: ServerOpsAuditOutcome
   durationMs?: number
   unitId?: string
+  containerId?: string
   command?: string
   exitCode?: number
   signal?: string
@@ -249,8 +270,11 @@ export type ServerOpsLogSince = '15m' | '1h' | '6h' | '24h' | 'boot'
 /** journalctl 日志查询的标准优先级。 */
 export type ServerOpsLogPriority = 'emerg' | 'alert' | 'crit' | 'err' | 'warning' | 'notice' | 'info' | 'debug'
 
-/** 日志来源只允许整个系统或一个严格校验的 service。 */
-export type ServerOpsLogSource = { kind: 'system' } | { kind: 'unit'; unitId: string }
+/** 日志来源只允许整个系统、严格 service 或完整身份的 Docker 容器。 */
+export type ServerOpsLogSource =
+  | { kind: 'system' }
+  | { kind: 'unit'; unitId: string }
+  | { kind: 'container'; containerId: string }
 
 /** 启动实时日志流的有界查询。 */
 export interface ServerOpsLogStartInput {
@@ -489,8 +513,8 @@ function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: ReadonlySet<st
 
 /** 审计记录允许出现的公开字段集合。 */
 const SERVER_OPS_AUDIT_RECORD_KEYS = new Set([
-  'id', 'timestamp', 'sessionId', 'hostId', 'actor', 'operation', 'phase', 'outcome',
-  'durationMs', 'unitId', 'command', 'exitCode', 'signal', 'errorCode',
+  'id', 'operationId', 'timestamp', 'sessionId', 'windowId', 'hostId', 'actor', 'operation', 'resourceType', 'resourceId', 'phase', 'outcome',
+  'durationMs', 'unitId', 'containerId', 'command', 'exitCode', 'signal', 'errorCode',
   'commandTruncated',
 ])
 
@@ -499,31 +523,67 @@ function isServerOpsAuditOperation(value: unknown): value is ServerOpsAuditOpera
   return value === 'connect' || value === 'exec' || value === 'disconnect'
     || value === 'service-start' || value === 'service-stop' || value === 'service-restart'
     || value === 'service-enable' || value === 'service-disable'
+    || value === 'trust-replace' || value === 'trust-revoke'
+    || value === 'docker-start' || value === 'docker-stop' || value === 'docker-restart'
+    || value === 'file-mkdir' || value === 'file-rename' || value === 'file-delete' || value === 'file-save'
+    || value === 'file-save-as' || value === 'file-upload' || value === 'file-download'
 }
 
 /** 判断审计主体与操作是否符合权限矩阵。 */
-function isServerOpsAuditActorOperation(actor: unknown, operation: unknown): actor is ServerOpsAuditActor {
+export function isServerOpsAuditActorOperation(actor: unknown, operation: unknown): actor is ServerOpsAuditActor {
   if (actor === 'agent') return operation === 'connect' || operation === 'exec' || operation === 'disconnect'
-  if (actor === 'user') return typeof operation === 'string' && operation.startsWith('service-') && isServerOpsAuditOperation(operation)
+    || operation === 'docker-start' || operation === 'docker-stop' || operation === 'docker-restart'
+    || typeof operation === 'string' && operation.startsWith('file-') && isServerOpsAuditOperation(operation)
+  if (actor === 'user') return typeof operation === 'string'
+    && (operation.startsWith('service-') || operation.startsWith('trust-') || operation.startsWith('docker-') || operation.startsWith('file-'))
+    && isServerOpsAuditOperation(operation)
   return false
 }
 
 /** 校验公开审计记录，拒绝未知字段和所有非有界字符串。 */
 export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, SERVER_OPS_AUDIT_RECORD_KEYS)) return false
-  if (!isServerOpsId(value.id) || !isServerOpsId(value.sessionId) || !isServerOpsId(value.hostId)) return false
+  if (!isServerOpsId(value.id) || !isServerOpsId(value.hostId)) return false
+  if (value.operationId !== undefined && !isServerOpsId(value.operationId)) return false
   if (!Number.isSafeInteger(value.timestamp) || typeof value.timestamp !== 'number'
     || value.timestamp < 0 || value.timestamp > 8_640_000_000_000_000) return false
   if (!isServerOpsAuditOperation(value.operation)) return false
   if (!isServerOpsAuditActorOperation(value.actor, value.operation)) return false
+  /** Agent 必须来自真实会话；用户允许旧 service session 或新的窗口来源，二者互斥。 */
+  if (value.actor === 'agent') {
+    if (!isServerOpsId(value.sessionId) || value.windowId !== undefined) return false
+  } else {
+    const hasLegacySession = isServerOpsId(value.sessionId)
+    const hasWindow = typeof value.windowId === 'number' && Number.isSafeInteger(value.windowId)
+      && value.windowId > 0 && value.windowId <= 2_147_483_647
+    if (hasLegacySession === hasWindow) return false
+    if (value.operationId !== undefined && !hasWindow) return false
+  }
   if (value.phase !== 'start' && value.phase !== 'result') return false
-  if (value.outcome !== 'success' && value.outcome !== 'error') return false
+  if (value.outcome !== 'pending' && value.outcome !== 'success'
+    && value.outcome !== 'error' && value.outcome !== 'unknown') return false
   if (value.durationMs !== undefined
     && (typeof value.durationMs !== 'number' || !Number.isSafeInteger(value.durationMs) || value.durationMs < 0 || value.durationMs > 86_400_000)) return false
   /** 服务动作必须携带安全 unit；其它操作不得借 unit 字段扩展语义。 */
   const isServiceOperation = value.operation.startsWith('service-')
   if (isServiceOperation !== (value.unitId !== undefined)) return false
   if (value.unitId !== undefined && !isValidServerOpsSystemdUnitId(value.unitId)) return false
+  /** 信任操作使用独立资源类别，并且只接受可关联的窗口用户记录。 */
+  const isTrustOperation = value.operation === 'trust-replace' || value.operation === 'trust-revoke'
+  if (isTrustOperation !== (value.resourceType === 'host-trust')) return false
+  if (isTrustOperation && (value.actor !== 'user' || value.operationId === undefined || value.windowId === undefined)) return false
+  /** Docker 操作必须绑定完整容器 ID 与独立资源类别。 */
+  const isDockerOperation = value.operation === 'docker-start' || value.operation === 'docker-stop' || value.operation === 'docker-restart'
+  const hasDockerResource = value.resourceType === 'docker-container'
+  if (isDockerOperation !== hasDockerResource) return false
+  if (isDockerOperation !== (value.containerId !== undefined)) return false
+  if (value.containerId !== undefined && (typeof value.containerId !== 'string' || !/^[a-f0-9]{64}$/u.test(value.containerId))) return false
+  const isFileOperation = value.operation.startsWith('file-')
+  if (isFileOperation !== (value.resourceType === 'remote-file')) return false
+  if (isFileOperation !== (value.resourceId !== undefined)) return false
+  if (isFileOperation && (value.operationId === undefined || typeof value.resourceId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.resourceId))) return false
+  if (!isTrustOperation && !isDockerOperation && !isFileOperation && value.resourceType !== undefined) return false
+  if (isDockerOperation && value.operationId === undefined) return false
   if (value.command !== undefined && (typeof value.command !== 'string' || value.command.length > 512)) return false
   if (value.command === undefined) {
     if (value.commandTruncated !== undefined) return false
@@ -541,7 +601,9 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
   if (value.operation !== 'exec' && (value.command !== undefined || value.commandTruncated !== undefined
     || value.exitCode !== undefined || value.signal !== undefined)) return false
   /** 开始阶段没有终止结果；成功结果也不能携带失败语义。 */
-  if (value.phase === 'start' && (value.exitCode !== undefined || value.signal !== undefined || value.errorCode !== undefined)) return false
+  if (value.phase === 'start' && (value.outcome === 'success' || value.outcome === 'unknown'
+    || value.exitCode !== undefined || value.signal !== undefined || value.errorCode !== undefined)) return false
+  if (value.phase === 'result' && value.outcome === 'pending') return false
   if (value.outcome === 'success' && (value.signal !== undefined || value.errorCode !== undefined
     || (value.exitCode !== undefined && value.exitCode !== 0))) return false
   return true
@@ -883,6 +945,10 @@ function parseServerOpsLogSource(value: unknown): ServerOpsLogSource {
   if (value.kind === 'system' && hasOnlyKeys(value, new Set(['kind']))) return { kind: 'system' }
   if (value.kind === 'unit' && hasOnlyKeys(value, new Set(['kind', 'unitId']))) {
     return { kind: 'unit', unitId: parseServerOpsSystemdUnitId(value.unitId) }
+  }
+  if (value.kind === 'container' && hasOnlyKeys(value, new Set(['kind', 'containerId']))
+    && typeof value.containerId === 'string' && /^[a-f0-9]{64}$/u.test(value.containerId)) {
+    return { kind: 'container', containerId: value.containerId }
   }
   throw new Error('SERVER_OPS_LOG_START_INPUT_INVALID')
 }

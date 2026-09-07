@@ -1,4 +1,6 @@
-import { isServerOpsId } from '@proma/shared'
+import { randomUUID } from 'node:crypto'
+import { isServerOpsId, parseServerOpsDockerResourcesInput, parseServerOpsDockerContainerDetailInput, parseServerOpsDockerActionPrepareInput } from '@proma/shared'
+import { parseServerOpsFilePreviewInput, parseServerOpsFileMutationInput } from '@proma/shared'
 import type {
   AgentSessionMeta,
   ServerOpsAuditAppendInput,
@@ -8,6 +10,17 @@ import type {
   ServerOpsConnectionState,
   ServerOpsHost,
   ServerOpsHostKey,
+  ServerOpsDockerResourcesInput,
+  ServerOpsDockerResourcesResult,
+  ServerOpsDockerContainerDetailInput,
+  ServerOpsDockerContainerDetailResult,
+  ServerOpsDockerActionPrepareInput,
+  ServerOpsDockerActionResult,
+  ServerOpsFilePreviewInput,
+  ServerOpsFilePreviewResult,
+  ServerOpsFileListResult,
+  ServerOpsFileMutationInput,
+  ServerOpsFileMutationResult,
 } from '@proma/shared'
 import { isOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import { getServerOpsServiceContext } from './server-ops-service-context'
@@ -58,12 +71,23 @@ export interface ServerOpsAgentFacadeServices {
   access: Pick<import('./server-ops-agent-access-store').ServerOpsAgentAccessStore, 'get' | 'getCurrent' | 'revoke'>
   connections: Pick<import('./server-ops-ipc').ServerOpsConnectionContract, 'getState' | 'connect' | 'exec' | 'disconnect'>
   audit: Pick<import('./server-ops-audit-store').ServerOpsAuditStore, 'append'>
+    & { prepareForWrites?: () => Promise<void> }
+  docker?: Pick<import('./server-ops-docker-service').ServerOpsDockerService, 'listResources' | 'getContainerDetail' | 'runAgentAction'>
+  files?: Pick<import('./server-ops-file-service').ServerOpsFileService, 'list' | 'preview' | 'mutateForAgent' | 'releaseReader'>
 }
 
 /** Facade 可替换依赖，仅用于隔离会话事实与主进程服务实例。 */
 export interface ServerOpsAgentFacadeDependencies {
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   services: ServerOpsAgentFacadeServices
+  /** 为每次远程操作生成可审计的唯一身份。 */
+  uuid?: () => string
+}
+
+/** 贯穿一次远程操作开始与结果审计的稳定上下文。 */
+interface ServerOpsAgentAuditContext {
+  operationId: string
+  startedAt: number
 }
 
 /** 创建 Facade 时由 Orchestrator 闭包捕获的真实运行身份。 */
@@ -81,7 +105,13 @@ export interface ServerOpsAgentFacade {
   status: (input: { hostId: string }) => ServerOpsAgentStatus
   connect: (input: { hostId: string }) => Promise<ServerOpsAgentStatus>
   exec: (input: { hostId: string; command: string; timeoutMs?: number }) => Promise<ServerOpsAgentExecResult>
-  disconnect: (input: { hostId: string }) => ServerOpsAgentStatus
+  disconnect: (input: { hostId: string }) => Promise<ServerOpsAgentStatus>
+  dockerResources?: (input: ServerOpsDockerResourcesInput) => Promise<ServerOpsDockerResourcesResult>
+  dockerDetail?: (input: ServerOpsDockerContainerDetailInput) => Promise<ServerOpsDockerContainerDetailResult>
+  dockerAction?: (input: ServerOpsDockerActionPrepareInput) => Promise<ServerOpsDockerActionResult>
+  filesList?: (input: ServerOpsFilePreviewInput) => Promise<ServerOpsFileListResult>
+  filesRead?: (input: ServerOpsFilePreviewInput) => Promise<ServerOpsFilePreviewResult>
+  filesMutate?: (input: ServerOpsFileMutationInput) => Promise<ServerOpsFileMutationResult>
 }
 
 /** 仅普通用户交互运行可以注册并执行服务器工具。 */
@@ -140,6 +170,8 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
       access: context.access,
       connections: context.connections,
       audit: context.audit,
+      docker: context.docker,
+      files: context.files,
     },
   } : null)
   if (!dependencies) return null
@@ -160,17 +192,26 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
   }
 
   /** 远程动作开始前同步写审计；失败必须用稳定错误阻断真实调用。 */
-  const appendAuditStart = (operation: ServerOpsAuditOperation, hostId: string, command?: string): number => {
+  const appendAuditStart = (
+    operation: ServerOpsAuditOperation,
+    hostId: string,
+    command?: string,
+  ): ServerOpsAgentAuditContext => {
     try {
-      return dependencies.services.audit.append({
+      /** 同一次远程操作的开始与结果共享该唯一身份。 */
+      const operationId = (dependencies.uuid ?? randomUUID)()
+      /** Store 返回的持久化时间戳是 duration 的统一起点。 */
+      const startedAt = dependencies.services.audit.append({
         actor: 'agent',
+        operationId,
         sessionId: input.sessionId,
         hostId,
         operation,
         phase: 'start',
-        outcome: 'success',
+        outcome: 'pending',
         ...(command === undefined ? {} : { command }),
       }).timestamp
+      return { operationId, startedAt }
     } catch {
       throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED')
     }
@@ -180,19 +221,20 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
   const appendAuditResult = (
     operation: ServerOpsAuditOperation,
     hostId: string,
-    startedAt: number,
+    context: ServerOpsAgentAuditContext,
     outcome: 'success' | 'error',
     options: Pick<ServerOpsAuditAppendInput, 'command' | 'exitCode' | 'signal' | 'errorCode'> = {},
   ): boolean => {
     try {
       dependencies.services.audit.append({
         actor: 'agent',
+        operationId: context.operationId,
         sessionId: input.sessionId,
         hostId,
         operation,
         phase: 'result',
         outcome,
-        durationMs: Math.max(0, Date.now() - startedAt),
+        durationMs: Math.max(0, Date.now() - context.startedAt),
         ...options,
       })
       return false
@@ -201,7 +243,67 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
     }
   }
 
+  /** 按 Pi 工具实际发送的双空格 JSON 正文计算 UTF-8 预算，包含缩进开销。 */
+  const boundedResult = <T>(value: T): T => {
+    if (Buffer.byteLength(JSON.stringify(value, null, 2), 'utf8') > 65_536) throw new Error('SERVER_OPS_AGENT_RESULT_TOO_LARGE')
+    return value
+  }
+
   return {
+    ...(dependencies.services.files ? {
+      async filesList(raw: ServerOpsFilePreviewInput) {
+        const parsed = parseServerOpsFilePreviewInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        /** 单次读取独占 owner，结束后不留下不可再使用的分页句柄。 */
+        const ownerKey = `agent-read:${input.sessionId}:${randomUUID()}`
+        try {
+          const result = await dependencies.services.files!.list(ownerKey, parsed)
+          requireAuthorizedHost(parsed.hostId)
+          const { cursor, ...page } = result
+          return boundedResult({ ...page, ...(cursor && !page.truncatedReason ? { truncatedReason: 'item-limit' as const } : {}) })
+        } finally { dependencies.services.files!.releaseReader(ownerKey) }
+      },
+      async filesRead(raw: ServerOpsFilePreviewInput) {
+        const parsed = parseServerOpsFilePreviewInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        const ownerKey = `agent-read:${input.sessionId}:${randomUUID()}`
+        try {
+          const result = await dependencies.services.files!.preview(ownerKey, parsed)
+          requireAuthorizedHost(parsed.hostId)
+          return boundedResult(result)
+        } finally { dependencies.services.files!.releaseReader(ownerKey) }
+      },
+      async filesMutate(raw: ServerOpsFileMutationInput) {
+        const parsed = parseServerOpsFileMutationInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        const result = await dependencies.services.files!.mutateForAgent(input.sessionId, parsed, () => { requireAuthorizedHost(parsed.hostId) })
+        requireAuthorizedHost(parsed.hostId)
+        return boundedResult(result)
+      },
+    } : {}),
+    ...(dependencies.services.docker ? {
+      async dockerResources(raw: ServerOpsDockerResourcesInput) {
+        const parsed = parseServerOpsDockerResourcesInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        const result = await dependencies.services.docker!.listResources(parsed)
+        requireAuthorizedHost(parsed.hostId)
+        return boundedResult(result)
+      },
+      async dockerDetail(raw: ServerOpsDockerContainerDetailInput) {
+        const parsed = parseServerOpsDockerContainerDetailInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        const result = await dependencies.services.docker!.getContainerDetail(parsed)
+        requireAuthorizedHost(parsed.hostId)
+        return boundedResult(result)
+      },
+      async dockerAction(raw: ServerOpsDockerActionPrepareInput) {
+        const parsed = parseServerOpsDockerActionPrepareInput(raw)
+        requireAuthorizedHost(parsed.hostId)
+        const result = await dependencies.services.docker!.runAgentAction(input.sessionId, parsed, () => { requireAuthorizedHost(parsed.hostId) })
+        requireAuthorizedHost(parsed.hostId)
+        return boundedResult(result)
+      },
+    } : {}),
     list() {
       if (!isInteractiveRunSource(input.triggeredBy)
         || !isOrdinaryTopLevelAgentSession(dependencies.getSession(input.sessionId))) {
@@ -230,38 +332,44 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
       return publicStatus(dependencies.services.connections.getState(host.id))
     },
     async connect({ hostId }) {
-      const host = requireAuthorizedHost(hostId)
-      const startedAt = appendAuditStart('connect', host.id)
+      const initialHost = requireAuthorizedHost(hostId)
+      if (dependencies.services.audit.prepareForWrites) await dependencies.services.audit.prepareForWrites()
+      /** schema guard 等待后重新验证会话、授权与资产事实。 */
+      const host = requireAuthorizedHost(initialHost.id)
+      const auditContext = appendAuditStart('connect', host.id)
       try {
         /** 底层只返回公开状态，但仍移除 connectionId 等内部字段。 */
         const state = await dependencies.services.connections.connect({ hostId: host.id, cols: 120, rows: 32 })
         const outcome = state.phase === 'error' || state.phase === 'blocked' ? 'error' : 'success'
-        const warning = appendAuditResult('connect', host.id, startedAt, outcome, {
+        const warning = appendAuditResult('connect', host.id, auditContext, outcome, {
           ...(state.errorCode ? { errorCode: getServerOpsAuditErrorCode({ code: state.errorCode }) } : {}),
         })
         return { ...publicStatus(state), ...(warning ? { warnings: ['SERVER_OPS_AUDIT_RESULT_WRITE_FAILED'] } : {}) }
       } catch (error) {
-        const warning = appendAuditResult('connect', host.id, startedAt, 'error', { errorCode: getServerOpsAuditErrorCode(error) })
+        const warning = appendAuditResult('connect', host.id, auditContext, 'error', { errorCode: getServerOpsAuditErrorCode(error) })
         if (warning) throw attachAuditResultWarning(error)
         throw error
       }
     },
     async exec({ hostId, command, timeoutMs = 30_000 }) {
-      const host = requireAuthorizedHost(hostId)
+      const initialHost = requireAuthorizedHost(hostId)
       if (typeof command !== 'string' || command.length < 1 || command.length > 8192 || command.includes('\0')) {
         throw new Error('SERVER_OPS_EXEC_COMMAND_INVALID')
       }
       if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120_000) {
         throw new Error('SERVER_OPS_EXEC_TIMEOUT_INVALID')
       }
+      if (dependencies.services.audit.prepareForWrites) await dependencies.services.audit.prepareForWrites()
+      /** schema guard 等待后重新验证授权，并从 fresh 状态取得连接身份。 */
+      const host = requireAuthorizedHost(initialHost.id)
       const state = dependencies.services.connections.getState(host.id)
       if (state.phase !== 'connected' || !state.connectionId) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
-      const startedAt = appendAuditStart('exec', host.id, command)
+      const auditContext = appendAuditStart('exec', host.id, command)
       try {
         const result = await dependencies.services.connections.exec(host.id, state.connectionId, command, timeoutMs)
         /** 非零退出码或 signal 都代表远程命令失败，但真实输出仍原样返回给 Agent。 */
         const outcome = result.signal !== undefined || (result.exitCode !== undefined && result.exitCode !== 0) ? 'error' : 'success'
-        const warning = appendAuditResult('exec', host.id, startedAt, outcome, {
+        const warning = appendAuditResult('exec', host.id, auditContext, outcome, {
           command,
           ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
           ...(result.signal === undefined ? {} : { signal: result.signal }),
@@ -275,20 +383,23 @@ export function createServerOpsAgentFacade(input: CreateServerOpsAgentFacadeInpu
           ...(warning ? { warnings: ['SERVER_OPS_AUDIT_RESULT_WRITE_FAILED'] } : {}),
         }
       } catch (error) {
-        const warning = appendAuditResult('exec', host.id, startedAt, 'error', { command, errorCode: getServerOpsAuditErrorCode(error) })
+        const warning = appendAuditResult('exec', host.id, auditContext, 'error', { command, errorCode: getServerOpsAuditErrorCode(error) })
         if (warning) throw attachAuditResultWarning(error)
         throw error
       }
     },
-    disconnect({ hostId }) {
-      const host = requireAuthorizedHost(hostId)
-      const startedAt = appendAuditStart('disconnect', host.id)
+    async disconnect({ hostId }) {
+      const initialHost = requireAuthorizedHost(hostId)
+      if (dependencies.services.audit.prepareForWrites) await dependencies.services.audit.prepareForWrites()
+      /** schema guard 等待后重新验证授权，避免断开已经不再授权的目标。 */
+      const host = requireAuthorizedHost(initialHost.id)
+      const auditContext = appendAuditStart('disconnect', host.id)
       try {
         const state = dependencies.services.connections.disconnect(host.id)
-        const warning = appendAuditResult('disconnect', host.id, startedAt, 'success')
+        const warning = appendAuditResult('disconnect', host.id, auditContext, 'success')
         return { ...publicStatus(state), ...(warning ? { warnings: ['SERVER_OPS_AUDIT_RESULT_WRITE_FAILED'] } : {}) }
       } catch (error) {
-        const warning = appendAuditResult('disconnect', host.id, startedAt, 'error', { errorCode: getServerOpsAuditErrorCode(error) })
+        const warning = appendAuditResult('disconnect', host.id, auditContext, 'error', { errorCode: getServerOpsAuditErrorCode(error) })
         if (warning) throw attachAuditResultWarning(error)
         throw error
       } finally {

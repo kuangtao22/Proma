@@ -1475,14 +1475,14 @@ export class AgentOrchestrator {
         }
 
         // 服务器元数据、连接和断开均由 Facade 再次校验当前会话与单槽授权，可直接放行。
-        if (['server_list', 'server_status', 'server_connect', 'server_disconnect'].includes(toolName)) {
+        if (['server_list', 'server_status', 'server_connect', 'server_disconnect', 'server_docker_resources', 'server_docker_detail', 'server_files_list', 'server_files_read'].includes(toolName)) {
           return { behavior: 'allow' as const, updatedInput: input }
         }
 
         // 远程命令使用独立窄只读语法。未知或高风险命令在 plan 中拒绝，其他模式也必须逐次审批。
-        if (toolName === 'server_exec') {
+        if (toolName === 'server_exec' || toolName === 'server_docker_action' || toolName === 'server_files_mutate') {
           const command = typeof input.command === 'string' ? input.command : ''
-          if (isServerOpsReadOnlyCommand(command)) return { behavior: 'allow' as const, updatedInput: input }
+          if (toolName === 'server_exec' && isServerOpsReadOnlyCommand(command)) return { behavior: 'allow' as const, updatedInput: input }
           if (currentMode === 'plan') {
             return { behavior: 'deny' as const, message: '计划模式下仅允许只读服务器探测命令，请在计划获批后执行高风险操作。' }
           }

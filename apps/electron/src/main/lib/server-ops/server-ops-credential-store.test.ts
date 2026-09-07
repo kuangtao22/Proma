@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ServerOpsCredentialStore } from './server-ops-credential-store'
+import { ServerOpsCredentialStore as ProductionServerOpsCredentialStore } from './server-ops-credential-store'
+import type { ServerOpsCredentialStoreDependencies } from './server-ops-credential-store'
+
+/** Store 单元测试复用已独立验证的事务合同，只隔离原生 addon 装载。 */
+class ServerOpsCredentialStore extends ProductionServerOpsCredentialStore {
+  constructor(configDir?: string, dependencies: Partial<ServerOpsCredentialStoreDependencies> = {}) {
+    super(configDir, { transaction: (callback) => callback(), ...dependencies })
+  }
+}
 
 /** 当前测试创建的隔离配置目录。 */
 const temporaryDirectories: string[] = []
@@ -88,5 +96,46 @@ describe('服务器运维凭据 Store', () => {
       .toThrow('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE')
     store.setVolatile('host-1', { kind: 'password', password: 'password-canary' })
     expect(store.resolve('host-1')).toMatchObject({ password: 'password-canary' })
+  })
+
+  test('Given 两个已构造凭据 Store When 分别保存不同主机 Then fresh-read 保留双方密文', () => {
+    const configDir = createConfigDir()
+    let nextId = 0
+    const safeStorage = {
+      isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'unknown' as const,
+      encryptString: (value: string) => Buffer.from(`cipher:${value}`),
+      decryptString: (value: Buffer) => value.toString().replace(/^cipher:/, ''),
+    }
+    const transaction = <T>(callback: () => T): T => callback()
+    const first = new ServerOpsCredentialStore(configDir, { platform: 'darwin', safeStorage, transaction, uuid: () => `credential-${++nextId}`, now: () => nextId })
+    const second = new ServerOpsCredentialStore(configDir, { platform: 'darwin', safeStorage, transaction, uuid: () => `credential-${++nextId}`, now: () => nextId })
+
+    const firstRef = first.remember('host-1', { kind: 'password', password: 'first-secret' })
+    const secondRef = second.remember('host-2', { kind: 'password', password: 'second-secret' })
+
+    expect(first.getCredentialRef('host-2')).toBe(secondRef)
+    expect(second.resolve('host-1', firstRef)).toEqual({ kind: 'password', password: 'first-secret' })
+  })
+
+  test('Given 已有凭据文件损坏 When 尝试保存 Then fail closed 且不覆盖现场', () => {
+    const configDir = createConfigDir()
+    const opsDir = join(configDir, 'server-ops')
+    const filePath = join(opsDir, 'credentials.json')
+    const safeStorage = {
+      isEncryptionAvailable: () => true,
+      getSelectedStorageBackend: () => 'unknown' as const,
+      encryptString: (value: string) => Buffer.from(value),
+      decryptString: (value: Buffer) => value.toString(),
+    }
+    mkdirSync(opsDir, { recursive: true })
+    writeFileSync(filePath, '{broken-credentials', 'utf8')
+    const store = new ServerOpsCredentialStore(configDir, {
+      platform: 'darwin', safeStorage, transaction: (callback) => callback(),
+    })
+
+    expect(() => store.remember('host-1', { kind: 'password', password: 'new-secret' }))
+      .toThrow('SERVER_OPS_CREDENTIAL_READ_FAILED')
+    expect(readFileSync(filePath, 'utf8')).toBe('{broken-credentials')
   })
 })

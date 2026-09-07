@@ -68,6 +68,22 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('服务器运维日志 Service', () => {
+  test('Given 完整容器身份 When 启动日志 Then 使用固定本机 Docker socket 且复用现有流背压', async () => {
+    const fixture = createFixture()
+    /** Docker 日志测试使用的完整容器身份。 */
+    const containerId = 'a'.repeat(64)
+    const started = await fixture.service.start('owner-1', {
+      hostId: 'host-1', source: { kind: 'container', containerId }, since: '1h', priority: 'debug', tailLines: 300,
+    })
+
+    expect(fixture.starts[0]?.command).toBe(`LC_ALL=C env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH -u DOCKER_CONFIG -u DOCKER_API_VERSION docker --host unix:///var/run/docker.sock container logs --follow --timestamps --tail 300 --since '1h' -- '${containerId}'`)
+    fixture.service.acknowledge('owner-1', { hostId: 'host-1', streamId: started.streamId, sequence: 3 })
+    expect(fixture.acks).toEqual([{ identity: { hostId: 'host-1', connectionId: 'connection-1', generation: 1 }, streamId: started.streamId, sequence: 3 }])
+    await expect(fixture.service.start('owner-2', {
+      hostId: 'host-1', source: { kind: 'container', containerId: 'web-1' }, since: '1h', priority: 'info', tailLines: 100,
+    })).rejects.toThrow('SERVER_OPS_LOG_START_INPUT_INVALID')
+  })
+
   test('Given 合法查询 When runtime started Then 返回不含 connectionId 的公开身份与严格命令', async () => {
     const fixture = createFixture()
     const gate = createDeferred()

@@ -430,13 +430,23 @@ import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
 import { ServerOpsAgentAccessStore } from './lib/server-ops/server-ops-agent-access-store'
 import { ServerOpsAuditStore } from './lib/server-ops/server-ops-audit-store'
-import { disposeServerOpsBeforeQuit, disposeServerOpsLifecycle, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
+import { disposeServerOpsLifecycle, registerServerOpsBeforeQuitBarrier, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
 import { ServerOpsHostStore } from './lib/server-ops/server-ops-host-store'
 import { ServerOpsCredentialStore } from './lib/server-ops/server-ops-credential-store'
 import { ServerOpsHostTrustStore } from './lib/server-ops/server-ops-host-trust-store'
+import { ServerOpsTrustService } from './lib/server-ops/server-ops-trust-service'
+import { createServerOpsConfigTransaction } from './lib/server-ops/server-ops-config-transaction'
+import { watchServerOpsTrust } from './lib/server-ops/server-ops-trust-watcher'
 import { ServerOpsConnectionService, createServerOpsConnectionSystemDependencies } from './lib/server-ops/server-ops-connection-service'
 import { ServerOpsOverviewService } from './lib/server-ops/server-ops-overview-service'
 import { ServerOpsSystemdService } from './lib/server-ops/server-ops-systemd-service'
+import { ServerOpsDockerService } from './lib/server-ops/server-ops-docker-service'
+import { ServerOpsFileService } from './lib/server-ops/server-ops-file-service'
+import { ServerOpsDockerConsoleService } from './lib/server-ops/server-ops-docker-console-service'
+import { ServerOpsFileTransferService, ServerOpsSafeFileTransferRecoveryStore } from './lib/server-ops/server-ops-file-transfer-service'
+import { ServerOpsLocalFileLeaseRegistry } from './lib/server-ops/server-ops-local-file-leases'
+import { SERVER_OPS_TRANSFER_CHANNELS, parseServerOpsTransferSnapshot } from '@proma/shared'
+import { SERVER_OPS_CONSOLE_IPC_CHANNELS, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleExitEvent } from '@proma/shared'
 import { ServerOpsLogService } from './lib/server-ops/server-ops-log-service'
 import { serverOpsRuntimeClient } from './lib/server-ops/server-ops-runtime-client'
 import { writeTextFileAtomic } from './lib/safe-file'
@@ -2060,18 +2070,110 @@ export function registerIpcHandlers(): void {
   const serverOpsCredentialStore = new ServerOpsCredentialStore(undefined, { safeStorage })
   /** endpoint Host Key 与显示主机资产分离持久化。 */
   const serverOpsHostTrustStore = new ServerOpsHostTrustStore()
+  /** 共享实例准入阻止旧实例在信任写入或审计升级期间覆盖配置。 */
+  const acquireServerOpsMutationGuard = async (): Promise<() => void> => {
+    let guard: Awaited<ReturnType<typeof dataRootInstanceLease.acquireMigrationGuard>>
+    try { guard = await dataRootInstanceLease.acquireMigrationGuard() } catch { throw new Error('SERVER_OPS_TRUST_BUSY') }
+    try {
+      if (await dataRootInstanceLease.hasOtherActiveLease()) throw new Error('SERVER_OPS_OTHER_INSTANCE_ACTIVE')
+      return () => guard.release()
+    } catch (error) {
+      try { guard.release() } catch { /* 保留原准入错误，退出流程清理当前实例 guard。 */ }
+      throw error instanceof Error && error.message === 'SERVER_OPS_OTHER_INSTANCE_ACTIVE'
+        ? error : new Error('SERVER_OPS_TRUST_BUSY')
+    }
+  }
   /** 真实 SSH 连接统一由独立 utility runtime 编排。 */
   const serverOpsConnectionService = new ServerOpsConnectionService({
     hosts: serverOpsHostStore,
     credentials: serverOpsCredentialStore,
     trust: serverOpsHostTrustStore,
     runtime: serverOpsRuntimeClient,
+    acquireMutationGuard: acquireServerOpsMutationGuard,
     ...createServerOpsConnectionSystemDependencies(),
   })
   /** Agent 服务器授权仅存在主进程内存，并复用同一运维服务实例。 */
   const serverOpsAgentAccessStore = new ServerOpsAgentAccessStore()
   /** Agent 远程动作审计与 Facade、IPC 共享唯一持久化实例。 */
-  const serverOpsAuditStore = new ServerOpsAuditStore()
+  const serverOpsAuditStore = new ServerOpsAuditStore(undefined, { requirePreparedSchema: true })
+  /** 所有领域共享同一 Store；schema 升级统一通过实例准入守卫。 */
+  const serverOpsAudit = {
+    append: serverOpsAuditStore.append.bind(serverOpsAuditStore),
+    list: serverOpsAuditStore.list.bind(serverOpsAuditStore),
+    prepareForWrites: () => serverOpsAuditStore.prepareForWrites(acquireServerOpsMutationGuard),
+  }
+  /** 指纹管理的实例准入短暂阻止新旧实例与当前提交并行，不占用 SSH 网络期间。 */
+  const serverOpsTrustService = new ServerOpsTrustService({
+    hosts: serverOpsHostStore,
+    trust: serverOpsHostTrustStore,
+    connections: serverOpsConnectionService,
+    audit: serverOpsAudit,
+    transaction: createServerOpsConfigTransaction(join(getConfigDir(), 'server-ops')),
+    revokeHostAccess: (hostId) => serverOpsIpcRegistration.revokeHost(hostId),
+    acquireMutationGuard: acquireServerOpsMutationGuard,
+  })
+  /** Docker 固定命令复用 SSH 身份与审计；不读取客户端 Docker context。 */
+  const serverOpsDockerService = new ServerOpsDockerService({
+    getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
+    exec: (hostId, connectionId, command, timeoutMs) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs),
+    audit: serverOpsAudit,
+  })
+  /** 文件服务共用 SSH 代次和审计，不向 Renderer 暴露底层 SFTP 句柄。 */
+  const serverOpsFileService = new ServerOpsFileService({
+    hosts: serverOpsHostStore,
+    connections: {
+      getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
+      sftp: (input) => serverOpsConnectionService.sftp(input),
+      closeSftpOwner: (ownerKey) => serverOpsRuntimeClient.closeSftpOwner(ownerKey),
+    },
+    audit: serverOpsAudit,
+  })
+  /** 仅向仍获授权的所属窗口推送容器终端事件。 */
+  const sendServerOpsConsoleEvent = (ownerId: number, channel: string, payload: unknown): void => {
+    const owner = BrowserWindow.fromId(ownerId)
+    if (!owner || owner.isDestroyed() || !listAuthorizedDesignWebContents().some((contents) => contents.id === owner.webContents.id)) return
+    try { owner.webContents.send(channel, payload) } catch { /* 窗口关闭竞态不击穿 SSH 事件回调。 */ }
+  }
+  /** 每个容器终端使用独立 channel，生命周期与主机终端分离。 */
+  const serverOpsConsoleService = new ServerOpsDockerConsoleService({
+    connection: serverOpsConnectionService,
+    publishOutput: (ownerId, event) => sendServerOpsConsoleEvent(ownerId, SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT, parseServerOpsConsoleOutputEvent(event)),
+    publishExit: (ownerId, event) => sendServerOpsConsoleEvent(ownerId, SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT, parseServerOpsConsoleExitEvent(event)),
+  })
+  /** 文件选择与传输只能由当前仍授权的主窗口发起。 */
+  const isServerOpsFileOwnerAlive = (ownerId: number): boolean => {
+    const owner = BrowserWindow.fromId(ownerId)
+    return Boolean(owner && !owner.isDestroyed() && listAuthorizedDesignWebContents().some((contents) => contents.id === owner.webContents.id))
+  }
+  /** 系统选择器在 Main 打开 fd，Renderer 只得到与窗口绑定的一次性标识。 */
+  const serverOpsFileLeases = new ServerOpsLocalFileLeaseRegistry({
+    isOwnerAlive: isServerOpsFileOwnerAlive,
+    selectUpload: async (ownerId) => {
+      const owner = BrowserWindow.fromId(ownerId)
+      if (!owner || !isServerOpsFileOwnerAlive(ownerId)) throw new Error('SERVER_OPS_ACCESS_DENIED')
+      const result = await dialog.showOpenDialog(owner, { title: '选择上传文件', properties: ['openFile'] })
+      return result.canceled ? null : result.filePaths[0] ?? null
+    },
+    selectDownload: async (ownerId, suggestedName) => {
+      const owner = BrowserWindow.fromId(ownerId)
+      if (!owner || !isServerOpsFileOwnerAlive(ownerId)) throw new Error('SERVER_OPS_ACCESS_DENIED')
+      const result = await dialog.showSaveDialog(owner, { title: '下载远程文件', defaultPath: suggestedName })
+      return result.canceled ? null : result.filePath ?? null
+    },
+  })
+  /** 两项活动传输共用唯一 SSH 连接，恢复意图位于业务数据根。 */
+  const serverOpsTransfers = new ServerOpsFileTransferService({
+    connections: serverOpsConnectionService,
+    leases: serverOpsFileLeases,
+    isOwnerAlive: isServerOpsFileOwnerAlive,
+    audit: serverOpsAudit,
+    recovery: new ServerOpsSafeFileTransferRecoveryStore(getConfigDir()),
+    publish: (ownerId, snapshot) => {
+      const owner = BrowserWindow.fromId(ownerId)
+      if (!owner || !isServerOpsFileOwnerAlive(ownerId)) return
+      try { owner.webContents.send(SERVER_OPS_TRANSFER_CHANNELS.PROGRESS, parseServerOpsTransferSnapshot(snapshot)) } catch { /* 关闭中的窗口不会阻断传输收口。 */ }
+    },
+  })
   /** 概览复用唯一 SSH connection generation，不创建额外连接。 */
   const serverOpsOverviewService = new ServerOpsOverviewService({
     connections: serverOpsConnectionService,
@@ -2081,7 +2183,7 @@ export function registerIpcHandlers(): void {
   const serverOpsSystemdService = new ServerOpsSystemdService({
     getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
     exec: (hostId, connectionId, command, timeoutMs) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs),
-    audit: serverOpsAuditStore,
+    audit: serverOpsAudit,
     now: Date.now,
   })
   /** 实时日志流复用唯一连接，并仅在 main 内生成流身份。 */
@@ -2093,6 +2195,8 @@ export function registerIpcHandlers(): void {
   const serverOpsLifecycle = (() => {
     /** IPC 注册成功后用于异常路径精确回滚本轮 handler 与订阅。 */
     let ipcRegistration: ReturnType<typeof registerServerOpsIpcHandlers> | null = null
+    /** 监听只有随完整 context 注册成功才转移所有权。 */
+    let disposeTrustWatcher: (() => void) | undefined
     try {
       ipcRegistration = registerServerOpsIpcHandlers({
         ipc: ipcMain,
@@ -2101,10 +2205,16 @@ export function registerIpcHandlers(): void {
         connections: serverOpsConnectionService,
         credentials: serverOpsCredentialStore,
         access: serverOpsAgentAccessStore,
-        audit: serverOpsAuditStore,
+        audit: serverOpsAudit,
         overview: serverOpsOverviewService,
         systemd: serverOpsSystemdService,
         logs: serverOpsLogService,
+        trustManagement: serverOpsTrustService,
+        docker: serverOpsDockerService,
+        files: serverOpsFileService,
+        console: serverOpsConsoleService,
+        transfers: serverOpsTransfers,
+        fileLeases: serverOpsFileLeases,
         resolveOwnerWindow: (sender) => BrowserWindow.fromWebContents(sender),
         showLogSaveDialog: async (owner, options) => {
           /** owner 必然来自 BrowserWindow.fromWebContents，这里只恢复 Electron 的完整类型。 */
@@ -2114,22 +2224,43 @@ export function registerIpcHandlers(): void {
         now: () => new Date(),
         requireUserVisibleSession: (sessionId) => requireVisibleSession(sessionId),
       })
-      const disposeContextRegistration = registerServerOpsServiceContext({
+      disposeTrustWatcher = watchServerOpsTrust({
+        configDir: getConfigDir(),
+        reconcile: () => serverOpsConnectionService.reconcileTrust(),
+        unavailable: () => serverOpsConnectionService.blockUnavailableTrustMonitoring(),
+      })
+      const contextRegistration = registerServerOpsServiceContext({
         hosts: serverOpsHostStore,
         credentials: serverOpsCredentialStore,
         trust: serverOpsHostTrustStore,
         connections: serverOpsConnectionService,
         access: serverOpsAgentAccessStore,
-        audit: serverOpsAuditStore,
+        audit: serverOpsAudit,
         overview: serverOpsOverviewService,
         systemd: serverOpsSystemdService,
         logs: serverOpsLogService,
+        trustManagement: serverOpsTrustService,
+        docker: serverOpsDockerService,
+        files: serverOpsFileService,
+        console: serverOpsConsoleService,
+        transfers: serverOpsTransfers,
+        fileLeases: serverOpsFileLeases,
+        disposeTrustWatcher,
       })
       return {
         ipcRegistration,
-        dispose: disposeServerOpsLifecycle(() => ipcRegistration?.dispose(), disposeContextRegistration),
+        /** 共享 utility runtime 由应用级生命周期独占，旧 context 替换不会迟到停止新代。 */
+        dispose: disposeServerOpsLifecycle(
+          () => ipcRegistration?.dispose(),
+          contextRegistration.dispose,
+          () => { serverOpsRuntimeClient.stop() },
+          contextRegistration.ownsRuntime,
+        ),
       }
     } catch (error) {
+      try { disposeTrustWatcher?.() } catch (cleanupError) {
+        console.error('[Server Ops] 信任监听初始化回滚失败:', cleanupError)
+      }
       /** Server Ops 初始化失败时仍按 IPC、日志、连接顺序 best-effort 收口。 */
       try { ipcRegistration?.dispose() } catch (cleanupError) {
         console.error('[Server Ops] IPC 初始化回滚失败:', cleanupError)
@@ -2137,25 +2268,39 @@ export function registerIpcHandlers(): void {
       try { serverOpsLogService.dispose() } catch (cleanupError) {
         console.error('[Server Ops] 日志服务初始化回滚失败:', cleanupError)
       }
+      try { serverOpsTrustService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 信任服务初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsDockerService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] Docker 服务初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsFileService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 文件服务初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsConsoleService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 容器终端初始化回滚失败:', cleanupError)
+      }
+      void serverOpsTransfers.dispose().catch((cleanupError) => console.error('[Server Ops] 传输初始化回滚失败:', cleanupError))
+      void serverOpsFileLeases.dispose().catch((cleanupError) => console.error('[Server Ops] 文件句柄初始化回滚失败:', cleanupError))
       try { serverOpsConnectionService.dispose() } catch (cleanupError) {
         console.error('[Server Ops] 连接服务初始化回滚失败:', cleanupError)
+      }
+      try { serverOpsRuntimeClient.stop() } catch (cleanupError) {
+        console.error('[Server Ops] SSH runtime 初始化回滚失败:', cleanupError)
       }
       throw error
     }
   })()
   /** 运维 IPC 注册结果同时承载普通 Agent 会话删除时的授权收口。 */
   const serverOpsIpcRegistration = serverOpsLifecycle.ipcRegistration
-  /** 必须先释放日志 owner/订阅与 IPC，再停止唯一连接和 utility runtime。 */
-  let serverOpsDisposed = false
-  const disposeServerOps = (): void => {
-    if (serverOpsDisposed) return
-    serverOpsDisposed = true
-    app.removeListener('before-quit', disposeServerOps)
-    disposeServerOpsBeforeQuit(serverOpsLifecycle.dispose, (error) => {
+  /** 首次及在途重复退出都由同一屏障拦截，清理终态才解绑并恢复 quit。 */
+  registerServerOpsBeforeQuitBarrier(
+    app,
+    serverOpsLifecycle.dispose,
+    (error) => {
       console.error('[Server Ops] 退出清理失败:', error)
-    })
-  }
-  app.prependOnceListener('before-quit', disposeServerOps)
+    },
+  )
   /** 图片任务直接更新 Canvas 节点后发布准确 revision，驱动折叠节点即时刷新。 */
   const publishCanvasImageGraphChange = (event: CanvasChangeEvent): void => {
     for (const contents of listAuthorizedDesignWebContents()) {

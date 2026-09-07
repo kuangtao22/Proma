@@ -18,6 +18,7 @@ import type {
   ServerOpsConnectionLogExitEvent,
   ServerOpsConnectionLogOutputEvent,
 } from './server-ops-connection-service'
+import { SERVER_OPS_DOCKER_COMMAND_PREFIX } from './server-ops-docker-service'
 
 /** Log Service 可见的最小连接边界。 */
 export interface ServerOpsLogConnection {
@@ -57,8 +58,13 @@ function quotePosix(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`
 }
 
-/** 从严格 Shared 输入构造唯一 journalctl 命令模板。 */
-function buildJournalCommand(input: ServerOpsLogStartInput): string {
+/** 从严格 Shared 输入构造唯一受控日志命令模板。 */
+function buildLogCommand(input: ServerOpsLogStartInput): string {
+  if (input.source.kind === 'container') {
+    /** boot 对容器日志表示从 Unix epoch 开始，但初始输出仍受 tail 上限约束。 */
+    const since = input.since === 'boot' ? '0' : input.since
+    return `${SERVER_OPS_DOCKER_COMMAND_PREFIX} container logs --follow --timestamps --tail ${input.tailLines} --since ${quotePosix(since)} -- ${quotePosix(input.source.containerId)}`
+  }
   /** 只有 unit 来源附加受控的 systemd unit 参数。 */
   const unitArgument = input.source.kind === 'unit' ? ` --unit=${quotePosix(input.source.unitId)}` : ''
   return `LC_ALL=C journalctl --no-pager --output=short-iso-precise --priority=${input.priority} --lines=${input.tailLines} ${JOURNAL_SINCE_ARGUMENTS[input.since]}${unitArgument} --follow`
@@ -104,7 +110,7 @@ export class ServerOpsLogService {
     this.streamsByOwner.set(ownerKey, owned)
     this.ownersByStream.set(streamId, ownerKey)
     try {
-      await this.dependencies.connection.startLog(identity, streamId, buildJournalCommand(parsed))
+      await this.dependencies.connection.startLog(identity, streamId, buildLogCommand(parsed))
     } catch (error) {
       this.removeIfCurrent(owned)
       throw error

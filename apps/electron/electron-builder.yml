@@ -41,6 +41,8 @@ npmRebuild: false
 # 通用文件配置
 files:
   - dist/**/*
+  # 临时本地服务器验收脚本不进入正式安装包。
+  - "!dist/*-smoke.cjs"
   # build:resources 会把 resources 拷到 dist/，但 electron-builder 已通过 buildResources
   # 直接使用原始资源；仅保留 Linux runtime 需要的 icon.png，避免重复打包。
   - "!dist/resources/**"
@@ -64,6 +66,11 @@ files:
 
 # 通用额外资源
 extraResources:
+  # Server Ops 四类共享配置的非阻塞进程锁，作为 N-API 模块加载。
+  - from: resources/server-ops-config-lock
+    to: server-ops-config-lock
+    filter:
+      - "*.node"
   # LIST/SEARCH 使用的跨平台稳定目录 helper，绑定授权与枚举到同一原生 handle。
   - from: resources/stable-directory
     to: stable-directory
@@ -119,6 +126,7 @@ mac:
     - from: resources/eventkit/macos-eventkit.node
       to: eventkit/macos-eventkit.node
   binaries:
+    - resources/server-ops-config-lock/server-ops-config-lock.node
     - resources/stable-directory/stable-directory-helper
     - resources/agent-island/macos-agent-island-helper
     - resources/eventkit/macos-eventkit.node

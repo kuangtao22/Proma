@@ -31,6 +31,11 @@ export * from './agent-provider'
 export * from './agent-runtime'
 export * from './terminal'
 export * from './server-ops'
+export * from './server-ops-trust'
+export * from './server-ops-docker'
+export * from './server-ops-console'
+export * from './server-ops-files'
+export * from './server-ops-transfers'
 
 // 环境检测相关类型
 export * from './environment'

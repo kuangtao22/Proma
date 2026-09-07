@@ -4,6 +4,12 @@ import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import type {
   ServerOpsConnectInput,
+  ServerOpsConsoleAck,
+  ServerOpsConsoleExitEvent,
+  ServerOpsConsoleIdentity,
+  ServerOpsConsoleInput,
+  ServerOpsConsoleOutputEvent,
+  ServerOpsConsoleResizeInput,
   ServerOpsConfirmHostKeyInput,
   ServerOpsConnectionState,
   ServerOpsCredentialInput,
@@ -21,10 +27,13 @@ import type {
   ServerOpsRuntimeConnectionInput,
   ServerOpsRuntimeLogExitEvent,
   ServerOpsRuntimeLogOutputEvent,
+  ServerOpsSftpCall,
 } from './server-ops-runtime-client'
+import { createServerOpsEndpoint, sameServerOpsHostKey } from './server-ops-host-trust-store'
 import type { ServerOpsHostTrustResult } from './server-ops-host-trust-store'
 import type { ServerOpsRuntimeConnectResult } from '../../../utility/server-ops/server-ops-runtime-protocol'
 import type { ServerOpsRuntimeExecResult } from '../../../utility/server-ops/server-ops-runtime-protocol'
+import type { ServerOpsSftpResult } from '../../../utility/server-ops/server-ops-sftp-runtime'
 
 /** 连接 Service 所需的公开主机资产边界。 */
 export interface ServerOpsConnectionHostStore {
@@ -51,6 +60,8 @@ export interface ServerOpsConnectionTrustStore {
 export interface ServerOpsConnectionRuntime {
   connect: (input: ServerOpsRuntimeConnectionInput) => Promise<ServerOpsRuntimeConnectResult>
   exec: (hostId: string, connectionId: string, command: string, timeoutMs: number) => Promise<ServerOpsRuntimeExecResult>
+  sftp?: (input: ServerOpsSftpCall) => Promise<ServerOpsSftpResult>
+  closeSftpOwner?: (ownerKey: string) => void | Promise<void>
   startLog: (hostId: string, connectionId: string, streamId: string, command: string) => Promise<void>
   stopLog: (hostId: string, connectionId: string, streamId: string) => void
   acknowledgeLog: (hostId: string, connectionId: string, streamId: string, sequence: number) => void
@@ -62,6 +73,13 @@ export interface ServerOpsConnectionRuntime {
   onExit: (listener: (event: ServerOpsTerminalExitEvent) => void) => () => void
   onLogOutput: (listener: (event: ServerOpsRuntimeLogOutputEvent) => void) => () => void
   onLogExit: (listener: (event: ServerOpsRuntimeLogExitEvent) => void) => () => void
+  startConsole?: (input: import('../../../utility/server-ops/server-ops-console-runtime').ServerOpsConsoleRuntimeStart) => Promise<void>
+  stopConsole?: (input: ServerOpsConsoleIdentity) => Promise<void>
+  inputConsole?: (input: ServerOpsConsoleInput) => void
+  resizeConsole?: (input: ServerOpsConsoleResizeInput) => void
+  acknowledgeConsole?: (input: ServerOpsConsoleAck) => void
+  onConsoleOutput?: (listener: (event: ServerOpsConsoleOutputEvent) => void) => () => void
+  onConsoleExit?: (listener: (event: ServerOpsConsoleExitEvent) => void) => () => void
 }
 
 /** 连接 Service 可替换的系统与领域依赖。 */
@@ -73,6 +91,8 @@ export interface ServerOpsConnectionServiceDependencies {
   uuid: () => string
   resolveSshAgent: () => string
   readPrivateKey: (path: string) => Buffer
+  /** 与显式信任管理共用的短期本地实例准入。 */
+  acquireMutationGuard: () => Promise<() => void>
 }
 
 /** 当前活跃 SSH 连接的内部所有权身份。 */
@@ -92,6 +112,9 @@ export interface ServerOpsConnectionLogExitEvent extends ServerOpsRuntimeLogExit
   generation: number
 }
 
+export interface ServerOpsConnectionConsoleOutputEvent extends ServerOpsConsoleOutputEvent { generation: number }
+export interface ServerOpsConnectionConsoleExitEvent extends ServerOpsConsoleExitEvent { generation: number }
+
 /** 首次 Host Key 候选在主进程内存中的完整绑定。 */
 interface PendingHostKeyCandidate {
   candidateId: string
@@ -99,6 +122,7 @@ interface PendingHostKeyCandidate {
   address: string
   port: number
   key: ServerOpsHostKey
+  generation: number
 }
 
 /** 单台主机当前连接请求的内部所有权事实。 */
@@ -126,6 +150,10 @@ export class ServerOpsConnectionService {
   private readonly states = new Map<string, ServerOpsConnectionState>()
   /** 每台主机的连接代次与当前在途 runtime ID。 */
   private readonly lifecycles = new Map<string, HostConnectionLifecycle>()
+  /** 连接建立时的 endpoint，资产编辑不能把旧连接挪到新服务器。 */
+  private readonly activeEndpoints = new Map<string, string>()
+  /** 尚未取得终态的命令数量，用于阻止信任变更打断未决远程动作。 */
+  private readonly pendingOperations = new Map<string, number>()
   /** 未确认 Host Key 候选只存在主进程内存。 */
   private readonly pendingCandidates = new Map<string, PendingHostKeyCandidate>()
   /** 连接状态订阅者。 */
@@ -140,6 +168,9 @@ export class ServerOpsConnectionService {
   private readonly logOutputListeners = new Set<(event: ServerOpsConnectionLogOutputEvent) => void>()
   /** 只向 Log Service 暴露的日志终态订阅。 */
   private readonly logExitListeners = new Set<(event: ServerOpsConnectionLogExitEvent) => void>()
+  private readonly consoleOutputListeners = new Set<(event: ServerOpsConnectionConsoleOutputEvent) => void>()
+  private readonly consoleExitListeners = new Set<(event: ServerOpsConnectionConsoleExitEvent) => void>()
+  private readonly activeConsoles = new Map<string, ServerOpsActiveConnectionIdentity & { containerId: string }>()
   /** runtime 输出订阅清理器。 */
   private readonly disposeRuntimeOutput: () => void
   /** runtime 退出订阅清理器。 */
@@ -148,6 +179,8 @@ export class ServerOpsConnectionService {
   private readonly disposeRuntimeLogOutput: () => void
   /** runtime 日志终态订阅清理器。 */
   private readonly disposeRuntimeLogExit: () => void
+  private readonly disposeRuntimeConsoleOutput: () => void
+  private readonly disposeRuntimeConsoleExit: () => void
 
   constructor(dependencies: ServerOpsConnectionServiceDependencies) {
     this.dependencies = dependencies
@@ -177,6 +210,20 @@ export class ServerOpsConnectionService {
       if (!identity || identity.connectionId !== event.connectionId) return
       this.notifyLogExit({ ...event, generation: identity.generation })
     })
+    this.disposeRuntimeConsoleOutput = dependencies.runtime.onConsoleOutput?.((event) => {
+      const owned = this.activeConsoles.get(event.consoleId)
+      if (!owned || owned.hostId !== event.hostId || owned.connectionId !== event.connectionId
+        || owned.containerId !== event.containerId || !this.isActiveIdentity(owned)) return
+      this.notifyConsoleOutput({ ...event, generation: owned.generation })
+    }) ?? (() => undefined)
+    this.disposeRuntimeConsoleExit = dependencies.runtime.onConsoleExit?.((event) => {
+      const owned = this.activeConsoles.get(event.consoleId)
+      if (!owned || owned.hostId !== event.hostId || owned.connectionId !== event.connectionId
+        || owned.containerId !== event.containerId) return
+      this.activeConsoles.delete(event.consoleId)
+      this.decrementPendingOperation(event.hostId)
+      this.notifyConsoleExit({ ...event, generation: owned.generation })
+    }) ?? (() => undefined)
   }
 
   /** 订阅公开连接状态。 */
@@ -209,8 +256,19 @@ export class ServerOpsConnectionService {
     return () => this.logExitListeners.delete(listener)
   }
 
+  onConsoleOutput(listener: (event: ServerOpsConnectionConsoleOutputEvent) => void): () => void { this.consoleOutputListeners.add(listener); return () => this.consoleOutputListeners.delete(listener) }
+  onConsoleExit(listener: (event: ServerOpsConnectionConsoleExitEvent) => void): () => void { this.consoleExitListeners.add(listener); return () => this.consoleExitListeners.delete(listener) }
+
   /** 返回指定主机当前公开连接状态。 */
   getState(hostId: string): ServerOpsConnectionState {
+    /** blocked/首次确认的观测同样绑定原地址，不能被资产编辑搬到新 endpoint。 */
+    const state = this.states.get(hostId)
+    if (state?.phase === 'blocked' || state?.phase === 'host-key-required') {
+      try {
+        const host = this.dependencies.hosts.get(hostId)
+        if (!host || this.activeEndpoints.get(hostId) !== createServerOpsEndpoint(host)) return this.disconnect(hostId)
+      } catch { return this.disconnect(hostId) }
+    }
     return { ...(this.states.get(hostId) ?? { hostId, phase: 'disconnected' as const }) }
   }
 
@@ -219,11 +277,43 @@ export class ServerOpsConnectionService {
     /** fresh-read 的内部连接生命周期。 */
     const lifecycle = this.lifecycles.get(hostId)
     if (!lifecycle?.activeConnectionId) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    this.assertCurrentTrust(hostId)
     return { hostId, connectionId: lifecycle.activeConnectionId, generation: lifecycle.generation }
+  }
+
+  /** 返回包括在途连接在内的主机代次，供信任候选绑定。 */
+  getGeneration(hostId: string): number {
+    return this.lifecycles.get(hostId)?.generation ?? 0
+  }
+
+  /** 未决命令在显式断线后仍保留 busy，直到运行时确认终态。 */
+  hasPendingOperations(hostId: string): boolean {
+    return (this.pendingOperations.get(hostId) ?? 0) > 0
+  }
+
+  /** 配置文件变化通知触发低频对账，流式输出本身不增加磁盘读取。 */
+  reconcileTrust(): void {
+    for (const [hostId, lifecycle] of this.lifecycles) {
+      if (!lifecycle.activeConnectionId) continue
+      try { this.assertCurrentTrust(hostId) } catch { /* 已在校验失败分支断线并发布状态。 */ }
+    }
+  }
+
+  /** 监听故障后旧连接全部失效，新连接需等待应用重新初始化监听。 */
+  private trustMonitoringAvailable = true
+
+  /** 主进程目录监听丢失时阻断全部活跃和在途连接。 */
+  blockUnavailableTrustMonitoring(): void {
+    this.trustMonitoringAvailable = false
+    for (const hostId of new Set([...this.states.keys(), ...this.lifecycles.keys()])) {
+      this.disconnect(hostId)
+      this.publishError(hostId, 'SERVER_OPS_TRUST_WATCH_UNAVAILABLE', '服务器信任监听不可用，请重启应用')
+    }
   }
 
   /** 保存一次性凭据并建立真实 SSH 连接。 */
   async connect(input: ServerOpsConnectInput): Promise<ServerOpsConnectionState> {
+    if (!this.trustMonitoringAvailable) return this.publishError(input.hostId, 'SERVER_OPS_TRUST_WATCH_UNAVAILABLE', '服务器信任监听不可用，请重启应用')
     /** 新请求先取得独占代次，并释放同主机旧连接或旧在途请求。 */
     const generation = this.invalidateConnections(input.hostId)
     /** 每次操作 fresh-read 的主机资产。 */
@@ -257,6 +347,16 @@ export class ServerOpsConnectionService {
         this.disconnectRuntimeConnection(host.id, connectionId)
         return this.getState(host.id)
       }
+      if (result.status === 'connected') {
+        /** 握手期间其它实例换密钥或编辑主机时，旧成功不得成为新身份。 */
+        const freshHost = this.dependencies.hosts.get(host.id)
+        if (!freshHost || createServerOpsEndpoint(freshHost) !== createServerOpsEndpoint(host)
+          || !sameServerOpsHostKey(this.dependencies.trust.get(freshHost), result.hostKey)) {
+          this.disconnect(host.id)
+          return this.publishError(host.id, 'SERVER_OPS_HOST_KEY_CHANGED', '服务器身份已变化，请重新连接')
+        }
+      }
+      this.activeEndpoints.set(host.id, createServerOpsEndpoint(host))
       this.lifecycles.set(host.id, result.status === 'connected'
         ? { generation, activeConnectionId: connectionId }
         : { generation })
@@ -270,6 +370,7 @@ export class ServerOpsConnectionService {
         if (connectionId) this.disconnectRuntimeConnection(host.id, connectionId)
         return this.getState(host.id)
       }
+      if (connectionId) this.disconnectRuntimeConnection(host.id, connectionId)
       this.lifecycles.set(host.id, { generation })
       if (isServerOpsRuntimeError(error)) return this.publishError(host.id, error.code, error.message)
       /** 领域错误只允许已知稳定码，其余统一收敛。 */
@@ -283,8 +384,69 @@ export class ServerOpsConnectionService {
     this.assertActiveConnection(hostId, connectionId)
     if (!command || command.length > 8192 || command.includes('\0')) throw new Error('SERVER_OPS_EXEC_COMMAND_INVALID')
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120000) throw new Error('SERVER_OPS_EXEC_TIMEOUT_INVALID')
-    return this.dependencies.runtime.exec(hostId, connectionId, command, timeoutMs)
+    this.pendingOperations.set(hostId, (this.pendingOperations.get(hostId) ?? 0) + 1)
+    try {
+      return await this.dependencies.runtime.exec(hostId, connectionId, command, timeoutMs)
+    } finally {
+      const remaining = (this.pendingOperations.get(hostId) ?? 1) - 1
+      if (remaining > 0) this.pendingOperations.set(hostId, remaining)
+      else this.pendingOperations.delete(hostId)
+    }
   }
+
+  /** 在当前可信连接上执行一次有界 SFTP 请求，await 前后都复核身份并计入变更门禁。 */
+  async sftp(input: ServerOpsSftpCall): Promise<ServerOpsSftpResult> {
+    if (!this.dependencies.runtime.sftp) throw new Error('SERVER_OPS_SFTP_UNAVAILABLE')
+    const identity = this.getActiveIdentity(input.hostId)
+    if (identity.connectionId !== input.connectionId) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    this.pendingOperations.set(input.hostId, (this.pendingOperations.get(input.hostId) ?? 0) + 1)
+    try {
+      const result = await this.dependencies.runtime.sftp(input)
+      this.assertActiveIdentity(identity)
+      return result
+    } finally {
+      const remaining = (this.pendingOperations.get(input.hostId) ?? 1) - 1
+      if (remaining > 0) this.pendingOperations.set(input.hostId, remaining)
+      else this.pendingOperations.delete(input.hostId)
+    }
+  }
+
+  /** 关闭精确 owner 的 SFTP cursor/handle，供窗口和单条传输生命周期收口。 */
+  async closeSftpOwner(ownerKey: string): Promise<void> {
+    await this.dependencies.runtime.closeSftpOwner?.(ownerKey)
+  }
+
+  /** 启动独立容器 Console，并在整个 channel 生命周期内占用信任变更门禁。 */
+  async startConsole(identity: ServerOpsActiveConnectionIdentity, consoleId: string, containerId: string, cols: number, rows: number): Promise<ServerOpsConsoleIdentity> {
+    if (!this.dependencies.runtime.startConsole) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    this.assertActiveIdentity(identity)
+    const session = { consoleId, hostId: identity.hostId, connectionId: identity.connectionId, containerId }
+    this.incrementPendingOperation(identity.hostId)
+    try {
+      await this.dependencies.runtime.startConsole({ ...session, cols, rows })
+      this.assertActiveIdentity(identity)
+      this.activeConsoles.set(consoleId, { ...identity, containerId })
+      return session
+    } catch (error) {
+      this.decrementPendingOperation(identity.hostId)
+      try { await this.dependencies.runtime.stopConsole?.(session) } catch { /* 启动失败后的清理不覆盖原错误。 */ }
+      throw error
+    }
+  }
+
+  async stopConsole(input: ServerOpsConsoleIdentity): Promise<void> {
+    const owned = this.requireConsole(input)
+    try { await this.dependencies.runtime.stopConsole?.(input) } finally {
+      if (this.activeConsoles.get(input.consoleId) === owned) {
+        this.activeConsoles.delete(input.consoleId)
+        this.decrementPendingOperation(input.hostId)
+      }
+    }
+  }
+
+  writeConsole(input: ServerOpsConsoleInput): void { this.requireConsole(input); this.dependencies.runtime.inputConsole?.(input) }
+  resizeConsole(input: ServerOpsConsoleResizeInput): void { this.requireConsole(input); this.dependencies.runtime.resizeConsole?.(input) }
+  acknowledgeConsole(input: ServerOpsConsoleAck): void { this.requireConsole(input); this.dependencies.runtime.acknowledgeConsole?.(input) }
 
   /** 以当前连接身份启动日志，await 前后都复核 generation。 */
   async startLog(identity: ServerOpsActiveConnectionIdentity, streamId: string, command: string): Promise<void> {
@@ -309,19 +471,37 @@ export class ServerOpsConnectionService {
 
   /** 确认首次 Host Key，持久化固定值后使用 fresh 数据重新连接。 */
   async confirmHostKey(input: ServerOpsConfirmHostKeyInput): Promise<ServerOpsConnectionState> {
-    /** 候选必须同时匹配不可枚举 ID 与目标主机。 */
-    const candidate = this.pendingCandidates.get(input.candidateId)
-    if (!candidate || candidate.hostId !== input.hostId) {
+    /** guard 等待前先拒绝已失效候选，避免无意义占用实例准入。 */
+    if (!this.resolvePendingHostKeyCandidate(input)) {
       return this.publishError(input.hostId, 'SERVER_OPS_HOST_KEY_CANDIDATE_EXPIRED', '服务器指纹确认已失效，请重新连接')
     }
-    /** 确认时再次读取主机，endpoint 变化会使候选失效。 */
-    const host = this.dependencies.hosts.get(input.hostId)
-    if (!host || host.address !== candidate.address || host.port !== candidate.port) {
+    const release = await this.dependencies.acquireMutationGuard()
+    let failure: unknown
+    let committed = false
+    try {
+      /** await 后重新读取候选、主机和 generation，迟到确认不得写入或认证。 */
+      const resolved = this.resolvePendingHostKeyCandidate(input)
+      if (!resolved) {
+        return this.publishError(input.hostId, 'SERVER_OPS_HOST_KEY_CANDIDATE_EXPIRED', '服务器指纹确认已失效，请重新连接')
+      }
+      this.dependencies.trust.trust(resolved.host, resolved.candidate.key)
       this.pendingCandidates.delete(input.candidateId)
-      return this.publishError(input.hostId, 'SERVER_OPS_HOST_KEY_CANDIDATE_EXPIRED', '服务器地址已变化，请重新连接')
+      committed = true
+    } catch (error) {
+      failure = error
+      throw error
+    } finally {
+      try {
+        release()
+      } catch (releaseError) {
+        /** 释放失败不能把已经提交的信任或原始领域异常伪装成可重试失败。 */
+        if (failure && (typeof failure === 'object' || typeof failure === 'function')) {
+          try { Object.defineProperty(failure, 'cause', { value: releaseError, configurable: true }) } catch { /* 保留原错误。 */ }
+        } else if (!committed) {
+          // 候选失效的公开结果已经形成，释放故障不能覆盖它。
+        }
+      }
     }
-    this.dependencies.trust.trust(host, candidate.key)
-    this.pendingCandidates.delete(input.candidateId)
     return this.connect({ hostId: input.hostId, cols: input.cols, rows: input.rows })
   }
 
@@ -376,6 +556,8 @@ export class ServerOpsConnectionService {
     this.disposeRuntimeExit()
     this.disposeRuntimeLogOutput()
     this.disposeRuntimeLogExit()
+    this.disposeRuntimeConsoleOutput()
+    this.disposeRuntimeConsoleExit()
     /** states 与 lifecycles 的并集覆盖活跃和仅在途的主机。 */
     const hostIds = new Set([...this.states.keys(), ...this.lifecycles.keys()])
     for (const hostId of hostIds) this.invalidateConnections(hostId)
@@ -446,18 +628,51 @@ export class ServerOpsConnectionService {
     }
     /** 未知候选只在主进程内存中保留，确认后必须 fresh reconnect。 */
     const candidateId = this.dependencies.uuid()
-    this.pendingCandidates.set(candidateId, { candidateId, hostId: host.id, address: host.address, port: host.port, key: trustResult.observed })
+    this.pendingCandidates.set(candidateId, {
+      candidateId, hostId: host.id, address: host.address, port: host.port,
+      key: trustResult.observed, generation: this.getGeneration(host.id),
+    })
     return this.publish({ hostId: host.id, phase: 'host-key-required', candidate: { candidateId, ...trustResult.observed } })
   }
 
   /** 校验终端操作归属当前 connected 状态。 */
   private assertActiveConnection(hostId: string, connectionId: string): void {
     if (!this.isActiveConnection(hostId, connectionId)) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    this.assertCurrentTrust(hostId)
+  }
+
+  /** fresh-read 首次确认候选、endpoint 与连接代次，返回写入所需权威主机。 */
+  private resolvePendingHostKeyCandidate(input: ServerOpsConfirmHostKeyInput): {
+    candidate: PendingHostKeyCandidate
+    host: ServerOpsHost
+  } | undefined {
+    const candidate = this.pendingCandidates.get(input.candidateId)
+    if (!candidate || candidate.hostId !== input.hostId) return undefined
+    const host = this.dependencies.hosts.get(input.hostId)
+    if (!host || host.address !== candidate.address || host.port !== candidate.port
+      || this.getGeneration(input.hostId) !== candidate.generation) {
+      this.pendingCandidates.delete(input.candidateId)
+      return undefined
+    }
+    return { candidate, host }
+  }
+
+  /** 每次新远程动作都复核磁盘信任；撤销、损坏或 endpoint 变化立即撤掉旧连接。 */
+  private assertCurrentTrust(hostId: string): void {
+    try {
+      const host = this.dependencies.hosts.get(hostId)
+      const state = this.states.get(hostId)
+      if (host && state?.hostKey && this.activeEndpoints.get(hostId) === createServerOpsEndpoint(host)
+        && sameServerOpsHostKey(this.dependencies.trust.get(host), state.hostKey)) return
+    } catch { /* 损坏或不可读信任等同身份无法证明。 */ }
+    this.disconnect(hostId)
+    throw new Error('SERVER_OPS_HOST_KEY_CHANGED')
   }
 
   /** 校验调用方捕获的完整连接身份。 */
   private assertActiveIdentity(identity: ServerOpsActiveConnectionIdentity): void {
     if (!this.isActiveIdentity(identity)) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    this.assertCurrentTrust(identity.hostId)
   }
 
   /** 判断 host、connection 与 generation 是否仍为当前所有权事实。 */
@@ -468,7 +683,10 @@ export class ServerOpsConnectionService {
 
   /** 无异常读取当前连接身份，供高频事件过滤使用。 */
   private tryGetActiveIdentity(hostId: string): ServerOpsActiveConnectionIdentity | undefined {
-    try { return this.getActiveIdentity(hostId) } catch { return undefined }
+    const lifecycle = this.lifecycles.get(hostId)
+    return lifecycle?.activeConnectionId
+      ? { hostId, connectionId: lifecycle.activeConnectionId, generation: lifecycle.generation }
+      : undefined
   }
 
   /** 隔离日志输出订阅者异常。 */
@@ -485,6 +703,33 @@ export class ServerOpsConnectionService {
     }
   }
 
+  private notifyConsoleOutput(event: ServerOpsConnectionConsoleOutputEvent): void {
+    for (const listener of this.consoleOutputListeners) { try { listener({ ...event }) } catch { /* 消费者异常不能阻断 Console。 */ } }
+  }
+
+  private notifyConsoleExit(event: ServerOpsConnectionConsoleExitEvent): void {
+    for (const listener of this.consoleExitListeners) { try { listener({ ...event }) } catch { /* 消费者异常不能阻断清理。 */ } }
+  }
+
+  private requireConsole(input: ServerOpsConsoleIdentity): ServerOpsActiveConnectionIdentity & { containerId: string } {
+    const owned = this.activeConsoles.get(input.consoleId)
+    if (!owned || owned.hostId !== input.hostId || owned.connectionId !== input.connectionId || owned.containerId !== input.containerId) {
+      throw new Error('SERVER_OPS_CONSOLE_NOT_ACTIVE')
+    }
+    this.assertActiveIdentity(owned)
+    return owned
+  }
+
+  private incrementPendingOperation(hostId: string): void {
+    this.pendingOperations.set(hostId, (this.pendingOperations.get(hostId) ?? 0) + 1)
+  }
+
+  private decrementPendingOperation(hostId: string): void {
+    const remaining = (this.pendingOperations.get(hostId) ?? 1) - 1
+    if (remaining > 0) this.pendingOperations.set(hostId, remaining)
+    else this.pendingOperations.delete(hostId)
+  }
+
   /** 判断事件或终端操作是否属于当前公开活跃连接。 */
   private isActiveConnection(hostId: string, connectionId: string): boolean {
     /** 当前主机公开连接状态。 */
@@ -498,6 +743,7 @@ export class ServerOpsConnectionService {
 
   /** 推进主机连接代次，并尽力释放当前 active 与 pending runtime。 */
   private invalidateConnections(hostId: string): number {
+    this.activeEndpoints.delete(hostId)
     /** 失效前的内部连接生命周期。 */
     const lifecycle = this.lifecycles.get(hostId)
     /** 下一代次用于拒绝全部旧异步结果。 */

@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test'
-import { SERVER_OPS_IPC_CHANNELS } from '@proma/shared'
+import { SERVER_OPS_IPC_CHANNELS, SERVER_OPS_TRUST_CHANNELS, SERVER_OPS_DOCKER_CHANNELS, SERVER_OPS_FILE_CHANNELS, SERVER_OPS_CONSOLE_IPC_CHANNELS, SERVER_OPS_TRANSFER_CHANNELS } from '@proma/shared'
 import type { AgentSessionMeta, ServerOpsAuditListResult, ServerOpsConnectionState, ServerOpsHost, ServerOpsLogExitEvent, ServerOpsLogOutputEvent, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputEvent, ServerOpsUpsertHostInput } from '@proma/shared'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { registerServerOpsIpcHandlers } from './server-ops-ipc'
@@ -78,6 +78,12 @@ function createAgentAccessHarness(options: {
   hostExists?: boolean
   forgetHost?: (hostId: string) => void
   auditResult?: unknown
+  trustManagement?: ServerOpsIpcOptions['trustManagement']
+  docker?: ServerOpsIpcOptions['docker']
+  files?: ServerOpsIpcOptions['files']
+  console?: ServerOpsIpcOptions['console']
+  transfers?: ServerOpsIpcOptions['transfers']
+  fileLeases?: ServerOpsIpcOptions['fileLeases']
 } = {}) {
   const handlers = new Map<string, TestHandler>()
   const events: Array<{ channel: string; payload: unknown }> = []
@@ -89,7 +95,9 @@ function createAgentAccessHarness(options: {
     isDestroyed: () => false,
     send: (channel: string, payload: unknown) => { events.push({ channel, payload }) },
   } as unknown as WebContents
-  registerServerOpsIpcHandlers({
+  /** 模拟主窗口的关闭回调，验证候选不能在销毁后使用。 */
+  let closeOwner = (): void => undefined
+  const registration = registerServerOpsIpcHandlers({
     ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
     listAuthorizedWebContents: () => [sender],
     hosts: {
@@ -111,15 +119,154 @@ function createAgentAccessHarness(options: {
         return (options.auditResult ?? { records: [] }) as ServerOpsAuditListResult
       },
     },
+    trustManagement: options.trustManagement,
+    docker: options.docker,
+    files: options.files,
+    console: options.console,
+    transfers: options.transfers,
+    fileLeases: options.fileLeases,
+    resolveOwnerWindow: () => ({ id: 70, webContents: sender, isDestroyed: () => false,
+      once: (_event, callback) => { closeOwner = callback }, removeListener: () => undefined }),
     requireUserVisibleSession: () => {
       if (options.visible === false) throw new Error('SESSION_NOT_VISIBLE')
       return options.session ?? createAgentSession()
     },
   })
-  return { access, auditCalls, events, handlers, sender }
+  return { access, auditCalls, events, handlers, sender, registration, closeOwner: () => closeOwner() }
 }
 
 describe('服务器运维 IPC', () => {
+  test('Given 传输请求 When Renderer 伪造本地路径或owner Then 拒绝且关闭等待传输与lease同时收口', async () => {
+    /** 分别控制传输任务和未领取 fd 的清理完成时间。 */
+    let finishTransfers!: () => void
+    let finishLeases!: () => void
+    const transferClose = new Promise<void>((resolve) => { finishTransfers = resolve })
+    const leaseClose = new Promise<void>((resolve) => { finishLeases = resolve })
+    const calls: unknown[] = []
+    const fixture = createAgentAccessHarness({
+      transfers: {
+        start: async (ownerId, ownerKey, input) => {
+          calls.push({ ownerId, ownerKey, input })
+          return { transferId: 'transfer-1', hostId: 'host-1', direction: 'upload', fileName: 'test.txt', remotePath: '/test.txt', status: 'queued', transferredBytes: 0, totalBytes: 10, createdAt: 1, updatedAt: 1 }
+        },
+        list: () => [], cancel: async () => undefined,
+        closeOwner: async (ownerId, ownerKey) => { calls.push({ transferClose: ownerId, ownerKey }); await transferClose },
+      },
+      fileLeases: {
+        selectUpload: async () => null, selectDownload: async () => null,
+        release: async (ownerId, ownerKey, leaseId) => { calls.push({ ownerId, ownerKey, leaseId }) },
+        closeOwner: async (ownerId, ownerKey) => { calls.push({ leaseClose: ownerId, ownerKey }); await leaseClose },
+      },
+    })
+    const input = { hostId: 'host-1', direction: 'upload', remotePath: '/test.txt', leaseId: 'lease-1' }
+    await expect(invoke(fixture.handlers, SERVER_OPS_TRANSFER_CHANNELS.START, createSender(99), input)).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    await expect(invoke(fixture.handlers, SERVER_OPS_TRANSFER_CHANNELS.START, fixture.sender, { ...input, localPath: '/private/file' })).rejects.toThrow()
+    expect(calls).toEqual([])
+    await invoke(fixture.handlers, SERVER_OPS_TRANSFER_CHANNELS.START, fixture.sender, input)
+    expect(calls).toContainEqual({ ownerId: 70, ownerKey: 'window:70:transfers', input })
+    await invoke(fixture.handlers, SERVER_OPS_TRANSFER_CHANNELS.RELEASE_SELECTION, fixture.sender, { leaseId: 'lease-2' })
+    expect(calls).toContainEqual({ ownerId: 70, ownerKey: 'window:70:transfers', leaseId: 'lease-2' })
+    let closed = false
+    const closing = invoke(fixture.handlers, SERVER_OPS_TRANSFER_CHANNELS.CLOSE_OWNER, fixture.sender, {}).then(() => { closed = true })
+    await Promise.resolve()
+    finishTransfers()
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    finishLeases()
+    await closing
+    expect(closed).toBe(true)
+    fixture.registration.dispose()
+  })
+  test('Given 文件请求 When 非授权窗口或伪造 owner 调用 Then 拒绝且正常窗口关闭精确释放文件 owner', async () => {
+    /** 记录通过真实窗口身份调用文件服务的操作。 */
+    const calls: unknown[] = []
+    const fixture = createAgentAccessHarness({ files: {
+      list: async (ownerKey, input) => { calls.push({ ownerKey, input }); return { hostId: input.hostId, path: '/', entries: [] } },
+      preview: async () => { throw new Error('unused') },
+      prepare: async () => { throw new Error('unused') },
+      commit: async () => { throw new Error('unused') },
+      cancel: () => undefined,
+      closeOwner: (ownerId, ownerKey) => { calls.push({ closed: ownerId, ownerKey }) },
+    } })
+    await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, createSender(99), { hostId: 'host-1', path: '/' })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, fixture.sender, { hostId: 'host-1', path: '/', ownerKey: 'other' })).rejects.toThrow()
+    expect(calls).toEqual([])
+    await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, fixture.sender, { hostId: 'host-1', path: '/' })).resolves.toMatchObject({ entries: [] })
+    expect(calls).toContainEqual({ ownerKey: 'window:70:files', input: { hostId: 'host-1', path: '/' } })
+    fixture.closeOwner()
+    expect(calls).toContainEqual({ closed: 70, ownerKey: 'window:70:files' })
+    fixture.registration.dispose()
+  })
+
+  test('Given 独立容器终端 When 输入带额外命令字段或窗口关闭 Then 严格拒绝并释放该窗口终端', async () => {
+    /** 完整容器身份与主窗口调用记录。 */
+    const identity = { hostId: 'host-1', connectionId: 'connection-1', consoleId: 'console-1', containerId: 'a'.repeat(64) }
+    const calls: unknown[] = []
+    const fixture = createAgentAccessHarness({ console: {
+      start: async (ownerId) => { calls.push({ start: ownerId }); return identity },
+      close: async () => undefined,
+      write: (ownerId, input) => { calls.push({ ownerId, input }) },
+      resize: () => undefined,
+      acknowledge: () => undefined,
+      getSnapshot: () => undefined,
+      disposeOwner: (ownerId) => { calls.push({ closed: ownerId }) },
+    } })
+    await expect(invoke(fixture.handlers, SERVER_OPS_CONSOLE_IPC_CHANNELS.START, createSender(99), { hostId: 'host-1', containerId: identity.containerId, cols: 80, rows: 24 })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    await expect(invoke(fixture.handlers, SERVER_OPS_CONSOLE_IPC_CHANNELS.WRITE, fixture.sender, { ...identity, data: 'pwd\n', command: 'extra' })).rejects.toThrow()
+    expect(calls).toEqual([])
+    await expect(invoke(fixture.handlers, SERVER_OPS_CONSOLE_IPC_CHANNELS.START, fixture.sender, { hostId: 'host-1', containerId: identity.containerId, cols: 80, rows: 24 })).resolves.toEqual(identity)
+    await invoke(fixture.handlers, SERVER_OPS_CONSOLE_IPC_CHANNELS.WRITE, fixture.sender, { ...identity, data: 'pwd\n' })
+    expect(calls).toContainEqual({ ownerId: 70, input: { ...identity, data: 'pwd\n' } })
+    fixture.closeOwner()
+    expect(calls).toContainEqual({ closed: 70 })
+    fixture.registration.dispose()
+  })
+
+  test('Given Docker IPC When 访问、取消与窗口关闭 Then 校验授权、字段及可信 owner', async () => {
+    const calls: unknown[] = []
+    const fixture = createAgentAccessHarness({ docker: {
+      listResources: async (input) => { calls.push(input); return { hostId: 'host-1', capability: 'available', containers: [], images: [], networks: [], volumes: [], warnings: [] } },
+      getContainerDetail: async () => { throw new Error('unused') },
+      prepareAction: async () => { throw new Error('unused') },
+      commitAction: async () => { throw new Error('unused') },
+      cancelAction: (owner, input) => { calls.push({ owner, input }) },
+      disposeOwner: (owner) => { calls.push({ closed: owner }) },
+    } })
+    await expect(invoke(fixture.handlers, SERVER_OPS_DOCKER_CHANNELS.LIST_RESOURCES, createSender(99), { hostId: 'host-1' })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    await expect(invoke(fixture.handlers, SERVER_OPS_DOCKER_CHANNELS.LIST_RESOURCES, fixture.sender, { hostId: 'host-1', command: 'arbitrary' })).rejects.toThrow('SERVER_OPS_DOCKER_RESOURCES_INPUT_INVALID')
+    expect(calls).toEqual([])
+    await expect(invoke(fixture.handlers, SERVER_OPS_DOCKER_CHANNELS.LIST_RESOURCES, fixture.sender, { hostId: 'host-1' })).resolves.toMatchObject({ capability: 'available' })
+    await invoke(fixture.handlers, SERVER_OPS_DOCKER_CHANNELS.CANCEL_ACTION, fixture.sender, { hostId: 'host-1', candidateId: 'candidate-1' })
+    expect(calls).toContainEqual({ owner: 70, input: { hostId: 'host-1', candidateId: 'candidate-1' } })
+    fixture.closeOwner()
+    expect(calls).toContainEqual({ closed: 70 })
+    fixture.registration.dispose()
+  })
+  test('Given 信任管理请求 When 主窗口调用 Then owner 来自 Electron 且销毁后清理候选', async () => {
+    /** 信任服务公开输出及所有权调用记录。 */
+    const snapshot = { hostId: 'host-1', name: '测试', address: 'localhost', port: 22,
+      trustedKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:first' },
+      observedKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:second' }, affectedHosts: [{ id: 'host-1', name: '测试' }] }
+    const owners: number[] = []
+    const disposed: number[] = []
+    const harness = createAgentAccessHarness({ trustManagement: {
+      get: () => snapshot,
+      prepare: (owner, input) => { owners.push(owner); return { ...snapshot, action: input.action, candidateId: 'candidate-1', expiresAt: 300_000 } },
+      commit: async (owner) => { owners.push(owner); return { hostId: 'host-1', action: 'replace', affectedHostIds: ['host-1'] } },
+      cancel: (owner) => { owners.push(owner) }, disposeOwner: (owner) => { disposed.push(owner) },
+    } })
+    try {
+      await expect(invoke(harness.handlers, SERVER_OPS_TRUST_CHANNELS.PREPARE, createSender(8), { hostId: 'host-1', action: 'replace' })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(harness.handlers, SERVER_OPS_TRUST_CHANNELS.PREPARE, harness.sender, { hostId: 'host-1', action: 'replace', windowId: 9 })).rejects.toThrow()
+      expect(owners).toHaveLength(0)
+      expect(await invoke(harness.handlers, SERVER_OPS_TRUST_CHANNELS.PREPARE, harness.sender, { hostId: 'host-1', action: 'replace' })).toMatchObject({ candidateId: 'candidate-1' })
+      await invoke(harness.handlers, SERVER_OPS_TRUST_CHANNELS.COMMIT, harness.sender, { hostId: 'host-1', candidateId: 'candidate-1', confirmationName: '测试' })
+      expect(owners).toEqual([70, 70])
+      harness.closeOwner()
+      expect(disposed).toEqual([70])
+    } finally { harness.registration.dispose() }
+  })
+
   test('LIST_AUDIT 仅允许授权主窗口并把严格解析后的筛选发送给 Store', async () => {
     const harness = createAgentAccessHarness()
     await expect(invoke(harness.handlers, SERVER_OPS_IPC_CHANNELS.LIST_AUDIT, harness.sender, {
@@ -395,14 +542,17 @@ describe('服务器运维 IPC', () => {
       requireUserVisibleSession: () => createAgentSession(),
     })
 
-    expect(registration.channels).toEqual(Object.values(SERVER_OPS_IPC_CHANNELS).filter((channel) => !([
+    expect(registration.channels).toEqual([...Object.values(SERVER_OPS_IPC_CHANNELS).filter((channel) => !([
       SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE,
       SERVER_OPS_IPC_CHANNELS.TERMINAL_OUTPUT,
       SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT,
       SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED,
       SERVER_OPS_IPC_CHANNELS.LOG_OUTPUT,
       SERVER_OPS_IPC_CHANNELS.LOG_EXIT,
-    ] as readonly string[]).includes(channel)))
+    ] as readonly string[]).includes(channel)), ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
+      ...Object.values(SERVER_OPS_FILE_CHANNELS),
+      ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
+      ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS)])
     expect(await invoke(handlers, SERVER_OPS_IPC_CHANNELS.LIST_HOSTS, sender)).toEqual([createHost()])
     expect(await invoke(handlers, SERVER_OPS_IPC_CHANNELS.UPSERT_HOST, sender, {
       host: {
@@ -658,6 +808,15 @@ describe('服务器运维 IPC', () => {
     expect(fixture.domainCalls).toContain('action:restart')
   })
 
+  test('Given 非授权 BrowserWindow When 执行服务动作 Then 在领域调用前拒绝', async () => {
+    const fixture = createObservabilityHarness({ authorizeSecondWindow: false })
+    await expect(invoke(fixture.handlers, SERVER_OPS_IPC_CHANNELS.RUN_SERVICE_ACTION, fixture.senderTwo, {
+      sessionId: 'session-1', hostId: 'host-1', unitId: 'nginx.service', action: 'restart',
+    })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    expect(fixture.domainCalls).toEqual([])
+    fixture.registration.dispose()
+  })
+
   test('日志 owner 仅由 sender 窗口推导且事件只发送给所属存活窗口', async () => {
     const fixture = createObservabilityHarness()
     await expect(invoke(fixture.handlers, SERVER_OPS_IPC_CHANNELS.START_LOG_STREAM, fixture.sender, {
@@ -758,7 +917,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(22)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(50)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -777,7 +936,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(22)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(50)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)
@@ -809,7 +968,7 @@ describe('服务器运维 IPC', () => {
 })
 
 /** 创建覆盖观测、日志 owner 与导出边界的集中夹具。 */
-function createObservabilityHarness(options: { hostName?: string; startResult?: unknown; stopError?: Error } = {}) {
+function createObservabilityHarness(options: { hostName?: string; startResult?: unknown; stopError?: Error; authorizeSecondWindow?: boolean } = {}) {
   const handlers = new Map<string, TestHandler>()
   const domainCalls: string[] = []
   const logCalls: string[] = []
@@ -841,7 +1000,7 @@ function createObservabilityHarness(options: { hostName?: string; startResult?: 
       handle: (channel, handler) => { handlers.set(channel, handler) },
       removeHandler: (channel) => { cleanupCalls.push(`remove:${channel}`); handlers.delete(channel) },
     },
-    listAuthorizedWebContents: () => [sender, senderTwo],
+    listAuthorizedWebContents: () => options.authorizeSecondWindow === false ? [sender] : [sender, senderTwo],
     hosts: { list: () => [], get: () => createHost(options.hostName), upsert: () => createHost(), setCredentialRef: () => createHost(), remove: () => true },
     credentials: { remember: () => 'credential-1', forgetHost: () => undefined },
     connections: createConnections(),
@@ -872,7 +1031,7 @@ function createObservabilityHarness(options: { hostName?: string; startResult?: 
     requireUserVisibleSession: (sessionId) => { visibleSessions.push(sessionId); return createAgentSession() },
   })
   return {
-    handlers, sender, domainCalls, logCalls, cleanupCalls, eventsOne, eventsTwo, dialogCalls, writes, results, stops,
+    handlers, sender, senderTwo, domainCalls, logCalls, cleanupCalls, eventsOne, eventsTwo, dialogCalls, writes, results, stops,
     registration, visibleSessions, accessReads: () => accessReadCount,
     emitLogOutput: (event: ServerOpsLogOutputEvent) => outputListener?.(event),
     emitLogExit: (event: ServerOpsLogExitEvent) => logExitListener?.(event),

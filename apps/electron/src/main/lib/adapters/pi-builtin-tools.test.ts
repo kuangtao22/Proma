@@ -53,6 +53,31 @@ const sdk = {
 } as typeof import('@earendil-works/pi-coding-agent')
 
 describe('Pi Server Ops 工具合同', () => {
+  test('Given 文件与 Docker 服务已接通 When 构建工具 Then 只公开受限字段且内部运行不注册新能力', async () => {
+    /** 用已存在的窄 Facade 方法证明能力按真实服务注册。 */
+    const facade = {
+      filesList: async () => ({ hostId: 'host-1', path: '/', entries: [] }),
+      filesRead: async () => { throw new Error('unused') },
+      filesMutate: async () => { throw new Error('unused') },
+      dockerResources: async () => { throw new Error('unused') },
+      dockerDetail: async () => { throw new Error('unused') },
+      dockerAction: async () => { throw new Error('unused') },
+    } as unknown as ServerOpsAgentFacade
+    const tools = buildServerOpsTools(sdk, facade)
+    expect(tools.map((tool) => tool.name)).toEqual([
+      'server_list', 'server_status', 'server_connect', 'server_exec', 'server_disconnect',
+      'server_docker_resources', 'server_docker_detail', 'server_docker_action',
+      'server_files_list', 'server_files_read', 'server_files_mutate',
+    ])
+    const schemas = JSON.stringify(tools.slice(5).map((tool) => tool.parameters))
+    expect(schemas).not.toMatch(/sessionId|credentialRef|ownerKey|connectionId|candidateId|localPath/)
+    expect(schemas).toContain('editToken')
+    const internal = await buildPiBuiltinTools(sdk, {
+      sessionId: 'session-1', channelId: 'channel-1', triggeredBy: 'automation', serverOpsFacade: facade,
+      productivityTools: { todosEnabled: false, calendarEnabled: false, obsidianEnabled: false },
+    })
+    expect(internal.tools.some((tool) => tool.name.startsWith('server_'))).toBe(false)
+  })
   test('Given 已初始化 facade When 构建工具 Then 只注册五个无 sessionId/credentialRef 输入的工具', () => {
     const facade = {} as ServerOpsAgentFacade
     const tools = buildServerOpsTools(sdk, facade)

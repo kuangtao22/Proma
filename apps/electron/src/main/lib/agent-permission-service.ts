@@ -368,7 +368,7 @@ export class AgentPermissionService {
    * 判断工具是否为只读操作（智能模式下自动允许）
    */
   private isReadOnlyTool(toolName: string, input: Record<string, unknown>): boolean {
-    if (['server_list', 'server_status', 'server_connect', 'server_disconnect'].includes(toolName)) return true
+    if (['server_list', 'server_status', 'server_connect', 'server_disconnect', 'server_docker_resources', 'server_docker_detail', 'server_files_list', 'server_files_read'].includes(toolName)) return true
     if (toolName === 'server_exec') {
       return typeof input.command === 'string' && isServerOpsReadOnlyCommand(input.command)
     }
@@ -394,7 +394,7 @@ export class AgentPermissionService {
 
     // PowerShell 尚未实现命令级白名单和危险命令分类，绝不能把某次
     // 批准扩展为整个工具的会话授权。
-    if (toolName === 'PowerShell' || toolName === 'server_exec') return false
+    if (['PowerShell', 'server_exec', 'server_docker_action', 'server_files_mutate'].includes(toolName)) return false
 
     // 非 Bash 工具：检查工具名是否在白名单中
     if (toolName !== 'Bash') {
@@ -417,7 +417,7 @@ export class AgentPermissionService {
 
     if (toolName !== 'Bash') {
       // 防御性兜底：远程执行与 PowerShell 即使收到伪造 alwaysAllow 也不得进入工具级白名单。
-      if (toolName !== 'PowerShell' && toolName !== 'server_exec') whitelist.allowedTools.add(toolName)
+      if (!['PowerShell', 'server_exec', 'server_docker_action', 'server_files_mutate'].includes(toolName)) whitelist.allowedTools.add(toolName)
     } else {
       const command = typeof input.command === 'string' ? input.command : ''
       const baseCommand = this.extractBaseCommand(command)
@@ -484,7 +484,7 @@ export class AgentPermissionService {
       sdkTitle: options.title,
       sdkDescription: options.description,
       // PowerShell 目前没有 Bash 等价的命令级白名单和危险分类；每次都要求明确批准。
-      ...(['PowerShell', 'server_exec'].includes(toolName) ? { allowAlways: false } : {}),
+      ...(['PowerShell', 'server_exec', 'server_docker_action', 'server_files_mutate'].includes(toolName) ? { allowAlways: false } : {}),
     }
   }
 

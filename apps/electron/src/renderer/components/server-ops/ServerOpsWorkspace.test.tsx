@@ -477,6 +477,44 @@ describe('服务器运维右侧工作区', () => {
     expect(html).not.toContain('<option value="exec">')
   })
 
+  test('Given 信任审计包含进行中和未知结果 When 渲染 Then 显示稳定中文且不渲染缺失身份', () => {
+    const host = createHost()
+    const records: ServerOpsAuditRecord[] = [
+      {
+        id: 'audit-trust-start', operationId: 'operation-1', timestamp: Date.UTC(2026, 8, 7), windowId: 7,
+        hostId: host.id, actor: 'user', operation: 'trust-replace', resourceType: 'host-trust', phase: 'start', outcome: 'pending',
+      },
+      {
+        id: 'audit-trust-result', operationId: 'operation-2', timestamp: Date.UTC(2026, 8, 7, 0, 1), windowId: 7,
+        hostId: host.id, actor: 'user', operation: 'trust-revoke', resourceType: 'host-trust', phase: 'result', outcome: 'unknown',
+      },
+    ]
+    const html = renderToStaticMarkup(
+      <ServerOpsWorkspaceView
+        {...createCallbacks()} status="ready" hosts={[host]} selectedHost={host} activeSection="audit"
+        auditStatus="ready" auditRecords={records} auditActorFilter="user" auditOperationFilter="all"
+      />,
+    )
+
+    expect(html).toContain('替换服务器信任')
+    expect(html).toContain('撤销服务器信任')
+    expect(html).toContain('进行中')
+    expect(html).toContain('结果未知')
+    expect(html).not.toContain('undefined')
+    expect(html).toContain('<option value="trust-replace">')
+    expect(html).toContain('<option value="trust-revoke">')
+  })
+
+  test('Given 已选择服务器 When 渲染工具栏 Then 信任入口与 Agent Shield 权限入口语义分离', () => {
+    const host = createHost()
+    const html = renderToStaticMarkup(
+      <ServerOpsWorkspaceView {...createCallbacks()} status="ready" hosts={[host]} selectedHost={host} activeSection="overview" />,
+    )
+
+    expect(html).toContain('aria-label="管理服务器信任"')
+    expect(html).toContain('aria-label="允许当前 Agent 使用此服务器"')
+  })
+
   test('Given 审计 actor 筛选 When 加载当前主机服务操作 Then IPC 包含完整 actor 与 operation', async () => {
     /** 记录控制器映射出的公开 IPC 筛选。 */
     const inputs: unknown[] = []
@@ -890,7 +928,8 @@ describe('服务器运维右侧工作区', () => {
     expect(dataHtml).toContain('PostgreSQL')
     expect(dataHtml).toContain('MySQL')
     expect(dataHtml).toContain('Redis')
-    expect(dataHtml).toContain('默认只读')
+    expect(dataHtml).toContain('尚未接入')
+    expect(dataHtml).not.toContain('等待能力探测')
   })
 
   test('Given 已选择服务器 When 在概览与服务页切换 Then 服务面板保持同一实例且仅切换 active', () => {

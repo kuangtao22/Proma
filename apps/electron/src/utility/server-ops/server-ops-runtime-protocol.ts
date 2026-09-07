@@ -1,5 +1,11 @@
 import { Buffer } from 'node:buffer'
+import { parseServerOpsSftpRequest, parseServerOpsSftpResult } from './server-ops-sftp-runtime'
+import type { ServerOpsSftpRequest, ServerOpsSftpResult } from './server-ops-sftp-runtime'
 import type { ServerOpsHostKey, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck, ServerOpsTerminalOutputEvent } from '@proma/shared'
+import { parseServerOpsConsoleAck, parseServerOpsConsoleExitEvent, parseServerOpsConsoleIdentity,
+  parseServerOpsConsoleInput, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleResizeInput } from '@proma/shared'
+import type { ServerOpsConsoleIdentity } from '@proma/shared'
+import type { ServerOpsConsoleRuntimeStart } from './server-ops-console-runtime'
 
 /** utility process 接收的 SSH 认证材料。 */
 export type ServerOpsRuntimeAuthentication =
@@ -51,12 +57,18 @@ export type ServerOpsRuntimeConnectResult =
 
 /** 主进程发往 SSH runtime 的内部消息。 */
 export type ServerOpsRuntimeRequest =
+  | { type: 'server-ops.sftp'; input: ServerOpsSftpRequest }
   | { type: 'server-ops.connect'; input: ServerOpsRuntimeConnectRequest }
   | { type: 'server-ops.exec'; input: ServerOpsRuntimeExecRequest }
   | { type: 'server-ops.disconnect'; hostId: string; connectionId: string }
   | { type: 'server-ops.terminal-input'; hostId: string; connectionId: string; data: string }
   | { type: 'server-ops.terminal-resize'; hostId: string; connectionId: string; cols: number; rows: number }
   | { type: 'server-ops.terminal-ack'; input: ServerOpsTerminalOutputAck }
+  | { type: 'server-ops.console-start'; input: ServerOpsConsoleRuntimeStart }
+  | { type: 'server-ops.console-stop'; input: ServerOpsConsoleIdentity }
+  | { type: 'server-ops.console-input'; input: import('@proma/shared').ServerOpsConsoleInput }
+  | { type: 'server-ops.console-resize'; input: import('@proma/shared').ServerOpsConsoleResizeInput }
+  | { type: 'server-ops.console-ack'; input: import('@proma/shared').ServerOpsConsoleAck }
   | { type: 'server-ops.log-start'; input: ServerOpsRuntimeLogStartRequest }
   | { type: 'server-ops.log-stop'; streamId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.log-ack'; streamId: string; hostId: string; connectionId: string; sequence: number }
@@ -64,12 +76,16 @@ export type ServerOpsRuntimeRequest =
 
 /** SSH runtime 发回主进程的内部消息。 */
 export type ServerOpsRuntimeMessage =
+  | { type: 'server-ops.sftp-result'; hostId: string; connectionId: string; result: ServerOpsSftpResult }
   | { type: 'server-ops.ready'; pid: number }
   | { type: 'server-ops.connect-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeConnectResult }
   | { type: 'server-ops.exec-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeExecResult }
   | { type: 'server-ops.error'; requestId?: string; hostId: string; connectionId: string; code: string; message: string }
   | { type: 'server-ops.terminal-output'; event: ServerOpsTerminalOutputEvent }
   | { type: 'server-ops.terminal-exit'; event: ServerOpsTerminalExitEvent }
+  | { type: 'server-ops.console-started'; session: ServerOpsConsoleIdentity }
+  | { type: 'server-ops.console-output'; event: import('@proma/shared').ServerOpsConsoleOutputEvent }
+  | { type: 'server-ops.console-exit'; event: import('@proma/shared').ServerOpsConsoleExitEvent }
   | { type: 'server-ops.log-started'; streamId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.log-chunk'; streamId: string; hostId: string; connectionId: string; sequence: number; data: string }
   | { type: 'server-ops.log-exit'; streamId: string; hostId: string; connectionId: string; reason: ServerOpsRuntimeLogExitReason; errorCode?: string }
@@ -226,6 +242,9 @@ function isLogSequence(value: unknown): value is number {
 export function parseServerOpsRuntimeRequest(value: unknown): ServerOpsRuntimeRequest {
   try {
     if (!isRecord(value) || typeof value.type !== 'string') throw new Error('invalid')
+    if (value.type === 'server-ops.sftp' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseServerOpsSftpRequest(value.input) }
+    }
     if (value.type === 'server-ops.connect' && hasExactKeys(value, ['type', 'input'])) {
       return { type: value.type, input: parseConnectRequest(value.input) }
     }
@@ -250,6 +269,25 @@ export function parseServerOpsRuntimeRequest(value: unknown): ServerOpsRuntimeRe
       && isRuntimeId(value.input.hostId) && isRuntimeId(value.input.connectionId)
       && typeof value.input.sequence === 'number' && Number.isSafeInteger(value.input.sequence) && value.input.sequence >= 1) {
       return { type: value.type, input: { hostId: value.input.hostId, connectionId: value.input.connectionId, sequence: value.input.sequence } }
+    }
+    if (value.type === 'server-ops.console-start' && hasExactKeys(value, ['type', 'input'])
+      && hasExactKeys(value.input, ['consoleId', 'hostId', 'connectionId', 'containerId', 'cols', 'rows'])
+      && isTerminalDimension(value.input.cols) && isTerminalDimension(value.input.rows)) {
+      return { type: value.type, input: { ...parseServerOpsConsoleIdentity({ consoleId: value.input.consoleId,
+        hostId: value.input.hostId, connectionId: value.input.connectionId, containerId: value.input.containerId }),
+        cols: value.input.cols, rows: value.input.rows } }
+    }
+    if (value.type === 'server-ops.console-stop' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseServerOpsConsoleIdentity(value.input) }
+    }
+    if (value.type === 'server-ops.console-input' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseServerOpsConsoleInput(value.input) }
+    }
+    if (value.type === 'server-ops.console-resize' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseServerOpsConsoleResizeInput(value.input) }
+    }
+    if (value.type === 'server-ops.console-ack' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseServerOpsConsoleAck(value.input) }
     }
     if (value.type === 'server-ops.log-start' && hasExactKeys(value, ['type', 'input'])) {
       return { type: value.type, input: parseLogStartRequest(value.input) }
@@ -332,6 +370,10 @@ function parseTerminalExitEvent(value: unknown): ServerOpsTerminalExitEvent {
 export function parseServerOpsRuntimeMessage(value: unknown): ServerOpsRuntimeMessage {
   try {
     if (!isRecord(value) || typeof value.type !== 'string') throw new Error('invalid')
+    if (value.type === 'server-ops.sftp-result' && hasExactKeys(value, ['type', 'hostId', 'connectionId', 'result'])
+      && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
+      return { type: value.type, hostId: value.hostId, connectionId: value.connectionId, result: parseServerOpsSftpResult(value.result) }
+    }
     if (value.type === 'server-ops.ready' && hasExactKeys(value, ['type', 'pid'])
       && typeof value.pid === 'number' && Number.isSafeInteger(value.pid) && value.pid >= 1 && value.pid <= 2_147_483_647) {
       return { type: value.type, pid: value.pid }
@@ -361,6 +403,15 @@ export function parseServerOpsRuntimeMessage(value: unknown): ServerOpsRuntimeMe
     }
     if (value.type === 'server-ops.terminal-exit' && hasExactKeys(value, ['type', 'event'])) {
       return { type: value.type, event: parseTerminalExitEvent(value.event) }
+    }
+    if (value.type === 'server-ops.console-started' && hasExactKeys(value, ['type', 'session'])) {
+      return { type: value.type, session: parseServerOpsConsoleIdentity(value.session) }
+    }
+    if (value.type === 'server-ops.console-output' && hasExactKeys(value, ['type', 'event'])) {
+      return { type: value.type, event: parseServerOpsConsoleOutputEvent(value.event) }
+    }
+    if (value.type === 'server-ops.console-exit' && hasExactKeys(value, ['type', 'event'])) {
+      return { type: value.type, event: parseServerOpsConsoleExitEvent(value.event) }
     }
     if (value.type === 'server-ops.log-started'
       && hasExactKeys(value, ['type', 'streamId', 'hostId', 'connectionId'])

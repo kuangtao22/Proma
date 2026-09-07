@@ -1,4 +1,51 @@
 import {
+  SERVER_OPS_TRANSFER_CHANNELS,
+  parseServerOpsLocalFileSelection,
+  parseServerOpsTransferUploadSelectionInput,
+  parseServerOpsTransferDownloadSelectionInput,
+  parseServerOpsTransferReleaseSelectionInput,
+  parseServerOpsTransferStartInput,
+  parseServerOpsTransferListInput,
+  parseServerOpsTransferCancelInput,
+  parseServerOpsTransferOwnerInput,
+  parseServerOpsTransferSnapshot,
+  parseServerOpsTransferSnapshots,
+  SERVER_OPS_FILE_CHANNELS,
+  parseServerOpsFileListInput,
+  parseServerOpsFileListResult,
+  parseServerOpsFilePreviewInput,
+  parseServerOpsFilePreviewResult,
+  parseServerOpsFileMutationInput,
+  parseServerOpsFileCandidate,
+  parseServerOpsFileCommitInput,
+  parseServerOpsFileMutationResult,
+  parseServerOpsFileCancelInput,
+  parseServerOpsFileOwnerInput,
+  SERVER_OPS_CONSOLE_IPC_CHANNELS,
+  parseServerOpsConsoleStartInput,
+  parseServerOpsConsoleIdentity,
+  parseServerOpsConsoleInput,
+  parseServerOpsConsoleResizeInput,
+  parseServerOpsConsoleAck,
+  parseServerOpsConsoleOutputEvent,
+  SERVER_OPS_DOCKER_CHANNELS,
+  parseServerOpsDockerResourcesInput,
+  parseServerOpsDockerResourcesResult,
+  parseServerOpsDockerContainerDetailInput,
+  parseServerOpsDockerContainerDetailResult,
+  parseServerOpsDockerActionPrepareInput,
+  parseServerOpsDockerActionCandidate,
+  parseServerOpsDockerActionCommitInput,
+  parseServerOpsDockerActionResult,
+  parseServerOpsDockerActionCancelInput,
+  SERVER_OPS_TRUST_CHANNELS,
+  parseServerOpsTrustInput,
+  parseServerOpsTrustPrepareInput,
+  parseServerOpsTrustCommitInput,
+  parseServerOpsTrustCancelInput,
+  parseServerOpsTrustSnapshot,
+  parseServerOpsTrustCandidate,
+  parseServerOpsTrustResult,
   SERVER_OPS_IPC_CHANNELS,
   isServerOpsId,
   parseServerOpsConnectInput,
@@ -62,6 +109,12 @@ import type {
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { requireOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import type { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
+import type { ServerOpsTrustService } from './server-ops-trust-service'
+import type { ServerOpsDockerService } from './server-ops-docker-service'
+import type { ServerOpsFileService } from './server-ops-file-service'
+import type { ServerOpsDockerConsoleService } from './server-ops-docker-console-service'
+import type { ServerOpsFileTransferService } from './server-ops-file-transfer-service'
+import type { ServerOpsLocalFileLeaseRegistry } from './server-ops-local-file-leases'
 
 /** 运维 IPC handler 的最小签名。 */
 type ServerOpsIpcHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -113,7 +166,7 @@ export interface ServerOpsOverviewContract {
 export interface ServerOpsSystemdContract {
   listServices(input: ServerOpsServiceListInput): Promise<ServerOpsServiceListResult | unknown>
   getServiceDetail(input: ServerOpsServiceDetailInput): Promise<ServerOpsServiceDetailResult | unknown>
-  runAction(input: ServerOpsServiceActionInput): Promise<ServerOpsServiceActionResult | unknown>
+  runAction(input: ServerOpsServiceActionInput, windowId: number): Promise<ServerOpsServiceActionResult | unknown>
 }
 
 /** IPC 可见的日志服务窄接口。 */
@@ -155,6 +208,12 @@ export interface ServerOpsIpcOptions {
   overview?: ServerOpsOverviewContract
   systemd?: ServerOpsSystemdContract
   logs?: ServerOpsLogContract
+  trustManagement?: Pick<ServerOpsTrustService, 'get' | 'prepare' | 'commit' | 'cancel' | 'disposeOwner'>
+  docker?: Pick<ServerOpsDockerService, 'listResources' | 'getContainerDetail' | 'prepareAction' | 'commitAction' | 'cancelAction' | 'disposeOwner'>
+  files?: Pick<ServerOpsFileService, 'list' | 'preview' | 'prepare' | 'commit' | 'cancel' | 'closeOwner'>
+  console?: Pick<ServerOpsDockerConsoleService, 'start' | 'close' | 'write' | 'resize' | 'acknowledge' | 'getSnapshot' | 'disposeOwner'>
+  transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
+  fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
   resolveOwnerWindow?: (sender: WebContents) => ServerOpsOwnerWindow | null
   showLogSaveDialog?: (window: ServerOpsOwnerWindow, options: ServerOpsLogSaveDialogOptions) => Promise<{ canceled: boolean; filePath?: string }>
   writeTextFileAtomic?: (filePath: string, content: string) => unknown
@@ -166,6 +225,7 @@ export interface ServerOpsIpcOptions {
 export interface ServerOpsIpcRegistration {
   channels: string[]
   revokeSession: (sessionId: string) => void
+  revokeHost: (hostId: string) => void
   dispose: () => void
 }
 
@@ -253,6 +313,11 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.STOP_LOG_STREAM,
     SERVER_OPS_IPC_CHANNELS.ACK_LOG_OUTPUT,
     SERVER_OPS_IPC_CHANNELS.EXPORT_LOG,
+    ...Object.values(SERVER_OPS_TRUST_CHANNELS),
+    ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
+    ...Object.values(SERVER_OPS_FILE_CHANNELS),
+    ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
+    ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS),
   ]
 
   /** 当前注册器已见过的窗口 owner。 */
@@ -297,6 +362,11 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
       const listener = (): void => {
         closedListeners.delete(ownerKey)
         try { options.logs?.disposeOwner(ownerKey) } catch { /* 窗口终态清理不能反向击穿 Electron。 */ }
+        try { options.trustManagement?.disposeOwner(window.id) } catch { /* 独立清理未提交的信任候选。 */ }
+        try { options.docker?.disposeOwner(window.id) } catch { /* 独立清理未提交的容器候选。 */ }
+        try { options.files?.closeOwner(window.id, `${ownerKey}:files`) } catch { /* 文件 owner 与日志、传输独立。 */ }
+        try { options.console?.disposeOwner(window.id) } catch { /* 容器终端不能遗留后台 channel。 */ }
+        void closeTransferOwner(window.id, ownerKey).catch(() => undefined)
         owners.delete(ownerKey)
         for (const [streamId, routedOwner] of ownersByStream) {
           if (routedOwner === ownerKey) ownersByStream.delete(streamId)
@@ -312,6 +382,201 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   installHandler(SERVER_OPS_IPC_CHANNELS.LIST_HOSTS, (event) => {
     assertAuthorizedSender(event, options)
     return options.hosts.list()
+  })
+  installHandler(SERVER_OPS_TRUST_CHANNELS.GET, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTrustInput(input)
+    requireOwner(event)
+    if (!options.trustManagement) throw new Error('SERVER_OPS_TRUST_UNAVAILABLE')
+    return parseServerOpsTrustSnapshot(options.trustManagement.get(parsed))
+  })
+  installHandler(SERVER_OPS_TRUST_CHANNELS.PREPARE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTrustPrepareInput(input)
+    const { window } = requireOwner(event)
+    if (!options.trustManagement) throw new Error('SERVER_OPS_TRUST_UNAVAILABLE')
+    return parseServerOpsTrustCandidate(options.trustManagement.prepare(window.id, parsed))
+  })
+  installHandler(SERVER_OPS_TRUST_CHANNELS.COMMIT, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTrustCommitInput(input)
+    const { window } = requireOwner(event)
+    if (!options.trustManagement) throw new Error('SERVER_OPS_TRUST_UNAVAILABLE')
+    return parseServerOpsTrustResult(await options.trustManagement.commit(window.id, parsed))
+  })
+  installHandler(SERVER_OPS_TRUST_CHANNELS.CANCEL, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTrustCancelInput(input)
+    const { window } = requireOwner(event)
+    if (!options.trustManagement) throw new Error('SERVER_OPS_TRUST_UNAVAILABLE')
+    options.trustManagement.cancel(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_DOCKER_CHANNELS.LIST_RESOURCES, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDockerResourcesInput(input)
+    if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
+    return parseServerOpsDockerResourcesResult(await options.docker.listResources(parsed))
+  })
+  installHandler(SERVER_OPS_DOCKER_CHANNELS.GET_CONTAINER_DETAIL, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDockerContainerDetailInput(input)
+    if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
+    return parseServerOpsDockerContainerDetailResult(await options.docker.getContainerDetail(parsed))
+  })
+  installHandler(SERVER_OPS_DOCKER_CHANNELS.PREPARE_ACTION, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDockerActionPrepareInput(input)
+    const { window } = requireOwner(event)
+    if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
+    return parseServerOpsDockerActionCandidate(await options.docker.prepareAction(window.id, parsed))
+  })
+  installHandler(SERVER_OPS_DOCKER_CHANNELS.COMMIT_ACTION, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDockerActionCommitInput(input)
+    const { window } = requireOwner(event)
+    if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
+    return parseServerOpsDockerActionResult(await options.docker.commitAction(window.id, parsed))
+  })
+  installHandler(SERVER_OPS_DOCKER_CHANNELS.CANCEL_ACTION, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDockerActionCancelInput(input)
+    const { window } = requireOwner(event)
+    if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
+    options.docker.cancelAction(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.LIST, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsFileListInput(input)
+    const { ownerKey } = requireOwner(event)
+    if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
+    return parseServerOpsFileListResult(await options.files.list(`${ownerKey}:files`, parsed))
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.PREVIEW, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsFilePreviewInput(input)
+    const { ownerKey } = requireOwner(event)
+    if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
+    return parseServerOpsFilePreviewResult(await options.files.preview(`${ownerKey}:files`, parsed))
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.PREPARE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsFileMutationInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
+    return parseServerOpsFileCandidate(await options.files.prepare(window.id, `${ownerKey}:files`, parsed))
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.COMMIT, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsFileCommitInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
+    return parseServerOpsFileMutationResult(await options.files.commit(window.id, `${ownerKey}:files`, parsed))
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.CANCEL, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsFileCancelInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
+    options.files.cancel(window.id, `${ownerKey}:files`, parsed)
+  })
+  installHandler(SERVER_OPS_FILE_CHANNELS.CLOSE_OWNER, (event, input) => {
+    assertAuthorizedSender(event, options)
+    parseServerOpsFileOwnerInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    options.files?.closeOwner(window.id, `${ownerKey}:files`)
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.START, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleStartInput(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    return parseServerOpsConsoleIdentity(await options.console.start(window.id, parsed))
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.CLOSE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleIdentity(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    await options.console.close(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.WRITE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleInput(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    options.console.write(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.RESIZE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleResizeInput(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    options.console.resize(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.ACK_OUTPUT, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleAck(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    options.console.acknowledge(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.SNAPSHOT, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConsoleIdentity(input)
+    const { window } = requireOwner(event)
+    if (!options.console) throw new Error('SERVER_OPS_CONSOLE_UNAVAILABLE')
+    const snapshot = options.console.getSnapshot(window.id, parsed)
+    return snapshot === undefined ? undefined : parseServerOpsConsoleOutputEvent(snapshot)
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.SELECT_UPLOAD, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferUploadSelectionInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (options.connections.getState(parsed.hostId).phase !== 'connected') throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    if (!options.fileLeases) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    return parseServerOpsLocalFileSelection(await options.fileLeases.selectUpload(window.id, `${ownerKey}:transfers`))
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.SELECT_DOWNLOAD, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferDownloadSelectionInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (options.connections.getState(parsed.hostId).phase !== 'connected') throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
+    if (!options.fileLeases) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    return parseServerOpsLocalFileSelection(await options.fileLeases.selectDownload(window.id, `${ownerKey}:transfers`, parsed.fileName))
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.START, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferStartInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.transfers) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    return parseServerOpsTransferSnapshot(await options.transfers.start(window.id, `${ownerKey}:transfers`, parsed))
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.RELEASE_SELECTION, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferReleaseSelectionInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.fileLeases) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    await options.fileLeases.release(window.id, `${ownerKey}:transfers`, parsed.leaseId)
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.LIST, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferListInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.transfers) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    return parseServerOpsTransferSnapshots(options.transfers.list(window.id, `${ownerKey}:transfers`, parsed))
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.CANCEL, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTransferCancelInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    if (!options.transfers) throw new Error('SERVER_OPS_TRANSFER_UNAVAILABLE')
+    await options.transfers.cancel(window.id, `${ownerKey}:transfers`, parsed)
+  })
+  installHandler(SERVER_OPS_TRANSFER_CHANNELS.CLOSE_OWNER, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    parseServerOpsTransferOwnerInput(input)
+    const { ownerKey, window } = requireOwner(event)
+    await closeTransferOwner(window.id, ownerKey)
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.LIST_AUDIT, (event, input) => {
     assertAuthorizedSender(event, options)
@@ -432,11 +697,12 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.RUN_SERVICE_ACTION, async (event, input) => {
     assertAuthorizedSender(event, options)
+    const owner = requireOwner(event)
     /** 动作必须在领域调用前再次重建 DTO 并证明审计会话是普通可见顶层 Agent。 */
     const parsed = parseServerOpsServiceActionInput(input)
     if (!options.systemd) throw new Error('SERVER_OPS_SYSTEMD_UNAVAILABLE')
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(parsed.sessionId))
-    return parseServerOpsServiceActionResult(await options.systemd.runAction(parseServerOpsServiceActionInput(parsed)))
+    return parseServerOpsServiceActionResult(await options.systemd.runAction(parseServerOpsServiceActionInput(parsed), owner.window.id))
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.START_LOG_STREAM, async (event, input) => {
     assertAuthorizedSender(event, options)
@@ -537,7 +803,10 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     } satisfies ServerOpsAgentAccessChanged)
   }
   /** 逐项安装 runtime 与日志订阅，使中途失败可精确逆序回滚。 */
-  installSubscription(() => options.connections.onState((state) => broadcast(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, state)))
+  installSubscription(() => options.connections.onState((state) => {
+    if (state.phase === 'disconnected' || state.phase === 'blocked' || state.phase === 'error') revokeHostAccess(state.hostId)
+    broadcast(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, state)
+  }))
   installSubscription(() => options.connections.onOutput((output) => broadcast(SERVER_OPS_IPC_CHANNELS.TERMINAL_OUTPUT, output)))
   installSubscription(() => options.connections.onExit((exit) => {
       /** 非预期远端断线和 runtime 退出都必须收口该主机的 Agent 授权。 */
@@ -575,6 +844,16 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     else window.off?.('closed', listener)
   }
 
+  /** 释放窗口的传输与未领取本地 fd；两类资源均必须尝试清理。 */
+  async function closeTransferOwner(ownerId: number, ownerKey: string): Promise<void> {
+    const results = await Promise.allSettled([
+      options.transfers?.closeOwner(ownerId, `${ownerKey}:transfers`),
+      options.fileLeases?.closeOwner(ownerId, `${ownerKey}:transfers`),
+    ])
+    const failed = results.find((result) => result.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
+  }
+
   /** 注册失败时逆序、best-effort 回滚所有已安装资源。 */
   function rollbackRegistration(): void {
     for (const unsubscribe of [...subscriptions].reverse()) {
@@ -583,6 +862,11 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     subscriptions.length = 0
     for (const { window, listener } of [...closedListeners.values()].reverse()) {
       try { removeClosedListener(window, listener) } catch { /* 继续回滚其它 listener。 */ }
+      try { options.trustManagement?.disposeOwner(window.id) } catch { /* 候选清理不阻断回滚。 */ }
+      try { options.docker?.disposeOwner(window.id) } catch { /* 容器候选清理不阻断回滚。 */ }
+      try { options.files?.closeOwner(window.id, `window:${window.id}:files`) } catch { /* 继续回滚其它 owner。 */ }
+      try { options.console?.disposeOwner(window.id) } catch { /* 继续回滚其它 owner。 */ }
+      void closeTransferOwner(window.id, `window:${window.id}`).catch(() => undefined)
     }
     closedListeners.clear()
     for (const ownerKey of [...owners.keys()].reverse()) {
@@ -601,6 +885,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   return {
     channels,
     revokeSession,
+    revokeHost: revokeHostAccess,
     dispose: () => {
       if (disposed) return
       disposed = true
@@ -612,6 +897,11 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
       subscriptions.length = 0
       for (const { window, listener } of closedListeners.values()) {
         try { removeClosedListener(window, listener) } catch (error) { firstError ??= error }
+        try { options.trustManagement?.disposeOwner(window.id) } catch (error) { firstError ??= error }
+        try { options.docker?.disposeOwner(window.id) } catch (error) { firstError ??= error }
+        try { options.files?.closeOwner(window.id, `window:${window.id}:files`) } catch (error) { firstError ??= error }
+        try { options.console?.disposeOwner(window.id) } catch (error) { firstError ??= error }
+        void closeTransferOwner(window.id, `window:${window.id}`).catch(() => undefined)
       }
       closedListeners.clear()
       for (const ownerKey of owners.keys()) {

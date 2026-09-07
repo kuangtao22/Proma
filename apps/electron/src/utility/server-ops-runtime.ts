@@ -1,5 +1,9 @@
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2'
+import { ServerOpsSftpRuntime, ServerOpsSftpRuntimeError } from './server-ops/server-ops-sftp-runtime'
+import type { ServerOpsSftpRequest } from './server-ops/server-ops-sftp-runtime'
 import type { ServerOpsTerminalExitEvent } from '@proma/shared'
+import { ServerOpsConsoleRuntimeController } from './server-ops/server-ops-console-runtime'
+import type { ServerOpsConsoleRuntimeChannel } from './server-ops/server-ops-console-runtime'
 import {
   acknowledgeRuntimeOutput,
   createHostKeyFingerprint,
@@ -47,6 +51,10 @@ interface ManagedSshConnection {
   execChannels: Set<ClientChannel>
   logStreams: Map<string, ManagedLogStream>
   logController: RuntimeLogStreamController
+  /** Docker Console 使用独立 exec PTY，不与主机终端 channel 混用。 */
+  consoleController: ServerOpsConsoleRuntimeController<ReturnType<typeof setTimeout>>
+  /** 懒建立 SFTP channel，随 SSH 连接统一释放。 */
+  sftp: ServerOpsSftpRuntime
 }
 
 /** runtime 使用 Node timer 的单条日志流状态。 */
@@ -104,6 +112,9 @@ function handleRequest(raw: unknown): void {
     case 'server-ops.exec':
       exec(request.input)
       return
+    case 'server-ops.sftp':
+      void dispatchSftp(request.input)
+      return
     case 'server-ops.disconnect':
       disconnect(request.connectionId, '用户已断开连接')
       return
@@ -127,6 +138,27 @@ function handleRequest(raw: unknown): void {
       emitExitWhenDrained(connection)
       return
     }
+    case 'server-ops.console-start': {
+      const connection = connections.get(request.input.connectionId)
+      if (!connection || connection.hostId !== request.input.hostId) {
+        post({ type: 'server-ops.console-exit', event: { ...request.input, message: 'SSH 连接未激活' } })
+        return
+      }
+      connection.consoleController.start(request.input)
+      return
+    }
+    case 'server-ops.console-stop':
+      connections.get(request.input.connectionId)?.consoleController.stop(request.input)
+      return
+    case 'server-ops.console-input':
+      connections.get(request.input.connectionId)?.consoleController.write(request.input)
+      return
+    case 'server-ops.console-resize':
+      connections.get(request.input.connectionId)?.consoleController.resize(request.input)
+      return
+    case 'server-ops.console-ack':
+      connections.get(request.input.connectionId)?.consoleController.acknowledge(request.input)
+      return
     case 'server-ops.log-start':
       {
         /** 日志启动必须匹配当前连接的完整身份。 */
@@ -154,6 +186,27 @@ function handleRequest(raw: unknown): void {
       for (const connectionId of [...connections.keys()]) disconnect(connectionId, '应用正在退出')
       for (const connectionId of [...pendingClients.keys()]) disconnect(connectionId, '应用正在退出', false)
       post({ type: 'server-ops.stopped' })
+  }
+}
+
+/** 将 SFTP 分派到精确的已认证连接；迟到结果不回流到新连接。 */
+async function dispatchSftp(request: ServerOpsSftpRequest): Promise<void> {
+  const connection = connections.get(request.connectionId)
+  if (!connection || connection.hostId !== request.hostId || connection.exitEvent) {
+    post({ type: 'server-ops.sftp-result', hostId: request.hostId, connectionId: request.connectionId, result: { type: 'error', requestId: request.requestId, code: 'SERVER_OPS_CONNECTION_NOT_ACTIVE', outcome: 'not-committed' } })
+    return
+  }
+  try {
+    const result = await connection.sftp.dispatch(request)
+    if (connections.get(request.connectionId) === connection && !connection.exitEvent) post({ type: 'server-ops.sftp-result', hostId: request.hostId, connectionId: request.connectionId, result })
+  } catch (error) {
+    if (connections.get(request.connectionId) !== connection || connection.exitEvent) return
+    const readOnly = ['list', 'preview', 'stat', 'open-read', 'read', 'close', 'cancel', 'close-owner'].includes(request.type)
+    post({ type: 'server-ops.sftp-result', hostId: request.hostId, connectionId: request.connectionId, result: {
+      type: 'error', requestId: request.requestId,
+      code: error instanceof ServerOpsSftpRuntimeError ? error.code : 'SERVER_OPS_SFTP_FAILED',
+      outcome: error instanceof ServerOpsSftpRuntimeError ? error.outcome : readOnly ? 'not-committed' : 'unknown',
+    } })
   }
 }
 
@@ -209,6 +262,18 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
         setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimer: (timer) => clearTimeout(timer),
       })
+      /** 每个 SSH 连接拥有独立 Console 控制器与 channel 集合。 */
+      const consoleController = new ServerOpsConsoleRuntimeController<ReturnType<typeof setTimeout>>({
+        execute: (command, options, callback) => {
+          client.exec(command, { pty: options.pty }, (execError, consoleChannel) => {
+            if (execError) { callback(execError); return }
+            callback(undefined, createRuntimeConsoleChannel(consoleChannel))
+          })
+        },
+        post,
+        setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+        clearTimer: (timer) => clearTimeout(timer),
+      })
       /** 已完成认证且成功打开 PTY 的连接。 */
       const managed: ManagedSshConnection = {
         hostId: input.hostId,
@@ -219,6 +284,8 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
         execChannels: new Set(),
         logStreams,
         logController,
+        consoleController,
+        sftp: new ServerOpsSftpRuntime({ hostId: input.hostId, connectionId: input.connectionId, client }),
       }
       connections.set(input.connectionId, managed)
       pendingClients.delete(input.connectionId)
@@ -349,6 +416,19 @@ function createRuntimeLogChannel(channel: ClientChannel): RuntimeLogChannel {
   }
 }
 
+/** 把 ssh2 exec PTY channel 适配为 Docker Console 的窄接口。 */
+function createRuntimeConsoleChannel(channel: ClientChannel): ServerOpsConsoleRuntimeChannel {
+  return {
+    write: (data) => { channel.write(data) },
+    setWindow: (rows, cols, height, width) => { channel.setWindow(rows, cols, height, width) },
+    onData: (listener) => { channel.on('data', listener) },
+    onStderrData: (listener) => { channel.stderr.on('data', listener) },
+    onceExit: (listener) => { channel.once('exit', listener) },
+    onceClose: (listener) => { channel.once('close', listener) },
+    close: () => { channel.close() },
+  }
+}
+
 /** 构造 ssh2 配置，秘密不进入 argv、环境变量或日志。 */
 function createConnectConfig(input: ServerOpsRuntimeConnectRequest, hostVerifier: (key: Buffer) => boolean): ConnectConfig {
   /** 所有认证方式共享的连接安全选项。 */
@@ -405,7 +485,9 @@ function emitExitWhenDrained(connection: ManagedSshConnection): void {
 /** 收束已关闭 channel 的输出、连接和退出事件。 */
 function closeManagedConnection(connection: ManagedSshConnection, message: string): void {
   if (connections.get(connection.connectionId) !== connection) return
+  connection.sftp.dispose()
   connection.logController.finishAll('connection-closed')
+  connection.consoleController.dispose(message)
   for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
   connection.execChannels.clear()
   flushOutput(connection)
@@ -428,8 +510,10 @@ function disconnect(connectionId: string, message: string, notify = true): void 
     return
   }
   connections.delete(connectionId)
+  connection.sftp.dispose()
   if (connection.flushTimer) clearTimeout(connection.flushTimer)
   connection.logController.finishAll('connection-closed')
+  connection.consoleController.dispose(message)
   try { connection.channel.close() } catch { /* channel 已关闭时可幂等收束。 */ }
   for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
   connection.execChannels.clear()
