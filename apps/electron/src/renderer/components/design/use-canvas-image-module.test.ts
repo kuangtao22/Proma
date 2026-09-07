@@ -385,6 +385,58 @@ describe('Canvas 生图模块 controller', () => {
     expect(fixture.state(moduleTarget).draft).toMatchObject({ prompt: '服务端规范提示词', dirty: false })
   })
 
+  test('Given 权威配置选择公共工作流 When 编辑并保存 Then 深拷贝完整输入且保持 profile 为空', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('workflow-save')
+    /** 权威公共工作流输入同时覆盖标量与素材引用。 */
+    const mediaWorkflow: NonNullable<CanvasImageModuleConfig['mediaWorkflow']> = {
+      workflowId: 'workflow-1',
+      workflowRevision: 2,
+      connectionId: 'connection-1',
+      inputs: {
+        promptText: { kind: 'scalar', value: '权威提示' },
+        reference: {
+          kind: 'asset',
+          asset: { assetId: 'asset-1', revision: 3, hash: 'a'.repeat(64), mediaKind: 'image' },
+        },
+      },
+    }
+    const authoritative = snapshot(moduleTarget, 7)
+    authoritative.config.mediaWorkflow = mediaWorkflow
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(authoritative)
+    await flush()
+
+    expect(fixture.state(moduleTarget).draft?.mediaWorkflow).toEqual(mediaWorkflow)
+    expect(fixture.state(moduleTarget).draft?.mediaWorkflow).not.toBe(mediaWorkflow)
+
+    /** 本地编辑对象用于验证提交请求不会共享后续可变引用。 */
+    const edited = structuredClone(mediaWorkflow)
+    edited.inputs.promptText = { kind: 'scalar', value: '本地提示' }
+    controller.updateDraft({ mediaWorkflow: edited, selectedModelProfileId: null })
+    const pendingCommit = controller.commitDraft()
+
+    expect(fixture.saveCalls[0]).toMatchObject({
+      expectedConfigRevision: 7,
+      selectedModelProfileId: null,
+      mediaWorkflow: edited,
+    })
+    expect(fixture.saveCalls[0]?.mediaWorkflow).not.toBe(edited)
+    expect(fixture.saveCalls[0]?.mediaWorkflow?.inputs.promptText).toEqual({ kind: 'scalar', value: '本地提示' })
+
+    const saved = config(moduleTarget, 8)
+    saved.mediaWorkflow = structuredClone(fixture.saveCalls[0]!.mediaWorkflow!)
+    fixture.saveQueue[0]?.resolve(saved)
+    await pendingCommit
+
+    expect(fixture.state(moduleTarget).draft).toMatchObject({
+      selectedModelProfileId: null,
+      mediaWorkflow: saved.mediaWorkflow,
+      dirty: false,
+    })
+  })
+
   test('Given dirty 草稿 When revision conflict Then 保留本地草稿和错误且不写入新目标', async () => {
     const fixture = createFixture()
     const targetA = target('conflict-a')

@@ -161,6 +161,23 @@ describe('CanvasTaskOperationService', () => {
     expect(fixture.traceReadCount).toBe(0)
   })
 
+  test('Given ComfyUI 图片任务 When 读取详情 Then 仅公开模型名称、标识和执行器', async () => {
+    const fixture = createFixture([createJob({
+      imageModelSnapshot: {
+        profileId: 'media:preset-1:1', name: 'Comfy 海报', modelId: 'workflow-1@1', executor: 'comfyui',
+        mediaProfileId: 'preset-1', mediaProfileRevision: 1, connectionId: 'connection-1',
+        workflowId: 'workflow-1', workflowRevision: 1, workflowHash: 'a'.repeat(64),
+      },
+    })])
+
+    const details = await fixture.service.getTaskLocked(reference)
+
+    expect(details.model).toEqual({ name: 'Comfy 海报', modelId: 'workflow-1@1', executor: 'comfyui' })
+    expect(details.model).not.toHaveProperty('connectionId')
+    expect(details.model).not.toHaveProperty('workflowId')
+    expect(details.model).not.toHaveProperty('mediaProfileId')
+  })
+
   test('Given 请求日志和超过 50 次尝试 When 读取详情 Then 日志按需读取且响应保持在 64KiB', async () => {
     const attempts = Array.from({ length: 70 }, (_, index) => createJob({
       id: `job-${index + 1}`, attemptNumber: index + 1, createdAt: index + 1,

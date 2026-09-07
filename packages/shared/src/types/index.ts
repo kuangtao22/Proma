@@ -83,6 +83,12 @@ export * from './design'
 
 // 独立 Canvas 图文档相关类型
 export * from './canvas'
+export * from './canvas-media'
+export * from './canvas-media-model-scope'
 export * from './canvas-workflow-run'
+export * from './media-workflow'
+export * from './media-workflow-fields'
+export * from './media-api-model'
+export * from './media'
 // 用户授权的 Markdown Vault 相关类型
 export * from './vault'

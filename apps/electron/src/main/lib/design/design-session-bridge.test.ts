@@ -7,6 +7,7 @@ import {
   rmSync,
   symlinkSync,
   truncateSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -195,6 +196,25 @@ describe('Design Session Bridge', () => {
 
     expect(importedBytes).toEqual([pngBytes])
     expect(importedBytes[0]).not.toEqual(replacementBytes)
+  })
+
+  test('Given 稳定句柄对应文件被同大小原地改写 When 读取图片 Then 通过 mtime 变化拒绝消费', () => {
+    const imagePath = join(root, 'mutated-in-place.png')
+    writeFileSync(imagePath, pngBytes)
+    const source = openAuthorizedAgentImageSource({
+      inputPath: imagePath,
+      baseDir: root,
+      allowedRoots: [root],
+    })
+    try {
+      /** 保持 inode 和 size 不变，只改写内容并固定不同 mtime。 */
+      const replacement = Buffer.alloc(pngBytes.byteLength, 1)
+      writeFileSync(imagePath, replacement)
+      utimesSync(imagePath, new Date(2_000), new Date(2_000))
+      expect(() => source.readBytes()).toThrow('Agent 图片文件身份已变化')
+    } finally {
+      source.close()
+    }
   })
 
   test('Given SDK 工具结果持久化图片归属 When 导入设计 Then 接受当前会话的精确附件字段', async () => {

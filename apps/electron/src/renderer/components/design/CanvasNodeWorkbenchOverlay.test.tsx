@@ -13,6 +13,7 @@ function createNode(kind: CanvasNode['kind']): CanvasNode {
   const base = { id: `node-${kind}`, title: `${kind} 节点`, position: { x: 40, y: 60 } }
   if (kind === 'agent') return { ...base, kind, agentSessionId: 'session-1' }
   if (kind === 'image') return { ...base, kind, imageModuleId: 'image-module-1' }
+  if (kind === 'audio' || kind === 'video') return { ...base, kind, mediaModuleId: 'media-module-1' }
   if (kind === 'document') return { ...base, kind, documentId: 'document-1', contentRevision: 0 }
   return { ...base, kind, prototypeId: 'prototype-1', contentRevision: 0, devicePreset: 'desktop' }
 }
@@ -31,7 +32,8 @@ function renderWorkbench(kind: CanvasNode['kind'], x = 40, y = 60, zoom = 1): st
 
 describe('Canvas 节点下方详情', () => {
   test.each([
-    ['agent', 'Agent'], ['image', '生图'], ['document', '文档'], ['webview', '原型'],
+    ['agent', 'Agent'], ['image', '生图'], ['audio', '音频'], ['video', '视频'],
+    ['document', '文档'], ['webview', '原型'],
   ] as const)('Given %s 节点 When 展开详情 Then 固定在卡片下方且不可独立拖动', (kind, label) => {
     const html = renderWorkbench(kind)
     expect(html).toContain(`aria-label="${label}工作台"`)
@@ -46,6 +48,8 @@ describe('Canvas 节点下方详情', () => {
   test.each([
     ['agent', undefined, { width: 760, height: 640 }],
     ['image', undefined, { width: 960, height: 700 }],
+    ['audio', undefined, { width: 720, height: 560 }],
+    ['video', undefined, { width: 960, height: 700 }],
     ['document', undefined, { width: 900, height: 700 }],
     ['webview', 'desktop', { width: 960, height: 720 }],
     ['webview', 'mobile', { width: 520, height: 720 }],

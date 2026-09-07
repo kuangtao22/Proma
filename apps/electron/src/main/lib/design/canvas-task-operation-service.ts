@@ -35,7 +35,7 @@ export interface CanvasTaskDetailsInput extends CanvasTaskReference {
 export interface CanvasTaskPublicModel {
   name: string
   modelId: string
-  executor: 'nano-banana' | 'openai-images'
+  executor: 'nano-banana' | 'openai-images' | 'comfyui'
 }
 
 /** 任务详情中的单次尝试。 */

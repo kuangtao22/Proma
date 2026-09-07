@@ -172,6 +172,7 @@ function hasKeys(value: Record<string, unknown>, required: readonly string[], op
 /** 从节点严格提取受管内容身份。 */
 function contentIdentity(node: CanvasNode): { kind: CanvasContentKind; contentId: string } | null {
   if (node.kind === 'image') return { kind: 'image', contentId: node.imageModuleId }
+  if (node.kind === 'audio' || node.kind === 'video') return { kind: node.kind, contentId: node.mediaModuleId }
   if (node.kind === 'document') return { kind: 'document', contentId: node.documentId }
   if (node.kind === 'webview') return { kind: 'webview', contentId: node.prototypeId }
   return null
@@ -202,7 +203,9 @@ function parseIntentNode(value: unknown): CanvasNode {
       || typeof value.position.y !== 'number' || !Number.isFinite(value.position.y)) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
     return { id: parsed.nodeId, kind: 'agent', title: value.title, position: { x: value.position.x, y: value.position.y }, agentSessionId: value.agentSessionId }
   }
-  const identityKey = value.kind === 'image' ? 'imageModuleId' : value.kind === 'document' ? 'documentId' : 'prototypeId'
+  const identityKey = value.kind === 'image' ? 'imageModuleId'
+    : value.kind === 'audio' || value.kind === 'video' ? 'mediaModuleId'
+      : value.kind === 'document' ? 'documentId' : 'prototypeId'
   const parsed = parseCreateCanvasContentNodeInput({
     projectId: 'project', canvasId: 'canvas', operationId: '11111111-1111-4111-8111-111111111111',
     nodeId: value.id, kind: value.kind, contentId: value[identityKey], title: value.title,
@@ -214,6 +217,26 @@ function parseIntentNode(value: unknown): CanvasNode {
       throw new Error('CANVAS_CONTENT_INTENT_INVALID')
     }
     return { id: parsed.nodeId, kind: 'image', title: parsed.title, position: parsed.position, imageModuleId: parsed.contentId, ...(value.adoptedAssetId === undefined ? {} : { adoptedAssetId: value.adoptedAssetId }) }
+  }
+  if ((parsed.kind === 'audio' || parsed.kind === 'video')
+    && hasKeys(
+      value,
+      ['id', 'kind', 'title', 'position', 'mediaModuleId'],
+      ['adoptedConfigRevision'],
+    )
+    && (value.adoptedConfigRevision === undefined
+      || (Number.isSafeInteger(value.adoptedConfigRevision)
+        && (value.adoptedConfigRevision as number) >= 0))) {
+    return {
+      id: parsed.nodeId,
+      kind: parsed.kind,
+      title: parsed.title,
+      position: parsed.position,
+      mediaModuleId: parsed.contentId,
+      ...(value.adoptedConfigRevision === undefined
+        ? {}
+        : { adoptedConfigRevision: value.adoptedConfigRevision as number }),
+    }
   }
   if (parsed.kind === 'document'
     && hasKeys(value, ['id', 'kind', 'title', 'position', 'documentId', 'contentRevision'])
@@ -334,6 +357,9 @@ export function parseCanvasContentNodeIntent(value: unknown, target: CanvasTarge
 function createContentNode(input: CreateCanvasContentNodeInput): CanvasNode {
   const base = { id: input.nodeId, title: input.title, position: input.position }
   if (input.kind === 'image') return { ...base, kind: 'image', imageModuleId: input.contentId }
+  if (input.kind === 'audio' || input.kind === 'video') {
+    return { ...base, kind: input.kind, mediaModuleId: input.contentId }
+  }
   if (input.kind === 'document') return { ...base, kind: 'document', documentId: input.contentId, contentRevision: 0 }
   return {
     ...base,
@@ -378,6 +404,9 @@ function createTrashEntry(
   }
   if (node.kind === 'document') {
     return parseCanvasTrashEntry({ ...base, kind: node.kind, contentRevision: node.contentRevision })
+  }
+  if (node.kind === 'audio' || node.kind === 'video') {
+    return parseCanvasTrashEntry({ ...base, kind: node.kind })
   }
   return parseCanvasTrashEntry({
     ...base,
@@ -762,20 +791,28 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const entry = (await dependencies.contentStore.listTrash(input)).find((candidate) => candidate.trashId === input.trashId)
       if (!entry) throw new Error('CANVAS_TRASH_ENTRY_NOT_FOUND')
       const base = { id: entry.nodeId, title: entry.title, position: input.position }
-      const node: CanvasNode = entry.kind === 'image' ? {
-        ...base,
-        kind: 'image',
-        imageModuleId: entry.contentId,
-        ...(entry.adoptedAssetId ? { adoptedAssetId: entry.adoptedAssetId } : {}),
-      }
-        : entry.kind === 'document' ? { ...base, kind: 'document', documentId: entry.contentId, contentRevision: entry.contentRevision }
-          : {
-              ...base,
-              kind: 'webview',
-              prototypeId: entry.contentId,
-              contentRevision: entry.contentRevision,
-              devicePreset: entry.devicePreset,
-            }
+      const node: CanvasNode = (() => {
+        switch (entry.kind) {
+          case 'image': return {
+            ...base,
+            kind: 'image',
+            imageModuleId: entry.contentId,
+            ...(entry.adoptedAssetId ? { adoptedAssetId: entry.adoptedAssetId } : {}),
+          }
+          case 'audio': return { ...base, kind: 'audio', mediaModuleId: entry.contentId }
+          case 'video': return { ...base, kind: 'video', mediaModuleId: entry.contentId }
+          case 'document': return {
+            ...base, kind: 'document', documentId: entry.contentId, contentRevision: entry.contentRevision,
+          }
+          case 'webview': return {
+            ...base,
+            kind: 'webview',
+            prototypeId: entry.contentId,
+            contentRevision: entry.contentRevision,
+            devicePreset: entry.devicePreset,
+          }
+        }
+      })()
       if (document.nodes.some((candidate) => candidate.id === node.id)) throw new Error('CANVAS_NODE_IDENTITY_CONFLICT')
       const timestamp = now()
       const intent: CanvasContentNodeIntent = { schemaVersion: 1, operation: 'restore', state: 'prepared', operationId: input.operationId, ...targetFrom(input), node, expectedRevision: input.expectedRevision, trashId: input.trashId, trashEntry: entry, createdAt: timestamp, updatedAt: timestamp }

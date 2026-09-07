@@ -100,6 +100,8 @@ export function calculateCanvasWorkbenchResize(input: CanvasWorkbenchResizeInput
 export function resolveCanvasWorkbenchDefaultSize(node: CanvasNode): CanvasWorkbenchSize {
   if (node.kind === 'agent') return { width: 760, height: 640 }
   if (node.kind === 'image') return { width: 960, height: 700 }
+  if (node.kind === 'audio') return { width: 720, height: 560 }
+  if (node.kind === 'video') return { width: 960, height: 700 }
   if (node.kind === 'document') return { width: 900, height: 700 }
   return node.devicePreset === 'mobile' ? { width: 520, height: 720 } : { width: 960, height: 720 }
 }
@@ -138,6 +140,8 @@ export interface CanvasNodeWorkbenchOverlayProps {
 export function getCanvasNodeKindLabel(kind: CanvasNodeKind): string {
   if (kind === 'agent') return 'Agent'
   if (kind === 'image') return '生图'
+  if (kind === 'audio') return '音频'
+  if (kind === 'video') return '视频'
   if (kind === 'document') return '文档'
   return '原型'
 }
@@ -145,6 +149,8 @@ export function getCanvasNodeKindLabel(kind: CanvasNodeKind): string {
 /** 返回非 Agent 基础工作台的稳定下一步，不读取节点正文。 */
 function getCanvasNodeNextAction(kind: Exclude<CanvasNodeKind, 'agent'>): string {
   if (kind === 'image') return '下一步：配置提示词并选择模型'
+  if (kind === 'audio') return '下一步：配置音频工作流'
+  if (kind === 'video') return '下一步：配置视频工作流'
   if (kind === 'document') return '下一步：开始撰写内容'
   return '下一步：创建 HTML 原型'
 }

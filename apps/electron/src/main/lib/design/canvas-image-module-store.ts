@@ -251,10 +251,14 @@ export function createCanvasImageModuleStore(
     /** 原始配置用于区分 v1 迁移与 v2 读取。 */
     const rawConfig = parseJson(await readFile(capability, target, 'config.json'))
     /** v2 直接严格解析；v1 只通过精确迁移器。 */
-    const config = hasExactKeys(rawConfig, [
+    /** 工作流字段为可选扩展，存在时也必须通过共享精确解析器。 */
+    const configKeys = [
       'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
       'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode', 'adoptedAssetId',
-    ])
+      ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'mediaWorkflow')
+        ? ['mediaWorkflow'] : []),
+    ]
+    const config = hasExactKeys(rawConfig, configKeys)
       ? parseCanvasImageModuleConfig(rawConfig)
       : migrateLegacyConfig(rawConfig)
     /** 公共 meta 仍使用统一 schema v1 身份提交标记。 */
@@ -308,12 +312,16 @@ export function createCanvasImageModuleStore(
       if (!Number.isSafeInteger(timestamp) || timestamp < current.updatedAt) {
         throw new Error('CANVAS_IMAGE_TIME_INVALID')
       }
+      /** 切回普通 profile 时必须移除旧工作流选择，避免两个执行来源同时存在。 */
+      const currentWithoutMediaWorkflow = { ...current }
+      delete currentWithoutMediaWorkflow.mediaWorkflow
       return commitConfig(input, capability, {
-        ...current,
+        ...currentWithoutMediaWorkflow,
         revision: current.revision + 1,
         updatedAt: timestamp,
         prompt: input.prompt,
         selectedModelProfileId: input.selectedModelProfileId,
+        ...(input.mediaWorkflow ? { mediaWorkflow: structuredClone(input.mediaWorkflow) } : {}),
         aspectRatio: input.aspectRatio,
         imageSize: input.imageSize,
         contextMode: input.contextMode,

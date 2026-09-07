@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
@@ -320,6 +321,29 @@ describe('Design revision 原子存储', () => {
 
     expect(unchanged.revision).toBe(0)
     expect(existsSync(join(projectRoot, '.proma/design/canvas.json'))).toBe(false)
+  })
+
+  test('Given 旧文档缺少mediaAssets When 加载 Then 兼容并规范化为空数组', () => {
+    const store = createStore()
+    const legacy = createEmptyDesignDocument('project-1', 100)
+    delete legacy.mediaAssets
+    mkdirSync(join(projectRoot, '.proma/design'), { recursive: true })
+    writeFileSync(join(projectRoot, '.proma/design/canvas.json'), JSON.stringify(legacy))
+    expect(store.load('project-1').document.mediaAssets).toEqual([])
+  })
+
+  test('Given 内部音视频mutation When 走内部Store Then 与文档同revision提交且Renderer公开入口拒绝', () => {
+    const store = createStore()
+    const asset = {
+      id: 'media-1', revision: 1 as const, hash: 'a'.repeat(64), mediaKind: 'video' as const,
+      filename: 'media-1.mp4', relativePath: 'assets/media-1.mp4', byteSize: 16, mediaType: 'video/mp4', createdAt: 100,
+      metadata: { width: 1280, height: 720, durationMs: 2000, fps: null, codec: 'h264', hasAudio: true },
+    }
+    expect(() => store.mutate('project-1', 0, [{ type: 'upsert-media-assets', assets: [asset] }] as never)).toThrow('DESIGN_MUTATION_INVALID')
+    const saved = store.mutateInternal('project-1', 0, [{ type: 'upsert-media-assets', assets: [asset] }])
+    expect(saved).toMatchObject({ revision: 1, mediaAssets: [asset] })
+    const removed = store.mutateInternal('project-1', 1, [{ type: 'remove-media-assets', assetIds: ['media-1'] }])
+    expect(removed.mediaAssets).toEqual([])
   })
 })
 

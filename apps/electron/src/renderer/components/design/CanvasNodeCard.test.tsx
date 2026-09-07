@@ -119,6 +119,8 @@ describe('Canvas 通用折叠节点卡片', () => {
   test.each([
     ['agent', 'Agent'],
     ['image', '生图'],
+    ['audio', '音频'],
+    ['video', '视频'],
     ['document', '文档'],
     ['webview', '原型'],
   ] as const)('Given %s 节点 When 折叠渲染 Then 显示类型和展开入口', (kind, label) => {
@@ -195,6 +197,22 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).not.toContain('<img')
     expect(html).toContain('这是只来自画布文档的单行摘要')
     expect(html).toContain('已创建')
+  })
+
+  test('Given Comfy 当前节点采样 When 渲染卡片 Then 显示阶段与原始计数且不伪造整体百分比', () => {
+    const html = renderCard('image', {
+      activityState: 'running',
+      mediaProgress: {
+        phase: 'running',
+        phaseLabel: '运行中',
+        nodeProgressLabel: '当前节点 sampler · 4/20',
+      },
+    })
+
+    expect(html).toContain('运行中')
+    expect(html).toContain('当前节点 sampler · 4/20')
+    expect(html).not.toContain('20%')
+    expect(html).toContain('h-[144px]')
   })
 
   test('Given 生图节点展示正式采用版本 When 折叠渲染 Then 不暴露候选批次状态或入口', () => {

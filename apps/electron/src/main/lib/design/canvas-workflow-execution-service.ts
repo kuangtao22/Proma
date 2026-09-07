@@ -6,23 +6,38 @@ import type {
   CanvasRunWorkflowInput,
   CanvasRunWorkflowResult,
   CanvasTarget,
-  CanvasWorkflowImageSummary,
-  CanvasWorkflowNodeResult,
-  CanvasWorkflowNodeStatus,
   CanvasWorkflowRun,
   CanvasWorkflowRunChangedEvent,
+  CanvasWorkflowImageSummary,
   CanvasWorkflowRunListInput,
-  CanvasWorkflowRunNode,
+  CanvasWorkflowNodeResult,
+  CanvasWorkflowNodeStatus,
   CanvasWorkflowRunPage,
+  MediaInputValue,
 } from '@proma/shared'
-import { resolveCanvasEdgeBinding } from '@proma/shared'
-import type {
-  CanvasAgentExecutionResult,
-  CanvasAgentExecutionService,
-} from './canvas-agent-execution-service'
+import {
+  CANVAS_WORKFLOW_RUN_DURATION_MS,
+  CANVAS_WORKFLOW_RUN_NODE_LIMIT,
+  resolveCanvasEdgeBinding,
+} from '@proma/shared'
+import type { CanvasAgentExecutionService } from './canvas-agent-execution-service'
+import type { CanvasAgentOutputCommitResult } from './canvas-agent-output-service'
 import type { CanvasImageRunService } from './canvas-image-run-service'
-import type { CanvasToolRunContext } from './canvas-tool-provider'
 import type { CanvasWorkflowRunStore } from './canvas-workflow-run-store'
+import type { CanvasToolRunContext } from './canvas-tool-provider'
+import {
+  createCanvasWorkflowNodeOperationId,
+  createCanvasWorkflowNodeIdentityHash,
+  createCanvasWorkflowPlanSnapshot,
+  createCanvasWorkflowDynamicSuccessorAmendment,
+  bindCanvasWorkflowMediaInputDeclarations,
+  prepareCanvasWorkflowMediaInputs,
+  reconcileCanvasWorkflowRun,
+  type CanvasWorkflowAdoptionFact,
+  type CanvasWorkflowImageAdoptionQuery,
+  type CanvasWorkflowMediaAdoptionQuery,
+  type CanvasWorkflowResolvedMediaInputs,
+} from './canvas-workflow-planner'
 import {
   createCanvasWorkflowGraphPlan,
   type CanvasWorkflowGraphPlan,
@@ -31,7 +46,7 @@ import {
 /** 单次工作流中的 Canvas Agent 并发上限。 */
 const MAX_AGENT_CONCURRENCY = 2
 /** Canvas 工作流与单 Agent 长工具共用的总时限。 */
-export const CANVAS_WORKFLOW_TIMEOUT_MS = 15 * 60_000
+export const CANVAS_WORKFLOW_TIMEOUT_MS = CANVAS_WORKFLOW_RUN_DURATION_MS
 
 /** 为单个图片节点派生跨分波重放稳定且互不冲突的安全 operationId。 */
 function createWorkflowImageOperationId(
@@ -58,7 +73,7 @@ export interface CanvasWorkflowExecutionServiceDependencies {
   validateAccess: (context: CanvasToolRunContext, canvasId: string) => void | Promise<void>
   isAgentBusy: (node: Extract<CanvasNode, { kind: 'agent' }>) => boolean
   agentExecution: Pick<CanvasAgentExecutionService, 'execute'>
-  /** 进程重启后按稳定 operation 对账原 Agent 子运行。 */
+  /** 只按原父工作流消息身份查询已运行 Agent，不允许读取当前末条输出代替。 */
   recoverAgentExecution?: (input: CanvasTarget & {
     nodeId: string
     agentSessionId: string
@@ -66,20 +81,84 @@ export interface CanvasWorkflowExecutionServiceDependencies {
     expectedUserMessageUuid: string
     expectedStartedAt: number
   }) => Promise<
+    | { status: 'completed'; output: CanvasAgentOutputCommitResult }
     | { status: 'running' | 'missing' | 'changed' }
-    | { status: 'completed'; output: NonNullable<CanvasAgentExecutionResult['output']> }
   >
-  imageRuns: Pick<CanvasImageRunService, 'run' | 'awaitBatch'> & Partial<Pick<CanvasImageRunService, 'cancelTasks'>>
-  /** 注入后启用跨重启运行；缺省只用于兼容尚未完成接线的调用方。 */
+  imageRuns: Pick<CanvasImageRunService, 'run' | 'awaitBatch' | 'cancelTasks'>
+  /** 注入后启用跨重启固定计划；缺省仅供旧调用与存量测试兼容。 */
   workflowRuns?: CanvasWorkflowRunStore
   /** 持久运行关键事实写入成功后的轻量通知。 */
   onRunChanged?: (event: CanvasWorkflowRunChangedEvent) => void
-  /** 查询精确候选是否已由用户采用，恢复不会把采用当作自动启动信号。 */
-  isImageCandidateAdopted?: (input: CanvasTarget & {
-    nodeId: string
-    batchId: string
-    taskId: string
-  }) => Promise<{ adopted: boolean; artifactHash: string | null; committedAt: number | null }>
+  /**
+   * 外部 Agent/媒体任务仍运行时，按 workflowRunId 替换已有唤醒并在 resumeAt 前后恢复一次。
+   * 远端终态事件可提前触发同一恢复；协调器须在工作流进入用户边界或终态后清理旧唤醒。
+   */
+  scheduleDurableResume?: (input: CanvasTarget & {
+    workflowRunId: string
+    ownerSessionId: string
+    resumeAt: number
+  }) => void | Promise<void>
+  /** 仅接收 Host journal 中由已完成 child 为固定直接下游准备的配置修订。 */
+  applyPreparedHandoffs?: (run: CanvasWorkflowRun, document: CanvasDocument) => Promise<CanvasWorkflowRun>
+  /** 只接受精确 batch/task 的图片采用事实。 */
+  isImageCandidateAdopted?: (
+    query: CanvasWorkflowImageAdoptionQuery,
+  ) => CanvasWorkflowAdoptionFact | Promise<CanvasWorkflowAdoptionFact>
+  /** 音视频执行通过适配器消费 typed DAG resolver，禁止从边端口猜输入。 */
+  mediaRuns?: {
+    resolveInputs: (target: CanvasTarget & {
+      nodeId: string
+      mediaModuleId: string
+      mediaKind: 'audio' | 'video'
+    }) => Promise<CanvasWorkflowResolvedMediaInputs>
+    run: (input: CanvasTarget & {
+      nodeId: string
+      mediaModuleId: string
+      mediaKind: 'audio' | 'video'
+      expectedConfigRevision: number
+      operationId: string
+      resolvedValues: Record<string, MediaInputValue>
+      expectedInputHashes: Record<string, string>
+      /** 父工作流的真实调用主体由调度器传给提交授权边界。 */
+      context: CanvasToolRunContext
+      workflowRunId: string
+      signal: AbortSignal
+    }) => Promise<{
+      status: 'running' | 'waiting-adoption' | 'failed' | 'cancelled'
+      mediaRunId: string
+      outputKeys: string[]
+      errorCode: string | null
+      retryable?: boolean
+    }>
+    /** 恢复已取得 mediaRunId 的原任务，包括 collection-failed 的下载续跑。 */
+    reconcile?: (input: CanvasTarget & {
+      nodeId: string
+      mediaModuleId: string
+      mediaKind: 'audio' | 'video'
+      operationId: string
+      mediaRunId: string
+      context: CanvasToolRunContext
+      workflowRunId: string
+      signal: AbortSignal
+      deadlineAt: number
+    }) => Promise<{
+      status: 'running' | 'waiting-adoption' | 'failed' | 'cancelled'
+      mediaRunId: string
+      outputKeys: string[]
+      errorCode: string | null
+      retryable?: boolean
+    }>
+    cancel: (input: CanvasTarget & {
+      nodeId: string
+      mediaModuleId: string
+      mediaKind: 'audio' | 'video'
+      mediaRunId: string
+    }) => Promise<void>
+  }
+  /** 音视频采用必须精确匹配当前 workflow 的 run/output key。 */
+  isMediaOutputAdopted?: (
+    query: CanvasWorkflowMediaAdoptionQuery,
+  ) => CanvasWorkflowAdoptionFact | Promise<CanvasWorkflowAdoptionFact>
   now?: () => number
   setDeadline?: (callback: () => void, timeoutMs: number) => CanvasWorkflowDeadlineHandle
 }
@@ -94,22 +173,80 @@ export interface CanvasWorkflowExecutionService {
   ) => Promise<CanvasRunWorkflowResult>
   resume: (
     context: CanvasToolRunContext,
-    input: CanvasTarget & { runId: string },
+    input: CanvasTarget & {
+      runId: string
+      expectedRunRevision?: number
+      resumeOperationId?: string
+      addDurationMs?: number
+      addMediaRuns?: number
+      retryNodeIds?: string[]
+    },
     signal?: AbortSignal,
   ) => Promise<CanvasRunWorkflowResult>
   cancel: (
     context: CanvasToolRunContext,
     input: CanvasTarget & { runId: string },
   ) => Promise<CanvasWorkflowRun>
-  get: (
+  /** 登记 Host 创建事务点名的单个动态后继，不接受 Agent 自报节点集合。 */
+  registerCreatedSuccessor: (
     context: CanvasToolRunContext,
-    input: CanvasTarget & { runId: string },
-  ) => Promise<CanvasWorkflowRun>
-  list: (
+    input: CanvasTarget & { nodeId: string; sourceToolCallId: string },
+  ) => Promise<CanvasWorkflowSuccessorRegistrationResult>
+  /** 创建已提交但正常登记异常时，持久化精确节点的阻断事实。 */
+  recordCreatedSuccessorRegistrationFailure: (
+    context: CanvasToolRunContext,
+    input: CanvasTarget & { nodeId: string; sourceToolCallId: string },
+  ) => Promise<CanvasWorkflowSuccessorRegistrationResult>
+  get: (context: CanvasToolRunContext, input: CanvasTarget & { runId: string }) => Promise<CanvasWorkflowRun>
+  list: (context: CanvasToolRunContext, canvasId: string) => Promise<CanvasWorkflowRun[]>
+  listPage: (
     context: CanvasToolRunContext,
     canvasId: string,
     options?: Pick<CanvasWorkflowRunListInput, 'cursor' | 'limit'>,
   ) => Promise<CanvasWorkflowRunPage>
+}
+
+/** 创建成功后的父工作流登记结果；未纳入计划不反转节点创建事实。 */
+export interface CanvasWorkflowSuccessorRegistrationResult {
+  status: 'registered' | 'already-registered' | 'blocked'
+  workflowRunId: string
+  workflowRunRevision: number
+  reasonCode: string | null
+}
+
+/** 只追加创建事务点名的失败节点；该事实不会授予任何执行能力。 */
+function createBlockedSuccessorAmendment(
+  run: CanvasWorkflowRun,
+  document: CanvasDocument,
+  parentAgentNodeId: string,
+  createdNodeId: string,
+  reasonCode: string,
+): CanvasWorkflowRun {
+  const createdNode = document.nodes.find((node) => node.id === createdNodeId)
+  if (!createdNode) throw new Error('CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_NOT_FOUND')
+  if (run.nodes.length >= CANVAS_WORKFLOW_RUN_NODE_LIMIT) {
+    throw new Error('CANVAS_WORKFLOW_NODE_LIMIT_EXCEEDED')
+  }
+  const next = structuredClone(run)
+  next.status = 'partial'
+  next.observedCanvasRevision = Math.max(next.observedCanvasRevision, document.revision)
+  next.nodes.push({
+    nodeId: createdNode.id,
+    kind: createdNode.kind,
+    identityHash: createCanvasWorkflowNodeIdentityHash(createdNode),
+    plannedArtifactHash: null,
+    mediaConfigRevision: null,
+    inputBindings: [],
+    dependencyNodeIds: [parentAgentNodeId],
+    status: 'blocked',
+    errorCode: reasonCode,
+    execution: null,
+    executionHistory: [],
+    retryDisposition: 'none',
+    completedArtifactHash: null,
+    completedAt: null,
+  })
+  return next
 }
 
 /** 调度器内部节点状态，错误只保存稳定错误码。 */
@@ -131,29 +268,16 @@ function nodeIdentity(node: CanvasNode): string {
   switch (node.kind) {
     case 'agent': return `${node.kind}\0${node.agentSessionId}`
     case 'image': return `${node.kind}\0${node.imageModuleId}`
+    case 'audio':
+    case 'video': return `${node.kind}\0${node.mediaModuleId}`
     case 'document': return `${node.kind}\0${node.documentId}`
     case 'webview': return `${node.kind}\0${node.prototypeId}`
   }
 }
 
-/** 对稳定业务事实生成 SHA-256 指纹，布局与标题不参与恢复有效性。 */
-function stableHash(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex')
-}
-
-/** 返回节点当前正式产物指纹；未提交节点返回 null。 */
-function nodeArtifactHash(node: CanvasNode): string | null {
-  switch (node.kind) {
-    case 'agent': return node.outputPointer?.contentSha256 ?? null
-    case 'image': return node.adoptedAssetId ? stableHash(['image-asset', node.adoptedAssetId]) : null
-    case 'document': return stableHash(['document', node.documentId, node.contentRevision])
-    case 'webview': return stableHash(['webview', node.prototypeId, node.contentRevision, node.devicePreset])
-  }
-}
-
 /** 返回单条合法 bound 边不会随 revision 改变的执行身份。 */
 function edgeIdentity(edge: CanvasDocument['edges'][number]): string {
-  return [edge.id, edge.sourceNodeId, edge.sourcePort, edge.targetNodeId, edge.targetPort, edge.relation].join('\0')
+  return [edge.id, edge.sourceNodeId, edge.sourcePort, edge.sourceOutputKey ?? '', edge.targetNodeId, edge.targetPort, edge.relation].join('\0')
 }
 
 /** 只索引共享解析器确认的 bound 执行边，association 不参与稳定性。 */
@@ -380,116 +504,98 @@ function projectNodeResults(
   })
 }
 
-/** 把图规划快照转换成可跨重启验证的持久节点。 */
-function createPersistentNodes(
-  document: CanvasDocument,
-  plan: CanvasWorkflowGraphPlan,
-): CanvasWorkflowRunNode[] {
-  const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
-  return plan.reachableNodeIds.map((nodeId) => {
-    const node = nodesById.get(nodeId)
-    if (!node) throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
-    const initial = plan.initialStates.get(nodeId) ?? 'blocked'
-    const artifactHash = nodeArtifactHash(node)
-    const inputBindings = document.edges.flatMap((edge) => {
-      if (edge.targetNodeId !== nodeId || edge.relation === 'association') return []
-      const source = nodesById.get(edge.sourceNodeId)
-      if (!source) return []
-      const resolution = resolveCanvasEdgeBinding(edge, source.kind, node.kind)
-      if (resolution.state !== 'bound') return []
-      const externalArtifactHash = plan.reachableNodeIds.includes(source.id)
-        ? null : nodeArtifactHash(source)
-      return [{
-        targetInputKey: `${resolution.targetSlot}:${edge.id}`,
-        requiredKind: resolution.targetSlot === 'context.image' || resolution.targetSlot === 'image.reference'
-          ? 'image' as const : 'text' as const,
-        sourceNodeId: source.id,
-        sourceOutputKey: resolution.sourceCapability,
-        sourceArtifactHash: externalArtifactHash,
-        resolvedValueHash: externalArtifactHash,
-      }]
-    }).sort((left, right) => left.targetInputKey.localeCompare(right.targetInputKey)
-      || (left.sourceNodeId ?? '').localeCompare(right.sourceNodeId ?? ''))
-    return {
-      nodeId,
-      kind: node.kind,
-      identityHash: stableHash(nodeIdentity(node)),
-      plannedArtifactHash: artifactHash,
-      mediaConfigRevision: null,
-      inputBindings,
-      dependencyNodeIds: [...(plan.dependenciesByNodeId.get(nodeId) ?? [])],
-      status: initial === 'satisfied' ? 'satisfied'
-        : initial === 'started' ? 'ready'
-          : initial === 'waiting-approval' ? 'waiting-approval'
-            : 'blocked',
-      errorCode: initial === 'blocked' ? 'CANVAS_WORKFLOW_NODE_UNSUPPORTED' : null,
-      execution: null,
-      completedArtifactHash: null,
-      completedAt: null,
+/** 将持久节点状态映射为现有公开工作流结果，内部身份不会跨工具合同泄露。 */
+function projectDurableRunResult(run: CanvasWorkflowRun): CanvasRunWorkflowResult {
+  const nodes: CanvasWorkflowNodeResult[] = run.nodes.map((node) => {
+    const status: CanvasWorkflowNodeStatus = node.status === 'ready' || node.status === 'running'
+      ? 'started'
+      : node.status === 'waiting-adoption'
+        ? 'waiting-review'
+        : node.status
+    if (status === 'failed' || status === 'blocked') {
+      return { nodeId: node.nodeId, status, errorCode: node.errorCode ?? 'CANVAS_WORKFLOW_INCOMPLETE' }
     }
+    return { nodeId: node.nodeId, status, errorCode: null }
   })
-}
-
-/** 将持久节点状态映射到既有公开工具结果。 */
-function projectPersistentNode(node: CanvasWorkflowRunNode): CanvasWorkflowNodeResult {
-  if (node.status === 'blocked' || node.status === 'failed') {
-    return { nodeId: node.nodeId, status: node.status, errorCode: node.errorCode ?? 'CANVAS_WORKFLOW_INCOMPLETE' }
-  }
-  if (node.status === 'ready' || node.status === 'running') {
-    return node.status === 'running'
-      ? { nodeId: node.nodeId, status: 'blocked', errorCode: 'CANVAS_WORKFLOW_ALREADY_RUNNING' }
-      : { nodeId: node.nodeId, status: 'started', errorCode: null }
-  }
-  if (node.status === 'waiting-adoption') {
-    return { nodeId: node.nodeId, status: 'waiting-review', errorCode: null }
-  }
-  return { nodeId: node.nodeId, status: node.status, errorCode: null }
-}
-
-/** 从唯一持久事实生成既有有界工作流结果。 */
-function projectPersistentResult(run: CanvasWorkflowRun): CanvasRunWorkflowResult {
-  const nodes = run.nodes.map(projectPersistentNode)
-  const waitingImages = run.nodes.filter((node) => node.kind === 'image' && node.status === 'waiting-adoption')
-  const failedImages = run.nodes.filter((node) => node.kind === 'image' && node.status === 'failed')
-  const imageCount = run.nodes.filter((node) => node.kind === 'image' && node.execution !== null).length
-  const imageSummary: CanvasWorkflowImageSummary | null = imageCount === 0 ? null : {
-    status: failedImages.length > 0 ? 'partial' : waitingImages.length > 0 ? 'ready' : 'adopted',
-    totalCount: imageCount,
-    candidateCount: waitingImages.length + run.nodes.filter((node) => (
-      node.kind === 'image' && node.status === 'completed'
-    )).length,
-    failedCount: failedImages.length,
-    runningCount: run.nodes.filter((node) => node.kind === 'image' && node.status === 'running').length,
+  const imageNodes = run.nodes.filter((node) => node.kind === 'image' && node.execution?.kind === 'image')
+  const candidateCount = imageNodes.filter((node) => node.status === 'waiting-adoption' || node.status === 'completed').length
+  const failedCount = imageNodes.filter((node) => node.status === 'failed').length
+  const runningCount = imageNodes.filter((node) => node.status === 'running').length
+  const imageSummary: CanvasWorkflowImageSummary | null = imageNodes.length === 0 ? null : {
+    status: candidateCount === imageNodes.length ? 'ready' : failedCount > 0 ? 'partial' : 'running',
+    totalCount: imageNodes.length,
+    candidateCount,
+    failedCount,
+    runningCount,
   }
   const base = {
-    runId: run.id,
     initialRevision: run.initialCanvasRevision,
     finalRevision: run.observedCanvasRevision,
     nodes,
     imageSummary,
   }
-  if (run.status === 'completed') return { ...base, status: 'completed', requiresReview: false, errorCode: null }
-  if (run.status === 'waiting-review') return { ...base, status: 'waiting-review', requiresReview: true, errorCode: null }
+  if (run.status === 'completed') {
+    return { ...base, status: 'completed', requiresReview: false, errorCode: null }
+  }
+  if (run.status === 'waiting-review') {
+    return { ...base, status: 'waiting-review', requiresReview: true, errorCode: null }
+  }
   if (run.status === 'cancelled') {
-    return { ...base, status: 'cancelled', requiresReview: false, errorCode: 'CANVAS_WORKFLOW_CANCELLED' }
+    return { ...base, status: 'cancelled', requiresReview: false, errorCode: null }
   }
   if (run.status === 'failed') {
     return { ...base, status: 'failed', requiresReview: false, errorCode: 'CANVAS_WORKFLOW_FAILED' }
   }
+  if (run.status === 'waiting-budget') {
+    return {
+      ...base,
+      status: 'partial',
+      requiresReview: false,
+      errorCode: 'CANVAS_WORKFLOW_BUDGET_EXHAUSTED',
+    }
+  }
   return {
     ...base,
     status: 'partial',
-    requiresReview: waitingImages.length > 0,
-    errorCode: run.nodes.some((node) => node.status === 'running') ? 'CANVAS_WORKFLOW_ALREADY_RUNNING' : null,
+    requiresReview: nodes.some((node) => node.status === 'waiting-review'),
+    errorCode: null,
   }
 }
 
-/** 判断持久节点的全部直接依赖是否已有正式产物。 */
-function isPersistentNodeReady(node: CanvasWorkflowRunNode, run: CanvasWorkflowRun): boolean {
-  return node.dependencyNodeIds.every((dependencyId) => {
-    const dependency = run.nodes.find((candidate) => candidate.nodeId === dependencyId)
-    return dependency?.status === 'satisfied' || dependency?.status === 'completed'
-  })
+/** 从已提交 Agent 指针派生完成事实，不保存消息正文。 */
+function hashAgentCompletion(output: NonNullable<Awaited<ReturnType<CanvasAgentExecutionService['execute']>>['output']>): string {
+  return createHash('sha256').update(JSON.stringify([
+    'canvas-workflow-agent-output', output.pointer,
+  ])).digest('hex')
+}
+
+/** 扣减一个已持久执行段的保守耗时，并暂停时钟。 */
+function pauseDurableRunDuration(run: CanvasWorkflowRun, timestamp: number): void {
+  const activeStartedAt = run.budget.activeStartedAt
+  if (activeStartedAt === null) return
+  const elapsed = Math.max(0, timestamp - activeStartedAt)
+  run.budget.remainingDurationMs = Math.max(0, run.budget.remainingDurationMs - elapsed)
+  run.budget.activeStartedAt = null
+}
+
+/** 开始新的执行计时段；调用方须立即持久化该起点。 */
+function startDurableRunDuration(run: CanvasWorkflowRun, timestamp: number): void {
+  if (run.budget.activeStartedAt !== null) return
+  run.budget.activeStartedAt = timestamp
+}
+
+/** 校验恢复回调只能提交当前节点的精确正式输出。 */
+function assertRecoveredAgentOutput(
+  output: CanvasAgentOutputCommitResult,
+  target: CanvasTarget & { nodeId: string },
+  expectedStartedAt: number,
+): void {
+  if (output.target.projectId !== target.projectId
+    || output.target.canvasId !== target.canvasId
+    || output.target.nodeId !== target.nodeId
+    || output.pointer.completedAt < expectedStartedAt) {
+    throw new Error('CANVAS_AGENT_RECOVERY_OUTPUT_INVALID')
+  }
 }
 
 /** 创建一次性、无持久运行计划的 Canvas 工作流调度器。 */
@@ -503,14 +609,739 @@ export function createCanvasWorkflowExecutionService(
     const timer = setTimeout(callback, timeoutMs)
     return { cancel: () => clearTimeout(timer) }
   })
+  /** 持久运行的活动控制器按 Canvas 隔离，取消可精确终止当前等待。 */
+  const durableControllers = new Map<string, AbortController>()
 
-  /** 旧调用方未接入 Store 时继续使用原有进程内执行语义。 */
-  const executeVolatile = async (
+  /** journal 提交后发送轻量变化事实；通知失败不能反转权威保存。 */
+  const notifyRunChanged = (run: CanvasWorkflowRun): void => {
+    try {
+      dependencies.onRunChanged?.({
+        projectId: run.projectId,
+        canvasId: run.canvasId,
+        runId: run.id,
+        revision: run.revision,
+      })
+    } catch {
+      /** 观察者只负责唤醒界面，不参与状态事务。 */
+    }
+  }
+
+  /** 返回保存结果并发布对应 revision，供各专用 CAS 入口统一使用。 */
+  const publishSavedRun = (run: CanvasWorkflowRun): CanvasWorkflowRun => {
+    notifyRunChanged(run)
+    return run
+  }
+
+  /** 保存一次持久状态推进并接管新的 revision。 */
+  const persistRun = (run: CanvasWorkflowRun): CanvasWorkflowRun => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    const saved = dependencies.workflowRuns.saveExecutionProgress(run, run.revision)
+    return publishSavedRun(saved)
+  }
+
+  /** 判断异常是否为持久运行并发提交冲突。 */
+  const isWorkflowRunConflict = (error: unknown): boolean => (
+    error instanceof Error && error.message === 'CANVAS_WORKFLOW_RUN_CONFLICT'
+  )
+
+  /** 先以 fresh-read + CAS 记录取消意图，使后续清理失败也不会丢失用户事实。 */
+  const requestDurableCancellation = (
+    target: CanvasTarget,
+    runId: string,
+    timestamp: number,
+  ): CanvasWorkflowRun => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = dependencies.workflowRuns.get(target, runId)
+      if (current.status === 'cancelled' || current.status === 'completed'
+        || current.cancelRequestedAt !== null) return current
+      current.cancelRequestedAt = timestamp
+      try {
+        return publishSavedRun(dependencies.workflowRuns.save(current, current.revision))
+      } catch (error) {
+        if (!isWorkflowRunConflict(error) || attempt === 3) throw error
+      }
+    }
+    throw new Error('CANVAS_WORKFLOW_RUN_CONFLICT')
+  }
+
+  /** 从最新 journal 收敛取消终态，避免覆盖并发执行刚提交的节点事实。 */
+  const finalizeDurableCancellation = (
+    target: CanvasTarget,
+    runId: string,
+    timestamp: number,
+    deadlineExpired: boolean,
+  ): CanvasWorkflowRun => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = dependencies.workflowRuns.get(target, runId)
+      if (current.status === 'cancelled' || current.status === 'completed') return current
+      for (const node of current.nodes) {
+        if (node.status === 'ready' || node.status === 'running' || node.status === 'waiting-approval') {
+          node.status = 'cancelled'
+          node.errorCode = null
+        }
+      }
+      /** 已持久化 intent 时，预算只累计到用户实际请求取消的时刻。 */
+      pauseDurableRunDuration(current, current.cancelRequestedAt ?? timestamp)
+      if (deadlineExpired) current.budget.remainingDurationMs = 0
+      current.cancelRequestedAt = current.cancelRequestedAt ?? timestamp
+      current.cancelledAt = timestamp
+      current.status = 'cancelled'
+      try {
+        return publishSavedRun(dependencies.workflowRuns.save(current, current.revision))
+      } catch (error) {
+        if (!isWorkflowRunConflict(error) || attempt === 3) throw error
+      }
+    }
+    throw new Error('CANVAS_WORKFLOW_RUN_CONFLICT')
+  }
+
+  /** deadline 只暂停本地推进，不伪造用户取消，也不改写已提交远端任务身份。 */
+  const pauseDurableRunForBudget = (
+    target: CanvasTarget,
+    runId: string,
+    timestamp: number,
+  ): CanvasWorkflowRun => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = dependencies.workflowRuns.get(target, runId)
+      if (current.status === 'cancelled' || current.status === 'completed') return current
+      pauseDurableRunDuration(current, timestamp)
+      current.budget.remainingDurationMs = 0
+      current.status = current.nodes.some((node) => node.status === 'waiting-adoption')
+        ? 'waiting-review'
+        : 'waiting-budget'
+      try {
+        return publishSavedRun(dependencies.workflowRuns.save(current, current.revision))
+      } catch (error) {
+        if (!isWorkflowRunConflict(error) || attempt === 3) throw error
+      }
+    }
+    throw new Error('CANVAS_WORKFLOW_RUN_CONFLICT')
+  }
+
+  /** 将持久运行恢复并推进到下一个用户边界或终态。 */
+  const driveDurableRun = async (
     context: CanvasToolRunContext,
-    input: CanvasRunWorkflowInput,
-    toolCallId: string,
+    initialRun: CanvasWorkflowRun,
     parentSignal?: AbortSignal,
-  ): Promise<CanvasRunWorkflowResult> => {
+  ): Promise<CanvasWorkflowRun> => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    if (initialRun.projectId !== context.projectId || initialRun.owner.sessionId !== context.sessionId) {
+      throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+    }
+    if (initialRun.status === 'cancelled' || initialRun.status === 'completed') return initialRun
+    if (initialRun.status === 'waiting-budget' && initialRun.budget.remainingDurationMs === 0) {
+      return initialRun
+    }
+    const initialTarget = { projectId: initialRun.projectId, canvasId: initialRun.canvasId }
+    if (initialRun.cancelRequestedAt !== null) {
+      return finalizeDurableCancellation(initialTarget, initialRun.id, now(), false)
+    }
+    const releaseLease = dependencies.workflowRuns.acquireLease(initialTarget, initialRun.id)
+    if (!releaseLease) return dependencies.workflowRuns.get(initialTarget, initialRun.id)
+    const activeKey = `${initialRun.projectId}\0${initialRun.canvasId}`
+    if (durableControllers.has(activeKey)) {
+      releaseLease()
+      throw new Error('CANVAS_WORKFLOW_ACTIVE')
+    }
+    const controller = new AbortController()
+    durableControllers.set(activeKey, controller)
+    const onParentAbort = (): void => controller.abort('cancel')
+    parentSignal?.addEventListener('abort', onParentAbort, { once: true })
+    if (parentSignal?.aborted) controller.abort('cancel')
+    let run = initialRun
+    const target = initialTarget
+    /** 权限始终复核当前调用者；外部执行身份固定为 journal 中的原始工作流 owner。 */
+    const executionContext: CanvasToolRunContext = {
+      ...context,
+      sessionId: initialRun.owner.sessionId,
+      runStartedAt: initialRun.owner.runStartedAt,
+    }
+    /** 当前进程只为实际执行段注册 deadline；等待 review 时没有计时器。 */
+    const deadlineState: { handle: CanvasWorkflowDeadlineHandle | null } = { handle: null }
+    let deadlineAt = now() + run.budget.remainingDurationMs
+    let deadlineExpired = false
+
+    /** 恢复或开始执行段，并按 journal 剩余时长设置唯一 deadline。 */
+    const activateDurationBudget = (): void => {
+      if (deadlineState.handle || controller.signal.aborted) return
+      const timestamp = now()
+      pauseDurableRunDuration(run, timestamp)
+      if (run.budget.remainingDurationMs === 0) {
+        deadlineExpired = true
+        controller.abort('deadline')
+        return
+      }
+      startDurableRunDuration(run, timestamp)
+      run = persistRun(run)
+      deadlineAt = timestamp + run.budget.remainingDurationMs
+      deadlineState.handle = setDeadline(() => {
+        deadlineExpired = true
+        controller.abort('deadline')
+      }, run.budget.remainingDurationMs)
+    }
+
+    /** 用户边界或终态暂停计时并持久化真实剩余值。 */
+    const pauseAndPersistDurationBudget = (): void => {
+      if (run.budget.activeStartedAt === null) return
+      pauseDurableRunDuration(run, now())
+      run = persistRun(run)
+      deadlineState.handle?.cancel()
+      deadlineState.handle = null
+    }
+
+    try {
+      if (run.status === 'running') activateDurationBudget()
+      while (!controller.signal.aborted) {
+        await awaitReadOnlyWithinDeadline(
+          () => dependencies.validateAccess(context, run.canvasId), controller.signal,
+        )
+        const document = await awaitReadOnlyWithinDeadline(() => dependencies.load(target), controller.signal)
+        await awaitReadOnlyWithinDeadline(
+          () => dependencies.validateAccess(context, run.canvasId), controller.signal,
+        )
+
+        /** 先以原消息身份恢复已启动 Agent；不得用当前末条输出或节点旧指针替代。 */
+        let changed = false
+        let externalExecutionStillRunning = false
+        for (const node of run.nodes) {
+          if (node.status !== 'running' || node.execution?.kind !== 'agent') continue
+          const canvasNode = document.nodes.find((candidate): candidate is Extract<CanvasNode, { kind: 'agent' }> => (
+            candidate.id === node.nodeId && candidate.kind === 'agent'
+          ))
+          if (!canvasNode || !dependencies.recoverAgentExecution) {
+            node.status = 'failed'
+            node.errorCode = 'CANVAS_AGENT_RUN_INTERRUPTED'
+            changed = true
+            continue
+          }
+          const recovered = await dependencies.recoverAgentExecution({
+            ...target,
+            nodeId: node.nodeId,
+            agentSessionId: canvasNode.agentSessionId,
+            operationId: node.execution.operationId,
+            expectedUserMessageUuid: (node.executionHistory?.length ?? 0) > 0
+              ? node.execution.operationId
+              : run.operationId,
+            expectedStartedAt: run.owner.runStartedAt,
+          })
+          if (recovered.status === 'completed') {
+            assertRecoveredAgentOutput(recovered.output, { ...target, nodeId: node.nodeId }, run.owner.runStartedAt)
+            node.status = 'completed'
+            node.errorCode = null
+            node.completedArtifactHash = hashAgentCompletion(recovered.output)
+            node.completedAt = recovered.output.pointer.completedAt
+            run.observedCanvasRevision = Math.max(run.observedCanvasRevision, recovered.output.revision)
+          } else if (recovered.status === 'running') {
+            externalExecutionStillRunning = true
+          } else if (recovered.status === 'changed') {
+            node.status = 'failed'
+            node.errorCode = 'CANVAS_WORKFLOW_OUTPUT_CHANGED'
+          } else {
+            node.status = 'failed'
+            node.errorCode = 'CANVAS_AGENT_RUN_INTERRUPTED'
+          }
+          changed = true
+        }
+
+        /** 已取得 mediaRunId 的节点只恢复原运行和下载收集，不重新提交媒体任务。 */
+        for (const node of run.nodes) {
+          if (node.status !== 'running' || node.execution?.kind !== 'media'
+            || !node.execution.mediaRunId) continue
+          const canvasNode = document.nodes.find((candidate): candidate is Extract<CanvasNode, {
+            kind: 'audio' | 'video'
+          }> => candidate.id === node.nodeId && (candidate.kind === 'audio' || candidate.kind === 'video'))
+          if (!canvasNode || !dependencies.mediaRuns?.reconcile) {
+            node.status = 'failed'
+            node.errorCode = 'CANVAS_MEDIA_RUN_INTERRUPTED'
+            changed = true
+            continue
+          }
+          const originalMediaRunId = node.execution.mediaRunId
+          const recovered = await dependencies.mediaRuns.reconcile({
+            ...target,
+            nodeId: node.nodeId,
+            mediaModuleId: canvasNode.mediaModuleId,
+            mediaKind: canvasNode.kind,
+            operationId: node.execution.operationId,
+            mediaRunId: originalMediaRunId,
+            context: executionContext,
+            workflowRunId: run.id,
+            signal: controller.signal,
+            deadlineAt,
+          })
+          if (recovered.mediaRunId !== originalMediaRunId) {
+            throw new Error('CANVAS_MEDIA_RUN_ID_MISMATCH')
+          }
+          node.execution.outputKeys = [...recovered.outputKeys]
+          node.status = recovered.status
+          node.errorCode = recovered.status === 'failed'
+            ? recovered.errorCode ?? 'CANVAS_MEDIA_RUN_FAILED'
+            : null
+          node.retryDisposition = recovered.status === 'failed'
+            ? recovered.retryable ? 'terminal-failed' : 'submission-unknown'
+            : 'none'
+          if (recovered.status === 'running') externalExecutionStillRunning = true
+          changed = true
+        }
+
+        /** 提交确认前崩溃只可按原 operationId 幂等重放。 */
+        for (const node of run.nodes) {
+          if (node.status === 'running' && node.execution?.kind === 'image'
+            && node.execution.batchId === null) {
+            node.status = 'ready'
+            changed = true
+          } else if (node.status === 'running' && node.execution?.kind === 'media'
+            && node.execution.mediaRunId === null) {
+            node.status = 'ready'
+            changed = true
+          }
+        }
+        if (changed) run = persistRun(run)
+        if (externalExecutionStillRunning) {
+          await dependencies.scheduleDurableResume?.({
+            ...target,
+            workflowRunId: run.id,
+            ownerSessionId: run.owner.sessionId,
+            resumeAt: deadlineAt,
+          })
+          break
+        }
+
+        if (dependencies.applyPreparedHandoffs) {
+          const prepared = await dependencies.applyPreparedHandoffs(run, document)
+          if (JSON.stringify(prepared) !== JSON.stringify(run)) {
+            run = publishSavedRun(dependencies.workflowRuns.savePreparedMediaAmendment(prepared, run.revision))
+          }
+        }
+
+        const reconciled = await reconcileCanvasWorkflowRun(run, document, {
+          isImageCandidateAdopted: dependencies.isImageCandidateAdopted ?? (() => ({
+            adopted: false, artifactHash: null, committedAt: null,
+          })),
+          isMediaOutputAdopted: dependencies.isMediaOutputAdopted,
+        })
+        /** 已完成上游使原正式下游变为待更新时，只重跑固定范围内该后继。 */
+        const completedIds = new Set(reconciled.run.nodes
+          .filter((node) => node.status === 'completed')
+          .map((node) => node.nodeId))
+        for (const node of reconciled.run.nodes) {
+          const current = document.nodes.find((candidate) => candidate.id === node.nodeId)
+          if (node.status === 'satisfied'
+            && current?.upstreamChange?.sourceNodeIds.some((nodeId) => completedIds.has(nodeId))) {
+            node.status = 'ready'
+          }
+        }
+        if (JSON.stringify(reconciled.run) !== JSON.stringify(run)) {
+          run = persistRun(reconciled.run)
+        } else {
+          run = reconciled.run
+        }
+        /** waiting-review 采用成功后才重新开始扣减执行时长。 */
+        if (run.status === 'running' && !deadlineState.handle) activateDurationBudget()
+        if (controller.signal.aborted) break
+
+        /** 恢复图片已提交任务时继续等待原 batch/task，不重投生成。 */
+        const waitingImage = run.nodes.find((node) => (
+          node.status === 'running'
+          && node.execution?.kind === 'image'
+          && node.execution.batchId !== null
+          && node.execution.taskId !== null
+        ))
+        if (waitingImage?.execution?.kind === 'image'
+          && waitingImage.execution.batchId
+          && waitingImage.execution.taskId) {
+          const batchId = waitingImage.execution.batchId
+          const taskId = waitingImage.execution.taskId
+          try {
+            const terminal = await dependencies.imageRuns.awaitBatch({
+              ...target,
+              batchId,
+              taskIds: [taskId],
+              signal: controller.signal,
+              deadlineAt,
+            })
+            const entry = terminal.entries.find((candidate) => (
+              candidate.nodeId === waitingImage.nodeId
+              && candidate.taskId === taskId
+            ))
+            if (entry?.status === 'candidate') {
+              waitingImage.status = 'waiting-adoption'
+              waitingImage.errorCode = null
+              waitingImage.retryDisposition = 'none'
+            } else {
+              waitingImage.status = 'failed'
+              waitingImage.errorCode = entry?.status === 'failed'
+                ? 'CANVAS_IMAGE_RUN_FAILED'
+                : 'CANVAS_IMAGE_RESULT_INVALID'
+              waitingImage.retryDisposition = entry?.status === 'failed'
+                ? 'terminal-failed'
+                : 'submission-unknown'
+            }
+          } catch (error) {
+            if (controller.signal.aborted) break
+            waitingImage.status = 'failed'
+            waitingImage.errorCode = stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED')
+            waitingImage.retryDisposition = 'submission-unknown'
+          }
+          run = persistRun(run)
+          continue
+        }
+
+        const readyAgentIds = reconciled.readyNodeIds.filter((nodeId) => (
+          run.nodes.find((node) => node.nodeId === nodeId)?.kind === 'agent'
+        )).slice(0, MAX_AGENT_CONCURRENCY)
+        if (readyAgentIds.length > 0) {
+          for (const nodeId of readyAgentIds) {
+            const node = run.nodes.find((candidate) => candidate.nodeId === nodeId)!
+            node.status = 'running'
+            node.execution = {
+              kind: 'agent',
+              operationId: createCanvasWorkflowNodeOperationId(
+                run.operationId, nodeId, 'agent', node.executionHistory?.length ?? 0,
+              ),
+            }
+          }
+          run = persistRun(run)
+          /** 子 Agent 可在运行中登记动态后继，完成回写前必须接管最新 journal revision。 */
+          const expectedAgentOperations = new Map(readyAgentIds.map((nodeId) => {
+            const execution = run.nodes.find((node) => node.nodeId === nodeId)?.execution
+            if (execution?.kind !== 'agent') throw new Error('CANVAS_AGENT_RUN_IDENTITY_INVALID')
+            return [nodeId, execution.operationId]
+          }))
+          const results = await Promise.allSettled(readyAgentIds.map((nodeId) => (
+            dependencies.agentExecution.execute({
+              mode: 'parent-orchestrated',
+              target: { ...target, nodeId },
+              parentSessionId: executionContext.sessionId,
+              expectedGraphRevision: document.revision,
+              parentWorkflow: { runId: run.id, parentSessionId: executionContext.sessionId },
+              instruction: run.goal,
+              userMessageUuid: (run.nodes.find((node) => node.nodeId === nodeId)?.executionHistory?.length ?? 0) > 0
+                ? expectedAgentOperations.get(nodeId)!
+                : run.operationId,
+              startedAt: run.owner.runStartedAt,
+              signal: controller.signal,
+            })
+          )))
+          run = dependencies.workflowRuns.get(target, run.id)
+          let agentCommitInterrupted = false
+          for (let index = 0; index < readyAgentIds.length; index += 1) {
+            const nodeId = readyAgentIds[index]!
+            const node = run.nodes.find((candidate) => candidate.nodeId === nodeId)
+            if (!node || node.status !== 'running' || node.execution?.kind !== 'agent'
+              || node.execution.operationId !== expectedAgentOperations.get(nodeId)) {
+              if (controller.signal.aborted || run.cancelRequestedAt !== null || run.status === 'cancelled') {
+                agentCommitInterrupted = true
+                break
+              }
+              throw new Error('CANVAS_AGENT_RUN_IDENTITY_INVALID')
+            }
+            const result = results[index]!
+            if (result.status === 'fulfilled' && result.value.status === 'completed' && result.value.output) {
+              node.status = 'completed'
+              node.errorCode = null
+              node.completedArtifactHash = hashAgentCompletion(result.value.output)
+              node.completedAt = result.value.output.pointer.completedAt
+              run.observedCanvasRevision = Math.max(run.observedCanvasRevision, result.value.output.revision)
+            } else if (result.status === 'fulfilled' && result.value.status === 'cancelled') {
+              node.status = 'cancelled'
+              node.errorCode = null
+            } else {
+              node.status = 'failed'
+              node.errorCode = result.status === 'rejected'
+                ? stableErrorCode(result.reason, 'CANVAS_AGENT_RUN_FAILED')
+                : 'CANVAS_AGENT_RUN_FAILED'
+              node.retryDisposition = result.status === 'fulfilled'
+                ? 'terminal-failed'
+                : 'submission-unknown'
+            }
+          }
+          if (agentCommitInterrupted) break
+          run = persistRun(run)
+          continue
+        }
+
+        const readyImageId = reconciled.readyNodeIds.find((nodeId) => (
+          run.nodes.find((node) => node.nodeId === nodeId)?.kind === 'image'
+        ))
+        if (readyImageId) {
+          const node = document.nodes.find((candidate): candidate is Extract<CanvasNode, { kind: 'image' }> => (
+            candidate.id === readyImageId && candidate.kind === 'image'
+          ))
+          const runNode = run.nodes.find((candidate) => candidate.nodeId === readyImageId)!
+          if (!node) throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+          const isReplay = runNode.execution?.kind === 'image'
+          const operationId = isReplay
+            ? runNode.execution!.operationId
+            : createCanvasWorkflowNodeOperationId(
+                run.operationId, readyImageId, 'image', runNode.executionHistory?.length ?? 0,
+              )
+          runNode.status = 'running'
+          runNode.execution = { kind: 'image', operationId, batchId: null, taskId: null }
+          if (!isReplay) {
+            run.budget.consumedMediaRuns += 1
+            run.budget.remainingMediaRuns -= 1
+          }
+          run = persistRun(run)
+          try {
+            const started = await dependencies.imageRuns.run(
+              executionContext, target, [node], operationId, { signal: controller.signal, deadlineAt },
+            )
+            const task = started.tasks.find((candidate) => candidate.nodeId === readyImageId)
+            if (!started.batch || !task?.taskId) throw new Error('CANVAS_IMAGE_BATCH_MISSING')
+            const persistedNode = run.nodes.find((candidate) => candidate.nodeId === readyImageId)!
+            persistedNode.execution = {
+              kind: 'image', operationId, batchId: started.batch.batchId, taskId: task.taskId,
+            }
+            run = persistRun(run)
+          } catch (error) {
+            if (controller.signal.aborted) break
+            const persistedNode = run.nodes.find((candidate) => candidate.nodeId === readyImageId)!
+            persistedNode.status = 'failed'
+            persistedNode.errorCode = stableErrorCode(error, 'CANVAS_IMAGE_RUN_FAILED')
+            persistedNode.retryDisposition = 'submission-unknown'
+            run = persistRun(run)
+          }
+          continue
+        }
+
+        const readyMediaIds = reconciled.readyNodeIds.filter((nodeId) => {
+          const kind = run.nodes.find((node) => node.nodeId === nodeId)?.kind
+          return kind === 'audio' || kind === 'video'
+        })
+        if (readyMediaIds.length > 0) {
+          const nodeId = readyMediaIds[0]!
+          const canvasNode = document.nodes.find((candidate): candidate is Extract<CanvasNode, {
+            kind: 'audio' | 'video'
+          }> => candidate.id === nodeId && (candidate.kind === 'audio' || candidate.kind === 'video'))
+          const runNode = run.nodes.find((candidate) => candidate.nodeId === nodeId)!
+          if (!canvasNode) throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+          if (!dependencies.mediaRuns) {
+            runNode.status = 'blocked'
+            runNode.errorCode = 'CANVAS_WORKFLOW_MEDIA_EXECUTOR_UNAVAILABLE'
+            run.status = 'partial'
+            run = persistRun(run)
+            break
+          }
+          const resolved = await dependencies.mediaRuns.resolveInputs({
+            ...target,
+            nodeId,
+            mediaModuleId: canvasNode.mediaModuleId,
+            mediaKind: canvasNode.kind,
+          })
+          const prepared = prepareCanvasWorkflowMediaInputs(run, nodeId, resolved)
+          const isReplay = runNode.execution?.kind === 'media'
+          const operationId = isReplay
+            ? runNode.execution!.operationId
+            : createCanvasWorkflowNodeOperationId(
+                run.operationId, nodeId, canvasNode.kind, runNode.executionHistory?.length ?? 0,
+              )
+          const preparedIndex = run.nodes.findIndex((candidate) => candidate.nodeId === nodeId)
+          prepared.node.status = 'running'
+          prepared.node.errorCode = null
+          prepared.node.execution = {
+            kind: 'media', operationId, mediaRunId: null, outputKeys: [],
+          }
+          run.nodes[preparedIndex] = prepared.node
+          if (!isReplay) {
+            run.budget.consumedMediaRuns += 1
+            run.budget.remainingMediaRuns -= 1
+          }
+          run = persistRun(run)
+          const expectedInputHashes = Object.fromEntries(prepared.node.inputBindings.map((binding) => [
+            binding.targetInputKey,
+            binding.resolvedValueHash!,
+          ]))
+          try {
+            const result = await dependencies.mediaRuns.run({
+              ...target,
+              nodeId,
+              mediaModuleId: canvasNode.mediaModuleId,
+              mediaKind: canvasNode.kind,
+              expectedConfigRevision: resolved.configRevision,
+              operationId,
+              resolvedValues: prepared.resolvedValues,
+              expectedInputHashes,
+              context: executionContext,
+              workflowRunId: run.id,
+              signal: controller.signal,
+            })
+            const persistedNode = run.nodes.find((candidate) => candidate.nodeId === nodeId)!
+            persistedNode.execution = {
+              kind: 'media',
+              operationId,
+              mediaRunId: result.mediaRunId,
+              outputKeys: [...result.outputKeys],
+            }
+            persistedNode.status = result.status
+            persistedNode.errorCode = result.status === 'failed'
+              ? result.errorCode ?? 'CANVAS_MEDIA_RUN_FAILED'
+              : null
+            persistedNode.retryDisposition = result.status === 'failed'
+              ? result.retryable ? 'terminal-failed' : 'submission-unknown'
+              : 'none'
+            run = persistRun(run)
+          } catch (error) {
+            if (controller.signal.aborted) break
+            const persistedNode = run.nodes.find((candidate) => candidate.nodeId === nodeId)!
+            persistedNode.status = 'failed'
+            persistedNode.errorCode = stableErrorCode(error, 'CANVAS_MEDIA_RUN_FAILED')
+            persistedNode.retryDisposition = 'submission-unknown'
+            run = persistRun(run)
+          }
+          continue
+        }
+
+        if (run.status === 'running') {
+          const hasWaitingApproval = run.nodes.some((node) => node.status === 'waiting-approval')
+          run.status = hasWaitingApproval ? 'partial' : 'failed'
+          run = persistRun(run)
+        }
+        break
+      }
+
+      if (controller.signal.aborted) {
+        run = deadlineExpired
+          ? pauseDurableRunForBudget(target, run.id, now())
+          : finalizeDurableCancellation(target, run.id, now(), false)
+      } else if (run.status !== 'running') {
+        /** review、审批或终态不占用执行预算。 */
+        pauseAndPersistDurationBudget()
+      }
+      return run
+    } catch (error) {
+      if (!controller.signal.aborted) throw error
+      return deadlineExpired
+        ? pauseDurableRunForBudget(target, run.id, now())
+        : finalizeDurableCancellation(target, run.id, now(), false)
+    } finally {
+      deadlineState.handle?.cancel()
+      parentSignal?.removeEventListener('abort', onParentAbort)
+      if (durableControllers.get(activeKey) === controller) durableControllers.delete(activeKey)
+      releaseLease()
+    }
+  }
+
+  /** 创建副作用完成后若无法正常扩展计划，保存精确失败节点或将当前分支置为失败。 */
+  const persistCreatedSuccessorFailure = async (
+    context: CanvasToolRunContext,
+    input: CanvasTarget & { nodeId: string; sourceToolCallId: string },
+    reasonCode: string,
+  ): Promise<CanvasWorkflowSuccessorRegistrationResult> => {
+    if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    const parentWorkflow = context.parentWorkflow
+    const branchTarget = context.canvasAgentTarget
+    if (context.canvasAgentMode !== 'parent-orchestrated' || !parentWorkflow || !branchTarget
+      || input.projectId !== context.projectId
+      || branchTarget.projectId !== input.projectId || branchTarget.canvasId !== input.canvasId
+      || !/^[A-Za-z0-9_-]{1,160}$/.test(input.nodeId)
+      || !/^[A-Za-z0-9_-]{1,160}$/.test(input.sourceToolCallId)) {
+      throw new Error('CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_CONTEXT_INVALID')
+    }
+    await dependencies.validateAccess(context, input.canvasId)
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const current = dependencies.workflowRuns.get(input, parentWorkflow.runId)
+      if (current.owner.sessionId !== parentWorkflow.parentSessionId
+        || current.owner.runStartedAt !== context.runStartedAt) {
+        throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+      }
+      if (current.cancelRequestedAt !== null || current.status !== 'running') {
+        return { status: 'blocked', workflowRunId: current.id, workflowRunRevision: current.revision,
+          reasonCode: 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_RUN_CLOSED' }
+      }
+      const document = await dependencies.load(input)
+      await dependencies.validateAccess(context, input.canvasId)
+      const branchCanvasNode = document.nodes.find((node) => node.id === branchTarget.nodeId)
+      const branchRunNode = current.nodes.find((node) => node.nodeId === branchTarget.nodeId)
+      if (branchCanvasNode?.kind !== 'agent' || branchCanvasNode.agentSessionId !== context.sessionId
+        || branchRunNode?.kind !== 'agent' || branchRunNode.status !== 'running'
+        || branchRunNode.execution?.kind !== 'agent') {
+        throw new Error('CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_BRANCH_INACTIVE')
+      }
+      const existing = current.nodes.find((node) => node.nodeId === input.nodeId)
+      if (existing) {
+        const createdNode = document.nodes.find((node) => node.id === input.nodeId)
+        if (!createdNode || createdNode.kind !== existing.kind
+          || createCanvasWorkflowNodeIdentityHash(createdNode) !== existing.identityHash) {
+          throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+        }
+        return existing.status === 'blocked'
+          ? { status: 'blocked', workflowRunId: current.id, workflowRunRevision: current.revision,
+              reasonCode: existing.errorCode ?? reasonCode }
+          : { status: 'already-registered', workflowRunId: current.id,
+              workflowRunRevision: current.revision, reasonCode: null }
+      }
+      try {
+        if (current.nodes.length < CANVAS_WORKFLOW_RUN_NODE_LIMIT) {
+          const blocked = createBlockedSuccessorAmendment(
+            current, document, branchTarget.nodeId, input.nodeId, reasonCode,
+          )
+          const saved = publishSavedRun(dependencies.workflowRuns.saveDynamicSuccessorAmendment(blocked, current.revision))
+          return { status: 'blocked', workflowRunId: saved.id, workflowRunRevision: saved.revision, reasonCode }
+        }
+        /** 节点上限下无法追加身份，至少让原父分支跨重启明确失败。 */
+        const failed = structuredClone(current)
+        const failedBranch = failed.nodes.find((node) => node.nodeId === branchTarget.nodeId)!
+        failedBranch.status = 'failed'
+        failedBranch.errorCode = reasonCode
+        failed.status = 'partial'
+        const saved = publishSavedRun(dependencies.workflowRuns.save(failed, current.revision))
+        return { status: 'blocked', workflowRunId: saved.id, workflowRunRevision: saved.revision, reasonCode }
+      } catch (error) {
+        if (!isWorkflowRunConflict(error) || attempt === 3) throw error
+      }
+    }
+    throw new Error('CANVAS_WORKFLOW_RUN_CONFLICT')
+  }
+
+  return {
+    execute: async (context, input, toolCallId, parentSignal) => {
+      if (dependencies.workflowRuns) {
+        const target = { projectId: context.projectId, canvasId: input.canvasId }
+        await dependencies.validateAccess(context, input.canvasId)
+        const document = await dependencies.load(target)
+        await dependencies.validateAccess(context, input.canvasId)
+        if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+        const snapshot = createCanvasWorkflowPlanSnapshot(document, input)
+        if (dependencies.mediaRuns) {
+          for (let index = 0; index < snapshot.nodes.length; index += 1) {
+            const plannedNode = snapshot.nodes[index]!
+            if (plannedNode.kind !== 'audio' && plannedNode.kind !== 'video') continue
+            const canvasNode = document.nodes.find((node) => node.id === plannedNode.nodeId)
+            if (!canvasNode || (canvasNode.kind !== 'audio' && canvasNode.kind !== 'video')) {
+              throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+            }
+            const resolved = await dependencies.mediaRuns.resolveInputs({
+              ...target,
+              nodeId: canvasNode.id,
+              mediaModuleId: canvasNode.mediaModuleId,
+              mediaKind: canvasNode.kind,
+            })
+            snapshot.nodes[index] = bindCanvasWorkflowMediaInputDeclarations(plannedNode, resolved)
+          }
+        }
+        for (const rootNodeId of snapshot.rootNodeIds) {
+          const rootNode = document.nodes.find((node) => node.id === rootNodeId)
+          if (rootNode?.kind === 'agent' && dependencies.isAgentBusy(rootNode)) throw new Error('SESSION_BUSY')
+        }
+        const run = dependencies.workflowRuns.create({
+          ...target,
+          operationId: toolCallId,
+          owner: { sessionId: context.sessionId, runStartedAt: context.runStartedAt },
+          initialCanvasRevision: document.revision,
+          rootNodeIds: snapshot.rootNodeIds,
+          goal: input.goal,
+          nodes: snapshot.nodes,
+          maxMediaRuns: input.maxImageRuns,
+          consumedMediaRuns: 0,
+          autoResumeAfterAdoption: true,
+        })
+        notifyRunChanged(run)
+        return projectDurableRunResult(await driveDurableRun(context, run, parentSignal))
+      }
       /** 目标身份只来自父运行项目和已解析输入 Canvas。 */
       const target = { projectId: context.projectId, canvasId: input.canvasId }
       const activeKey = `${target.projectId}\0${target.canvasId}`
@@ -828,526 +1659,204 @@ export function createCanvasWorkflowExecutionService(
         parentSignal?.removeEventListener('abort', onParentAbort)
         if (activeRuns.get(activeKey) === owner) activeRuns.delete(activeKey)
       }
-  }
-
-  const workflowRuns = dependencies.workflowRuns
-  /** 当前服务实例的持久执行控制器用于 owner cancel 精确终止等待。 */
-  const durableControllers = new Map<string, AbortController>()
-
-  /** 保存持久运行并接管 Store 分配的新 revision。 */
-  const persistRun = (run: CanvasWorkflowRun): CanvasWorkflowRun => {
-    if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
-    const saved = workflowRuns.save(run, run.revision)
-    dependencies.onRunChanged?.({
-      projectId: saved.projectId, canvasId: saved.canvasId,
-      runId: saved.id, revision: saved.revision,
-    })
-    return saved
-  }
-
-  /** 校验调用者仍来自创建该工作流的普通 Agent 会话。 */
-  const assertSessionOwner = (context: CanvasToolRunContext, run: CanvasWorkflowRun): void => {
-    if (run.projectId !== context.projectId
-      || run.owner.sessionId !== context.sessionId) {
-      throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
-    }
-  }
-
-  /** execute 的幂等重放必须仍属于首次父运行，防止复用旧 operation。 */
-  const assertOriginalOwner = (context: CanvasToolRunContext, run: CanvasWorkflowRun): void => {
-    assertSessionOwner(context, run)
-    if (run.owner.runStartedAt !== context.runStartedAt) {
-      throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
-    }
-  }
-
-  /** 验证固定计划仍指向相同业务节点，布局和标题变化不参与失效。 */
-  const assertPersistentGraphValid = (run: CanvasWorkflowRun, document: CanvasDocument): void => {
-    const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
-    for (const runNode of run.nodes) {
-      const node = nodesById.get(runNode.nodeId)
-      if (!node || node.kind !== runNode.kind || stableHash(nodeIdentity(node)) !== runNode.identityHash) {
-        throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+    },
+    resume: async (context, input, signal) => {
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+      if (input.projectId !== context.projectId) throw new Error('CANVAS_WORKFLOW_RUN_TARGET_INVALID')
+      await dependencies.validateAccess(context, input.canvasId)
+      const hasAmendment = input.expectedRunRevision !== undefined
+        || input.resumeOperationId !== undefined
+        || input.addDurationMs !== undefined
+        || input.addMediaRuns !== undefined
+        || input.retryNodeIds !== undefined
+      if ((input.expectedRunRevision === undefined) !== (input.resumeOperationId === undefined)) {
+        throw new Error('CANVAS_WORKFLOW_RESUME_AMENDMENT_INVALID')
       }
-      if (runNode.status === 'satisfied' && nodeArtifactHash(node) !== runNode.plannedArtifactHash) {
-        throw new Error('CANVAS_WORKFLOW_INPUT_CHANGED')
+      let run = dependencies.workflowRuns.get(input, input.runId)
+      if (run.owner.sessionId !== context.sessionId) {
+        throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
       }
-      if (runNode.status === 'completed' && runNode.kind === 'agent'
-        && nodeArtifactHash(node) !== runNode.completedArtifactHash) {
-        throw new Error('CANVAS_WORKFLOW_OUTPUT_CHANGED')
+      if (hasAmendment) {
+        if (signal?.aborted) throw new Error('CANVAS_WORKFLOW_ABORTED')
+        if (input.expectedRunRevision === undefined || input.resumeOperationId === undefined) {
+          throw new Error('CANVAS_WORKFLOW_RESUME_AMENDMENT_INVALID')
+        }
+        run = publishSavedRun(dependencies.workflowRuns.amendForResume({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          runId: input.runId,
+          expectedRevision: input.expectedRunRevision,
+          operationId: input.resumeOperationId,
+          addDurationMs: input.addDurationMs ?? 0,
+          addMediaRuns: input.addMediaRuns ?? 0,
+          retryNodeIds: input.retryNodeIds ?? [],
+        }))
       }
-      const currentBindings = document.edges.flatMap((edge) => {
-        if (edge.targetNodeId !== runNode.nodeId || edge.relation === 'association') return []
-        const source = nodesById.get(edge.sourceNodeId)
-        if (!source) throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
-        const resolution = resolveCanvasEdgeBinding(edge, source.kind, node.kind)
-        if (resolution.state !== 'bound') throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
-        return [{
-          targetInputKey: `${resolution.targetSlot}:${edge.id}`,
-          sourceNodeId: source.id,
-          sourceOutputKey: resolution.sourceCapability,
-        }]
-      }).sort((left, right) => left.targetInputKey.localeCompare(right.targetInputKey))
-      const plannedBindings = runNode.inputBindings.map((binding) => ({
-        targetInputKey: binding.targetInputKey,
-        sourceNodeId: binding.sourceNodeId,
-        sourceOutputKey: binding.sourceOutputKey,
-      })).sort((left, right) => left.targetInputKey.localeCompare(right.targetInputKey))
-      if (JSON.stringify(currentBindings) !== JSON.stringify(plannedBindings)) {
-        throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
-      }
-    }
-  }
-
-  /** 在副作用前固化直接上游正式产物哈希，恢复时拒绝输入漂移。 */
-  const freezePersistentInputs = (
-    node: CanvasWorkflowRunNode,
-    run: CanvasWorkflowRun,
-    document: CanvasDocument,
-  ): void => {
-    const documentNodes = new Map(document.nodes.map((candidate) => [candidate.id, candidate]))
-    for (const binding of node.inputBindings) {
-      if (!binding.sourceNodeId) continue
-      const sourceRunNode = run.nodes.find((candidate) => candidate.nodeId === binding.sourceNodeId)
-      const sourceDocumentNode = documentNodes.get(binding.sourceNodeId)
-      const artifactHash = sourceRunNode?.completedArtifactHash
-        ?? sourceRunNode?.plannedArtifactHash
-        ?? (sourceDocumentNode ? nodeArtifactHash(sourceDocumentNode) : null)
-      if (!artifactHash) throw new Error('CANVAS_WORKFLOW_INPUT_UNAVAILABLE')
-      if ((binding.sourceArtifactHash !== null && binding.sourceArtifactHash !== artifactHash)
-        || (binding.resolvedValueHash !== null && binding.resolvedValueHash !== artifactHash)) {
-        throw new Error('CANVAS_WORKFLOW_INPUT_CHANGED')
-      }
-      binding.sourceArtifactHash = artifactHash
-      binding.resolvedValueHash = artifactHash
-    }
-  }
-
-  /** 根据节点终态收敛运行状态，等待采用保持人工边界。 */
-  const reconcileRunStatus = (run: CanvasWorkflowRun): void => {
-    if (run.status === 'cancelled') return
-    if (run.nodes.some((node) => node.status === 'waiting-adoption')) {
-      run.status = 'waiting-review'
-      return
-    }
-    if (run.nodes.every((node) => node.status === 'satisfied' || node.status === 'completed')) {
-      run.status = 'completed'
-      return
-    }
-    if (run.nodes.some((node) => (
-      node.status === 'failed' || node.status === 'blocked'
-      || node.status === 'waiting-approval' || node.status === 'cancelled'
-    ))) {
-      run.status = 'partial'
-      return
-    }
-    run.status = 'running'
-  }
-
-  /** 固化恢复期间发现的 Agent 输出漂移，让 UI 可明确提示重新规划。 */
-  const failRecoveredAgentOutputChanged = (
-    run: CanvasWorkflowRun,
-    node: CanvasWorkflowRunNode,
-  ): never => {
-    node.status = 'failed'
-    node.errorCode = 'CANVAS_WORKFLOW_OUTPUT_CHANGED'
-    node.completedArtifactHash = null
-    node.completedAt = null
-    reconcileRunStatus(run)
-    persistRun(run)
-    throw new Error('CANVAS_WORKFLOW_OUTPUT_CHANGED')
-  }
-
-  /** 在跨进程租约内恢复原子任务并推进到下一个人工边界。 */
-  const drivePersistentRun = async (
-    context: CanvasToolRunContext,
-    initialRun: CanvasWorkflowRun,
-    parentSignal?: AbortSignal,
-  ): Promise<CanvasWorkflowRun> => {
-    if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
-    assertSessionOwner(context, initialRun)
-    const target = { projectId: initialRun.projectId, canvasId: initialRun.canvasId }
-    const releaseLease = workflowRuns.acquireLease(target, initialRun.id)
-    if (!releaseLease) return workflowRuns.get(target, initialRun.id)
-    const controller = new AbortController()
-    const onParentAbort = (): void => controller.abort('parent')
-    parentSignal?.addEventListener('abort', onParentAbort, { once: true })
-    if (parentSignal?.aborted) controller.abort('parent')
-    durableControllers.set(initialRun.id, controller)
-    let run = workflowRuns.get(target, initialRun.id)
-    let deadlineExpired = false
-    const deadlineMs = Math.max(1, run.budget.remainingDurationMs)
-    const deadlineAt = now() + deadlineMs
-    const deadline = setDeadline(() => {
-      deadlineExpired = true
-      controller.abort('deadline')
-    }, deadlineMs)
-
-    /** 异步结果提交前重新读取取消事实，迟到结果只能保留外部产物。 */
-    const reloadBeforeCommit = (): boolean => {
-      const fresh = workflowRuns.get(target, run.id)
-      if (fresh.status === 'cancelled') {
-        run = fresh
-        return false
-      }
-      if (fresh.revision !== run.revision) {
-        run = fresh
-        return false
-      }
-      return true
-    }
-
-    try {
-      if (run.status === 'cancelled' || run.status === 'completed') return run
-      if (run.budget.activeStartedAt === null) {
-        run.budget.activeStartedAt = now()
-        run = persistRun(run)
-      }
-      await dependencies.validateAccess(context, run.canvasId)
-      let document = await dependencies.load(target)
-      await dependencies.validateAccess(context, run.canvasId)
-      assertPersistentGraphValid(run, document)
-      run.observedCanvasRevision = Math.max(run.observedCanvasRevision, document.revision)
-
-      /** 先对账已完成候选；采用只改变状态，不自动触发本函数。 */
-      if (dependencies.isImageCandidateAdopted) {
+      if (!signal?.aborted && run.status !== 'completed' && run.status !== 'cancelled'
+        && run.cancelRequestedAt === null) {
+        /** 未取得提交回执时只重放原 operation；已有远端 ID 则只恢复原任务。 */
+        let shouldRecoverUnknownSubmission = false
         for (const node of run.nodes) {
-          if (node.status !== 'waiting-adoption' || node.execution?.kind !== 'image'
-            || !node.execution.batchId || !node.execution.taskId) continue
-          const adoption = await dependencies.isImageCandidateAdopted({
-            ...target,
-            nodeId: node.nodeId,
-            batchId: node.execution.batchId,
-            taskId: node.execution.taskId,
-          })
-          if (!adoption.adopted) continue
-          if (!adoption.artifactHash || !adoption.committedAt) {
-            node.status = 'failed'
-            node.errorCode = 'CANVAS_IMAGE_ADOPTION_INVALID'
+          if (node.status !== 'failed' || node.retryDisposition !== 'submission-unknown') continue
+          if (node.execution?.kind === 'image') {
+            node.status = node.execution.batchId && node.execution.taskId ? 'running' : 'ready'
+          } else if (node.execution?.kind === 'media') {
+            node.status = node.execution.mediaRunId ? 'running' : 'ready'
           } else {
-            node.status = 'completed'
-            node.errorCode = null
-            node.completedArtifactHash = adoption.artifactHash
-            node.completedAt = adoption.committedAt
-          }
-          run = persistRun(run)
-        }
-      }
-
-      /** 进程崩溃后先按稳定身份对账原 Agent，提交未知时绝不重放。 */
-      let agentStillRunning = false
-      for (const node of run.nodes) {
-        if (node.status !== 'running' || node.execution?.kind !== 'agent') continue
-        const canvasNode = document.nodes.find((candidate): candidate is Extract<CanvasNode, { kind: 'agent' }> => (
-          candidate.id === node.nodeId && candidate.kind === 'agent'
-        ))
-        if (!canvasNode || !dependencies.recoverAgentExecution) {
-          node.status = 'failed'
-          node.errorCode = 'CANVAS_AGENT_RUN_OUTCOME_UNKNOWN'
-          continue
-        }
-        const recovered = await dependencies.recoverAgentExecution({
-          ...target,
-          nodeId: node.nodeId,
-          agentSessionId: canvasNode.agentSessionId,
-          operationId: node.execution.operationId,
-          expectedUserMessageUuid: run.operationId,
-          expectedStartedAt: run.owner.runStartedAt,
-        })
-        if (recovered.status === 'running') {
-          agentStillRunning = true
-        } else if (recovered.status === 'changed') {
-          failRecoveredAgentOutputChanged(run, node)
-        } else if (recovered.status === 'completed'
-          && recovered.output.target.projectId === target.projectId
-          && recovered.output.target.canvasId === target.canvasId
-          && recovered.output.target.nodeId === node.nodeId
-          && recovered.output.pointer.completedAt >= run.owner.runStartedAt) {
-          node.status = 'completed'
-          node.errorCode = null
-          node.completedArtifactHash = recovered.output.pointer.contentSha256
-          node.completedAt = recovered.output.pointer.completedAt
-          run.observedCanvasRevision = Math.max(run.observedCanvasRevision, recovered.output.revision)
-          /** 恢复等待期间正式输出可能被其它运行替换，推进任何下游前复查当前图。 */
-          document = await dependencies.load(target)
-          await dependencies.validateAccess(context, run.canvasId)
-          /** 当前节点仍存在但正式指纹变化时先固化可重规划终态，再向调用方返回冲突。 */
-          const refreshedNode = document.nodes.find((candidate): candidate is Extract<CanvasNode, { kind: 'agent' }> => (
-            candidate.id === node.nodeId && candidate.kind === 'agent'
-            && candidate.agentSessionId === canvasNode.agentSessionId
-          ))
-          if (refreshedNode
-            && nodeArtifactHash(refreshedNode) !== recovered.output.pointer.contentSha256) {
-            failRecoveredAgentOutputChanged(run, node)
-          }
-          assertPersistentGraphValid(run, document)
-        } else {
-          node.status = 'failed'
-          node.errorCode = 'CANVAS_AGENT_RUN_OUTCOME_UNKNOWN'
-        }
-      }
-      if (agentStillRunning || run.nodes.some((node) => node.errorCode === 'CANVAS_AGENT_RUN_OUTCOME_UNKNOWN')) {
-        reconcileRunStatus(run)
-        return persistRun(run)
-      }
-
-      while (!controller.signal.aborted) {
-        /** 已有精确图片批次时只等待原任务，不创建新消费。 */
-        const runningImage = run.nodes.find((node) => (
-          node.status === 'running' && node.execution?.kind === 'image'
-        ))
-        if (runningImage?.execution?.kind === 'image') {
-          const operationId = runningImage.execution.operationId
-          let batchId = runningImage.execution.batchId
-          let taskId = runningImage.execution.taskId
-          const canvasNode = document.nodes.find((node): node is Extract<CanvasNode, { kind: 'image' }> => (
-            node.id === runningImage.nodeId && node.kind === 'image'
-          ))
-          if (!canvasNode) throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
-          if (!batchId || !taskId) {
-            const started = await dependencies.imageRuns.run(
-              context, target, [canvasNode], operationId, { signal: controller.signal, deadlineAt },
-            )
-            const task = started.tasks.find((candidate) => candidate.nodeId === runningImage.nodeId)
-            if (!started.batch || !task?.taskId) throw new Error('CANVAS_IMAGE_BATCH_MISSING')
-            if (!reloadBeforeCommit()) break
-            batchId = started.batch.batchId
-            taskId = task.taskId
-            runningImage.execution = { kind: 'image', operationId, batchId, taskId }
-            run = persistRun(run)
-          }
-          const terminal = await dependencies.imageRuns.awaitBatch({
-            ...target, batchId, taskIds: [taskId], signal: controller.signal, deadlineAt,
-          })
-          if (!reloadBeforeCommit()) break
-          const entry = terminal.entries.find((candidate) => (
-            candidate.nodeId === runningImage.nodeId && candidate.taskId === taskId
-          ))
-          if (entry?.status === 'candidate') {
-            runningImage.status = 'waiting-adoption'
-            runningImage.errorCode = null
-          } else {
-            runningImage.status = 'failed'
-            runningImage.errorCode = entry?.status === 'failed'
-              ? 'CANVAS_IMAGE_RUN_FAILED' : 'CANVAS_IMAGE_RESULT_INVALID'
-          }
-          run = persistRun(run)
-          continue
-        }
-
-        const readyAgents = run.nodes.filter((node) => (
-          node.kind === 'agent' && node.status === 'ready' && isPersistentNodeReady(node, run)
-        )).slice(0, MAX_AGENT_CONCURRENCY)
-        if (readyAgents.length > 0) {
-          for (const node of readyAgents) {
-            freezePersistentInputs(node, run, document)
-            node.status = 'running'
-            node.execution = {
-              kind: 'agent',
-              operationId: `workflow-node-${stableHash(['agent', run.operationId, node.nodeId])}`,
-            }
-          }
-          run = persistRun(run)
-          const results = await Promise.allSettled(readyAgents.map((node) => (
-            dependencies.agentExecution.execute({
-              mode: 'parent-orchestrated',
-              target: { ...target, nodeId: node.nodeId },
-              parentSessionId: context.sessionId,
-              expectedGraphRevision: document.revision,
-              instruction: run.goal,
-              userMessageUuid: run.operationId,
-              startedAt: run.owner.runStartedAt,
-              signal: controller.signal,
-            })
-          )))
-          if (!reloadBeforeCommit()) break
-          for (let index = 0; index < readyAgents.length; index += 1) {
-            const node = run.nodes.find((candidate) => candidate.nodeId === readyAgents[index]!.nodeId)!
-            const result = results[index]!
-            if (result.status === 'fulfilled' && result.value.status === 'completed' && result.value.output) {
-              node.status = 'completed'
-              node.errorCode = null
-              node.completedArtifactHash = result.value.output.pointer.contentSha256
-              node.completedAt = result.value.output.pointer.completedAt
-              run.observedCanvasRevision = Math.max(run.observedCanvasRevision, result.value.output.revision)
-            } else if (result.status === 'fulfilled' && result.value.status === 'cancelled') {
-              node.status = 'cancelled'
-              node.errorCode = null
-            } else {
-              node.status = 'failed'
-              node.errorCode = result.status === 'rejected'
-                ? stableErrorCode(result.reason, 'CANVAS_AGENT_RUN_FAILED')
-                : 'CANVAS_AGENT_RUN_FAILED'
-            }
-          }
-          run = persistRun(run)
-          if (controller.signal.aborted) break
-          document = await dependencies.load(target)
-          assertPersistentGraphValid(run, document)
-          run.observedCanvasRevision = Math.max(run.observedCanvasRevision, document.revision)
-          continue
-        }
-
-        const readyImage = run.nodes.find((node) => (
-          node.kind === 'image' && node.status === 'ready' && isPersistentNodeReady(node, run)
-        ))
-        if (readyImage) {
-          if (run.budget.remainingMediaRuns === 0) {
-            readyImage.status = 'waiting-approval'
-            run = persistRun(run)
             continue
           }
-          freezePersistentInputs(readyImage, run, document)
-          readyImage.status = 'running'
-          readyImage.execution = {
-            kind: 'image',
-            operationId: createWorkflowImageOperationId(run.operationId, readyImage.nodeId),
-            batchId: null,
-            taskId: null,
-          }
-          run.budget.consumedMediaRuns += 1
-          run.budget.remainingMediaRuns -= 1
-          run = persistRun(run)
-          continue
+          node.errorCode = null
+          shouldRecoverUnknownSubmission = true
         }
-        break
-      }
-
-      run = workflowRuns.get(target, run.id)
-      if (run.status !== 'cancelled') {
-        if (controller.signal.aborted) {
-          for (const node of run.nodes) {
-            if (node.status === 'ready' || node.status === 'running') {
-              node.status = 'cancelled'
-              node.errorCode = null
-            }
-          }
-          run.status = 'cancelled'
-          run.cancelRequestedAt = run.cancelRequestedAt ?? now()
-          run.cancelledAt = now()
-        } else {
-          reconcileRunStatus(run)
+        if (shouldRecoverUnknownSubmission) {
+          run.status = 'running'
+          run = publishSavedRun(dependencies.workflowRuns.saveExecutionProgress(run, run.revision))
         }
-        const elapsed = run.budget.activeStartedAt === null
-          ? 0 : Math.max(0, now() - run.budget.activeStartedAt)
-        run.budget.remainingDurationMs = Math.max(0, run.budget.remainingDurationMs - elapsed)
-        run.budget.activeStartedAt = null
-        run = persistRun(run)
       }
-      if (deadlineExpired && run.status !== 'cancelled') {
-        throw new Error('CANVAS_WORKFLOW_TIMEOUT')
-      }
-      return run
-    } finally {
-      deadline.cancel()
-      durableControllers.delete(initialRun.id)
-      parentSignal?.removeEventListener('abort', onParentAbort)
-      releaseLease()
-    }
-  }
-
-  /** 持久入口先幂等创建固定计划，再由跨进程租约推进。 */
-  const executePersistent = async (
-    context: CanvasToolRunContext,
-    input: CanvasRunWorkflowInput,
-    toolCallId: string,
-    signal?: AbortSignal,
-  ): Promise<CanvasRunWorkflowResult> => {
-    if (!workflowRuns) return executeVolatile(context, input, toolCallId, signal)
-    const target = { projectId: context.projectId, canvasId: input.canvasId }
-    /** operation 查找必须带完整父运行身份，避免其它 session 或代次的同名工具调用占位。 */
-    const owner = { sessionId: context.sessionId, runStartedAt: context.runStartedAt }
-    await dependencies.validateAccess(context, input.canvasId)
-    const existing = workflowRuns.findByOperation(target, toolCallId, owner)
-    if (existing) {
-      assertOriginalOwner(context, existing)
-      return projectPersistentResult(await drivePersistentRun(context, existing, signal))
-    }
-    const document = await dependencies.load(target)
-    await dependencies.validateAccess(context, input.canvasId)
-    if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
-    const plan = createCanvasWorkflowGraphPlan({
-      document, startNodeIds: input.startNodeIds, maxImageRuns: input.maxImageRuns,
-    })
-    for (const rootNodeId of plan.rootNodeIds) {
-      const rootNode = document.nodes.find((node): node is Extract<CanvasNode, { kind: 'agent' }> => (
-        node.id === rootNodeId && node.kind === 'agent'
-      ))
-      if (rootNode && dependencies.isAgentBusy(rootNode)) throw new Error('SESSION_BUSY')
-    }
-    const run = workflowRuns.create({
-      ...target,
-      operationId: toolCallId,
-      owner,
-      initialCanvasRevision: document.revision,
-      rootNodeIds: plan.rootNodeIds,
-      goal: input.goal,
-      nodes: createPersistentNodes(document, plan),
-      maxMediaRuns: input.maxImageRuns,
-      consumedMediaRuns: 0,
-      maxDurationMs: CANVAS_WORKFLOW_TIMEOUT_MS,
-      autoResumeAfterAdoption: false,
-    })
-    dependencies.onRunChanged?.({
-      projectId: run.projectId, canvasId: run.canvasId, runId: run.id, revision: run.revision,
-    })
-    return projectPersistentResult(await drivePersistentRun(context, run, signal))
-  }
-
-  return {
-    execute: executePersistent,
-    resume: async (context, input, signal) => {
-      if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
-      if (input.projectId !== context.projectId) throw new Error('CANVAS_WORKFLOW_RUN_TARGET_INVALID')
-      await dependencies.validateAccess(context, input.canvasId)
-      const run = workflowRuns.get(input, input.runId)
-      assertSessionOwner(context, run)
-      return projectPersistentResult(await drivePersistentRun(context, run, signal))
+      return projectDurableRunResult(await driveDurableRun(context, run, signal))
     },
     cancel: async (context, input) => {
-      if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
       if (input.projectId !== context.projectId) throw new Error('CANVAS_WORKFLOW_RUN_TARGET_INVALID')
       await dependencies.validateAccess(context, input.canvasId)
-      let run = workflowRuns.get(input, input.runId)
-      assertSessionOwner(context, run)
-      if (run.status === 'cancelled') return run
-      durableControllers.get(run.id)?.abort('cancel')
+      let run = dependencies.workflowRuns.get(input, input.runId)
+      if (run.owner.sessionId !== context.sessionId) throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+      if (run.status === 'cancelled' || run.status === 'completed') return run
+      const timestamp = now()
+      run = requestDurableCancellation(input, input.runId, timestamp)
+      if (run.status === 'cancelled' || run.status === 'completed') return run
+      durableControllers.get(`${input.projectId}\0${input.canvasId}`)?.abort('cancel')
+      /** 各外部清理互相隔离；取消事实不能被单个适配器异常反转。 */
+      const cleanupTasks: Promise<unknown>[] = []
       for (const node of run.nodes) {
         if (node.status === 'running' && node.execution?.kind === 'image'
-          && node.execution.batchId && node.execution.taskId && dependencies.imageRuns.cancelTasks) {
-          await dependencies.imageRuns.cancelTasks({
-            ...input,
-            batchId: node.execution.batchId,
-            taskIds: [node.execution.taskId],
-          })
+          && node.execution.batchId && node.execution.taskId) {
+          const batchId = node.execution.batchId
+          const taskId = node.execution.taskId
+          cleanupTasks.push(Promise.resolve().then(() => dependencies.imageRuns.cancelTasks({
+            projectId: input.projectId, canvasId: input.canvasId, batchId, taskIds: [taskId],
+          })))
         }
       }
-      run = workflowRuns.get(input, input.runId)
-      if (run.status === 'cancelled') return run
-      const timestamp = now()
-      for (const node of run.nodes) {
-        if (node.status === 'ready' || node.status === 'running' || node.status === 'waiting-approval') {
-          node.status = 'cancelled'
-          node.errorCode = null
-        }
+      const mediaRuns = dependencies.mediaRuns
+      if (mediaRuns) {
+        cleanupTasks.push((async () => {
+          let document: CanvasDocument
+          try {
+            document = await dependencies.load(input)
+          } catch {
+            /** 文档读取失败时仍继续图片清理与 journal 终态收敛。 */
+            return
+          }
+          /** 同一工作流内的远端媒体取消也逐项隔离。 */
+          const mediaCleanupTasks: Promise<unknown>[] = []
+          for (const node of run.nodes) {
+            if (node.status !== 'running' || node.execution?.kind !== 'media'
+              || !node.execution.mediaRunId || (node.kind !== 'audio' && node.kind !== 'video')) continue
+            const canvasNode = document.nodes.find((candidate) => candidate.id === node.nodeId)
+            if (!canvasNode || (canvasNode.kind !== 'audio' && canvasNode.kind !== 'video')) continue
+            const mediaRunId = node.execution.mediaRunId
+            mediaCleanupTasks.push(Promise.resolve().then(() => mediaRuns.cancel({
+              projectId: input.projectId, canvasId: input.canvasId, nodeId: node.nodeId,
+              mediaModuleId: canvasNode.mediaModuleId, mediaKind: canvasNode.kind, mediaRunId,
+            })))
+          }
+          await Promise.allSettled(mediaCleanupTasks)
+        })())
       }
-      run.cancelRequestedAt = run.cancelRequestedAt ?? timestamp
-      run.cancelledAt = timestamp
-      run.status = 'cancelled'
-      return persistRun(run)
+      await Promise.allSettled(cleanupTasks)
+      return finalizeDurableCancellation(input, input.runId, timestamp, false)
     },
+    registerCreatedSuccessor: async (context, input) => {
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+      const parentWorkflow = context.parentWorkflow
+      const branchTarget = context.canvasAgentTarget
+      if (context.canvasAgentMode !== 'parent-orchestrated' || !parentWorkflow || !branchTarget
+        || input.projectId !== context.projectId
+        || branchTarget.projectId !== input.projectId || branchTarget.canvasId !== input.canvasId
+        || !/^[A-Za-z0-9_-]{1,160}$/.test(input.nodeId)
+        || !/^[A-Za-z0-9_-]{1,160}$/.test(input.sourceToolCallId)) {
+        throw new Error('CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_CONTEXT_INVALID')
+      }
+      await dependencies.validateAccess(context, input.canvasId)
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const current = dependencies.workflowRuns.get(input, parentWorkflow.runId)
+        if (current.owner.sessionId !== parentWorkflow.parentSessionId
+          || current.owner.runStartedAt !== context.runStartedAt) {
+          throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+        }
+        if (current.cancelRequestedAt !== null || current.status !== 'running') {
+          return {
+            status: 'blocked', workflowRunId: current.id,
+            workflowRunRevision: current.revision,
+            reasonCode: 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_RUN_CLOSED',
+          }
+        }
+        const document = await dependencies.load(input)
+        await dependencies.validateAccess(context, input.canvasId)
+        const branchCanvasNode = document.nodes.find((node) => node.id === branchTarget.nodeId)
+        const branchRunNode = current.nodes.find((node) => node.nodeId === branchTarget.nodeId)
+        if (branchCanvasNode?.kind !== 'agent' || branchCanvasNode.agentSessionId !== context.sessionId
+          || branchRunNode?.kind !== 'agent' || branchRunNode.status !== 'running'
+          || branchRunNode.execution?.kind !== 'agent') {
+          throw new Error('CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_BRANCH_INACTIVE')
+        }
+        const existing = current.nodes.find((node) => node.nodeId === input.nodeId)
+        if (existing) {
+          const createdNode = document.nodes.find((node) => node.id === input.nodeId)
+          if (!createdNode || createdNode.kind !== existing.kind
+            || createCanvasWorkflowNodeIdentityHash(createdNode) !== existing.identityHash) {
+            throw new Error('CANVAS_WORKFLOW_GRAPH_CHANGED')
+          }
+          return existing.status === 'blocked'
+            ? { status: 'blocked', workflowRunId: current.id, workflowRunRevision: current.revision,
+                reasonCode: existing.errorCode ?? 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_REGISTRATION_FAILED' }
+            : { status: 'already-registered', workflowRunId: current.id,
+                workflowRunRevision: current.revision, reasonCode: null }
+        }
+        let amended: CanvasWorkflowRun
+        try {
+          amended = createCanvasWorkflowDynamicSuccessorAmendment(
+            current, document, branchTarget.nodeId, input.nodeId,
+          )
+        } catch (error) {
+          return persistCreatedSuccessorFailure(context, input,
+            stableErrorCode(error, 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_INVALID'))
+        }
+        try {
+          const saved = publishSavedRun(dependencies.workflowRuns.saveDynamicSuccessorAmendment(amended, current.revision))
+          return {
+            status: 'registered', workflowRunId: saved.id,
+            workflowRunRevision: saved.revision, reasonCode: null,
+          }
+        } catch (error) {
+          if (!isWorkflowRunConflict(error) || attempt === 3) throw error
+        }
+      }
+      throw new Error('CANVAS_WORKFLOW_RUN_CONFLICT')
+    },
+    recordCreatedSuccessorRegistrationFailure: async (context, input) => (
+      persistCreatedSuccessorFailure(
+        context,
+        input,
+        'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_REGISTRATION_FAILED',
+      )
+    ),
     get: async (context, input) => {
-      if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
       if (input.projectId !== context.projectId) throw new Error('CANVAS_WORKFLOW_RUN_TARGET_INVALID')
       await dependencies.validateAccess(context, input.canvasId)
-      const run = workflowRuns.get(input, input.runId)
-      assertSessionOwner(context, run)
-      return run
+      return dependencies.workflowRuns.get(input, input.runId)
     },
-    list: async (context, canvasId, options) => {
-      if (!workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+    list: async (context, canvasId) => {
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
       await dependencies.validateAccess(context, canvasId)
-      return workflowRuns.listPage(
+      return dependencies.workflowRuns.list({ projectId: context.projectId, canvasId })
+    },
+    listPage: async (context, canvasId, options) => {
+      if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
+      await dependencies.validateAccess(context, canvasId)
+      return dependencies.workflowRuns.listPage(
         { projectId: context.projectId, canvasId },
         { ...options, ownerSessionId: context.sessionId },
       )

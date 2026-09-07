@@ -314,7 +314,7 @@ describe('原生 Canvas 大画布性能预算', () => {
 
     expect(captured?.onlyRenderVisibleElements).toBe(true)
     expect(Object.keys(captured?.nodeTypes ?? {}).sort()).toEqual([
-      'canvasAgent', 'canvasDocument', 'canvasImage', 'canvasWebview',
+      'canvasAgent', 'canvasDocument', 'canvasImage', 'canvasMedia', 'canvasWebview',
     ])
   })
 

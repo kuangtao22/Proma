@@ -10,6 +10,10 @@ import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNE
 import { createLanBridgePreloadApi } from './lan-bridge-preload'
 import type { LanBridgePreloadApi } from './lan-bridge-preload'
 import { createDesignPreloadApi } from './design-preload'
+import { createMediaPreloadApi } from './media-preload'
+import { createCanvasMediaPreloadApi } from './canvas-media-preload'
+import type { CanvasMediaPreloadApi } from '@proma/shared'
+import type { MediaPreloadApi } from '@proma/shared'
 import type { DesignPreloadApi } from './design-preload'
 import { createNormalPathManagementPreloadApi } from './path-management-preload'
 import type { NormalPathManagementPreloadApi } from './path-management-preload'
@@ -268,7 +272,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload {
+export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload, MediaPreloadApi, CanvasMediaPreloadApi {
   // ===== 运行时相关 =====
 
   /**
@@ -1484,6 +1488,16 @@ const electronAPI: ElectronAPI = {
     const bridge = (_event: unknown, value: unknown): void => listener(value)
     ipcRenderer.on(channel, bridge)
     return () => ipcRenderer.removeListener(channel, bridge)
+  }),
+  ...createCanvasMediaPreloadApi((channel, input) => ipcRenderer.invoke(channel, input), (channel, callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: unknown): void => callback(value)
+    ipcRenderer.on(channel, listener)
+    return () => ipcRenderer.removeListener(channel, listener)
+  }),
+  ...createMediaPreloadApi((channel, input) => ipcRenderer.invoke(channel, input), (channel, callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, value: unknown): void => { callback(value) }
+    ipcRenderer.on(channel, listener)
+    return () => { ipcRenderer.removeListener(channel, listener) }
   }),
   ...pathManagementPreloadApi,
   ...designPreloadApi,

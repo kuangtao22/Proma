@@ -9,6 +9,22 @@ import {
 import * as imageModelSettingsModule from './ImageGenerationModelSettings'
 import * as toolSettingsModule from './ToolSettings'
 
+/** 新媒体页期望的独立条目视图合同。 */
+interface ExpectedIndependentCatalogModule {
+  ImageGenerationModelCatalogView: (props: {
+    profiles: ImageGenerationModelProfile[]
+    channelOptions: ImageGenerationModelCatalogResult['channelOptions']
+    credentialsConfigured: boolean
+    saving: boolean
+    onSaveProfiles: (profiles: ImageGenerationModelProfile[]) => void
+  }) => React.ReactElement
+}
+
+/** 通过期望合同访问待实现的独立条目视图。 */
+function getIndependentCatalogModule(): ExpectedIndependentCatalogModule {
+  return imageModelSettingsModule as unknown as ExpectedIndependentCatalogModule
+}
+
 /** 创建生图模型设置测试使用的 profile。 */
 function createProfile(
   id: string,
@@ -53,6 +69,23 @@ function createOpenAIProfile(
 }
 
 describe('ImageGenerationModelSettings', () => {
+  test('Given 已保存媒体模型 When 渲染独立目录 Then 提供添加编辑复制删除且不直接展开表单', () => {
+    const { ImageGenerationModelCatalogView } = getIndependentCatalogModule()
+    const html = renderToStaticMarkup(<ImageGenerationModelCatalogView
+      profiles={[createProfile('profile-flash', 'Flash', 'gemini-flash')]}
+      channelOptions={[]}
+      credentialsConfigured
+      saving={false}
+      onSaveProfiles={() => undefined}
+    />)
+
+    expect(html).toContain('添加模型')
+    expect(html).toContain('aria-label="编辑 Flash"')
+    expect(html).toContain('aria-label="复制 Flash"')
+    expect(html).toContain('aria-label="删除 Flash"')
+    expect(html).not.toContain('aria-label="生图模型名称 Flash"')
+  })
+
   test('Given GPT Image profile When 选择渠道 Then 模型下拉只显示该渠道启用模型', () => {
     const { getImageGenerationProfileModels } = imageModelSettingsModule
     const profile = createOpenAIProfile({ channelId: 'channel-gpt', modelId: 'gpt-image-2' })

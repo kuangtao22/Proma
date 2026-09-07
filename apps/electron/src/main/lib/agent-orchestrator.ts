@@ -19,7 +19,7 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, CanvasNodeReference, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, AgentMediaAttachment, CanvasNodeReference, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
   PROMA_PERMISSION_MODE_CONFIG,
@@ -616,6 +616,7 @@ export class AgentOrchestrator {
     uuid?: string,
     vaultFocus?: import('@proma/shared').VaultFocusAttribution,
     canvasNodeReferences?: CanvasNodeReference[],
+    mediaAttachments?: AgentMediaAttachment[],
   ): string {
     const persistedUuid = uuid ?? randomUUID()
     const userSDKMsg: SDKMessage = {
@@ -628,6 +629,7 @@ export class AgentOrchestrator {
       _createdAt: createdAt,
       ...(vaultFocus ? { _vaultFocus: vaultFocus } : {}),
       ...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {}),
+      ...(mediaAttachments?.length ? { mediaAttachments } : {}),
     } as unknown as SDKMessage
     appendSDKMessages(sessionId, [userSDKMsg])
     return persistedUuid
@@ -721,7 +723,7 @@ export class AgentOrchestrator {
     callbacks: SessionCallbacks,
     extensions: AgentRunExtensions = {},
   ): Promise<void> {
-    const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid, canvasNodeReferences } = input
+    const { sessionId, userMessage, rawUserMessage, userMessageUuid, channelId, modelId, workspaceId: requestedWorkspaceId, additionalDirectories, permissionModeOverride, mentionedSkills, mentionedMcpServers, mentionedSessionIds, mentionedTodoIds, mentionedCalendarEventIds, automationContext, retryOfErrorUuid, canvasNodeReferences, mediaAttachments } = input
     /** 受限内部运行可关闭 Workspace Skills，避免 Pi 把普通 Skill 目录注入系统提示。 */
     const runSkillsEnabled = extensions.skillsMode !== 'disabled'
     // Capture the focus once per turn. Later UI focus changes must not rewrite this reply's attribution.
@@ -795,6 +797,7 @@ export class AgentOrchestrator {
           focus: initialVaultFocus.focus,
         } : undefined,
         canvasNodeReferences,
+        mediaAttachments,
       )
       userMessagePersisted = true
     }
@@ -2650,6 +2653,7 @@ export class AgentOrchestrator {
     mentionedTodoIds?: string[],
     mentionedCalendarEventIds?: string[],
     canvasNodeReferences?: CanvasNodeReference[],
+    mediaAttachments?: AgentMediaAttachment[],
     canvasWorkspacePrompt?: string,
   ): Promise<string> {
     if (!this.activeSessions.has(sessionId)) {
@@ -2718,6 +2722,7 @@ export class AgentOrchestrator {
       priority: 'now' as const,
       uuid,
       session_id: sessionId,
+      ...(mediaAttachments?.length ? { mediaAttachments } : {}),
     }
 
     try {
@@ -2744,6 +2749,7 @@ export class AgentOrchestrator {
           },
         } : {}),
         ...(canvasNodeReferences?.length ? { _canvasNodeReferences: canvasNodeReferences } : {}),
+        ...(mediaAttachments?.length ? { mediaAttachments } : {}),
       } as unknown as SDKMessage
       appendSDKMessages(sessionId, [persistMsg])
       this.flushPendingUserSkillActivations(sessionId, uuid)

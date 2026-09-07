@@ -162,6 +162,7 @@ export function createNativeCanvasWorkflowRunController(
 const WORKFLOW_STATUS_LABELS: Record<CanvasWorkflowRun['status'], string> = {
   running: '运行中',
   'waiting-review': '待验收',
+  'waiting-budget': '预算已用尽',
   completed: '已完成',
   partial: '部分完成',
   failed: '失败',
@@ -230,6 +231,9 @@ export function NativeCanvasWorkflowRunEntries({
                 <p className="mt-1 text-xs text-muted-foreground">
                   {completedCount}/{run.nodes.length} 个节点 · 更新于 {formatWorkflowRunUpdatedAt(run.updatedAt)}
                 </p>
+                {run.status === 'waiting-budget' ? (
+                  <p className="mt-1 text-xs text-muted-foreground">请在 Agent 对话中补充预算后恢复工作流</p>
+                ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-1">
                 {canResumeWorkflowRun(run) ? (

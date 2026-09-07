@@ -321,6 +321,8 @@ function createIpcFixture(store: DesignStore, readOnlyReason?: string): {
     imageModels: {
       listCatalog: () => ({ profiles: [], channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
       replaceProfiles: (profiles) => ({ profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: false }),
+      listMediaApiCatalog: () => ({ revision: 0, entries: [] }),
+      replaceMediaApiProfiles: (_profiles, expectedRevision) => ({ revision: expectedRevision + 1, entries: [] }),
     },
     imagePreferences: {
       getSelection: (projectId) => ({ projectId, options: [] }),

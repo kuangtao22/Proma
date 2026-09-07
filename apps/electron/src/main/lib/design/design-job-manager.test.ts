@@ -23,6 +23,7 @@ import type {
 } from '@proma/shared'
 import type { DesignAssetImportBatch, DesignAssetImportSource } from './design-asset-service'
 import { DesignJobManager } from './design-job-manager'
+import type { DesignMediaImageExecutionResult } from './design-job-manager'
 import { applyDesignMutations } from './design-store'
 import type { DesignStore } from './design-store'
 import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
@@ -64,6 +65,22 @@ function createOpenAISnapshot(): ImageGenerationModelSnapshot {
     executor: 'openai-images',
     channelId: 'channel-gpt',
     modelId: 'gpt-image-2',
+  }
+}
+
+/** 创建项目私有 ComfyUI 预设的固定版本快照。 */
+function createComfySnapshot(): ImageGenerationModelSnapshot {
+  return {
+    profileId: 'media:preset-1:1',
+    name: 'Comfy 海报',
+    executor: 'comfyui',
+    modelId: 'workflow-1@1',
+    mediaProfileId: 'preset-1',
+    mediaProfileRevision: 1,
+    connectionId: 'connection-1',
+    workflowId: 'workflow-1',
+    workflowRevision: 1,
+    workflowHash: 'a'.repeat(64),
   }
 }
 
@@ -223,6 +240,85 @@ describe('Design Job Manager', () => {
     await entered.promise
     release.resolve()
     await harness.manager.run(job.id)
+  })
+
+  test('Given Canvas 图片选择 ComfyUI When 执行成功 Then 不创建 LLM 会话并登记原候选链', async () => {
+    const mediaHarness = createHarness({ withCandidateBatches: true, withMediaExecution: true })
+    mediaHarness.settings = {}
+    mediaHarness.resolveAvailableSnapshot = () => createComfySnapshot()
+    const job = await mediaHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('comfy'),
+      imageModelProfileId: 'media:preset-1:1',
+      candidateBatchId: 'batch-comfy',
+    })
+
+    await mediaHarness.manager.run(job.id)
+
+    expect(mediaHarness.mediaRunCount).toBe(1)
+    expect(mediaHarness.createdSessions).toEqual([])
+    expect(mediaHarness.runInputs).toEqual([])
+    expect(mediaHarness.importSources).toEqual([])
+    expect(mediaHarness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-media' })
+    expect(mediaHarness.candidateTerminalEvents).toEqual([{
+      jobId: job.id,
+      candidateBatchId: 'batch-comfy',
+      status: 'succeeded',
+      outputAssetId: 'asset-media',
+      error: null,
+    }])
+  })
+
+  test('Given ComfyUI 运行任务无法确认精确取消 When 取消 Then 保留运行态等待远端对账', async () => {
+    const mediaHarness = createHarness({ withMediaExecution: true })
+    mediaHarness.resolveAvailableSnapshot = () => createComfySnapshot()
+    mediaHarness.mediaCancelConfirmed = false
+    mediaHarness.mediaRun = async () => new Promise(() => undefined)
+    const job = await mediaHarness.manager.createCanvasImage(createCanvasImageInput('comfy-cancel'))
+    await mediaHarness.manager.start(job.id)
+
+    await expect(mediaHarness.manager.cancel('project-1', job.id)).rejects.toThrow('取消尚未确认')
+
+    expect(mediaHarness.manager.get(job.id)?.status).toBe('running')
+  })
+
+  test('Given 重启留下 ComfyUI running journal When 恢复 Then 对账原任务而非标记 interrupted', async () => {
+    const beforeRestart = createHarness({ withMediaExecution: true })
+    beforeRestart.resolveAvailableSnapshot = () => createComfySnapshot()
+    beforeRestart.mediaRun = async () => new Promise(() => undefined)
+    const job = await beforeRestart.manager.createCanvasImage(createCanvasImageInput('comfy-recover'))
+    await beforeRestart.manager.start(job.id)
+
+    const restarted = createHarness({ withMediaExecution: true })
+    restarted.assertSnapshotAvailable = () => { throw new Error('MEDIA_PROFILE_DISABLED') }
+    const recovered = await restarted.manager.recover('project-1')
+    await restarted.manager.run(job.id)
+
+    expect(recovered.find((candidate) => candidate.id === job.id)?.status).toBe('running')
+    expect(restarted.mediaRunCount).toBe(1)
+    expect(restarted.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-media' })
+  })
+
+  test('Given ComfyUI 对账超时但远端状态未知 When 本轮等待结束 Then 保留 running 和稳定错误供后续恢复', async () => {
+    const mediaHarness = createHarness({ withMediaExecution: true })
+    mediaHarness.resolveAvailableSnapshot = () => createComfySnapshot()
+    mediaHarness.mediaRun = async () => ({ status: 'pending', error: 'MEDIA_EXECUTION_PENDING' })
+    const job = await mediaHarness.manager.createCanvasImage(createCanvasImageInput('comfy-pending'))
+
+    await mediaHarness.manager.run(job.id)
+
+    expect(mediaHarness.manager.get(job.id)).toMatchObject({
+      status: 'running',
+      error: 'MEDIA_EXECUTION_PENDING',
+    })
+
+    mediaHarness.mediaRun = async (current) => ({
+      status: 'succeeded',
+      asset: { ...createAsset('asset-media'), sourceJobId: current.id },
+    })
+    await mediaHarness.manager.resumeMediaJob('project-1', job.id)
+
+    expect(mediaHarness.mediaRunCount).toBe(2)
+    expect(mediaHarness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-media' })
   })
 
   test('Given 会话创建在 running 前失败 When start Then 拒绝确认并收口失败任务', async () => {
@@ -504,6 +600,22 @@ describe('Design Job Manager', () => {
     expect(reloaded.manager.getTaskDetails('project-1', job.id, false)).toMatchObject({
       canvasInputReferences: [expect.objectContaining({ kind: 'webview', nodeId: 'webview-1' })],
     })
+  })
+
+  test('Given 视频节点已采用封面角色 When 创建重载并运行图片任务 Then 保留确切来源并使用封面图片', async () => {
+    harness.canvasInputReferences = [{
+      nodeId: 'video-reference', kind: 'video', revision: 2,
+      summary: '已采用视频封面', summaryHash: 'a'.repeat(64),
+      assetId: 'asset-reference', sourcePort: 'image.asset', targetPort: 'image.reference',
+      sourceOutputKey: 'poster.main', sourceArtifactHash: 'b'.repeat(64),
+    }]
+    harness.messages = [createToolMessage('session-1/output.png')]
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    expect(createHarness().manager.getTaskDetails('project-1', job.id, false)).toMatchObject({
+      canvasInputReferences: [expect.objectContaining({ kind: 'video', sourceOutputKey: 'poster.main', sourceArtifactHash: 'b'.repeat(64) })],
+    })
+    await harness.manager.run(job.id)
+    expect(harness.runInputs[0]?.userMessage).toContain('referenceImagePaths: ["/trusted/asset-reference.png"]')
   })
 
   test('Given Canvas 图片参考已绑定 When 运行生成 Then 隐藏 Agent 收到真实参考图路径', async () => {
@@ -2099,7 +2211,12 @@ describe('Design Job Manager', () => {
   })
 
   /** 创建覆盖真实状态机边界的可注入 Manager。 */
-  function createHarness(options: { withCandidateBatches?: boolean } = {}) {
+  test('Given 画布明确不选API模型 When 手动或Agent准备图片任务 Then 在任务创建前拒绝范围外模型', async () => {
+    const fixture = createHarness({ mediaModelScope: { mode: 'selected', modelIds: [] } })
+    await expect(fixture.manager.preflightCanvasImage(createCanvasImageInput('scope'))).rejects.toThrow('CANVAS_MEDIA_MODEL_OUT_OF_SCOPE')
+  })
+
+  function createHarness(options: { withCandidateBatches?: boolean; withMediaExecution?: boolean; mediaModelScope?: import('@proma/shared').CanvasMediaModelScope } = {}) {
     /** Design 上下文与项目指令测试使用的显式项目根。 */
     const projectRoot = join(cacheRoot, 'project')
     mkdirSync(projectRoot, { recursive: true })
@@ -2140,6 +2257,8 @@ describe('Design Job Manager', () => {
       traceWriteError?: Error
       cleanupError?: Error
       projectFiles: Record<string, string>
+      mediaRun: (job: DesignJobRecord) => Promise<DesignMediaImageExecutionResult>
+      mediaCancelConfirmed: boolean
     } = {
       settings: { agentChannelId: 'channel-default', agentModelId: 'model-default' },
       messages: [] as AgentMessage[],
@@ -2163,6 +2282,10 @@ describe('Design Job Manager', () => {
       sdkMessages: [],
       canvasInputReferences: [],
       projectFiles: { 'src/App.tsx': 'export function App() { return "首页" }' },
+      mediaRun: async (job) => ({ status: 'succeeded',
+        asset: { ...createAsset('asset-media'), sourceJobId: job.id, prompt: job.prompt },
+      }),
+      mediaCancelConfirmed: true,
     }
     const createdSessions: AgentSessionMeta[] = []
     const stoppedSessions: string[] = []
@@ -2183,6 +2306,7 @@ describe('Design Job Manager', () => {
     let batchCommits = 0
     let batchRollbacks = 0
     let retryIntentWrites = 0
+    let mediaRunCount = 0
     /** 记录 trace 读取次数，证明详情首屏不会加载大日志。 */
     let traceReadCount = 0
     /** 记录完整 journal 目录扫描次数，目标索引建立后不得重复扫描。 */
@@ -2248,6 +2372,7 @@ describe('Design Job Manager', () => {
       },
     }
     const manager = new DesignJobManager({
+      getCanvasMediaModelScope: () => options.mediaModelScope,
       pathResolver: { resolve: () => ({ jobsDir: join(cacheRoot, 'jobs'), projectRoot }) },
       readJobsDirectory: (path) => {
         journalScanCount += 1
@@ -2316,6 +2441,15 @@ describe('Design Job Manager', () => {
           ? state.resolveCanvasInputReferences()
           : state.canvasInputReferences.map((reference) => ({ ...reference })),
       },
+      ...(options.withMediaExecution
+        ? {
+            mediaExecution: {
+              runImage: async (job) => { mediaRunCount += 1; return state.mediaRun(job) },
+              recoverImage: async (job) => { mediaRunCount += 1; return state.mediaRun(job) },
+              cancel: async () => ({ confirmed: state.mediaCancelConfirmed }),
+            },
+          }
+        : {}),
       imageModels: {
         resolveAvailableSnapshot: (profileId) => {
           modelResolutionCount += 1
@@ -2491,6 +2625,7 @@ describe('Design Job Manager', () => {
       get batchCommits() { return batchCommits },
       get batchRollbacks() { return batchRollbacks },
       get retryIntentWrites() { return retryIntentWrites },
+      get mediaRunCount() { return mediaRunCount },
       get traceReadCount() { return traceReadCount },
       get journalScanCount() { return journalScanCount },
       get journalReadCount() { return journalReadCount },
@@ -2541,6 +2676,8 @@ describe('Design Job Manager', () => {
       set resolveExecutionRoute(value: typeof state.resolveExecutionRoute) {
         state.resolveExecutionRoute = value
       },
+      set mediaRun(value: typeof state.mediaRun) { state.mediaRun = value },
+      set mediaCancelConfirmed(value: boolean) { state.mediaCancelConfirmed = value },
     }
   }
 })

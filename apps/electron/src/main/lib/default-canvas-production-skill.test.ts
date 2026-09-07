@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.10"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.12"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -147,7 +147,7 @@ test('Given 用户明确要求执行整套画布方案 When 读取 canvas-produc
   expect(skill).toContain('不能仅因为存在连线就自动运行')
   expect(skill).toContain('文档和 WebView 不需要单独运行')
   expect(skill).toContain('不得超过 `maxImageRuns`')
-  expect(skill).toContain('必须停在等待用户采用')
+  expect(skill).toContain('未获得采用授权时必须停在等待用户采用')
   expect(skill).toContain('从当前正式产物和待更新状态继续')
 })
 
@@ -174,4 +174,15 @@ test('Given 四类 Agent 运行范围 When 读取 canvas-production Then 十五�
   expect(skill).toContain('等待采用、可继续、完成和取消状态')
   expect(skill).toContain('批量导出最多十六项')
   expect(skill).toContain('相同工具调用重放必须复用原结果')
+})
+
+test('Given 连续生产任务 When 读取 Skill Then 提供恢复与四类业务的实际交付步骤', () => {
+  const skill = readCanvasProductionSkill()
+  for (const capability of ['canvas_get_image_candidates', 'canvas_adopt_image_candidates',
+    'canvas_resume_workflow', 'waiting-budget', 'retryNodeIds', 'media_import_local_file',
+    'media_get_asset_file', 'canvas_attach_media_assets', '电影制作', '完整 App', '运营计划', '采集与数据分析', 'metadataOnly']) {
+    expect(skill).toContain(capability)
+  }
+  expect(skill).toContain('提交结果未知')
+  expect(skill).toContain('不能当作真实服务验收')
 })

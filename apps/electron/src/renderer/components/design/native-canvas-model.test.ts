@@ -90,6 +90,47 @@ describe('原生 Canvas 纯投影', () => {
     ])
   })
 
+  test('Given 图片节点存在媒体运行投影 When 建立 Flow 数据 Then 只注入目标节点且不改变几何', () => {
+    const nodes = toNativeCanvasFlowNodes(createDocument(), {
+      nodeIssues: [],
+      runningSessionIds: new Set(),
+      mediaProgressByNodeId: new Map([['image-1', {
+        phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+      }]]),
+      canCreateChild: false,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
+    })
+
+    expect(nodes.find((node) => node.id === 'image-1')).toMatchObject({
+      width: 288,
+      data: { mediaProgress: { phase: 'running', nodeProgressLabel: '当前节点 sampler · 4/20' } },
+    })
+    expect(nodes.find((node) => node.id === 'doc-1')?.data.mediaProgress).toBeUndefined()
+  })
+
+  test('Given AV 节点存在媒体运行投影 When 建立 Flow 数据 Then 卡片展示后端阶段与当前节点计数', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'video-1', kind: 'video', title: '视频', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module',
+    })
+    const nodes = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [],
+      runningSessionIds: new Set(),
+      mediaProgressByNodeId: new Map([['video-1', {
+        phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+      }]]),
+      canCreateChild: false,
+      onCreateChild: () => undefined,
+      onWorkbenchNodeChange: () => undefined,
+    })
+
+    expect(nodes.find((node) => node.id === 'video-1')?.data.mediaProgress).toEqual({
+      phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+    })
+  })
+
   test('Given Agent 节点存在问题和运行快照 When 投影 Then unavailable 优先且不可扩展', () => {
     const document = createDocument()
     const nodes = toNativeCanvasFlowNodes(document, {
@@ -393,6 +434,26 @@ describe('原生 Canvas 纯投影', () => {
       targetPort: 'image.reference',
       relation: 'reference',
     })
+  })
+
+  test('Given AV 图片输出边被重新确认 When 更新关系 Then 保留确切输出选择', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'video-source', kind: 'video', title: '视频', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module',
+    })
+    const edge = {
+      id: 'edge-video-poster', sourceNodeId: 'video-source', sourcePort: 'image.asset',
+      sourceOutputKey: 'poster.main', targetNodeId: 'image-1', targetPort: 'image.reference',
+      relation: 'reference' as const,
+    }
+
+    expect(confirmNativeCanvasEdge(edge, 'derives', document)).toMatchObject({
+      sourceOutputKey: 'poster.main', sourcePort: 'image.asset', targetPort: 'image.reference', relation: 'derives',
+    })
+    expect(confirmNativeCanvasEdge(edge, 'association', document)).not.toHaveProperty('sourceOutputKey')
+    document.edges = [edge]
+    expect(toNativeCanvasFlowEdges(document)[0]?.label).toBe('引用 · poster.main')
   })
 })
 

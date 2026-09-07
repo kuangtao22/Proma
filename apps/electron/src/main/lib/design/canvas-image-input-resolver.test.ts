@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasDocument, CanvasImageTarget, SDKMessage } from '@proma/shared'
+import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
+import type { CanvasDocument, CanvasImageTarget, MediaAssetRef, SDKMessage } from '@proma/shared'
 import {
   CANVAS_IMAGE_INPUT_MAX_MEDIA,
   CANVAS_IMAGE_INPUT_MAX_REFERENCES,
@@ -262,5 +262,150 @@ describe('Canvas 图片直接输入解析器', () => {
     expect(resolvedAssets).toEqual([{ projectId: 'project-1', assetId: 'asset-reference' }])
     expect(references[0]).toMatchObject({ assetId: 'asset-reference' })
     expect(references[0]).not.toHaveProperty('path')
+  })
+
+  test('Given 视频节点显式选择已采用 poster When 解析旧图片输入 Then 固化确切 key、hash 并复验正式身份', async () => {
+    const { document, target } = createDocument()
+    const videoNode = {
+      id: 'video-source', kind: 'video' as const, title: '视频来源', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module', adoptedConfigRevision: 7,
+    }
+    document.nodes.push(videoNode)
+    document.edges = [createCanvasBoundEdge(videoNode, document.nodes[0]!, {
+      id: 'edge-poster', sourceNodeId: videoNode.id, sourceOutputKey: 'poster.main',
+      targetNodeId: target.nodeId, relation: 'reference',
+    })]
+    const poster: MediaAssetRef = {
+      assetId: 'poster-asset', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image',
+    }
+    let adoptedReads = 0
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: { load: async () => { throw new Error('不应读取图片模块') } },
+      resolveAssetPath: (_projectId, assetId) => `/project/assets/${assetId}.png`,
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+      getAdoptedMediaImage: async (_mediaTarget, outputKey) => {
+        adoptedReads += 1
+        expect(outputKey).toBe('poster.main')
+        return { asset: poster, candidateId: 'candidate-1', runId: 'run-1', configRevision: 7 }
+      },
+    })
+
+    const references = await resolver.resolve(target)
+
+    expect(adoptedReads).toBe(2)
+    expect(references).toEqual([expect.objectContaining({
+      nodeId: videoNode.id,
+      kind: 'video',
+      revision: 7,
+      assetId: poster.assetId,
+      sourceOutputKey: 'poster.main',
+      sourceArtifactHash: poster.hash,
+      sourcePort: 'image.asset',
+      targetPort: 'image.reference',
+    })])
+  })
+
+  test('Given 同一 AV 节点采用两个图片输出 When 解析旧图片输入 Then 按 outputKey 保留两条确切引用', async () => {
+    const { document, target } = createDocument()
+    const videoNode = {
+      id: 'video-source', kind: 'video' as const, title: '视频来源', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module', adoptedConfigRevision: 8,
+    }
+    document.nodes.push(videoNode)
+    document.edges = ['poster.main', 'poster.alt'].map((sourceOutputKey) => createCanvasBoundEdge(
+      videoNode,
+      document.nodes[0]!,
+      {
+        id: `edge-${sourceOutputKey}`, sourceNodeId: videoNode.id, sourceOutputKey,
+        targetNodeId: target.nodeId, relation: 'reference',
+      },
+    ))
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: { load: async () => { throw new Error('不应读取图片模块') } },
+      resolveAssetPath: (_projectId, assetId) => `/project/assets/${assetId}.png`,
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+      getAdoptedMediaImage: async (_mediaTarget, outputKey) => ({
+        asset: {
+          assetId: `asset-${outputKey}`, revision: 1,
+          hash: (outputKey === 'poster.main' ? 'a' : 'b').repeat(64), mediaKind: 'image',
+        },
+        candidateId: `candidate-${outputKey}`, runId: 'run-1', configRevision: 8,
+      }),
+    })
+
+    const references = await resolver.resolve(target)
+
+    expect(references.map((reference) => [reference.sourceOutputKey, reference.assetId])).toEqual([
+      ['poster.main', 'asset-poster.main'],
+      ['poster.alt', 'asset-poster.alt'],
+    ])
+  })
+
+  test('Given AV 图片读取期间边被改为另一 outputKey When 最终复验 Then 拒绝继续使用旧素材', async () => {
+    const { document, target } = createDocument()
+    const videoNode = {
+      id: 'video-source', kind: 'video' as const, title: '视频来源', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module', adoptedConfigRevision: 7,
+    }
+    document.nodes.push(videoNode)
+    document.edges = [createCanvasBoundEdge(videoNode, document.nodes[0]!, {
+      id: 'edge-poster', sourceNodeId: videoNode.id, sourceOutputKey: 'poster.main',
+      targetNodeId: target.nodeId, relation: 'reference',
+    })]
+    let authoritativeDocument = document
+    let adoptedReads = 0
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => authoritativeDocument },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: { load: async () => { throw new Error('不应读取图片模块') } },
+      resolveAssetPath: (_projectId, assetId) => `/project/assets/${assetId}.png`,
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+      getAdoptedMediaImage: async () => {
+        adoptedReads += 1
+        if (adoptedReads === 2) {
+          authoritativeDocument = structuredClone(document)
+          authoritativeDocument.edges[0]!.sourceOutputKey = 'poster.alt'
+        }
+        return {
+          asset: { assetId: 'poster-asset', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image' },
+          candidateId: 'candidate-1', runId: 'run-1', configRevision: 7,
+        }
+      },
+    })
+
+    await expect(resolver.resolve(target)).rejects.toThrow('CANVAS_IMAGE_INPUT_REVISION_CONFLICT')
+  })
+
+  test('Given AV 边未选择输出或正式输出不是图片 When 解析旧图片输入 Then 明确拒绝且不消费视频字节', async () => {
+    const { document, target } = createDocument()
+    const videoNode = {
+      id: 'video-source', kind: 'video' as const, title: '视频来源', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module',
+    }
+    document.nodes.push(videoNode)
+    document.edges = [createCanvasBoundEdge(videoNode, document.nodes[0]!, {
+      id: 'edge-video', sourceNodeId: videoNode.id, targetNodeId: target.nodeId, relation: 'reference',
+    })]
+    const resolver = createCanvasImageInputResolver({
+      canvasStore: { requireStableAuthoritativeDocument: () => document },
+      getAgentOutput: async () => ({ revision: 0, messages: [] }),
+      imageStore: { load: async () => { throw new Error('不应读取图片模块') } },
+      resolveAssetPath: () => { throw new Error('不应解析视频路径') },
+      readDocument: async () => ({ revision: 0, markdown: '' }),
+      readPrototype: async () => ({ revision: 0, summary: '' }),
+      getAdoptedMediaImage: async () => ({
+        asset: { assetId: 'video-asset', revision: 1, hash: 'b'.repeat(64), mediaKind: 'video' },
+        candidateId: 'candidate-1', runId: 'run-1', configRevision: 1,
+      }),
+    })
+
+    await expect(resolver.resolve(target)).rejects.toThrow('CANVAS_IMAGE_INPUT_MEDIA_ADAPTER_REQUIRED')
   })
 })

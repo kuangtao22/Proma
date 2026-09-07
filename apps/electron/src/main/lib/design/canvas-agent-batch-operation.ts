@@ -405,7 +405,8 @@ function collectResources(
     const node = nodes[0]!
     if (finalIdentities.has(key) || node.kind === 'agent') continue
     const contentId = node.kind === 'image' ? node.imageModuleId
-      : node.kind === 'document' ? node.documentId : node.prototypeId
+      : node.kind === 'document' ? node.documentId
+        : node.kind === 'audio' || node.kind === 'video' ? node.mediaModuleId : node.prototypeId
     const trashEntries = nodes.map((candidate) => parseCanvasTrashEntry({
       schemaVersion: 2,
       trashId: randomUUID(),

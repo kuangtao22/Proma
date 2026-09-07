@@ -25,12 +25,14 @@ import type {
   ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
+  MediaApiModelCatalogResult,
   PrepareDesignAssetForSessionInput,
   PreparedDesignAssetMention,
   RelinkDesignAssetInput,
   RegisterDesignContextAssetInput,
   SaveDesignMutationsInput,
   SaveImageGenerationModelProfilesInput,
+  SaveMediaApiModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
   UpdateDesignContextEntryInput,
@@ -130,7 +132,7 @@ export interface DesignIpcOptions {
   context: DesignIpcContextCatalog
   imageModels: Pick<
     ImageGenerationModelCatalog,
-    'listCatalog' | 'replaceProfiles'
+    'listCatalog' | 'replaceProfiles' | 'listMediaApiCatalog' | 'replaceMediaApiProfiles'
   >
   imagePreferences: Pick<
     DesignImageModelPreferences,
@@ -396,12 +398,23 @@ function parseDeleteDesignContextInput(value: unknown): DeleteDesignContextInput
   return { projectId: value.projectId, entryId: value.entryId }
 }
 
-/** 解析完整替换模型目录的请求根，只允许 profiles 数组。 */
+/** 解析完整替换图片目录的请求根，并兼容旧入口缺省 revision。 */
 function parseSaveImageModelProfilesInput(value: unknown): SaveImageGenerationModelProfilesInput {
   if (!isRecord(value)
-    || !hasOnlyKeys(value, ['profiles'])
-    || !Array.isArray(value.profiles)) throw new Error('Design 请求结构无效')
-  return { profiles: value.profiles as SaveImageGenerationModelProfilesInput['profiles'] }
+    || !hasOnlyKeys(value, ['profiles', 'expectedRevision'])
+    || !Array.isArray(value.profiles)
+    || (value.expectedRevision !== undefined && (!Number.isSafeInteger(value.expectedRevision) || Number(value.expectedRevision) < 0))) throw new Error('Design 请求结构无效')
+  return { profiles: value.profiles as SaveImageGenerationModelProfilesInput['profiles'], ...(value.expectedRevision === undefined ? {} : { expectedRevision: Number(value.expectedRevision) }) }
+}
+
+/** 解析带必填 CAS revision 的统一 API 媒体模型替换请求。 */
+function parseSaveMediaApiModelProfilesInput(value: unknown): SaveMediaApiModelProfilesInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['profiles', 'expectedRevision'])
+    || !Array.isArray(value.profiles)
+    || !Number.isSafeInteger(value.expectedRevision)
+    || Number(value.expectedRevision) < 0) throw new Error('Design 请求结构无效')
+  return { profiles: value.profiles as SaveMediaApiModelProfilesInput['profiles'], expectedRevision: Number(value.expectedRevision) }
 }
 
 /** 解析项目生图模型选择更新，不接受模型详情或额外字段。 */
@@ -691,6 +704,8 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
   const channels = [
     DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES,
     DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES,
+    DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES,
+    DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES,
     DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION,
     DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION,
     DESIGN_IPC_CHANNELS.LOAD,
@@ -822,8 +837,29 @@ export function registerDesignIpcHandlers(options: DesignIpcOptions): DesignIpcR
     const input = parseSaveImageModelProfilesInput(value)
     /** 保存结果先与广播解耦，窗口通知失败不得反向污染已提交目录。 */
     const result = runImageModelOperation(
-      () => options.imageModels.replaceProfiles(input.profiles),
+      () => options.imageModels.replaceProfiles(input.profiles, input.expectedRevision),
       '保存生图模型配置失败',
+    )
+    broadcastImageModelProfilesChanged(options.listAuthorizedWebContents())
+    return result
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES, async (event, value): Promise<MediaApiModelCatalogResult> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    if (value !== undefined) throw new Error('Design 请求结构无效')
+    return runImageModelOperation(
+      () => options.imageModels.listMediaApiCatalog(),
+      '读取媒体模型配置失败',
+    )
+  })
+
+  options.ipc.handle(DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES, async (event, value): Promise<MediaApiModelCatalogResult> => {
+    assertAuthorizedSender(event, options.listAuthorizedWebContents())
+    const input = parseSaveMediaApiModelProfilesInput(value)
+    /** 保存后复用同一目录广播，让图片选择器与其它设置窗口刷新。 */
+    const result = runImageModelOperation(
+      () => options.imageModels.replaceMediaApiProfiles(input.profiles, input.expectedRevision),
+      '保存媒体模型配置失败',
     )
     broadcastImageModelProfilesChanged(options.listAuthorizedWebContents())
     return result

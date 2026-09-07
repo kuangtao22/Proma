@@ -7,7 +7,7 @@ import {
   type CanvasNode,
   type CanvasTarget,
 } from '@proma/shared'
-import { createCanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
+import { createCanvasImageCandidateBatchService, createCanvasImageCandidateHash } from './canvas-image-candidate-batch-service'
 import type { CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
 import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 import { parseCanvasDocument } from './canvas-document-store'
@@ -30,7 +30,10 @@ test('Given Agent 明确整批采用 When 同 operation 重放或变更模式 Th
 })
 
 /** 创建 14 节点内存夹具；normalizeDocument 为 true 时复现主进程 Store 的读写重建。 */
-function createFixture(normalizeDocument = false) {
+function createFixture(input: boolean | { validateCandidate?: () => Promise<void> } = false) {
+  /** 同时覆盖真实 Store 规范化与异步候选预检。 */
+  const normalizeDocument = typeof input === 'boolean' ? input : false
+  const options = typeof input === 'boolean' ? {} : input
   const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
   const batches = new Map<string, CanvasImageCandidateBatch>()
   const intents = new Map<string, CanvasImageCandidateAdoptionIntent>()
@@ -101,6 +104,7 @@ function createFixture(normalizeDocument = false) {
   }
   const service = createCanvasImageCandidateBatchService({
     store,
+    validateCandidate: options.validateCandidate,
     dependencyState: {
       consumeAndPropagate: (input) => {
         dependencyProjectionCalls += 1
@@ -280,6 +284,59 @@ describe('Canvas 图片候选批次 Service', () => {
     await expect(fixture.service.reconcileLocked(fixture.target)).resolves.toEqual({ publications: [] })
 
     expect(fixture.exclusiveCalls).toBe(0)
+  })
+
+  test('Given 候选预检等待期间撤权 When Agent 采用 Then intent 和正式版本都不写入', async () => {
+    /** 在真实服务的异步预检阶段撤销 Host 授权。 */
+    let authorized = true
+    const fixture = createFixture({ validateCandidate: async () => {
+      await Promise.resolve()
+      authorized = false
+    } })
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-revoked', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-revoked', entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', candidateBatchId: 'batch-revoked',
+      status: 'succeeded', outputAssetId: 'asset-new', error: null,
+    })
+    const batch = await fixture.service.load({ ...fixture.target, batchId: 'batch-revoked' })
+    await expect(fixture.service.adopt({ ...fixture.target, batchId: 'batch-revoked', mode: 'all' },
+      createCanvasImageCandidateHash(batch), () => {
+        if (!authorized) throw new Error('ACCESS_REVOKED')
+      })).rejects.toThrow('ACCESS_REVOKED')
+    expect(fixture.intents.size).toBe(0)
+    expect(fixture.adopted).toEqual([])
+    expect(fixture.canvas.revision).toBe(3)
+  })
+
+  test('Given Agent 持有旧候选指纹 When 采用 Then 在任何版本写入前拒绝', async () => {
+    /** 单节点候选用于证明指纹校验发生于事务边界。 */
+    const fixture = createFixture()
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-token', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-token', entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, jobId: 'job-0', candidateBatchId: 'batch-token',
+      status: 'succeeded', outputAssetId: 'asset-new', error: null,
+    })
+    await expect(fixture.service.adopt({
+      ...fixture.target, batchId: 'batch-token', mode: 'all',
+    }, '0'.repeat(64))).rejects.toThrow('CANVAS_IMAGE_CANDIDATES_CHANGED')
+    expect(fixture.adopted).toEqual([])
+    expect(fixture.intents.size).toBe(0)
+    /** 精确指纹允许同一采用请求重放，而不会再次推进正式版本。 */
+    const batch = await fixture.service.load({ ...fixture.target, batchId: 'batch-token' })
+    const hash = createCanvasImageCandidateHash(batch)
+    await expect(fixture.service.adopt({ ...fixture.target, batchId: 'batch-token', mode: 'all' }, hash,
+      () => { throw new Error('ACCESS_REVOKED') })).rejects.toThrow('ACCESS_REVOKED')
+    expect(fixture.adopted).toEqual([])
+    const first = await fixture.service.adopt({ ...fixture.target, batchId: 'batch-token', mode: 'all' }, hash)
+    const replay = await fixture.service.adopt({ ...fixture.target, batchId: 'batch-token', mode: 'all' }, hash)
+    expect(replay).toEqual(first)
+    expect(fixture.adopted).toEqual(['node-0'])
   })
 
   test('Given 首个批次监听器抛错 When Job 终态完成登记 Then 持久化成功且继续通知后续监听器', async () => {
@@ -810,6 +867,54 @@ describe('Canvas 图片候选批次 Service', () => {
 
     expect(fixture.intents.get('operation-1')?.expectedGraphSha256).toBe(expectedGraphSha256)
     expect(fixture.canvas.revision).toBe(adoptedRevision)
+    expect(fixture.configs.get('node-0')?.revision).toBe(2)
+  })
+
+  test.each([false, true])('Given 旧字段顺序的采用事务 When 规范化后恢复且内容篡改=%s Then 只接受完整原图证明', async (tampered) => {
+    /** 从真实 parser 基线构造旧版本尚未规范化的提交 hash。 */
+    const fixture = createFixture()
+    fixture.canvas = parseCanvasDocument({ ...fixture.canvas,
+      nodes: [...fixture.canvas.nodes, { id: 'legacy-downstream', kind: 'document', title: '旧版下游',
+        position: { x: 0, y: 100 }, documentId: 'legacy-doc', contentRevision: 1 }],
+      edges: [{ id: 'legacy-edge', sourceNodeId: 'node-0', sourcePort: 'image.asset',
+        targetNodeId: 'legacy-downstream', targetPort: 'context.image', relation: 'depends-on' }],
+    }, fixture.target).document
+    await fixture.service.createBatch({ ...fixture.target, batchId: 'legacy-batch', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!] })
+    await fixture.service.recordJobTerminal({ ...fixture.target, jobId: 'job-0', status: 'succeeded', outputAssetId: 'new-0', error: null })
+    const baseRevision = fixture.canvas.revision
+    const legacyGraph: CanvasDocument = { ...fixture.canvas, revision: baseRevision + 1,
+      nodes: fixture.canvas.nodes.map((node) => node.id === 'node-0' && node.kind === 'image'
+        ? { ...node, adoptedAssetId: 'new-0' }
+        : node.id === 'legacy-downstream'
+          ? { ...node, upstreamChange: { sourceNodeIds: ['node-0'], changedAt: 100 } }
+          : node),
+      updatedAt: 100,
+    }
+    const legacyHash = createHash('sha256').update(JSON.stringify({ viewport: legacyGraph.viewport,
+      nodes: legacyGraph.nodes, edges: legacyGraph.edges })).digest('hex')
+    fixture.canvas = parseCanvasDocument(legacyGraph, fixture.target).document
+    expect(legacyHash).not.toBe(createHash('sha256').update(JSON.stringify({ viewport: fixture.canvas.viewport,
+      nodes: fixture.canvas.nodes, edges: fixture.canvas.edges })).digest('hex'))
+    fixture.configs.set('node-0', { ...fixture.configs.get('node-0')!, revision: 2, adoptedAssetId: 'new-0' })
+    fixture.intents.set('legacy-operation', { schemaVersion: 1, operationId: 'legacy-operation',
+      batchId: 'legacy-batch', ...fixture.target, mode: 'all', baseCanvasRevision: baseRevision,
+      entries: [{ nodeId: 'node-0', imageModuleId: 'module-0', oldAssetId: 'old-0', candidateAssetId: 'new-0',
+        expectedConfigRevision: 1, committedConfigRevision: 2 }],
+      expectedGraphSha256: legacyHash, state: 'modules-committing', createdAt: 100, updatedAt: 100,
+    })
+    if (tampered) {
+      fixture.canvas.nodes[1] = { ...fixture.canvas.nodes[1]!, title: '已被修改' }
+      await expect(fixture.service.reconcile(fixture.target)).rejects.toThrow('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+      expect(fixture.batches.get('legacy-batch')?.status).toBe('ready')
+    } else {
+      /** 主线恢复返回已提交发布事实，供锁外通知使用。 */
+      const result = await fixture.service.reconcile(fixture.target)
+      expect(result.publications).toHaveLength(1)
+      expect(result.publications[0]?.document).toEqual(fixture.canvas)
+      expect(fixture.batches.get('legacy-batch')?.status).toBe('adopted')
+      expect(fixture.intents.get('legacy-operation')?.state).toBe('batch-committed')
+    }
     expect(fixture.configs.get('node-0')?.revision).toBe(2)
   })
 

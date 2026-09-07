@@ -123,6 +123,8 @@ export interface CanvasImageCandidateBatchServiceDependencies {
   validateCandidate?: (batch: CanvasImageCandidateBatch, entry: CanvasImageCandidateBatchEntry) => Promise<void>
   now?: () => number
   randomUUID?: () => string
+  /** 正式采用事务完成后的非阻塞通知，仅供原已授权工作流恢复。 */
+  onAdopted?: (target: CanvasTarget) => void
 }
 
 /** 候选批次业务服务公开窄接口。 */
@@ -140,7 +142,7 @@ export interface CanvasImageCandidateBatchService {
   retryJobLocked(input: RetryCanvasImageCandidateJobInput): Promise<string>
   /** 调用方已持有同一 Canvas 串行权时采用历史素材，避免重新获取非重入锁。 */
   adoptExistingAssetLocked(input: AdoptExistingCanvasImageAssetInput): Promise<CanvasImageCandidateBatch>
-  adopt(input: AdoptCanvasImageCandidateBatchInput, execution?: CanvasCandidateAdoptionExecution): Promise<CanvasImageCandidateBatch>
+  adopt(input: AdoptCanvasImageCandidateBatchInput, execution?: CanvasCandidateAdoptionExecution | string, validateAccess?: () => void): Promise<CanvasImageCandidateBatch>
   abandon(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   /** 调用方已持有同一 Canvas 串行权时恢复，避免重复获取非重入锁。 */
   reconcileLocked(input: CanvasTarget): Promise<CanvasImageCandidateAdoptionReconciliation>
@@ -152,6 +154,17 @@ export interface CanvasImageCandidateBatchService {
 export interface CanvasCandidateAdoptionExecution {
   operationId: string
   validateAccess: () => void
+  /** 可选候选指纹，在任何新采用写入前核对所见版本。 */
+  expectedCandidateHash?: string
+}
+
+/** 生成候选选择指纹；只绑定真实版本身份，采用状态变化不使同一请求失去幂等性。 */
+export function createCanvasImageCandidateHash(batch: CanvasImageCandidateBatch): string {
+  return createHash('sha256').update(JSON.stringify([
+    'canvas-image-candidates', batch.projectId, batch.canvasId, batch.batchId,
+    batch.entries.map((entry) => [entry.nodeId, entry.imageModuleId, entry.jobId,
+      entry.candidateAssetId, entry.initialConfigRevision, entry.initialAdoptedAssetId]),
+  ])).digest('hex')
 }
 
 /** 按条目事实派生活跃批次状态。 */
@@ -472,6 +485,8 @@ export function createCanvasImageCandidateBatchService(
         updatedAt: now(),
       })
     }
+    try { dependencies.onAdopted?.({ projectId: batch.projectId, canvasId: batch.canvasId }) }
+    catch { reportCanvasImageDiagnostic('CANVAS_IMAGE_BATCH_LISTENER_FAILED') }
     return { batch, document }
   }
 
@@ -658,6 +673,11 @@ export function createCanvasImageCandidateBatchService(
     await requireReconciledLocked(input)
     const batch = await dependencies.store.load(input, input.batchId)
     execution?.validateAccess()
+    if (execution?.expectedCandidateHash !== undefined
+      && (!/^[a-f0-9]{64}$/.test(execution.expectedCandidateHash)
+        || createCanvasImageCandidateHash(batch) !== execution.expectedCandidateHash)) {
+      throw new Error('CANVAS_IMAGE_CANDIDATES_CHANGED')
+    }
     if (execution) {
       /** 原采用 intent 同时作为结果凭证；重放不能覆盖后续用户编辑。 */
       let receipt: CanvasImageCandidateAdoptionIntent | undefined
@@ -906,9 +926,19 @@ export function createCanvasImageCandidateBatchService(
         return saved
       })
     },
-    adopt: async (rawInput, execution) => {
+    adopt: async (rawInput, execution, validateAccess) => {
       const input = parseAdoptCanvasImageCandidateBatchInput(rawInput)
-      return dependencies.runExclusive(input, () => adoptBatchLocked(input, execution))
+      /** 原生事务文件名要求 UUID，指纹仍稳定派生身份以支持跨重启重放。 */
+      const digest = typeof execution === 'string' ? createHash('sha256').update(JSON.stringify([
+        'canvas-candidate-adoption', input.projectId, input.canvasId, input.batchId, input.mode, execution,
+      ])).digest('hex') : undefined
+      /** 指纹式工具调用复用主线持久回执，重放不会覆盖后来采用的版本。 */
+      const adoption = typeof execution === 'string' && digest ? {
+        operationId: `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`,
+        expectedCandidateHash: execution,
+        validateAccess: validateAccess ?? (() => {}),
+      } : typeof execution === 'string' ? undefined : execution
+      return dependencies.runExclusive(input, () => adoptBatchLocked(input, adoption))
     },
     abandon: async (rawInput) => {
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)

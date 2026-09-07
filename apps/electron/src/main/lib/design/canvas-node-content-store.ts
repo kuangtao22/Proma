@@ -20,6 +20,10 @@ import type {
   CanvasTrustedDirectoryCapability,
   LegacyCanvasContentSeed,
 } from './canvas-document-store'
+import {
+  createInitialCanvasMediaModuleState,
+  parseCanvasMediaModuleState,
+} from './canvas-media-store'
 
 /** 内容目录单次列表的硬上限，与 native helper 保持一致。 */
 const MAX_CONTENT_ENTRIES = 512
@@ -490,6 +494,18 @@ export function createCanvasNodeContentStore(
         || config.updatedAt !== meta.updatedAt) {
         throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       }
+    } else if (input.kind === 'audio' || input.kind === 'video') {
+      const configContent = await readFile(capability, childName, directoryEntryId, 'config.json')
+      if (configContent === null) throw new Error('CANVAS_CONTENT_CORRUPT: missing config.json')
+      const state = parseCanvasMediaModuleState(JSON.parse(configContent) as unknown, {
+        projectId: 'content-store', canvasId: 'content-store', nodeId: 'content-store',
+        mediaModuleId: input.contentId, mediaKind: input.kind,
+      })
+      if (state.revision !== meta.revision
+        || state.config.createdAt !== meta.createdAt
+        || state.config.updatedAt !== meta.updatedAt) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
     } else {
       const bodyName = input.kind === 'document' ? 'content.md' : 'index.html'
       if (await readFile(capability, childName, directoryEntryId, bodyName) === null) {
@@ -538,6 +554,16 @@ export function createCanvasNodeContentStore(
       assertSameIdentity(parseImageConfig(config), input)
       return
     }
+    if (input.kind === 'audio' || input.kind === 'video') {
+      if (config === null || document !== null || webview !== null) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      parseCanvasMediaModuleState(JSON.parse(config) as unknown, {
+        projectId: 'content-store', canvasId: 'content-store', nodeId: 'content-store',
+        mediaModuleId: input.contentId, mediaKind: input.kind,
+      })
+      return
+    }
     if (input.kind === 'document') {
       if (document === null || document !== '' || config !== null || webview !== null) {
         throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
@@ -580,6 +606,9 @@ export function createCanvasNodeContentStore(
     if (seed.initialContent !== undefined
       && (typeof seed.initialContent !== 'string'
         || seed.initialContent.length > MAX_CONTENT_TEXT_LENGTH)) {
+      throw new Error('CANVAS_ARTIFACT_CONTENT_INVALID')
+    }
+    if ((kind === 'audio' || kind === 'video') && seed.initialContent !== undefined) {
       throw new Error('CANVAS_ARTIFACT_CONTENT_INVALID')
     }
     /** 新产物正文；空内容与 legacy 迁移沿用既有默认值。 */
@@ -637,6 +666,27 @@ export function createCanvasNodeContentStore(
     /** 新内容使用的有限时间戳。 */
     const timestamp = now()
     if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new Error('CANVAS_CONTENT_TIME_INVALID')
+
+    if (kind === 'audio' || kind === 'video') {
+      const existingConfigContent = await readFile(nodes, 'nodes', contentId, 'config.json')
+      const state = existingConfigContent === null
+        ? createInitialCanvasMediaModuleState({ mediaModuleId: contentId, mediaKind: kind }, timestamp)
+        : parseCanvasMediaModuleState(JSON.parse(existingConfigContent) as unknown, {
+            projectId: target.projectId, canvasId: target.canvasId, nodeId: contentId,
+            mediaModuleId: contentId, mediaKind: kind,
+          })
+      if (state.revision !== 0 || state.config.createdAt !== state.config.updatedAt) {
+        throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      }
+      const configText = `${JSON.stringify(state, null, 2)}\n`
+      await ensureExactFile(nodes, 'nodes', contentId, 'config.json', configText)
+      const meta: CanvasNodeContentMeta = {
+        schemaVersion: 1, kind, contentId, revision: 0,
+        createdAt: state.config.createdAt, updatedAt: state.config.updatedAt,
+      }
+      await ensureExactFile(nodes, 'nodes', contentId, 'meta.json', `${JSON.stringify(meta, null, 2)}\n`)
+      return
+    }
 
     if (kind === 'image') {
       /** 已有部分图片配置决定重放必须沿用的初始时间。 */
@@ -857,7 +907,9 @@ export function createCanvasNodeContentStore(
     && left.deletedRevision === right.deletedRevision
     && left.deletedAt === right.deletedAt
     && (left.kind !== 'image' || right.kind !== 'image' || left.adoptedAssetId === right.adoptedAssetId)
-    && (left.kind === 'image' || right.kind === 'image' || left.contentRevision === right.contentRevision)
+    && ((left.kind !== 'document' && left.kind !== 'webview')
+      || (right.kind !== 'document' && right.kind !== 'webview')
+      || left.contentRevision === right.contentRevision)
     && (left.kind !== 'webview' || right.kind !== 'webview' || left.devicePreset === right.devicePreset)
   )
 

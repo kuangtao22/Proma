@@ -190,6 +190,7 @@ function createDraftFromConfig(config: CanvasImageModuleConfig): CanvasImageModu
   return {
     prompt: config.prompt,
     selectedModelProfileId: config.selectedModelProfileId,
+    mediaWorkflow: config.mediaWorkflow ? structuredClone(config.mediaWorkflow) : null,
     aspectRatio: config.aspectRatio,
     imageSize: config.imageSize,
     contextMode: config.contextMode,
@@ -216,6 +217,7 @@ function isSameCanvasImageDraft(
   return current?.dirty === true
     && current.prompt === submitted.prompt
     && current.selectedModelProfileId === submitted.selectedModelProfileId
+    && JSON.stringify(current.mediaWorkflow) === JSON.stringify(submitted.mediaWorkflow)
     && current.aspectRatio === submitted.aspectRatio
     && current.imageSize === submitted.imageSize
     && current.contextMode === submitted.contextMode
@@ -459,7 +461,7 @@ export function createCanvasImageModuleController(
       const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'save', generation }
       beginErrorOperation(owner)
       /** 请求使用的本地草稿副本。 */
-      const draft = { ...current.draft }
+      const draft = structuredClone(current.draft)
       dependencies.updateState(key, { saveState: 'saving' })
       try {
         /** 服务端返回的权威配置可能含规范化字段和新 revision。 */
@@ -468,6 +470,7 @@ export function createCanvasImageModuleController(
           expectedConfigRevision: current.snapshot.config.revision,
           prompt: draft.prompt,
           selectedModelProfileId: draft.selectedModelProfileId,
+          ...(draft.mediaWorkflow ? { mediaWorkflow: structuredClone(draft.mediaWorkflow) } : {}),
           aspectRatio: draft.aspectRatio,
           imageSize: draft.imageSize,
           contextMode: draft.contextMode,

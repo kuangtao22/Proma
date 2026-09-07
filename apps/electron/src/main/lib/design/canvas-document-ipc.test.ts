@@ -784,7 +784,7 @@ function createContext(options: {
           ?? createImageCandidateBatch(input.batchId)
       },
       adopt: async (input, execution) => {
-        execution?.validateAccess()
+        if (execution && typeof execution !== 'string') execution.validateAccess()
         imageCalls.push({ type: 'candidate-adopt', value: input })
         return options.imageCandidateBatch ?? createImageCandidateBatch(input.batchId)
       },
@@ -3765,7 +3765,7 @@ describe('原生 Canvas 文档 IPC', () => {
       artifacts: {
         create: async (input: {
           canvasId: string
-          artifactType: 'document' | 'webview' | 'image'
+          artifactType: 'document' | 'webview' | 'image' | 'audio' | 'video'
           source: { toolCallId: string }
         }) => ({
           canvasId: input.canvasId,
@@ -4331,7 +4331,8 @@ describe('原生 Canvas 文档 IPC', () => {
       },
       workflowExecution: {
         execute: async () => { throw new Error('不得新建工作流') },
-        list: async (current) => { calls.push(current); return { runs: [], nextCursor: null } },
+        list: async () => [],
+        listPage: async (current) => { calls.push(current); return { runs: [], nextCursor: null } },
         get: async () => { throw new Error('未请求详情') },
         cancel: async () => { throw new Error('未请求停止') },
         resume: async (current, input) => {

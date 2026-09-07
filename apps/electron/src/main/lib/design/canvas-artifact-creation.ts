@@ -25,8 +25,8 @@ import type {
   PrepareCanvasArtifactContentInput,
 } from './canvas-node-content-store'
 
-/** 首版支持的 Agent 画布产物类型。 */
-export type CanvasArtifactType = 'document' | 'webview' | 'image'
+/** Agent 可原子创建的画布产物类型；音视频先创建空媒体模块，再单独保存工作流配置。 */
+export type CanvasArtifactType = 'document' | 'webview' | 'image' | 'audio' | 'video'
 
 /** 原子创建一次画布产物所需的可信输入。 */
 export interface CanvasArtifactCreationInput extends CanvasTarget {
@@ -36,7 +36,7 @@ export interface CanvasArtifactCreationInput extends CanvasTarget {
   content: string
   /** 仅主进程已验证的图片导入服务可提供；普通 Agent 工具不接收素材 ID。 */
   adoptedAssetId?: string
-  /** WebView 可由 Agent 显式选择设备；缺省网页，图片产物忽略该字段。 */
+  /** WebView 可由 Agent 显式选择设备；其它产物忽略该字段。 */
   devicePreset?: CanvasWebviewDevicePreset
   position?: DesignPoint
   sourceNodeId?: string
@@ -294,13 +294,21 @@ function createArtifactOperations(
         contentRevision: 0,
         devicePreset: input.devicePreset ?? 'desktop',
       }
-    : {
+    : input.artifactType === 'image'
+    ? {
         id: identity.nodeId,
         kind: 'image',
         title: input.title,
         position,
         imageModuleId: identity.contentId,
         ...(input.adoptedAssetId ? { adoptedAssetId: input.adoptedAssetId } : {}),
+      }
+    : {
+        id: identity.nodeId,
+        kind: input.artifactType,
+        title: input.title,
+        position,
+        mediaModuleId: identity.contentId,
       }
   /** 节点提交和可选连线保持在同一个 batch。 */
   const operations: CanvasMutation[] = [{ type: 'upsert-nodes', nodes: [node] }]
@@ -372,7 +380,8 @@ function isOwnedArtifactNode(
 ): boolean {
   if (artifactType === 'document') return node.kind === 'document' && node.documentId === contentId
   if (artifactType === 'webview') return node.kind === 'webview' && node.prototypeId === contentId
-  return node.kind === 'image' && node.imageModuleId === contentId
+  if (artifactType === 'image') return node.kind === 'image' && node.imageModuleId === contentId
+  return node.kind === artifactType && node.mediaModuleId === contentId
 }
 
 /** 判断任意权威节点是否仍引用准备内容，避免补偿误删已提交资源。 */
@@ -380,6 +389,7 @@ function documentReferencesContent(document: CanvasDocument, contentId: string):
   return document.nodes.some((node) => (
     (node.kind === 'webview' && node.prototypeId === contentId)
     || (node.kind === 'image' && node.imageModuleId === contentId)
+    || ((node.kind === 'audio' || node.kind === 'video') && node.mediaModuleId === contentId)
     || (node.kind === 'document' && node.documentId === contentId)
   ))
 }
@@ -397,7 +407,7 @@ export function createCanvasArtifactCreationService(
       /** 写内容前先验证初始 revision、来源节点和默认位置。 */
       const initialDocument = dependencies.documents.load(target).document
       createArtifactOperations(input, initialDocument, identity)
-      /** 图片沿用项目当前默认模型；WebView 不携带图片配置。 */
+      /** 图片沿用项目当前默认模型；音视频创建空模块，工作流配置由独立 CAS 工具保存。 */
       const preparedInput: PrepareCanvasArtifactContentInput = input.artifactType === 'image'
         ? {
             kind: 'image',
@@ -406,7 +416,11 @@ export function createCanvasArtifactCreationService(
             selectedModelProfileId: dependencies.resolveDefaultImageModelProfileId?.(input.projectId) ?? null,
             ...(input.adoptedAssetId ? { adoptedAssetId: input.adoptedAssetId } : {}),
           }
-        : { kind: input.artifactType, contentId: identity.contentId, content: input.content }
+        : {
+            kind: input.artifactType,
+            contentId: identity.contentId,
+            content: input.artifactType === 'audio' || input.artifactType === 'video' ? '' : input.content,
+          }
       await dependencies.content.prepareArtifactContent(target, preparedInput)
 
       /** 以指定 revision 和 source ID 执行一次可恢复 batch。 */

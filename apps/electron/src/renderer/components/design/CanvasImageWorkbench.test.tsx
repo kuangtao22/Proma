@@ -4,10 +4,18 @@ import type {
   DesignAsset,
   DesignJobRecord,
   ImageGenerationModelOption,
+  MediaAssetRecord,
+  MediaConnectionSummary,
+  MediaWorkflowVersion,
 } from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CanvasImageModuleViewState } from '@/atoms/native-canvas-atoms'
-import { CanvasImageWorkbench } from './CanvasImageWorkbench'
+import {
+  buildCanvasImageMediaWorkflowChange,
+  CanvasImageWorkbench,
+  createCanvasImageWorkflowBaseline,
+} from './CanvasImageWorkbench'
+import { createCanvasMediaWorkflowDraft } from './CanvasMediaWorkbench'
 
 /** 创建 Canvas 生图工作台使用的模型选项。 */
 function createModelOption(): ImageGenerationModelOption {
@@ -139,14 +147,25 @@ function renderWorkbench(
     exportState?: 'idle' | 'exporting'
     exportError?: string | null
     adoptingAssetId?: string | null
+    mediaProgressByJobId?: ReadonlyMap<string, { phase: 'running'; phaseLabel: string; nodeProgressLabel?: string }>
+    imageModelOptions?: ImageGenerationModelOption[]
+    mediaWorkflow?: CanvasImageModuleSnapshot['config']['mediaWorkflow']
+    mediaWorkflows?: MediaWorkflowVersion[]
+    mediaConnections?: MediaConnectionSummary[]
+    mediaAssets?: MediaAssetRecord[]
   } = {},
 ): string {
   return renderToStaticMarkup(
     <CanvasImageWorkbench
       state={state}
       writable={writable}
-      imageModelOptions={[createModelOption()]}
+      imageModelOptions={options.imageModelOptions ?? [createModelOption()]}
       imageModelLoadState="ready"
+      mediaWorkflow={options.mediaWorkflow}
+      mediaWorkflows={options.mediaWorkflows}
+      mediaConnections={options.mediaConnections}
+      mediaAssets={options.mediaAssets}
+      onMediaWorkflowChange={() => undefined}
       onDraftChange={() => undefined}
       onGenerate={() => undefined}
       onCancel={() => undefined}
@@ -160,11 +179,102 @@ function renderWorkbench(
       onLoadTaskDetails={() => undefined}
       onConfigureModels={() => undefined}
       onRetryLoad={() => undefined}
+      mediaProgressByJobId={options.mediaProgressByJobId}
     />,
   )
 }
 
 describe('Canvas 生图工作台', () => {
+  test('Given 多字段工作流只完成首个字段 When 提升配置 Then 保留本地草稿且不覆盖外部基线', () => {
+    const workflow: MediaWorkflowVersion = {
+      id: 'workflow-multi', name: '多字段工作流', projectId: null, revision: 1,
+      hash: 'c'.repeat(64), createdAt: 1,
+      definition: {
+        schemaVersion: 1,
+        prompt: {
+          first: { class_type: 'TextNode', inputs: { text: '' } },
+          second: { class_type: 'TextNode', inputs: { text: '' } },
+        },
+        bindings: [
+          { key: 'first', kind: 'text', nodeId: 'first', input: 'text', field: {
+            classType: 'TextNode', valueKind: 'string', label: '第一字段', controlType: 'text', required: true,
+          } },
+          { key: 'second', kind: 'text', nodeId: 'second', input: 'text', field: {
+            classType: 'TextNode', valueKind: 'string', label: '第二字段', controlType: 'text', required: true,
+          } },
+        ],
+        outputs: [{ key: 'image', nodeId: 'save', outputIndex: 0, mediaType: 'image' }],
+      },
+    }
+    const drafts = createCanvasMediaWorkflowDraft(workflow)
+    /** 首字段已完成但第二字段仍为空，不能把空 inputs 提升到父配置。 */
+    const partialDrafts = drafts.map((draft, index) => index === 0 ? { ...draft, value: '第一段' } : draft)
+    expect(buildCanvasImageMediaWorkflowChange(workflow, partialDrafts, 'connection-1')).toBeNull()
+
+    /** 等价父对象必须产生同一基线，避免普通重渲染清空本地未完成字段。 */
+    const external = {
+      workflowId: workflow.id,
+      workflowRevision: workflow.revision,
+      connectionId: 'connection-1',
+      inputs: {
+        first: { kind: 'scalar' as const, value: '旧第一段' },
+        second: { kind: 'scalar' as const, value: '旧第二段' },
+      },
+    }
+    expect(createCanvasImageWorkflowBaseline(external, [workflow])).toBe(
+      createCanvasImageWorkflowBaseline(structuredClone(external), [structuredClone(workflow)]),
+    )
+
+    /** 两个必填字段完整后才生成可持久化配置。 */
+    const completeDrafts = partialDrafts.map((draft, index) => index === 1 ? { ...draft, value: '第二段' } : draft)
+    expect(buildCanvasImageMediaWorkflowChange(workflow, completeDrafts, 'connection-1')).toEqual({
+      workflowId: workflow.id,
+      workflowRevision: workflow.revision,
+      connectionId: 'connection-1',
+      inputs: {
+        first: { kind: 'scalar', value: '第一段' },
+        second: { kind: 'scalar', value: '第二段' },
+      },
+    })
+  })
+
+  test('Given Comfy 模型仍选择 auto 尺寸 When 渲染配置 Then 禁止提交并明确要求固定尺寸', () => {
+    const current = createState()
+    const comfyOption: ImageGenerationModelOption = {
+      profileId: 'profile-1', name: 'Comfy', modelId: 'workflow', executor: 'comfyui',
+      mediaProfileId: 'preset', mediaProfileRevision: 1, connectionId: 'connection',
+      workflowId: 'workflow', workflowRevision: 1, workflowHash: 'a'.repeat(64), available: true,
+    }
+    const html = renderWorkbench({
+      ...current,
+      draft: current.draft ? { ...current.draft, imageSize: 'auto' } : null,
+    }, true, { imageModelOptions: [comfyOption] })
+
+    expect(html).toContain('ComfyUI 工作流需要选择明确的图片尺寸')
+    expect(html).toMatch(/<button(?=[^>]*disabled="")[^>]*>[^<]*(?:<svg[\s\S]*?<\/svg>)?生成图片<\/button>/u)
+  })
+
+  test('Given 活跃 Comfy 任务存在当前节点采样 When 渲染工作台 Then 明确展示阶段而不显示整体百分比', () => {
+    const current = createState()
+    const active = {
+      ...createJob('job-comfy', 'running'),
+      imageModelSnapshot: {
+        profileId: 'media:preset:1', name: 'Comfy', modelId: 'workflow', executor: 'comfyui' as const,
+        mediaProfileId: 'preset', mediaProfileRevision: 1, connectionId: 'connection',
+        workflowId: 'workflow', workflowRevision: 1, workflowHash: 'a'.repeat(64),
+      },
+    }
+    const html = renderWorkbench({
+      ...current,
+      snapshot: current.snapshot ? { ...current.snapshot, jobs: [active, ...current.snapshot.jobs] } : null,
+    }, true, { mediaProgressByJobId: new Map([['job-comfy', {
+      phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+    }]]) })
+
+    expect(html).toContain('当前节点 sampler · 4/20')
+    expect(html).not.toContain('20%')
+  })
+
   test('Given 图片模块包含多个成功版本 When 渲染详情 Then 只展示统一历史版本入口', () => {
     const html = renderWorkbench(createState())
 
@@ -225,6 +335,55 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('proma-file://thumbnail-token/asset-2.webp')
     expect(html).not.toContain('/assets/asset-2.png')
     expect(html).not.toContain('/thumbnails/asset-2.webp')
+  })
+
+  test('Given 图片节点选择公共工作流 When 渲染 Then 显示连接、动态字段和项目素材', () => {
+    const workflow: MediaWorkflowVersion = {
+      id: 'workflow-1', name: '公共海报工作流', projectId: null, revision: 2,
+      hash: 'a'.repeat(64), createdAt: 1,
+      definition: {
+        schemaVersion: 1,
+        prompt: {
+          text: { class_type: 'CLIPTextEncode', inputs: { text: '' } },
+          image: { class_type: 'LoadImage', inputs: { image: '' } },
+        },
+        bindings: [
+          { key: 'promptText', kind: 'text', nodeId: 'text', input: 'text', field: {
+            classType: 'CLIPTextEncode', valueKind: 'string', label: '画面描述', controlType: 'text', required: true,
+          } },
+          { key: 'reference', kind: 'image', nodeId: 'image', input: 'image', loader: 'LoadImage', field: {
+            classType: 'LoadImage', valueKind: 'string', label: '参考素材', controlType: 'image', required: true,
+          } },
+        ],
+        outputs: [{ key: 'image', nodeId: 'save', outputIndex: 0, mediaType: 'image' }],
+      },
+    }
+    const mediaAsset: MediaAssetRecord = {
+      id: 'media-asset-1', revision: 1, hash: 'b'.repeat(64), filename: 'reference.png', byteSize: 10,
+      mediaType: 'image/png', mediaKind: 'image', metadata: { width: 10, height: 10 }, createdAt: 1,
+    }
+    const html = renderWorkbench(createState(), true, {
+      mediaWorkflow: {
+        workflowId: workflow.id, workflowRevision: workflow.revision, connectionId: 'connection-1',
+        inputs: {
+          promptText: { kind: 'scalar', value: '安静的首页' },
+          reference: { kind: 'asset', asset: { assetId: mediaAsset.id, revision: 1, hash: mediaAsset.hash, mediaKind: 'image' } },
+        },
+      },
+      mediaWorkflows: [workflow],
+      mediaConnections: [{
+        id: 'connection-1', name: '本地 ComfyUI', driver: 'comfyui', enabled: true,
+        revision: 1, instanceGeneration: 'generation-1', credentialConfigured: false,
+      }],
+      mediaAssets: [mediaAsset],
+    })
+
+    expect(html).toContain('ComfyUI 连接')
+    expect(html).toContain('公共工作流')
+    expect(html).toContain('画面描述')
+    expect(html).toContain('参考素材')
+    expect(html).toContain('安静的首页')
+    expect(html).toContain('导入参考素材')
   })
 
   test('Given 配置内容超过工作台高度 When 渲染 Then 主操作固定在底部且工作台保持可滚动', () => {

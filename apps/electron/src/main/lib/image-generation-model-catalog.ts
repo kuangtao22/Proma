@@ -7,16 +7,21 @@ import type {
   ImageGenerationModelOption,
   ImageGenerationModelProfile,
   ImageGenerationModelSnapshot,
+  MediaApiModelCatalogEntry,
+  MediaApiModelCatalogResult,
+  MediaApiModelExecutionSupport,
+  MediaApiModelProfile,
 } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
+  parseMediaApiModelProfile,
 } from '@proma/shared'
 import type { ResolvedImageGenerationRoute } from './image-generation-runtime'
 import { writeJsonFileAtomic } from './safe-file'
 
-/** 新保存目录统一使用 schema v2，v1 只作为 Nano Banana 兼容输入。 */
-const IMAGE_GENERATION_MODELS_SCHEMA_VERSION = 2
+/** 新保存目录统一使用 schema v3，v1/v2 只作为兼容输入。 */
+const IMAGE_GENERATION_MODELS_SCHEMA_VERSION = 3
 /** 旧 Nano Banana 配置合成项的稳定 ID。 */
 const LEGACY_PROFILE_ID = 'legacy-nano-banana-default'
 /** 旧配置未指定模型时使用的默认图片模型。 */
@@ -51,8 +56,16 @@ interface ImageGenerationModelsFileV2 {
   profiles: ImageGenerationModelProfile[]
 }
 
+/** schema v3 以单一 revision 管理 Nano 与全部渠道型 API 媒体模型。 */
+interface ImageGenerationModelsFileV3 {
+  schemaVersion: 3
+  revision: number
+  profiles: Array<Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }>>
+  mediaApiProfiles: MediaApiModelProfile[]
+}
+
 /** 读取时兼容的完整目录联合类型。 */
-type ImageGenerationModelsFile = ImageGenerationModelsFileV1 | ImageGenerationModelsFileV2
+type ImageGenerationModelsFile = ImageGenerationModelsFileV1 | ImageGenerationModelsFileV2 | ImageGenerationModelsFileV3
 
 /** 模型目录的文件路径、凭据和渠道依赖。 */
 export interface ImageGenerationModelCatalogDependencies {
@@ -66,11 +79,33 @@ export interface ImageGenerationModelCatalogDependencies {
   decryptChannelApiKey: (channelId: string) => string
   /** 生成旧兼容 profile 时间戳；生产默认使用当前时间。 */
   now?: () => number
+  /** 项目级 ComfyUI 预设只通过窄适配器参与选择，不写入旧模型目录。 */
+  media?: ImageGenerationMediaCatalogAdapter
+}
+
+/** 项目级媒体目录适配器，不向模型目录暴露连接凭据或工作流正文。 */
+export interface ImageGenerationMediaCatalogAdapter {
+  listOptions(projectId: string): Array<Extract<ImageGenerationModelOption, { executor: 'comfyui'; profileId: string }>>
+  resolveAvailableSnapshot(
+    projectId: string,
+    selectionId: string,
+  ): Extract<ImageGenerationModelSnapshot, { executor: 'comfyui'; profileId: string }>
+  /** 公共工作流直接生成独立快照，不创建或依赖伪 profile。 */
+  resolveAvailableWorkflowSnapshot(
+    projectId: string,
+    workflow: import('@proma/shared').CanvasImageMediaWorkflow,
+  ): Extract<ImageGenerationModelSnapshot, { executor: 'comfyui'; source: 'workflow' }>
+  assertSnapshotAvailable(
+    projectId: string,
+    snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'comfyui' }>,
+  ): void
 }
 
 /** 目录读取后附带是否来自旧工具配置的信息。 */
 interface LoadedProfiles {
   profiles: ImageGenerationModelProfile[]
+  mediaApiProfiles: MediaApiModelProfile[]
+  revision: number
   inheritedFromLegacyConfig: boolean
 }
 
@@ -102,27 +137,43 @@ export class ImageGenerationModelCatalog {
       channelOptions: state.channels.map((channel) => this.toChannelOption(channel, state)),
       inheritedFromLegacyConfig: loaded.inheritedFromLegacyConfig,
       credentialsConfigured: hasNanoBananaApiKey(state.nanoBananaCredentials),
+      revision: loaded.revision,
+    }
+  }
+
+  /** 列出图片、音频和视频 API 模型及真实执行支持。 */
+  listMediaApiCatalog(): MediaApiModelCatalogResult {
+    /** 单次读取固定渠道、凭据与目录版本。 */
+    const state = this.createInvocationState()
+    /** 当前 v3 或从旧目录无损投影的 API 模型。 */
+    const loaded = this.loadProfiles(state.nanoBananaCredentials)
+    return {
+      revision: loaded.revision,
+      entries: loaded.mediaApiProfiles.map((profile) => this.toMediaApiCatalogEntry(profile, state)),
     }
   }
 
   /** 列出全部 profile 的选择项，包括当前不可用项及明确原因。 */
-  listOptions(): ImageGenerationModelOption[] {
+  listOptions(projectId?: string): ImageGenerationModelOption[] {
     /** 本次列表计算只读取一次渠道和旧凭据。 */
     const state = this.createInvocationState()
     /** 当前磁盘目录或旧配置合成结果。 */
     const loaded = this.loadProfiles(state.nanoBananaCredentials)
-    return loaded.profiles.map((profile) => toOption(
+    const localOptions = loaded.profiles.map((profile) => toOption(
       profile,
       this.getAvailability(profile, state),
     ))
+    return projectId && this.dependencies.media
+      ? [...localOptions, ...this.dependencies.media.listOptions(projectId).map((option) => ({ ...option }))]
+      : localOptions
   }
 
-  /** 严格校验并完整替换所有 profile，使用 safe-file 原子写入 schema v2。 */
-  replaceProfiles(profiles: ImageGenerationModelProfile[]): ImageGenerationModelCatalogResult {
+  /** 严格校验并替换图片投影，保留其它协议并使用同一目录 revision CAS。 */
+  replaceProfiles(profiles: ImageGenerationModelProfile[], expectedRevision?: number): ImageGenerationModelCatalogResult {
     if (!Array.isArray(profiles)) {
       throw new Error('生图模型 profiles 必须是数组')
     }
-    /** 经 schema v2 字段校验并清洗展示文本后的完整 profile。 */
+    /** 经图片 schema 校验并清洗展示文本后的完整 profile。 */
     const validatedProfiles = validateProfiles(profiles, SUPPORTED_EXECUTORS)
     /** 保存前固定渠道与凭据快照，避免逐项校验时配置漂移。 */
     const state = this.createInvocationState()
@@ -133,14 +184,24 @@ export class ImageGenerationModelCatalog {
         throw new Error(`${availability.unavailableReason}: ${profile.id}`)
       }
     }
-    if (existsSync(this.dependencies.configPath)) {
-      /** 写前确认当前主文件有效，避免覆盖唯一损坏事实或污染恢复候选。 */
-      this.readModelsFile()
-    }
+    /** 当前目录同时提供 CAS revision 与必须保留的非图片协议。 */
+    const current = this.loadProfiles(state.nanoBananaCredentials)
+    assertCatalogRevision(current.revision, expectedRevision)
+    /** Nano profile 保持旧运行时合同。 */
+    const nanoProfiles = validatedProfiles.filter((profile): profile is Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }> => profile.executor === 'nano-banana')
+    /** OpenAI Images 使用同一稳定 ID 投影到统一 API 目录。 */
+    const imageApiProfiles = validatedProfiles
+      .filter((profile): profile is Extract<ImageGenerationModelProfile, { executor: 'openai-images' }> => profile.executor === 'openai-images')
+      .map(imageProfileToMediaApiProfile)
+    /** 旧图片入口不得删除音频、视频或未来其它协议。 */
+    const preservedProfiles = current.mediaApiProfiles.filter((profile) => profile.mediaKind !== 'image')
+    validateCrossCatalogIds(nanoProfiles, [...imageApiProfiles, ...preservedProfiles])
     /** 写入值只包含固定 schema 与 profile 白名单字段。 */
-    const file: ImageGenerationModelsFileV2 = {
+    const file: ImageGenerationModelsFileV3 = {
       schemaVersion: IMAGE_GENERATION_MODELS_SCHEMA_VERSION,
-      profiles: validatedProfiles,
+      revision: current.revision + 1,
+      profiles: nanoProfiles,
+      mediaApiProfiles: [...imageApiProfiles, ...preservedProfiles],
     }
     writeJsonFileAtomic(this.dependencies.configPath, file)
     return {
@@ -148,11 +209,44 @@ export class ImageGenerationModelCatalog {
       channelOptions: state.channels.map((channel) => this.toChannelOption(channel, state)),
       inheritedFromLegacyConfig: false,
       credentialsConfigured: hasNanoBananaApiKey(state.nanoBananaCredentials),
+      revision: file.revision,
+    }
+  }
+
+  /** 使用 expectedRevision 完整替换渠道型 API 模型，并保留 Nano profile。 */
+  replaceMediaApiProfiles(profiles: MediaApiModelProfile[], expectedRevision: number): MediaApiModelCatalogResult {
+    if (!Array.isArray(profiles)) throw new Error('媒体 API 模型 profiles 必须是数组')
+    /** shared parser 清洗并校验协议、能力和 scope ID。 */
+    const validatedProfiles = validateMediaApiProfiles(profiles)
+    /** 当前目录与渠道快照只读取一次。 */
+    const state = this.createInvocationState()
+    /** 当前目录提供 Nano profiles 与 CAS revision。 */
+    const current = this.loadProfiles(state.nanoBananaCredentials)
+    assertCatalogRevision(current.revision, expectedRevision)
+    for (const profile of validatedProfiles) this.assertMediaApiProfileReference(profile, state)
+    /** Nano 与 API 模型的稳定 ID 不能碰撞。 */
+    const nanoProfiles = current.profiles.filter((profile): profile is Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }> => profile.executor === 'nano-banana')
+    validateCrossCatalogIds(nanoProfiles, validatedProfiles)
+    /** 单文件原子写入保证两类入口共享同一并发边界。 */
+    const file: ImageGenerationModelsFileV3 = {
+      schemaVersion: IMAGE_GENERATION_MODELS_SCHEMA_VERSION,
+      revision: current.revision + 1,
+      profiles: nanoProfiles,
+      mediaApiProfiles: validatedProfiles,
+    }
+    writeJsonFileAtomic(this.dependencies.configPath, file)
+    return {
+      revision: file.revision,
+      entries: validatedProfiles.map((profile) => this.toMediaApiCatalogEntry(profile, state)),
     }
   }
 
   /** 解析当前可执行的 profile，并固化任务所需公开字段。 */
-  resolveAvailableSnapshot(profileId: string): ImageGenerationModelSnapshot {
+  resolveAvailableSnapshot(profileId: string, projectId?: string): ImageGenerationModelSnapshot {
+    if (profileId.startsWith('media:')) {
+      if (!projectId || !this.dependencies.media) throw new Error(`生图模型不存在: ${profileId}`)
+      return { ...this.dependencies.media.resolveAvailableSnapshot(projectId, profileId) }
+    }
     /** 本次解析固定使用同一渠道和凭据快照。 */
     const state = this.createInvocationState()
     /** 当前 ID 对应的严格解析 profile。 */
@@ -161,8 +255,22 @@ export class ImageGenerationModelCatalog {
     return toSnapshot(profile)
   }
 
+  /** 解析 Canvas 图片节点直接选择的公共工作流，并冻结完整执行身份。 */
+  resolveAvailableWorkflowSnapshot(
+    workflow: import('@proma/shared').CanvasImageMediaWorkflow,
+    projectId: string,
+  ): Extract<ImageGenerationModelSnapshot, { executor: 'comfyui'; source: 'workflow' }> {
+    if (!this.dependencies.media) throw new Error('媒体工作流执行器未初始化')
+    return this.dependencies.media.resolveAvailableWorkflowSnapshot(projectId, workflow)
+  }
+
   /** 确认历史快照仍可由当前同一执行配置运行；profile 改名不影响快照。 */
-  assertSnapshotAvailable(snapshot: ImageGenerationModelSnapshot): void {
+  assertSnapshotAvailable(snapshot: ImageGenerationModelSnapshot, projectId?: string): void {
+    if (snapshot.executor === 'comfyui') {
+      if (!projectId || !this.dependencies.media) throw new Error('ComfyUI 生图配置不可用')
+      this.dependencies.media.assertSnapshotAvailable(projectId, snapshot)
+      return
+    }
     /** 本次复核固定使用同一渠道和凭据快照。 */
     const state = this.createInvocationState()
     /** 当前 ID 对应的严格解析 profile。 */
@@ -172,7 +280,11 @@ export class ImageGenerationModelCatalog {
   }
 
   /** 实时复核任务快照，并解析只在本次主进程调用内存在的敏感运行路由。 */
-  resolveExecutionRoute(snapshot: ImageGenerationModelSnapshot): ResolvedImageGenerationRoute {
+  resolveExecutionRoute(snapshot: ImageGenerationModelSnapshot, projectId?: string): ResolvedImageGenerationRoute {
+    if (snapshot.executor === 'comfyui') {
+      this.assertSnapshotAvailable(snapshot, projectId)
+      return { executor: 'comfyui', snapshot: { ...snapshot } }
+    }
     /** 解密结果只保留在本方法的单次调用状态。 */
     const state = this.createInvocationState()
     /** 快照必须仍精确引用同一 profile。 */
@@ -232,11 +344,32 @@ export class ImageGenerationModelCatalog {
       const now = (this.dependencies.now ?? Date.now)()
       return {
         profiles: [createLegacyProfile(credentials, now)],
+        mediaApiProfiles: [],
+        revision: 0,
         inheritedFromLegacyConfig: true,
       }
     }
+    /** 旧文件只读投影，直到任一保存入口原子升级为 v3。 */
+    const file = this.readModelsFile()
+    if (file.schemaVersion === 3) {
+      return {
+        profiles: [
+          ...file.profiles,
+          ...file.mediaApiProfiles.filter((profile) => profile.protocol === 'openai-images').map(mediaApiProfileToImageProfile),
+        ],
+        mediaApiProfiles: file.mediaApiProfiles,
+        revision: file.revision,
+        inheritedFromLegacyConfig: false,
+      }
+    }
+    /** v1/v2 中的 OpenAI Images 原样迁移稳定 ID、渠道引用与时间戳。 */
+    const legacyProfiles = file.profiles
     return {
-      profiles: this.readModelsFile().profiles,
+      profiles: legacyProfiles,
+      mediaApiProfiles: legacyProfiles.flatMap((profile) => profile.executor === 'openai-images'
+        ? [imageProfileToMediaApiProfile(profile)]
+        : []),
+      revision: 0,
       inheritedFromLegacyConfig: false,
     }
   }
@@ -285,6 +418,46 @@ export class ImageGenerationModelCatalog {
     const model = channel.models.find((candidate) => candidate.id === profile.modelId)
     if (!model?.enabled) return { available: false, unavailableReason: '关联模型不可用' }
     return this.getChannelCredential(channel.id, state)
+  }
+
+  /** 校验 API 模型引用的渠道与 OpenAI Images 真实模型身份。 */
+  private assertMediaApiProfileReference(profile: MediaApiModelProfile, state: CatalogInvocationState): void {
+    /** profile 引用的渠道只承载稳定身份，秘密不进入模型目录。 */
+    const channel = state.channels.find((candidate) => candidate.id === profile.channelId)
+    if (!channel) throw new Error(`关联的模型配置已不存在: ${profile.id}`)
+    if (profile.protocol === 'openai-images' && !channel.models.some((model) => model.id === profile.modelId)) {
+      throw new Error(`关联模型不存在: ${profile.id}`)
+    }
+  }
+
+  /** 生成不含秘密的 API 模型条目，未接执行器保持 configuration-only。 */
+  private toMediaApiCatalogEntry(profile: MediaApiModelProfile, state: CatalogInvocationState): MediaApiModelCatalogEntry {
+    /** 渠道名称只在读取时派生，不进入统一模型目录持久化。 */
+    const channel = state.channels.find((candidate) => candidate.id === profile.channelId)
+    /** 停用状态优先于渠道与 adapter 判断。 */
+    let support: MediaApiModelExecutionSupport
+    if (!profile.enabled) {
+      support = { state: 'unavailable', reason: '模型已停用' }
+    } else {
+      if (!channel) support = { state: 'unavailable', reason: '关联的模型配置已不存在' }
+      else if (!channel.enabled) support = { state: 'unavailable', reason: '关联的模型配置已停用' }
+      else if (!channel.baseUrl.trim()) support = { state: 'unavailable', reason: '关联的模型配置缺少 Base URL' }
+      else {
+        /** 只有 OpenAI Images 需要匹配渠道启用模型；其它协议允许保存真实供应商 ID。 */
+        const modelAvailable = profile.protocol !== 'openai-images'
+          || channel.models.some((model) => model.id === profile.modelId && model.enabled)
+        /** 凭据状态只在主进程内读取，不进入返回值。 */
+        const credential = modelAvailable ? this.getChannelCredential(channel.id, state) : { available: false, unavailableReason: '关联模型不可用' }
+        if (!credential.available) support = { state: 'unavailable', reason: credential.unavailableReason ?? '模型配置不可用' }
+        else if (profile.protocol === 'openai-images') support = { state: 'supported', adapterId: 'openai-images' }
+        else support = { state: 'configuration-only', reason: '执行适配尚未接入' }
+      }
+    }
+    return {
+      profile: copyMediaApiProfile(profile),
+      ...(channel ? { channelName: channel.name } : {}),
+      support,
+    }
   }
 
   /** 每个渠道在单次公开操作中最多解密一次。 */
@@ -379,15 +552,16 @@ function parseModelsFile(value: unknown): ImageGenerationModelsFile {
   if (!isPlainObject(value)) {
     throw new Error('生图模型目录格式无效：根节点必须是普通对象')
   }
-  /** 根节点字段必须完整且仅包含 schemaVersion 与 profiles。 */
+  /** 根节点字段必须匹配对应 schema。 */
   const rootKeys = Object.keys(value)
-  if (rootKeys.length !== 2 || !rootKeys.includes('schemaVersion') || !rootKeys.includes('profiles')) {
+  if (!rootKeys.includes('schemaVersion') || !rootKeys.includes('profiles')) {
     throw new Error('生图模型目录格式无效：必须且只能包含 schemaVersion 和 profiles')
   }
   if (!Array.isArray(value.profiles)) {
     throw new Error('生图模型目录 profiles 必须是数组')
   }
   if (value.schemaVersion === 1) {
+    if (rootKeys.length !== 2) throw new Error('生图模型目录格式无效：schema v1 字段无效')
     const profiles = validateProfiles(
       value.profiles,
       new Set<ImageGenerationExecutor>(['nano-banana']),
@@ -401,12 +575,62 @@ function parseModelsFile(value: unknown): ImageGenerationModelsFile {
     }
   }
   if (value.schemaVersion === 2) {
+    if (rootKeys.length !== 2) throw new Error('生图模型目录格式无效：schema v2 字段无效')
     return {
       schemaVersion: 2,
       profiles: validateProfiles(value.profiles, SUPPORTED_EXECUTORS),
     }
   }
+  if (value.schemaVersion === 3) {
+    if (rootKeys.length !== 4 || !rootKeys.includes('revision') || !rootKeys.includes('mediaApiProfiles')) {
+      throw new Error('生图模型目录格式无效：schema v3 字段无效')
+    }
+    if (!Number.isSafeInteger(value.revision) || Number(value.revision) < 0 || !Array.isArray(value.mediaApiProfiles)) {
+      throw new Error('生图模型目录 revision 或 mediaApiProfiles 无效')
+    }
+    /** v3 原 profile 只允许 Nano Banana，渠道型图片由统一 API 目录投影。 */
+    const profiles = validateProfiles(value.profiles, new Set<ImageGenerationExecutor>(['nano-banana'])).map((profile) => {
+      if (profile.executor !== 'nano-banana') throw new Error('schema v3 profiles 只支持 Nano Banana')
+      return profile
+    })
+    /** 统一 API 模型使用 shared 严格解析器。 */
+    const mediaApiProfiles = validateMediaApiProfiles(value.mediaApiProfiles)
+    validateCrossCatalogIds(profiles, mediaApiProfiles)
+    return { schemaVersion: 3, revision: Number(value.revision), profiles, mediaApiProfiles }
+  }
   throw new Error(`不支持的生图模型目录 schemaVersion: ${String(value.schemaVersion)}`)
+}
+
+/** 校验统一 API 模型数组的字段与稳定 ID 唯一性。 */
+function validateMediaApiProfiles(profiles: readonly unknown[]): MediaApiModelProfile[] {
+  /** 已出现的 scope 模型 ID。 */
+  const ids = new Set<string>()
+  return profiles.map((profile) => {
+    /** shared parser 返回清洗后的独立 profile。 */
+    const validated = parseMediaApiModelProfile(profile)
+    if (ids.has(validated.id)) throw new Error(`媒体 API 模型 ID 重复: ${validated.id}`)
+    ids.add(validated.id)
+    return validated
+  })
+}
+
+/** Nano 与渠道型 API 模型共用 scope 时拒绝稳定 ID 碰撞。 */
+function validateCrossCatalogIds(
+  profiles: readonly Extract<ImageGenerationModelProfile, { executor: 'nano-banana' }>[],
+  mediaApiProfiles: readonly MediaApiModelProfile[],
+): void {
+  /** Nano profile ID 集合。 */
+  const nanoIds = new Set(profiles.map((profile) => profile.id))
+  /** 首个碰撞的 API 模型。 */
+  const duplicate = mediaApiProfiles.find((profile) => nanoIds.has(profile.id))
+  if (duplicate) throw new Error(`模型目录 ID 重复: ${duplicate.id}`)
+}
+
+/** 有 expectedRevision 时执行严格 CAS；旧入口缺省保持兼容。 */
+function assertCatalogRevision(currentRevision: number, expectedRevision?: number): void {
+  if (expectedRevision !== undefined && currentRevision !== expectedRevision) {
+    throw new Error(`模型目录已变化，请重新加载（当前 ${currentRevision}，提交 ${expectedRevision}）`)
+  }
 }
 
 /** 校验 profile 数组的字段、值域与 ID 唯一性，并返回独立副本。 */
@@ -592,4 +816,44 @@ function copyProfile(profile: ImageGenerationModelProfile): ImageGenerationModel
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
   }
+}
+
+/** 把旧 OpenAI Images profile 无损投影到统一 API 媒体模型。 */
+function imageProfileToMediaApiProfile(
+  profile: Extract<ImageGenerationModelProfile, { executor: 'openai-images' }>,
+): MediaApiModelProfile {
+  return {
+    id: profile.id,
+    name: profile.name,
+    mediaKind: 'image',
+    protocol: 'openai-images',
+    channelId: profile.channelId,
+    modelId: profile.modelId,
+    capabilities: ['text-to-image'],
+    enabled: profile.enabled,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  }
+}
+
+/** 把可执行 OpenAI Images 条目投影回旧图片运行时合同。 */
+function mediaApiProfileToImageProfile(
+  profile: Extract<MediaApiModelProfile, { protocol: 'openai-images' }> | MediaApiModelProfile,
+): Extract<ImageGenerationModelProfile, { executor: 'openai-images' }> {
+  if (profile.protocol !== 'openai-images') throw new Error('媒体 API 模型不能投影为 OpenAI Images')
+  return {
+    id: profile.id,
+    name: profile.name,
+    executor: 'openai-images',
+    channelId: profile.channelId,
+    modelId: profile.modelId,
+    enabled: profile.enabled,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  }
+}
+
+/** 复制 API profile 及能力数组，避免调用方修改读取结果。 */
+function copyMediaApiProfile(profile: MediaApiModelProfile): MediaApiModelProfile {
+  return { ...profile, capabilities: [...profile.capabilities] }
 }

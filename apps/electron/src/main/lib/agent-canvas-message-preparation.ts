@@ -49,6 +49,9 @@ export function createAgentQueueNowInput(candidate: AgentSubmitOrEnqueueInput): 
     mentionedSessionIds: candidate.mentionedSessionIds,
     mentionedTodoIds: candidate.mentionedTodoIds,
     mentionedCalendarEventIds: candidate.mentionedCalendarEventIds,
+    ...(Object.prototype.hasOwnProperty.call(candidate, 'mediaAttachments')
+      ? { mediaAttachments: candidate.mediaAttachments }
+      : {}),
     ...(Object.prototype.hasOwnProperty.call(candidate, 'canvasNodeReferences')
       ? { canvasNodeReferences: candidate.canvasNodeReferences }
       : {}),

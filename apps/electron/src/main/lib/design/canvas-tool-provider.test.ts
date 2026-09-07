@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import type { AgentCanvasBinding, CanvasDocument, CanvasMutation, CanvasNodeReference, CanvasRunNodesBatchSummary, CanvasSessionMeta, DesignJobRecord } from '@proma/shared'
+import type { AgentCanvasBinding, CanvasDocument, CanvasImageCandidateBatch, CanvasMutation, CanvasNodeReference, CanvasRunNodesBatchSummary, CanvasSessionMeta, DesignJobRecord } from '@proma/shared'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import {
   CANVAS_TOOL_NAMES,
@@ -94,6 +94,10 @@ function createFixture(options: {
   const agentExecutionInputs: unknown[] = []
   /** 工作流执行只记录 Host 绑定后的父运行与审批参数。 */
   const workflowExecutionInputs: unknown[] = []
+  /** 动态计划登记必须只消费 Host 创建结果。 */
+  const successorRegistrationInputs: unknown[] = []
+  /** 音视频工具调用记录用于验证所有路径委托统一 CanvasMediaService。 */
+  const canvasMediaInputs: Array<{ operation: string; input: unknown }> = []
   /** 精确指针读取调用用于证明摘要不会漂移到后续运行。 */
   const agentOutputReadPointers: unknown[] = []
   /** 授权与关联调用计数用于证明工具执行时 fresh-read。 */
@@ -242,6 +246,14 @@ function createFixture(options: {
           errorCode: null,
         }
       },
+      resume: async () => { throw new Error('fixture resume unavailable') },
+      cancel: async () => { throw new Error('fixture cancel unavailable') },
+      get: async () => { throw new Error('fixture get unavailable') },
+      list: async () => [],
+      registerCreatedSuccessor: async (runContext, input) => {
+        successorRegistrationInputs.push({ runContext, input })
+        return { status: 'registered' as const, workflowRunId: 'workflow-1', workflowRunRevision: 2, reasonCode: null }
+      },
     },
     readNodeContent: async (_target, node) => node.kind === 'document' ? 'A'.repeat(40_000) : '',
     artifacts: {
@@ -339,6 +351,7 @@ function createFixture(options: {
           schemaVersion: 2 as const, kind: 'image' as const, contentId: input.imageModuleId,
           revision: input.expectedConfigRevision + 1, createdAt: 1, updatedAt: 3,
           prompt: input.prompt, selectedModelProfileId: input.selectedModelProfileId,
+          ...(input.mediaWorkflow ? { mediaWorkflow: structuredClone(input.mediaWorkflow) } : {}),
           aspectRatio: input.aspectRatio, imageSize: input.imageSize, contextMode: input.contextMode,
           adoptedAssetId: 'asset-1',
         }
@@ -372,6 +385,105 @@ function createFixture(options: {
         }
       },
     },
+    canvasMedia: {
+      load: async (input) => {
+        canvasMediaInputs.push({ operation: 'load', input: structuredClone(input) })
+        return {
+          target: input,
+          config: {
+            schemaVersion: 1 as const,
+            contentId: input.mediaModuleId,
+            mediaKind: input.mediaKind,
+            revision: 2,
+            createdAt: 1,
+            updatedAt: 2,
+            profile: { profileId: 'profile-1', profileRevision: 1 },
+            inputs: [],
+            outputs: [{ key: 'primary', mediaKind: input.mediaKind, role: 'primary' as const, order: 0 }],
+            adoptedOutputs: [],
+          },
+          candidates: [],
+          runs: [],
+          assets: [],
+        }
+      },
+      save: async (input) => {
+        canvasMediaInputs.push({ operation: 'save', input: structuredClone(input) })
+        return {
+          schemaVersion: 1 as const,
+          contentId: input.mediaModuleId,
+          mediaKind: input.mediaKind,
+          revision: input.expectedConfigRevision + 1,
+          createdAt: 1,
+          updatedAt: 3,
+          profile: input.profile,
+          inputs: input.inputs,
+          outputs: input.outputs,
+          adoptedOutputs: [],
+        }
+      },
+      run: async (input, origin) => {
+        canvasMediaInputs.push({ operation: 'run', input: structuredClone({ input, origin }) })
+        return {
+          id: `run-${input.nodeId}`,
+          projectId: input.projectId,
+          revision: 1,
+          phase: 'queued' as const,
+          profileId: 'profile-1',
+          profileRevision: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          outputs: [],
+          error: null,
+          progress: { nodeId: '7', value: 1, max: 4 },
+        }
+      },
+      attachCompletedRun: async (input, actor) => {
+        canvasMediaInputs.push({ operation: 'attach', input: structuredClone({ input, actor }) })
+        return {
+          id: `candidate:${input.runId}`,
+          operationId: 'attach-operation',
+          runId: input.runId,
+          sourceConfigRevision: input.expectedConfigRevision,
+          profile: { profileId: 'profile-1', profileRevision: 1 },
+          sourceRef: { kind: 'profile-version', profileId: 'profile-1', profileRevision: 1 },
+          outputs: [{ key: 'primary', mediaKind: input.mediaKind, role: 'primary' as const, order: 0,
+            asset: { assetId: 'attached-asset', revision: 1, hash: 'a'.repeat(64), mediaKind: input.mediaKind } }],
+          createdAt: 3,
+        }
+      },
+      cancel: async (input, runId) => {
+        canvasMediaInputs.push({ operation: 'cancel', input: structuredClone({ input, runId }) })
+        return {
+          id: runId,
+          projectId: input.projectId,
+          revision: 2,
+          phase: 'cancel-requested' as const,
+          profileId: 'profile-1',
+          profileRevision: 1,
+          createdAt: 1,
+          updatedAt: 2,
+          outputs: [],
+          error: null,
+          progress: null,
+        }
+      },
+      adopt: async (input) => {
+        canvasMediaInputs.push({ operation: 'adopt', input: structuredClone(input) })
+        return {
+          schemaVersion: 1 as const,
+          contentId: input.mediaModuleId,
+          mediaKind: input.mediaKind,
+          revision: input.expectedConfigRevision + 1,
+          createdAt: 1,
+          updatedAt: 3,
+          profile: { profileId: 'profile-1', profileRevision: 1 },
+          inputs: [],
+          outputs: [{ key: 'primary', mediaKind: input.mediaKind, role: 'primary' as const, order: 0 }],
+          adoptedOutputs: [],
+        }
+      },
+    },
   }
   const context: CanvasToolRunContext = {
     projectId: target.projectId, sessionId: 'session-1', runStartedAt: 99,
@@ -382,6 +494,8 @@ function createFixture(options: {
     agentArtifactInputs, importedImageInputs,
     textUpdateInputs, imageSaveInputs,
     agentConfigUpdateInputs, agentExecutionInputs, workflowExecutionInputs, agentOutputReadPointers,
+    successorRegistrationInputs,
+    canvasMediaInputs,
     getAuthorizeReadCalls: () => authorizeReadCalls,
     getRequireLinkedCanvasCalls: () => requireLinkedCanvasCalls,
     getListCalls: () => listCalls,
@@ -563,6 +677,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_get_task', 'canvas_cancel_task', 'canvas_retry_task',
       'canvas_list_versions', 'canvas_read_version', 'canvas_adopt_version',
       'canvas_export_artifact', 'canvas_list_trash', 'canvas_restore_node',
+      'canvas_resume_workflow', 'canvas_cancel_workflow',
     ])
     expect(parentOrchestrated.allowedToolNames.filter((name) => operationNames.includes(name))).toEqual([
       'canvas_get_task', 'canvas_list_versions', 'canvas_read_version',
@@ -573,7 +688,63 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(parentOrchestrated.systemPromptAppend).not.toContain('`canvas_retry_task`')
   })
 
-  test('Given 普通分析运行 When 获取上下文 Then 注入十五工具、Canvas Skill 路由与硬边界且不扫描全部画布', async () => {
+  test('Given 图片候选 When Agent 查询后采用 Then 使用精确指纹且不暴露素材路径', async () => {
+    /** 仅当前画布的真实节点可被查询和采用。 */
+    const fixture = createFixture()
+    const batch: CanvasImageCandidateBatch = {
+      schemaVersion: 1, ...target, batchId: 'batch-1', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-1', status: 'ready',
+      entries: [{ nodeId: 'image-1', imageModuleId: 'image-content-1', initialAdoptedAssetId: 'asset-1',
+        initialConfigRevision: 1, jobId: 'job-1', candidateAssetId: 'secret-asset', status: 'candidate', error: null }],
+      adoption: null, createdAt: 1, updatedAt: 2,
+    }
+    const adoptedHashes: Array<string | undefined> = []
+    fixture.dependencies.imageCandidates = {
+      load: async () => structuredClone(batch),
+      adopt: async (_input, hash) => {
+        adoptedHashes.push(typeof hash === 'string' ? hash : hash?.expectedCandidateHash)
+        return { ...batch, status: 'adopted', adoption: { mode: 'all', adoptedNodeIds: ['image-1'],
+          keptNodeIds: [], invalidatedDownstreamNodeIds: [], committedAt: 3 } }
+      },
+    }
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const queried = await executeTool(run.piCustomTools, 'canvas_get_image_candidates', { canvasId: 'canvas-1', batchId: 'batch-1' })
+    const details = queried.details as { candidateHash: string }
+    expect(details.candidateHash).toMatch(/^[a-f0-9]{64}$/)
+    expect(JSON.stringify(queried)).not.toContain('secret-asset')
+    const inspected = await executeTool(run.piCustomTools, 'canvas_get_image_candidates', {
+      canvasId: 'canvas-1', batchId: 'batch-1', inspectNodeIds: ['image-1'],
+    })
+    expect(inspected.details).toMatchObject({ imageCount: 1, inspections: [{ nodeId: 'image-1', status: 'ready' }] })
+    expect(inspected.content.filter((entry) => entry.type === 'image')).toHaveLength(1)
+    await expect(executeTool(run.piCustomTools, 'canvas_get_image_candidates', {
+      canvasId: 'canvas-1', batchId: 'batch-1', inspectNodeIds: ['image-1', 'image-1'],
+    })).rejects.toThrow('CANVAS_IMAGE_BATCH_LIMIT')
+    await expect(executeTool(run.piCustomTools, 'canvas_get_image_candidates', {
+      canvasId: 'canvas-unlinked', batchId: 'batch-1',
+    })).rejects.toThrow()
+    const result = await executeTool(run.piCustomTools, 'canvas_adopt_image_candidates', {
+      canvasId: 'canvas-1', batchId: 'batch-1', candidateHash: details.candidateHash, mode: 'all',
+    })
+    expect(result.details).toMatchObject({ status: 'adopted', adoptedNodeIds: ['image-1'] })
+    expect(adoptedHashes).toEqual([details.candidateHash])
+    const plan = createCanvasToolRun(fixture.dependencies, { ...fixture.context, permissionCeiling: 'plan' })
+    await expect(executeTool(plan.piCustomTools, 'canvas_adopt_image_candidates', {
+      canvasId: 'canvas-1', batchId: 'batch-1', candidateHash: details.candidateHash, mode: 'all',
+    })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    expect(adoptedHashes).toHaveLength(1)
+    /** 文件读取期间发生候选替换时，不把旧缩略图与新指纹一起返回。 */
+    const readThumbnail = fixture.dependencies.images.readThumbnail
+    fixture.dependencies.images.readThumbnail = async (...args) => {
+      batch.entries[0]!.candidateAssetId = 'replacement-asset'
+      return readThumbnail(...args)
+    }
+    await expect(executeTool(run.piCustomTools, 'canvas_get_image_candidates', {
+      canvasId: 'canvas-1', batchId: 'batch-1', inspectNodeIds: ['image-1'],
+    })).rejects.toThrow('CANVAS_IMAGE_CANDIDATES_CHANGED')
+  })
+
+  test('Given 普通分析运行 When 获取上下文 Then 注入统一 Canvas 工具、Skill 路由与硬边界且不扫描全部画布', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     expect(run.piCustomTools.map((tool) => tool.name)).toEqual([
@@ -586,16 +757,29 @@ describe('普通 Agent Canvas Tool Provider', () => {
       'canvas_create_agent',
       'canvas_import_image',
       'canvas_create_artifact',
+      'canvas_create_media',
       'canvas_update_artifact',
       'canvas_update_image_config',
+      'canvas_update_media_config',
+      'canvas_inspect_media',
+      'canvas_attach_media_run',
+      'canvas_cancel_media_run',
+      'canvas_adopt_media_candidate',
       'canvas_update_agent_config',
       'canvas_run_agent',
       'canvas_run_workflow',
+      'canvas_get_workflow_run',
+      'canvas_list_workflow_runs',
+      'canvas_resume_workflow',
+      'canvas_cancel_workflow',
       'canvas_run_nodes',
     ])
     expect(run.allowedToolNames).toEqual([...CANVAS_TOOL_NAMES])
     expect(run.allowedToolNamesMode).toBe('extend')
-    expect(run.singleApprovalToolNames).toEqual(['canvas_run_nodes', 'canvas_run_workflow'])
+    expect(run.singleApprovalToolNames).toEqual([
+      'canvas_run_nodes', 'canvas_run_workflow', 'canvas_resume_workflow',
+      'canvas_cancel_workflow', 'canvas_cancel_media_run',
+    ])
     expect(run.systemPromptAppend).toContain('不要按“首页”或“设计”等关键词硬编码')
     expect(run.systemPromptAppend).toContain('先读取并遵循 `canvas-production` Skill')
     expect(run.systemPromptAppend).toContain('Skill 不可用')
@@ -608,8 +792,8 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(run.piCustomTools.find((tool) => tool.name === 'canvas_create_artifact')?.description)
       .toContain('文档')
     const runNodesDescription = run.piCustomTools.find((tool) => tool.name === 'canvas_run_nodes')?.description ?? ''
-    expect(runNodesDescription).toContain('生图节点')
-    expect(runNodesDescription).toContain('模型费用')
+    expect(runNodesDescription).toContain('图片、音频或视频节点')
+    expect(runNodesDescription).toContain('产生费用')
     expect(runNodesDescription).not.toContain('WebView')
     const result = await executeTool(run.piCustomTools, 'canvas_get_context', {})
     expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
@@ -910,6 +1094,31 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.imageSaveInputs).toHaveLength(0)
   })
 
+  test('Given Agent 选择公共图片工作流 When 更新图片配置 Then 清除 profile 并保存完整媒体输入', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const mediaWorkflow = {
+      workflowId: 'workflow-1', workflowRevision: 2, connectionId: 'connection-1',
+      inputs: {
+        promptText: { kind: 'scalar', value: '直接映射提示词' },
+        reference: { kind: 'asset', asset: {
+          assetId: 'asset-1', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image',
+        } },
+      },
+    } as const
+
+    await executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3,
+      expectedConfigRevision: 4, mediaWorkflow,
+    }, 'tool-image-workflow-1')
+
+    expect(fixture.imageSaveInputs[0]).toMatchObject({
+      selectedModelProfileId: null,
+      mediaWorkflow,
+    })
+    expect(fixture.runInputs).toHaveLength(0)
+  })
+
   test('Given 普通 Agent 局部修改专业 Agent 配置 When 双 revision 匹配 Then 保留省略字段且不接受会话归属字段', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
@@ -1047,6 +1256,58 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.getRequireLinkedCanvasCalls()).toBe(1)
   })
 
+  test('Given 持久工作流等待验收 When 查询、列出、恢复与取消 Then 全部委托统一工作流服务', async () => {
+    const fixture = createFixture()
+    const calls: string[] = []
+    const durableRun = {
+      id: 'workflow-1', revision: 4, status: 'waiting-review', rootNodeIds: ['agent-1'],
+      budget: { maxMediaRuns: 4, consumedMediaRuns: 1, remainingMediaRuns: 3 }, updatedAt: 10,
+    }
+    fixture.dependencies.workflowExecution.get = async () => {
+      calls.push('get')
+      return durableRun as never
+    }
+    fixture.dependencies.workflowExecution.list = async () => {
+      calls.push('list')
+      return [durableRun as never]
+    }
+    const resumeInputs: unknown[] = []
+    fixture.dependencies.workflowExecution.resume = async (_context, input) => {
+      calls.push('resume')
+      resumeInputs.push(input)
+      return {
+        status: 'completed', initialRevision: 3, finalRevision: 4, nodes: [],
+        imageSummary: null, requiresReview: false, errorCode: null,
+      }
+    }
+    fixture.dependencies.workflowExecution.cancel = async () => {
+      calls.push('cancel')
+      return { ...durableRun, status: 'cancelled' } as never
+    }
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await executeTool(run.piCustomTools, 'canvas_get_workflow_run', { canvasId: 'canvas-1', runId: 'workflow-1' })
+    const listed = await executeTool(run.piCustomTools, 'canvas_list_workflow_runs', { canvasId: 'canvas-1' })
+    await executeTool(run.piCustomTools, 'canvas_resume_workflow', { canvasId: 'canvas-1', runId: 'workflow-1' })
+    await executeTool(run.piCustomTools, 'canvas_resume_workflow', {
+      canvasId: 'canvas-1', runId: 'workflow-1', expectedRunRevision: 4,
+      resumeOperationId: 'extend-1', addDurationMs: 3_600_000, addMediaRuns: 4, retryNodeIds: ['image-1'],
+      projectId: 'spoofed-project', owner: { sessionId: 'spoofed-session' },
+    })
+    expect(resumeInputs[1]).toEqual({
+      ...target, runId: 'workflow-1', expectedRunRevision: 4, resumeOperationId: 'extend-1',
+      addDurationMs: 3_600_000, addMediaRuns: 4, retryNodeIds: ['image-1'],
+    })
+    await executeTool(run.piCustomTools, 'canvas_cancel_workflow', {
+      canvasId: 'canvas-1', runId: 'workflow-1', cancelIntent: 'explicit',
+    })
+
+    expect(calls).toEqual(['get', 'list', 'resume', 'resume', 'cancel'])
+    expect(listed.details).toMatchObject({
+      runs: [{ id: 'workflow-1', status: 'waiting-review', budget: { remainingMediaRuns: 3 } }],
+    })
+  })
+
   test('Given 正式输出包含多字节字符 When 生成响应摘要 Then 按 UTF-8 字节安全截断且不切断字符', async () => {
     const prefix = '中'.repeat(1_365)
     const fixture = createFixture({ agentOutputAtPointer: `${prefix}😀后续正文` })
@@ -1110,11 +1371,16 @@ describe('普通 Agent Canvas Tool Provider', () => {
     const rendererManualToolNames = [
       'canvas_get_context', 'canvas_list_nodes', 'canvas_inspect_images', 'canvas_read',
       'canvas_apply_changes', 'canvas_import_image', 'canvas_create_artifact',
-      'canvas_update_artifact',
+      'canvas_create_media', 'canvas_update_artifact',
       ...(ordinary.allowedToolNames.includes('canvas_update_image_config') ? ['canvas_update_image_config'] : []),
+      'canvas_update_media_config', 'canvas_inspect_media', 'canvas_cancel_media_run',
+      'canvas_adopt_media_candidate', 'canvas_get_workflow_run', 'canvas_list_workflow_runs',
+      'canvas_resume_workflow', 'canvas_cancel_workflow',
       'canvas_run_nodes',
     ]
-    const parentOrchestratedToolNames = rendererManualToolNames.filter((name) => name !== 'canvas_run_nodes')
+    const parentOrchestratedToolNames = rendererManualToolNames.filter((name) => ![
+      'canvas_cancel_media_run', 'canvas_resume_workflow', 'canvas_cancel_workflow', 'canvas_run_nodes',
+    ].includes(name))
     /** 模拟未来给普通 Agent 新增的高权限工具，Canvas Agent 必须默认拒绝。 */
     const futurePrivilegedTool: ToolDefinition = {
       ...ordinary.piCustomTools[0]!,
@@ -1147,6 +1413,238 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(details.nodes[1]?.artifact).toMatchObject({
       nodeId: 'image-1', kind: 'image', currentRevision: 4, adoptedAssetId: 'asset-1',
     })
+  })
+
+  test('Given 音视频节点已有运行 When read 与 inspect Then 只返回配置、候选和节点进度元数据', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1),
+        revision: 3,
+        nodes: [{
+          id: 'video-1', kind: 'video', title: '主片', position: { x: 0, y: 0 }, mediaModuleId: 'media-video-1',
+        }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const originalLoad = fixture.dependencies.canvasMedia.load
+    fixture.dependencies.canvasMedia.load = async (input) => ({
+      ...(await originalLoad(input)),
+      runs: [{
+        id: 'run-video-1', projectId: 'project-1', revision: 4, phase: 'running',
+        profileId: 'profile-1', profileRevision: 1, createdAt: 1, updatedAt: 4,
+        outputs: [], error: null, progress: { nodeId: '42', value: 3, max: 8 },
+      }],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const read = await executeTool(run.piCustomTools, 'canvas_read', {
+      canvasId: 'canvas-1', nodeIds: ['video-1'],
+    })
+    const inspect = await executeTool(run.piCustomTools, 'canvas_inspect_media', {
+      canvasId: 'canvas-1', nodeId: 'video-1',
+    })
+
+    expect(JSON.stringify(read.details)).toContain('"metadataOnly":true')
+    expect(inspect.details).toMatchObject({
+      metadataOnly: true,
+      runs: [{ phase: 'running', progress: { nodeId: '42', value: 3, max: 8 } }],
+    })
+    expect(JSON.stringify(inspect.details)).not.toContain('mediaUrl')
+    expect(JSON.stringify(inspect.details)).not.toContain('localPath')
+  })
+
+  test('Given Agent 创建并配置音频节点 When 调用媒体工具 Then 只经产物服务和 CanvasMediaService 提交', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const created = await executeTool(run.piCustomTools, 'canvas_create_media', {
+      canvasId: 'canvas-1', baseRevision: 3, mediaKind: 'audio', title: '旁白',
+      sourceNodeId: 'doc-1', relation: 'depends-on',
+    }, 'tool-create-audio')
+    expect(created.details).toMatchObject({ mediaKind: 'audio', configRevision: 0, requiresConfiguration: true })
+    expect(fixture.artifactInputs).toEqual([expect.objectContaining({
+      artifactType: 'audio', content: '', sourceNodeId: 'doc-1', relation: 'depends-on',
+    })])
+
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 4,
+        nodes: [{ id: 'audio-1', kind: 'audio', title: '旁白', position: { x: 0, y: 0 }, mediaModuleId: 'media-audio-1' }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const configured = await executeTool(run.piCustomTools, 'canvas_update_media_config', {
+      canvasId: 'canvas-1', nodeId: 'audio-1', baseRevision: 4, expectedConfigRevision: 2,
+      profile: { profileId: 'profile-1', profileRevision: 1 },
+      inputs: [{ key: 'text', kind: 'text', source: { type: 'literal', value: '你好' } }],
+      outputs: [{ key: 'primary', mediaKind: 'audio', role: 'primary', order: 0 }],
+    })
+    expect(configured.details).toMatchObject({ mediaKind: 'audio', configRevision: 3, requiresRun: true })
+    expect(fixture.canvasMediaInputs.some((entry) => entry.operation === 'save')).toBe(true)
+    await executeTool(run.piCustomTools, 'canvas_update_media_config', {
+      canvasId: 'canvas-1', nodeId: 'audio-1', baseRevision: 4, expectedConfigRevision: 2,
+      profile: null, inputs: [{ key: 'text', kind: 'text', source: { type: 'literal', value: '草稿旁白' } }],
+      outputs: [{ key: 'primary', mediaKind: 'audio', role: 'primary', order: 0 }],
+    })
+    expect(fixture.canvasMediaInputs.at(-1)).toMatchObject({ operation: 'save', input: { profile: null } })
+  })
+
+  test('Given 父编排 child 创建产物 When 登记动态后继 Then 只传 Host 创建结果且登记失败保留创建事实', async () => {
+    const fixture = createFixture()
+    const context: CanvasToolRunContext = { ...fixture.context, canvasAgentMode: 'parent-orchestrated',
+      canvasAgentTarget: { ...target, nodeId: 'agent-1' }, parentWorkflow: { runId: 'workflow-1', parentSessionId: 'parent-1' } }
+    const run = createCanvasToolRun(fixture.dependencies, context)
+    for (const [toolName, extra] of [
+      ['canvas_create_media', { mediaKind: 'video' }],
+      ['canvas_create_artifact', { artifactType: 'document', content: '# 交付' }],
+      ['canvas_import_image', { localPath: '/authorized/reference.png' }],
+    ] as const) {
+      const result = await executeTool(run.piCustomTools, toolName, {
+        canvasId: target.canvasId, baseRevision: 3, title: '新产物', ...extra,
+      }, 'trusted-create-call')
+      expect(result.details).toMatchObject({ workflowRegistration: { status: 'registered', workflowRunId: 'workflow-1' } })
+    }
+    expect(fixture.successorRegistrationInputs).toEqual([
+      { runContext: context, input: { ...target, nodeId: 'artifact-created', sourceToolCallId: 'trusted-create-call' } },
+      { runContext: context, input: { ...target, nodeId: 'artifact-created', sourceToolCallId: 'trusted-create-call' } },
+      { runContext: context, input: { ...target, nodeId: 'image-imported', sourceToolCallId: 'trusted-create-call' } },
+    ])
+    fixture.dependencies.workflowExecution.registerCreatedSuccessor = async () => { throw new Error('DISK_ERROR_WITH_PRIVATE_PATH') }
+    fixture.dependencies.workflowExecution.recordCreatedSuccessorRegistrationFailure = async () => ({
+      status: 'blocked', workflowRunId: 'workflow-1', workflowRunRevision: 3,
+      reasonCode: 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_REGISTRATION_FAILED',
+    })
+    const created = await executeTool(run.piCustomTools, 'canvas_create_media', {
+      canvasId: target.canvasId, baseRevision: 3, title: '旁白', mediaKind: 'audio',
+    })
+    expect(created.details).toMatchObject({ nodeId: 'artifact-created', workflowRegistration: {
+      status: 'blocked', workflowRunRevision: 3,
+      reasonCode: 'CANVAS_WORKFLOW_DYNAMIC_SUCCESSOR_REGISTRATION_FAILED',
+    } })
+    expect(JSON.stringify(created)).not.toContain('PRIVATE_PATH')
+  })
+
+  test('Given 父工作流 child When 用结构批次创建未登记节点 Then 批次执行前拒绝', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, canvasAgentMode: 'parent-orchestrated',
+      canvasAgentTarget: { ...target, nodeId: 'agent-1' }, parentWorkflow: { runId: 'workflow-1', parentSessionId: 'parent-1' } })
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: target.canvasId, baseRevision: 3,
+      operations: [{ type: 'upsert-nodes', nodes: [{ id: 'unregistered', kind: 'image', title: '绕过',
+        imageModuleId: 'unregistered-image', position: { x: 0, y: 0 } }] }],
+    })).rejects.toThrow('CANVAS_WORKFLOW_SUCCESSOR_USE_CREATE_TOOL')
+    expect(fixture.batchInputs).toEqual([])
+  })
+
+  test('Given 媒体候选与活动运行 When Agent 采用并取消 Then 两项操作都绑定权威节点模块身份', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [{ id: 'audio-1', kind: 'audio', title: '旁白', position: { x: 0, y: 0 }, mediaModuleId: 'media-audio-1' }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await executeTool(run.piCustomTools, 'canvas_adopt_media_candidate', {
+      canvasId: 'canvas-1', nodeId: 'audio-1', expectedConfigRevision: 2,
+      candidateId: 'candidate-1', selectedKeys: ['primary'],
+    })
+    await executeTool(run.piCustomTools, 'canvas_cancel_media_run', {
+      canvasId: 'canvas-1', nodeId: 'audio-1', runId: 'run-audio-1', cancelIntent: 'explicit',
+    })
+
+    expect(fixture.canvasMediaInputs.filter((entry) => ['adopt', 'cancel'].includes(entry.operation)))
+      .toEqual([
+        expect.objectContaining({ operation: 'adopt', input: expect.objectContaining({ mediaModuleId: 'media-audio-1' }) }),
+        expect.objectContaining({ operation: 'cancel', input: expect.objectContaining({ input: expect.objectContaining({ mediaModuleId: 'media-audio-1' }) }) }),
+      ])
+  })
+
+  test('Given 普通 Agent 已有成功独立 run When 显式挂接既有 AV 节点 Then Host 传入真实 actor 且不返回资产标识', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [{ id: 'video-1', kind: 'video', title: '主片', position: { x: 0, y: 0 }, mediaModuleId: 'media-video-1' }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_attach_media_run', {
+      canvasId: 'canvas-1', nodeId: 'video-1', expectedConfigRevision: 2, runId: 'independent-run-1',
+    })
+
+    expect(fixture.canvasMediaInputs.at(-1)).toEqual({
+      operation: 'attach',
+      input: {
+        input: { ...target, nodeId: 'video-1', mediaModuleId: 'media-video-1', mediaKind: 'video', expectedConfigRevision: 2, runId: 'independent-run-1' },
+        actor: { sessionId: 'session-1', runStartedAt: 99, mode: 'project-agent' },
+      },
+    })
+    expect(result.details).toMatchObject({ candidateId: 'candidate:independent-run-1', runId: 'independent-run-1', adopted: false })
+    expect(JSON.stringify(result.details)).not.toContain('attached-asset')
+
+    const parent = createCanvasToolRun(fixture.dependencies, {
+      ...fixture.context,
+      sessionId: 'canvas-agent-session-1',
+      canvasAgentMode: 'parent-orchestrated',
+      canvasAgentTarget: { ...target, nodeId: 'agent-1' },
+    })
+    expect(parent.allowedToolNames).not.toContain('canvas_attach_media_run')
+    expect(parent.piCustomTools.some((tool) => tool.name === 'canvas_attach_media_run')).toBe(false)
+  })
+
+  test('Given 当前会话导入的音视频 When 回填画布 Then 绑定 Host 身份且工具重放复用 operationId', async () => {
+    /** 模拟本地导入后的精确资产引用和可观察调用。 */
+    const fixture = createFixture()
+    const asset = { assetId: 'local-asset', revision: 1, hash: 'a'.repeat(64), mediaKind: 'video' as const }
+    const calls: unknown[] = []
+    fixture.dependencies.documents.load = () => ({
+      document: { ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [{ id: 'video-1', kind: 'video', title: '成片', position: { x: 0, y: 0 }, mediaModuleId: 'media-video-1' }] },
+      writable: true, nodeIssues: [],
+    })
+    fixture.dependencies.canvasMedia.attachImportedAssets = async (input, actor) => {
+      calls.push(structuredClone({ input, actor }))
+      return { id: 'candidate:local-receipt', operationId: input.operationId, runId: 'local-receipt',
+        sourceConfigRevision: input.expectedConfigRevision, createdAt: 1,
+        source: { kind: 'local-import', operationId: input.operationId, sourceSessionId: actor.sessionId },
+        outputs: [{ key: 'primary', mediaKind: 'video', role: 'primary', order: 0, asset }] }
+    }
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const params = { canvasId: target.canvasId, nodeId: 'video-1', expectedConfigRevision: 2,
+      outputs: [{ key: 'primary', asset }] }
+    const result = await executeTool(run.piCustomTools, 'canvas_attach_media_assets', params, 'local-attach-call')
+    await executeTool(run.piCustomTools, 'canvas_attach_media_assets', params, 'local-attach-call')
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toEqual(calls[1])
+    expect(calls[0]).toEqual({ input: { ...target, nodeId: 'video-1', mediaModuleId: 'media-video-1',
+      mediaKind: 'video', expectedConfigRevision: 2, operationId: expect.any(String), outputs: params.outputs },
+    actor: { sessionId: 'session-1', runStartedAt: 99, mode: 'project-agent' } })
+    expect(result.details).toMatchObject({ candidateId: 'candidate:local-receipt', sourceKind: 'local-import', adopted: false })
+    expect(JSON.stringify(result.details)).not.toContain('local-asset')
+    expect(fixture.runInputs).toEqual([])
+    expect(fixture.canvasMediaInputs).toEqual([])
+
+    await expect(executeTool(run.piCustomTools, 'canvas_attach_media_assets', {
+      ...params, outputs: [{ key: 'primary', asset: { ...asset, hash: 'invalid' } }],
+    })).rejects.toThrow('CANVAS_MEDIA_INPUT_INVALID')
+    const plan = createCanvasToolRun(fixture.dependencies, { ...fixture.context, permissionCeiling: 'plan' })
+    await expect(executeTool(plan.piCustomTools, 'canvas_attach_media_assets', params)).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+    expect(calls).toHaveLength(2)
+
+    const manual = createCanvasToolRun(fixture.dependencies, { ...fixture.context,
+      canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'renderer-manual' })
+    expect(manual.allowedToolNames).toContain('canvas_attach_media_assets')
+    const parent = createCanvasToolRun(fixture.dependencies, { ...fixture.context,
+      canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated' })
+    expect(parent.allowedToolNames).not.toContain('canvas_attach_media_assets')
   })
 
   test('Given Agent 节点已有权威正式输出 When canvas_read Then 返回验证正文且统一受 32 KiB 预算约束', async () => {
@@ -1527,6 +2025,14 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
   })
 
+  test('Given Agent 有运行权限 When 尝试改写媒体模型范围 Then 拒绝自动扩大用户范围', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'set-media-model-scope', scope: { mode: 'all-enabled' } }] })).rejects.toThrow('CANVAS_MEDIA_MODEL_SCOPE_USER_MANAGED')
+    expect(fixture.batchInputs).toHaveLength(0)
+  })
+
   test('Given 删除意图模糊或明确 When apply Then 模糊拒绝，明确返回 revision/task identity', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
@@ -1809,6 +2315,61 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })
     expect(fixture.runInputs).toEqual([['image-1', 'image-2']])
     expect(fixture.runToolCallIds).toEqual(['tool-batch-1'])
+  })
+
+  test('Given 独立音视频节点 When run_nodes Then 使用权威模块身份委托统一媒体服务并返回进度任务 ID', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [
+          { id: 'audio-1', kind: 'audio', title: '旁白', position: { x: 0, y: 0 }, mediaModuleId: 'media-audio-1' },
+          { id: 'video-1', kind: 'video', title: '主片', position: { x: 100, y: 0 }, mediaModuleId: 'media-video-1' },
+        ],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_run_nodes', {
+      canvasId: 'canvas-1', nodeIds: ['video-1', 'audio-1'],
+    }, 'tool-media-run')
+
+    expect(result.details).toMatchObject({
+      tasks: [
+        { nodeId: 'video-1', status: 'started', taskId: 'run-video-1' },
+        { nodeId: 'audio-1', status: 'started', taskId: 'run-audio-1' },
+      ],
+    })
+    expect(fixture.canvasMediaInputs.filter((entry) => entry.operation === 'run')).toHaveLength(2)
+    expect(fixture.runInputs).toEqual([])
+  })
+
+  test('Given 所选媒体节点存在直接上下游 When run_nodes Then 在任何生成副作用前阻断下游', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: {
+        ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [
+          { id: 'audio-1', kind: 'audio', title: '音轨', position: { x: 0, y: 0 }, mediaModuleId: 'media-audio-1' },
+          { id: 'video-1', kind: 'video', title: '成片', position: { x: 100, y: 0 }, mediaModuleId: 'media-video-1' },
+        ],
+        edges: [{
+          id: 'edge-media', sourceNodeId: 'audio-1', sourcePort: 'audio.asset',
+          targetNodeId: 'video-1', targetPort: 'audio.reference', relation: 'depends-on',
+        }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_run_nodes', {
+      canvasId: 'canvas-1', nodeIds: ['audio-1', 'video-1'],
+    })).rejects.toThrow('SELECTED_UPSTREAM_REGENERATING')
+    expect(fixture.canvasMediaInputs).toEqual([])
+    expect(fixture.runInputs).toEqual([])
   })
 
   test('Given webview 内容已提交 When execute run_nodes Then 返回稳定 idle 而非 unsupported', async () => {

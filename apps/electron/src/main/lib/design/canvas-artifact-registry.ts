@@ -104,16 +104,32 @@ export const IMAGE_ARTIFACT_DESCRIPTOR: CanvasArtifactDescriptor<'image'> = Obje
   ] satisfies CanvasArtifactCapability[]),
 })
 
+/** 音频节点通过通用媒体服务支持配置、运行、预览、采用和导出。 */
+export const AUDIO_ARTIFACT_DESCRIPTOR: CanvasArtifactDescriptor<'audio'> = Object.freeze({
+  kind: 'audio',
+  capabilities: Object.freeze([
+    'create', 'read', 'update', 'preview', 'run', 'adopt', 'export',
+  ] satisfies CanvasArtifactCapability[]),
+})
+
+/** 视频节点与音频节点共享通用媒体能力矩阵。 */
+export const VIDEO_ARTIFACT_DESCRIPTOR: CanvasArtifactDescriptor<'video'> = Object.freeze({
+  kind: 'video',
+  capabilities: AUDIO_ARTIFACT_DESCRIPTOR.capabilities,
+})
+
 /** 三类产物的唯一代码能力事实，不写入节点或业务 JSON。 */
 const ARTIFACT_DESCRIPTORS: Readonly<Record<CanvasContentKind, CanvasArtifactDescriptor>> = Object.freeze({
   document: DOCUMENT_ARTIFACT_DESCRIPTOR,
   webview: WEBVIEW_ARTIFACT_DESCRIPTOR,
   image: IMAGE_ARTIFACT_DESCRIPTOR,
+  audio: AUDIO_ARTIFACT_DESCRIPTOR,
+  video: VIDEO_ARTIFACT_DESCRIPTOR,
 })
 
 /** 固定的产物类别顺序用于完整性检查和稳定诊断。 */
 const ARTIFACT_KINDS: readonly CanvasContentKind[] = Object.freeze([
-  'document', 'webview', 'image',
+  'document', 'webview', 'image', 'audio', 'video',
 ])
 
 /**

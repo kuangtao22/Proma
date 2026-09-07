@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -15,7 +15,17 @@ import {
 import { createInitialNativeCanvasState, nativeCanvasStatesAtom } from '@/atoms/native-canvas-atoms'
 import { designAdapter } from '@/lib/design-adapter'
 import { getCanvasExpandedTitlebarHeight } from '@/lib/window-titlebar-layout'
-import {
+/** Adapter 单测不验证模型品牌资源，避免 Bun 直接解析 Vite 图片导入。 */
+mock.module('@/lib/model-logo', () => ({
+  DefaultLogo: 'model-logo.png',
+  PromaLogo: 'proma-logo.png',
+  getChannelLogo: () => 'model-logo.png',
+  getModelLogo: () => 'model-logo.png',
+  getProviderLogo: () => 'model-logo.png',
+  resolveModelDisplayName: (modelId: string) => modelId,
+  resolveModelProvider: () => 'unknown',
+}))
+const {
   CanvasWorkspaceAdapter,
   CanvasWorkspaceLauncher,
   buildCanvasWorkspaceTabs,
@@ -26,7 +36,7 @@ import {
   submitCanvasWorkspaceTitle,
   useAgentCanvasLegacyViewInitialization,
   useAgentCanvasWorkspaceRegistry,
-} from './CanvasWorkspaceAdapter'
+} = await import('./CanvasWorkspaceAdapter')
 
 interface Deferred<T> {
   promise: Promise<T>

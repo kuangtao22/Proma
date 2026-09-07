@@ -7,6 +7,7 @@ import type {
   CanvasDocument,
   CanvasImageModuleConfig,
   CanvasLayoutRect,
+  CanvasMediaTarget,
   CanvasNodeLifecycleResult,
   CanvasMutation,
   CanvasNode,
@@ -96,6 +97,10 @@ import {
 } from './CanvasDocumentWorkbench'
 import { CanvasImageWorkbench } from './CanvasImageWorkbench'
 import {
+  CanvasMediaWorkbench,
+  type CanvasMediaWorkbenchAdapter,
+} from './CanvasMediaWorkbench'
+import {
   CanvasWebviewWorkbench,
   type CanvasWebviewWorkbenchAdapter,
 } from './CanvasWebviewWorkbench'
@@ -116,6 +121,9 @@ import type {
   NativeCanvasWorkflowRunState,
 } from './NativeCanvasWorkflowRunDialog'
 import { NativeCanvasToolbar } from './NativeCanvasToolbar'
+import { CanvasMediaModelPicker } from './CanvasMediaModelPicker'
+import { useCanvasMediaNodeProgress, useMediaRunProgress } from './use-media-run-progress'
+import type { MediaRunProgressProjection } from './use-media-run-progress'
 import {
   CanvasAgentConversation,
   type CanvasAgentConversationAdapter,
@@ -244,6 +252,21 @@ export interface NativeCanvasAdapter {
   adoptCanvasImageAsset?: DesignAdapter['adoptCanvasImageAsset']
   releaseCanvasImageMedia?: DesignAdapter['releaseCanvasImageMedia']
   onCanvasImageModuleChanged?: DesignAdapter['onCanvasImageModuleChanged']
+  /** 音视频工作台完整能力只在展开媒体节点时按需组合。 */
+  canvasMediaLoad?: DesignAdapter['canvasMediaLoad']
+  canvasMediaSave?: DesignAdapter['canvasMediaSave']
+  canvasMediaRun?: DesignAdapter['canvasMediaRun']
+  canvasMediaCancel?: DesignAdapter['canvasMediaCancel']
+  canvasMediaAdopt?: DesignAdapter['canvasMediaAdopt']
+  canvasMediaReadPreview?: DesignAdapter['canvasMediaReadPreview']
+  canvasMediaReleasePreview?: DesignAdapter['canvasMediaReleasePreview']
+  canvasMediaExportOutput?: DesignAdapter['canvasMediaExportOutput']
+  onCanvasMediaChanged?: DesignAdapter['onCanvasMediaChanged']
+  mediaGetSettings?: DesignAdapter['mediaGetSettings']
+  mediaListAssets?: DesignAdapter['mediaListAssets']
+  mediaWatchProject?: DesignAdapter['mediaWatchProject']
+  mediaUnwatchProject?: DesignAdapter['mediaUnwatchProject']
+  onMediaRunChanged?: DesignAdapter['onMediaRunChanged']
   /** WebView 原型只在展开节点时按需读取。 */
   loadCanvasWebview?: DesignAdapter['loadCanvasWebview']
   /** WebView 折叠卡片只读取主进程生成的静态预览。 */
@@ -252,6 +275,8 @@ export interface NativeCanvasAdapter {
   getTaskTrace?: DesignAdapter['getTaskTrace']
   /** Canvas 工作台复用项目模型目录，但模型选择仍写入图片模块草稿。 */
   getImageModelSelection?: DesignAdapter['getImageModelSelection']
+  /** 顶部候选范围使用统一 API 媒体目录，旧嵌入宿主仍可省略。 */
+  listMediaApiModelProfiles?: DesignAdapter['listMediaApiModelProfiles']
   setImageModelSelection?: DesignAdapter['setImageModelSelection']
   onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
   onImageModelSelectionChanged?: DesignAdapter['onImageModelSelectionChanged']
@@ -1072,6 +1097,8 @@ export function createRebuiltNativeCanvasStateUpdate(
 /** 非 Agent 类型到固定新节点标题的稳定映射。 */
 const NATIVE_CANVAS_CONTENT_NODE_TITLES: Record<Exclude<CanvasNodeKind, 'agent'>, string> = {
   image: '新生图',
+  audio: '新音频',
+  video: '新视频',
   document: '新文档',
   webview: '新原型',
 }
@@ -1319,6 +1346,7 @@ function createCanvasImageDraftSignature(draft: CanvasImageModuleDraft): string 
   return JSON.stringify([
     draft.prompt,
     draft.selectedModelProfileId,
+    draft.mediaWorkflow,
     draft.aspectRatio,
     draft.imageSize,
     draft.contextMode,
@@ -1895,7 +1923,10 @@ export function createNativeCanvasWorkbenchDraftCommitterKey(
 /** 图片工作台同时需要模块命令和项目模型目录命令。 */
 type NativeCanvasImageWorkbenchAdapter = CanvasImageModuleAdapter
   & DesignImageModelSelectionAdapter
-  & Pick<DesignAdapter, 'exportCanvasArtifact'>
+  & Pick<DesignAdapter, 'exportCanvasArtifact' | 'mediaGetSettings' | 'mediaListAssets'>
+
+/** 音视频节点只依赖媒体模块和通用媒体目录的窄合同。 */
+type NativeCanvasMediaWorkbenchAdapter = CanvasMediaWorkbenchAdapter
 
 /** 图片工作台向当前 Workspace 动态登记草稿提交器。 */
 type RegisterNativeCanvasWorkbenchDraftCommitter = (
@@ -1973,7 +2004,9 @@ function createNativeCanvasImageWorkbenchAdapter(
     || !adapter.setImageModelSelection
     || !adapter.onImageModelProfilesChanged
     || !adapter.onImageModelSelectionChanged
-    || !adapter.exportCanvasArtifact) return null
+    || !adapter.exportCanvasArtifact
+    || !adapter.mediaGetSettings
+    || !adapter.mediaListAssets) return null
   return {
     loadCanvasImageModule: adapter.loadCanvasImageModule,
     saveCanvasImageModule: adapter.saveCanvasImageModule,
@@ -1990,6 +2023,42 @@ function createNativeCanvasImageWorkbenchAdapter(
     onImageModelProfilesChanged: adapter.onImageModelProfilesChanged,
     onImageModelSelectionChanged: adapter.onImageModelSelectionChanged,
     exportCanvasArtifact: adapter.exportCanvasArtifact,
+    mediaGetSettings: adapter.mediaGetSettings,
+    mediaListAssets: adapter.mediaListAssets,
+  }
+}
+
+/** 从 Workspace 可选 Adapter 中提取媒体工作台需要的完整窄合同。 */
+function createNativeCanvasMediaWorkbenchAdapter(
+  adapter: NativeCanvasAdapter,
+): NativeCanvasMediaWorkbenchAdapter | null {
+  if (!adapter.canvasMediaLoad
+    || !adapter.canvasMediaSave
+    || !adapter.canvasMediaRun
+    || !adapter.canvasMediaCancel
+    || !adapter.canvasMediaAdopt
+    || !adapter.canvasMediaReadPreview
+    || !adapter.canvasMediaReleasePreview
+    || !adapter.canvasMediaExportOutput
+    || !adapter.onCanvasMediaChanged
+    || !adapter.mediaGetSettings
+    || !adapter.mediaWatchProject
+    || !adapter.mediaUnwatchProject
+    || !adapter.onMediaRunChanged) return null
+  return {
+    canvasMediaLoad: adapter.canvasMediaLoad,
+    canvasMediaSave: adapter.canvasMediaSave,
+    canvasMediaRun: adapter.canvasMediaRun,
+    canvasMediaCancel: adapter.canvasMediaCancel,
+    canvasMediaAdopt: adapter.canvasMediaAdopt,
+    canvasMediaReadPreview: adapter.canvasMediaReadPreview,
+    canvasMediaReleasePreview: adapter.canvasMediaReleasePreview,
+    canvasMediaExportOutput: adapter.canvasMediaExportOutput,
+    onCanvasMediaChanged: adapter.onCanvasMediaChanged,
+    mediaGetSettings: adapter.mediaGetSettings,
+    mediaWatchProject: adapter.mediaWatchProject,
+    mediaUnwatchProject: adapter.mediaUnwatchProject,
+    onMediaRunChanged: adapter.onMediaRunChanged,
   }
 }
 
@@ -2040,6 +2109,7 @@ interface CanvasImageNodeWorkbenchProps {
   autoSaveEnabled: boolean
   onDirtyChange: (nodeId: string, dirty: boolean) => void
   onRegisterDraftCommitter: RegisterNativeCanvasWorkbenchDraftCommitter
+  mediaProgressByJobId: ReadonlyMap<string, MediaRunProgressProjection>
 }
 
 /** 只在图片节点展开时挂载模块状态、模型目录和媒体授权。 */
@@ -2051,6 +2121,7 @@ function CanvasImageNodeWorkbench({
   autoSaveEnabled,
   onDirtyChange,
   onRegisterDraftCommitter,
+  mediaProgressByJobId,
 }: CanvasImageNodeWorkbenchProps): React.ReactElement {
   /** 图片节点的四元业务身份。 */
   const imageTarget = React.useMemo(() => ({
@@ -2079,6 +2150,29 @@ function CanvasImageNodeWorkbench({
   const modelState = projectModelStates.get(target.projectId) ?? fallbackModelState
   /** 模型广播和手动重试命令。 */
   const modelSelection = useDesignImageModelSelection(target.projectId, adapter)
+  /** 公共工作流、连接和项目素材由媒体主进程边界一次并行读取。 */
+  const [mediaCatalog, setMediaCatalog] = React.useState<{
+    workflows: import('@proma/shared').MediaWorkflowVersion[]
+    connections: import('@proma/shared').MediaConnectionSummary[]
+    assets: import('@proma/shared').MediaAssetRecord[]
+  }>({ workflows: [], connections: [], assets: [] })
+
+  React.useEffect(() => {
+    let active = true
+    void Promise.all([adapter.mediaGetSettings(), adapter.mediaListAssets(target.projectId)])
+      .then(([settings, assets]) => {
+        if (!active) return
+        /** 图片节点只展示未归档公共工作流；项目私有草稿继续由媒体节点管理。 */
+        const archived = new Set(settings.archivedWorkflowIds ?? [])
+        setMediaCatalog({
+          workflows: settings.workflows.filter((workflow) => workflow.projectId === null && !archived.has(workflow.id)),
+          connections: settings.connections.filter((connection) => connection.archivedAt === undefined),
+          assets,
+        })
+      })
+      .catch(() => { if (active) setMediaCatalog({ workflows: [], connections: [], assets: [] }) })
+    return () => { active = false }
+  }, [adapter, target.projectId])
   /** 打开设置面板所需的三个原子命令。 */
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setSettingsTab = useSetAtom(settingsTabAtom)
@@ -2191,6 +2285,11 @@ function CanvasImageNodeWorkbench({
       imageModelOptions={modelState.imageModelOptions}
       imageModelLoadState={modelState.imageModelLoadState}
       imageModelError={modelState.imageModelError}
+      mediaWorkflow={imageModule.state.draft?.mediaWorkflow ?? null}
+      mediaWorkflows={mediaCatalog.workflows}
+      mediaConnections={mediaCatalog.connections}
+      mediaAssets={mediaCatalog.assets}
+      onMediaWorkflowChange={(workflow) => imageModule.updateDraft({ mediaWorkflow: workflow })}
       onDraftChange={imageModule.updateDraft}
       onGenerate={generate}
       onCancel={(jobId) => { void imageModule.cancelJob(jobId).catch(() => undefined) }}
@@ -2210,6 +2309,7 @@ function CanvasImageNodeWorkbench({
         if (modelState.imageModelLoadState === 'failed') modelSelection.retryLoad()
       }}
       onCopyPrompt={(prompt) => { void copyTextToClipboard(prompt).catch(() => undefined) }}
+      mediaProgressByJobId={mediaProgressByJobId}
     />
   )
 }
@@ -2554,6 +2654,11 @@ export function NativeCanvasWorkspace({
     () => createNativeCanvasImageWorkbenchAdapter(adapter),
     [adapter],
   )
+  /** 音视频工作台只有在模块与运行事件合同齐全时才接通。 */
+  const mediaWorkbenchAdapter = React.useMemo(
+    () => createNativeCanvasMediaWorkbenchAdapter(adapter),
+    [adapter],
+  )
 
   React.useEffect(() => {
     if (!adapter.listJobs || !adapter.onChanged) return
@@ -2693,26 +2798,63 @@ export function NativeCanvasWorkspace({
   const imagePreviews = React.useMemo(() => new Map(
     (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
   ), [state.snapshot?.imagePreviews])
-  /** Job 事件与项目 Store 共用同一优先级，避免候选态和活动态读取不同快照。 */
-  const currentProjectJobs = canvasActivityJobs?.projectId === target.projectId
-    ? canvasActivityJobs.jobs
-    : designProjectStates.get(target.projectId)?.jobs ?? EMPTY_NATIVE_CANVAS_DESIGN_JOBS
+  /** 当前项目任务优先使用独立活动控制器快照，未就绪时回退项目级 Jotai 状态。 */
+  const projectCanvasJobs = React.useMemo(() => (
+    canvasActivityJobs?.projectId === target.projectId
+      ? canvasActivityJobs.jobs
+      : designProjectStates.get(target.projectId)?.jobs ?? EMPTY_NATIVE_CANVAS_DESIGN_JOBS
+  ), [canvasActivityJobs, designProjectStates, target.projectId])
+  /** Comfy 运行只保存在 Renderer 项目投影，不进入 Canvas 文档或 Job journal。 */
+  const mediaProgressByJobId = useMediaRunProgress(target.projectId, projectCanvasJobs)
+  /** 图片 Job 按节点 ID 建立 Comfy 运行进度索引。 */
+  const imageMediaProgressByNodeId = React.useMemo(() => {
+    /** 当前画布的图片节点媒体进度索引。 */
+    const progress = new Map<string, MediaRunProgressProjection>()
+    for (const job of projectCanvasJobs) {
+      if (job.target?.kind !== 'canvas-image' || job.target.canvasId !== target.canvasId) continue
+      /** 只有已加载的 Comfy Job 投影才覆盖普通节点状态。 */
+      const current = mediaProgressByJobId.get(job.id)
+      if (current) progress.set(job.target.nodeId, current)
+    }
+    return progress
+  }, [mediaProgressByJobId, projectCanvasJobs, target.canvasId])
+  /** AV 卡片按文档节点固化完整媒体模块目标，不从运行事件猜测归属。 */
+  const canvasMediaTargets = React.useMemo<CanvasMediaTarget[]>(() => (
+    state.snapshot?.document.nodes.flatMap((node): CanvasMediaTarget[] => (
+      node.kind === 'audio' || node.kind === 'video'
+        ? [{
+            projectId: target.projectId,
+            canvasId: target.canvasId,
+            nodeId: node.id,
+            mediaModuleId: node.mediaModuleId,
+            mediaKind: node.kind,
+          }]
+        : []
+    )) ?? []
+  ), [state.snapshot?.document.nodes, target.canvasId, target.projectId])
+  /** AV 初次读取后由模块和运行事件增量更新，不轮询媒体服务。 */
+  const canvasMediaProgressByNodeId = useCanvasMediaNodeProgress(canvasMediaTargets, mediaWorkbenchAdapter)
+  /** Graph 对图片与 AV 节点使用同一个只读进度合同。 */
+  const mediaProgressByNodeId = React.useMemo(() => new Map([
+    ...imageMediaProgressByNodeId,
+    ...canvasMediaProgressByNodeId,
+  ]), [canvasMediaProgressByNodeId, imageMediaProgressByNodeId])
   /** 四类卡片统一消费按 nodeId 聚合的结构化活动态。 */
   const nodeActivityStates = React.useMemo(() => state.snapshot
     ? createNativeCanvasNodeActivityStates(
         state.snapshot.document,
         runningSessionIds,
-        currentProjectJobs,
+        projectCanvasJobs,
       )
     : new Map<string, CanvasNodeActivityState>(), [
-      currentProjectJobs,
+      projectCanvasJobs,
       runningSessionIds,
       state.snapshot,
     ])
   /** 成功 Job 只派生候选展示索引，不加载图片模块或改变正式采用状态。 */
   const imageCandidateNodeIds = React.useMemo(() => state.snapshot
-    ? createNativeCanvasImageCandidateNodeIds(state.snapshot.document, currentProjectJobs)
-    : new Set<string>(), [currentProjectJobs, state.snapshot])
+    ? createNativeCanvasImageCandidateNodeIds(state.snapshot.document, projectCanvasJobs)
+    : new Set<string>(), [projectCanvasJobs, state.snapshot])
   /** 当前可见范围只依赖轻量节点几何，不读取工作台正文。 */
   const visibleNodeIds = React.useMemo(() => viewDocument
     ? listVisibleNativeCanvasNodeIds(viewDocument, canvasSurfaceSize)
@@ -3715,6 +3857,21 @@ export function NativeCanvasWorkspace({
           autoSaveEnabled={viewState.pendingWorkbenchSwitchNodeId === null}
           onDirtyChange={updateWorkbenchDirty}
           onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
+          mediaProgressByJobId={mediaProgressByJobId}
+        />
+      )
+    } else if ((node.kind === 'audio' || node.kind === 'video') && mediaWorkbenchAdapter) {
+      content = (
+        <CanvasMediaWorkbench
+          key={`${target.projectId}:${target.canvasId}:${node.id}:${node.mediaModuleId}:media`}
+          target={{
+            ...target,
+            nodeId: node.id,
+            mediaModuleId: node.mediaModuleId,
+            mediaKind: node.kind,
+          }}
+          writable={workspaceWritable}
+          adapter={mediaWorkbenchAdapter}
         />
       )
     } else if (node.kind === 'document' && documentWorkbenchAdapter && state.snapshot) {
@@ -3775,6 +3932,8 @@ export function NativeCanvasWorkspace({
     closeWorkbench,
     conversationAdapter,
     imageWorkbenchAdapter,
+    mediaWorkbenchAdapter,
+    mediaProgressByJobId,
     documentWorkbenchAdapter,
     webviewWorkbenchAdapter,
     registerWorkbenchDraftCommitter,
@@ -3861,6 +4020,16 @@ export function NativeCanvasWorkspace({
               className="relative h-full min-w-0"
             >
               <NativeCanvasToolbar
+                mediaModelPicker={adapter.getImageModelSelection ? <CanvasMediaModelPicker
+                  key={`${target.projectId}:${target.canvasId}`}
+                  projectId={target.projectId}
+                  scope={(viewDocument ?? state.snapshot.document).mediaModelScope}
+                  disabled={!workspaceWritable}
+                  getImageModelSelection={adapter.getImageModelSelection}
+                  listMediaApiModelProfiles={adapter.listMediaApiModelProfiles}
+                  onImageModelProfilesChanged={adapter.onImageModelProfilesChanged}
+                  onChange={(scope) => controllerRef.current?.enqueueMutation({ type: 'set-media-model-scope', scope })}
+                /> : undefined}
                 activeTool={viewState.activeTool}
                 writable={workspaceWritable}
                 canAdd={canCreateNode}
@@ -3892,6 +4061,7 @@ export function NativeCanvasWorkspace({
                 runningSessionIds={runningSessionIds}
                 nodeActivityStates={nodeActivityStates}
                 imageCandidateNodeIds={imageCandidateNodeIds}
+                mediaProgressByNodeId={mediaProgressByNodeId}
                 imagePreviews={imagePreviews}
                 loadCanvasWebviewPreview={adapter.loadCanvasWebviewPreview}
                 pendingWebviewDeviceNodeIds={pendingWebviewDeviceNodeIds}

@@ -38,6 +38,8 @@ function listSupportedCapabilities(node: CanvasNode): CanvasNodeCapability[] {
       'read', 'preview', 'update-config', 'run', 'review-required',
       'task-status', 'task-control', 'versions', 'adopt-version', 'export',
     ]
+    case 'audio':
+    case 'video': return ['read', 'update-config', 'run', 'review-required']
     case 'document':
     case 'webview': return ['read', 'update-content', 'versions', 'adopt-version', 'export']
   }
@@ -56,12 +58,16 @@ function hasCapabilityTool(
 ): boolean {
   switch (capability) {
     case 'read': return availableToolNames.has('canvas_read')
-    case 'preview': return availableToolNames.has('canvas_inspect_images')
+    case 'preview': return node.kind === 'audio' || node.kind === 'video'
+      ? availableToolNames.has('canvas_inspect_media')
+      : availableToolNames.has('canvas_inspect_images')
     case 'review-required': return true
     case 'run': return availableToolNames.has(node.kind === 'agent' ? 'canvas_run_agent' : 'canvas_run_nodes')
     case 'update-config': return node.kind === 'agent'
       ? availableToolNames.has('canvas_update_agent_config')
-      : availableToolNames.has('canvas_update_image_config') || availableToolNames.has('canvas_update_artifact')
+      : node.kind === 'audio' || node.kind === 'video'
+        ? availableToolNames.has('canvas_update_media_config')
+        : availableToolNames.has('canvas_update_image_config') || availableToolNames.has('canvas_update_artifact')
     case 'update-content': return availableToolNames.has('canvas_update_artifact')
     case 'task-status': return availableToolNames.has('canvas_get_task')
     case 'task-control': return availableToolNames.has('canvas_cancel_task')

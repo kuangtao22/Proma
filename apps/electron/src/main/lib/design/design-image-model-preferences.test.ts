@@ -81,7 +81,7 @@ function createFixture(options: ImageGenerationModelOption[]) {
 }
 
 describe('Design 项目生图模型偏好', () => {
-  test('Given 偏好文件不存在 When 读取 Then 选择首个可用模型但不落盘', () => {
+  test('Given 偏好文件不存在 When 读取 Then 不隐式选择模型且不落盘', () => {
     const fixture = createFixture([
       createOption('disabled', false),
       createOption('profile-a'),
@@ -93,9 +93,30 @@ describe('Design 项目生图模型偏好', () => {
     expect(selection).toEqual({
       projectId: 'project-a',
       options: [createOption('disabled', false), createOption('profile-a'), createOption('profile-b')],
-      selectedProfileId: 'profile-a',
     })
     expect(existsSync(createPaths(fixture.root, 'project-a').preferencesPath)).toBe(false)
+  })
+
+  test('Given Catalog 按项目返回媒体选项 When 读取与保存偏好 Then 始终传入当前项目', () => {
+    /** 记录每次目录读取绑定的项目，防止 Comfy 预设跨项目泄露。 */
+    const requestedProjects: string[] = []
+    const root = mkdtempSync(join(tmpdir(), 'proma-design-preferences-project-'))
+    temporaryRoots.push(root)
+    const service = new DesignImageModelPreferences({
+      pathResolver: { resolve: (projectId) => createPaths(root, projectId) },
+      imageModels: {
+        listOptions: (projectId) => {
+          requestedProjects.push(projectId ?? '')
+          return [createOption('profile-a')]
+        },
+      },
+      now: () => 123,
+    })
+
+    service.getSelection('project-a')
+    service.setSelection({ projectId: 'project-b', imageModelProfileId: 'profile-a' })
+
+    expect(requestedProjects).toEqual(['project-a', 'project-b'])
   })
 
   test('Given 偏好文件不存在且没有可用模型 When 读取 Then 保留未选择且不落盘', () => {

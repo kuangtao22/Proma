@@ -132,4 +132,21 @@ describe('原生 Canvas 工作流运行记录', () => {
     expect(html).toContain('aria-label="停止 完成主视觉"')
     expect(html).toContain('加载更多')
   })
+
+  test('Given 工作流预算耗尽 When 渲染记录 Then 明确提示通过 Agent 补充预算且不提供无效继续动作', () => {
+    const run = createRun('b'.repeat(48), 'waiting-budget')
+    run.budget.remainingDurationMs = 0
+    const html = renderToStaticMarkup(
+      <NativeCanvasWorkflowRunEntries
+        state={{ runs: [run], nextCursor: null, loading: false, loadingMore: false, operationRunId: null, error: null }}
+        onLoadMore={() => undefined}
+        onResume={() => undefined}
+        onCancel={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('预算已用尽')
+    expect(html).toContain('请在 Agent 对话中补充预算后恢复工作流')
+    expect(html).not.toContain('继续')
+  })
 })

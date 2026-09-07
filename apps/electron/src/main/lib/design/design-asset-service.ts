@@ -48,6 +48,9 @@ export interface DesignAssetImportSource {
   kind: 'picker' | 'agent' | 'job'
   sourceSessionId?: string
   sourceJobId?: string
+  /** 媒体执行事实与输出角色保留独立来源身份。 */
+  sourceMediaRunId?: string
+  sourceMediaOutputKey?: string
   parentAssetId?: string
   prompt?: string
 }
@@ -664,6 +667,8 @@ async function stageAsset(
       createdAt: now(),
       ...(source.sourceSessionId ? { sourceSessionId: source.sourceSessionId } : {}),
       ...(source.sourceJobId ? { sourceJobId: source.sourceJobId } : {}),
+      ...(source.sourceMediaRunId ? { sourceMediaRunId: source.sourceMediaRunId } : {}),
+      ...(source.sourceMediaOutputKey ? { sourceMediaOutputKey: source.sourceMediaOutputKey } : {}),
       ...(source.parentAssetId ? { parentAssetId: source.parentAssetId } : {}),
       ...(source.prompt !== undefined ? { prompt: source.prompt } : {}),
     },
@@ -1196,6 +1201,24 @@ export class DesignAssetService {
       } finally {
         if (existsSync(temporaryTarget)) unlinkSync(temporaryTarget)
       }
+    })
+  }
+
+  /**
+   * 按权威素材身份验证当前受管原图仍可用于正式采用。
+   * @param projectId 已登记项目稳定 ID。
+   * @param assetId 已存在于项目 Design 文档的素材 ID。
+   * @returns 原图普通文件身份、大小与 SHA-256 全部匹配时完成。
+   */
+  async verifyStoredAsset(projectId: string, assetId: string): Promise<void> {
+    const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
+    const asset = document.assets.find((item) => item.id === assetId)
+    if (!asset) throw new Error('DESIGN_ASSET_NOT_FOUND')
+    /** 排队前只读取文件大小；稳定句柄与内容哈希在队列内一次完成。 */
+    const assetPath = this.resolveStoredAssetFiles(projectId, asset)[0]
+    const byteSize = assertStoredAssetFile(assetPath).size
+    await this.processingQueue.run([byteSize], async () => {
+      readStoredAssetBytes(assetPath, asset)
     })
   }
 

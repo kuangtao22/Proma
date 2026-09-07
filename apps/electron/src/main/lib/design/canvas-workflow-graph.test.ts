@@ -12,6 +12,8 @@ function createNode(id: string, kind: CanvasNode['kind'], overrides: Partial<Can
   switch (kind) {
     case 'agent': return { ...base, kind, agentSessionId: `session-${id}` } as CanvasNode
     case 'image': return { ...base, kind, imageModuleId: `module-${id}` } as CanvasNode
+    case 'audio':
+    case 'video': return { ...base, kind, mediaModuleId: `module-${id}` } as CanvasNode
     case 'document': return { ...base, kind, documentId: `document-${id}`, contentRevision: 1 } as CanvasNode
     case 'webview': return {
       ...base, kind, prototypeId: `prototype-${id}`, contentRevision: 1, devicePreset: 'desktop',
@@ -250,6 +252,38 @@ describe('Canvas Workflow Graph', () => {
     expect(() => createCanvasWorkflowGraphPlan({
       document: createDocument(overNodes, overEdges), startNodeIds: ['root'], maxImageRuns: 0,
     })).toThrow('CANVAS_WORKFLOW_NODE_LIMIT_EXCEEDED')
+  })
+
+  test('Given 新 planner 显式开放正式文档与音视频起点 When 规划 Then 旧 Agent-only 默认不变且媒体共享预算', () => {
+    const documentRoot = createNode('document-root', 'document')
+    const audio = createNode('audio', 'audio')
+    const video = createNode('video', 'video')
+    const document = createDocument([documentRoot, audio, video], [
+      createCanvasBoundEdge(documentRoot, audio, {
+        id: 'edge-document-audio', sourceNodeId: documentRoot.id, targetNodeId: audio.id,
+        relation: 'depends-on',
+      }),
+      createCanvasBoundEdge(documentRoot, video, {
+        id: 'edge-document-video', sourceNodeId: documentRoot.id, targetNodeId: video.id,
+        relation: 'depends-on',
+      }),
+    ])
+
+    expect(() => createCanvasWorkflowGraphPlan({
+      document, startNodeIds: [documentRoot.id], maxImageRuns: 1,
+    })).toThrow('CANVAS_WORKFLOW_START_NODE_INVALID')
+    const plan = createCanvasWorkflowGraphPlan({
+      document,
+      startNodeIds: [documentRoot.id],
+      maxImageRuns: 1,
+      allowedStartNodeKinds: ['document'],
+      countAudioVideoRunsInBudget: true,
+    })
+
+    expect(plan.initialStates.get(documentRoot.id)).toBe('satisfied')
+    expect([plan.initialStates.get(audio.id), plan.initialStates.get(video.id)].sort()).toEqual([
+      'started', 'waiting-approval',
+    ])
   })
 
   test('Given 范围外存在坏边 When 规划合法根 Then 无关分支不污染当前执行图', () => {

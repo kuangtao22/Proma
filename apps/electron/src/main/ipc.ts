@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, removeMcpServerFromConfig, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
+import { buildCanvasMediaModelOptions, isCanvasMediaModelAllowed } from '@proma/shared'
 import type {
   QuickTaskSubmitInput,
   VoiceDictationAudioChunkInput,
@@ -228,6 +229,8 @@ import { createCanvasArtifactRevisionStore } from './lib/design/canvas-artifact-
 import {
   createCanvasArtifactRegistry,
   IMAGE_ARTIFACT_DESCRIPTOR,
+  AUDIO_ARTIFACT_DESCRIPTOR,
+  VIDEO_ARTIFACT_DESCRIPTOR,
 } from './lib/design/canvas-artifact-registry'
 import {
   createCanvasTextArtifactAdapter,
@@ -239,6 +242,15 @@ import { createCanvasImageRunService } from './lib/design/canvas-image-run-servi
 import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
 import { createCanvasWorkflowRunStore } from './lib/design/canvas-workflow-run-store'
 import { createCanvasArtifactExportService } from './lib/design/canvas-artifact-export-service'
+import { createCanvasWorkflowMediaAdapter } from './lib/design/canvas-workflow-runtime-adapters'
+import { createCanvasWorkflowResumeScheduler, shouldResumeCanvasWorkflow } from './lib/design/canvas-workflow-resume-scheduler'
+import { createCanvasMediaHandoffStore } from './lib/design/canvas-media-handoff-store'
+import { createCanvasMediaHandoffService } from './lib/design/canvas-media-handoff-service'
+import { createCanvasMediaStore } from './lib/design/canvas-media-store'
+import { CanvasMediaService } from './lib/design/canvas-media-service'
+import type { CanvasMediaServiceDependencies } from './lib/design/canvas-media-service'
+import { createCanvasMediaInputResolver } from './lib/design/canvas-media-input-resolver'
+import { registerCanvasMediaIpcHandlers } from './lib/design/canvas-media-ipc'
 import { CanvasAgentNodeCreationService } from './lib/design/canvas-agent-node-creation'
 import { createCanvasAgentConfigStore } from './lib/design/canvas-agent-config-store'
 import {
@@ -267,6 +279,7 @@ import {
 import {
   DesignSessionBridge,
   openAuthorizedAgentImageSource,
+  openAuthorizedAgentMediaSource,
 } from './lib/design/design-session-bridge'
 import { DesignExecutionSessionLifecycle } from './lib/design/design-execution-session-lifecycle'
 import {
@@ -428,6 +441,19 @@ import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHea
 import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
+import { MediaConfigStore } from './lib/media/media-config-store'
+import { MediaResourceService } from './lib/media/media-resource-service'
+import { MediaResourceSnapshotStore } from './lib/media/media-resource-snapshot-store'
+import { registerMediaIpcHandlers } from './lib/media/media-ipc'
+import { MediaRunService } from './lib/media/media-run-service'
+import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
+import { MediaDesignAssets } from './lib/media/media-design-assets'
+import { MediaAssetService } from './lib/media/media-asset-service'
+import { MediaSourceService } from './lib/media/media-source-service'
+import { assertMediaProbeAvailable } from './lib/media/media-file-probe'
+import { createMediaToolRun } from './lib/media/media-tool-provider'
+import { createMediaImageCatalog } from './lib/media/media-image-catalog'
+import { createMediaDesignImageExecution } from './lib/media/media-design-execution'
 import { ServerOpsAgentAccessStore } from './lib/server-ops/server-ops-agent-access-store'
 import { ServerOpsAuditStore } from './lib/server-ops/server-ops-audit-store'
 import { disposeServerOpsLifecycle, registerServerOpsBeforeQuitBarrier, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
@@ -624,6 +650,16 @@ interface DesignImageModelServices {
 /** 延迟创建的进程级唯一实例，避免模块加载阶段提前解析活动配置根。 */
 let designImageModelServices: DesignImageModelServices | undefined
 
+/** 媒体配置按 Electron ready 后的数据根与系统密钥身份延迟创建。 */
+let mediaConfiguration: MediaConfigStore | undefined
+/** 所有 UI、普通 Agent 与 Canvas 共享一个任务服务实例。 */
+let mediaRunService: MediaRunService | undefined
+
+/** 返回运行配置唯一实例，避免旧生图目录和媒体设置产生独立写入口。 */
+function getMediaConfiguration(): MediaConfigStore {
+  return mediaConfiguration ??= new MediaConfigStore(getConfigDir(), safeStorage)
+}
+
 /** 获取 Design IPC 与后续任务流程共享的生图模型服务实例。 */
 function getDesignImageModelServices(): DesignImageModelServices {
   if (designImageModelServices) return designImageModelServices
@@ -633,6 +669,7 @@ function getDesignImageModelServices(): DesignImageModelServices {
     getNanoBananaCredentials: () => getToolCredentials('nano-banana'),
     listChannels,
     decryptChannelApiKey: decryptApiKey,
+    media: createMediaImageCatalog(getMediaConfiguration()),
   })
   /** 项目偏好与系统目录共享同一 Catalog，保证选择和任务预检口径一致。 */
   const imagePreferences = new DesignImageModelPreferences({
@@ -2000,6 +2037,51 @@ function getAgentCanvasBindingStore(): AgentCanvasBindingStore {
 export function registerIpcHandlers(): void {
   /** normal 数据根已准备完成后再取得业务 Store，并在注册任何 handler 前完成初始化。 */
   const agentCanvasBindingStore = getAgentCanvasBindingStore()
+  /** 连接发现纯读取远端目录，执行权限仍在每次项目任务入口复核。 */
+  const mediaResources = new MediaResourceService({
+    resolveConnection: (connectionId, projectId) => getMediaConfiguration().resolveConnection(connectionId, projectId),
+    snapshots: new MediaResourceSnapshotStore(() => join(getConfigDir(), 'media', 'resource-snapshots')),
+  })
+  const mediaIpc = registerMediaIpcHandlers({
+    ipc: ipcMain,
+    isAuthorizedSender: (event) => listAuthorizedDesignWebContents().some((contents) => !contents.isDestroyed() && contents.id === event.sender.id),
+    assertProject: (projectId) => { if (!getAgentWorkspace(projectId)) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED') },
+    configuration: getMediaConfiguration(),
+    resources: mediaResources,
+    listAssets: (projectId) => mediaAssets.list(projectId),
+    importLocalAsset: async (event, projectId, kind) => {
+      /** 原生选择器只授权本次文件；异步返回后重新检查窗口与项目写权限。 */
+      const assertAccess = (): BrowserWindow => {
+        const owner = BrowserWindow.fromWebContents(event.sender)
+        if (!owner || owner.isDestroyed() || !listAuthorizedDesignWebContents().some((contents) => contents.id === event.sender.id)) throw new Error('MEDIA_ACCESS_DENIED')
+        if (!getAgentWorkspace(projectId)) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED')
+        workspaceOperationGuard.assertWorkspaceWritable(projectId)
+        if (getDesignProjectReadOnlyReason(projectId)) throw new Error('MEDIA_PROJECT_READ_ONLY')
+        return owner
+      }
+      const extensions = kind === 'image' ? ['png', 'jpg', 'jpeg', 'webp', 'gif'] : kind === 'audio' ? ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'mp4'] : ['mp4', 'webm', 'avi', 'mov']
+      const result = await dialog.showOpenDialog(assertAccess(), { title: '导入媒体素材', properties: ['openFile'], filters: [{ name: '媒体', extensions }] })
+      assertAccess()
+      const path = result.canceled ? undefined : result.filePaths[0]
+      if (!path) return null
+      const source = openAuthorizedAgentMediaSource({ inputPath: path, baseDir: dirname(path), allowedRoots: [dirname(path)], maxBytes: 100 * 1024 * 1024, label: '媒体' })
+      try {
+        const bytes = source.readBytes()
+        const hash = createHash('sha256').update(bytes).digest('hex')
+        const asset = await workspaceOperationGuard.runWorkspaceWrite(projectId, () => mediaAssets.register(projectId, `local:${hash}`, bytes, null, { mediaRunId: `local-${hash.slice(0, 40)}` }, kind))
+        assertAccess()
+        return mediaAssets.getRecord(projectId, asset)
+      } finally { source.close() }
+    },
+    getRun: (projectId, runId) => {
+      if (!mediaRunService) throw new Error('MEDIA_RUNTIME_NOT_READY')
+      return mediaRunService.get(projectId, runId)
+    },
+    getJobRun: (projectId, jobId) => {
+      const run = mediaRunService?.findOperation(projectId, jobId)
+      return run && mediaRunService?.getOrigin(projectId, run.id).designJobId === jobId ? run : null
+    },
+  })
   // ===== 本地终端（仅主 renderer 可操作，不能指定可执行文件） =====
   const assertMainTerminalRenderer = (senderId: number): void => {
     const mainWindow = getMainWindow()
@@ -2473,11 +2555,79 @@ export function registerIpcHandlers(): void {
       cleanupSuccessfulDesignTask?.(projectId, sourceJobId)
     },
   })
+  /** 媒体输出复用已有项目素材事务，任务恢复事实放在可移植项目目录。 */
+  const mediaImages = new MediaDesignAssets({ store: designStore, assets: designAssetService,
+    getStagingDirectory: (projectId) => designPathResolver.resolve(projectId).stagingDir,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect) })
+  /** 三类媒体共用同一 Design 权威目录，图片由原导入与缩略图服务处理。 */
+  const mediaAssets = new MediaAssetService({ pathResolver: designPathResolver, store: designStore, images: mediaImages,
+    resolveImagePath: (projectId, assetId) => designAssetService.resolveAssetPath(projectId, assetId),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect) })
+  /** 懒初始化晚于数据根 gate；每个副作用阶段都重新核对项目和发起主体。 */
+  const mediaRuns = new MediaRunService({
+    configuration: getMediaConfiguration(),
+    assertOutputSupport: async (workflow) => {
+      if (workflow.outputs.some((output) => output.mediaType !== 'image')) await assertMediaProbeAvailable()
+    },
+    getRunsDirectory: (projectId) => join(designPathResolver.resolve(projectId).designRoot, 'media', 'runs'),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+    authorize: (projectId, operation, origin) => {
+      if (!getAgentWorkspace(projectId)) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED')
+      if (operation !== 'read') {
+        workspaceOperationGuard.assertWorkspaceWritable(projectId)
+        if (getDesignProjectReadOnlyReason(projectId)) throw new Error('MEDIA_PROJECT_READ_ONLY')
+      }
+      if (origin?.canvasMedia && operation !== 'collect') {
+        const target = origin.canvasMedia
+        const document = canvasDocumentStore.load(target).document
+        const node = document.nodes.find((candidate) => candidate.id === target.nodeId)
+        if (!node || node.kind !== target.mediaKind || node.mediaModuleId !== target.mediaModuleId) throw new Error('MEDIA_CANVAS_TARGET_INVALID')
+      }
+      if (origin?.actor && operation !== 'collect') {
+        const actor = origin.actor
+        canvasToolAccess.authorizeRead({ projectId, sessionId: actor.sessionId, runStartedAt: actor.runStartedAt, explicitReferences: [], permissionCeiling: 'execute',
+          ...(actor.canvasId && actor.nodeId ? { canvasAgentTarget: { projectId, canvasId: actor.canvasId, nodeId: actor.nodeId }, canvasAgentMode: actor.mode === 'parent-orchestrated' ? 'parent-orchestrated' as const : 'renderer-manual' as const } : {}) })
+        if (operation === 'execute' && (actor.mode === 'parent-orchestrated' || getAgentSessionMeta(actor.sessionId)?.permissionMode === 'plan')) throw new Error('MEDIA_EXECUTION_NOT_AUTHORIZED')
+      }
+    },
+    readAsset: (projectId, asset) => mediaAssets.read(projectId, asset),
+    registerOutput: (projectId, operationId, bytes, contentType, origin) => mediaAssets.register(projectId, operationId, bytes, contentType, origin),
+    onChange: (run) => {
+      const origin = mediaRuns.getOrigin(run.projectId, run.id)
+      mediaIpc.publishRun({ run, ...(origin.designJobId ? { designJobId: origin.designJobId } : {}) })
+      if (origin.designJobId && ['succeeded', 'failed', 'cancelled'].includes(run.phase)) {
+        const jobId = origin.designJobId
+        // 已持久化终态在当前调用栈结束后推进候选，避免重入 run/Job 锁。
+        queueMicrotask(() => { void designJobManager.resumeMediaJob(run.projectId, jobId).catch(() => console.error('[媒体任务] 画布候选恢复未完成')) })
+      }
+      if (origin.canvasMedia && ['succeeded', 'failed', 'cancelled'].includes(run.phase)) {
+        const target = origin.canvasMedia
+        queueMicrotask(() => {
+          void (async () => {
+            if (run.phase === 'succeeded') await canvasMediaService.refreshCompleted(target)
+            await resumeAdoptedCanvasWorkflows(target)
+          })().catch(() => console.warn('[媒体任务] 媒体候选与工作流将在下次读取时继续恢复'))
+        })
+      }
+    },
+  })
+  mediaRunService = mediaRuns
+  const mediaSupervisor = new MediaRunSupervisor({ runs: mediaRuns,
+    onError: () => { console.warn('[媒体任务] 远端对账暂未完成，保留原运行身份') } })
+  app.once('before-quit', () => { mediaSupervisor.dispose(); mediaIpc.dispose() })
   /** 直接入边解析器只读取已提交 Agent JSONL、图片配置和受管正文。 */
   const canvasImageInputResolver = createCanvasImageInputResolver({
     canvasStore: canvasDocumentStore,
     imageStore: canvasImageModuleStore,
     resolveAssetPath: (projectId, assetId) => designAssetService.resolveAssetPath(projectId, assetId),
+    getAdoptedMediaImage: async (target, outputKey) => {
+      const state = await canvasMediaStore.load(target)
+      const output = state.config.adoptedOutputs.find((item) => item.key === outputKey)
+      if (!output || output.mediaKind !== 'image' || output.asset.mediaKind !== 'image') return null
+      const asset = mediaAssets.getRecord(target.projectId, output.asset)
+      if (asset.mediaKind !== 'image') return null
+      return { asset: output.asset, candidateId: output.candidateId, runId: output.runId, configRevision: state.config.revision }
+    },
     getAgentOutput: async (sessionId) => {
       const session = getAgentSessionMeta(sessionId)
       if (!session) throw new Error('CANVAS_IMAGE_INPUT_AGENT_INVALID')
@@ -2548,6 +2698,7 @@ export function registerIpcHandlers(): void {
           console.error('[Canvas Agent 输出] 单窗口图事实广播失败:', error)
         }
       }
+      queueMicrotask(() => { void resumeAdoptedCanvasWorkflows(target).catch(() => console.warn('[Canvas 工作流] Agent 输出恢复暂未完成')) })
     },
   })
   /** 查询与启动共用恢复事实捕获器，所有广播都在写 lease 释放后发生。 */
@@ -2621,6 +2772,7 @@ export function registerIpcHandlers(): void {
   /** Service 回调只会在 Job Manager 完成赋值后执行。 */
   let designJobManager: DesignJobManager
   const canvasImageCandidateBatchService = createCanvasImageCandidateBatchService({
+    onAdopted: (target) => { queueMicrotask(() => { void resumeAdoptedCanvasWorkflows(target).catch(() => console.warn('[Canvas 工作流] 图片采用恢复暂未完成')) }) },
     store: canvasImageCandidateBatchStore,
     dependencyState: canvasDependencyStateService,
     runExclusive: (target, effect) => canvasOperationSerializer.run(target, () => (
@@ -2650,6 +2802,8 @@ export function registerIpcHandlers(): void {
         || asset.sourceJobId !== job.id) {
         throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
       }
+      /** 采用前校验权威原图仍存在且内容一致，避免只凭候选元数据提交正式版本。 */
+      await designAssetService.verifyStoredAsset(batch.projectId, asset.id)
     },
     retryEntry: async (batch, entry) => {
       const replacement = designJobManager.retry(batch.projectId, entry.jobId)
@@ -2672,12 +2826,14 @@ export function registerIpcHandlers(): void {
   })
   /** Design Job 复用可见 Pi 会话和同一素材/Store 边界，不创建第二套 runtime。 */
   designJobManager = new DesignJobManager({
+    getCanvasMediaModelScope: (projectId, canvasId) => canvasDocumentStore.requireStableAuthoritativeDocument({ projectId, canvasId }).mediaModelScope,
     pathResolver: designPathResolver,
     store: designStore,
     assetService: designAssetService,
     canvasImageTargetAdapter: canvasImageJobTarget,
     canvasImageCandidateBatches: canvasImageCandidateBatchService,
     canvasImageInputResolver,
+    mediaExecution: createMediaDesignImageExecution({ configuration: getMediaConfiguration(), runs: mediaRuns, supervisor: mediaSupervisor, store: designStore }),
     imageModels,
     contextOrchestrator: designContextOrchestrator,
     getSettings,
@@ -2725,9 +2881,6 @@ export function registerIpcHandlers(): void {
       ))
       if (remainsActive) throw new Error('Canvas 图片任务仍在运行，节点未删除')
     },
-    resolveDefaultImageModelProfileId: (projectId) => (
-      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
-    ),
   })
   /** 批处理、LOAD、SAVE 与单节点操作共享上方创建的唯一 Canvas 串行器。 */
   /** 批量事务服务在主进程只实例化一次，后续工具 Provider 必须复用该实例。 */
@@ -2775,6 +2928,8 @@ export function registerIpcHandlers(): void {
   const canvasArtifactRegistry = createCanvasArtifactRegistry([
     createCanvasTextArtifactAdapter('document', canvasTextArtifactService),
     createCanvasTextArtifactAdapter('webview', canvasTextArtifactService),
+    { descriptor: AUDIO_ARTIFACT_DESCRIPTOR },
+    { descriptor: VIDEO_ARTIFACT_DESCRIPTOR },
     {
       descriptor: IMAGE_ARTIFACT_DESCRIPTOR,
       /** 图片只允许导出当前模块已采用的素材，路径由主进程选择器补入。 */
@@ -2797,9 +2952,6 @@ export function registerIpcHandlers(): void {
     documents: canvasDocumentStore,
     content: canvasNodeContentStore,
     batch: canvasAgentBatchOperation,
-    resolveDefaultImageModelProfileId: (projectId) => (
-      canvasImagePreferences.getSelection(projectId).selectedProfileId ?? null
-    ),
   })
   /** 已有图片复用 Design 素材 promotion 与 Canvas 产物事务，不创建第二套存储。 */
   const canvasImportedImage = createCanvasImportedImageService({
@@ -2828,6 +2980,12 @@ export function registerIpcHandlers(): void {
     assets: designAssetService,
   })
   setDefaultDesignJobManager(designJobManager)
+  /** 启动只恢复曾提交的远端任务，不重放尚未执行的准备意图。 */
+  queueMicrotask(() => {
+    for (const workspace of listAgentWorkspaces()) {
+      try { mediaSupervisor.recover(workspace.id) } catch { console.warn('[媒体任务] 项目恢复暂不可用') }
+    }
+  })
   /** Canvas 会话 IPC 与 Agent 工具共享同一公开事件通道。 */
   const broadcastCanvasSessionChange = (event: CanvasSessionChangeEvent): void => {
     for (const contents of listAuthorizedDesignWebContents()) {
@@ -2862,6 +3020,165 @@ export function registerIpcHandlers(): void {
     broadcastSession: broadcastCanvasSessionChange,
     broadcastBinding: broadcastAgentCanvasBindingChange,
   })
+  /** 来源授权只消费会话真实附件记录；不会从消息正文猜测路径。 */
+  const mediaSources = new MediaSourceService({
+    getSession: getAgentSessionMeta,
+    getMessages: getAgentSessionMessages,
+    authorize: (context, action) => {
+      const session = getAgentSessionMeta(context.sessionId)
+      if (!session || session.workspaceId !== context.projectId || !getAgentWorkspace(context.projectId)) {
+        throw new Error('MEDIA_SOURCE_PROJECT_MISMATCH')
+      }
+      if (action === 'import') {
+        workspaceOperationGuard.assertWorkspaceWritable(context.projectId)
+        if (getDesignProjectReadOnlyReason(context.projectId) || session.permissionMode === 'plan') {
+          throw new Error('MEDIA_SOURCE_IMPORT_NOT_AUTHORIZED')
+        }
+      }
+    },
+    resolveAttachmentPath: (path) => isAbsolute(path) ? path : resolveAttachmentPath(path),
+    getAllowedRoots: (session) => [
+      ...getAuthorizedRoots({ sessionId: session.id }),
+      getConversationAttachmentsDir(session.id),
+    ],
+    getLocalFileAccess: (session, projectId) => {
+      const workspace = getAgentWorkspace(projectId)
+      const baseDir = resolveAgentCwd(workspace, session.id, session.agentCwdMode, session.activeWorktree)
+      if (!workspace || !baseDir || session.workspaceId !== projectId) throw new Error('MEDIA_LOCAL_SOURCE_NOT_AUTHORIZED')
+      /** 显式本地导入复用 Agent 文件工具的项目/附加根，但不继承附件与预览临时目录。 */
+      return {
+        baseDir,
+        allowedRoots: [
+          baseDir,
+          getProjectFilesPath(workspace.slug),
+          ...(session.attachedDirectories ?? []),
+          ...(session.attachedFiles ?? []),
+          ...getWorkspaceAttachedDirectories(workspace.slug),
+          ...getWorkspaceAttachedFiles(workspace.slug),
+        ],
+      }
+    },
+    assets: mediaAssets,
+  })
+  /** 媒体模块只保存配置、运行和正式输出引用，媒体字节仍归项目资产层。 */
+  const canvasMediaStore = createCanvasMediaStore({
+    store: canvasDocumentStore,
+    onChanged: (target, state) => canvasMediaIpc.publishChanged({ target, revision: state.revision }),
+  })
+  /** 逐槽解析直接上游的正式产物，固定历史资产不会随上游变化。 */
+  const canvasMediaInputs = createCanvasMediaInputResolver({
+    canvasStore: canvasDocumentStore,
+    mediaStore: canvasMediaStore,
+    imageStore: canvasImageModuleStore,
+    getAgentText: async (sessionId, pointer) => {
+      const session = getAgentSessionMeta(sessionId)
+      if (!session?.sourceCanvasProjectId || !session.sourceCanvasId || !session.sourceCanvasNodeId) {
+        throw new Error('CANVAS_MEDIA_AGENT_SOURCE_INVALID')
+      }
+      const text = await canvasAgentOutputService.readAtPointer({
+        projectId: session.sourceCanvasProjectId, canvasId: session.sourceCanvasId, nodeId: session.sourceCanvasNodeId,
+      }, pointer)
+      return { messageUuid: pointer.messageUuid, contentSha256: pointer.contentSha256, text }
+    },
+    readDocument: async (target, documentId) => {
+      const committed = await readCommittedCanvasContent(target, documentId, 'content.md')
+      return { revision: committed.revision, markdown: committed.content }
+    },
+    getImageAsset: (projectId, assetId) => {
+      const image = designStore.requireStableAuthoritativeDocument(projectId).assets.find((asset) => asset.id === assetId)
+      if (!image) throw new Error('CANVAS_MEDIA_IMAGE_SOURCE_INVALID')
+      return { assetId, revision: 1, hash: image.sha256, mediaKind: 'image' }
+    },
+    getAdoptedOutput: async (target, outputKey) => {
+      const state = await canvasMediaStore.load(target)
+      const adopted = state.config.adoptedOutputs.find((output) => output.key === outputKey)
+      if (!adopted) return null
+      return { asset: adopted.asset, candidateId: adopted.candidateId, runId: adopted.runId, configRevision: state.config.revision }
+    },
+    getAssetRecord: (projectId, asset) => mediaAssets.getRecord(projectId, asset),
+  })
+  /** 所有入口消费同一业务依赖，只有预览与系统对话框按当前窗口提供。 */
+  const canvasMediaDependencies: Omit<CanvasMediaServiceDependencies, 'hostFiles'> = {
+    store: canvasMediaStore, configuration: getMediaConfiguration(), runs: mediaRuns,
+    supervisor: mediaSupervisor, assets: mediaAssets,
+    onAdopted: async (target, projection) => {
+      const committed = await canvasOperationSerializer.run(target, () => workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => {
+        const document = canvasDocumentStore.load(target).document
+        const node = document.nodes.find((item) => item.id === target.nodeId)
+        if (!node || node.kind !== target.mediaKind || node.mediaModuleId !== target.mediaModuleId) throw new Error('CANVAS_MEDIA_TARGET_INVALID')
+        /** 图内采用 revision 与模块 intent 配对，重启重放不得再次消费下游提示。 */
+        if ((node.adoptedConfigRevision ?? -1) >= projection.configRevision) return null
+        const propagated = canvasDependencyStateService.consumeAndPropagate({ document, producerNodeIds: [node.id], changedAt: projection.adoptedAt })
+        const nodes = propagated.nodes.map((item) => item.id === node.id ? {
+          ...item, adoptedConfigRevision: projection.configRevision,
+          ...(node.upstreamChange && node.upstreamChange.changedAt > projection.adoptedAt ? { upstreamChange: node.upstreamChange } : {}),
+        } : item)
+        return await canvasDocumentStore.mutate(target, document.revision, [{ type: 'upsert-nodes', nodes }])
+      }))
+      if (committed) {
+        for (const sender of listAuthorizedDesignWebContents()) {
+          try { sender.send(CANVAS_IPC_CHANNELS.CHANGED, { projectId: target.projectId, canvasId: target.canvasId, revision: committed.revision, cause: 'graph' }) }
+          catch { console.warn('[Canvas 媒体] 正式采用已提交，单窗口广播未完成') }
+        }
+      }
+      queueMicrotask(() => { void resumeAdoptedCanvasWorkflows(target).catch(() => console.warn('[Canvas 媒体] 待采用工作流将在后续显式恢复时重试')) })
+    },
+    authorizeTarget: (target, operation) => {
+      if (!getAgentWorkspace(target.projectId)) throw new Error('CANVAS_MEDIA_ACCESS_DENIED')
+      const node = canvasDocumentStore.load(target).document.nodes.find((item) => item.id === target.nodeId)
+      if (!node || node.kind !== target.mediaKind || node.mediaModuleId !== target.mediaModuleId) {
+        throw new Error('CANVAS_MEDIA_TARGET_INVALID')
+      }
+      if (operation !== 'read') {
+        workspaceOperationGuard.assertWorkspaceWritable(target.projectId)
+        if (getDesignProjectReadOnlyReason(target.projectId)) throw new Error('CANVAS_MEDIA_PROJECT_READ_ONLY')
+      }
+    },
+    resolveWorkflowInputs: async (target, expectedConfigRevision) => {
+      const inputs = await canvasMediaInputs.resolveNodeInputs(target)
+      if (inputs.configRevision !== expectedConfigRevision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
+      return inputs
+    },
+  }
+  const canvasMediaService = new CanvasMediaService({ ...canvasMediaDependencies, hostFiles: {
+    openPreview: async () => { throw new Error('CANVAS_MEDIA_WINDOW_REQUIRED') },
+    releasePreview: async () => undefined,
+    exportAsset: async () => { throw new Error('CANVAS_MEDIA_WINDOW_REQUIRED') },
+  } })
+  const canvasMediaIpc = registerCanvasMediaIpcHandlers({
+    ipc: ipcMain,
+    assertSender: (event, projectId) => {
+      if (!getAgentWorkspace(projectId) || !listAuthorizedDesignWebContents().some((sender) => sender === event.sender && !sender.isDestroyed())) {
+        throw new Error('CANVAS_MEDIA_ACCESS_DENIED')
+      }
+    },
+    createService: (hostFiles) => new CanvasMediaService({ ...canvasMediaDependencies, hostFiles }),
+    createMediaAccess: (projectId) => designAssetService.createMediaAccess(projectId),
+    exportAsset: async (event, target, asset, record) => {
+      const owner = BrowserWindow.fromWebContents(event.sender)
+      const options: SaveDialogOptions = { title: '导出媒体产物', defaultPath: record.filename,
+        filters: [{ name: record.mediaKind === 'video' ? '视频' : record.mediaKind === 'audio' ? '音频' : '图片', extensions: [extname(record.filename).slice(1)] }] }
+      const chosen = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      if (chosen.canceled || !chosen.filePath) return { cancelled: true }
+      if (event.sender.isDestroyed() || !listAuthorizedDesignWebContents().includes(event.sender)) throw new Error('CANVAS_MEDIA_ACCESS_DENIED')
+      await canvasMediaDependencies.authorizeTarget(target, 'write')
+      await workspaceOperationGuard.runWorkspaceWrite(target.projectId, async () => {
+        const bytes = await mediaAssets.read(target.projectId, asset)
+        await canvasMediaDependencies.authorizeTarget(target, 'write')
+        const { rename, unlink, writeFile: writeExport } = await import('node:fs/promises')
+        const path = chosen.filePath!
+        const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.proma-export`)
+        try {
+          await writeExport(temporary, bytes, { flag: 'wx' })
+          await rename(temporary, path)
+        } finally {
+          await unlink(temporary).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn('[Canvas 媒体] 导出临时文件清理失败') })
+        }
+      })
+      return { cancelled: false }
+    },
+  })
+  app.once('before-quit', () => canvasMediaIpc.dispose())
   /** 删除生命周期与 LIST 对账共用同一 Store 和固定广播边界。 */
   const agentCanvasBindingCleanup = {
     store: agentCanvasBindingStore,
@@ -2950,16 +3267,51 @@ export function registerIpcHandlers(): void {
     candidateBatches: canvasImageCandidateBatchService,
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
   })
-  /** 持久工作流复用现有项目写守卫，重启后保留原预算与子任务身份。 */
+  /** 跨重启保存固定执行范围、已消费预算和本次候选身份。 */
   const canvasWorkflowRuns = createCanvasWorkflowRunStore({
     pathResolver: designPathResolver,
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+    onChanged: (run) => canvasWorkflowResumeScheduler.changed(run),
   })
-  /** 显式工作流直接复用唯一 Agent、图片执行与持久记录服务。 */
+  /** 准备交接独立写入父 Canvas 的事务目录，不与运行 journal 争用 CAS。 */
+  const canvasMediaHandoffs = createCanvasMediaHandoffStore({
+    getDirectory: (target) => join(designPathResolver.resolveCanvas(target.projectId, target.canvasId).transactionsDir, 'media-handoffs'),
+    getWorkflow: (target, runId) => canvasWorkflowRuns.get(target, runId),
+    getRunOrigin: (projectId, runId) => mediaRuns.getOrigin(projectId, runId),
+    getRunSourceRef: (projectId, runId) => mediaRuns.getSourceRef(projectId, runId),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
+  const canvasMediaHandoff = createCanvasMediaHandoffService({
+    handoffs: canvasMediaHandoffs, modules: canvasMediaStore, inputs: canvasMediaInputs, runs: mediaRuns,
+    getWorkflow: (target, runId) => canvasWorkflowRuns.get(target, runId),
+    loadCanvas: (target) => canvasDocumentStore.load(target).document,
+    authorize: (context) => {
+      canvasToolAccess.authorizeRead(context)
+      if (!context.canvasAgentTarget || !context.parentWorkflow) throw new Error('MEDIA_PARENT_HANDOFF_REQUIRED')
+      canvasToolAccess.requireLinkedCanvas({ projectId: context.projectId, sessionId: context.parentWorkflow.parentSessionId,
+        runStartedAt: context.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] }, context.canvasAgentTarget.canvasId)
+      workspaceOperationGuard.assertWorkspaceWritable(context.projectId)
+      if (getAgentSessionMeta(context.parentWorkflow.parentSessionId)?.permissionMode === 'plan') throw new Error('MEDIA_EXECUTION_NOT_AUTHORIZED')
+    },
+  })
+  /** UI 与工具返回后仍保留原运行期限，远端静默不能让父流程无限运行。 */
+  const canvasWorkflowResumeScheduler = createCanvasWorkflowResumeScheduler({
+    resume: async (input) => {
+      const run = canvasWorkflowRuns.get(input, input.workflowRunId)
+      if (!shouldResumeCanvasWorkflow(run) || run.owner.sessionId !== input.ownerSessionId) return
+      await canvasWorkflowExecutionService.resume({ projectId: run.projectId, sessionId: run.owner.sessionId,
+        runStartedAt: run.owner.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] }, { ...input, runId: run.id })
+    },
+    onError: () => console.warn('[Canvas 工作流] 期限恢复暂未完成，保留原运行记录'),
+  })
+  app.once('before-quit', () => canvasWorkflowResumeScheduler.dispose())
+  /** 显式工作流复用唯一 Agent、图片与媒体服务。 */
   const canvasWorkflowExecutionService = createCanvasWorkflowExecutionService({
     load: (target) => canvasDocumentStore.load(target).document,
     validateAccess: (context, canvasId) => {
       canvasToolAccess.requireLinkedCanvas(context, canvasId)
+      if (getAgentSessionMeta(context.sessionId)?.permissionMode === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+      workspaceOperationGuard.assertWorkspaceWritable(context.projectId)
     },
     isAgentBusy: (node) => isAgentSessionBusy(node.agentSessionId),
     agentExecution: canvasAgentExecutionService,
@@ -2995,6 +3347,23 @@ export function registerIpcHandlers(): void {
       }
       return { status: recovery.latestRun && isAgentSessionBusy(input.agentSessionId) ? 'running' : 'missing' }
     },
+    scheduleDurableResume: (input) => canvasWorkflowResumeScheduler.schedule(input),
+    applyPreparedHandoffs: (run, document) => canvasMediaHandoff.apply(run, document),
+    isMediaOutputAdopted: async (query) => {
+      const node = canvasDocumentStore.load(query).document.nodes.find((item) => item.id === query.nodeId)
+      if (!node || (node.kind !== 'audio' && node.kind !== 'video')) return { adopted: false, artifactHash: null, committedAt: null }
+      const state = await canvasMediaStore.load({ ...query, mediaModuleId: node.mediaModuleId, mediaKind: node.kind })
+      const adopted = state.config.adoptedOutputs.find((output) => output.key === query.outputKey && output.runId === query.mediaRunId)
+      if (!adopted) return { adopted: false, artifactHash: null, committedAt: null }
+      mediaAssets.getRecord(query.projectId, adopted.asset)
+      return { adopted: true, artifactHash: adopted.asset.hash, committedAt: state.config.updatedAt }
+    },
+    mediaRuns: createCanvasWorkflowMediaAdapter({
+      media: canvasMediaService, runs: mediaRuns, supervisor: mediaSupervisor,
+      onCancelError: () => console.warn('[Canvas 工作流] 远端任务未确认取消，父流程停止推进后仍保留产物收集'),
+      claimOptions: (target, workflowRunId) => canvasMediaHandoff.claimOptions(target, workflowRunId),
+      resolveInputs: (target) => canvasMediaInputs.resolveNodeInputs(target),
+    }),
     onRunChanged: (event) => {
       for (const contents of listAuthorizedDesignWebContents()) {
         try { contents.send(CANVAS_IPC_CHANNELS.WORKFLOW_RUN_CHANGED, event) }
@@ -3060,6 +3429,44 @@ export function registerIpcHandlers(): void {
     candidateBatches: canvasImageCandidateBatchService,
     traceStore: designTraceStore,
     onBackgroundError: (message, error) => console.error(message, error),
+  })
+  /** 正式采用只唤醒原已授权工作流，保留其 owner、预算和固定范围。 */
+  const resumeAdoptedCanvasWorkflows = async (target: import('@proma/shared').CanvasTarget): Promise<void> => {
+    await resumeCanvasWorkflowRuns(canvasWorkflowRuns.list(target))
+  }
+  /** 先注册所有原期限，再以两个并发恢复，单任务等待不会延误后续 deadline。 */
+  const resumeCanvasWorkflowRuns = async (runs: import('@proma/shared').CanvasWorkflowRun[]): Promise<void> => {
+    const pending = runs.filter(shouldResumeCanvasWorkflow)
+    for (const run of pending) canvasWorkflowResumeScheduler.changed(run)
+    let nextIndex = 0
+    const consume = async (): Promise<void> => {
+      while (nextIndex < pending.length) {
+        const run = pending[nextIndex++]!
+        try {
+          await canvasWorkflowExecutionService.resume({ projectId: run.projectId, sessionId: run.owner.sessionId,
+            runStartedAt: run.owner.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] },
+          { projectId: run.projectId, canvasId: run.canvasId, runId: run.id })
+        } catch (error) {
+          if (!(error instanceof Error && error.message === 'CANVAS_WORKFLOW_ACTIVE')) console.warn('[Canvas 工作流] 原运行恢复暂未完成')
+        }
+      }
+    }
+    await Promise.all([consume(), consume()])
+  }
+  /** 启动只遍历已登记 Canvas 的有界 journal；恢复仍逐次复核原主体和固定预算。 */
+  queueMicrotask(() => {
+    void (async () => {
+      const runs: import('@proma/shared').CanvasWorkflowRun[] = []
+      for (const workspace of listAgentWorkspaces()) {
+        try {
+          for (const canvas of canvasSessionStore.list({ projectId: workspace.id })) {
+            try { runs.push(...canvasWorkflowRuns.list({ projectId: workspace.id, canvasId: canvas.id })) }
+            catch { console.warn('[Canvas 工作流] 单画布记录暂不可用，继续其它画布恢复') }
+          }
+        } catch { console.warn('[Canvas 工作流] 项目启动恢复暂未完成，保留原运行记录') }
+      }
+      await resumeCanvasWorkflowRuns(runs)
+    })().catch(() => console.warn('[Canvas 工作流] 启动恢复暂未完成，保留原运行记录'))
   })
   registerCanvasDocumentIpcHandlers({
     taskOperations: canvasTaskOperations,
@@ -3164,6 +3571,7 @@ export function registerIpcHandlers(): void {
     imageCandidateBatches: canvasImageCandidateBatchService,
     imageRunService: canvasImageRunService,
     workflowExecution: canvasWorkflowExecutionService,
+    canvasMedia: canvasMediaService,
     imageAssets: {
       list: (projectId) => designStore.requireStableAuthoritativeDocument(projectId).assets,
       readStoredThumbnail: (projectId, assetId) => designAssetService.readStoredThumbnail(projectId, assetId),
@@ -3180,6 +3588,49 @@ export function registerIpcHandlers(): void {
     },
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
     toolAccess: canvasToolAccess,
+    mediaTools: (context) => createMediaToolRun({
+      configuration: getMediaConfiguration(), resources: mediaResources, runs: mediaRuns, supervisor: mediaSupervisor,
+      authorize: (current, operation) => {
+        canvasToolAccess.authorizeRead(current)
+        if (current.canvasAgentTarget) canvasToolAccess.requireLinkedCanvas(current, current.canvasAgentTarget.canvasId)
+        if (operation !== 'read') {
+          workspaceOperationGuard.assertWorkspaceWritable(current.projectId)
+          if (getDesignProjectReadOnlyReason(current.projectId)) throw new Error('MEDIA_PROJECT_READ_ONLY')
+        }
+        if (['execute', 'cancel', 'publish'].includes(operation)
+          && (current.permissionCeiling !== 'execute' || current.canvasAgentMode === 'parent-orchestrated'
+            || getAgentSessionMeta(current.sessionId)?.permissionMode === 'plan')) throw new Error('MEDIA_EXECUTION_NOT_AUTHORIZED')
+      },
+      listAssets: async (current) => (await mediaAssets.list(current.projectId)).map((asset) => ({
+        asset: { assetId: asset.id, revision: asset.revision, hash: asset.hash, mediaKind: asset.mediaKind },
+        roles: [], ...asset.metadata,
+      })),
+      getAssetFile: (current, asset) => mediaSources.getAssetFile(current, asset),
+      listSources: (current) => mediaSources.listSources(current),
+      importAssets: (current, refs) => mediaSources.importAssets(current, refs),
+      importLocalFile: (current, input) => mediaSources.importLocalFile(current, input),
+      registerRemoteAsset: async (current, input) => {
+        canvasToolAccess.authorizeRead(current)
+        workspaceOperationGuard.assertWorkspaceWritable(current.projectId)
+        const resolved = getMediaConfiguration().resolveConnection(input.descriptor.connectionId, current.projectId)
+        if (resolved.connection.instanceGeneration !== input.descriptor.instanceGeneration) throw new Error('MEDIA_CONNECTION_CHANGED')
+        const contentHash = createHash('sha256').update(input.bytes).digest('hex')
+        const operationHash = createHash('sha256').update(JSON.stringify([input.descriptor, contentHash])).digest('hex')
+        const asset = await mediaAssets.register(current.projectId, `remote:${operationHash}`, input.bytes, input.contentType, {
+          mediaRunId: `remote-${createHash('sha256').update(current.sessionId).digest('hex').slice(0, 40)}`, sourceSessionId: current.sessionId,
+        })
+        canvasToolAccess.authorizeRead(current)
+        return asset
+      },
+      listModels: async (current, canvasId) => {
+        canvasToolAccess.authorizeRead(current)
+        if (canvasId) canvasToolAccess.requireLinkedCanvas(current, canvasId)
+        const scope = canvasId ? canvasDocumentStore.requireStableAuthoritativeDocument({ projectId: current.projectId, canvasId }).mediaModelScope : undefined
+        return buildCanvasMediaModelOptions(imageModels.listMediaApiCatalog(), imageModels.listOptions(current.projectId))
+          .filter((model) => isCanvasMediaModelAllowed(scope, model.profileId))
+      },
+      prepareParentRun: (current, input, origin) => canvasMediaHandoff.prepare(current, input, origin),
+    }, context),
   })
   registerDesignIpcHandlers({
     ipc: ipcMain,

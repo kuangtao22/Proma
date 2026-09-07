@@ -85,6 +85,7 @@ function createJob(
 }
 
 interface HarnessOptions {
+  loadConfig?: (node: Extract<CanvasNode, { kind: 'image' }>) => CanvasImageModuleConfig
   preflight?: (input: CreateDesignJobInput) => Promise<void>
   createOnce?: (
     input: CreateDesignJobInput,
@@ -127,7 +128,8 @@ function createHarness(options: HarnessOptions = {}) {
     imageModules: {
       load: async (imageTarget) => {
         calls.push(`load:${imageTarget.nodeId}`)
-        return createConfig(createImageNode(imageTarget.nodeId))
+        const node = createImageNode(imageTarget.nodeId)
+        return options.loadConfig?.(node) ?? createConfig(node)
       },
     },
     imageJobs: {
@@ -236,6 +238,39 @@ function createHarness(options: HarnessOptions = {}) {
 }
 
 describe('Canvas 图片统一运行服务', () => {
+  test('Given Agent 图片节点选择公共工作流 When 批量预检 Then 原样透传工作流且不伪造 profile', async () => {
+    const node = createImageNode('image-workflow')
+    /** 完整输入包含标量和素材，验证运行服务不做字段猜测或裁剪。 */
+    const mediaWorkflow: NonNullable<CanvasImageModuleConfig['mediaWorkflow']> = {
+      workflowId: 'workflow-1',
+      workflowRevision: 2,
+      connectionId: 'connection-1',
+      inputs: {
+        promptText: { kind: 'scalar', value: '保留原始提示' },
+        reference: {
+          kind: 'asset',
+          asset: { assetId: 'asset-1', revision: 3, hash: 'a'.repeat(64), mediaKind: 'image' },
+        },
+      },
+    }
+    /** 记录进入 DesignJob 预检边界的输入。 */
+    let preflightInput: CreateDesignJobInput | undefined
+    const harness = createHarness({
+      loadConfig: (current) => ({
+        ...createConfig(current),
+        selectedModelProfileId: null,
+        mediaWorkflow: structuredClone(mediaWorkflow),
+      }),
+      preflight: async (input) => { preflightInput = structuredClone(input) },
+    })
+
+    const result = await harness.service.run(context, target, [node], 'tool-workflow')
+
+    expect(result.tasks[0]).toMatchObject({ nodeId: node.id, status: 'started' })
+    expect(preflightInput).toMatchObject({ mediaWorkflow })
+    expect(preflightInput).not.toHaveProperty('imageModelProfileId')
+  })
+
   test('Given 第二张图预检失败 When 批量运行 Then 全部预检完成前不创建 journal', async () => {
     const first = createImageNode('image-a')
     const second = createImageNode('image-b')

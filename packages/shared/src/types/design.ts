@@ -1,4 +1,5 @@
-import type { CanvasImageInputReference, DesignGenerationConstraints } from './canvas'
+import type { CanvasImageInputReference, CanvasImageMediaWorkflow, DesignGenerationConstraints } from './canvas'
+import type { MediaAssetRecord, MediaInputValue } from './media'
 
 /** Design 画布文档的当前 schema 版本。 */
 export const DESIGN_DOCUMENT_VERSION = 1
@@ -90,7 +91,7 @@ export interface DesignViewport extends DesignPoint {
 export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
-export type ImageGenerationExecutor = 'nano-banana' | 'openai-images'
+export type ImageGenerationExecutor = 'nano-banana' | 'openai-images' | 'comfyui'
 export type DesignContextMode = 'auto' | 'project' | 'none'
 export type DesignContextCategory =
   | 'brand'
@@ -168,6 +169,31 @@ export type ImageGenerationModelSnapshot =
       executor: 'openai-images'
       channelId: string
     }
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'comfyui'
+      source?: undefined
+      mediaProfileId: string
+      mediaProfileRevision: number
+      connectionId: string
+      workflowId: string
+      workflowRevision: number
+      workflowHash: string
+    }
+  | {
+      executor: 'comfyui'
+      source: 'workflow'
+      /** 明确不存在 profile；可选 never 仅让通用只读展示安全访问该字段。 */
+      profileId?: undefined
+      name: string
+      /** 使用真实 workflow ID 与 revision 作为展示标识，不冒充 profile。 */
+      modelId: string
+      connectionId: string
+      instanceGeneration: string
+      workflowId: string
+      workflowRevision: number
+      workflowHash: string
+      inputs: Record<string, MediaInputValue>
+    }
 
 /** 项目选择器展示的生图模型及其当前可用性。 */
 export type ImageGenerationModelOption =
@@ -176,6 +202,10 @@ export type ImageGenerationModelOption =
       unavailableReason?: string
     }
   | Extract<ImageGenerationModelSnapshot, { executor: 'openai-images' }> & {
+      available: boolean
+      unavailableReason?: string
+    }
+  | Extract<ImageGenerationModelSnapshot, { executor: 'comfyui'; profileId: string }> & {
       available: boolean
       unavailableReason?: string
     }
@@ -195,11 +225,15 @@ export interface ImageGenerationModelCatalogResult {
   channelOptions: ImageGenerationChannelOption[]
   inheritedFromLegacyConfig: boolean
   credentialsConfigured: boolean
+  /** schema v3 目录 revision；旧调用方可缺省，新设置页保存必须回传。 */
+  revision?: number
 }
 
 /** 保存完整生图模型 profile 列表的输入。 */
 export interface SaveImageGenerationModelProfilesInput {
   profiles: ImageGenerationModelProfile[]
+  /** 新设置页用于多窗口 CAS；旧调用方缺省时保持兼容。 */
+  expectedRevision?: number
 }
 
 /** 项目可选择的生图模型及当前选择状态。 */
@@ -248,9 +282,16 @@ export interface DesignAsset {
   createdAt: number
   sourceSessionId?: string
   sourceJobId?: string
+  /** 生成来源的统一媒体运行 ID，不冒充 Design Job。 */
+  sourceMediaRunId?: string
+  /** 同一运行输出的稳定登记键，用于中断后的幂等收集。 */
+  sourceMediaOutputKey?: string
   prompt?: string
   parentAssetId?: string
 }
+
+/** @internal 音视频正式文件只在主进程通过受管相对路径解析。 */
+export type DesignMediaAssetRecord = MediaAssetRecord & { relativePath: string }
 
 /** 一组关联画布节点。 */
 export interface DesignGroup {
@@ -287,6 +328,8 @@ export interface DesignCanvasDocument {
   viewport: DesignViewport
   nodes: DesignCanvasNode[]
   assets: DesignAsset[]
+  /** 旧文档可缺省；加载时主进程规范化为空数组。 */
+  mediaAssets?: DesignMediaAssetRecord[]
   groups: DesignGroup[]
   annotations: DesignAnnotation[]
   createdAt: number
@@ -342,6 +385,11 @@ export type DesignMutation =
   | { type: 'upsert-annotations'; annotations: DesignAnnotation[] }
   | { type: 'remove-annotations'; annotationIds: string[] }
   | { type: 'patch-annotations'; removeIds: string[]; upserts: Array<DesignIndexedEntity<DesignAnnotation>> }
+
+/** @internal Renderer mutation 联合不包含这些媒体元数据写操作。 */
+export type DesignInternalMutation =
+  | { type: 'upsert-media-assets'; assets: DesignMediaAssetRecord[] }
+  | { type: 'remove-media-assets'; assetIds: string[] }
 
 /** 单次 Design 执行实际读取的创作上下文引用。 */
 export interface DesignContextReference {
@@ -475,7 +523,10 @@ export interface CreateDesignJobInput {
   action: DesignJobAction
   prompt: string
   contextMode: DesignContextMode
-  imageModelProfileId: string
+  /** 普通图片模型或旧 Comfy 预设；公共工作流任务不得伪造该 ID。 */
+  imageModelProfileId?: string
+  /** Canvas 图片节点选中的公共工作流及完整显式输入。 */
+  mediaWorkflow?: CanvasImageMediaWorkflow
   /** 新调用方使用明确目标；旧 Design 创建入口在迁移阶段仍可只提供 position。 */
   target?: CreateDesignJobTarget
   generationConstraints?: DesignGenerationConstraints
@@ -585,6 +636,8 @@ export const DESIGN_IPC_CHANNELS = {
   CANVAS_SESSION_CHANGED: 'design:canvas-session-changed',
   LIST_IMAGE_MODEL_PROFILES: 'design:list-image-model-profiles',
   SAVE_IMAGE_MODEL_PROFILES: 'design:save-image-model-profiles',
+  LIST_MEDIA_API_MODEL_PROFILES: 'design:list-media-api-model-profiles',
+  SAVE_MEDIA_API_MODEL_PROFILES: 'design:save-media-api-model-profiles',
   GET_IMAGE_MODEL_SELECTION: 'design:get-image-model-selection',
   SET_IMAGE_MODEL_SELECTION: 'design:set-image-model-selection',
   IMAGE_MODEL_PROFILES_CHANGED: 'design:image-model-profiles-changed',
@@ -631,6 +684,7 @@ export function createEmptyDesignDocument(
     viewport: { x: 0, y: 0, zoom: 1 },
     nodes: [],
     assets: [],
+    mediaAssets: [],
     groups: [],
     annotations: [],
     createdAt: now,

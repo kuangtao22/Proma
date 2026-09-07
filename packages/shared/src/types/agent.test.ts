@@ -7,6 +7,7 @@ import type {
   AgentSendInput,
   AgentSubmitOrEnqueueInput,
   SDKUserMessage,
+  AgentMediaAttachment,
 } from './agent'
 
 /** 测试使用的结构化 Canvas 节点引用。 */
@@ -96,5 +97,36 @@ describe('Agent Canvas 节点引用合同', () => {
 
     expect(message._canvasNodeReferences).toEqual([canvasNodeReference])
     expect('canvasNodeReferences' in message).toBe(false)
+  })
+})
+
+describe('Agent 媒体附件合同', () => {
+  test('Given 普通、即时和 deferred 发送 When 构造输入 Then 使用同一结构化附件字段', () => {
+    const attachment = {
+      filename: 'clip.mp4', mediaType: 'video/mp4', size: 12, targetPath: '/session/attachments/clip.mp4',
+    } satisfies AgentMediaAttachment
+    const sendInput: AgentSendInput = {
+      sessionId: 'session-1', userMessage: '处理视频', channelId: 'channel-1', mediaAttachments: [attachment],
+    }
+    const queueInput: AgentQueueMessageInput = {
+      sessionId: 'session-1', userMessage: '继续', mediaAttachments: [attachment],
+    }
+    const deferredInput: AgentDeferredQueueMessageInput = {
+      ...sendInput, queueMessageId: 'queue-1', mediaAttachments: [attachment],
+    }
+    expect(sendInput.mediaAttachments).toEqual([attachment])
+    expect(queueInput.mediaAttachments).toEqual([attachment])
+    expect(deferredInput.mediaAttachments).toEqual([attachment])
+  })
+
+  test('Given 用户消息落入 JSONL When 保存附件 Then 使用 MediaSourceService 可读取的字段名', () => {
+    const message: SDKUserMessage = {
+      type: 'user', parent_tool_use_id: null,
+      mediaAttachments: [{
+        filename: 'frame.png', mediaType: 'image/png', size: 8, targetPath: '/session/attachments/frame.png',
+      }],
+    }
+    expect(message.mediaAttachments?.[0]?.mediaType).toBe('image/png')
+    expect('_mediaAttachments' in message).toBe(false)
   })
 })

@@ -167,6 +167,17 @@ describe('CanvasDocumentStore', () => {
     }
   }
 
+  test('Given 显式空媒体模型范围 When 保存重载并修改视口 Then 保留空集合且旧 revision 无法扩大范围', () => {
+    const fixture = createFixture()
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const saved = fixture.store.mutate(target, 0, [{ type: 'set-media-model-scope', scope: { mode: 'selected', modelIds: [] } }])
+    expect(saved.mediaModelScope).toEqual({ mode: 'selected', modelIds: [] })
+    expect(fixture.store.load(target).document.mediaModelScope).toEqual({ mode: 'selected', modelIds: [] })
+    const next = fixture.store.mutate(target, saved.revision, [{ type: 'set-viewport', viewport: { x: 3, y: 4, zoom: 1 } }])
+    expect(next.mediaModelScope).toEqual({ mode: 'selected', modelIds: [] })
+    expect(() => fixture.store.mutate(target, 0, [{ type: 'set-media-model-scope', scope: { mode: 'all-enabled' } }])).toThrow()
+  })
+
   test('Given 上游来源达到共享上限 When 解析权威文档 Then 接受上限并拒绝再多一个', () => {
     const document = createConnectedDocument()
     /** 使用共享常量生成边界输入，避免测试与 parser 各自维护数字。 */
@@ -189,6 +200,68 @@ describe('CanvasDocumentStore', () => {
       }],
       edges: [],
     }, document)).toThrow('CANVAS_DOCUMENT_INVALID')
+  })
+
+  test('Given Host 已传播媒体采用 When 恢复文档或接收 mutation Then 只允许权威文档与可信 Store 写内部 revision', () => {
+    const document: CanvasDocument = {
+      ...createEmptyCanvasDocument('project-1', 'canvas-1', 20),
+      nodes: [{
+        id: 'audio-1', kind: 'audio', title: '旁白', position: { x: 0, y: 0 },
+        mediaModuleId: 'media-1', adoptedConfigRevision: 3,
+      }],
+    }
+
+    expect(parseCanvasDocument(document, document).document.nodes[0]).toEqual(document.nodes[0])
+    expect(() => parseCanvasDocument({
+      ...document,
+      nodes: [{ ...document.nodes[0]!, adoptedConfigRevision: -1 }],
+    }, document)).toThrow('CANVAS_DOCUMENT_INVALID')
+
+    const fixture = createFixture()
+    expect(() => fixture.store.validateBatchOperations(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'upsert-nodes', nodes: document.nodes }],
+    )).toThrow('CANVAS_MUTATION_INVALID')
+    expect(fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'upsert-nodes', nodes: document.nodes }],
+    ).nodes[0]).toEqual(document.nodes[0])
+  })
+
+  test('Given AV 节点确切图片输出边 When 可信 Store 保存 Then 保留 outputKey 且拒绝错误端口组合', () => {
+    const fixture = createFixture()
+    const source = {
+      id: 'video-source', kind: 'video' as const, title: '视频', position: { x: 0, y: 0 },
+      mediaModuleId: 'video-module',
+    }
+    const targetNode = {
+      id: 'image-target', kind: 'image' as const, title: '图片', position: { x: 10, y: 10 },
+      imageModuleId: 'image-module',
+    }
+    const nodes = [source, targetNode]
+    fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      0,
+      [{ type: 'upsert-nodes', nodes }],
+    )
+    const edge = {
+      id: 'edge-poster', sourceNodeId: source.id, sourcePort: 'image.asset',
+      sourceOutputKey: 'poster.main', targetNodeId: targetNode.id,
+      targetPort: 'image.reference', relation: 'reference' as const,
+    }
+
+    expect(fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      1,
+      [{ type: 'upsert-edges', edges: [edge] }],
+    ).edges).toEqual([edge])
+    expect(() => fixture.store.mutate(
+      { projectId: 'project-1', canvasId: 'canvas-1' },
+      2,
+      [{ type: 'upsert-edges', edges: [{ ...edge, sourcePort: 'video.asset' }] }],
+    )).toThrow('CANVAS_MUTATION_INVALID')
   })
 
   test('Given 大小写与标点来源的依赖投影 When 真实 Store mutate Then 可持久化并重新解析', () => {

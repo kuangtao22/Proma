@@ -200,6 +200,11 @@ function createFixture(): {
       replaceProfiles: (profiles) => ({
         profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
+      listMediaApiCatalog: () => ({ revision: 0, entries: [] }),
+      replaceMediaApiProfiles: (profiles, expectedRevision) => ({
+        revision: expectedRevision + 1,
+        entries: profiles.map((mediaProfile) => ({ profile: mediaProfile, support: { state: 'configuration-only' as const, reason: '测试适配未接入' } })),
+      }),
     },
     imagePreferences: {
       getSelection: (projectId) => ({ projectId, options: [] }),
@@ -262,6 +267,11 @@ describe('Design IPC', () => {
       replaceProfiles: (profiles) => ({
         profiles, channelOptions: [], inheritedFromLegacyConfig: false, credentialsConfigured: true,
       }),
+      listMediaApiCatalog: () => ({ revision: 0, entries: [] }),
+      replaceMediaApiProfiles: (profiles, expectedRevision) => ({
+        revision: expectedRevision + 1,
+        entries: profiles.map((mediaProfile) => ({ profile: mediaProfile, support: { state: 'configuration-only' as const, reason: '测试适配未接入' } })),
+      }),
     }
     fixture.options.imagePreferences = {
       getSelection: (projectId) => ({ projectId, options: [], selectedProfileId: 'profile-flash' }),
@@ -279,6 +289,8 @@ describe('Design IPC', () => {
     expect(registration.channels).toEqual(expect.arrayContaining([
       DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES,
       DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES,
+      DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES,
+      DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES,
       DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION,
       DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION,
     ]))
@@ -288,6 +300,12 @@ describe('Design IPC', () => {
     expect(await invoke(
       fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, fixture.senders[0]!, { profiles: [profile] },
     )).toMatchObject({ profiles: [profile] })
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES, fixture.senders[0]!,
+    )).toEqual({ revision: 0, entries: [] })
+    expect(await invoke(
+      fixture.handlers, DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES, fixture.senders[0]!, { profiles: [], expectedRevision: 0 },
+    )).toEqual({ revision: 1, entries: [] })
     expect(await invoke(
       fixture.handlers, DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, fixture.senders[0]!, { projectId: 'project-1' },
     )).toMatchObject({ projectId: 'project-1', selectedProfileId: 'profile-flash' })

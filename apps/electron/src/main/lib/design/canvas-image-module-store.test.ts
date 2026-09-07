@@ -233,4 +233,30 @@ describe('Canvas 图片模块 Store', () => {
 
     await expect(fixture.store.save(input)).rejects.toThrow('CANVAS_IMAGE_REVISION_CONFLICT')
   })
+
+  test('Given 公共工作流配置 When 保存并切回 profile Then 持久化完整输入后清除旧工作流', async () => {
+    const fixture = createFixture()
+    fixture.seed({
+      schemaVersion: 2, kind: 'image', contentId: target.imageModuleId, revision: 0,
+      createdAt: 100, updatedAt: 100, prompt: '', selectedModelProfileId: null,
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: null,
+    })
+    const workflow = {
+      workflowId: 'workflow-1', workflowRevision: 2, connectionId: 'connection-1',
+      inputs: { prompt: { kind: 'scalar' as const, value: '固定输入' } },
+    }
+    const saved = await fixture.store.save({
+      ...target, expectedConfigRevision: 0, prompt: '显示提示词', selectedModelProfileId: null,
+      mediaWorkflow: workflow, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none',
+    })
+    expect(saved.mediaWorkflow).toEqual(workflow)
+    expect(await fixture.store.load(target)).toEqual(saved)
+
+    const switched = await fixture.store.save({
+      ...target, expectedConfigRevision: 1, prompt: '普通模型', selectedModelProfileId: 'profile-1',
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none',
+    })
+    expect(switched.selectedModelProfileId).toBe('profile-1')
+    expect(switched).not.toHaveProperty('mediaWorkflow')
+  })
 })

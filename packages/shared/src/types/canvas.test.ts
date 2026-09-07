@@ -244,6 +244,28 @@ test('Given 图片到图片的类型化引用 When 判定绑定 Then 输出 imag
   })
 })
 
+test('Given AV 节点显式选择图片输出 When 判定绑定 Then 仅该 outputKey 进入旧图片参考槽', () => {
+  const edge = createCanvasBoundEdge(
+    { id: 'video-source', kind: 'video' },
+    { id: 'image-target', kind: 'image' },
+    {
+      id: 'edge-poster', sourceNodeId: 'video-source', sourceOutputKey: 'poster.main',
+      targetNodeId: 'image-target', relation: 'reference',
+    },
+  )
+
+  expect(edge).toMatchObject({
+    sourceOutputKey: 'poster.main', sourcePort: 'image.asset', targetPort: 'image.reference',
+  })
+  expect(resolveCanvasEdgeBinding(edge, 'video', 'image')).toEqual({
+    state: 'bound', sourceCapability: 'image.asset', targetSlot: 'image.reference',
+  })
+  expect(resolveCanvasEdgeBinding({ ...edge, sourceOutputKey: undefined }, 'video', 'image'))
+    .toEqual({ state: 'incompatible' })
+  expect(resolveCanvasEdgeBinding({ ...edge, sourcePort: 'video.asset' }, 'video', 'image'))
+    .toEqual({ state: 'incompatible' })
+})
+
 test('Given WebView 到图片的引用 When 创建绑定 Then 只能进入文本上下文槽', () => {
   /** HTML 产物只能提供文本上下文，不能冒充图片媒体。 */
   const edge = createCanvasBoundEdge(
@@ -389,6 +411,25 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test.each(['audio', 'video'] as const)('Given %s 快照含 Host 采用版本 When Renderer 严格解析 Then 保留只读 revision', (kind) => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', now)
+    document.nodes = [{
+      id: `node-${kind}`, kind, title: '媒体', position: { x: 0, y: 0 },
+      mediaModuleId: `module-${kind}`, adoptedConfigRevision: 2,
+    }]
+
+    expect(parseCanvasWorkspaceSnapshot({ document, writable: true, nodeIssues: [] }).document.nodes[0])
+      .toEqual(document.nodes[0])
+    expect(() => parseCanvasWorkspaceSnapshot({
+      document: {
+        ...document,
+        nodes: [{ ...document.nodes[0]!, adoptedConfigRevision: 1.5 }],
+      },
+      writable: true,
+      nodeIssues: [],
+    })).toThrow('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  })
+
   test('Given 大小写与标点稳定 ID 按 code-unit 排序 When 解析工作区快照 Then 保留确定性顺序', () => {
     const document = structuredClone(createDocument())
     document.nodes[0] = {
@@ -753,7 +794,7 @@ describe('Canvas 图共享合同', () => {
     expect(parseCanvasNodeReference(reference)).toEqual(reference)
     expect(() => parseCanvasNodeReference({ ...reference, nodeRevision: -1 })).toThrow()
     expect(() => parseCanvasNodeReference({ ...reference, nodeRevision: 1.5 })).toThrow()
-    expect(() => parseCanvasNodeReference({ ...reference, nodeType: 'video' })).toThrow()
+    expect(() => parseCanvasNodeReference({ ...reference, nodeType: 'spreadsheet' })).toThrow()
     expect(() => parseCanvasNodeReference({ ...reference, localPath: '/private/node.json' })).toThrow()
   })
 
@@ -881,6 +922,28 @@ describe('Canvas 图共享合同', () => {
     })
   })
 
+  test('Given 图片配置与任务使用固定版本 Comfy 预设 When 严格解析 Then 保留 media 命名空间和快照', () => {
+    const input = createCanvasImageSnapshotFixture()
+    input.config.selectedModelProfileId = 'media:preset-1:3'
+    input.jobs[0]!.imageModelSnapshot = {
+      profileId: 'media:preset-1:3',
+      name: 'Comfy 海报',
+      executor: 'comfyui',
+      modelId: 'workflow-1@2',
+      mediaProfileId: 'preset-1',
+      mediaProfileRevision: 3,
+      connectionId: 'connection-1',
+      workflowId: 'workflow-1',
+      workflowRevision: 2,
+      workflowHash: 'a'.repeat(64),
+    }
+
+    const parsed = parseCanvasImageModuleSnapshot(input)
+
+    expect(parsed.config.selectedModelProfileId).toBe('media:preset-1:3')
+    expect(parsed.jobs[0]?.imageModelSnapshot).toEqual(input.jobs[0]?.imageModelSnapshot)
+  })
+
   test('Given 图片配置含未知字段或超长提示词 When 严格解析 Then fail closed', () => {
     /** 合法配置基线用于只改变单一非法字段。 */
     const config = {
@@ -901,6 +964,34 @@ describe('Canvas 图共享合同', () => {
     expect(() => parseCanvasImageModuleConfig({ ...config, extra: true })).toThrow()
     expect(() => parseCanvasImageModuleConfig({ ...config, prompt: 'x'.repeat(100_001) })).toThrow()
     expect(() => parseCanvasImageModuleConfig({ ...config, aspectRatio: '2:1' })).toThrow()
+  })
+
+  test('Given 图片配置选择公共工作流 When 严格解析 Then 要求 profile 为空并深度校验输入', () => {
+    const config = {
+      schemaVersion: 2, kind: 'image', contentId: 'module-1', revision: 0,
+      createdAt: 10, updatedAt: 10, prompt: '界面提示词不覆盖工作流映射',
+      selectedModelProfileId: null, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto',
+      adoptedAssetId: null,
+      mediaWorkflow: {
+        workflowId: 'workflow-1', workflowRevision: 2, connectionId: 'connection-1',
+        inputs: {
+          promptText: { kind: 'scalar', value: '工作流提示词' },
+          image: { kind: 'asset', asset: { assetId: 'asset-1', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image' } },
+        },
+      },
+    } as const
+
+    const parsed = parseCanvasImageModuleConfig(config)
+    expect(parsed.mediaWorkflow).toEqual(config.mediaWorkflow)
+    expect(parsed.mediaWorkflow).not.toBe(config.mediaWorkflow)
+    expect(() => parseCanvasImageModuleConfig({ ...config, selectedModelProfileId: 'profile-1' }))
+      .toThrow('CANVAS_IMAGE_CONFIG_INVALID')
+    expect(() => parseCanvasImageModuleConfig({
+      ...config,
+      mediaWorkflow: { ...config.mediaWorkflow, inputs: { image: { kind: 'asset', asset: {
+        assetId: 'asset-1', revision: 1, hash: 'bad', mediaKind: 'image',
+      } } } },
+    })).toThrow('CANVAS_IMAGE_WORKFLOW_INVALID')
   })
 
   test('Given 合法图片模块快照 When 严格解析 Then 完整重建并与输入深隔离', () => {

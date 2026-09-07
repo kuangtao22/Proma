@@ -30,6 +30,8 @@ import {
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
+  isCanvasMediaModelAllowed,
+  parseCanvasImageMediaWorkflow,
 } from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
@@ -126,7 +128,7 @@ interface CanvasImagePreflightResult {
 }
 
 /** Manager 内部创建已使用独立可信 snapshot，不再依赖 Renderer profile ID。 */
-type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfileId'>
+type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfileId' | 'mediaWorkflow'>
 
 /** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
 const STORED_JOB_FIELDS = new Set([
@@ -192,11 +194,15 @@ export interface DesignJobManagerDependencies {
   }
   /** 从直接入边读取已提交事实并固化任务输入。 */
   canvasImageInputResolver?: CanvasImageInputResolver
+  /** 新任务从权威 Canvas 文档读取 API 模型候选范围；旧任务继续自身快照。 */
+  getCanvasMediaModelScope?: (projectId: string, canvasId: string) => import('@proma/shared').CanvasMediaModelScope | undefined
+  /** ComfyUI 图片执行器返回已登记素材，Manager 只负责原候选链与任务 journal。 */
+  mediaExecution?: DesignMediaImageExecution
   /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
   imageModels: Pick<
     ImageGenerationModelCatalog,
     'resolveAvailableSnapshot' | 'assertSnapshotAvailable' | 'resolveExecutionRoute'
-  >
+  > & Partial<Pick<ImageGenerationModelCatalog, 'resolveAvailableWorkflowSnapshot'>>
   /** 为每次 Design 运行创建隔离的只读上下文工具、预算与审计状态。 */
   contextOrchestrator: Pick<DesignContextOrchestrator, 'createRun'>
   getSettings: () => DesignJobSettings
@@ -246,6 +252,18 @@ export interface DesignJobManagerDependencies {
   createCreativeTaskId?: () => string
   now?: () => number
 }
+
+/** Canvas 媒体执行的窄边界，取消只有远端确认后才允许提交本地终态。 */
+export interface DesignMediaImageExecution {
+  runImage(job: DesignJobRecord): Promise<DesignMediaImageExecutionResult>
+  recoverImage(job: DesignJobRecord): Promise<DesignMediaImageExecutionResult>
+  cancel(projectId: string, jobId: string): Promise<{ confirmed: boolean }>
+}
+
+/** 媒体监督等待的有界结果；pending 保留任务身份供后续继续对账。 */
+export type DesignMediaImageExecutionResult =
+  | { status: 'succeeded'; asset: DesignAsset }
+  | { status: 'pending'; error: string }
 
 /** Design Job 状态变化事件，同时携带画布权威 revision。 */
 export interface DesignJobChangedEvent {
@@ -328,6 +346,8 @@ export class DesignJobManager {
     completion: Promise<void>
     resolveCompletion: () => void
   }>()
+  /** 启动恢复发现的 Comfy 任务，首次续跑只允许对账原 operation。 */
+  private readonly recoveringMediaJobs = new Set<string>()
   private readonly createId: () => string
   private readonly createCreativeTaskId: () => string
   private readonly now: () => number
@@ -349,8 +369,9 @@ export class DesignJobManager {
       throw new Error('Canvas 图片任务必须使用独立创建入口')
     }
     /** 可信模型校验必须早于 Store 读取、ID 生成、journal 和占位节点写入。 */
+    if (!input.imageModelProfileId || input.mediaWorkflow) throw new Error('设计任务缺少生图模型')
     const imageModelSnapshot = this.runImageModelValidation(
-      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
+      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId!, input.projectId),
     )
     return this.createInternal(input, imageModelSnapshot)
   }
@@ -479,7 +500,7 @@ export class DesignJobManager {
         canvasInputReferences: preflight.canvasInputReferences.map((reference) => ({ ...reference })),
         canvasImageConfigRevision: input.canvasImageConfigRevision,
         ...(input.candidateBatchId ? { candidateBatchId: input.candidateBatchId } : {}),
-        imageModelSnapshot: { ...preflight.imageModelSnapshot },
+        imageModelSnapshot: structuredClone(preflight.imageModelSnapshot),
         ...(input.sourceAssetId
           ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId }
           : {}),
@@ -521,13 +542,24 @@ export class DesignJobManager {
       throw new Error(`素材不存在: ${input.sourceAssetId}`)
     }
     /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
-    const imageModelSnapshot = this.runImageModelValidation(
-      () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId),
-    )
+    if ((input.imageModelProfileId ? 1 : 0) + (input.mediaWorkflow ? 1 : 0) !== 1) {
+      throw new Error('Canvas 图片任务必须且只能选择一种生图来源')
+    }
+    const imageModelSnapshot = this.runImageModelValidation(() => input.mediaWorkflow
+      ? this.dependencies.imageModels.resolveAvailableWorkflowSnapshot?.(input.mediaWorkflow, input.projectId)
+        ?? (() => { throw new Error('媒体工作流执行器未初始化') })()
+      : this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId!, input.projectId))
     /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
+    if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
+      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
+    )) throw new Error('CANVAS_MEDIA_MODEL_OUT_OF_SCOPE')
     const canvasInputReferences = await inputResolver.resolve(
       toCanvasImageTarget(input.projectId, input.target),
     )
+    // 素材解析可能等待磁盘；提交前再次读取范围，避免期间撤选被旧快照绕过。
+    if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
+      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
+    )) throw new Error('CANVAS_MEDIA_MODEL_OUT_OF_SCOPE')
     return {
       target: input.target,
       prompt,
@@ -698,6 +730,28 @@ export class DesignJobManager {
   }
 
   /**
+   * 精确恢复单个 ComfyUI 任务，供媒体监督器终态事件推进候选链。
+   * @param projectId 任务所属项目。
+   * @param jobId 已知媒体运行对应的 Design Job ID。
+   * @returns 原执行收尾并完成本次精确对账后返回。
+   */
+  async resumeMediaJob(projectId: string, jobId: string): Promise<void> {
+    let job = this.requireProjectJob(projectId, jobId)
+    if (job.imageModelSnapshot?.executor !== 'comfyui'
+      || (job.status !== 'queued' && job.status !== 'running')) return
+    /** pending 事件可能早于旧 Promise 从 active map 移除，先等待其完整收尾。 */
+    const active = this.activeExecutions.get(jobId)
+    if (active) {
+      await active.completion
+      job = this.requireProjectJob(projectId, jobId)
+      if (job.imageModelSnapshot?.executor !== 'comfyui'
+        || (job.status !== 'queued' && job.status !== 'running')) return
+    }
+    this.recoveringMediaJobs.add(jobId)
+    await this.run(jobId)
+  }
+
+  /**
    * 发起 queued 任务，并在任务进入 running 后立即确认。
    * @param jobId 需要启动的稳定任务 ID。
    * @returns 启动前置成功并进入 running 后完成；前置异常时拒绝。
@@ -755,7 +809,11 @@ export class DesignJobManager {
     start: { accept: () => void; reject: (error: unknown) => void },
   ): Promise<void> {
     const queued = this.requireJob(jobId)
-    if (queued.status !== 'queued') {
+    const recoveringMedia = this.recoveringMediaJobs.delete(jobId)
+    const isResumableMedia = queued.status === 'running'
+      && queued.imageModelSnapshot?.executor === 'comfyui'
+      && this.dependencies.mediaExecution !== undefined
+    if (queued.status !== 'queued' && !isResumableMedia) {
       start.accept()
       return
     }
@@ -768,9 +826,19 @@ export class DesignJobManager {
         start.reject(error)
         return
       }
+      if (imageModelSnapshot.executor === 'comfyui') {
+        /** 只有首次本地提交前复核当前配置；恢复必须以原 run 的远端事实为准。 */
+        if (queued.status === 'queued' && !recoveringMedia) {
+          this.runImageModelValidation(
+            () => this.dependencies.imageModels.assertSnapshotAvailable(imageModelSnapshot, queued.projectId),
+          )
+        }
+        await this.executeMediaImage(queued, start, recoveringMedia || isResumableMedia)
+        return
+      }
       /** 排队期间配置可能被删除、停用或修改，付费会话创建前必须再次复核。 */
       this.runImageModelValidation(
-        () => this.dependencies.imageModels.assertSnapshotAvailable(imageModelSnapshot),
+        () => this.dependencies.imageModels.assertSnapshotAvailable(imageModelSnapshot, queued.projectId),
       )
       const model = this.resolveModel(queued)
       if (!model) {
@@ -830,7 +898,7 @@ export class DesignJobManager {
           resolveTrustedImageRoute: (route) => {
             try {
               return this.runImageModelValidation(
-                () => this.dependencies.imageModels.resolveExecutionRoute(route),
+                () => this.dependencies.imageModels.resolveExecutionRoute(route, running.projectId),
               )
             } catch (error) {
               runError ??= error instanceof Error ? error.message : DESIGN_IMAGE_MODEL_VALIDATION_ERROR
@@ -874,11 +942,47 @@ export class DesignJobManager {
     }
   }
 
+  /** 使用已固化 ComfyUI 快照执行图片任务，不创建隐藏 Agent 或依赖 LLM 设置。 */
+  private async executeMediaImage(
+    job: StoredDesignJob,
+    start: { accept: () => void; reject: (error: unknown) => void },
+    recovering: boolean,
+  ): Promise<void> {
+    const mediaExecution = this.dependencies.mediaExecution
+    if (!mediaExecution || job.target.kind !== 'canvas-image') {
+      throw new Error('ComfyUI 当前仅支持 Canvas 图片任务')
+    }
+    /** 新任务先持久化 running；恢复任务沿用原 journal 状态和 operation 身份。 */
+    const running = job.status === 'queued'
+      ? this.updateStatus(job, 'running', { error: undefined })
+      : job
+    start.accept()
+    const result = recovering
+      ? await mediaExecution.recoverImage(clonePublicDesignJob(running))
+      : await mediaExecution.runImage(clonePublicDesignJob(running))
+    const latest = this.requireJob(job.id)
+    if (latest.status === 'cancelled' || latest.status === 'interrupted') return
+    if (result.status === 'pending') {
+      this.updateStatus(latest, 'running', { error: result.error })
+      return
+    }
+    if (result.asset.sourceJobId !== job.id) {
+      throw new Error('ComfyUI 返回素材与当前任务不匹配')
+    }
+    await this.commitRegisteredCanvasImageOutput(latest, result.asset)
+  }
+
   /** 取消 queued/running 任务；终态任务保持不变。 */
   async cancel(projectId: string, jobId: string): Promise<DesignJobRecord> {
     const job = this.requireProjectJob(projectId, jobId)
     if (job.terminalState?.status === 'pending') throw new Error('任务已进入结果提交阶段，无法取消')
     if (job.status !== 'queued' && job.status !== 'running') return job
+    if (job.imageModelSnapshot?.executor === 'comfyui') {
+      const mediaExecution = this.dependencies.mediaExecution
+      if (!mediaExecution) throw new Error('ComfyUI 图片执行边界未初始化')
+      const result = await mediaExecution.cancel(projectId, jobId)
+      if (!result.confirmed) throw new Error('远端任务取消尚未确认')
+    }
     if (job.sessionId) await this.dependencies.stopAgent(job.sessionId)
     const latest = this.requireProjectJob(projectId, jobId)
     /** stopAgent 等待期间也可能跨过输出提交点，必须再次以最新 journal 判定。 */
@@ -1017,7 +1121,9 @@ export class DesignJobManager {
 
   /** 恢复单项目 journal，把无法续跑的 running 任务标记为 interrupted。 */
   async recover(projectId: string): Promise<DesignJobRecord[]> {
-    return this.dependencies.runWorkspaceWrite(projectId, async () => {
+    /** 写 lease 释放后才启动的媒体恢复任务，避免输出提交等待自己持有的项目锁。 */
+    const mediaRecoveryIds: string[] = []
+    const recovered = await this.dependencies.runWorkspaceWrite(projectId, async () => {
       const jobs = this.readProjectJobs(projectId)
       this.rebuildCanvasImageIndex(projectId, jobs)
       for (const stored of jobs) {
@@ -1074,6 +1180,10 @@ export class DesignJobManager {
             /** 本次恢复补建的替代任务，必须在返回用户前收敛为可显式重试的终态。 */
             const replacement = this.completeRetryIntent(job)
             if (replacement.status === 'queued' || replacement.status === 'running') {
+              if (replacement.imageModelSnapshot?.executor === 'comfyui' && this.dependencies.mediaExecution) {
+                mediaRecoveryIds.push(replacement.id)
+                continue
+              }
               this.updateStatus(replacement, 'interrupted', {
                 error: replacement.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
               })
@@ -1085,6 +1195,10 @@ export class DesignJobManager {
           continue
         }
         if (job.status === 'queued' || job.status === 'running') {
+          if (job.imageModelSnapshot?.executor === 'comfyui' && this.dependencies.mediaExecution) {
+            mediaRecoveryIds.push(job.id)
+            continue
+          }
           this.updateStatus(job, 'interrupted', {
             error: job.status === 'queued' ? '应用退出，排队任务已中断' : '应用退出，任务已中断',
           })
@@ -1094,6 +1208,13 @@ export class DesignJobManager {
       await this.finalizeRecoveredTerminals(recovered)
       return this.listCachedProjectJobs(projectId).map(clonePublicDesignJob)
     })
+    for (const jobId of mediaRecoveryIds) {
+      this.recoveringMediaJobs.add(jobId)
+      void this.run(jobId).catch((error: unknown) => {
+        this.warn(`[Design Job 恢复] ComfyUI 任务 ${jobId} 对账失败: ${String(error)}`)
+      })
+    }
+    return recovered
   }
 
   /** 启动时恢复全部已登记项目任务。 */
@@ -1115,6 +1236,7 @@ export class DesignJobManager {
       try {
         for (const job of this.readProjectJobs(projectId)) {
           if (job.status === 'running') {
+            if (job.imageModelSnapshot?.executor === 'comfyui' && this.dependencies.mediaExecution) continue
             const interrupted = this.updateStatus(job, 'interrupted', { error: '应用退出，任务已中断' })
             void this.finalizeExecution(interrupted.id)
           }
@@ -1624,6 +1746,19 @@ export class DesignJobManager {
     })
   }
 
+  /** 把媒体服务已登记的素材接入现有 Canvas 候选事务，避免再次导入或复制文件。 */
+  private async commitRegisteredCanvasImageOutput(job: StoredDesignJob, asset: DesignAsset): Promise<void> {
+    await this.dependencies.runWorkspaceWrite(job.projectId, async () => {
+      const latest = this.requireJob(job.id)
+      if (latest.status === 'cancelled' || latest.status === 'interrupted') return
+      /** 已登记素材没有临时导入批次，候选提交与回滚均不再操作文件。 */
+      const batch = [asset] as DesignAssetImportBatch
+      batch.commit = () => undefined
+      batch.rollback = () => undefined
+      await this.commitCanvasImageOutput(job, latest, asset, batch)
+    })
+  }
+
   /** Canvas 图片输出只登记共享 Asset，再采用到独立模块，不创建旧 Design 节点。 */
   private async commitCanvasImageOutput(
     job: StoredDesignJob,
@@ -1903,7 +2038,7 @@ export class DesignJobManager {
         ? { ...previous.generationConstraints }
         : undefined,
       canvasInputReferences: previous.canvasInputReferences?.map((reference) => ({ ...reference })),
-      imageModelSnapshot: previous.imageModelSnapshot ? { ...previous.imageModelSnapshot } : undefined,
+      imageModelSnapshot: previous.imageModelSnapshot ? structuredClone(previous.imageModelSnapshot) : undefined,
       sessionId: undefined,
       outputAssetId: undefined,
       parentAssetId: previous.sourceAssetId,
@@ -2245,9 +2380,29 @@ function isOptionalStableId(value: unknown): value is string | undefined {
 /** 严格校验 journal 中不含凭据的生图模型快照。 */
 function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnapshot {
   if (!isRecord(value)) return false
-  /** 两种 snapshot 共享的公开字段必须严格有效。 */
+  if (value.executor === 'comfyui' && value.source === 'workflow') {
+    if (Object.keys(value).length !== 10
+      || typeof value.name !== 'string' || !value.name.trim() || value.name.length > IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH
+      || typeof value.modelId !== 'string' || !value.modelId.trim() || value.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
+      || !isSafeDesignStableId(value.connectionId)
+      || !isSafeDesignStableId(value.instanceGeneration)
+      || !isSafeDesignStableId(value.workflowId)
+      || !Number.isSafeInteger(value.workflowRevision) || (value.workflowRevision as number) < 1
+      || typeof value.workflowHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.workflowHash)) return false
+    try {
+      parseCanvasImageMediaWorkflow({
+        workflowId: value.workflowId,
+        workflowRevision: value.workflowRevision,
+        connectionId: value.connectionId,
+        inputs: value.inputs,
+      })
+      return true
+    } catch { return false }
+  }
+  /** 三种 snapshot 共享的公开字段必须严格有效。 */
   const baseValid = typeof value.profileId === 'string'
     && value.profileId.length > 0
+    && value.profileId.length <= 160
     && value.profileId === value.profileId.trim()
     && typeof value.name === 'string'
     && value.name.trim().length > 0
@@ -2258,11 +2413,21 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
     && value.modelId === value.modelId.trim()
   if (!baseValid) return false
   if (value.executor === 'nano-banana') return Object.keys(value).length === 4
-  return value.executor === 'openai-images'
-    && typeof value.channelId === 'string'
+  if (value.executor === 'openai-images') return typeof value.channelId === 'string'
     && value.channelId.length > 0
     && value.channelId === value.channelId.trim()
     && Object.keys(value).length === 5
+  return value.executor === 'comfyui'
+    && Object.keys(value).length === 10
+    && isSafeDesignStableId(value.mediaProfileId)
+    && Number.isSafeInteger(value.mediaProfileRevision)
+    && (value.mediaProfileRevision as number) > 0
+    && isSafeDesignStableId(value.connectionId)
+    && isSafeDesignStableId(value.workflowId)
+    && Number.isSafeInteger(value.workflowRevision)
+    && (value.workflowRevision as number) > 0
+    && typeof value.workflowHash === 'string'
+    && /^[a-f0-9]{64}$/.test(value.workflowHash)
 }
 
 /** 严格校验新 journal 的双目标联合。 */
@@ -2383,12 +2548,12 @@ function isCanvasImageInputReference(value: unknown): boolean {
   const hasTargetPort = Object.hasOwn(value, 'targetPort')
   const allowedFields = new Set([
     'nodeId', 'kind', 'revision', 'summary', 'summaryHash', 'assetId',
-    'sourcePort', 'targetPort',
+    'sourcePort', 'targetPort', 'sourceOutputKey', 'sourceArtifactHash',
   ])
   if (Object.keys(value).some((field) => !allowedFields.has(field))) return false
   if (hasSourcePort !== hasTargetPort
     || !isSafeDesignStableId(value.nodeId)
-    || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
+    || !['agent', 'image', 'document', 'webview', 'audio', 'video'].includes(String(value.kind))
     || !Number.isSafeInteger(value.revision)
     || (value.revision as number) < 0
     || typeof value.summary !== 'string'
@@ -2398,7 +2563,15 @@ function isCanvasImageInputReference(value: unknown): boolean {
     || !/^[a-f0-9]{64}$/.test(value.summaryHash)
     || (hasSourcePort && !isCanvasArtifactOutputCapability(value.sourcePort))
     || (hasTargetPort && !isCanvasArtifactInputSlot(value.targetPort))) return false
-  return value.assetId === undefined || isSafeDesignStableId(value.assetId)
+  /** 音视频来源只允许确切已采用的图片角色，不能把原始视频或音轨传给旧生图器。 */
+  if (value.kind === 'audio' || value.kind === 'video') {
+    return isSafeDesignStableId(value.assetId)
+      && value.sourcePort === 'image.asset' && value.targetPort === 'image.reference'
+      && typeof value.sourceOutputKey === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(value.sourceOutputKey)
+      && typeof value.sourceArtifactHash === 'string' && /^[a-f0-9]{64}$/.test(value.sourceArtifactHash)
+  }
+  return !Object.hasOwn(value, 'sourceOutputKey') && !Object.hasOwn(value, 'sourceArtifactHash')
+    && (value.assetId === undefined || isSafeDesignStableId(value.assetId))
 }
 
 /** Design 专属操作必须显式取得旧画布目标，禁止 Canvas 任务误入布局逻辑。 */

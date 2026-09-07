@@ -84,6 +84,7 @@ import type {
   ImportDesignContextDocumentInput,
   ImportDesignAssetsInput,
   ImageGenerationModelCatalogResult,
+  MediaApiModelCatalogResult,
   ListCanvasSessionsInput,
   LoadCanvasInput,
   RebuildCanvasAgentNodeInput,
@@ -104,6 +105,7 @@ import type {
   UnlinkAgentCanvasInput,
   UnlinkAgentCanvasResult,
   SaveImageGenerationModelProfilesInput,
+  SaveMediaApiModelProfilesInput,
   ListDesignContextInput,
   UpsertDesignContextDocumentInput,
   UpdateCanvasSessionInput,
@@ -221,6 +223,8 @@ export interface DesignPreloadApi {
   onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => () => void
   listImageModelProfiles: () => Promise<ImageGenerationModelCatalogResult>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => Promise<ImageGenerationModelCatalogResult>
+  listMediaApiModelProfiles: () => Promise<MediaApiModelCatalogResult>
+  saveMediaApiModelProfiles: (input: SaveMediaApiModelProfilesInput) => Promise<MediaApiModelCatalogResult>
   getImageModelSelection: (projectId: string) => Promise<DesignImageModelSelection>
   setImageModelSelection: (input: UpdateDesignImageModelSelectionInput) => Promise<DesignImageModelSelection>
   onImageModelProfilesChanged: (listener: () => void) => () => void
@@ -570,6 +574,7 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
         expectedConfigRevision: input.expectedConfigRevision,
         prompt: input.prompt,
         selectedModelProfileId: input.selectedModelProfileId,
+        ...(input.mediaWorkflow ? { mediaWorkflow: structuredClone(input.mediaWorkflow) } : {}),
         aspectRatio: input.aspectRatio,
         imageSize: input.imageSize,
         contextMode: input.contextMode,
@@ -834,6 +839,8 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
     },
     listImageModelProfiles: () => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES) as Promise<ImageGenerationModelCatalogResult>,
     saveImageModelProfiles: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, input) as Promise<ImageGenerationModelCatalogResult>,
+    listMediaApiModelProfiles: () => ipc.invoke(DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES) as Promise<MediaApiModelCatalogResult>,
+    saveMediaApiModelProfiles: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES, input) as Promise<MediaApiModelCatalogResult>,
     getImageModelSelection: (projectId) => ipc.invoke(DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, { projectId }) as Promise<DesignImageModelSelection>,
     setImageModelSelection: (input) => ipc.invoke(DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, input) as Promise<DesignImageModelSelection>,
     onImageModelProfilesChanged: (listener) => {

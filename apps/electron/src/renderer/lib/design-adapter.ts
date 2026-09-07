@@ -26,6 +26,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
+  CanvasMediaPreloadApi,
   GetCanvasImageCandidateBatchInput,
   AdoptCanvasImageCandidateBatchInput,
   ReleaseCanvasImageMediaInput,
@@ -82,6 +83,7 @@ import type {
   ListDesignContextInput,
   ListCanvasSessionsInput,
   LoadCanvasInput,
+  MediaPreloadApi,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
   RestoreCanvasNodeInput,
@@ -106,11 +108,18 @@ import type {
   DesignPreloadApi,
 } from '../../preload/design-preload'
 
+/** Canvas 工作区组合使用的 preload 合同。 */
+type CanvasWorkspacePreloadApi =
+  DesignPreloadApi
+  & CanvasMediaPreloadApi
+  & Pick<MediaPreloadApi, 'mediaGetSettings' | 'mediaListAssets' | 'mediaWatchProject' | 'mediaUnwatchProject' | 'onMediaRunChanged'>
+
 /** 测试和非 Electron 环境可注入的 Design API 子集。 */
-export type PartialDesignApi = Partial<DesignPreloadApi>
+export type PartialDesignApi = Partial<CanvasWorkspacePreloadApi>
 
 /** Renderer 组件唯一使用的 Design 适配器。 */
-export interface DesignAdapter {
+export interface DesignAdapter extends CanvasMediaPreloadApi,
+  Pick<MediaPreloadApi, 'mediaGetSettings' | 'mediaListAssets' | 'mediaWatchProject' | 'mediaUnwatchProject' | 'onMediaRunChanged'> {
   /** 加载绑定精确正文 revision 的文本产物。 */
   loadCanvasTextArtifact: (input: CanvasTextArtifactTarget) => Promise<CanvasTextArtifactSnapshot>
   /** 提交新的文档或 WebView 正文修订。 */
@@ -222,6 +231,8 @@ export interface DesignAdapter {
   deleteCanvasSession: (input: DeleteCanvasSessionInput) => ReturnType<DesignPreloadApi['deleteCanvasSession']>
   onCanvasSessionChanged: (listener: (event: CanvasSessionChangeEvent) => void) => ReturnType<DesignPreloadApi['onCanvasSessionChanged']>
   listImageModelProfiles: () => ReturnType<DesignPreloadApi['listImageModelProfiles']>
+  /** 读取图片、音频、视频 API 模型的统一公开目录。 */
+  listMediaApiModelProfiles: () => ReturnType<DesignPreloadApi['listMediaApiModelProfiles']>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => ReturnType<DesignPreloadApi['saveImageModelProfiles']>
   getImageModelSelection: (projectId: string) => ReturnType<DesignPreloadApi['getImageModelSelection']>
   setImageModelSelection: (input: UpdateDesignImageModelSelectionInput) => ReturnType<DesignPreloadApi['setImageModelSelection']>
@@ -253,7 +264,10 @@ export interface DesignAdapter {
 }
 
 /** 获取必需 preload 方法；缺失时给出稳定的集成错误。 */
-function requireMethod<K extends keyof DesignPreloadApi>(api: PartialDesignApi, key: K): DesignPreloadApi[K] {
+function requireMethod<K extends keyof CanvasWorkspacePreloadApi>(
+  api: PartialDesignApi,
+  key: K,
+): CanvasWorkspacePreloadApi[K] {
   const method = api[key]
   if (!method) throw new Error(`Design API 未接通: ${key}`)
   return method
@@ -763,6 +777,20 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       return makeIdempotentAdapterRelease(release)
     },
     onCanvasChanges: subscribeCanvasChanges,
+    canvasMediaLoad: (input) => requireMethod(api, 'canvasMediaLoad')(input),
+    canvasMediaSave: (input) => requireMethod(api, 'canvasMediaSave')(input),
+    canvasMediaRun: (input) => requireMethod(api, 'canvasMediaRun')(input),
+    canvasMediaCancel: (input) => requireMethod(api, 'canvasMediaCancel')(input),
+    canvasMediaAdopt: (input) => requireMethod(api, 'canvasMediaAdopt')(input),
+    canvasMediaReadPreview: (input) => requireMethod(api, 'canvasMediaReadPreview')(input),
+    canvasMediaReleasePreview: (input) => requireMethod(api, 'canvasMediaReleasePreview')(input),
+    canvasMediaExportOutput: (input) => requireMethod(api, 'canvasMediaExportOutput')(input),
+    onCanvasMediaChanged: (listener) => requireMethod(api, 'onCanvasMediaChanged')(listener),
+    mediaGetSettings: () => requireMethod(api, 'mediaGetSettings')(),
+    mediaListAssets: (projectId) => requireMethod(api, 'mediaListAssets')(projectId),
+    mediaWatchProject: (projectId) => requireMethod(api, 'mediaWatchProject')(projectId),
+    mediaUnwatchProject: (projectId) => requireMethod(api, 'mediaUnwatchProject')(projectId),
+    onMediaRunChanged: (listener) => requireMethod(api, 'onMediaRunChanged')(listener),
     listAgentCanvasBindings: (input) => callCanvasApi(
       () => requireMethod(api, 'listAgentCanvasBindings')(input),
       CANVAS_ADAPTER_FALLBACKS.bindingList,
@@ -796,6 +824,7 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     deleteCanvasSession: (input) => requireMethod(api, 'deleteCanvasSession')(input),
     onCanvasSessionChanged: (listener) => requireMethod(api, 'onCanvasSessionChanged')(listener),
     listImageModelProfiles: () => requireMethod(api, 'listImageModelProfiles')(),
+    listMediaApiModelProfiles: () => requireMethod(api, 'listMediaApiModelProfiles')(),
     saveImageModelProfiles: (input) => requireMethod(api, 'saveImageModelProfiles')(input),
     getImageModelSelection: (projectId) => requireMethod(api, 'getImageModelSelection')(projectId),
     setImageModelSelection: (input) => requireMethod(api, 'setImageModelSelection')(input),

@@ -1,11 +1,15 @@
 import * as React from 'react'
 import type {
   CanvasImageAspectRatio,
+  CanvasImageMediaWorkflow,
   CanvasImageSize,
   DesignAsset,
   DesignContextMode,
   DesignJobRecord,
   ImageGenerationModelOption,
+  MediaAssetRecord,
+  MediaConnectionSummary,
+  MediaWorkflowVersion,
 } from '@proma/shared'
 import {
   Check,
@@ -33,9 +37,21 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { DesignTaskDetailsView } from './DesignTaskDetails'
+import {
+  buildCanvasMediaWorkflowValues,
+  CanvasMediaWorkflowForm,
+  createCanvasMediaWorkflowDraft,
+  type CanvasMediaWorkflowInputDraft,
+} from './CanvasMediaWorkbench'
+import type { MediaRunProgressProjection } from './use-media-run-progress'
 
 /** Canvas 图片工作台的模型加载状态。 */
 export type CanvasImageModelLoadState = 'idle' | 'loading' | 'ready' | 'failed'
+
+/** 可选媒体目录未接线时复用稳定空数组，避免表单同步 effect 重复触发。 */
+const EMPTY_MEDIA_WORKFLOWS: MediaWorkflowVersion[] = []
+const EMPTY_MEDIA_CONNECTIONS: MediaConnectionSummary[] = []
+const EMPTY_MEDIA_ASSETS: MediaAssetRecord[] = []
 
 /** Canvas 图片工作台只接收状态与命令，不直接调用 IPC。 */
 export interface CanvasImageWorkbenchProps {
@@ -44,6 +60,16 @@ export interface CanvasImageWorkbenchProps {
   imageModelOptions: ImageGenerationModelOption[]
   imageModelLoadState: CanvasImageModelLoadState
   imageModelError?: string | null
+  /** 图片节点可直接选择的公共工作流版本。 */
+  mediaWorkflows?: MediaWorkflowVersion[]
+  /** 当前可用连接，选择公共工作流时必须由用户显式指定。 */
+  mediaConnections?: MediaConnectionSummary[]
+  /** 当前项目已经授权并登记的媒体素材。 */
+  mediaAssets?: MediaAssetRecord[]
+  /** 独立保存的公共工作流选择；null 表示使用旧模型 profile。 */
+  mediaWorkflow?: CanvasImageMediaWorkflow | null
+  /** 保存公共工作流选择及完整显式输入。 */
+  onMediaWorkflowChange?: (workflow: CanvasImageMediaWorkflow | null) => void
   onDraftChange: (patch: Partial<Omit<CanvasImageModuleDraft, 'dirty'>>) => void
   onGenerate: () => void
   onCancel: (jobId: string) => void
@@ -59,6 +85,170 @@ export interface CanvasImageWorkbenchProps {
   onConfigureModels: () => void
   onRetryLoad: () => void
   onCopyPrompt?: (prompt: string) => void
+  /** 活跃 Comfy Job 的运行阶段按 Job ID 提供，不影响普通图片执行器。 */
+  mediaProgressByJobId?: ReadonlyMap<string, MediaRunProgressProjection>
+}
+
+/** 公共工作流编辑器复用统一动态表单，不允许图片节点引用未提交 Canvas 输出。 */
+function CanvasImageWorkflowEditor({
+  projectId,
+  workflow,
+  workflows,
+  connections,
+  assets,
+  writable,
+  busy,
+  onChange,
+  onValidationChange,
+}: {
+  projectId: string
+  workflow: CanvasImageMediaWorkflow | null
+  workflows: readonly MediaWorkflowVersion[]
+  connections: readonly MediaConnectionSummary[]
+  assets: readonly MediaAssetRecord[]
+  writable: boolean
+  busy: boolean
+  onChange(workflow: CanvasImageMediaWorkflow | null): void
+  onValidationChange(error: string | null): void
+}): React.ReactElement {
+  /** 外部已保存选择只按真实业务基线同步，父组件创建等价对象时不得覆盖本地未完成草稿。 */
+  const externalBaseline = createCanvasImageWorkflowBaseline(workflow, workflows)
+  /** 本地选择允许在必填字段完成前存在，不把不合法 inputs 写入父级配置。 */
+  const [workflowSelection, setWorkflowSelection] = React.useState(
+    workflow ? `${workflow.workflowId}:${workflow.workflowRevision}` : '',
+  )
+  /** 当前连接选择在 workflow 写入前也需要留在本地。 */
+  const [connectionId, setConnectionId] = React.useState(workflow?.connectionId ?? '')
+  /** 当前版本定义驱动完整表单，不按字段 key 猜测语义。 */
+  const selected = workflows.find((item) => `${item.id}:${item.revision}` === workflowSelection)
+  const [inputs, setInputs] = React.useState<CanvasMediaWorkflowInputDraft[]>(
+    selected ? createCanvasMediaWorkflowDraft(selected, workflow?.inputs) : [],
+  )
+  /** 已消费的外部基线用于区分真实配置变化与父组件普通重渲染。 */
+  const consumedBaseline = React.useRef(externalBaseline)
+
+  React.useEffect(() => {
+    if (consumedBaseline.current === externalBaseline) return
+    consumedBaseline.current = externalBaseline
+    setWorkflowSelection(workflow ? `${workflow.workflowId}:${workflow.workflowRevision}` : '')
+    setConnectionId(workflow?.connectionId ?? '')
+    const next = workflow
+      ? workflows.find((item) => item.id === workflow.workflowId && item.revision === workflow.workflowRevision)
+      : undefined
+    setInputs(next ? createCanvasMediaWorkflowDraft(next, workflow?.inputs) : [])
+  }, [externalBaseline, workflow, workflows])
+
+  React.useEffect(() => {
+    onValidationChange(selected ? buildCanvasMediaWorkflowValues(selected, inputs).error : null)
+  }, [inputs, onValidationChange, selected])
+
+  /** 同一 ID 只展示最新公共版本，项目私有草稿不进入图片节点选择器。 */
+  const latestPublic = [...workflows]
+    .filter((item) => item.projectId === null)
+    .sort((left, right) => left.name.localeCompare(right.name) || right.revision - left.revision)
+    .filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index)
+
+  return (
+    <div className="space-y-3 border-t border-border pt-3">
+      <div className="space-y-1.5">
+        <Label className="text-xs">ComfyUI 连接</Label>
+        <Select value={connectionId} disabled={!writable || busy || connections.length === 0} onValueChange={(value) => {
+          setConnectionId(value)
+          if (!selected) return
+          const next = buildCanvasImageMediaWorkflowChange(selected, inputs, value)
+          if (next) onChange(next)
+        }}>
+          <SelectTrigger className="h-8 rounded-sm px-2 text-xs"><SelectValue placeholder="选择连接" /></SelectTrigger>
+          <SelectContent>{connections.map((item) => (
+            <SelectItem key={item.id} value={item.id} disabled={!item.enabled}>{item.name}</SelectItem>
+          ))}</SelectContent>
+        </Select>
+      </div>
+      <div className="space-y-1.5">
+        <Label className="text-xs">公共工作流</Label>
+        <Select value={workflowSelection}
+          disabled={!writable || busy || !connectionId || latestPublic.length === 0}
+          onValueChange={(value) => {
+            const next = latestPublic.find((item) => `${item.id}:${item.revision}` === value)
+            if (!next) return
+            const drafts = createCanvasMediaWorkflowDraft(next)
+            const built = buildCanvasMediaWorkflowValues(next, drafts)
+            setWorkflowSelection(value)
+            setInputs(drafts)
+            onValidationChange(built.error)
+            const change = buildCanvasImageMediaWorkflowChange(next, drafts, connectionId)
+            if (change) onChange(change)
+          }}>
+          <SelectTrigger className="h-8 rounded-sm px-2 text-xs"><SelectValue placeholder="选择工作流" /></SelectTrigger>
+          <SelectContent>{latestPublic.map((item) => (
+            <SelectItem key={`${item.id}:${item.revision}`} value={`${item.id}:${item.revision}`}>{item.name}</SelectItem>
+          ))}</SelectContent>
+        </Select>
+      </div>
+      {selected ? <CanvasMediaWorkflowForm
+        projectId={projectId}
+        inputs={inputs}
+        assets={assets}
+        writable={writable}
+        busy={busy}
+        onInputChange={(index, input) => {
+          const next = inputs.map((item, itemIndex) => itemIndex === index ? input : item)
+          const built = buildCanvasMediaWorkflowValues(selected, next)
+          setInputs(next)
+          onValidationChange(built.error)
+          const change = buildCanvasImageMediaWorkflowChange(selected, next, connectionId)
+          if (change) onChange(change)
+        }}
+      /> : null}
+    </div>
+  )
+}
+
+/**
+ * 生成外部工作流配置的稳定同步基线。
+ * @param workflow 父级已接受的合法工作流配置。
+ * @param workflows 当前可见的工作流版本目录。
+ * @returns 仅在身份、定义、连接或完整输入真实变化时改变的字符串。
+ */
+export function createCanvasImageWorkflowBaseline(
+  workflow: CanvasImageMediaWorkflow | null,
+  workflows: readonly MediaWorkflowVersion[],
+): string {
+  if (!workflow) return 'none'
+  /** 工作流 hash 代表字段合同，revision 相同但目录修复时也需要刷新草稿。 */
+  const workflowHash = workflows.find((item) => (
+    item.id === workflow.workflowId && item.revision === workflow.workflowRevision
+  ))?.hash ?? 'missing'
+  return JSON.stringify([
+    workflow.workflowId,
+    workflow.workflowRevision,
+    workflowHash,
+    workflow.connectionId,
+    workflow.inputs,
+  ])
+}
+
+/**
+ * 仅把完整合法的图片工作流草稿提升为父级配置。
+ * @param workflow 当前选择的公共工作流版本。
+ * @param inputs 本地可包含未完成字段的输入草稿。
+ * @param connectionId 用户明确选择的 ComfyUI 连接。
+ * @returns 合法完整配置；未完成时返回 null 并继续保留本地草稿。
+ */
+export function buildCanvasImageMediaWorkflowChange(
+  workflow: MediaWorkflowVersion,
+  inputs: readonly CanvasMediaWorkflowInputDraft[],
+  connectionId: string,
+): CanvasImageMediaWorkflow | null {
+  if (!connectionId) return null
+  const built = buildCanvasMediaWorkflowValues(workflow, inputs)
+  if (built.error) return null
+  return {
+    workflowId: workflow.id,
+    workflowRevision: workflow.revision,
+    connectionId,
+    inputs: built.values,
+  }
 }
 
 /** 项目上下文三态的稳定用户文案。 */
@@ -193,6 +383,11 @@ export function CanvasImageWorkbench({
   imageModelOptions,
   imageModelLoadState,
   imageModelError,
+  mediaWorkflows = EMPTY_MEDIA_WORKFLOWS,
+  mediaConnections = EMPTY_MEDIA_CONNECTIONS,
+  mediaAssets = EMPTY_MEDIA_ASSETS,
+  mediaWorkflow = null,
+  onMediaWorkflowChange,
   onDraftChange,
   onGenerate,
   onCancel,
@@ -207,9 +402,14 @@ export function CanvasImageWorkbench({
   onConfigureModels,
   onRetryLoad,
   onCopyPrompt,
+  mediaProgressByJobId,
 }: CanvasImageWorkbenchProps): React.ReactElement {
   /** 当前打开的任务详情仅属于本工作台实例。 */
   const [detailsJobId, setDetailsJobId] = React.useState<string | null>(null)
+  /** 动态字段错误直接阻止生成，避免无效工作流进入主进程付费边界。 */
+  const [workflowValidationError, setWorkflowValidationError] = React.useState<string | null>(null)
+  /** 用户切回普通 profile 时重建编辑器，清掉尚未提升到父级的本地工作流草稿。 */
+  const [workflowEditorGeneration, setWorkflowEditorGeneration] = React.useState(0)
 
   if (state.phase === 'idle' || state.phase === 'loading') {
     return (
@@ -245,6 +445,8 @@ export function CanvasImageWorkbench({
   const latestJob = jobs[0]
   /** 运行任务优先代表当前界面状态，避免较新的历史终态遮住正在执行的任务。 */
   const displayedJob = activeJob ?? latestJob
+  /** 只有当前展示 Job 属于 Comfy 执行时才存在运行阶段投影。 */
+  const mediaProgress = displayedJob ? mediaProgressByJobId?.get(displayedJob.id) : undefined
   /** 只有可恢复终态任务显示重试。 */
   const retryableJob = latestJob && ['failed', 'cancelled', 'interrupted'].includes(latestJob.status)
     ? latestJob
@@ -270,14 +472,18 @@ export function CanvasImageWorkbench({
     && state.previewAssetId !== snapshot.config.adoptedAssetId
   /** 可用模型供选择，失效的当前模型仍显示但不可生成。 */
   const selectedModel = imageModelOptions.find((option) => option.profileId === draft.selectedModelProfileId)
+  /** Comfy 工作流尺寸必须显式映射 width/height，auto 无法证明真实输出尺寸。 */
+  const comfyAutoSizeUnsupported = selectedModel?.executor === 'comfyui' && draft.imageSize === 'auto'
   /** 生图需要可写、配置就绪、非运行、提示词和可用模型。 */
   const generationDisabled = !writable
     || Boolean(activeJob)
     || state.saveState === 'saving'
     || state.saveState === 'conflict'
-    || imageModelLoadState !== 'ready'
+    || (!mediaWorkflow && imageModelLoadState !== 'ready')
     || !draft.prompt.trim()
-    || !selectedModel?.available
+    || (!mediaWorkflow && !selectedModel?.available)
+    || Boolean(workflowValidationError)
+    || comfyAutoSizeUnsupported
   /** 图片任务、素材采用和配置保存共用错误通道，主操作区必须始终给出可见反馈。 */
   const operationError = state.error
     ?? (state.saveState === 'failed' || state.saveState === 'conflict'
@@ -334,6 +540,12 @@ export function CanvasImageWorkbench({
           )}
           {displayedJob && JOB_STATUS_MESSAGES[displayedJob.status] && !displayedJob.error && (
             <p className="text-xs text-muted-foreground">{JOB_STATUS_MESSAGES[displayedJob.status]}</p>
+          )}
+          {mediaProgress && (
+            <div className="space-y-0.5 border-l-2 border-primary/40 pl-2 text-xs text-muted-foreground" role="status">
+              <p className="font-medium text-foreground">{mediaProgress.phaseLabel}</p>
+              {mediaProgress.nodeProgressLabel ? <p className="break-words">{mediaProgress.nodeProgressLabel}</p> : null}
+            </div>
           )}
 
           <div className="space-y-2">
@@ -455,9 +667,13 @@ export function CanvasImageWorkbench({
               <div className="h-8 animate-pulse rounded-sm bg-muted" aria-label="正在加载生图模型" />
             ) : (
               <Select
-                value={draft.selectedModelProfileId ?? ''}
+                value={mediaWorkflow ? '' : draft.selectedModelProfileId ?? ''}
                 disabled={!writable || imageModelLoadState !== 'ready' || imageModelOptions.length === 0}
-                onValueChange={(profileId) => onDraftChange({ selectedModelProfileId: profileId })}
+                onValueChange={(profileId) => {
+                  setWorkflowEditorGeneration((value) => value + 1)
+                  onMediaWorkflowChange?.(null)
+                  onDraftChange({ selectedModelProfileId: profileId })
+                }}
               >
                 <SelectTrigger id="canvas-image-model" className="h-8 rounded-sm px-2 text-xs">
                   <SelectValue placeholder="未配置生图模型">
@@ -484,6 +700,27 @@ export function CanvasImageWorkbench({
               </div>
             )}
           </div>
+
+          {onMediaWorkflowChange && (mediaWorkflows.length > 0 || mediaWorkflow) ? (
+            <CanvasImageWorkflowEditor
+              key={workflowEditorGeneration}
+              projectId={snapshot.target.projectId}
+              workflow={mediaWorkflow}
+              workflows={mediaWorkflows}
+              connections={mediaConnections}
+              assets={mediaAssets}
+              writable={writable}
+              busy={Boolean(activeJob) || state.saveState === 'saving'}
+              onValidationChange={setWorkflowValidationError}
+              onChange={(next) => {
+                if (next && !mediaWorkflow) onDraftChange({ selectedModelProfileId: null })
+                onMediaWorkflowChange(next)
+              }}
+            />
+          ) : null}
+          {workflowValidationError ? (
+            <p className="break-words text-xs text-destructive" role="alert">{workflowValidationError}</p>
+          ) : null}
 
           <div className="space-y-1.5">
             <Label className="text-xs">项目上下文</Label>
@@ -544,10 +781,19 @@ export function CanvasImageWorkbench({
               </SelectTrigger>
               <SelectContent>
                 {IMAGE_SIZE_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                  <SelectItem
+                    key={option.value}
+                    value={option.value}
+                    disabled={selectedModel?.executor === 'comfyui' && option.value === 'auto'}
+                  >
+                    {option.label}
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {comfyAutoSizeUnsupported ? (
+              <p className="text-xs text-destructive">ComfyUI 工作流需要选择明确的图片尺寸</p>
+            ) : null}
           </div>
 
           <div className="space-y-1.5">
