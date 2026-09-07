@@ -398,6 +398,31 @@ export function resolveNativeCanvasWorkbenchNodeRect(
   }
 }
 
+/** 当前展开工作台的定位输入；订阅与浮窗一起挂载、释放。 */
+interface NativeCanvasWorkbenchGeometryProps {
+  /** 工作台所属的权威节点。 */
+  node: CanvasNode
+  /** 仅保存逐帧坐标的内存 Store。 */
+  geometryStore: NativeCanvasTransientGeometryStore
+  /** 使用节点与屏幕矩形渲染现有工作台。 */
+  renderWorkbench: NonNullable<NativeCanvasGraphProps['renderWorkbench']>
+}
+
+/** 只让展开的工作台订阅瞬时坐标，避免缩放每帧同步重渲染整个 Graph。 */
+const NativeCanvasWorkbenchGeometry = React.memo(function NativeCanvasWorkbenchGeometry({
+  node,
+  geometryStore,
+  renderWorkbench,
+}: NativeCanvasWorkbenchGeometryProps): React.ReactElement {
+  /** 工作台独立消费最新几何；关闭后不再保留订阅。 */
+  const geometry = React.useSyncExternalStore(
+    geometryStore.subscribe,
+    geometryStore.getSnapshot,
+    geometryStore.getSnapshot,
+  )
+  return <>{renderWorkbench(node, resolveNativeCanvasWorkbenchNodeRect(node, geometry))}</>
+})
+
 /** 将关系与推导出的输入槽转换为用户可理解的菜单标签。 */
 function getNativeCanvasRelationOptionLabel(
   edge: CanvasEdge,
@@ -588,12 +613,6 @@ export function NativeCanvasGraph({
   }
   /** 注入 Store 仅用于复用同一瞬时数据源，不改变默认运行路径。 */
   const geometryStore = transientGeometryStore ?? internalGeometryStoreRef.current
-  /** 仅 Graph 与当前工作台订阅高频几何，不触发 Workspace/Jotai 重渲染。 */
-  const transientGeometry = React.useSyncExternalStore(
-    geometryStore.subscribe,
-    geometryStore.getSnapshot,
-    geometryStore.getSnapshot,
-  )
   /** 仅保留最近一次手工创建的边及所属画布，供用户即时选择语义。 */
   const [pendingRelation, setPendingRelation] = React.useState<PendingNativeCanvasRelation | null>(null)
   /** 只有仍属于当前画布的菜单边才允许进入渲染和提交链路。 */
@@ -917,10 +936,11 @@ export function NativeCanvasGraph({
   }
   /** 工作台与 Flow 同处 Graph 根层，但不进入 ReactFlow transform 容器。 */
   const workbench = workbenchNode && renderWorkbench
-    ? renderWorkbench(
-        workbenchNode,
-        resolveNativeCanvasWorkbenchNodeRect(workbenchNode, transientGeometry),
-      )
+    ? <NativeCanvasWorkbenchGeometry
+        node={workbenchNode}
+        geometryStore={geometryStore}
+        renderWorkbench={renderWorkbench}
+      />
     : null
 
   return (

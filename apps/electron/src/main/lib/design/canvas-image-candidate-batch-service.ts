@@ -21,6 +21,7 @@ import type {
 } from './canvas-image-candidate-batch-store'
 import type { CanvasDependencyStateService } from './canvas-dependency-state-service'
 import { reportCanvasImageDiagnostic } from './canvas-image-diagnostics'
+import { parseCanvasDocument } from './canvas-document-store'
 
 /** 创建批次时每个节点已经固化的基线。 */
 export interface CreateCanvasImageCandidateBatchEntry {
@@ -160,13 +161,37 @@ function deriveStatus(entries: readonly CanvasImageCandidateBatchEntry[]): Canva
   return 'partial'
 }
 
-/** 计算不含 revision 与时间字段的精确 Canvas 图事实。 */
-function createGraphSha256(document: CanvasDocument): string {
+/** 计算图事实哈希；默认沿用 Store 规范字段顺序，normalize=false 仅用于精确匹配旧 intent。 */
+function createGraphSha256(document: CanvasDocument, normalize = true): string {
+  /** 新增 upstreamChange 等字段后，必须按实际落盘 parser 重建后再计算提交证明。 */
+  const canonical = normalize ? parseCanvasDocument(document, document).document : document
   return createHash('sha256').update(JSON.stringify({
-    viewport: document.viewport,
-    nodes: document.nodes,
-    edges: document.edges,
+    viewport: canonical.viewport,
+    nodes: canonical.nodes,
+    edges: canonical.edges,
   })).digest('hex')
+}
+
+/** 校验完整图；旧版新增下游提示可重建原字段顺序，无法精确证明的历史仍拒绝恢复。 */
+function matchesGraphSha256(
+  document: CanvasDocument,
+  intent: CanvasImageCandidateAdoptionIntent,
+  dependencyState: CanvasDependencyStateService,
+): boolean {
+  if (createGraphSha256(document) === intent.expectedGraphSha256
+    || createGraphSha256(document, false) === intent.expectedGraphSha256) return true
+  /** 旧投影只可能在本批直接下游新增提示，不能重排无关节点或改变字段值。 */
+  const downstreamIds = new Set(getInvalidatedDownstreamNodeIds(document, intent, dependencyState))
+  /** 新增提示的来源只能来自本次 producer，混有旧来源时保留规范字段位置。 */
+  const producerIds = new Set(intent.entries.map((entry) => entry.nodeId))
+  /** 只尝试一次有界的旧序列化，不枚举字段排列或放宽整图哈希。 */
+  const legacyNodes = document.nodes.map((node) => {
+    if (!downstreamIds.has(node.id) || node.upstreamChange?.changedAt !== intent.createdAt
+      || !node.upstreamChange.sourceNodeIds.every((id) => producerIds.has(id))) return node
+    const { upstreamChange, ...withoutChange } = node
+    return { ...withoutChange, upstreamChange }
+  })
+  return createGraphSha256({ ...document, nodes: legacyNodes }, false) === intent.expectedGraphSha256
 }
 
 /** 从图关系派生本批需要提示更新的直接下游节点。 */
@@ -377,14 +402,14 @@ export function createCanvasImageCandidateBatchService(
       } catch (error) {
         const reloaded = await dependencies.loadCanvas(intent)
         if (reloaded.revision !== intent.baseCanvasRevision + 1
-          || createGraphSha256(reloaded) !== intent.expectedGraphSha256) {
+          || !matchesGraphSha256(reloaded, intent, dependencies.dependencyState)) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED', { cause: error })
         }
         document = reloaded
       }
     }
     if (document.revision !== intent.baseCanvasRevision + 1
-      || createGraphSha256(document) !== intent.expectedGraphSha256) {
+      || !matchesGraphSha256(document, intent, dependencies.dependencyState)) {
       throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
     }
     if (intent.state === 'prepared' || intent.state === 'modules-committing') {
