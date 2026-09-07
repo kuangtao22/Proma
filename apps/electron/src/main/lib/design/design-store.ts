@@ -20,6 +20,8 @@ import type {
   DesignCanvasDocument,
   DesignCanvasNode,
   DesignGroup,
+  DesignInternalMutation,
+  DesignMediaAssetRecord,
   DesignMutation,
   DesignPoint,
   DesignViewport,
@@ -67,8 +69,17 @@ export interface DesignStore {
   ) => DesignCanvasDocument
 }
 
+/** 主进程内部媒体服务可提交的扩展 Store；Renderer IPC 不持有该方法。 */
+export interface InternalDesignStore extends DesignStore {
+  mutateInternal: (
+    projectId: string,
+    expectedRevision: number,
+    mutations: DesignInternalMutation[],
+  ) => DesignCanvasDocument
+}
+
 /** 生产启动边界可显式初始化 legacy Design 文档的扩展 Store。 */
-export interface InitializableDesignStore extends DesignStore {
+export interface InitializableDesignStore extends InternalDesignStore {
   /** 幂等落盘项目的 legacy Design 空文档或返回既有权威文档。 */
   initialize: (projectId: string) => DesignCanvasDocument
 }
@@ -184,8 +195,50 @@ function isDesignAsset(value: unknown): value is DesignAsset {
     && isFiniteNumber(value.createdAt)
     && isOptionalNonEmptyString(value.sourceSessionId)
     && isOptionalNonEmptyString(value.sourceJobId)
+    && isOptionalNonEmptyString(value.sourceMediaRunId)
+    && isOptionalNonEmptyString(value.sourceMediaOutputKey)
     && isOptionalString(value.prompt)
     && isOptionalNonEmptyString(value.parentAssetId)
+}
+
+/** 校验音视频资产的真实探测元数据与受管相对路径。 */
+function isDesignMediaAsset(value: unknown): value is DesignMediaAssetRecord {
+  if (!isRecord(value)
+    || !isNonEmptyString(value.id)
+    || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value.id)
+    || value.revision !== 1
+    || typeof value.hash !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.hash)
+    || !isNonEmptyString(value.filename)
+    || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$/.test(value.filename)
+    || !isSafeManagedRelativePath(value.relativePath, 'assets')
+    || value.relativePath !== `assets/${value.filename}`
+    || !isFiniteNumber(value.byteSize)
+    || !Number.isSafeInteger(value.byteSize)
+    || value.byteSize < 0
+    || value.byteSize > 128 * 1024 * 1024
+    || !isFiniteNumber(value.createdAt)
+    || !isOptionalNonEmptyString(value.sourceMediaRunId)
+    || !isOptionalNonEmptyString(value.sourceMediaOutputKey)
+    || !isOptionalNonEmptyString(value.sourceSessionId)
+    || !isRecord(value.metadata)) return false
+  if (value.mediaKind === 'audio') {
+    return ['audio/wav', 'audio/mpeg', 'audio/flac', 'audio/ogg', 'audio/mp4', 'audio/webm'].includes(String(value.mediaType))
+      && Number.isSafeInteger(value.metadata.durationMs) && (value.metadata.durationMs as number) > 0
+      && Number.isSafeInteger(value.metadata.sampleRate) && (value.metadata.sampleRate as number) > 0
+      && Number.isSafeInteger(value.metadata.channels) && (value.metadata.channels as number) > 0
+      && isNonEmptyString(value.metadata.codec) && value.metadata.codec.length <= 128
+  }
+  if (value.mediaKind === 'video') {
+    return ['video/mp4', 'video/webm', 'video/x-msvideo', 'video/quicktime'].includes(String(value.mediaType))
+      && Number.isSafeInteger(value.metadata.width) && (value.metadata.width as number) > 0
+      && Number.isSafeInteger(value.metadata.height) && (value.metadata.height as number) > 0
+      && Number.isSafeInteger(value.metadata.durationMs) && (value.metadata.durationMs as number) > 0
+      && (value.metadata.fps === null || (isFiniteNumber(value.metadata.fps) && value.metadata.fps > 0))
+      && isNonEmptyString(value.metadata.codec) && value.metadata.codec.length <= 128
+      && typeof value.metadata.hasAudio === 'boolean'
+  }
+  return false
 }
 
 /** 判断未知节点满足持久化 schema。 */
@@ -309,6 +362,7 @@ export function isDesignCanvasDocument(
     || !isDesignViewport(value.viewport)
     || !Array.isArray(value.assets)
     || !value.assets.every(isDesignAsset)
+    || (value.mediaAssets !== undefined && (!Array.isArray(value.mediaAssets) || !value.mediaAssets.every(isDesignMediaAsset)))
     || !Array.isArray(value.nodes)
     || !value.nodes.every(isDesignNode)
     || !Array.isArray(value.groups)
@@ -320,6 +374,8 @@ export function isDesignCanvasDocument(
 
   /** 已通过单体 schema 校验的素材列表。 */
   const assets = value.assets
+  /** 旧文档缺省为空的音视频资产列表。 */
+  const mediaAssets = value.mediaAssets ?? []
   /** 已通过单体 schema 校验的节点列表。 */
   const nodes = value.nodes
   /** 已通过单体 schema 校验的分组列表。 */
@@ -327,11 +383,14 @@ export function isDesignCanvasDocument(
   /** 已通过单体 schema 校验的批注列表。 */
   const annotations = value.annotations
   if (!hasUniqueIds(assets)
+    || !hasUniqueIds(mediaAssets)
+    || new Set([...assets.map((asset) => asset.id), ...mediaAssets.map((asset) => asset.id)]).size !== assets.length + mediaAssets.length
     || !hasUniqueIds(nodes)
     || !hasUniqueIds(groups)
     || !hasUniqueIds(annotations)
     || !hasUniqueStringField(assets, (asset) => asset.relativePath)
     || !hasUniqueStringField(assets, (asset) => asset.thumbnailRelativePath)
+    || !hasUniqueStringField([...assets.map((asset) => asset.relativePath), ...mediaAssets.map((asset) => asset.relativePath)], (path) => path)
     || !hasAcyclicAssetParents(assets)) {
     return false
   }
@@ -435,6 +494,21 @@ export function applyDesignMutations(
         break
       default:
         throw new Error('DESIGN_MUTATION_INVALID')
+    }
+  }
+  return next
+}
+
+/** 只供主进程媒体服务应用音视频元数据变更。 */
+function applyDesignInternalMutations(document: DesignCanvasDocument, mutations: DesignInternalMutation[]): DesignCanvasDocument {
+  let next = structuredClone(document)
+  for (const mutation of mutations) {
+    if (mutation.type === 'upsert-media-assets') {
+      next.mediaAssets = upsertById(next.mediaAssets ?? [], mutation.assets)
+    } else if (mutation.type === 'remove-media-assets') {
+      next.mediaAssets = (next.mediaAssets ?? []).filter((asset) => !mutation.assetIds.includes(asset.id))
+    } else {
+      throw new Error('DESIGN_MUTATION_INVALID')
     }
   }
   return next
@@ -654,7 +728,7 @@ function readDesignCandidate(
       const value: unknown = JSON.parse(raw)
       return {
         exists: true,
-        document: isDesignCanvasDocument(value, projectId) ? value : null,
+        document: isDesignCanvasDocument(value, projectId) ? { ...value, mediaAssets: value.mediaAssets ?? [] } : null,
       }
     } catch {
       return { exists: true, document: null }
@@ -830,7 +904,21 @@ export function createDesignStore(options: DesignStoreOptions = {}): Initializab
     return next
   }
 
-  return { load, initialize, requireStableAuthoritativeDocument, mutate }
+  /** 内部媒体 mutation 复用同一 revision、校验与原子提交，不进入 Renderer mutation 联合。 */
+  function mutateInternal(projectId: string, expectedRevision: number, mutations: DesignInternalMutation[]): DesignCanvasDocument {
+    const current = requireStableAuthoritativeDocument(projectId)
+    if (expectedRevision !== current.revision) throw new Error(`DESIGN_REVISION_CONFLICT: expected=${expectedRevision}, current=${current.revision}`)
+    if (mutations.length === 0) return current
+    const mutated = applyDesignInternalMutations(current, mutations)
+    const next: DesignCanvasDocument = { ...mutated, revision: current.revision + 1, updatedAt: now() }
+    if (!isDesignCanvasDocument(next, projectId)) throw new Error('DESIGN_DOCUMENT_INVALID')
+    const paths = pathResolver.resolve(projectId)
+    ensureDesignDirectories(paths)
+    writeMutatedDocument(paths, current, next)
+    return next
+  }
+
+  return { load, initialize, requireStableAuthoritativeDocument, mutate, mutateInternal }
 }
 
 /** 生产进程共享的 Design 存储实例。 */

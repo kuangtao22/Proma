@@ -93,17 +93,18 @@ describe('原生 Canvas 顶部工具栏', () => {
     expect(hasElementProperty(elementTree, 'align', 'center')).toBeTrue()
   })
 
-  test('Given 多类型节点基础层 When 读取添加选项 Then 固定五项顺序且仅视频禁用', () => {
+  test('Given 多类型节点基础层 When 读取添加选项 Then 固定六项顺序且全部可用', () => {
     expect(NATIVE_CANVAS_NODE_TYPE_OPTIONS).toEqual([
       { kind: 'agent', label: 'Agent', enabled: true },
       { kind: 'image', label: '生图', enabled: true },
       { kind: 'document', label: '文档', enabled: true },
       { kind: 'webview', label: '原型', enabled: true },
-      { kind: 'video', label: '视频', enabled: false },
+      { kind: 'audio', label: '音频', enabled: true },
+      { kind: 'video', label: '视频', enabled: true },
     ])
   })
 
-  test('Given 四个可用类型 When 选择悬浮菜单选项 Then 分别回传精确节点类型', () => {
+  test('Given 六个可用类型 When 选择悬浮菜单选项 Then 分别回传精确节点类型', () => {
     const selected: CanvasNodeKind[] = []
     const onAddNode = (kind: CanvasNodeKind): void => { selected.push(kind) }
 
@@ -112,19 +113,19 @@ describe('原生 Canvas 顶部工具栏', () => {
       if (option.enabled) handler?.()
     }
 
-    expect(selected).toEqual(['agent', 'image', 'document', 'webview'])
+    expect(selected).toEqual(['agent', 'image', 'document', 'webview', 'audio', 'video'])
   })
 
-  test('Given 视频尚未开放 When 尝试取得选择处理器 Then 不绑定回调', () => {
+  test('Given 视频已经开放 When 取得选择处理器 Then 回传视频类型', () => {
     const onAddNode = mock(() => undefined)
-    const videoOption = NATIVE_CANVAS_NODE_TYPE_OPTIONS[4]
+    const videoOption = NATIVE_CANVAS_NODE_TYPE_OPTIONS[5]
 
     const handler = createNativeCanvasNodeTypeSelectHandler(videoOption, onAddNode)
     handler?.()
 
-    expect(videoOption).toEqual({ kind: 'video', label: '视频', enabled: false })
-    expect(handler).toBeUndefined()
-    expect(onAddNode).not.toHaveBeenCalled()
+    expect(videoOption).toEqual({ kind: 'video', label: '视频', enabled: true })
+    expect(handler).toBeDefined()
+    expect(onAddNode).toHaveBeenCalledWith('video')
   })
 
   test('Given 两个问题节点 When 渲染工具栏 Then 显示可聚焦的问题入口', () => {

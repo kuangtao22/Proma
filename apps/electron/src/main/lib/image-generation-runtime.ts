@@ -12,8 +12,13 @@ export type ResolvedImageGenerationRoute =
       baseUrl: string
       apiKey: string
     }
+  | {
+      executor: 'comfyui'
+      snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'comfyui' }>
+    }
 
 /** 单次图片工具执行前解析任务快照的主进程闭包。 */
 export type ResolveImageGenerationRoute = (
   snapshot: ImageGenerationModelSnapshot,
+  projectId?: string,
 ) => ResolvedImageGenerationRoute

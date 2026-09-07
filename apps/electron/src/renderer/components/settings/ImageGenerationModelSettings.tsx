@@ -8,9 +8,10 @@ import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
 } from '@proma/shared'
-import { Loader2, Plus, Save, Trash2 } from 'lucide-react'
+import { Copy, Loader2, Pencil, Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -54,6 +55,8 @@ export interface ImageGenerationModelSettingsState {
   requestGeneration: number
   requestEditGeneration: number
   editGeneration: number
+  /** 单文件模型目录 CAS revision。 */
+  catalogRevision: number
 }
 
 type ImageGenerationModelSettingsAction =
@@ -167,6 +170,94 @@ function prepareProfilesForSave(
 /** 导出保存整理函数，锁定时间戳与权威 baseline 语义。 */
 export const prepareImageGenerationModelProfilesForSave = prepareProfilesForSave
 
+/** 独立条目目录视图的输入。 */
+interface ImageGenerationModelCatalogViewProps {
+  profiles: ImageGenerationModelProfile[]
+  channelOptions: ImageGenerationChannelOption[]
+  credentialsConfigured: boolean
+  saving: boolean
+  onSaveProfiles: (profiles: ImageGenerationModelProfile[]) => boolean | void | Promise<boolean | void>
+}
+
+/** 为复制操作创建不复用稳定身份的草稿。 */
+function copyImageGenerationModelProfile(
+  profile: ImageGenerationModelProfile,
+  id: string,
+  now: number,
+): ImageGenerationModelProfile {
+  return { ...profile, id, name: `${profile.name} 副本`, createdAt: now, updatedAt: now }
+}
+
+/** 媒体页使用的已保存列表与单条编辑器。 */
+export function ImageGenerationModelCatalogView({
+  profiles,
+  channelOptions,
+  credentialsConfigured,
+  saving,
+  onSaveProfiles,
+}: ImageGenerationModelCatalogViewProps): React.ReactElement {
+  /** 当前单条模型草稿。 */
+  const [draft, setDraft] = React.useState<ImageGenerationModelProfile | null>(null)
+  /** 待删除的模型身份。 */
+  const [deleteId, setDeleteId] = React.useState<string | null>(null)
+  /** 草稿对应的已有模型；缺失表示新增或复制。 */
+  const existing = draft ? profiles.find((profile) => profile.id === draft.id) : undefined
+  /** 单条草稿的可操作错误。 */
+  const draftError = draft ? validateImageGenerationModelProfiles([draft], channelOptions) : null
+  /** Nano Banana 模型是否缺少公共凭据。 */
+  const credentialMissing = draft?.executor === 'nano-banana' && !credentialsConfigured
+
+  /** 保存当前单条草稿并保留其它已保存条目。 */
+  const saveDraft = async (): Promise<void> => {
+    if (!draft || draftError || credentialMissing || saving) return
+    /** 替换已有条目或追加新条目后的完整目录。 */
+    const nextProfiles = existing
+      ? profiles.map((profile) => profile.id === draft.id ? draft : profile)
+      : [...profiles, draft]
+    /** 保存结果；明确失败时保留草稿。 */
+    const saved = await onSaveProfiles(nextProfiles)
+    if (saved !== false) setDraft(null)
+  }
+
+  /** 切换渠道并选择该渠道首个启用模型。 */
+  const changeChannel = (channelId: string): void => {
+    if (!draft || draft.executor !== 'openai-images') return
+    /** 当前渠道。 */
+    const channel = channelOptions.find((candidate) => candidate.channelId === channelId)
+    setDraft({ ...draft, channelId, modelId: channel?.models[0]?.id ?? '' })
+  }
+
+  return (
+    <>
+      <SettingsCard divided className="rounded">
+        {draft ? (
+          <div className="space-y-4 p-4">
+            {(draftError || credentialMissing) && <p role="alert" className="text-xs text-destructive">{credentialMissing ? '请先配置 Nano Banana API Key' : draftError}</p>}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="space-y-1 text-xs font-medium">名称<Input aria-label={`编辑模型名称 ${draft.name || draft.id}`} value={draft.name} maxLength={IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH} disabled={saving} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+              {draft.executor === 'openai-images' ? (
+                <>
+                  <label className="space-y-1 text-xs font-medium">模型配置<Select value={draft.channelId || undefined} disabled={saving} onValueChange={changeChannel}><SelectTrigger><SelectValue placeholder="选择模型配置" /></SelectTrigger><SelectContent>{channelOptions.map((channel) => <SelectItem key={channel.channelId} value={channel.channelId} disabled={!channel.available}>{channel.name}</SelectItem>)}</SelectContent></Select></label>
+                  <label className="space-y-1 text-xs font-medium">模型<Select value={draft.modelId || undefined} disabled={saving || !draft.channelId} onValueChange={(modelId) => setDraft({ ...draft, modelId })}><SelectTrigger><SelectValue placeholder="选择生图模型" /></SelectTrigger><SelectContent>{getImageGenerationProfileModels(draft, channelOptions).map((model) => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent></Select></label>
+                </>
+              ) : <label className="space-y-1 text-xs font-medium">模型 ID<Input value={draft.modelId} maxLength={IMAGE_GENERATION_MODEL_ID_MAX_LENGTH} disabled={saving} onChange={(event) => setDraft({ ...draft, modelId: event.target.value })} /></label>}
+              <div className="flex items-end"><label className="flex h-9 items-center gap-2 text-xs"><Switch checked={draft.enabled} disabled={saving} onCheckedChange={(enabled) => setDraft({ ...draft, enabled })} />启用模型</label></div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-border/60 pt-3"><Button type="button" size="sm" variant="outline" disabled={saving} onClick={() => setDraft(null)}>取消</Button><Button type="button" size="sm" disabled={saving || draftError !== null || credentialMissing} onClick={() => void saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : <Save />}保存模型</Button></div>
+          </div>
+        ) : profiles.length === 0 ? <div className="px-4 py-8 text-center text-xs text-muted-foreground">尚未配置生图模型</div> : profiles.map((profile) => (
+          <div key={profile.id} className="flex min-w-0 items-center gap-3 px-4 py-3">
+            <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{profile.name}</span><span className="block truncate text-xs text-muted-foreground">{profile.modelId} · {profile.executor === 'openai-images' ? 'OpenAI Images' : 'Nano Banana'} · {profile.enabled ? '已启用' : '已停用'}</span></span>
+            <div className="flex items-center gap-1"><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={saving} onClick={() => { const now = Date.now(); setDraft(copyImageGenerationModelProfile(profile, globalThis.crypto.randomUUID(), now)) }}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => setDraft({ ...profile })}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={saving} onClick={() => setDeleteId(profile.id)}><Trash2 /></Button></div>
+          </div>
+        ))}
+        {!draft && <div className="flex justify-end px-4 py-3"><Button type="button" size="sm" variant="outline" disabled={saving} onClick={() => setDraft({ ...createImageGenerationModelProfile(globalThis.crypto.randomUUID(), Date.now()), name: '' })}><Plus />添加模型</Button></div>}
+      </SettingsCard>
+      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) setDeleteId(null) }} title="删除媒体模型？" description="删除后，使用该模型的项目需要重新选择模型。" confirmLabel="删除" loading={saving} variant="destructive" onConfirm={async () => { if (!deleteId) return; const saved = await onSaveProfiles(profiles.filter((profile) => profile.id !== deleteId)); if (saved !== false) setDeleteId(null) }} />
+    </>
+  )
+}
+
 /** 比较两份目录的稳定身份和用户可编辑字段。 */
 function haveSameEditableProfiles(
   left: readonly ImageGenerationModelProfile[],
@@ -202,6 +293,7 @@ export function createImageGenerationModelSettingsState(
     requestGeneration: 0,
     requestEditGeneration: 0,
     editGeneration: 0,
+    catalogRevision: catalog?.revision ?? 0,
   }
 }
 
@@ -242,7 +334,7 @@ export function reduceImageGenerationModelSettingsState(
           externalUpdatePending: action.mode === 'reload' || !haveSameEditableProfiles(
               action.result.profiles,
               state.baselineProfiles,
-            ),
+            ) || (action.result.revision ?? 0) !== state.catalogRevision,
         }
       }
       return {
@@ -255,6 +347,7 @@ export function reduceImageGenerationModelSettingsState(
         loadError: null,
         dirty: false,
         externalUpdatePending: false,
+        catalogRevision: action.result.revision ?? 0,
       }
     }
     case 'request-failed':
@@ -276,6 +369,7 @@ export function reduceImageGenerationModelSettingsState(
         loadError: null,
         requestGeneration: state.requestGeneration + 1,
         requestEditGeneration: state.editGeneration,
+        catalogRevision: action.result.revision ?? 0,
       }
   }
 }
@@ -614,46 +708,47 @@ export function ImageGenerationModelSettings(): React.ReactElement {
   }, [loadProfiles])
 
   /** 本地校验通过后完整替换系统模型目录。 */
-  const handleSave = React.useCallback(async (): Promise<void> => {
+  const handleSave = React.useCallback(async (candidateProfiles = state.profiles): Promise<boolean> => {
     /** 当前编辑态的本地校验错误。 */
-    const validationError = validateImageGenerationModelProfiles(state.profiles, state.channelOptions)
+    const validationError = validateImageGenerationModelProfiles(candidateProfiles, state.channelOptions)
     if (validationError) {
       toast.error(validationError)
-      return
+      return false
     }
     if (
-      (state.profiles.some((profile) => profile.executor === 'nano-banana') && !state.credentialsConfigured)
-      || state.profiles.length === 0
+      (candidateProfiles.some((profile) => profile.executor === 'nano-banana') && !state.credentialsConfigured)
       || !canStartImageGenerationModelSave(
         savingRef.current,
         reloadInProgressRef.current,
       )
-    ) return
+    ) return false
 
     savingRef.current = true
     setSaving(true)
     try {
       /** 提交前去除用户输入两端空白，并统一更新时间。 */
       const normalizedProfiles = prepareProfilesForSave(
-        state.profiles,
+        candidateProfiles,
         state.baselineProfiles,
         Date.now(),
       )
       /** 主进程原子保存后返回的权威目录。 */
-      const result = await window.electronAPI.saveImageModelProfiles({ profiles: normalizedProfiles })
-      if (!mountedRef.current) return
+      const result = await window.electronAPI.saveImageModelProfiles({ profiles: normalizedProfiles, expectedRevision: state.catalogRevision })
+      if (!mountedRef.current) return false
       requestGenerationRef.current += 1
       dispatch({ type: 'save-succeeded', result })
       toast.success('生图模型配置已保存')
+      return true
     } catch (error) {
       if (mountedRef.current) {
         toast.error(error instanceof Error ? error.message : '生图模型配置保存失败')
       }
+      return false
     } finally {
       savingRef.current = false
       if (mountedRef.current) setSaving(false)
     }
-  }, [state.baselineProfiles, state.channelOptions, state.credentialsConfigured, state.profiles])
+  }, [state.baselineProfiles, state.catalogRevision, state.channelOptions, state.credentialsConfigured, state.profiles])
 
   return (
     <SettingsSection
@@ -684,19 +779,17 @@ export function ImageGenerationModelSettings(): React.ReactElement {
           </div>
         </SettingsCard>
       ) : (
-        <ImageGenerationModelSettingsView
+        <div className="space-y-3">
+          {state.externalUpdatePending && <div className="flex flex-wrap items-center justify-between gap-2 border border-border/60 px-3 py-2 text-xs text-muted-foreground"><span>外部配置已更新，当前草稿仍保留。</span><Button type="button" size="sm" variant="outline" disabled={saving || reloadInProgress} onClick={() => void runInteractiveLoad('reload')}>重新加载</Button></div>}
+          {state.loadError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{state.loadError}</span><Button type="button" size="sm" variant="outline" disabled={saving || reloadInProgress} onClick={() => void runInteractiveLoad('background')}>重试</Button></div>}
+        <ImageGenerationModelCatalogView
           profiles={state.profiles}
           channelOptions={state.channelOptions}
           credentialsConfigured={state.credentialsConfigured}
           saving={saving}
-          reloadInProgress={reloadInProgress}
-          externalUpdatePending={state.externalUpdatePending}
-          loadError={state.loadError}
-          onProfilesChange={(profiles) => dispatch({ type: 'profiles-edited', profiles })}
-          onSave={() => { void handleSave() }}
-          onReload={() => { void runInteractiveLoad('reload') }}
-          onRetry={() => { void runInteractiveLoad('background') }}
+          onSaveProfiles={(profiles) => handleSave(profiles)}
         />
+        </div>
       )}
     </SettingsSection>
   )

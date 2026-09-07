@@ -24,6 +24,8 @@ function listSupportedCapabilities(node: CanvasNode): CanvasNodeCapability[] {
   switch (node.kind) {
     case 'agent': return ['read', 'update-config', 'run']
     case 'image': return ['read', 'update-config', 'run', 'review-required']
+    case 'audio':
+    case 'video': return ['read', 'update-config', 'run', 'review-required']
     case 'document':
     case 'webview': return ['read', 'update-content']
   }

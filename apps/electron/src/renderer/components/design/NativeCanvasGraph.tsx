@@ -48,10 +48,12 @@ import {
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
+import type { MediaRunProgressProjection } from './use-media-run-progress'
 import type {
   NativeCanvasDocumentFlowNode,
   NativeCanvasFlowNode,
   NativeCanvasImageFlowNode,
+  NativeCanvasMediaFlowNode,
   NativeCanvasWebviewFlowNode,
 } from './native-canvas-model'
 
@@ -62,6 +64,11 @@ function NativeCanvasAgentNode(props: NodeProps<Extract<NativeCanvasFlowNode, { 
 
 /** 渲染生图折叠节点，不读取图片历史。 */
 function NativeCanvasImageNode({ data, selected }: NodeProps<NativeCanvasImageFlowNode>): React.ReactElement {
+  return <CanvasNodeCard {...data} selected={selected} />
+}
+
+/** 渲染通用音视频折叠节点，重媒体只在工作台按需读取。 */
+function NativeCanvasMediaNode({ data, selected }: NodeProps<NativeCanvasMediaFlowNode>): React.ReactElement {
   return <CanvasNodeCard {...data} selected={selected} />
 }
 
@@ -101,6 +108,7 @@ function NativeCanvasWebviewNode({ data, selected }: NodeProps<NativeCanvasWebvi
 export const NATIVE_CANVAS_NODE_TYPES = {
   canvasAgent: NativeCanvasAgentNode,
   canvasImage: NativeCanvasImageNode,
+  canvasMedia: NativeCanvasMediaNode,
   canvasDocument: NativeCanvasDocumentNode,
   canvasWebview: NativeCanvasWebviewNode,
 } satisfies NodeTypes
@@ -294,6 +302,8 @@ export interface NativeCanvasGraphProps {
   runningSessionIds?: ReadonlySet<string>
   /** 按节点 ID 聚合的结构化活动态，优先于节点展示文案。 */
   nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
+  /** 按图片节点 ID 聚合的 Comfy 运行阶段与当前节点采样计数。 */
+  mediaProgressByNodeId?: ReadonlyMap<string, MediaRunProgressProjection>
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   /** WebView 卡片仅请求受管静态 WebP，不在折叠态加载 HTML。 */
@@ -397,6 +407,7 @@ export function NativeCanvasGraph({
   nodeIssues = EMPTY_CANVAS_NODE_ISSUES,
   runningSessionIds = EMPTY_RUNNING_SESSION_IDS,
   nodeActivityStates = EMPTY_NODE_ACTIVITY_STATES,
+  mediaProgressByNodeId,
   imagePreviews,
   loadCanvasWebviewPreview,
   pendingWebviewDeviceNodeIds,
@@ -454,6 +465,7 @@ export function NativeCanvasGraph({
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
+      mediaProgressByNodeId,
       imagePreviews,
       loadCanvasWebviewPreview,
       pendingWebviewDeviceNodeIds,
@@ -507,6 +519,7 @@ export function NativeCanvasGraph({
       nodeIssues,
       runningSessionIds,
       nodeActivityStates,
+      mediaProgressByNodeId,
       imagePreviews,
       loadCanvasWebviewPreview,
       pendingWebviewDeviceNodeIds,
@@ -521,7 +534,7 @@ export function NativeCanvasGraph({
     }))
     flowNodesRef.current = nextNodes
     setFlowNodes(nextNodes)
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, imagePreviews, loadCanvasWebviewPreview, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, imagePreviews, loadCanvasWebviewPreview, mediaProgressByNodeId, nodeActivityStates, nodeIssues, onCreateChild, onReferenceNode, onWebviewDevicePresetChange, pendingWebviewDeviceNodeIds, runningSessionIds, workbenchNodeChange, writable])
 
   React.useEffect(() => {
     /** 几何 Store 复用 reducer 结果，手势中不会被迟到的远端 viewport 覆盖。 */

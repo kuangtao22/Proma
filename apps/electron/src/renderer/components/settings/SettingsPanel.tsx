@@ -26,6 +26,7 @@ import {
   Mic,
   HardDriveDownload,
   HardDrive,
+  Images,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ShortcutKeycaps } from "@/components/shortcuts/ShortcutKeycaps";
@@ -35,6 +36,7 @@ import {
   settingsCloseRequestedAtom,
   settingsOpenAtom,
   settingsPendingSessionNavigationAtom,
+  mediaSettingsFocusAtom,
   type SettingsSessionNavigation,
 } from "@/atoms/settings-tab";
 import type { SettingsTab } from "@/atoms/settings-tab";
@@ -66,6 +68,7 @@ import { VoiceInputSettings } from "./VoiceInputSettings";
 import { PathManagementSettings } from "./PathManagementSettings";
 import { StorageSettings } from "./StorageSettings";
 import { OnboardingSettings } from "./OnboardingSettings";
+import { MediaSettings } from "./MediaSettings";
 import { useOpenSession } from '@/hooks/useOpenSession'
 
 /** 设置 Tab 定义 */
@@ -79,6 +82,7 @@ interface TabItem {
 const BASE_TABS: TabItem[] = [
   { id: "general", label: "通用设置", icon: <Settings size={16} /> },
   { id: "channels", label: "模型配置", icon: <Radio size={16} /> },
+  { id: "media", label: "媒体生成", icon: <Images size={16} /> },
   { id: "vision-relay", label: "视觉助手", icon: <Eye size={16} /> },
   { id: "prompts", label: "提示词管理", icon: <BookOpen size={16} /> },
   { id: "proxy", label: "代理设置", icon: <Globe size={16} /> },
@@ -125,6 +129,8 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <GeneralSettings />;
     case "channels":
       return <ChannelSettings />;
+    case "media":
+      return <MediaSettings />;
     case "vision-relay":
       return <VisionRelaySettings />;
     case "prompts":
@@ -171,6 +177,7 @@ export function SettingsPanel({
   const setAutomationForm = useSetAtom(automationFormAtom);
   const hasUpdate = useAtomValue(hasUpdateAtom);
   const hasEnvironmentIssues = useAtomValue(hasEnvironmentIssuesAtom);
+  const mediaSettingsFocus = useAtomValue(mediaSettingsFocusAtom);
   const openSession = useOpenSession()
   /** 统一的退出拦截对话框状态 */
   type PendingAction =
@@ -180,6 +187,16 @@ export function SettingsPanel({
     | null
   const [pendingAction, setPendingAction] = React.useState<PendingAction>(null)
   const showNavDialog = pendingAction !== null
+
+  // 旧 Design 入口仍先写入 channels；发现旧 image-models focus 后立即转到统一媒体页。
+  React.useEffect(() => {
+    if (mediaSettingsFocus !== 'image-models' || activeTab === 'media') return
+    if (activeTab === 'channels' && channelFormDirty) {
+      setPendingAction({ type: 'tab', tabId: 'media' })
+      return
+    }
+    setActiveTab('media')
+  }, [activeTab, channelFormDirty, mediaSettingsFocus, setActiveTab])
 
   /** 执行待处理的操作 */
   const executePendingAction = (): void => {

@@ -290,6 +290,8 @@ const AgentHistoryQuoteClickContext = React.createContext<((quote: QuotedSelecti
 const CANVAS_NODE_REFERENCE_TYPE_LABELS: Record<CanvasNodeKind, string> = {
   agent: 'Agent',
   image: '生图',
+  audio: '音频',
+  video: '视频',
   document: '文档',
   webview: '原型',
 }

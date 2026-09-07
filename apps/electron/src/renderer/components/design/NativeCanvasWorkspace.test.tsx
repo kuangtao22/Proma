@@ -46,7 +46,17 @@ import {
   designProjectStatesAtom,
 } from '@/atoms/design-atoms'
 import { CanvasPublicOperationError } from '@/lib/design-adapter'
-import {
+/** Workspace 单测不验证模型品牌资源，避免 Bun 直接解析 Vite 位图导入。 */
+mock.module('@/lib/model-logo', () => ({
+  DefaultLogo: 'model-logo.png',
+  PromaLogo: 'proma-logo.png',
+  getChannelLogo: () => 'model-logo.png',
+  getModelLogo: () => 'model-logo.png',
+  getProviderLogo: () => 'model-logo.png',
+  resolveModelDisplayName: (modelId: string) => modelId,
+  resolveModelProvider: () => 'unknown',
+}))
+const {
   NATIVE_CANVAS_COMMIT_UNCERTAIN_CODE,
   NATIVE_CANVAS_RECOVERY_REQUIRED_CODE,
   NATIVE_CANVAS_REVISION_CONFLICT_CODE,
@@ -90,7 +100,7 @@ import {
   createNativeCanvasJobActivityController,
   commitNativeCanvasArrangeMutation,
   listVisibleNativeCanvasNodeIds,
-} from './NativeCanvasWorkspace'
+} = await import('./NativeCanvasWorkspace')
 import type {
   CanvasAgentNodeCommandState,
   NativeCanvasScheduler,
@@ -688,6 +698,15 @@ describe('Canvas 生图工作台接入', () => {
             }),
             onImageModelProfilesChanged: () => () => {},
             onImageModelSelectionChanged: () => () => {},
+            mediaGetSettings: async () => ({
+              schemaVersion: 2,
+              revision: 0,
+              connections: [],
+              workflows: [],
+              profiles: [],
+              archivedWorkflowIds: [],
+            }),
+            mediaListAssets: async () => [],
             exportCanvasArtifact: async () => undefined,
           }}
           flowRenderer={(props) => <>{props.nodes[0]?.data.workbench}</>}

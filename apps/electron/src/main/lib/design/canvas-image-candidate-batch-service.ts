@@ -21,6 +21,7 @@ import type {
 } from './canvas-image-candidate-batch-store'
 import type { CanvasDependencyStateService } from './canvas-dependency-state-service'
 import { reportCanvasImageDiagnostic } from './canvas-image-diagnostics'
+import { parseCanvasDocument } from './canvas-document-store'
 
 /** 创建批次时每个节点已经固化的基线。 */
 export interface CreateCanvasImageCandidateBatchEntry {
@@ -110,6 +111,8 @@ export interface CanvasImageCandidateBatchServiceDependencies {
   validateCandidate?: (batch: CanvasImageCandidateBatch, entry: CanvasImageCandidateBatchEntry) => Promise<void>
   now?: () => number
   randomUUID?: () => string
+  /** 正式采用事务完成后的非阻塞通知，仅供原已授权工作流恢复。 */
+  onAdopted?: (target: CanvasTarget) => void
 }
 
 /** 候选批次业务服务公开窄接口。 */
@@ -127,10 +130,19 @@ export interface CanvasImageCandidateBatchService {
   retryJobLocked(input: RetryCanvasImageCandidateJobInput): Promise<string>
   /** 调用方已持有同一 Canvas 串行权时采用历史素材，避免重新获取非重入锁。 */
   adoptExistingAssetLocked(input: AdoptExistingCanvasImageAssetInput): Promise<CanvasImageCandidateBatch>
-  adopt(input: AdoptCanvasImageCandidateBatchInput): Promise<CanvasImageCandidateBatch>
+  adopt(input: AdoptCanvasImageCandidateBatchInput, expectedCandidateHash?: string, validateAccess?: () => void): Promise<CanvasImageCandidateBatch>
   abandon(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   /** 恢复目标 Canvas 中所有未完成整批采用 intent。 */
   reconcile(input: CanvasTarget): Promise<void>
+}
+
+/** 生成候选选择指纹；只绑定真实版本身份，采用状态变化不使同一请求失去幂等性。 */
+export function createCanvasImageCandidateHash(batch: CanvasImageCandidateBatch): string {
+  return createHash('sha256').update(JSON.stringify([
+    'canvas-image-candidates', batch.projectId, batch.canvasId, batch.batchId,
+    batch.entries.map((entry) => [entry.nodeId, entry.imageModuleId, entry.jobId,
+      entry.candidateAssetId, entry.initialConfigRevision, entry.initialAdoptedAssetId]),
+  ])).digest('hex')
 }
 
 /** 按条目事实派生活跃批次状态。 */
@@ -140,13 +152,33 @@ function deriveStatus(entries: readonly CanvasImageCandidateBatchEntry[]): Canva
   return 'partial'
 }
 
-/** 计算不含 revision 与时间字段的精确 Canvas 图事实。 */
-function createGraphSha256(document: CanvasDocument): string {
+/** 图哈希复用 Store 规范化；原字段顺序只用于证明历史 intent。 */
+function createGraphSha256(document: CanvasDocument, normalize = true): string {
+  const canonical = normalize ? parseCanvasDocument(document, document).document : document
   return createHash('sha256').update(JSON.stringify({
-    viewport: document.viewport,
-    nodes: document.nodes,
-    edges: document.edges,
+    viewport: canonical.viewport,
+    nodes: canonical.nodes,
+    edges: canonical.edges,
   })).digest('hex')
+}
+
+/** 仅重建本批新增下游提示的旧字段位置，始终以完整图哈希证明提交。 */
+function matchesGraphSha256(
+  document: CanvasDocument,
+  intent: CanvasImageCandidateAdoptionIntent,
+  dependencyState: CanvasDependencyStateService,
+): boolean {
+  if (createGraphSha256(document) === intent.expectedGraphSha256
+    || createGraphSha256(document, false) === intent.expectedGraphSha256) return true
+  const downstreamIds = new Set(getInvalidatedDownstreamNodeIds(document, intent, dependencyState))
+  const producerIds = new Set(intent.entries.map((entry) => entry.nodeId))
+  const legacyNodes = document.nodes.map((node) => {
+    if (!downstreamIds.has(node.id) || node.upstreamChange?.changedAt !== intent.createdAt
+      || !node.upstreamChange.sourceNodeIds.every((id) => producerIds.has(id))) return node
+    const { upstreamChange, ...withoutChange } = node
+    return { ...withoutChange, upstreamChange }
+  })
+  return createGraphSha256({ ...document, nodes: legacyNodes }, false) === intent.expectedGraphSha256
 }
 
 /** 从图关系派生本批需要提示更新的直接下游节点。 */
@@ -357,14 +389,14 @@ export function createCanvasImageCandidateBatchService(
       } catch (error) {
         const reloaded = await dependencies.loadCanvas(intent)
         if (reloaded.revision !== intent.baseCanvasRevision + 1
-          || createGraphSha256(reloaded) !== intent.expectedGraphSha256) {
+          || !matchesGraphSha256(reloaded, intent, dependencies.dependencyState)) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED', { cause: error })
         }
         document = reloaded
       }
     }
     if (document.revision !== intent.baseCanvasRevision + 1
-      || createGraphSha256(document) !== intent.expectedGraphSha256) {
+      || !matchesGraphSha256(document, intent, dependencies.dependencyState)) {
       throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
     }
     if (intent.state === 'prepared' || intent.state === 'modules-committing') {
@@ -427,6 +459,8 @@ export function createCanvasImageCandidateBatchService(
         updatedAt: now(),
       })
     }
+    try { dependencies.onAdopted?.({ projectId: batch.projectId, canvasId: batch.canvasId }) }
+    catch { reportCanvasImageDiagnostic('CANVAS_IMAGE_BATCH_LISTENER_FAILED') }
     return batch
   }
 
@@ -527,9 +561,20 @@ export function createCanvasImageCandidateBatchService(
   /** 在已持锁边界内采用一个已验证候选批次。 */
   const adoptBatchLocked = async (
     input: AdoptCanvasImageCandidateBatchInput,
+    expectedCandidateHash?: string,
+    validateAccess?: () => void,
   ): Promise<CanvasImageCandidateBatch> => {
+    validateAccess?.()
     await reconcileLocked(input)
     const batch = await dependencies.store.load(input, input.batchId)
+    validateAccess?.()
+    if (expectedCandidateHash !== undefined) {
+      if (!/^[a-f0-9]{64}$/.test(expectedCandidateHash)
+        || createCanvasImageCandidateHash(batch) !== expectedCandidateHash) {
+        throw new Error('CANVAS_IMAGE_CANDIDATES_CHANGED')
+      }
+      if (batch.status === 'adopted' && batch.adoption?.mode === input.mode) return batch
+    }
     if (batch.status === 'adopted' || batch.status === 'abandoned') {
       throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
     }
@@ -549,6 +594,7 @@ export function createCanvasImageCandidateBatchService(
         throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
       }
       await dependencies.validateCandidate?.(batch, entry)
+      validateAccess?.()
     }
     /** 图基线与目标节点身份同样在任何模块写入前固化。 */
     const document = await dependencies.loadCanvas(input)
@@ -578,6 +624,8 @@ export function createCanvasImageCandidateBatchService(
     }
     /** 最终哈希在 intent 首次可见前完成，恢复无需重新猜测目标图。 */
     const projection = createAdoptionProjection(document, draftIntent, dependencies.dependencyState)
+    /** 锁等待或异步预检期间撤权时，不创建新的采用事务。 */
+    validateAccess?.()
     const intent = await dependencies.store.saveAdoptionIntent({
       ...draftIntent,
       expectedGraphSha256: createGraphSha256(projection.expectedDocument),
@@ -742,9 +790,9 @@ export function createCanvasImageCandidateBatchService(
         return saved
       })
     },
-    adopt: async (rawInput) => {
+    adopt: async (rawInput, expectedCandidateHash, validateAccess) => {
       const input = parseAdoptCanvasImageCandidateBatchInput(rawInput)
-      return dependencies.runExclusive(input, () => adoptBatchLocked(input))
+      return dependencies.runExclusive(input, () => adoptBatchLocked(input, expectedCandidateHash, validateAccess))
     },
     abandon: async (rawInput) => {
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)

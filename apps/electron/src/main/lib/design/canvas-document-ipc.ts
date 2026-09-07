@@ -86,6 +86,7 @@ import {
   type CanvasImageRunService,
 } from './canvas-image-run-service'
 import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
+import type { CanvasMediaService } from './canvas-media-service'
 import { parseCanvasDocument } from './canvas-document-store'
 import type { CanvasDocumentStore } from './canvas-document-store'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
@@ -214,6 +215,10 @@ export interface CanvasDocumentIpcOptions {
   imageRunService?: CanvasImageRunService
   /** 普通 Agent 工作流复用唯一主进程调度服务。 */
   workflowExecution?: Pick<CanvasWorkflowExecutionService, 'execute'>
+    & Partial<Pick<CanvasWorkflowExecutionService, 'resume' | 'cancel' | 'get' | 'list' | 'registerCreatedSuccessor' | 'recordCreatedSuccessorRegistrationFailure'>>
+  /** Agent Canvas 音视频工具复用生产进程唯一媒体服务。 */
+  canvasMedia?: Pick<CanvasMediaService, 'load' | 'save' | 'run' | 'attachCompletedRun' | 'cancel' | 'adopt'>
+    & Partial<Pick<CanvasMediaService, 'attachImportedAssets'>>
   /** 图片模块只读取 Design 素材公开元数据并创建目录媒体授权。 */
   imageAssets: {
     list: (projectId: string) => DesignAsset[]
@@ -242,6 +247,8 @@ export interface CanvasDocumentIpcOptions {
   getProjectReadOnlyReason: (projectId: string) => string | undefined
   /** 生产普通 Agent 工具复用的唯一授权与关联 facade。 */
   toolAccess?: CanvasToolAccessFacade
+  /** 两类交互 Agent 的共享媒体工具由生产 Host 注入。 */
+  mediaTools?: (context: CanvasToolRunContext) => CanvasToolRun
 }
 
 /** Registry 中可执行统一导出的内部适配器。 */
@@ -649,9 +656,12 @@ function parseImageJobControlInput(value: unknown) {
 
 /** 在共享保存解析器读取值前先确认全部字段均为自有数据属性。 */
 function parseImageSaveInput(value: unknown): SaveCanvasImageModuleInput {
+  /** 公共工作流选择是可选字段，存在时纳入 exact-key 边界。 */
+  const hasMediaWorkflow = isRecord(value) && Object.hasOwn(value, 'mediaWorkflow')
   const keys = [
     'projectId', 'canvasId', 'nodeId', 'imageModuleId', 'expectedConfigRevision',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
+    ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
   ] as const
   if (!isRecord(value) || !hasExactDataKeys(value, keys)) throw new Error('CANVAS_IMAGE_SAVE_INPUT_INVALID')
   return parseSaveCanvasImageModuleInput(value)
@@ -1141,7 +1151,7 @@ export function registerCanvasDocumentIpcHandlers(
       /** 统一 run 继续创建并启动现有 Design Job，不引入第二套执行器。 */
       const config = await options.imageModules.load(target)
       assertOwnedImageConfig(config, target)
-      if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+      if (!config.selectedModelProfileId && !config.mediaWorkflow) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
       const job = await options.imageJobs.createCanvasImage({
         projectId: target.projectId,
         target: {
@@ -1151,7 +1161,9 @@ export function registerCanvasDocumentIpcHandlers(
         action: config.adoptedAssetId ? 'edit' : 'generate',
         prompt: config.prompt,
         contextMode: config.contextMode,
-        imageModelProfileId: config.selectedModelProfileId,
+        ...(config.mediaWorkflow
+          ? { mediaWorkflow: structuredClone(config.mediaWorkflow) }
+          : { imageModelProfileId: config.selectedModelProfileId! }),
         generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
         canvasImageConfigRevision: config.revision,
         ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
@@ -1490,8 +1502,22 @@ export function registerCanvasDocumentIpcHandlers(
           agentOutputs: options.agent.outputs,
           agentConfigs: options.agent.configs,
           agentExecution: options.agent.execution,
-          workflowExecution: options.workflowExecution ?? {
-            execute: async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') },
+          workflowExecution: {
+            execute: options.workflowExecution?.execute
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            resume: options.workflowExecution?.resume
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            cancel: options.workflowExecution?.cancel
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            get: options.workflowExecution?.get
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            list: options.workflowExecution?.list
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            registerCreatedSuccessor: options.workflowExecution?.registerCreatedSuccessor
+              ?? (async () => { throw new Error('CANVAS_WORKFLOW_UNAVAILABLE') }),
+            ...(options.workflowExecution?.recordCreatedSuccessorRegistrationFailure
+              ? { recordCreatedSuccessorRegistrationFailure: options.workflowExecution.recordCreatedSuccessorRegistrationFailure }
+              : {}),
           },
           artifacts: options.artifacts,
           importImage: options.importImage,
@@ -1511,6 +1537,16 @@ export function registerCanvasDocumentIpcHandlers(
           batch,
           readNodeContent: readCanvasNodeContent,
           imageRuns: imageRunService,
+          imageCandidates: options.imageCandidateBatches,
+          canvasMedia: options.canvasMedia ?? {
+            load: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+            save: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+            run: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+            attachCompletedRun: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+            cancel: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+            adopt: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
+          },
+          mediaTools: options.mediaTools,
         }, context),
         documents: options.store,
         agentConfigs: options.agent.configs,
@@ -1783,7 +1819,7 @@ export function registerCanvasDocumentIpcHandlers(
         const config = await options.imageModules.load(input)
         assertOwnedImageConfig(config, input)
         if (config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_IMAGE_REVISION_CONFLICT')
-        if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+        if (!config.selectedModelProfileId && !config.mediaWorkflow) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
         /** 任务输入先完成无写入预检，再分配任何 journal 或候选批次身份。 */
         const jobInput: CreateDesignJobInput = {
           projectId: input.projectId,
@@ -1794,7 +1830,9 @@ export function registerCanvasDocumentIpcHandlers(
           action: config.adoptedAssetId ? 'edit' : 'generate',
           prompt: config.prompt,
           contextMode: config.contextMode,
-          imageModelProfileId: config.selectedModelProfileId,
+          ...(config.mediaWorkflow
+            ? { mediaWorkflow: structuredClone(config.mediaWorkflow) }
+            : { imageModelProfileId: config.selectedModelProfileId! }),
           generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
           canvasImageConfigRevision: config.revision,
           ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),

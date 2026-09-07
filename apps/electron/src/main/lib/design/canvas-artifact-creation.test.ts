@@ -149,6 +149,26 @@ describe('Canvas Agent 产物原子创建服务', () => {
       })
   })
 
+  test('Given Agent 创建音频媒体节点 When 提交 Then 准备空媒体模块并持久化稳定 mediaModuleId', async () => {
+    const fixture = createFixture()
+
+    const result = await fixture.service.create({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'audio',
+      title: '旁白',
+      content: '该字段不会写入媒体模块',
+      sourceNodeId: 'requirements-1',
+      relation: 'depends-on',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-audio-1' },
+    })
+
+    expect(result).toMatchObject({ artifactType: 'audio', revision: 4 })
+    expect(fixture.prepared).toEqual([expect.objectContaining({ kind: 'audio', content: '' })])
+    expect(getBatchOperations(fixture.batches[0]!).find((operation) => operation.type === 'upsert-nodes'))
+      .toMatchObject({ nodes: [{ kind: 'audio', mediaModuleId: expect.stringMatching(/^artifact-content-/) }] })
+  })
+
   test('Given 来源与 relation 仅提供一项 When 创建 Then 在准备内容前拒绝', async () => {
     const fixture = createFixture()
     /** 创建调用的公共字段。 */

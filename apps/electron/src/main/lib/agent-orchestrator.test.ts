@@ -84,6 +84,21 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(queueBody).toContain("text: rawText ?? text")
   })
 
+  test('Given Host 已固化图片音视频附件 When 普通发送或 queue-now Then JSONL 保留结构化媒体字段', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const persistStart = source.indexOf('  private persistUserMessage(')
+    const persistEnd = source.indexOf('\n  }', persistStart) + 4
+    const persistBody = source.slice(persistStart, persistEnd)
+    const queueStart = source.indexOf('  async queueMessage(')
+    const queueEnd = source.indexOf('\n  }\n}', queueStart)
+    const queueBody = source.slice(queueStart, queueEnd)
+
+    expect(persistBody).toContain('mediaAttachments?: AgentMediaAttachment[]')
+    expect(persistBody).toContain('...(mediaAttachments?.length ? { mediaAttachments } : {})')
+    expect(queueBody).toContain('mediaAttachments?: AgentMediaAttachment[]')
+    expect(queueBody.match(/\.\.\.\(mediaAttachments\?\.length \? \{ mediaAttachments \} : \{\}\)/g)?.length).toBeGreaterThanOrEqual(2)
+  })
+
   test('Given 单次运行注入可信生图路由 When 构建 Pi 工具 Then 仅经运行扩展传入内置工具上下文', () => {
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
     const sendStart = source.indexOf('  async sendMessage(')

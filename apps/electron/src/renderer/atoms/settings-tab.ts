@@ -14,9 +14,10 @@ import { atom } from 'jotai'
 import type { TabType } from './tab-atoms'
 
 /** `migration` 继续作为“路径与迁移”的稳定 id，避免已有导航状态失效。 */
-export type SettingsTab = 'general' | 'channels' | 'vision-relay' | 'proxy' | 'appearance' | 'about' | 'onboarding' | 'prompts' | 'tools' | 'bots' | 'shortcuts' | 'voice-input' | 'migration' | 'storage'
+export type SettingsTab = 'general' | 'channels' | 'media' | 'vision-relay' | 'proxy' | 'appearance' | 'about' | 'onboarding' | 'prompts' | 'tools' | 'bots' | 'shortcuts' | 'voice-input' | 'migration' | 'storage'
 export type ToolSettingsFocus = 'web-search' | 'nano-banana' | 'custom-tools'
-export type ChannelSettingsFocus = 'image-models'
+export type MediaSettingsFocus = 'image-models'
+export type ChannelSettingsFocus = MediaSettingsFocus
 
 /** 当前设置标签页（不持久化，每次打开设置默认显示渠道） */
 export const settingsTabAtom = atom<SettingsTab>('channels')
@@ -24,8 +25,11 @@ export const settingsTabAtom = atom<SettingsTab>('channels')
 /** Chat 工具设置页的目标配置区，用于从内置 MCP 详情直达对应配置 */
 export const toolSettingsFocusAtom = atom<ToolSettingsFocus | null>(null)
 
-/** 模型配置页的目标区块，用于 Design 直达生图模型设置。 */
-export const channelSettingsFocusAtom = atom<ChannelSettingsFocus | null>(null)
+/** 媒体设置页的目标区块，用于 Design 直达生图模型设置。 */
+export const mediaSettingsFocusAtom = atom<MediaSettingsFocus | null>(null)
+
+/** 兼容旧调用方名称，旧入口仍会由设置面板转到媒体页。 */
+export const channelSettingsFocusAtom = mediaSettingsFocusAtom
 
 /** 设置浮窗是否打开 */
 export const settingsOpenAtom = atom(false)

@@ -42,6 +42,7 @@ function createNode(id: string, kind: CanvasNode['kind'], stale = false): Canvas
   }
   if (kind === 'agent') return { ...base, kind, agentSessionId: `session-${id}` }
   if (kind === 'image') return { ...base, kind, imageModuleId: `module-${id}` }
+  if (kind === 'audio' || kind === 'video') return { ...base, kind, mediaModuleId: `module-${id}` }
   if (kind === 'document') return { ...base, kind, documentId: `document-${id}`, contentRevision: 1 }
   return { ...base, kind, prototypeId: `prototype-${id}`, contentRevision: 1, devicePreset: 'desktop' }
 }
@@ -299,7 +300,10 @@ function createFixture(document: CanvasDocument, options: {
         }
       },
     },
-    imageRuns: options.imageRunService ?? {
+    imageRuns: options.imageRunService ? {
+      ...options.imageRunService,
+      cancelTasks: async () => undefined,
+    } : {
       run: async (_context, _target, nodes, _operationId, runOptions) => {
         if (!runOptions) throw new Error('TEST_IMAGE_RUN_OPTIONS_REQUIRED')
         imageRuns.push(nodes.map((node) => node.id))
@@ -339,6 +343,7 @@ function createFixture(document: CanvasDocument, options: {
           entries,
         }
       },
+      cancelTasks: async () => undefined,
     },
     now: options.now ?? (() => 1_000),
     setDeadline: (callback) => {

@@ -28,6 +28,7 @@ import type { Edge, Node, NodeHandle } from '@xyflow/react'
 import { AGENT_STATUS_LABELS } from './CanvasAgentNode'
 import type { CanvasAgentFlowData, CanvasAgentFlowNode } from './CanvasAgentNode'
 import type { CanvasNodeCardData, CanvasNodeFlowData } from './CanvasNodeCard'
+import type { MediaRunProgressProjection } from './use-media-run-progress'
 
 /** Canvas 语义边在画布上的稳定中文标签。 */
 const CANVAS_EDGE_RELATION_LABELS: Readonly<Record<CanvasEdgeRelation, string>> = {
@@ -187,6 +188,8 @@ export interface NativeCanvasProjectionOptions {
   runningSessionIds: ReadonlySet<string>
   /** Workspace 已按节点 ID 聚合的最终瞬时活动状态。 */
   nodeActivityStates?: ReadonlyMap<string, CanvasNodeActivityState>
+  /** Workspace 按图片节点 ID 投影的 Comfy 运行阶段。 */
+  mediaProgressByNodeId?: ReadonlyMap<string, MediaRunProgressProjection>
   /** 工作区共享的素材预览索引，节点投影不得自行加载图片模块。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   canCreateChild: boolean
@@ -212,8 +215,9 @@ const DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS: NativeCanvasProjectionOptions = 
 
 /** 非 Agent 折叠节点只附带稳定业务引用，不读取引用内容。 */
 export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
-  kind: 'image' | 'document' | 'webview'
+  kind: 'image' | 'audio' | 'video' | 'document' | 'webview'
   imageModuleId?: string
+  mediaModuleId?: string
   adoptedAssetId?: string
   previewUrl?: string
   documentId?: string
@@ -232,6 +236,8 @@ export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
 export type NativeCanvasContentFlowData = NativeCanvasContentNodeData & CanvasNodeFlowData
 /** XYFlow 中的生图折叠节点。 */
 export type NativeCanvasImageFlowNode = Node<NativeCanvasContentFlowData & { kind: 'image' }, 'canvasImage'>
+/** XYFlow 中的通用音视频折叠节点。 */
+export type NativeCanvasMediaFlowNode = Node<NativeCanvasContentFlowData & { kind: 'audio' | 'video' }, 'canvasMedia'>
 /** XYFlow 中的文档折叠节点。 */
 export type NativeCanvasDocumentFlowNode = Node<NativeCanvasContentFlowData & { kind: 'document' }, 'canvasDocument'>
 /** XYFlow 中的原型折叠节点。 */
@@ -240,6 +246,7 @@ export type NativeCanvasWebviewFlowNode = Node<NativeCanvasContentFlowData & { k
 export type NativeCanvasFlowNode =
   | CanvasAgentFlowNode
   | NativeCanvasImageFlowNode
+  | NativeCanvasMediaFlowNode
   | NativeCanvasDocumentFlowNode
   | NativeCanvasWebviewFlowNode
 
@@ -433,6 +440,8 @@ export function toNativeCanvasFlowNodes(
       const preview = node.adoptedAssetId
         ? options.imagePreviews?.get(node.adoptedAssetId)
         : undefined
+      /** 当前图片节点的 Comfy 运行投影只读取一次，保持投影逻辑清晰。 */
+      const mediaProgress = options.mediaProgressByNodeId?.get(node.id)
       return {
         ...base,
         type: 'canvasImage',
@@ -442,6 +451,7 @@ export function toNativeCanvasFlowNodes(
           title: node.title,
           imageModuleId: node.imageModuleId,
           activityState,
+          ...(mediaProgress ? { mediaProgress } : {}),
           ...(node.adoptedAssetId ? { adoptedAssetId: node.adoptedAssetId } : {}),
           ...(preview ? { previewUrl: preview.previewUrl, nodeHeight: nodeSize.height } : {}),
           statusLabel: node.adoptedAssetId ? '已有素材' : '待创作',
@@ -467,6 +477,28 @@ export function toNativeCanvasFlowNodes(
           contentRevision: node.contentRevision,
           statusLabel: '已创建',
           summary: `内容版本 ${node.contentRevision}`,
+          canOpenWorkbench: true,
+          onOpenWorkbench: options.onWorkbenchNodeChange,
+          canCreateChild: options.canCreateChild,
+          ...(options.canCreateChild ? { onCreateChild: options.onCreateChild } : {}),
+          ...(options.onReferenceNode ? { onReferenceNode: options.onReferenceNode } : {}),
+        },
+      }
+    }
+    if (node.kind === 'audio' || node.kind === 'video') {
+      const mediaProgress = options.mediaProgressByNodeId?.get(node.id)
+      return {
+        ...base,
+        type: 'canvasMedia',
+        data: {
+          id: node.id,
+          kind: node.kind,
+          title: node.title,
+          mediaModuleId: node.mediaModuleId,
+          activityState,
+          statusLabel: '待创作',
+          summary: node.kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
+          ...(mediaProgress ? { mediaProgress } : {}),
           canOpenWorkbench: true,
           onOpenWorkbench: options.onWorkbenchNodeChange,
           canCreateChild: options.canCreateChild,
@@ -535,9 +567,9 @@ export function toNativeCanvasFlowEdges(document: CanvasDocument): Edge[] {
       focusable: true,
       animated: false,
       data: { relation: edge.relation, bindingState: binding.state },
-      label: binding.state === 'unresolved'
+      label: `${binding.state === 'unresolved'
         ? `${CANVAS_EDGE_RELATION_LABELS[edge.relation]} · 待确认`
-        : CANVAS_EDGE_RELATION_LABELS[edge.relation],
+        : CANVAS_EDGE_RELATION_LABELS[edge.relation]}${edge.sourceOutputKey ? ` · ${edge.sourceOutputKey}` : ''}`,
     }
   })
 }
@@ -578,6 +610,9 @@ export function confirmNativeCanvasEdge(
   return createCanvasBoundEdge(source, target, {
     id: edge.id,
     sourceNodeId: edge.sourceNodeId,
+    ...(relation !== 'association' && edge.sourceOutputKey !== undefined
+      ? { sourceOutputKey: edge.sourceOutputKey }
+      : {}),
     targetNodeId: edge.targetNodeId,
     relation,
   })

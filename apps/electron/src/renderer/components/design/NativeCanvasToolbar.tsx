@@ -41,7 +41,8 @@ export const NATIVE_CANVAS_NODE_TYPE_OPTIONS = [
   { kind: 'image', label: '生图', enabled: true },
   { kind: 'document', label: '文档', enabled: true },
   { kind: 'webview', label: '原型', enabled: true },
-  { kind: 'video', label: '视频', enabled: false },
+  { kind: 'audio', label: '音频', enabled: true },
+  { kind: 'video', label: '视频', enabled: true },
 ] as const
 
 /** 顶部悬浮菜单单项的稳定联合类型。 */
@@ -78,6 +79,8 @@ export interface NativeCanvasToolbarProps {
   onArrangeVisible?: () => void
   onArrangeAll?: () => void
   onFocusFirstIssue: () => void
+  /** 由画布文档保存的媒体模型候选范围控件。 */
+  mediaModelPicker?: React.ReactNode
 }
 
 /** 根据节点类型返回稳定图标，避免菜单标签承担全部识别负担。 */
@@ -147,14 +150,16 @@ export function NativeCanvasToolbar({
   onArrangeVisible,
   onArrangeAll,
   onFocusFirstIssue,
+  mediaModelPicker,
 }: NativeCanvasToolbarProps): React.ReactElement {
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <nav
         aria-label="Canvas 工具栏"
-        className="absolute left-1/2 top-3 z-10 flex max-w-[calc(100%-1rem)] -translate-x-1/2 items-center gap-1 rounded-[8px] border border-border/70 bg-background/95 p-1 shadow-md backdrop-blur"
+        className="absolute left-1/2 top-3 z-10 flex max-w-[calc(100%-1rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-1 rounded-[8px] border border-border/70 bg-background/95 p-1 shadow-md backdrop-blur"
         onPointerDown={(event) => event.stopPropagation()}
       >
+        {mediaModelPicker}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

@@ -41,15 +41,9 @@ export class DesignImageModelPreferences {
     /** 路径只能由受信任项目解析器生成。 */
     const preferencesPath = this.dependencies.pathResolver.resolve(projectId).preferencesPath
     /** Catalog 已清洗且不含凭据的全部选项副本。 */
-    const options = this.dependencies.imageModels.listOptions().map((option) => ({ ...option }))
+    const options = this.dependencies.imageModels.listOptions(projectId).map((option) => ({ ...option }))
     if (!existsSync(preferencesPath)) {
-      /** 首次使用只在内存选择第一个可用项，不制造隐式磁盘写入。 */
-      const defaultOption = options.find((option) => option.available)
-      return {
-        projectId,
-        options,
-        ...(defaultOption ? { selectedProfileId: defaultOption.profileId } : {}),
-      }
+      return { projectId, options }
     }
 
     /** 已存在文件必须从主文件严格解析，禁止隐式恢复候选。 */
@@ -77,7 +71,7 @@ export class DesignImageModelPreferences {
       readPreferencesFile(paths.preferencesPath)
     }
     /** 单次 Catalog 快照同时用于可用性校验和成功返回，避免提交后再次读取配置或凭据。 */
-    const options = this.dependencies.imageModels.listOptions().map((option) => ({ ...option }))
+    const options = this.dependencies.imageModels.listOptions(input.projectId).map((option) => ({ ...option }))
     /** Renderer 只能选择当前目录中存在且可用的公开 profile。 */
     const selectedOption = options.find((option) => option.profileId === input.imageModelProfileId)
     if (!selectedOption) throw new Error(`生图模型不存在: ${input.imageModelProfileId}`)

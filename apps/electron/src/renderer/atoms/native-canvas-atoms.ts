@@ -1,6 +1,7 @@
 import {
   parseCanvasImageTarget,
   type CanvasImageAspectRatio,
+  type CanvasImageMediaWorkflow,
   type CanvasImageModuleSnapshot,
   type CanvasImageSize,
   type CanvasImageTarget,
@@ -35,6 +36,7 @@ export type CanvasImageModuleSaveState = 'saved' | 'dirty' | 'saving' | 'failed'
 export interface CanvasImageModuleDraft {
   prompt: string
   selectedModelProfileId: string | null
+  mediaWorkflow?: CanvasImageMediaWorkflow | null
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
   contextMode: DesignContextMode

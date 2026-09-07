@@ -56,7 +56,14 @@ import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
 import { getAgentSessionWorkspacePath } from './config-paths'
-import { getAgentWorkspaceBySlug, getLocalProjectRootStatus, getProjectFilesPath } from './agent-workspace-manager'
+import {
+  getAgentWorkspace,
+  getAgentWorkspaceBySlug,
+  getLocalProjectRootStatus,
+  getProjectFilesPath,
+  getWorkspaceAttachedDirectories,
+  getWorkspaceAttachedFiles,
+} from './agent-workspace-manager'
 import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
 import { buildCanvasAgentActiveRunSnapshot, isEligibleProjectAgent } from './agent-session-visibility'
 import {
@@ -92,9 +99,42 @@ import {
   type CanvasNodeReferenceResolver,
 } from './design/canvas-node-reference-resolver'
 import { getCanvasToolProviderRuntime } from './design/canvas-document-ipc'
+import { openAuthorizedAgentMediaSource } from './design/design-session-bridge'
+import {
+  prepareAgentMediaAttachmentsForSend,
+  type AgentMediaAttachmentInput,
+} from './agent-media-attachment-preparation'
 
 /** 保持现有主进程调用方从 agent-service 导入运行扩展类型的兼容性。 */
 export type { AgentRunExtensions } from './agent-run-extensions'
+
+/** 使用主进程权威会话和项目根固化显式图片、音频和视频附件。 */
+function prepareAgentMediaInput<T extends AgentMediaAttachmentInput>(input: T): T {
+  if (!Object.prototype.hasOwnProperty.call(input, 'mediaAttachments')) return input
+  return workspaceOperationGuard.runSessionWrite(input.sessionId, () => prepareAgentMediaAttachmentsForSend(input, {
+    getSession: getAgentSessionMeta,
+    getWorkspace: getAgentWorkspace,
+    getAllowedRoots: (session, workspace) => [
+      getAgentSessionWorkspacePath(workspace.slug, session.id),
+      getProjectFilesPath(workspace.slug),
+      ...(session.activeWorktree?.path ? [session.activeWorktree.path] : []),
+      ...(session.attachedDirectories ?? []),
+      ...(session.attachedFiles ?? []),
+      ...getWorkspaceAttachedDirectories(workspace.slug),
+      ...getWorkspaceAttachedFiles(workspace.slug),
+    ],
+    getSessionAttachmentsDirectory: (session, workspace) => (
+      join(getAgentSessionWorkspacePath(workspace.slug, session.id), 'attachments')
+    ),
+    openSource: ({ inputPath, allowedRoots, maxBytes }) => openAuthorizedAgentMediaSource({
+      inputPath,
+      baseDir: process.cwd(),
+      allowedRoots,
+      maxBytes,
+      label: '媒体',
+    }),
+  }))
+}
 
 // ===== 实例创建 =====
 
@@ -113,6 +153,8 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
   input: T,
   extensions: AgentRunExtensions = {},
 ): PreparedAgentCanvasMessage<T> {
+  /** 媒体授权先于 Canvas 与运行准备完成，后续阶段只使用会话内固化路径。 */
+  const mediaPreparedInput = prepareAgentMediaInput(input)
   /** runtime 同时提供唯一引用解析器和工具 facade；缺失时仅允许无引用消息继续。 */
   const runtime = getCanvasToolProviderRuntime()
   /** 显式分支便于审计生产 resolver 来源，禁止隐藏回退 Store。 */
@@ -121,7 +163,7 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
     : unavailableCanvasReferenceResolver
   /** 引用先完成权威解析，工具上下文只能使用解析后的快照。 */
   const prepared = prepareAgentCanvasMessageForSend(
-    input,
+    mediaPreparedInput,
     extensions,
     referenceResolver,
   )
@@ -964,6 +1006,7 @@ async function queuePreparedAgentMessage(
     resolved.input.mentionedTodoIds,
     resolved.input.mentionedCalendarEventIds,
     resolved.references,
+    resolved.input.mediaAttachments,
     resolved.canvasWorkspacePrompt,
   )
 }
@@ -976,7 +1019,9 @@ export async function submitOrEnqueueAgentMessage(
   input: AgentSubmitOrEnqueueInput,
   webContents: WebContents,
 ): Promise<AgentSubmitOrEnqueueResult> {
-  return routeAgentSubmitOrEnqueue(input, {
+  /** deferred 消息入队前必须完成附件固化，不能等当前 run 结束后再信任旧路径。 */
+  const mediaPreparedInput = prepareAgentMediaInput(input)
+  return routeAgentSubmitOrEnqueue(mediaPreparedInput, {
     isActive: (sessionId) => orchestrator.isActive(sessionId),
     prepareNow: (candidate) => prepareAgentRun(createAgentQueueNowInput(candidate)),
     injectPrepared: async (prepared) => {
@@ -997,9 +1042,10 @@ export async function submitOrEnqueueAgentMessage(
 
 /** 兼容旧调用：仅将消息追加到主进程 deferred queue。 */
 export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
+  const mediaPreparedInput = prepareAgentMediaInput(input)
   workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
     registerWebContents(input.sessionId, webContents)
-    agentQueueCoordinator.enqueue(input)
+    agentQueueCoordinator.enqueue(mediaPreparedInput)
   })
 }
 

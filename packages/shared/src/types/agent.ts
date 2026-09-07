@@ -253,6 +253,8 @@ export interface SDKUserMessage {
   skill_activations?: SkillActivation[]
   /** 持久化到 SDK JSONL 的 Canvas 节点引用快照；发送 IPC 使用无下划线字段。 */
   _canvasNodeReferences?: CanvasNodeReference[]
+  /** Host 固化后的用户图片、音频或视频附件；媒体来源服务只读取该结构化字段。 */
+  mediaAttachments?: AgentMediaAttachment[]
 }
 
 /** Skill successfully loaded during an Agent turn. */
@@ -1248,6 +1250,18 @@ export interface WorkspaceCapabilities {
 /** Canvas 节点引用在发送边界采用的 revision 解析语义。 */
 export type CanvasNodeReferenceMode = 'latest' | 'exact'
 
+/** Host 可验证并持久化的 Agent 图片、音频或视频附件。 */
+export interface AgentMediaAttachment {
+  /** 面向用户展示的安全文件名。 */
+  filename: string
+  /** 仅允许 image/*、audio/* 或 video/*。 */
+  mediaType: string
+  /** Host 固化时确认的字节数。 */
+  size: number
+  /** Host 固化到当前会话附件目录后的绝对路径。 */
+  targetPath: string
+}
+
 /**
  * Agent 发送消息的输入参数
  */
@@ -1292,6 +1306,8 @@ export interface AgentSendInput {
   canvasNodeReferences?: CanvasNodeReference[]
   /** latest 刷新普通发送快照；exact 保持历史重试的原 revision。 */
   canvasNodeReferenceMode?: CanvasNodeReferenceMode
+  /** 本次消息显式携带的媒体附件；Host 会在运行或入队前重新校验并固化。 */
+  mediaAttachments?: AgentMediaAttachment[]
 }
 
 // ===== Agent 队列消息 =====
@@ -1411,6 +1427,8 @@ export interface AgentQueueMessageInput {
   mentionedCalendarEventIds?: string[]
   /** 本次队列消息显式携带的 Canvas 节点引用快照。 */
   canvasNodeReferences?: CanvasNodeReference[]
+  /** 本次队列消息显式携带的媒体附件。 */
+  mediaAttachments?: AgentMediaAttachment[]
 }
 
 export interface AgentQueuedMessageControlInput {

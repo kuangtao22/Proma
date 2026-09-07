@@ -81,6 +81,34 @@ describe('Design preload', () => {
     ])
   })
 
+  test('Given 图片模块保存公共工作流 When Preload 发送 Then 深拷贝完整输入且不夹带私有字段', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const mediaWorkflow = {
+      workflowId: 'workflow-1', workflowRevision: 2, connectionId: 'connection-1',
+      inputs: { prompt: { kind: 'scalar' as const, value: '固定输入' } },
+    }
+    await api.saveCanvasImageModule({
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+      expectedConfigRevision: 3, prompt: '任务说明', selectedModelProfileId: null,
+      mediaWorkflow, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none',
+    })
+    mediaWorkflow.inputs.prompt = { kind: 'scalar', value: '迟到改写' }
+
+    expect(recorded.invokes[0]).toEqual({
+      channel: CANVAS_IPC_CHANNELS.SAVE_IMAGE_MODULE,
+      args: [{
+        projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+        expectedConfigRevision: 3, prompt: '任务说明', selectedModelProfileId: null,
+        mediaWorkflow: {
+          workflowId: 'workflow-1', workflowRevision: 2, connectionId: 'connection-1',
+          inputs: { prompt: { kind: 'scalar', value: '固定输入' } },
+        },
+        aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none',
+      }],
+    })
+  })
+
   test('Given 图片候选批次 API When 调用 Then 只向四个固定通道透传公开字段', async () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)
@@ -189,6 +217,8 @@ describe('Design preload', () => {
       [() => api.deleteCanvasSession({ projectId: 'p1', canvasId: 'canvas-1' }), DESIGN_IPC_CHANNELS.DELETE_CANVAS_SESSION, [{ projectId: 'p1', canvasId: 'canvas-1' }]],
       [() => api.listImageModelProfiles(), DESIGN_IPC_CHANNELS.LIST_IMAGE_MODEL_PROFILES, []],
       [() => api.saveImageModelProfiles({ profiles: [] }), DESIGN_IPC_CHANNELS.SAVE_IMAGE_MODEL_PROFILES, [{ profiles: [] }]],
+      [() => api.listMediaApiModelProfiles(), DESIGN_IPC_CHANNELS.LIST_MEDIA_API_MODEL_PROFILES, []],
+      [() => api.saveMediaApiModelProfiles({ profiles: [], expectedRevision: 3 }), DESIGN_IPC_CHANNELS.SAVE_MEDIA_API_MODEL_PROFILES, [{ profiles: [], expectedRevision: 3 }]],
       [() => api.getImageModelSelection('p1'), DESIGN_IPC_CHANNELS.GET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1' }]],
       [() => api.setImageModelSelection({ projectId: 'p1', imageModelProfileId: 'profile-flash' }), DESIGN_IPC_CHANNELS.SET_IMAGE_MODEL_SELECTION, [{ projectId: 'p1', imageModelProfileId: 'profile-flash' }]],
       [() => api.loadDesignWorkspace('p1'), DESIGN_IPC_CHANNELS.LOAD, [{ projectId: 'p1' }]],

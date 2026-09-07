@@ -205,6 +205,7 @@ describe('Design 共享契约', () => {
       viewport: { x: 0, y: 0, zoom: 1 },
       nodes: [],
       assets: [],
+      mediaAssets: [],
       groups: [],
       annotations: [],
       createdAt: 100,

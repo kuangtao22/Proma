@@ -136,15 +136,16 @@ function createFixture(options: {
 }
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
-/** 三类受管内容节点，用于参数化全部中断阶段。 */
-const contentKinds: CanvasContentKind[] = ['image', 'document', 'webview']
-/** 测试 helper 只返回三类内容节点，排除 Agent 可选字段。 */
+/** 全部受管内容节点，用于参数化中断阶段。 */
+const contentKinds: CanvasContentKind[] = ['image', 'audio', 'video', 'document', 'webview']
+/** 测试 helper 只返回受管内容节点，排除 Agent 可选字段。 */
 type TestContentNode = Extract<CanvasNode, { kind: CanvasContentKind }>
 
 /** 按内容类别构造严格 v2 intent 节点。 */
 function createIntentNode(kind: CanvasContentKind, position = { x: 1, y: 2 }): TestContentNode {
   const base = { id: 'node-strict', title: '严格节点', position }
   if (kind === 'image') return { ...base, kind, imageModuleId: 'content-strict' }
+  if (kind === 'audio' || kind === 'video') return { ...base, kind, mediaModuleId: 'content-strict' }
   if (kind === 'document') return { ...base, kind, documentId: 'content-strict', contentRevision: 0 }
   return { ...base, kind, prototypeId: 'content-strict', contentRevision: 0, devicePreset: 'desktop' }
 }
@@ -195,6 +196,25 @@ describe('CanvasContentNodeLifecycle', () => {
     expect(() => parseCanvasContentNodeIntent({ ...value, extra: true }, target, value.operationId)).toThrow('CANVAS_CONTENT_INTENT_INVALID')
   })
 
+  test.each(['audio', 'video'] as const)('Given %s intent 带 Host 采用版本 When 严格解析 Then 保留非负整数并拒绝非法值', (kind) => {
+    const operationId = '12121212-1212-4212-8212-121212121212'
+    const value = {
+      schemaVersion: 1, operation: 'create', state: 'prepared', operationId, ...target,
+      node: {
+        id: `node-${kind}`, kind, title: '媒体', position: { x: 0, y: 0 },
+        mediaModuleId: `content-${kind}`, adoptedConfigRevision: 4,
+      },
+      expectedRevision: 0, createdAt: 10, updatedAt: 10,
+    } as const
+
+    expect(parseCanvasContentNodeIntent(value, target, operationId).node)
+      .toMatchObject({ kind, adoptedConfigRevision: 4 })
+    expect(() => parseCanvasContentNodeIntent({
+      ...value,
+      node: { ...value.node, adoptedConfigRevision: -1 },
+    }, target, operationId)).toThrow('CANVAS_CONTENT_INTENT_INVALID')
+  })
+
   test('Given 恶意 Agent content intent When 解析或推进 Then create/restore 均 fail closed', async () => {
     const operationId = '23232323-2323-4323-8323-232323232323'
     const agentNode = { id: 'agent-evil', kind: 'agent', title: 'Agent', position: { x: 0, y: 0 }, agentSessionId: 'session-evil' } as const
@@ -213,7 +233,9 @@ describe('CanvasContentNodeLifecycle', () => {
   test.each(contentKinds)('Given %s delete/restore trash 绑定 When 任一身份错配 Then parser 拒绝', (kind) => {
     const operationId = '24242424-2424-4424-8424-242424242424'
     const node = createIntentNode(kind)
-    const identity = node.kind === 'image' ? node.imageModuleId : node.kind === 'document' ? node.documentId : node.prototypeId
+    const identity = node.kind === 'image' ? node.imageModuleId
+      : node.kind === 'audio' || node.kind === 'video' ? node.mediaModuleId
+        : node.kind === 'document' ? node.documentId : node.prototypeId
     const trashEntry = { schemaVersion: 1, trashId: 'trash-strict', nodeId: node.id, kind, contentId: identity, title: node.title, position: node.position, deletedRevision: 4, deletedAt: 10 } as const
     const base = { schemaVersion: 1, operation: 'delete', state: 'prepared', operationId, ...target, node, expectedRevision: 4, trashId: trashEntry.trashId, trashEntry, createdAt: 10, updatedAt: 10 } as const
     /** 历史 schema1 条目在 intent 解析边界统一升级为规范化 schema2。 */
@@ -449,13 +471,23 @@ describe('CanvasContentNodeLifecycle', () => {
       contentId: 'image-content',
     },
     {
+      kind: 'audio' as const,
+      node: { id: 'audio-lossless', kind: 'audio' as const, title: '音频', position: { x: 2, y: 3 }, mediaModuleId: 'audio-content' },
+      contentId: 'audio-content',
+    },
+    {
+      kind: 'video' as const,
+      node: { id: 'video-lossless', kind: 'video' as const, title: '视频', position: { x: 3, y: 4 }, mediaModuleId: 'video-content' },
+      contentId: 'video-content',
+    },
+    {
       kind: 'document' as const,
-      node: { id: 'document-lossless', kind: 'document' as const, title: '文档', position: { x: 3, y: 4 }, documentId: 'document-content', contentRevision: 7 },
+      node: { id: 'document-lossless', kind: 'document' as const, title: '文档', position: { x: 4, y: 5 }, documentId: 'document-content', contentRevision: 7 },
       contentId: 'document-content',
     },
     {
       kind: 'webview' as const,
-      node: { id: 'webview-lossless', kind: 'webview' as const, title: '原型', position: { x: 5, y: 6 }, prototypeId: 'webview-content', contentRevision: 9, devicePreset: 'mobile' as const },
+      node: { id: 'webview-lossless', kind: 'webview' as const, title: '原型', position: { x: 6, y: 7 }, prototypeId: 'webview-content', contentRevision: 9, devicePreset: 'mobile' as const },
       contentId: 'webview-content',
     },
   ])('Given $kind 真实节点状态 When 删除并恢复 Then v2 trash 与节点状态无损往返', async ({ node, contentId }) => {

@@ -3522,7 +3522,7 @@ describe('原生 Canvas 文档 IPC', () => {
       artifacts: {
         create: async (input: {
           canvasId: string
-          artifactType: 'document' | 'webview' | 'image'
+          artifactType: 'document' | 'webview' | 'image' | 'audio' | 'video'
           source: { toolCallId: string }
         }) => ({
           canvasId: input.canvasId,

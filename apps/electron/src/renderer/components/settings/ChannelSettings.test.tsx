@@ -65,9 +65,8 @@ test('Given 上次加载失败 When 重试成功 Then 替换渠道并清除错�
   expect(state.error).toBeNull()
 })
 
-test('Given 设置列表 When 渲染模型配置 Then 生图设置位于渠道区块之后', () => {
+test('Given 设置列表 When 渲染模型配置 Then 生图设置已迁移到统一媒体页', () => {
   const source = readFileSync(new URL('./ChannelSettings.tsx', import.meta.url), 'utf8')
-  expect(source.indexOf('title="模型配置"'))
-    .toBeLessThan(source.indexOf('<ImageGenerationModelSettings />'))
-  expect(source).toContain('<ImageGenerationModelSettings />')
+  expect(source).not.toContain('<ImageGenerationModelSettings />')
+  expect(source).not.toContain("focusedSection !== 'image-models'")
 })

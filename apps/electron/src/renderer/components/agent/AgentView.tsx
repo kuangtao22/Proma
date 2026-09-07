@@ -131,7 +131,7 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
-import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, CanvasNodeReference, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
+import type { AgentDeferredQueueMessageInput, AgentMediaAttachment, AgentSendInput, AgentPendingFile, AgentThinkingLevel, CanvasNodeReference, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
 import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
@@ -250,6 +250,7 @@ function createUserSDKMessage(
   uuid?: string,
   createdAt = Date.now(),
   canvasNodeReferences?: readonly CanvasNodeReference[],
+  mediaAttachments?: readonly AgentMediaAttachment[],
 ): SDKMessage {
   const message: OptimisticSDKUserMessage = {
     type: 'user',
@@ -262,8 +263,21 @@ function createUserSDKMessage(
     ...(canvasNodeReferences && canvasNodeReferences.length > 0
       ? { _canvasNodeReferences: [...canvasNodeReferences] }
       : {}),
+    ...(mediaAttachments && mediaAttachments.length > 0
+      ? { mediaAttachments: [...mediaAttachments] }
+      : {}),
   }
   return message
+}
+
+/** 从展示附件中只提取显式图片、音频和视频，供 Host 的结构化授权边界使用。 */
+function getMediaAttachments(attachments?: readonly AgentQueuedAttachment[]): AgentMediaAttachment[] | undefined {
+  const mediaAttachments = (attachments ?? [])
+    .filter((attachment) => attachment.mediaType.startsWith('image/')
+      || attachment.mediaType.startsWith('audio/')
+      || attachment.mediaType.startsWith('video/'))
+    .map((attachment) => ({ ...attachment }))
+  return mediaAttachments.length > 0 ? mediaAttachments : undefined
 }
 
 function resolveRunContextWindow(
@@ -1112,6 +1126,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       : ''
     const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
     if (!agentChannelId || !hasAvailableModel) return 'skipped'
+    const mediaAttachments = getMediaAttachments(message.attachments)
 
     return submitQueuedMessagePayload(payload, async (submittedPayload) => {
       clearStoppedByUser()
@@ -1141,6 +1156,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         mentionedSessionIds: submittedPayload.mentions.mentionedSessionIds,
         mentionedTodoIds: submittedPayload.mentions.mentionedTodoIds,
         mentionedCalendarEventIds: submittedPayload.mentions.mentionedCalendarEventIds,
+        ...(mediaAttachments ? { mediaAttachments } : {}),
         ...(submittedPayload.canvasNodeReferences && submittedPayload.canvasNodeReferences.length > 0
           ? { canvasNodeReferences: submittedPayload.canvasNodeReferences }
           : {}),
@@ -1151,6 +1167,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           message.id,
           Date.now(),
           submittedPayload.canvasNodeReferences,
+          mediaAttachments,
         ))
         setQueuedMessages((prev) => removeQueuedMessage(prev, message.id))
         return
@@ -2139,6 +2156,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         ? buildQuotedSelectionBlock(quotedSelection)
         : ''
       const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
+      const queuedMediaAttachments = getMediaAttachments(message.attachments)
       const queuedInput: AgentDeferredQueueMessageInput & { dispatch: 'after_current' } = {
         queueMessageId: message.id,
         sessionId,
@@ -2155,6 +2173,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         mentionedSessionIds: payload.mentions.mentionedSessionIds,
         mentionedTodoIds: payload.mentions.mentionedTodoIds,
         mentionedCalendarEventIds: payload.mentions.mentionedCalendarEventIds,
+        ...(queuedMediaAttachments
+          ? { mediaAttachments: queuedMediaAttachments }
+          : {}),
         ...(payload.canvasNodeReferences && payload.canvasNodeReferences.length > 0
           ? { canvasNodeReferences: payload.canvasNodeReferences }
           : {}),
@@ -2285,6 +2306,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       ? await preparePendingFilesForSend(pendingFilesSnapshot, additionalDirectoriesForRun)
       : null
     if (pendingFilesSnapshot.length > 0 && !attachmentContext) return
+    const mediaAttachments = getMediaAttachments(attachmentContext?.attachments)
     let fileReferences = attachmentContext?.referenceBlock ?? ''
 
     // 构建引用选中文本：内联 XML 拼入 prompt，对话框不展示（parseAttachedFiles 剥离）
@@ -2346,6 +2368,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       ...(canvasNodeReferencesSnapshot.length > 0
         ? { _canvasNodeReferences: [...canvasNodeReferencesSnapshot] }
         : {}),
+      ...(mediaAttachments ? { mediaAttachments } : {}),
     } as unknown as SDKMessage
     appendOptimisticPersistedMessage(tempUserSDKMsg)
 
@@ -2365,6 +2388,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       ...(mentions.mentionedTodoIds.length > 0 && { mentionedTodoIds: mentions.mentionedTodoIds }),
       ...(mentions.mentionedCalendarEventIds.length > 0 && { mentionedCalendarEventIds: mentions.mentionedCalendarEventIds }),
       ...(canvasNodeReferencesSnapshot.length > 0 && { canvasNodeReferences: canvasNodeReferencesSnapshot }),
+      ...(mediaAttachments && { mediaAttachments }),
     }
 
     // 清空输入框（仅当发送的是用户自己输入的内容，而非推荐建议时）。
@@ -2601,6 +2625,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       startedAt: streamStartedAt,
       permissionModeOverride: permissionMode,
       ...(retryOfErrorUuid && { retryOfErrorUuid }),
+      ...(lastUserSDKMessage.mediaAttachments?.length
+        ? { mediaAttachments: [...lastUserSDKMessage.mediaAttachments] }
+        : {}),
       ...(lastUserSDKMessage._canvasNodeReferences?.length
         ? {
             canvasNodeReferences: [...lastUserSDKMessage._canvasNodeReferences],

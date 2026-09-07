@@ -15,6 +15,7 @@ function createNode(kind: CanvasNode['kind']): CanvasNode {
   const base = { id: `node-${kind}`, title: `${kind} 节点`, position: { x: 0, y: 0 } }
   if (kind === 'agent') return { ...base, kind, agentSessionId: 'session-1' }
   if (kind === 'image') return { ...base, kind, imageModuleId: 'image-module-1' }
+  if (kind === 'audio' || kind === 'video') return { ...base, kind, mediaModuleId: 'media-module-1' }
   if (kind === 'document') return { ...base, kind, documentId: 'document-1', contentRevision: 0 }
   return { ...base, kind, prototypeId: 'prototype-1', contentRevision: 0, devicePreset: 'desktop' }
 }
@@ -23,6 +24,8 @@ describe('Canvas 节点工作台覆盖层', () => {
   test.each([
     ['agent', 'Agent'],
     ['image', '生图'],
+    ['audio', '音频'],
+    ['video', '视频'],
     ['document', '文档'],
     ['webview', '原型'],
   ] as const)('Given %s 节点 When 渲染基础工作台 Then 使用稳定中文标签与锚定尺寸', (kind, label) => {

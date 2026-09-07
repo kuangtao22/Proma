@@ -7,6 +7,7 @@ import type {
   CanvasImageInputReference,
   CanvasImageTarget,
   CanvasNode,
+  MediaAssetRef,
   SDKMessage,
 } from '@proma/shared'
 import type { CanvasDocumentStore } from './canvas-document-store'
@@ -40,6 +41,14 @@ export interface CanvasPrototypeCommittedOutput {
   summary: string
 }
 
+/** AV 模块按确切输出 key 返回的当前正式图片。 */
+export interface CanvasAdoptedMediaImageOutput {
+  asset: MediaAssetRef
+  candidateId: string
+  runId: string
+  configRevision: number
+}
+
 /** Canvas 图片任务直接输入解析器。 */
 export interface CanvasImageInputResolver {
   resolve: (target: CanvasImageTarget) => Promise<CanvasImageInputReference[]>
@@ -59,13 +68,50 @@ export interface CanvasImageInputResolverDependencies {
     target: { projectId: string; canvasId: string },
     prototypeId: string,
   ) => Promise<CanvasPrototypeCommittedOutput>
+  getAdoptedMediaImage?: (
+    target: { projectId: string; canvasId: string; nodeId: string; mediaModuleId: string; mediaKind: 'audio' | 'video' },
+    outputKey: string,
+  ) => Promise<CanvasAdoptedMediaImageOutput | null>
 }
 
 /** 已通过 Host 节点类型与端口合同校验的单个直接输入。 */
 interface ResolvedCanvasInputBinding {
+  edgeId: string
   node: CanvasNode
   sourcePort: CanvasArtifactOutputCapability
   targetPort: CanvasArtifactInputSlot
+  sourceOutputKey?: string
+}
+
+/** 比较来源节点影响内容解析的稳定身份，忽略标题和位置等纯展示字段。 */
+function isSameCanvasInputSource(left: CanvasNode, right: CanvasNode): boolean {
+  if (left.id !== right.id || left.kind !== right.kind) return false
+  if (left.kind === 'agent' && right.kind === 'agent') return left.agentSessionId === right.agentSessionId
+  if (left.kind === 'image' && right.kind === 'image') return left.imageModuleId === right.imageModuleId
+  if ((left.kind === 'audio' || left.kind === 'video') && right.kind === left.kind) {
+    return left.mediaModuleId === right.mediaModuleId
+  }
+  if (left.kind === 'document' && right.kind === 'document') {
+    return left.documentId === right.documentId && left.contentRevision === right.contentRevision
+  }
+  if (left.kind === 'webview' && right.kind === 'webview') {
+    return left.prototypeId === right.prototypeId && left.contentRevision === right.contentRevision
+  }
+  return false
+}
+
+/** 比较 AV 正式输出的完整不可变身份，防止异步读取期间被新采用替换。 */
+function isSameAdoptedMediaImage(
+  left: CanvasAdoptedMediaImageOutput,
+  right: CanvasAdoptedMediaImageOutput,
+): boolean {
+  return left.candidateId === right.candidateId
+    && left.runId === right.runId
+    && left.configRevision === right.configRevision
+    && left.asset.assetId === right.asset.assetId
+    && left.asset.revision === right.asset.revision
+    && left.asset.hash === right.asset.hash
+    && left.asset.mediaKind === right.asset.mediaKind
 }
 
 /** 判断未知值是否为普通对象。 */
@@ -116,8 +162,9 @@ export function createCanvasImageInputResolver(
   /** 把单个上游节点解析为未应用全局预算的输入引用。 */
   const resolveNode = async (
     target: CanvasImageTarget,
-    node: CanvasNode,
+    input: ResolvedCanvasInputBinding,
   ): Promise<Omit<CanvasImageInputReference, 'summaryHash'> | undefined> => {
+    const { node } = input
     if (node.kind === 'agent') {
       /** Agent revision 和消息必须来自同一次权威 JSONL 快照。 */
       const output = await dependencies.getAgentOutput(node.agentSessionId)
@@ -161,6 +208,41 @@ export function createCanvasImageInputResolver(
         summary: output.markdown,
       }
     }
+    if (node.kind === 'audio' || node.kind === 'video') {
+      if (!dependencies.getAdoptedMediaImage
+        || input.sourcePort !== 'image.asset'
+        || input.targetPort !== 'image.reference'
+        || !input.sourceOutputKey) throw new Error('CANVAS_IMAGE_INPUT_MEDIA_ADAPTER_REQUIRED')
+      const mediaTarget = {
+        projectId: target.projectId,
+        canvasId: target.canvasId,
+        nodeId: node.id,
+        mediaModuleId: node.mediaModuleId,
+        mediaKind: node.kind,
+      }
+      const adopted = await dependencies.getAdoptedMediaImage(mediaTarget, input.sourceOutputKey)
+      if (!adopted || adopted.asset.mediaKind !== 'image') throw new Error('CANVAS_IMAGE_INPUT_MISSING')
+      if (node.adoptedConfigRevision !== adopted.configRevision) {
+        throw new Error('CANVAS_IMAGE_INPUT_REVISION_CONFLICT')
+      }
+      /** 图片输出沿用统一 Design 图片资产登记，路径验证证明字节可供旧图片执行器读取。 */
+      dependencies.resolveAssetPath(target.projectId, adopted.asset.assetId)
+      const refreshed = await dependencies.getAdoptedMediaImage(mediaTarget, input.sourceOutputKey)
+      if (!refreshed
+        || node.adoptedConfigRevision !== refreshed.configRevision
+        || !isSameAdoptedMediaImage(adopted, refreshed)) {
+        throw new Error('CANVAS_IMAGE_INPUT_REVISION_CONFLICT')
+      }
+      return {
+        nodeId: node.id,
+        kind: node.kind,
+        revision: requireRevision(adopted.configRevision),
+        summary: `当前采用媒体图片输出 ${input.sourceOutputKey}`,
+        assetId: adopted.asset.assetId,
+        sourceOutputKey: input.sourceOutputKey,
+        sourceArtifactHash: adopted.asset.hash,
+      }
+    }
     /** 原型 reader 负责把已提交 HTML/meta 投影为不执行脚本的安全摘要。 */
     const output = await dependencies.readPrototype(target, node.prototypeId)
     if (output.revision !== node.contentRevision) throw new Error('CANVAS_IMAGE_INPUT_REVISION_CONFLICT')
@@ -183,7 +265,7 @@ export function createCanvasImageInputResolver(
         || targetNode.imageModuleId !== target.imageModuleId) {
         throw new Error('CANVAS_IMAGE_TARGET_INVALID')
       }
-      /** 边顺序决定稳定输入顺序，重复源节点只保留首个已确认绑定。 */
+      /** 边顺序决定稳定输入顺序；AV 多图片输出按 nodeId + outputKey 独立保留。 */
       const boundSources = new Map<string, ResolvedCanvasInputBinding>()
       for (const edge of document.edges) {
         if (edge.targetNodeId !== target.nodeId || edge.relation === 'association') continue
@@ -196,11 +278,17 @@ export function createCanvasImageInputResolver(
           throw new Error('CANVAS_IMAGE_INPUT_CONFIRMATION_REQUIRED')
         }
         if (binding.state !== 'bound') throw new Error('CANVAS_IMAGE_INPUT_INVALID')
-        if (!boundSources.has(node.id)) {
-          boundSources.set(node.id, {
+        /** 单输出节点沿用 nodeId 去重，多输出 AV 节点额外固定 outputKey。 */
+        const sourceKey = (node.kind === 'audio' || node.kind === 'video') && edge.sourceOutputKey
+          ? `${node.id}\u0000${edge.sourceOutputKey}`
+          : node.id
+        if (!boundSources.has(sourceKey)) {
+          boundSources.set(sourceKey, {
+            edgeId: edge.id,
             node,
             sourcePort: binding.sourceCapability,
             targetPort: binding.targetSlot,
+            ...(edge.sourceOutputKey === undefined ? {} : { sourceOutputKey: edge.sourceOutputKey }),
           })
         }
       }
@@ -214,8 +302,9 @@ export function createCanvasImageInputResolver(
         if (references.length >= CANVAS_IMAGE_INPUT_MAX_REFERENCES
           || textLength >= CANVAS_IMAGE_INPUT_MAX_TEXT) break
         /** 图片媒体预算已满时不触发模块 Store 读取。 */
-        if (input.node.kind === 'image' && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
-        const resolved = await resolveNode(target, input.node)
+        if ((input.node.kind === 'image' || input.sourcePort === 'image.asset')
+          && mediaCount >= CANVAS_IMAGE_INPUT_MAX_MEDIA) continue
+        const resolved = await resolveNode(target, input)
         if (input.targetPort === 'image.reference' && !resolved?.assetId) {
           throw new Error('CANVAS_IMAGE_INPUT_MISSING')
         }
@@ -232,6 +321,27 @@ export function createCanvasImageInputResolver(
         })
         textLength += summary.length
         if (resolved.assetId) mediaCount += 1
+      }
+      /** I/O 完成后复验目标、来源和确切边，等待期间删边、换模块或改 outputKey 必须失效。 */
+      const freshDocument = dependencies.canvasStore.requireStableAuthoritativeDocument(target)
+      const freshTarget = freshDocument.nodes.find((node) => node.id === target.nodeId)
+      if (!freshTarget || freshTarget.kind !== 'image' || freshTarget.imageModuleId !== target.imageModuleId) {
+        throw new Error('CANVAS_IMAGE_TARGET_INVALID')
+      }
+      for (const input of inputs) {
+        const freshSource = freshDocument.nodes.find((node) => node.id === input.node.id)
+        const freshEdge = freshDocument.edges.find((edge) => edge.id === input.edgeId)
+        if (!freshSource
+          || !isSameCanvasInputSource(input.node, freshSource)
+          || !freshEdge
+          || freshEdge.sourceNodeId !== input.node.id
+          || freshEdge.targetNodeId !== target.nodeId
+          || freshEdge.sourceOutputKey !== input.sourceOutputKey
+          || freshEdge.sourcePort !== input.sourcePort
+          || freshEdge.targetPort !== input.targetPort
+          || resolveCanvasEdgeBinding(freshEdge, freshSource.kind, freshTarget.kind).state !== 'bound') {
+          throw new Error('CANVAS_IMAGE_INPUT_REVISION_CONFLICT')
+        }
       }
       return references
     },

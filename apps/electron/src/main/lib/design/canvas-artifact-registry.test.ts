@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  AUDIO_ARTIFACT_DESCRIPTOR,
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   IMAGE_ARTIFACT_DESCRIPTOR,
+  VIDEO_ARTIFACT_DESCRIPTOR,
   WEBVIEW_ARTIFACT_DESCRIPTOR,
   createCanvasImageArtifactAdapter,
   createCanvasArtifactRegistry,
@@ -15,6 +17,8 @@ function createAdapters(): CanvasArtifactAdapter[] {
     { descriptor: DOCUMENT_ARTIFACT_DESCRIPTOR },
     { descriptor: WEBVIEW_ARTIFACT_DESCRIPTOR },
     { descriptor: IMAGE_ARTIFACT_DESCRIPTOR },
+    { descriptor: AUDIO_ARTIFACT_DESCRIPTOR },
+    { descriptor: VIDEO_ARTIFACT_DESCRIPTOR },
   ]
 }
 
@@ -134,6 +138,8 @@ describe('Canvas Artifact Registry', () => {
       documentAdapter,
       { descriptor: WEBVIEW_ARTIFACT_DESCRIPTOR },
       { descriptor: IMAGE_ARTIFACT_DESCRIPTOR },
+      { descriptor: AUDIO_ARTIFACT_DESCRIPTOR },
+      { descriptor: VIDEO_ARTIFACT_DESCRIPTOR },
     ])
 
     expect(() => {
@@ -161,6 +167,8 @@ describe('Canvas Artifact Registry', () => {
       documentAdapter,
       { descriptor: WEBVIEW_ARTIFACT_DESCRIPTOR },
       { descriptor: IMAGE_ARTIFACT_DESCRIPTOR },
+      { descriptor: AUDIO_ARTIFACT_DESCRIPTOR },
+      { descriptor: VIDEO_ARTIFACT_DESCRIPTOR },
     ])
 
     mutableCapabilities.push('run')

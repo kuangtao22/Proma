@@ -19,6 +19,7 @@ import {
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
   parseCanvasAgentOutputPointer,
+  parseCanvasMediaModelScope,
   parseCanvasEdgeRelation,
   resolveCanvasEdgeBinding,
 } from '@proma/shared'
@@ -350,12 +351,14 @@ function parseViewport(value: unknown, message: string): { x: number; y: number;
  * @param message 失败时沿用的上层稳定错误码。
  * @param allowLegacyWebviewDeviceDefault 是否允许 schema v2 WebView 缺省为网页预设。
  * @param allowAgentOutputPointer 是否允许当前 schema v4 的正式输出指针。
+ * @param allowMediaAdoptionProjection 是否允许 Host 持久化的媒体采用投影版本。
  */
 function parseCanvasNode(
   value: unknown,
   message: string,
   allowLegacyWebviewDeviceDefault = false,
   allowAgentOutputPointer = true,
+  allowMediaAdoptionProjection = false,
 ): CanvasNode {
   if (!isRecord(value)
     || !isSafeDesignStableId(value.id)
@@ -434,6 +437,24 @@ function parseCanvasNode(
       kind: 'image',
       imageModuleId: value.imageModuleId,
       ...(value.adoptedAssetId === undefined ? {} : { adoptedAssetId: value.adoptedAssetId }),
+    }
+  }
+  /** 媒体内部采用版本只允许从权威文档恢复，公共 mutation 默认拒绝该字段。 */
+  if ((value.kind === 'audio' || value.kind === 'video')
+    && (hasExactKeys(value, [...baseKeys, 'mediaModuleId'])
+      || (allowMediaAdoptionProjection
+        && hasExactKeys(value, [...baseKeys, 'mediaModuleId', 'adoptedConfigRevision'])))
+    && isSafeDesignStableId(value.mediaModuleId)
+    && (value.adoptedConfigRevision === undefined
+      || (Number.isSafeInteger(value.adoptedConfigRevision)
+        && (value.adoptedConfigRevision as number) >= 0))) {
+    return {
+      ...base,
+      kind: value.kind,
+      mediaModuleId: value.mediaModuleId,
+      ...(value.adoptedConfigRevision === undefined
+        ? {}
+        : { adoptedConfigRevision: value.adoptedConfigRevision as number }),
     }
   }
   if (value.kind === 'document'
@@ -620,13 +641,18 @@ function parseLegacyCanvasEdge(value: unknown, message: string): CanvasEdgeV3 {
 /** 严格解析当前带语义的稳定端口边并重建对象。 */
 function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
   const fields = [
-    'id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort', 'relation',
+    'id', 'sourceNodeId', 'sourcePort',
+    ...(isRecord(value) && Object.hasOwn(value, 'sourceOutputKey') ? ['sourceOutputKey'] : []),
+    'targetNodeId', 'targetPort', 'relation',
   ] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
     || !isSafeDesignStableId(value.id)
     || !isSafeDesignStableId(value.sourceNodeId)
     || (!isSafeDesignStableId(value.sourcePort) && !isCanvasArtifactOutputCapability(value.sourcePort))
+    || (Object.hasOwn(value, 'sourceOutputKey')
+      && (typeof value.sourceOutputKey !== 'string'
+        || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value.sourceOutputKey)))
     || !isSafeDesignStableId(value.targetNodeId)
     || (!isSafeDesignStableId(value.targetPort) && !isCanvasArtifactInputSlot(value.targetPort))) {
     throw new Error(message)
@@ -636,6 +662,7 @@ function parseCanvasEdge(value: unknown, message: string): CanvasEdge {
       id: value.id,
       sourceNodeId: value.sourceNodeId,
       sourcePort: value.sourcePort,
+      ...(Object.hasOwn(value, 'sourceOutputKey') ? { sourceOutputKey: value.sourceOutputKey as string } : {}),
       targetNodeId: value.targetNodeId,
       targetPort: value.targetPort,
       relation: parseCanvasEdgeRelation(value.relation),
@@ -668,6 +695,8 @@ function assertUniqueIds(items: readonly { id: string }[], message: string): voi
  * @returns 规范化当前版本文档与主进程私有迁移上下文。
  */
 export function parseCanvasDocument(value: unknown, target: CanvasTarget): ParsedCanvasDocument {
+  /** 新范围属于 Canvas 文档，旧文件缺省不发生写入迁移。 */
+  const hasScope = isRecord(value) && Object.hasOwn(value, 'mediaModelScope')
   const fields = [
     'schemaVersion',
     'projectId',
@@ -678,6 +707,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     'edges',
     'createdAt',
     'updatedAt',
+    ...(hasScope ? ['mediaModelScope'] : []),
   ] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
@@ -716,6 +746,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
       'CANVAS_DOCUMENT_INVALID',
       value.schemaVersion === 2,
       value.schemaVersion === CANVAS_DOCUMENT_VERSION,
+      value.schemaVersion === CANVAS_DOCUMENT_VERSION,
     ))
   /** 节点类别索引让历史边迁移保持 O(nodes + edges)。 */
   const nodeKindsById = new Map(nodes.map((node) => [node.id, node.kind]))
@@ -752,6 +783,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     canvasId: target.canvasId,
     revision,
     viewport,
+    ...(hasScope ? { mediaModelScope: parseCanvasMediaModelScope(value.mediaModelScope) } : {}),
     nodes,
     edges,
     createdAt: value.createdAt,
@@ -855,6 +887,10 @@ function validateCanvasMutations(
       parseViewport(mutation.viewport, 'CANVAS_MUTATION_INVALID')
       continue
     }
+    if (mutation.type === 'set-media-model-scope' && hasExactKeys(mutation, ['type', 'scope'])) {
+      parseCanvasMediaModelScope(mutation.scope)
+      continue
+    }
     if (mutation.type === 'move-nodes' && hasExactKeys(mutation, ['type', 'positions'])
       && Array.isArray(mutation.positions)) {
       /** 位置列表按 nodeId 唯一，避免 reducer 的 Map 静默折叠。 */
@@ -876,7 +912,13 @@ function validateCanvasMutations(
       && Array.isArray(mutation.nodes)) {
       for (const value of mutation.nodes) {
         /** 每个节点先做单体 exact schema，再检查整批重复 ID。 */
-        const node = parseCanvasNode(value, 'CANVAS_MUTATION_INVALID')
+        const node = parseCanvasNode(
+          value,
+          'CANVAS_MUTATION_INVALID',
+          false,
+          true,
+          !protectAgentOutputPointers,
+        )
         /** 不可信 batch 只能原样携带既有正式输出，不能新增、覆盖或省略指针。 */
         if (authoritativeNodesById) {
           const authoritativeNode = authoritativeNodesById.get(node.id)

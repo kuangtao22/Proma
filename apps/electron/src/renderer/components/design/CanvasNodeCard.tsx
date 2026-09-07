@@ -2,7 +2,7 @@ import * as React from 'react'
 import type { CanvasNodeActivityState, CanvasNodeKind } from '@proma/shared'
 import { Handle, Position } from '@xyflow/react'
 import type { LucideIcon } from 'lucide-react'
-import { Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, MessageSquareQuote, Monitor, MoreHorizontal, Plus } from 'lucide-react'
+import { AudioLines, Bot, CircleAlert, FileImage, FileText, LoaderCircle, Maximize2, MessageSquareQuote, Monitor, MoreHorizontal, Plus, Video } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
@@ -15,6 +15,7 @@ import {
   NATIVE_CANVAS_NODE_TYPE_OPTIONS,
   NativeCanvasNodeTypePickerOption,
 } from './NativeCanvasToolbar'
+import type { MediaRunProgressProjection } from './use-media-run-progress'
 
 /** 折叠卡片只接收画布文档中的精确轻量展示字段和命令回调。 */
 export interface CanvasNodeCardData {
@@ -24,6 +25,8 @@ export interface CanvasNodeCardData {
   statusLabel: string
   /** Workspace 按节点 ID 聚合的瞬时活动状态。 */
   activityState?: CanvasNodeActivityState
+  /** Comfy 图片运行的瞬时阶段与当前节点采样计数。 */
+  mediaProgress?: MediaRunProgressProjection
   summary: string
   /** 仅生图节点可携带的工作区授权缩略图 URL。 */
   previewUrl?: string
@@ -55,6 +58,8 @@ export interface CanvasNodeCardProps extends CanvasNodeCardData {
 const CANVAS_NODE_PRESENTATION: Record<CanvasNodeKind, { label: string; Icon: LucideIcon }> = {
   agent: { label: 'Agent', Icon: Bot },
   image: { label: '生图', Icon: FileImage },
+  audio: { label: '音频', Icon: AudioLines },
+  video: { label: '视频', Icon: Video },
   document: { label: '文档', Icon: FileText },
   webview: { label: '原型', Icon: Monitor },
 }
@@ -99,7 +104,7 @@ function CanvasNodeActivityOutline({ state }: { state: CanvasNodeActivityState }
 
 /** 节点侧菜单单项的最小结构，兼容顶部菜单的禁用视频项。 */
 export interface CanvasNodeChildTypeOption {
-  kind: CanvasNodeKind | 'video'
+  kind: CanvasNodeKind
   label: string
   enabled: boolean
 }
@@ -110,7 +115,7 @@ export function createCanvasNodeChildTypeSelectHandler(
   sourceNodeId: string,
   onCreateChild: (sourceNodeId: string, kind: CanvasNodeKind) => void,
 ): (() => void) | undefined {
-  if (!option.enabled || option.kind === 'video') return undefined
+  if (!option.enabled) return undefined
   /** 捕获已收窄类型，避免回调执行时重新读取宽联合字段。 */
   const kind = option.kind
   return () => onCreateChild(sourceNodeId, kind)
@@ -135,6 +140,7 @@ export function CanvasNodeCard({
   title,
   statusLabel,
   activityState = 'idle',
+  mediaProgress,
   summary,
   previewUrl,
   nodeHeight,
@@ -163,6 +169,12 @@ export function CanvasNodeCard({
   /** 默认节点保留原 Tailwind 固定类，动态节点改用精确内联尺寸。 */
   const hasDynamicWidth = resolvedWidth !== 288
   const hasDynamicHeight = resolvedHeight !== 144
+  /** Comfy 阶段优先于普通 Job 状态，但不会写回节点或改变卡片几何。 */
+  const visibleStatusLabel = mediaProgress?.phaseLabel ?? statusLabel
+  /** 辅助技术同时读取阶段与当前节点采样计数。 */
+  const accessibleMediaProgress = mediaProgress?.nodeProgressLabel
+    ? `，${mediaProgress.nodeProgressLabel}`
+    : ''
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <div
@@ -189,7 +201,7 @@ export function CanvasNodeCard({
             hasDynamicHeight ? 'h-full' : 'h-[144px]',
             selected ? 'border-primary ring-2 ring-primary/25' : 'border-border',
           )}
-          aria-label={`${label}：${title}，${statusLabel}${activityState === 'idle' ? '' : `，${CANVAS_NODE_ACTIVITY_LABELS[activityState]}`}`}
+          aria-label={`${label}：${title}，${visibleStatusLabel}${accessibleMediaProgress}${activityState === 'idle' ? '' : `，${CANVAS_NODE_ACTIVITY_LABELS[activityState]}`}`}
         >
           <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
             <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
@@ -265,7 +277,10 @@ export function CanvasNodeCard({
               />
               <div className="absolute inset-x-0 bottom-0 flex min-w-0 items-center gap-2 bg-background/90 px-3 py-1.5 text-xs backdrop-blur-sm">
                 <p className="min-w-0 flex-1 truncate font-medium text-foreground">{title}</p>
-                <span className="shrink-0 text-muted-foreground" role="status">{statusLabel}</span>
+                <span className="min-w-0 shrink text-right text-muted-foreground" role="status" title={mediaProgress?.nodeProgressLabel}>
+                  <span className="block truncate">{visibleStatusLabel}</span>
+                  {mediaProgress?.nodeProgressLabel ? <span className="block max-w-40 truncate text-[10px]">{mediaProgress.nodeProgressLabel}</span> : null}
+                </span>
               </div>
             </div>
           ) : (
@@ -275,9 +290,12 @@ export function CanvasNodeCard({
               </h3>
               <div className="mt-auto flex min-w-0 items-center gap-2 text-xs">
                 <p className="min-w-0 flex-1 truncate text-muted-foreground">{summary}</p>
-                <span className="flex shrink-0 items-center gap-1 font-medium text-foreground" role="status">
-                  <CanvasNodeStatusIcon kind={kind} statusLabel={statusLabel} />
-                  {statusLabel}
+                <span className="min-w-0 shrink text-right font-medium text-foreground" role="status" title={mediaProgress?.nodeProgressLabel}>
+                  <span className="flex items-center justify-end gap-1">
+                    <CanvasNodeStatusIcon kind={kind} statusLabel={statusLabel} />
+                    {visibleStatusLabel}
+                  </span>
+                  {mediaProgress?.nodeProgressLabel ? <span className="block max-w-40 truncate text-[10px] font-normal text-muted-foreground">{mediaProgress.nodeProgressLabel}</span> : null}
                 </span>
               </div>
             </div>

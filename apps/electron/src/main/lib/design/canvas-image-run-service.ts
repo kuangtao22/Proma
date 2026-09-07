@@ -355,7 +355,9 @@ export function createCanvasImageRunService(
             /** 配置与预检使用相同快照，避免固化输入漂移。 */
             const config = await dependencies.imageModules.load(imageTarget)
             assertOwnedImageConfig(config, imageTarget)
-            if (!config.selectedModelProfileId) throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+            if ((config.selectedModelProfileId ? 1 : 0) + (config.mediaWorkflow ? 1 : 0) !== 1) {
+              throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
+            }
             /** 后续幂等创建复用此处完成预检的输入。 */
             const input: CreateDesignJobInput = {
               projectId: target.projectId,
@@ -368,7 +370,9 @@ export function createCanvasImageRunService(
               action: config.adoptedAssetId ? 'edit' : 'generate',
               prompt: config.prompt,
               contextMode: config.contextMode,
-              imageModelProfileId: config.selectedModelProfileId,
+              ...(config.mediaWorkflow
+                ? { mediaWorkflow: structuredClone(config.mediaWorkflow) }
+                : { imageModelProfileId: config.selectedModelProfileId! }),
               generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
               canvasImageConfigRevision: config.revision,
               candidateBatchId,

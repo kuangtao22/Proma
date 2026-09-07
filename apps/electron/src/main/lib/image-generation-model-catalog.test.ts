@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Channel, ImageGenerationModelProfile, ImageGenerationModelSnapshot } from '@proma/shared'
+import type { CanvasImageMediaWorkflow, Channel, ImageGenerationModelOption, ImageGenerationModelProfile, ImageGenerationModelSnapshot } from '@proma/shared'
 import {
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
@@ -151,6 +151,7 @@ describe('ImageGenerationModelCatalog', () => {
       channelOptions: [],
       inheritedFromLegacyConfig: true,
       credentialsConfigured: true,
+      revision: 0,
     })
     expect(existsSync(configPath)).toBe(false)
   })
@@ -187,11 +188,14 @@ describe('ImageGenerationModelCatalog', () => {
       channelOptions: [],
       inheritedFromLegacyConfig: false,
       credentialsConfigured: true,
+      revision: 1,
     })
     expect(restored).toEqual(saved)
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
+      revision: 1,
       profiles: saved.profiles,
+      mediaApiProfiles: [],
     })
     expect(JSON.parse(readFileSync(`${configPath}.bak`, 'utf8'))).toEqual(previousFile)
     expect(existsSync(`${configPath}.tmp`)).toBe(false)
@@ -262,7 +266,7 @@ describe('ImageGenerationModelCatalog', () => {
     expect(result.credentialsConfigured).toBe(true)
   })
 
-  test('Given schema v1 Nano Banana 目录 When 读取后保存 Then 原 ID 以 schema v2 原子写回', () => {
+  test('Given schema v1 Nano Banana 目录 When 读取后保存 Then 原 ID 以 schema v3 原子写回', () => {
     writeRawConfig(JSON.stringify({
       schemaVersion: 1,
       profiles: [createProfile('profile-old')],
@@ -275,8 +279,10 @@ describe('ImageGenerationModelCatalog', () => {
     expect(JSON.parse(readFileSync(configPath, 'utf8')).schemaVersion).toBe(1)
     catalog.replaceProfiles(loaded.profiles)
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
+      revision: 1,
       profiles: loaded.profiles,
+      mediaApiProfiles: [],
     })
   })
 
@@ -305,6 +311,66 @@ describe('ImageGenerationModelCatalog', () => {
     })
     expect(JSON.stringify(catalog.listCatalog())).not.toContain('secret-key')
     expect(JSON.stringify(catalog.listCatalog())).not.toContain('encrypted-key')
+  })
+
+  test('Given 项目私有 Comfy 预设 When 列出与解析 Then 仅目标项目得到固定版本快照', () => {
+    const snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'comfyui' }> = {
+      profileId: 'media:preset-1:3',
+      name: 'Comfy 海报',
+      executor: 'comfyui',
+      modelId: 'workflow-1@2',
+      mediaProfileId: 'preset-1',
+      mediaProfileRevision: 3,
+      connectionId: 'connection-1',
+      workflowId: 'workflow-1',
+      workflowRevision: 2,
+      workflowHash: 'a'.repeat(64),
+    }
+    const option: ImageGenerationModelOption = { ...snapshot, available: true }
+    const catalog = new ImageGenerationModelCatalog({
+      configPath,
+      getNanoBananaCredentials: () => ({}),
+      listChannels: () => [],
+      decryptChannelApiKey: () => '',
+      media: {
+        listOptions: (projectId) => projectId === 'project-a' ? [option] : [],
+        resolveAvailableSnapshot: (projectId, selectionId) => {
+          if (projectId !== 'project-a' || selectionId !== snapshot.profileId) throw new Error('MEDIA_PROFILE_NOT_AUTHORIZED')
+          return snapshot
+        },
+        resolveAvailableWorkflowSnapshot: (_projectId, workflow) => ({
+          executor: 'comfyui', source: 'workflow', name: '公共图片工作流',
+          modelId: `${workflow.workflowId}@${workflow.workflowRevision}`,
+          connectionId: workflow.connectionId, instanceGeneration: 'generation-1',
+          workflowId: workflow.workflowId, workflowRevision: workflow.workflowRevision,
+          workflowHash: 'b'.repeat(64), inputs: structuredClone(workflow.inputs),
+        }),
+        assertSnapshotAvailable: (projectId, current) => {
+          if (projectId !== 'project-a' || current.workflowHash !== snapshot.workflowHash) throw new Error('MEDIA_PROFILE_NOT_AUTHORIZED')
+        },
+      },
+    })
+
+    expect(catalog.listOptions('project-a')).toContainEqual(option)
+    expect(catalog.listOptions('project-b')).not.toContainEqual(option)
+    expect(catalog.resolveAvailableSnapshot(snapshot.profileId, 'project-a')).toEqual(snapshot)
+    expect(() => catalog.resolveAvailableSnapshot(snapshot.profileId, 'project-b')).toThrow('MEDIA_PROFILE_NOT_AUTHORIZED')
+    expect(catalog.resolveExecutionRoute(snapshot, 'project-a')).toEqual({ executor: 'comfyui', snapshot })
+
+    /** 公共工作流选择不经过 profile ID 解析，也不生成伪模型身份。 */
+    const workflowSelection: CanvasImageMediaWorkflow = {
+      workflowId: 'workflow-public', workflowRevision: 4, connectionId: 'connection-1',
+      inputs: { prompt: { kind: 'scalar', value: '海报' } },
+    }
+    const workflowSnapshot = catalog.resolveAvailableWorkflowSnapshot(workflowSelection, 'project-a')
+    expect(workflowSnapshot).toEqual({
+      executor: 'comfyui', source: 'workflow', name: '公共图片工作流',
+      modelId: 'workflow-public@4',
+      connectionId: 'connection-1', instanceGeneration: 'generation-1',
+      workflowId: 'workflow-public', workflowRevision: 4, workflowHash: 'b'.repeat(64),
+      inputs: workflowSelection.inputs,
+    })
+    expect(workflowSnapshot).not.toHaveProperty('profileId')
   })
 
   test('Given 已保存 GPT profile 的渠道被删除 When 列出选项 Then 保留 profile 并说明不可用', () => {
@@ -465,7 +531,7 @@ describe('ImageGenerationModelCatalog', () => {
 
   test.each([
     ['损坏 JSON', '{', '生图模型目录 JSON 损坏'],
-    ['未知 schemaVersion', JSON.stringify({ schemaVersion: 3, profiles: [] }), 'schemaVersion'],
+    ['未知 schemaVersion', JSON.stringify({ schemaVersion: 4, profiles: [] }), 'schemaVersion'],
     ['重复 ID', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('dup'), createProfile('dup')] }), 'ID 重复'],
     ['空 name', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-name', { name: '  ' })] }), 'name'],
     ['空 modelId', JSON.stringify({ schemaVersion: 1, profiles: [createProfile('empty-model', { modelId: '' })] }), 'modelId'],

@@ -2,12 +2,14 @@ import { describe, expect, test } from 'bun:test'
 import type { CanvasNode } from '@proma/shared'
 import { canvasNodeCapabilityRegistry } from './canvas-node-capability-registry'
 
-/** 构造覆盖四类节点的最小权威节点。 */
+/** 构造覆盖全部节点类别的最小权威节点。 */
 function createNode(kind: CanvasNode['kind']): CanvasNode {
   const base = { id: `${kind}-1`, kind, title: kind, position: { x: 0, y: 0 } }
   switch (kind) {
     case 'agent': return { ...base, kind, agentSessionId: 'session-1' }
     case 'image': return { ...base, kind, imageModuleId: 'image-module-1' }
+    case 'audio':
+    case 'video': return { ...base, kind, mediaModuleId: 'media-module-1' }
     case 'document': return { ...base, kind, documentId: 'document-1', contentRevision: 1 }
     case 'webview': return { ...base, kind, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' }
   }
@@ -24,7 +26,7 @@ describe('Canvas 节点能力注册表', () => {
     expect(canvasNodeCapabilityRegistry.list(createNode('webview'), { availability: 'available' }))
       .toEqual(['read', 'update-content'])
 
-    for (const kind of ['agent', 'image', 'document', 'webview'] as const) {
+    for (const kind of ['agent', 'image', 'audio', 'video', 'document', 'webview'] as const) {
       const capabilities = canvasNodeCapabilityRegistry.list(createNode(kind), { availability: 'available' })
       expect(capabilities.length).toBeLessThanOrEqual(5)
       expect(new Set(capabilities).size).toBe(capabilities.length)
@@ -33,8 +35,9 @@ describe('Canvas 节点能力注册表', () => {
 
   test('Given 节点不可用或损坏 When 枚举能力 Then 绝不公开运行能力', () => {
     for (const availability of ['unavailable', 'corrupt'] as const) {
-      expect(canvasNodeCapabilityRegistry.list(createNode('agent'), { availability })).not.toContain('run')
-      expect(canvasNodeCapabilityRegistry.list(createNode('image'), { availability })).not.toContain('run')
+      for (const kind of ['agent', 'image', 'audio', 'video'] as const) {
+        expect(canvasNodeCapabilityRegistry.list(createNode(kind), { availability })).not.toContain('run')
+      }
     }
   })
 

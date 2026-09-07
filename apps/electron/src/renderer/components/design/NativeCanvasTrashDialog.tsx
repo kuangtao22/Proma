@@ -182,6 +182,8 @@ export interface NativeCanvasTrashEntriesProps extends NativeCanvasTrashState {
 /** 回收条目类型的稳定中文标签。 */
 const TRASH_KIND_LABELS: Record<CanvasTrashEntry['kind'], string> = {
   image: '生图',
+  audio: '音频',
+  video: '视频',
   document: '文档',
   webview: '原型',
 }

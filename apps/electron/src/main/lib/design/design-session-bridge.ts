@@ -52,6 +52,12 @@ export interface OpenAuthorizedAgentImageSourceInput {
   allowedRoots: string[]
 }
 
+/** 打开已授权 Agent 通用媒体时使用的大小与错误语义。 */
+export interface OpenAuthorizedAgentMediaSourceInput extends OpenAuthorizedAgentImageSourceInput {
+  maxBytes: number
+  label: '图片' | '媒体'
+}
+
 /** Design 与 Agent 会话双向传递所需的可信主进程依赖。 */
 export interface DesignSessionBridgeDependencies {
   getSession: (sessionId: string) => AgentSessionMeta | undefined
@@ -74,35 +80,42 @@ function isPathWithinRoot(candidate: string, root: string): boolean {
 }
 
 /** 从已打开的稳定 fd 读取，并复核读取前后文件身份与大小未变化。 */
-function readStableAgentImage(descriptor: number, expected: { dev: number; ino: number; size: number }): Buffer {
+function readStableAgentFile(
+  descriptor: number,
+  expected: { dev: number; ino: number; size: number; mtimeMs: number },
+  maxBytes: number,
+  label: '图片' | '媒体',
+): Buffer {
   const before = fstatSync(descriptor)
   if (!before.isFile()
     || before.dev !== expected.dev
     || before.ino !== expected.ino
     || before.size !== expected.size
-    || before.size > MAX_AGENT_IMAGE_BYTES) {
-    throw new Error('Agent 图片文件身份已变化')
+    || before.mtimeMs !== expected.mtimeMs
+    || before.size > maxBytes) {
+    throw new Error(`Agent ${label}文件身份已变化`)
   }
   const bytes = readFileSync(descriptor)
   const after = fstatSync(descriptor)
   if (after.dev !== before.dev
     || after.ino !== before.ino
     || after.size !== before.size
+    || after.mtimeMs !== before.mtimeMs
     || bytes.byteLength !== before.size) {
-    throw new Error('Agent 图片读取期间已变化')
+    throw new Error(`Agent ${label}读取期间已变化`)
   }
   return bytes
 }
 
 /** 在授权根内打开稳定图片句柄，供会话桥与 Canvas Agent 工具共同使用。 */
-export function openAuthorizedAgentImageSource(
-  input: OpenAuthorizedAgentImageSourceInput,
+export function openAuthorizedAgentMediaSource(
+  input: OpenAuthorizedAgentMediaSourceInput,
 ): DesignAuthorizedImageSource {
   /** 相对路径只允许相对本次 Agent 的可信工作目录解释。 */
   const requestedPath = resolve(input.baseDir, input.inputPath)
   /** 明确拒绝叶子符号链接，避免平台缺少 O_NOFOLLOW 时语义降级。 */
   const requestedStat = lstatSync(requestedPath)
-  if (requestedStat.isSymbolicLink()) throw new Error('Agent 图片不能是符号链接')
+  if (requestedStat.isSymbolicLink()) throw new Error(`Agent ${input.label}不能是符号链接`)
   /** 无法 canonicalize 的授权根不参与授权判断。 */
   const allowedRoots = input.allowedRoots.flatMap((root) => {
     try {
@@ -116,8 +129,8 @@ export function openAuthorizedAgentImageSource(
     /** 稳定 fd 保证授权完成后，即使路径被置换，读取的仍是同一个 inode。 */
     descriptor = openSync(requestedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
     const openedStat = fstatSync(descriptor)
-    if (!openedStat.isFile()) throw new Error('Agent 图片不是普通文件')
-    if (openedStat.size > MAX_AGENT_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
+    if (!openedStat.isFile()) throw new Error(`Agent ${input.label}不是普通文件`)
+    if (openedStat.size > input.maxBytes) throw new Error(`${input.label}不能超过 ${Math.floor(input.maxBytes / 1024 / 1024)} MiB`)
     /** 真实路径与 fd 必须指向同一文件，并且真实路径必须处于授权根内。 */
     const imagePath = realpathSync(requestedPath)
     const pathStat = lstatSync(imagePath)
@@ -125,11 +138,12 @@ export function openAuthorizedAgentImageSource(
       || pathStat.isSymbolicLink()
       || pathStat.dev !== openedStat.dev
       || pathStat.ino !== openedStat.ino
-      || pathStat.size !== openedStat.size) {
-      throw new Error('Agent 图片授权校验期间已变化')
+      || pathStat.size !== openedStat.size
+      || pathStat.mtimeMs !== openedStat.mtimeMs) {
+      throw new Error(`Agent ${input.label}授权校验期间已变化`)
     }
     if (!allowedRoots.some((root) => isPathWithinRoot(imagePath, root))) {
-      throw new Error('图片不在指定 Agent 会话的授权目录内')
+      throw new Error(`${input.label}不在指定 Agent 会话的授权目录内`)
     }
     let closed = false
     /** 返回的来源只暴露稳定读取与幂等关闭能力，不暴露原始 fd。 */
@@ -137,8 +151,8 @@ export function openAuthorizedAgentImageSource(
       sourcePath: imagePath,
       byteSize: openedStat.size,
       readBytes: () => {
-        if (closed || descriptor === undefined) throw new Error('Agent 图片稳定句柄已关闭')
-        return readStableAgentImage(descriptor, openedStat)
+        if (closed || descriptor === undefined) throw new Error(`Agent ${input.label}稳定句柄已关闭`)
+        return readStableAgentFile(descriptor, openedStat, input.maxBytes, input.label)
       },
       close: () => {
         if (closed || descriptor === undefined) return
@@ -151,6 +165,13 @@ export function openAuthorizedAgentImageSource(
     if (descriptor !== undefined) closeSync(descriptor)
     throw error
   }
+}
+
+/** 保留 Design 图片调用入口和既有 64 MiB 错误合同。 */
+export function openAuthorizedAgentImageSource(
+  input: OpenAuthorizedAgentImageSourceInput,
+): DesignAuthorizedImageSource {
+  return openAuthorizedAgentMediaSource({ ...input, maxBytes: MAX_AGENT_IMAGE_BYTES, label: '图片' })
 }
 
 /** 从指定会话持久化消息中寻找精确 localPath 的图片归属证据。 */

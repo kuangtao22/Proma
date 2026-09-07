@@ -109,6 +109,28 @@ describe('Design 素材安全服务', () => {
       .toThrow('DESIGN_ASSET_NOT_FOUND')
   })
 
+  test('Given 候选元数据合法 When 原图完整、缺失或同尺寸篡改 Then 采用前验证只接受完整内容', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const assetPath = join(paths.assetsDir, basename(asset!.relativePath))
+    const originalBytes = readFileSync(assetPath)
+
+    await expect(service.verifyStoredAsset('project-1', asset!.id)).resolves.toBeUndefined()
+    await expect(service.verifyStoredAsset('project-1', 'missing-asset'))
+      .rejects.toThrow('DESIGN_ASSET_NOT_FOUND')
+
+    rmSync(assetPath)
+    await expect(service.verifyStoredAsset('project-1', asset!.id))
+      .rejects.toThrow('素材文件不存在')
+
+    const changedBytes = Buffer.from(originalBytes)
+    changedBytes[changedBytes.length - 1] = changedBytes[changedBytes.length - 1]! ^ 0xff
+    writeFileSync(assetPath, changedBytes)
+    expect(changedBytes.byteLength).toBe(asset!.byteSize)
+    await expect(service.verifyStoredAsset('project-1', asset!.id))
+      .rejects.toThrow('素材文件内容已变化')
+  })
+
   test('Given 缩略图被替换为符号链接或损坏文件 When Agent 请求读取 Then fail closed', async () => {
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])

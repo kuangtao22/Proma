@@ -3,7 +3,7 @@ import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument, SkillMeta } from '@proma/shared'
 import type { AgentRunExtensions } from '../agent-run-extensions'
 import type { CanvasAgentConfig } from './canvas-agent-config-store'
-import type { CanvasToolRun } from './canvas-tool-provider'
+import type { CanvasToolRun, CanvasToolRunContext } from './canvas-tool-provider'
 import {
   createCanvasAgentExecutionService,
   type CanvasAgentExecutionServiceDependencies,
@@ -32,6 +32,7 @@ function createFixture(options: {
   inspectHeadlessExtensions?: (extensions: AgentRunExtensions | undefined) => void
   parentAccessError?: Error
   inspectRunOutsidePrepare?: (prepareHeld: boolean) => void
+  inspectCanvasRunContext?: (context: CanvasToolRunContext) => void
 } = {}) {
   const calls: string[] = []
   const document: CanvasDocument = createEmptyCanvasDocument(target.projectId, target.canvasId, 1)
@@ -103,6 +104,7 @@ function createFixture(options: {
     },
     createCanvasRun: (context) => {
       calls.push(`tools:${context.canvasAgentMode}:${context.explicitReferences.map((reference) => reference.nodeId).join(',')}`)
+      options.inspectCanvasRunContext?.(context)
       return options.canvasRun ?? {
         systemPromptAppend: 'tools-prompt', piCustomTools: [],
         allowedToolNames: ['canvas_read', 'canvas_run_nodes'],
@@ -191,14 +193,17 @@ describe('Canvas Agent 统一执行服务', () => {
   })
 
   test('Given 父 Agent 编排运行 When 成功完成 Then 无需 Renderer 且使用 design 来源和父会话路由', async () => {
-    const fixture = createFixture()
+    let capturedContext: CanvasToolRunContext | undefined
+    const fixture = createFixture({ inspectCanvasRunContext: (context) => { capturedContext = context } })
     await fixture.service.execute({
       mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '生成三幕分镜',
       skillNames: ['专业策划'], userMessageUuid: 'anchor-2', startedAt: 60,
+      parentWorkflow: { runId: 'workflow-1', parentSessionId: 'parent-1' },
     })
 
     expect(fixture.calls).toContain('headless:design:parent-1:external')
     expect(fixture.calls).toContain('tools:parent-orchestrated:input-1')
+    expect(capturedContext?.parentWorkflow).toEqual({ runId: 'workflow-1', parentSessionId: 'parent-1' })
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
   })
 

@@ -22,6 +22,8 @@ import {
   requireCanvasAgentRunOwner,
 } from './canvas-agent-run-policy'
 import type { CanvasToolRun, CanvasToolRunContext } from './canvas-tool-provider'
+import { MEDIA_TOOL_NAMES } from '../media/media-tool-provider'
+import { CANVAS_IMAGE_CANDIDATE_TOOL_NAMES } from './canvas-image-candidate-tools'
 
 /** Renderer 手动运行只接受 IPC 已严格解析的消息身份。 */
 export interface CanvasRendererManualAgentExecutionRequest {
@@ -38,6 +40,8 @@ export interface CanvasParentOrchestratedAgentExecutionRequest {
   mode: 'parent-orchestrated'
   target: CanvasAgentTarget
   parentSessionId: string
+  /** Host 绑定的父持久工作流身份，子 Agent 不可从模型参数伪造。 */
+  parentWorkflow?: { runId: string; parentSessionId: string }
   /** Provider 初检时的图版本，只能由 Host 从工具参数重建。 */
   expectedGraphRevision: number
   instruction: string
@@ -114,6 +118,10 @@ export interface CanvasAgentExecutionService {
 
 /** parent 模式只开放当前节点生产所需能力；未来新增工具默认无权进入子 Agent。 */
 const PARENT_ALLOWED_CANVAS_TOOLS = new Set([
+  ...CANVAS_IMAGE_CANDIDATE_TOOL_NAMES,
+  ...MEDIA_TOOL_NAMES.filter((name) => !['media_execute_run', 'media_cancel_run', 'media_save_profile'].includes(name)),
+  'media_list_sources',
+  'media_import_assets',
   'canvas_get_context',
   'canvas_list_nodes',
   'canvas_inspect_images',
@@ -121,8 +129,14 @@ const PARENT_ALLOWED_CANVAS_TOOLS = new Set([
   'canvas_apply_changes',
   'canvas_import_image',
   'canvas_create_artifact',
+  'canvas_create_media',
   'canvas_update_artifact',
   'canvas_update_image_config',
+  'canvas_update_media_config',
+  'canvas_inspect_media',
+  'canvas_adopt_media_candidate',
+  'canvas_get_workflow_run',
+  'canvas_list_workflow_runs',
 ])
 
 /** 将长期和本轮 Skill 名称解析为当前启用 Skill 的稳定 slug。 */
@@ -209,6 +223,10 @@ export function createCanvasAgentExecutionService(
           throw new Error('CANVAS_AGENT_OWNER_INVALID')
         }
         if (request.mode === 'parent-orchestrated') {
+          if (request.parentWorkflow
+            && request.parentWorkflow.parentSessionId !== request.parentSessionId) {
+            throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+          }
           if (currentSnapshot.document.revision !== request.expectedGraphRevision) {
             throw new Error('CANVAS_REVISION_CONFLICT')
           }
@@ -240,6 +258,9 @@ export function createCanvasAgentExecutionService(
           permissionCeiling: currentOwner.session.permissionMode === 'plan' ? 'plan' : 'execute',
           canvasAgentTarget: request.target,
           canvasAgentMode: request.mode,
+          ...(request.mode === 'parent-orchestrated' && request.parentWorkflow
+            ? { parentWorkflow: request.parentWorkflow }
+            : {}),
         })
         const prompt = buildCanvasAgentExecutionSystemPrompt({
           mode: request.mode,

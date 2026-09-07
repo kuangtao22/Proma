@@ -10,6 +10,7 @@ import type {
   CanvasEdge,
   CanvasEdgeRelation,
   CanvasNode,
+  CanvasNodeKind,
   CanvasWorkflowNodeStatus,
 } from '@proma/shared'
 import { canvasNodeCapabilityRegistry } from './canvas-node-capability-registry'
@@ -28,6 +29,10 @@ export interface CreateCanvasWorkflowGraphPlanInput {
   document: CanvasDocument
   startNodeIds: readonly string[]
   maxImageRuns: number
+  /** 新版持久 planner 显式开放的起点类型；缺省保持旧 Agent-only 合同。 */
+  allowedStartNodeKinds?: readonly CanvasNodeKind[]
+  /** 新版持久 planner 为音视频与图片共用生成预算；缺省只计算图片。 */
+  countAudioVideoRunsInBudget?: boolean
 }
 
 /** 确定性 Canvas 执行图，Map 的插入顺序同样使用稳定节点 ID。 */
@@ -132,6 +137,9 @@ function hasCommittedArtifact(node: CanvasNode): boolean {
   switch (node.kind) {
     case 'agent': return node.outputPointer !== undefined
     case 'image': return node.adoptedAssetId !== undefined
+    /** 音视频采用事实位于独立模块，不能仅凭节点引用猜测已满足。 */
+    case 'audio':
+    case 'video': return false
     case 'document':
     case 'webview': return Number.isSafeInteger(node.contentRevision) && node.contentRevision >= 0
   }
@@ -201,8 +209,14 @@ export function createCanvasWorkflowGraphPlan(
     if (nodesById.has(node.id)) throw new Error('CANVAS_WORKFLOW_GRAPH_INVALID')
     nodesById.set(node.id, node)
   }
+  const allowedStartNodeKinds = new Set<CanvasNodeKind>(input.allowedStartNodeKinds ?? ['agent'])
   for (const rootNodeId of input.startNodeIds) {
-    if (nodesById.get(rootNodeId)?.kind !== 'agent') {
+    const rootNode = nodesById.get(rootNodeId)
+    if (!rootNode || !allowedStartNodeKinds.has(rootNode.kind)) {
+      throw new Error('CANVAS_WORKFLOW_START_NODE_INVALID')
+    }
+    if ((rootNode.kind === 'document' || rootNode.kind === 'webview')
+      && !hasCommittedArtifact(rootNode)) {
       throw new Error('CANVAS_WORKFLOW_START_NODE_INVALID')
     }
   }
@@ -341,7 +355,10 @@ export function createCanvasWorkflowGraphPlan(
   for (const nodeId of orderedNodeIds) {
     const node = nodesById.get(nodeId)!
     if (rootNodeIdSet.has(nodeId)) {
-      initialStates.set(nodeId, 'started')
+      initialStates.set(
+        nodeId,
+        node.kind === 'document' || node.kind === 'webview' ? 'satisfied' : 'started',
+      )
       continue
     }
     if (hasCommittedArtifact(node) && node.upstreamChange === undefined) {
@@ -352,7 +369,9 @@ export function createCanvasWorkflowGraphPlan(
       initialStates.set(nodeId, 'blocked')
       continue
     }
-    if (node.kind === 'image') {
+    if (node.kind === 'image'
+      || (input.countAudioVideoRunsInBudget === true
+        && (node.kind === 'audio' || node.kind === 'video'))) {
       if (imageRunCount >= input.maxImageRuns) {
         initialStates.set(nodeId, 'waiting-approval')
         continue

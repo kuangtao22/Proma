@@ -26,8 +26,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { ChannelForm } from './ChannelForm'
-import { ImageGenerationModelSettings } from './ImageGenerationModelSettings'
-import { channelSettingsFocusAtom } from '@/atoms/settings-tab'
 
 /** 组件视图模式 */
 type ViewMode = 'list' | 'create' | 'edit'
@@ -74,18 +72,6 @@ export function ChannelSettings(): React.ReactElement {
   const setGlobalChannels = useSetAtom(channelsAtom)
   const [deleteTarget, setDeleteTarget] = React.useState<Channel | null>(null)
   const agentChannelIdRef = React.useRef(agentChannelId)
-  const [focusedSection, setFocusedSection] = useAtom(channelSettingsFocusAtom)
-  const imageModelsRef = React.useRef<HTMLDivElement>(null)
-
-  React.useEffect(() => {
-    if (focusedSection !== 'image-models') return
-    window.requestAnimationFrame(() => {
-      imageModelsRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
-      imageModelsRef.current?.focus({ preventScroll: true })
-      setFocusedSection(null)
-    })
-  }, [focusedSection, setFocusedSection])
-
   React.useEffect(() => {
     agentChannelIdRef.current = agentChannelId
   }, [agentChannelId])
@@ -242,10 +228,6 @@ export function ChannelSettings(): React.ReactElement {
           </SettingsCard>
         ) : null}
       </SettingsSection>
-
-      <div ref={imageModelsRef} tabIndex={-1} className="scroll-mt-4 outline-none focus-visible:ring-2 focus-visible:ring-ring">
-        <ImageGenerationModelSettings />
-      </div>
 
       {/* 删除确认弹窗 */}
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>

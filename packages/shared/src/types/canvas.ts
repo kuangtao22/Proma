@@ -9,6 +9,8 @@ import type {
 } from './design'
 import type { AgentSessionMeta } from './agent'
 import type { SDKMessage } from './agent'
+import type { MediaInputValue } from './media'
+import { parseCanvasMediaModelScope } from './canvas-media-model-scope'
 
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
 export const CANVAS_IPC_CHANNELS = {
@@ -71,7 +73,7 @@ export function parseCanvasWebviewDevicePreset(value: unknown): CanvasWebviewDev
 }
 
 /** Canvas 支持的节点类别，每类节点只引用自身业务事实源。 */
-export type CanvasNodeKind = 'agent' | 'image' | 'document' | 'webview'
+export type CanvasNodeKind = 'agent' | 'image' | 'audio' | 'video' | 'document' | 'webview'
 
 /** 四类 Canvas 节点共享的瞬时活动状态，不写入持久化文档。 */
 export type CanvasNodeActivityState = 'idle' | 'queued' | 'running' | 'waiting-approval'
@@ -107,6 +109,11 @@ export interface CanvasImageTrashEntry extends CanvasTrashEntryBase {
   adoptedAssetId?: string
 }
 
+/** 音视频回收条目只保存受管模块身份，正式输出仍由模块配置恢复。 */
+export interface CanvasMediaTrashEntry extends CanvasTrashEntryBase {
+  kind: 'audio' | 'video'
+}
+
 /** 文档回收条目保留删除时采用的正文修订。 */
 export interface CanvasDocumentTrashEntry extends CanvasTrashEntryBase {
   kind: 'document'
@@ -123,11 +130,14 @@ export interface CanvasWebviewTrashEntry extends CanvasTrashEntryBase {
 /** Renderer 可见的严格回收条目判别联合。 */
 export type CanvasTrashEntry =
   | CanvasImageTrashEntry
+  | CanvasMediaTrashEntry
   | CanvasDocumentTrashEntry
   | CanvasWebviewTrashEntry
 
 /** Canvas 内容稳定 ID 的共享边界，与 native helper 合同保持一致。 */
 const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+/** AV 多输出选择 key 与媒体工作流 key 使用同一安全字符集。 */
+const CANVAS_EDGE_OUTPUT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/
 /** 图片提示词上限，避免配置、IPC 与任务 journal 被无界文本放大。 */
 export const CANVAS_IMAGE_PROMPT_MAX_LENGTH = 100_000
 /** Canvas 可恢复命令使用的 UUID，避免 operationId 与稳定内容 ID 混用。 */
@@ -177,7 +187,8 @@ function isCanvasNonNegativeInteger(value: unknown): value is number {
 
 /** 判断未知值是否为受限的 Canvas 内容类别。 */
 function isCanvasContentKind(value: unknown): value is CanvasContentKind {
-  return value === 'image' || value === 'document' || value === 'webview'
+  return value === 'image' || value === 'audio' || value === 'video'
+    || value === 'document' || value === 'webview'
 }
 
 /**
@@ -237,6 +248,8 @@ export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
   const hasV2Keys = record.schemaVersion === 2 && (
     (record.kind === 'image'
       && (hasExactCanvasKeys(record, baseKeys) || hasExactCanvasKeys(record, [...baseKeys, 'adoptedAssetId'])))
+    || ((record.kind === 'audio' || record.kind === 'video')
+      && hasExactCanvasKeys(record, baseKeys))
     || (record.kind === 'document'
       && hasExactCanvasKeys(record, [...baseKeys, 'contentRevision']))
     || (record.kind === 'webview'
@@ -281,6 +294,9 @@ export function parseCanvasTrashEntry(value: unknown): CanvasTrashEntry {
       kind: 'image',
       ...(record.adoptedAssetId === undefined ? {} : { adoptedAssetId: record.adoptedAssetId }),
     }
+  }
+  if (record.kind === 'audio' || record.kind === 'video') {
+    return { ...base, kind: record.kind }
   }
   if (record.kind === 'document') {
     if (!isLegacy && !isCanvasNonNegativeInteger(record.contentRevision)) {
@@ -369,6 +385,7 @@ export interface CanvasAgentNode extends CanvasNodeBase {
   agentSessionId: string
   outputPointer?: CanvasAgentOutputPointer
   imageModuleId?: never
+  mediaModuleId?: never
   adoptedAssetId?: never
   documentId?: never
   prototypeId?: never
@@ -382,6 +399,35 @@ export interface CanvasImageNode extends CanvasNodeBase {
   imageModuleId: string
   adoptedAssetId?: string
   agentSessionId?: never
+  mediaModuleId?: never
+  documentId?: never
+  prototypeId?: never
+  contentRevision?: never
+}
+
+/** 引用受管音频模块；正式输出只能由模块服务 CAS 采用。 */
+export interface CanvasAudioNode extends CanvasNodeBase {
+  kind: 'audio'
+  mediaModuleId: string
+  /** Host 已完成依赖传播的媒体配置 revision，Renderer 只读。 */
+  adoptedConfigRevision?: number
+  agentSessionId?: never
+  imageModuleId?: never
+  adoptedAssetId?: never
+  documentId?: never
+  prototypeId?: never
+  contentRevision?: never
+}
+
+/** 引用受管视频模块；角色化输出不写入公开图 mutation。 */
+export interface CanvasVideoNode extends CanvasNodeBase {
+  kind: 'video'
+  mediaModuleId: string
+  /** Host 已完成依赖传播的媒体配置 revision，Renderer 只读。 */
+  adoptedConfigRevision?: number
+  agentSessionId?: never
+  imageModuleId?: never
+  adoptedAssetId?: never
   documentId?: never
   prototypeId?: never
   contentRevision?: never
@@ -394,6 +440,7 @@ export interface CanvasDocumentNode extends CanvasNodeBase {
   contentRevision: number
   agentSessionId?: never
   imageModuleId?: never
+  mediaModuleId?: never
   adoptedAssetId?: never
   prototypeId?: never
 }
@@ -406,6 +453,7 @@ export interface CanvasWebviewNode extends CanvasNodeBase {
   devicePreset: CanvasWebviewDevicePreset
   agentSessionId?: never
   imageModuleId?: never
+  mediaModuleId?: never
   adoptedAssetId?: never
   documentId?: never
 }
@@ -414,11 +462,13 @@ export interface CanvasWebviewNode extends CanvasNodeBase {
 export type CanvasNode =
   | CanvasAgentNode
   | CanvasImageNode
+  | CanvasAudioNode
+  | CanvasVideoNode
   | CanvasDocumentNode
   | CanvasWebviewNode
 
 /** 拥有独立内容事实源的 Canvas 节点联合。 */
-export type CanvasContentNode = CanvasImageNode | CanvasDocumentNode | CanvasWebviewNode
+export type CanvasContentNode = CanvasImageNode | CanvasAudioNode | CanvasVideoNode | CanvasDocumentNode | CanvasWebviewNode
 
 /** Canvas 边表达的长期语义关系。 */
 export type CanvasEdgeRelation = 'association' | 'reference' | 'depends-on' | 'derives'
@@ -427,6 +477,8 @@ export type CanvasEdgeRelation = 'association' | 'reference' | 'depends-on' | 'd
 export type CanvasArtifactOutputCapability =
   | 'agent.text'
   | 'image.asset'
+  | 'audio.asset'
+  | 'video.asset'
   | 'document.markdown'
   | 'webview.html'
 
@@ -434,7 +486,11 @@ export type CanvasArtifactOutputCapability =
 export type CanvasArtifactInputSlot =
   | 'context.text'
   | 'context.image'
+  | 'context.audio'
+  | 'context.video'
   | 'image.reference'
+  | 'audio.reference'
+  | 'video.reference'
 
 /** Canvas 边经过节点类型校验后的执行绑定状态。 */
 export type CanvasEdgeBindingResolution =
@@ -454,6 +510,8 @@ export const CANVAS_UNBOUND_PORT = 'unbound'
 const CANVAS_NODE_OUTPUT_CAPABILITY: Readonly<Record<CanvasNodeKind, CanvasArtifactOutputCapability>> = {
   agent: 'agent.text',
   image: 'image.asset',
+  audio: 'audio.asset',
+  video: 'video.asset',
   document: 'document.markdown',
   webview: 'webview.html',
 }
@@ -465,7 +523,9 @@ export function isCanvasArtifactOutputCapability(value: unknown): value is Canva
 
 /** 判断未知值是否为受支持的 Canvas 输入槽。 */
 export function isCanvasArtifactInputSlot(value: unknown): value is CanvasArtifactInputSlot {
-  return value === 'context.text' || value === 'context.image' || value === 'image.reference'
+  return value === 'context.text' || value === 'context.image' || value === 'context.audio'
+    || value === 'context.video' || value === 'image.reference'
+    || value === 'audio.reference' || value === 'video.reference'
 }
 
 /** 严格解析 Canvas 边语义。 */
@@ -482,6 +542,8 @@ export interface CanvasEdge {
   id: string
   sourceNodeId: string
   sourcePort: string
+  /** AV 多输出节点作为图片参考时，固定所选正式输出 key。 */
+  sourceOutputKey?: string
   targetNodeId: string
   targetPort: string
   relation: CanvasEdgeRelation
@@ -499,6 +561,15 @@ export function createCanvasBoundEdge(
   target: Pick<CanvasNode, 'id' | 'kind'>,
   edge: Omit<CanvasEdge, 'sourcePort' | 'targetPort'>,
 ): CanvasEdge {
+  if (edge.sourceOutputKey !== undefined) {
+    if (!isCanvasEdgeOutputKey(edge.sourceOutputKey)
+      || (source.kind !== 'audio' && source.kind !== 'video')
+      || target.kind !== 'image'
+      || edge.relation === 'association') {
+      throw new Error('CANVAS_EDGE_OUTPUT_SELECTION_INVALID')
+    }
+    return { ...edge, sourcePort: 'image.asset', targetPort: 'image.reference' }
+  }
   if (edge.relation === 'association') {
     return { ...edge, sourcePort: CANVAS_UNBOUND_PORT, targetPort: CANVAS_UNBOUND_PORT }
   }
@@ -507,7 +578,11 @@ export function createCanvasBoundEdge(
   /** 图片产物进入媒体槽，其它产物只进入文本上下文。 */
   const targetPort: CanvasArtifactInputSlot = sourcePort === 'image.asset'
     ? target.kind === 'image' ? 'image.reference' : 'context.image'
-    : 'context.text'
+    : sourcePort === 'audio.asset'
+      ? target.kind === 'audio' || target.kind === 'video' ? 'audio.reference' : 'context.audio'
+      : sourcePort === 'video.asset'
+        ? target.kind === 'video' ? 'video.reference' : 'context.video'
+        : 'context.text'
   return { ...edge, sourcePort, targetPort }
 }
 
@@ -523,18 +598,26 @@ export function resolveCanvasEdgeBinding(
   sourceKind: CanvasNodeKind,
   targetKind: CanvasNodeKind,
 ): CanvasEdgeBindingResolution {
-  if (edge.relation === 'association') return { state: 'none' }
+  if (edge.relation === 'association') return edge.sourceOutputKey === undefined
+    ? { state: 'none' }
+    : { state: 'incompatible' }
   /** 用同一建边规则计算当前节点组合唯一允许的端口。 */
-  const expected = createCanvasBoundEdge(
-    { id: edge.sourceNodeId, kind: sourceKind },
-    { id: edge.targetNodeId, kind: targetKind },
-    {
-      id: edge.id,
-      sourceNodeId: edge.sourceNodeId,
-      targetNodeId: edge.targetNodeId,
-      relation: edge.relation,
-    },
-  )
+  let expected: CanvasEdge
+  try {
+    expected = createCanvasBoundEdge(
+      { id: edge.sourceNodeId, kind: sourceKind },
+      { id: edge.targetNodeId, kind: targetKind },
+      {
+        id: edge.id,
+        sourceNodeId: edge.sourceNodeId,
+        ...(edge.sourceOutputKey === undefined ? {} : { sourceOutputKey: edge.sourceOutputKey }),
+        targetNodeId: edge.targetNodeId,
+        relation: edge.relation,
+      },
+    )
+  } catch {
+    return { state: 'incompatible' }
+  }
   if (edge.sourcePort === expected.sourcePort && edge.targetPort === expected.targetPort) {
     return {
       state: 'bound',
@@ -556,6 +639,8 @@ export interface CanvasDocument {
   canvasId: string
   revision: number
   viewport: DesignViewport
+  /** 当前画布新任务的 API 模型候选范围；缺省兼容全部启用模式。 */
+  mediaModelScope?: import('./canvas-media-model-scope').CanvasMediaModelScope
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   createdAt: number
@@ -566,6 +651,12 @@ export interface CanvasDocument {
 export interface SetCanvasViewportMutation {
   type: 'set-viewport'
   viewport: DesignViewport
+}
+
+/** 显式更改当前画布的 API 模型范围，已有任务不受影响。 */
+export interface SetCanvasMediaModelScopeMutation {
+  type: 'set-media-model-scope'
+  scope: import('./canvas-media-model-scope').CanvasMediaModelScope
 }
 
 /** 单个节点的稳定 ID 与目标位置。 */
@@ -614,6 +705,7 @@ export interface SetCanvasWebviewDevicePresetMutation {
 /** Canvas reducer 可按顺序应用的完整 mutation 联合。 */
 export type CanvasMutation =
   | SetCanvasViewportMutation
+  | SetCanvasMediaModelScopeMutation
   | MoveCanvasNodesMutation
   | UpsertCanvasNodesMutation
   | RemoveCanvasNodesMutation
@@ -922,6 +1014,14 @@ export type CanvasImageAspectRatio = '1:1' | '16:9' | '4:3' | '9:16' | '3:4'
 /** 图片模块支持的固定输出尺寸。 */
 export type CanvasImageSize = 'auto' | '1K' | '2K' | '4K'
 
+/** 图片节点选择公共工作流时保存的固定版本、连接与完整输入。 */
+export interface CanvasImageMediaWorkflow {
+  workflowId: string
+  workflowRevision: number
+  connectionId: string
+  inputs: Record<string, MediaInputValue>
+}
+
 /** 图片模块 schema v2 的权威持久化配置。 */
 export interface CanvasImageModuleConfig {
   schemaVersion: 2
@@ -932,6 +1032,7 @@ export interface CanvasImageModuleConfig {
   updatedAt: number
   prompt: string
   selectedModelProfileId: string | null
+  mediaWorkflow?: CanvasImageMediaWorkflow
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
   contextMode: DesignContextMode
@@ -943,6 +1044,7 @@ export interface SaveCanvasImageModuleInput extends CanvasImageTarget {
   expectedConfigRevision: number
   prompt: string
   selectedModelProfileId: string | null
+  mediaWorkflow?: CanvasImageMediaWorkflow
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
   contextMode: DesignContextMode
@@ -1271,6 +1373,10 @@ export interface CanvasImageInputReference {
   summary: string
   summaryHash: string
   assetId?: string
+  /** AV 多输出节点提供图片时固化的确切输出 key。 */
+  sourceOutputKey?: string
+  /** AV 正式图片资产的不可变 SHA-256。 */
+  sourceArtifactHash?: string
   sourcePort?: CanvasArtifactOutputCapability
   targetPort?: CanvasArtifactInputSlot
 }
@@ -2019,6 +2125,11 @@ function isCanvasLifecycleId(value: unknown): value is string {
   return typeof value === 'string' && CANVAS_CONTENT_ID_PATTERN.test(value)
 }
 
+/** 判断 AV 边选择的媒体输出 key 是否可安全持久化。 */
+function isCanvasEdgeOutputKey(value: unknown): value is string {
+  return typeof value === 'string' && CANVAS_EDGE_OUTPUT_KEY_PATTERN.test(value)
+}
+
 /** 判断未知值是否为图片模块支持的画面比例。 */
 function isCanvasImageAspectRatio(value: unknown): value is CanvasImageAspectRatio {
   return value === '1:1' || value === '16:9' || value === '4:3' || value === '9:16' || value === '3:4'
@@ -2037,6 +2148,63 @@ function isCanvasImageContextMode(value: unknown): value is DesignContextMode {
 /** 判断可选稳定 ID 是否为 null 或安全 ID。 */
 function isOptionalCanvasImageId(value: unknown): value is string | null {
   return value === null || isCanvasLifecycleId(value)
+}
+
+/** 模型选择 ID 兼容旧 profile 与固定版本的 media:<id>:<revision> 命名空间。 */
+function isOptionalCanvasImageModelProfileId(value: unknown): value is string | null {
+  return value === null
+    || isCanvasLifecycleId(value)
+    || (typeof value === 'string'
+      && value.length <= 160
+      && /^media:[A-Za-z0-9_-]{1,128}:[1-9][0-9]*$/.test(value))
+}
+
+/** 严格解析图片工作流输入值，媒体引用只能指向固定项目素材版本。 */
+function parseCanvasImageMediaInputValue(value: unknown): MediaInputValue {
+  if (hasExactCanvasKeys(value, ['kind', 'value']) && value.kind === 'scalar'
+    && (typeof value.value === 'string' || typeof value.value === 'number' || typeof value.value === 'boolean')
+    && (typeof value.value !== 'number' || Number.isFinite(value.value))) {
+    return { kind: 'scalar', value: value.value }
+  }
+  if (hasExactCanvasKeys(value, ['kind', 'asset']) && value.kind === 'asset'
+    && hasExactCanvasKeys(value.asset, ['assetId', 'revision', 'hash', 'mediaKind'])
+    && isCanvasLifecycleId(value.asset.assetId)
+    && isCanvasNonNegativeInteger(value.asset.revision) && value.asset.revision > 0
+    && typeof value.asset.hash === 'string' && /^[a-f0-9]{64}$/.test(value.asset.hash)
+    && ['image', 'audio', 'video'].includes(String(value.asset.mediaKind))) {
+    return {
+      kind: 'asset',
+      asset: {
+        assetId: value.asset.assetId,
+        revision: value.asset.revision,
+        hash: value.asset.hash,
+        mediaKind: value.asset.mediaKind as 'image' | 'audio' | 'video',
+      },
+    }
+  }
+  throw new Error('CANVAS_IMAGE_WORKFLOW_INVALID')
+}
+
+/** 严格解析图片节点保存的公共工作流选择，不接受未知字段或无界输入。 */
+export function parseCanvasImageMediaWorkflow(value: unknown): CanvasImageMediaWorkflow {
+  if (!hasExactCanvasKeys(value, ['workflowId', 'workflowRevision', 'connectionId', 'inputs'])
+    || !isCanvasLifecycleId(value.workflowId)
+    || !isCanvasNonNegativeInteger(value.workflowRevision) || value.workflowRevision < 1
+    || !isCanvasLifecycleId(value.connectionId)
+    || value.inputs === null || typeof value.inputs !== 'object' || Array.isArray(value.inputs)) {
+    throw new Error('CANVAS_IMAGE_WORKFLOW_INVALID')
+  }
+  /** 输入 key 与数量均有界，避免配置或 journal 被手工膨胀。 */
+  const entries = Object.entries(value.inputs)
+  if (entries.length > 128 || entries.some(([key]) => !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(key))) {
+    throw new Error('CANVAS_IMAGE_WORKFLOW_INVALID')
+  }
+  return {
+    workflowId: value.workflowId,
+    workflowRevision: value.workflowRevision,
+    connectionId: value.connectionId,
+    inputs: Object.fromEntries(entries.map(([key, input]) => [key, parseCanvasImageMediaInputValue(input)])),
+  }
 }
 
 /** 判断图片提示词是否为有界字符串。 */
@@ -2098,11 +2266,13 @@ export function parseReleaseCanvasImageMediaInput(value: unknown): ReleaseCanvas
  * @returns 字段精确、枚举受限且文本有界的图片配置。
  */
 export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleConfig {
+  /** 可选工作流字段只在真实存在时进入 exact-key 合同。 */
+  const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
   /** v2 图片配置允许的完整字段集合。 */
   const keys = [
     'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
-    'adoptedAssetId',
+    'adoptedAssetId', ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || value.schemaVersion !== 2
@@ -2112,7 +2282,8 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     || !isCanvasNonNegativeInteger(value.createdAt)
     || !isCanvasNonNegativeInteger(value.updatedAt)
     || !isCanvasImagePrompt(value.prompt)
-    || !isOptionalCanvasImageId(value.selectedModelProfileId)
+    || !isOptionalCanvasImageModelProfileId(value.selectedModelProfileId)
+    || (hasMediaWorkflow && value.selectedModelProfileId !== null)
     || !isCanvasImageAspectRatio(value.aspectRatio)
     || !isCanvasImageSize(value.imageSize)
     || !isCanvasImageContextMode(value.contextMode)
@@ -2128,6 +2299,7 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     updatedAt: value.updatedAt,
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
+    ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
     aspectRatio: value.aspectRatio,
     imageSize: value.imageSize,
     contextMode: value.contextMode,
@@ -2222,6 +2394,69 @@ function parseCanvasImageModelSnapshot(value: unknown): ImageGenerationModelSnap
       executor: 'openai-images', channelId: value.channelId,
     }
   }
+  if (hasExactCanvasKeys(value, [
+    'executor', 'source', 'name', 'modelId', 'connectionId', 'instanceGeneration',
+    'workflowId', 'workflowRevision', 'workflowHash', 'inputs',
+  ])
+    && value.executor === 'comfyui'
+    && value.source === 'workflow'
+    && isCanvasImageSnapshotText(value.name, 128) && value.name.trim().length > 0
+    && isCanvasImageSnapshotText(value.modelId, 256) && value.modelId.trim().length > 0
+    && isCanvasLifecycleId(value.connectionId)
+    && isCanvasLifecycleId(value.instanceGeneration)
+    && isCanvasLifecycleId(value.workflowId)
+    && isCanvasNonNegativeInteger(value.workflowRevision) && value.workflowRevision > 0
+    && typeof value.workflowHash === 'string' && /^[a-f0-9]{64}$/.test(value.workflowHash)) {
+    const workflow = parseCanvasImageMediaWorkflow({
+      workflowId: value.workflowId,
+      workflowRevision: value.workflowRevision,
+      connectionId: value.connectionId,
+      inputs: value.inputs,
+    })
+    return {
+      executor: 'comfyui',
+      source: 'workflow',
+      name: value.name,
+      modelId: value.modelId,
+      connectionId: workflow.connectionId,
+      instanceGeneration: value.instanceGeneration,
+      workflowId: workflow.workflowId,
+      workflowRevision: workflow.workflowRevision,
+      workflowHash: value.workflowHash,
+      inputs: workflow.inputs,
+    }
+  }
+  if (hasExactCanvasKeys(value, [
+    'profileId', 'name', 'modelId', 'executor', 'mediaProfileId', 'mediaProfileRevision',
+    'connectionId', 'workflowId', 'workflowRevision', 'workflowHash',
+  ])
+    && isOptionalCanvasImageModelProfileId(value.profileId)
+    && value.profileId !== null
+    && isCanvasImageSnapshotText(value.name, 128)
+    && isCanvasImageSnapshotText(value.modelId, 256)
+    && value.executor === 'comfyui'
+    && isCanvasLifecycleId(value.mediaProfileId)
+    && isCanvasNonNegativeInteger(value.mediaProfileRevision)
+    && value.mediaProfileRevision > 0
+    && isCanvasLifecycleId(value.connectionId)
+    && isCanvasLifecycleId(value.workflowId)
+    && isCanvasNonNegativeInteger(value.workflowRevision)
+    && value.workflowRevision > 0
+    && typeof value.workflowHash === 'string'
+    && /^[a-f0-9]{64}$/.test(value.workflowHash)) {
+    return {
+      profileId: value.profileId,
+      name: value.name,
+      modelId: value.modelId,
+      executor: 'comfyui',
+      mediaProfileId: value.mediaProfileId,
+      mediaProfileRevision: value.mediaProfileRevision,
+      connectionId: value.connectionId,
+      workflowId: value.workflowId,
+      workflowRevision: value.workflowRevision,
+      workflowHash: value.workflowHash,
+    }
+  }
   throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
 }
 
@@ -2264,6 +2499,8 @@ function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInpu
   /** 只有图片上游允许额外携带 adopted 素材身份。 */
   const optionalKeys = [
     ...(value !== null && typeof value === 'object' && Object.hasOwn(value, 'assetId') ? ['assetId'] : []),
+    ...(value !== null && typeof value === 'object' && Object.hasOwn(value, 'sourceOutputKey') ? ['sourceOutputKey'] : []),
+    ...(value !== null && typeof value === 'object' && Object.hasOwn(value, 'sourceArtifactHash') ? ['sourceArtifactHash'] : []),
     ...(hasSourcePort ? ['sourcePort', 'targetPort'] : []),
   ]
   /** exact-key 合同按真实存在的可选字段构造。 */
@@ -2271,13 +2508,24 @@ function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInpu
   if (!hasExactCanvasKeys(value, keys)
     || hasSourcePort !== hasTargetPort
     || !isCanvasLifecycleId(value.nodeId)
-    || !['agent', 'image', 'document', 'webview'].includes(String(value.kind))
+    || !['agent', 'image', 'audio', 'video', 'document', 'webview'].includes(String(value.kind))
     || !isCanvasNonNegativeInteger(value.revision)
     || !isCanvasImageSnapshotText(value.summary, 8_192)
     || typeof value.summaryHash !== 'string' || !/^[0-9a-f]{64}$/iu.test(value.summaryHash)
     || (Object.hasOwn(value, 'assetId') && !isCanvasLifecycleId(value.assetId))
+    || (Object.hasOwn(value, 'sourceOutputKey') && !isCanvasEdgeOutputKey(value.sourceOutputKey))
+    || (Object.hasOwn(value, 'sourceArtifactHash')
+      && (typeof value.sourceArtifactHash !== 'string' || !/^[0-9a-f]{64}$/u.test(value.sourceArtifactHash)))
     || (hasSourcePort && !isCanvasArtifactOutputCapability(value.sourcePort))
-    || (hasTargetPort && !isCanvasArtifactInputSlot(value.targetPort))) {
+    || (hasTargetPort && !isCanvasArtifactInputSlot(value.targetPort))
+    || ((value.kind === 'audio' || value.kind === 'video')
+      && (!Object.hasOwn(value, 'assetId')
+        || !Object.hasOwn(value, 'sourceOutputKey')
+        || !Object.hasOwn(value, 'sourceArtifactHash')
+        || value.sourcePort !== 'image.asset'
+        || value.targetPort !== 'image.reference'))
+    || ((value.kind !== 'audio' && value.kind !== 'video')
+      && (Object.hasOwn(value, 'sourceOutputKey') || Object.hasOwn(value, 'sourceArtifactHash')))) {
     throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   }
   return {
@@ -2287,6 +2535,8 @@ function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInpu
     summary: value.summary,
     summaryHash: value.summaryHash,
     ...(Object.hasOwn(value, 'assetId') ? { assetId: value.assetId as string } : {}),
+    ...(Object.hasOwn(value, 'sourceOutputKey') ? { sourceOutputKey: value.sourceOutputKey as string } : {}),
+    ...(Object.hasOwn(value, 'sourceArtifactHash') ? { sourceArtifactHash: value.sourceArtifactHash as string } : {}),
     ...(hasSourcePort ? {
       sourcePort: value.sourcePort as CanvasArtifactOutputCapability,
       targetPort: value.targetPort as CanvasArtifactInputSlot,
@@ -2558,10 +2808,13 @@ export function parseCanvasImageModuleSnapshot(value: unknown): CanvasImageModul
  * @returns 身份、revision 和全部可编辑字段均已验证的保存命令。
  */
 export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImageModuleInput {
+  /** 可选工作流字段按实际存在性参与 exact-key 校验。 */
+  const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
   /** 图片保存命令允许的完整字段集合。 */
   const keys = [
     'projectId', 'canvasId', 'nodeId', 'imageModuleId', 'expectedConfigRevision',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
+    ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || !isCanvasLifecycleId(value.projectId)
@@ -2570,7 +2823,8 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
     || !isCanvasLifecycleId(value.imageModuleId)
     || !isCanvasNonNegativeInteger(value.expectedConfigRevision)
     || !isCanvasImagePrompt(value.prompt)
-    || !isOptionalCanvasImageId(value.selectedModelProfileId)
+    || !isOptionalCanvasImageModelProfileId(value.selectedModelProfileId)
+    || (hasMediaWorkflow && value.selectedModelProfileId !== null)
     || !isCanvasImageAspectRatio(value.aspectRatio)
     || !isCanvasImageSize(value.imageSize)
     || !isCanvasImageContextMode(value.contextMode)) {
@@ -2584,6 +2838,7 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
     expectedConfigRevision: value.expectedConfigRevision,
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
+    ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
     aspectRatio: value.aspectRatio,
     imageSize: value.imageSize,
     contextMode: value.contextMode,
@@ -2622,7 +2877,8 @@ function isCanvasLifecycleTitle(value: unknown): value is string {
 
 /** 判断未知值是否为 Canvas 支持的节点类别。 */
 function isCanvasNodeKind(value: unknown): value is CanvasNodeKind {
-  return value === 'agent' || value === 'image' || value === 'document' || value === 'webview'
+  return value === 'agent' || value === 'image' || value === 'audio' || value === 'video'
+    || value === 'document' || value === 'webview'
 }
 
 /**
@@ -3174,6 +3430,21 @@ function parseCanvasWorkspaceNode(value: unknown): CanvasNode {
       }
     }
   }
+  if ((record.kind === 'audio' || record.kind === 'video')
+    && (hasExactCanvasKeys(record, [...baseKeys, 'mediaModuleId'])
+      || hasExactCanvasKeys(record, [...baseKeys, 'mediaModuleId', 'adoptedConfigRevision']))
+    && isCanvasLifecycleId(record.mediaModuleId)
+    && (record.adoptedConfigRevision === undefined
+      || isCanvasNonNegativeInteger(record.adoptedConfigRevision))) {
+    return {
+      ...base,
+      kind: record.kind,
+      mediaModuleId: record.mediaModuleId,
+      ...(record.adoptedConfigRevision === undefined
+        ? {}
+        : { adoptedConfigRevision: record.adoptedConfigRevision }),
+    }
+  }
   if (record.kind === 'document'
     && hasExactCanvasKeys(record, [...baseKeys, 'documentId', 'contentRevision'])
     && isCanvasLifecycleId(record.documentId)
@@ -3204,11 +3475,16 @@ function parseCanvasWorkspaceNode(value: unknown): CanvasNode {
 /** 严格重建工作区快照中的单条 Canvas 关系边。 */
 function parseCanvasWorkspaceEdge(value: unknown, nodeIds: ReadonlySet<string>): CanvasEdge {
   /** 关系边允许的完整公开字段集合。 */
-  const keys = ['id', 'sourceNodeId', 'sourcePort', 'targetNodeId', 'targetPort', 'relation'] as const
+  const keys = [
+    'id', 'sourceNodeId', 'sourcePort',
+    ...(value !== null && typeof value === 'object' && Object.hasOwn(value, 'sourceOutputKey') ? ['sourceOutputKey'] : []),
+    'targetNodeId', 'targetPort', 'relation',
+  ] as const
   if (!hasExactCanvasKeys(value, keys)
     || !isCanvasLifecycleId(value.id)
     || !isCanvasLifecycleId(value.sourceNodeId)
     || (!isCanvasLifecycleId(value.sourcePort) && !isCanvasArtifactOutputCapability(value.sourcePort))
+    || (Object.hasOwn(value, 'sourceOutputKey') && !isCanvasEdgeOutputKey(value.sourceOutputKey))
     || !isCanvasLifecycleId(value.targetNodeId)
     || (!isCanvasLifecycleId(value.targetPort) && !isCanvasArtifactInputSlot(value.targetPort))
     || !nodeIds.has(value.sourceNodeId)
@@ -3219,6 +3495,7 @@ function parseCanvasWorkspaceEdge(value: unknown, nodeIds: ReadonlySet<string>):
     id: value.id,
     sourceNodeId: value.sourceNodeId,
     sourcePort: value.sourcePort,
+    ...(Object.hasOwn(value, 'sourceOutputKey') ? { sourceOutputKey: value.sourceOutputKey as string } : {}),
     targetNodeId: value.targetNodeId,
     targetPort: value.targetPort,
     relation: parseCanvasEdgeRelation(value.relation),
@@ -3271,10 +3548,13 @@ function parseCanvasWorkspaceImagePreview(value: unknown): CanvasImagePreview {
 
 /** 严格重建工作区快照中的 schema v4 Canvas 文档。 */
 function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
+  /** 可选范围字段仅在真实存在时参与 exact-key 合同。 */
+  const hasScope = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaModelScope')
   /** Canvas 文档只允许当前 v4 的完整公开字段集合。 */
   const keys = [
     'schemaVersion', 'projectId', 'canvasId', 'revision', 'viewport',
     'nodes', 'edges', 'createdAt', 'updatedAt',
+    ...(hasScope ? ['mediaModelScope'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || value.schemaVersion !== CANVAS_DOCUMENT_VERSION
@@ -3299,6 +3579,13 @@ function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
   if (nodeIds.size !== nodes.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
   /** 边在重建时同时校验两端节点引用。 */
   const edges = value.edges.map((edge) => parseCanvasWorkspaceEdge(edge, nodeIds))
+  /** 当前公开快照同样拒绝已知但非法的 AV 输出选择组合。 */
+  const nodeKindsById = new Map(nodes.map((node) => [node.id, node.kind]))
+  if (edges.some((edge) => resolveCanvasEdgeBinding(
+    edge,
+    nodeKindsById.get(edge.sourceNodeId)!,
+    nodeKindsById.get(edge.targetNodeId)!,
+  ).state === 'incompatible')) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
   /** 图内边 ID 必须唯一。 */
   const edgeIds = new Set(edges.map((edge) => edge.id))
   if (edgeIds.size !== edges.length) throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
@@ -3308,6 +3595,7 @@ function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
     canvasId: value.canvasId,
     revision: value.revision,
     viewport: { x: value.viewport.x, y: value.viewport.y, zoom: value.viewport.zoom },
+    ...(hasScope ? { mediaModelScope: parseCanvasMediaModelScope(value.mediaModelScope) } : {}),
     nodes,
     edges,
     createdAt: value.createdAt,
@@ -3510,6 +3798,9 @@ export function applyCanvasMutations(
       case 'set-viewport':
         next.viewport = mutation.viewport
         break
+      case 'set-media-model-scope':
+        next.mediaModelScope = parseCanvasMediaModelScope(mutation.scope)
+        break
       case 'move-nodes': {
         /** 本次批量移动中每个节点 ID 对应的最终位置。 */
         const positionsByNodeId = new Map(
@@ -3555,3 +3846,6 @@ export function applyCanvasMutations(
 
   return next
 }
+
+/** 音视频 Canvas 模块使用独立合同，旧图片模块保持原有类型与解析路径。 */
+export * from './canvas-media'
