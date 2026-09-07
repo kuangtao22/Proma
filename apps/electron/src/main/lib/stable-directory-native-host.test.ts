@@ -177,7 +177,8 @@ const nativeHelperPath = resolve(
 /** 真实 helper 测试共享一次原生编译，避免重复编译挤占单用例的卡死保护时间。 */
 beforeAll(() => {
   if (!nativeHelperPlatformSupported) return
-  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+  /** MSVC 把编译错误写到 stdout，直接透传才能在 CI 失败时保留根因。 */
+  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'inherit' })
 }, 30_000)
 
 describe('stable directory native host', () => {
