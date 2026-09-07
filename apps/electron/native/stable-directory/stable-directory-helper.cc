@@ -2699,7 +2699,7 @@ std::string ReadCanvasIntent(const Config& config, HANDLE transactions) {
     return CanvasContentReadResultJson("corrupt", "", 0, "", "", error);
   }
   return CanvasContentReadResultJson("ok", content, static_cast<std::size_t>(size),
-      std::to_string(WindowsVolumeId(identity)), std::to_string(WindowsFileId(identity)), "");
+      std::to_string(identity.dwVolumeSerialNumber), std::to_string(WindowsFileId(identity)), "");
 }
 
 // 直接枚举 transactions HANDLE，并把相对读取的 intent 正文放入协议内存结果。
