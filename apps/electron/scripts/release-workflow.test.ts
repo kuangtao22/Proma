@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { parseBoneReleaseVersion } from '../src/shared/release-version'
+import { validateReleaseNotes } from './validate-release-version'
 
 interface WorkflowJob {
   /** GitHub Runner 标签。 */
@@ -249,7 +251,8 @@ test('Bone 应用版本与更新频道保持一致', () => {
     'utf8',
   )
 
-  expect(metadata.version).toBe('0.19.31-bone.10')
+  expect(parseBoneReleaseVersion(metadata.version ?? '')).not.toBeNull()
+  expect(() => validateReleaseNotes(`v${metadata.version}`, resolve(import.meta.dir, '../../..'))).not.toThrow()
   expect(config.detectUpdateChannel).toBe(false)
   expect(config.publish).toEqual({
     provider: 'github',

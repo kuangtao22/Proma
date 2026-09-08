@@ -4,11 +4,15 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type {
+  CanvasContentKind,
   CanvasImageModuleConfig,
+  CanvasMutation,
   CanvasNodeContentMeta,
   CanvasTarget,
   CanvasTrashEntry,
 } from '@proma/shared'
+import { createEmptyCanvasDocument } from '@proma/shared'
+import { createCanvasArtifactCreationService } from './canvas-artifact-creation'
 import type { LegacyCanvasContentSeed } from './canvas-document-store'
 import type {
   StableDirectoryNativeRequest,
@@ -269,6 +273,8 @@ function readJson<T>(files: FakeEntryFiles, fileName: string): T {
 describe('Canvas 节点内容 Store', () => {
   test.each([
     ['image', ['config.json', 'meta.json']],
+    ['audio', ['config.json', 'meta.json']],
+    ['video', ['config.json', 'meta.json']],
     ['document', ['content.md', 'meta.json']],
     ['webview', ['index.html', 'meta.json']],
   ] as const)('Given %s 节点 When 准备空内容 Then 最后提交严格 meta 且可断言', async (kind, expectedFiles) => {
@@ -297,6 +303,62 @@ describe('Canvas 节点内容 Store', () => {
       })
     }
     expect(fixture.loadCount).toBe(2)
+  })
+
+  test.each(['audio', 'video'] as const)('Given %s 媒体产物 When 创建并重复准备 Then 保持原始空配置且不重复写入', async (kind) => {
+    /** 真实 Store 配合内存相对文件协议，覆盖产物创建入口。 */
+    const fixture = createFixture()
+    /** 媒体产物只接收空正文，配置后续单独保存。 */
+    const input = { kind, contentId: 'media-1', content: '' }
+    await fixture.store.prepareArtifactContent(target, input)
+    /** 保存首次落盘的完整文件与写入次数。 */
+    const originalFiles = structuredClone(fixture.scopes.nodes.get(input.contentId)!)
+    const writeCount = fixture.requests.filter((request) => request.mode === 'canvas-content-write').length
+    expect(readJson<Record<string, unknown>>(originalFiles, 'config.json')).toMatchObject({
+      schemaVersion: 1, revision: 0,
+      config: {
+        contentId: input.contentId, mediaKind: kind, revision: 0,
+        profile: null, inputs: [], outputs: [], adoptedOutputs: [],
+      },
+      operations: [], candidates: [], pendingAdoptionProjection: null,
+    })
+
+    await fixture.store.prepareArtifactContent(target, input)
+    await fixture.store.prepareEmptyContent(target, { kind, contentId: input.contentId })
+
+    expect(fixture.scopes.nodes.get(input.contentId)).toEqual(originalFiles)
+    expect(fixture.requests.filter((request) => request.mode === 'canvas-content-write')).toHaveLength(writeCount)
+    expect(await fixture.store.assertContent(target, input)).toMatchObject({ kind, revision: 0 })
+  })
+
+  test.each(['audio', 'video'] as const)('Given %s 产物携带非空正文 When 准备 Then 拒绝且不写入内容', async (kind) => {
+    /** 不允许把任意文本当作媒体模块配置写入。 */
+    const fixture = createFixture()
+    await expect(fixture.store.prepareArtifactContent(target, {
+      kind, contentId: 'media-1', content: '不能作为媒体配置的正文',
+    })).rejects.toThrow('CANVAS_ARTIFACT_CONTENT_INVALID')
+    expect(fixture.requests).toEqual([])
+  })
+
+  test.each(['audio', 'video'] as const)('Given %s 已提交配置缺失 When 重放创建 Then 报告损坏且不重建配置', async (kind) => {
+    /** 模拟配置文件丢失，但最终 meta 仍存在。 */
+    const fixture = createFixture()
+    const input = { kind, contentId: 'media-1', content: '' }
+    await fixture.store.prepareArtifactContent(target, input)
+    delete fixture.scopes.nodes.get(input.contentId)!['config.json']
+
+    await expect(fixture.store.prepareArtifactContent(target, input))
+      .rejects.toThrow('CANVAS_CONTENT_CORRUPT: missing config.json')
+    expect(fixture.scopes.nodes.get(input.contentId)?.['config.json']).toBeUndefined()
+  })
+
+  test.each(['agent', 'unknown', null])('Given 非内容类型 %s When 准备产物 Then 仍然拒绝且不访问目录', async (value) => {
+    /** 故意越过静态类型模拟不可信运行时输入。 */
+    const fixture = createFixture()
+    await expect(fixture.store.prepareArtifactContent(target, {
+      kind: value as CanvasContentKind, contentId: 'invalid-1', content: '',
+    })).rejects.toThrow('CANVAS_CONTENT_KIND_INVALID')
+    expect(fixture.requests).toEqual([])
   })
 
   test('Given Agent 创建 WebView 产物 When 准备初始内容 Then 原样保存完整 HTML 且支持相同请求幂等重放', async () => {
@@ -510,19 +572,24 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.nodes.get('committed-content')?.[bodyName]).toBe(body)
   })
 
-  test('Given 内容节点 When 移入独立 trashId 并恢复 Then entry 严格持久化且重放幂等', async () => {
+  test.each(['document', 'audio', 'video'] as const)('Given %s 内容节点 When 移入独立 trashId 并恢复 Then entry 严格持久化且重放幂等', async (kind) => {
     const fixture = createFixture()
-    await fixture.store.prepareEmptyContent(target, { kind: 'document', contentId: 'content-1' })
-    await fixture.store.moveToTrash(target, trashEntry)
+    /** 各类内容复用回收身份，文档专用版本字段不进入媒体条目。 */
+    const { contentRevision, ...baseEntry } = trashEntry
+    const entry: CanvasTrashEntry = kind === 'document'
+      ? { ...baseEntry, kind, contentRevision }
+      : { ...baseEntry, kind }
+    await fixture.store.prepareEmptyContent(target, { kind, contentId: 'content-1' })
+    await fixture.store.moveToTrash(target, entry)
     /** 模拟 rename 已提交、entry.json 写入确认前进程崩溃。 */
     delete fixture.scopes.trash.get('trash-1')!['entry.json']
-    await fixture.store.moveToTrash(target, trashEntry)
+    await fixture.store.moveToTrash(target, entry)
     expect(fixture.scopes.nodes.has('content-1')).toBe(false)
     expect(fixture.scopes.trash.has('trash-1')).toBe(true)
-    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-1')!, 'entry.json')).toEqual(trashEntry)
+    expect(readJson<CanvasTrashEntry>(fixture.scopes.trash.get('trash-1')!, 'entry.json')).toEqual(entry)
 
-    expect(await fixture.store.restoreFromTrash(target, 'trash-1')).toEqual(trashEntry)
-    expect(await fixture.store.restoreFromTrash(target, 'trash-1')).toEqual(trashEntry)
+    expect(await fixture.store.restoreFromTrash(target, 'trash-1')).toEqual(entry)
+    expect(await fixture.store.restoreFromTrash(target, 'trash-1')).toEqual(entry)
     expect(fixture.scopes.nodes.has('content-1')).toBe(true)
     expect(fixture.scopes.trash.has('trash-1')).toBe(false)
   })
@@ -867,9 +934,9 @@ describe('Canvas 节点内容 Store', () => {
     expect(fixture.scopes.nodes.size).toBe(0)
   })
 
-  test('Given 批量事务已准备内容 When 提交前回滚 Then 原子移出 nodes 且不进入公开回收列表', async () => {
+  test.each(['document', 'audio', 'video'] as const)('Given %s 批量事务已准备内容 When 提交前回滚 Then 原子移出 nodes 且不进入公开回收列表', async (kind) => {
     const fixture = createFixture()
-    const input = { kind: 'document' as const, contentId: 'content-batch' }
+    const input = { kind, contentId: 'content-batch' }
     await fixture.store.prepareEmptyContent(target, input)
 
     await fixture.store.discardPreparedContent(target, input, 'batch-rollback-1')
@@ -1073,6 +1140,34 @@ describe('Canvas 节点内容 Store', () => {
       await store.restoreFromTrash(target, sharedEntries[0]!.trashId)
       await store.restoreFromTrash(target, sharedEntries[1]!.trashId)
       expect(readdirSync(join(canvasRoot, 'trash'))).toEqual([])
+
+      for (const kind of ['audio', 'video'] as const) {
+        /** 使用真实产物服务与磁盘 Store，图提交仅替换为隔离内存记录。 */
+        const document = createEmptyCanvasDocument(target.projectId, target.canvasId, 100)
+        const service = createCanvasArtifactCreationService({
+          documents: { load: () => ({ document, writable: true, nodeIssues: [] }) },
+          content: store,
+          batch: {
+            execute: async (batch) => {
+              /** envelope 已由产物服务严格解析，此处取出待提交媒体节点。 */
+              const operations = batch.operations as unknown as CanvasMutation[]
+              const node = operations.flatMap((operation) => operation.type === 'upsert-nodes' ? operation.nodes : [])[0]
+              if (!node || (node.kind !== 'audio' && node.kind !== 'video')) throw new Error('测试媒体节点缺失')
+              await store.prepareEmptyContent(target, { kind: node.kind, contentId: node.mediaModuleId })
+              await expect(store.assertContent(target, { kind: node.kind, contentId: node.mediaModuleId }))
+                .resolves.toMatchObject({ kind, revision: 0 })
+              return { document: { ...document, nodes: [node], revision: document.revision + 1 }, operationId: 'media-create' }
+            },
+          },
+        })
+        /** 与 canvas_create_media 相同的空媒体产物请求，无生成服务依赖。 */
+        const result = await service.create({
+          ...target, baseRevision: document.revision, artifactType: kind,
+          title: '媒体卡片回归', content: '',
+          source: { sessionId: 'session-1', runStartedAt: 100, toolCallId: `native-${kind}` },
+        })
+        expect(result).toMatchObject({ artifactType: kind, revision: document.revision + 1 })
+      }
     } finally {
       rmSync(temporaryRoot, { recursive: true, force: true })
     }

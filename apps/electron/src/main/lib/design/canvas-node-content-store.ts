@@ -167,7 +167,8 @@ function requireContentId(value: unknown, label: string): string {
 
 /** 校验内容类别，阻止未来未知类别静默进入磁盘。 */
 function requireContentKind(value: unknown): CanvasContentKind {
-  if (value !== 'image' && value !== 'document' && value !== 'webview') {
+  if (value !== 'image' && value !== 'audio' && value !== 'video'
+    && value !== 'document' && value !== 'webview') {
     throw new Error('CANVAS_CONTENT_KIND_INVALID')
   }
   return value
@@ -608,7 +609,9 @@ export function createCanvasNodeContentStore(
         || seed.initialContent.length > MAX_CONTENT_TEXT_LENGTH)) {
       throw new Error('CANVAS_ARTIFACT_CONTENT_INVALID')
     }
-    if ((kind === 'audio' || kind === 'video') && seed.initialContent !== undefined) {
+    /** 音视频产物以空正文创建模块，非空正文不能冒充后续独立保存的媒体配置。 */
+    if ((kind === 'audio' || kind === 'video')
+      && seed.initialContent !== undefined && seed.initialContent !== '') {
       throw new Error('CANVAS_ARTIFACT_CONTENT_INVALID')
     }
     /** 新产物正文；空内容与 legacy 迁移沿用既有默认值。 */
@@ -621,6 +624,12 @@ export function createCanvasNodeContentStore(
     if (existingMeta) assertSameIdentity(existingMeta, { kind, contentId })
     if (existingMeta) {
       if (existingMeta.revision !== 0) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+      if (kind === 'audio' || kind === 'video') {
+        /** 重放只复验已提交媒体状态，不重建配置或落入 WebView 正文校验。 */
+        if (existingMeta.createdAt !== existingMeta.updatedAt) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
+        await assertContentInScope(nodes, 'nodes', { kind, contentId })
+        return
+      }
       if (kind === 'image') {
         /** 已提交图片必须完整存在，meta-last 之后禁止补写 config。 */
         const configContent = await readFile(nodes, 'nodes', contentId, 'config.json')
