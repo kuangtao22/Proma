@@ -15,13 +15,24 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { SettingsCard, SettingsSection } from './primitives'
+import { MediaSettingsPage } from './MediaSettingsPage'
+import { SettingsCard } from './primitives'
+
+/** 媒体模型页标题下方的导航与状态提示插槽。 */
+interface MediaApiModelSettingsProps {
+  /** 与搜索筛选同一行的媒体配置页签。 */
+  navigation?: React.ReactNode
+  /** 工具栏下方的公共状态提示。 */
+  children?: React.ReactNode
+}
 
 /** 统一媒体模型编辑器使用的目录属性。 */
-export interface MediaApiModelCatalogViewProps {
+export interface MediaApiModelCatalogViewProps extends MediaApiModelSettingsProps {
   entries: MediaApiModelCatalogEntry[]
   channelOptions: ImageGenerationChannelOption[]
   saving: boolean
+  /** 首次读取目录时展示加载态并禁用新增入口。 */
+  loading?: boolean
   onSaveProfiles: (profiles: MediaApiModelProfile[]) => boolean | Promise<boolean>
 }
 
@@ -170,7 +181,10 @@ export function MediaApiModelCatalogView({
   entries,
   channelOptions,
   saving,
+  loading = false,
   onSaveProfiles,
+  navigation,
+  children,
 }: MediaApiModelCatalogViewProps): React.ReactElement {
   /** 当前单条编辑草稿。 */
   const [draft, setDraft] = React.useState<MediaApiModelProfile | null>(null)
@@ -239,9 +253,37 @@ export function MediaApiModelCatalogView({
   }
 
   return (
-    <>
+    <MediaSettingsPage
+      title={draft ? (existing ? '编辑媒体模型' : '添加媒体模型') : '媒体模型'}
+      onBack={draft ? () => setDraft(null) : undefined}
+      busy={saving}
+      action={
+        <Button type="button" size="sm" disabled={loading || saving || draft !== null} onClick={() => setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now()))}>
+          <Plus size={16} />
+          <span>添加 API 模型</span>
+        </Button>
+      }
+    >
+      {!draft && <div className="flex flex-wrap items-center justify-between gap-3">
+        {navigation}
+        {!loading && (
+          <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center gap-2">
+            <div className="relative w-64 max-w-full">
+              <Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" />
+              <Input value={query} className="pl-9" placeholder="搜索名称、协议、渠道或能力" disabled={saving} onChange={(event) => setQuery(event.target.value)} />
+            </div>
+            <Select value={mediaKindFilter} disabled={saving} onValueChange={(value: MediaApiModelKind | 'all') => setMediaKindFilter(value)}>
+              <SelectTrigger className="w-32" aria-label="筛选媒体类型"><SelectValue /></SelectTrigger>
+              <SelectContent><SelectItem value="all">全部类型</SelectItem>{(['image', 'audio', 'video'] as const).map((kind) => <SelectItem key={kind} value={kind}>{MEDIA_KIND_LABELS[kind]}</SelectItem>)}</SelectContent>
+            </Select>
+          </div>
+        )}
+      </div>}
+      {children}
       <SettingsCard divided>
-        {draft ? (
+        {loading ? (
+          <div className="px-4 py-8 text-center text-xs text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取媒体模型...</div>
+        ) : draft ? (
           <div className="space-y-4 p-4">
             {draftError && <p role="alert" className="text-xs text-destructive">{draftError}</p>}
             <div className="grid gap-3 sm:grid-cols-2">
@@ -257,16 +299,6 @@ export function MediaApiModelCatalogView({
           </div>
         ) : (
           <>
-            <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row">
-              <div className="relative min-w-0 flex-1">
-                <Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" />
-                <Input value={query} className="pl-9" placeholder="搜索名称、协议、渠道或能力" disabled={saving} onChange={(event) => setQuery(event.target.value)} />
-              </div>
-              <Select value={mediaKindFilter} disabled={saving} onValueChange={(value: MediaApiModelKind | 'all') => setMediaKindFilter(value)}>
-                <SelectTrigger className="w-full sm:w-36" aria-label="筛选媒体类型"><SelectValue /></SelectTrigger>
-                <SelectContent><SelectItem value="all">全部类型</SelectItem>{(['image', 'audio', 'video'] as const).map((kind) => <SelectItem key={kind} value={kind}>{MEDIA_KIND_LABELS[kind]}</SelectItem>)}</SelectContent>
-              </Select>
-            </div>
             {filteredEntries.length === 0 ? (
               <div className="px-4 py-8 text-center text-xs text-muted-foreground">{entries.length === 0 ? '尚未配置 API 媒体模型' : '没有匹配的媒体模型'}</div>
             ) : filteredEntries.map(({ profile, channelName, support }) => {
@@ -287,17 +319,16 @@ export function MediaApiModelCatalogView({
                 </div>
               )
             })}
-            <div className="flex justify-end px-4 py-3"><Button type="button" size="sm" variant="outline" disabled={saving} onClick={() => setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now()))}><Plus />添加 API 模型</Button></div>
           </>
         )}
       </SettingsCard>
       <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) setDeleteId(null) }} title="删除 API 媒体模型？" description="删除后，引用该稳定模型 ID 的画布范围需要重新选择。" confirmLabel="删除" loading={saving} variant="destructive" onConfirm={async () => { if (!deleteId) return; if (await onSaveProfiles(profiles.filter((profile) => profile.id !== deleteId))) setDeleteId(null) }} />
-    </>
+    </MediaSettingsPage>
   )
 }
 
 /** 从主进程统一目录加载并保存 API 媒体模型。 */
-export function MediaApiModelSettings(): React.ReactElement {
+export function MediaApiModelSettings({ navigation, children }: MediaApiModelSettingsProps): React.ReactElement {
   /** 当前权威 API 媒体模型目录。 */
   const [catalog, setCatalog] = React.useState<MediaApiModelCatalogResult | null>(null)
   /** 渠道公开摘要只用于选择稳定 channelId，不包含秘密。 */
@@ -364,9 +395,9 @@ export function MediaApiModelSettings(): React.ReactElement {
   }
 
   return (
-    <SettingsSection title="媒体模型">
+    <MediaApiModelCatalogView entries={catalog?.entries ?? []} channelOptions={channelOptions} loading={loading && !catalog} saving={saving} onSaveProfiles={saveProfiles} navigation={navigation}>
+      {children}
       {error && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{error}</span><Button type="button" size="sm" variant="outline" disabled={loading || saving} onClick={() => void load()}>重新加载</Button></div>}
-      {loading && !catalog ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-xs text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取媒体模型...</div></SettingsCard> : <MediaApiModelCatalogView entries={catalog?.entries ?? []} channelOptions={channelOptions} saving={saving} onSaveProfiles={saveProfiles} />}
-    </SettingsSection>
+    </MediaApiModelCatalogView>
   )
 }

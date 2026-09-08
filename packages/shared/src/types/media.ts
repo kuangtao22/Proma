@@ -238,6 +238,62 @@ export interface MediaRemoteWorkflow {
   descriptor: MediaRemoteDescriptor
   format: 'ui' | 'api' | 'unknown'
   definition: import('./media-workflow').JsonObject
+  /** 设置页按同一主进程分析链展示兼容性；不存在表示旧调用方尚未分析。 */
+  analysis?: MediaRemoteWorkflowAnalysis
+}
+
+/** 远端工作流分析中的安全、可定位问题，不包含异常正文或认证信息。 */
+export interface MediaRemoteWorkflowAnalysisIssue {
+  code: string
+  message: string
+  nodeId?: string
+  input?: string
+}
+
+/** 工作流节点的有界结构摘要。 */
+export interface MediaRemoteWorkflowNodeSummary {
+  nodeId: string
+  classType: string
+  title?: string
+  position?: { x: number; y: number }
+  inputCount: number
+  linkedInputCount: number
+  outputTypes: string[]
+  supported: boolean
+  coreContract: boolean
+}
+
+/** 工作流输入的有界结构摘要。 */
+export interface MediaRemoteWorkflowInputSummary {
+  nodeId: string
+  input: string
+  classType: string
+  label: string
+  valueKind: 'string' | 'number' | 'boolean' | 'linked' | 'complex' | 'unknown'
+  linked: boolean
+  editable: boolean
+  bindingKey?: string
+}
+
+/** 工作流输出的有界结构摘要。 */
+export interface MediaRemoteWorkflowOutputSummary {
+  key: string
+  nodeId: string
+  classType: string
+  title?: string
+  mediaType: MediaKind
+  historyKey: 'images' | 'audio'
+}
+
+/** Renderer 与 Agent 共用的工作流转换和校验结果。 */
+export interface MediaRemoteWorkflowAnalysis {
+  format: MediaRemoteWorkflow['format']
+  definition: MediaWorkflowDefinition | null
+  issues: MediaRemoteWorkflowAnalysisIssue[]
+  nodes: MediaRemoteWorkflowNodeSummary[]
+  inputs: MediaRemoteWorkflowInputSummary[]
+  outputs: MediaRemoteWorkflowOutputSummary[]
+  convertible: boolean
 }
 /** 设置页删除采用归档，不破坏历史恢复。 */
 export interface ArchiveMediaConfigurationInput { kind: 'connection' | 'workflow'; id: string }

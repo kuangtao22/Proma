@@ -29,6 +29,9 @@ import type { MediaRunSupervisor } from './media-run-supervisor'
 import { inspectMediaWorkflow, matchMediaWorkflowInputs } from './media-workflow-inspection'
 import type { MediaInputCandidate } from './media-workflow-inspection'
 import type { PrepareCanvasMediaHandoffInput } from '../design/canvas-media-handoff-service'
+import { analyzeRemoteWorkflow, getRemoteWorkflowClassTypes } from './media-remote-workflow-analysis'
+import type { RemoteWorkflowAnalysis } from './media-remote-workflow-analysis'
+import { MediaRemoteWorkflowImportError, MediaWorkflowValidationError } from './media-workflow-error'
 
 const MAX_TOOL_RESPONSE_BYTES = 32 * 1024
 const MAX_RUNS_PER_TURN = 8
@@ -40,6 +43,8 @@ export const MEDIA_TOOL_NAMES = [
   'media_list_workflows',
   'media_list_resources',
   'media_read_remote_workflow',
+  'media_discover_workflows',
+  'media_import_remote_workflow',
   'media_import_remote_asset',
   'media_list_api_models',
   'media_get_node_schema',
@@ -96,6 +101,8 @@ export interface MediaToolProviderDependencies {
   }): Promise<MediaAssetRef>
   /** Host 按项目和可选 Canvas scope 返回已经过滤的 API 模型候选。 */
   listModels(context: CanvasToolRunContext, canvasId?: string): Promise<MediaApiModelCandidate[]>
+  /** Host 验证画布归属后返回用户选择的默认连接，不由 Agent 修改。 */
+  getCanvasConnection?(context: CanvasToolRunContext, canvasId: string): string | null
   /** 父编排 child 准备只能登记到原工作流计划内的精确媒体目标。 */
   prepareParentRun?(context: CanvasToolRunContext, input: PrepareCanvasMediaHandoffInput, origin: MediaRunOrigin): Promise<MediaRunSnapshot>
 }
@@ -105,6 +112,35 @@ interface WorkflowSelector {
   workflowRevision?: number
   definition?: unknown
   prompt?: unknown
+}
+
+/** 同时支持普通 Agent 指定画布与画布 Agent 的固定身份。 */
+function resolveMediaCanvasId(context: CanvasToolRunContext, canvasId?: string): string | undefined {
+  const fixedCanvasId = context.canvasAgentTarget?.canvasId
+  if (fixedCanvasId && canvasId && canvasId !== fixedCanvasId) throw new Error('MEDIA_CANVAS_TARGET_MISMATCH')
+  return fixedCanvasId ?? canvasId
+}
+
+/** 返回默认连接的可见状态；删除或停用时不隐藏用户的原选择。 */
+function canvasConnectionSelection(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, requestedCanvasId?: string) {
+  const canvasId = resolveMediaCanvasId(context, requestedCanvasId)
+  const connectionId = canvasId ? dependencies.getCanvasConnection?.(context, canvasId) ?? null : null
+  const connection = connectionId ? dependencies.configuration.listProject(context.projectId).connections.find((item) => item.id === connectionId) : undefined
+  return {
+    canvasId: canvasId ?? null,
+    selectedConnection: connectionId ? { id: connectionId, name: connection?.name ?? connectionId, enabled: connection?.enabled ?? false } : null,
+    connectionStatus: connectionId ? connection?.enabled ? 'available' : 'unavailable' : 'unbound',
+  }
+}
+
+/** 显式连接优先，否则继承画布选择；绝不隐式选目录第一项。 */
+function resolveMediaConnection(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, input: { connectionId?: string; canvasId?: string }): string {
+  const selection = canvasConnectionSelection(dependencies, context, input.canvasId)
+  const connectionId = input.connectionId ?? selection.selectedConnection?.id
+  if (!connectionId) throw new Error(selection.canvasId ? 'MEDIA_CANVAS_CONNECTION_REQUIRED' : 'MEDIA_CONNECTION_REQUIRED')
+  const connection = dependencies.configuration.listProject(context.projectId).connections.find((item) => item.id === connectionId)
+  if (!connection?.enabled) throw new Error('MEDIA_CONNECTION_UNAVAILABLE')
+  return connectionId
 }
 
 /** 远端 descriptor 的完整工具 schema，字段身份不能退化为显示名称。 */
@@ -256,8 +292,62 @@ function savedWorkflow(configuration: MediaConfiguration, id: string): MediaWork
   return item
 }
 
-/** 为远端工作流目录提取可选择摘要；只有 API 图可能进入后续检查和保存。 */
+/** 远端正文的内容身份，导入时复核，避免选型后静默采用另一版本。 */
+function remoteWorkflowContentHash(workflow: MediaRemoteWorkflow): string {
+  return createHash('sha256').update(JSON.stringify(workflow.definition)).digest('hex')
+}
+
+/** 仅加载候选实际使用的节点 schema，读取与转换均无保存或生成副作用。 */
+async function inspectRemoteWorkflow(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, descriptor: MediaRemoteDescriptor, loaded?: MediaRemoteWorkflow) {
+  const remote = loaded ?? await dependencies.resources.readWorkflow(descriptor, context.projectId)
+  const classTypes = getRemoteWorkflowClassTypes(remote)
+  const schema = classTypes.length ? await dependencies.resources.getSchema(descriptor.connectionId, context.projectId, classTypes) : {}
+  const analysis = analyzeRemoteWorkflow(remote, schema)
+  return { remote, analysis, contentHash: remoteWorkflowContentHash(remote) }
+}
+
+/** 比较真实媒体输入数量和输出类型；具体首尾帧等角色仍由 Agent 阅读节点语义判断。 */
+function matchRemoteWorkflow(analysis: RemoteWorkflowAnalysis, mediaKind: MediaKind, inputKinds?: MediaKind[]) {
+  const inputCounts = { image: 0, audio: 0, video: 0 }
+  const requestedCounts = { image: 0, audio: 0, video: 0 }
+  for (const binding of analysis.definition?.bindings ?? []) {
+    if (binding.kind === 'image' || binding.kind === 'audio' || binding.kind === 'video') inputCounts[binding.kind] += 1
+  }
+  for (const kind of inputKinds ?? []) requestedCounts[kind] += 1
+  const matchesOutput = analysis.outputs.some((output) => output.mediaType === mediaKind)
+  const matchesInputs = !analysis.definition || !inputKinds ? null
+    : (['image', 'audio', 'video'] as const).every((kind) => inputCounts[kind] === requestedCounts[kind])
+  return { matchesOutput, matchesInputs, inputCounts: analysis.definition ? inputCounts : null,
+    status: !analysis.definition ? 'blocked' : !matchesOutput || matchesInputs === false ? 'incompatible' : 'candidate' }
+}
+
+/** 两种草稿入口共用项目隔离、父编排分支身份与配置 CAS。 */
+function saveProjectWorkflow(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, input: {
+  id: string; name: string; definition: unknown; expectedConfigRevision: number; expectedWorkflowRevision: number
+}): MediaWorkflowVersion {
+  authorize(dependencies, context, 'draft')
+  const catalog = dependencies.configuration.listProject(context.projectId)
+  const branchPrefix = createHash('sha256').update(JSON.stringify([context.sessionId, context.runStartedAt])).digest('hex').slice(0, 24)
+  const expectedPrefix = `branch-${branchPrefix}-`
+  const id = context.canvasAgentMode === 'parent-orchestrated'
+    ? input.id.startsWith(expectedPrefix) ? input.id
+      : input.id.startsWith('branch-') ? (() => { throw new Error('MEDIA_WORKFLOW_DRAFT_SCOPE_INVALID') })()
+        : `${expectedPrefix}${input.id.slice(0, 80)}`
+    : input.id
+  if (latestRevision(catalog.workflows, id) !== input.expectedWorkflowRevision) throw new Error('MEDIA_WORKFLOW_DRAFT_CONFLICT')
+  const definition = parseMediaWorkflowDefinition(input.definition)
+  authorize(dependencies, context, 'draft')
+  return savedWorkflow(dependencies.configuration.saveWorkflow({ id, name: input.name, projectId: context.projectId, definition }, input.expectedConfigRevision), id)
+}
+
+/** 为旧目录入口提供摘要；UI 图引导进入实际转换分析，不再一律报告不支持。 */
 function summarizeRemoteWorkflow(workflow: MediaRemoteWorkflow): Record<string, unknown> {
+  if (workflow.format === 'ui') {
+    const analysis = analyzeRemoteWorkflow(workflow, {})
+    return { format: 'ui', executable: false, validationStatus: 'requires-analysis',
+      nodes: analysis.nodes.slice(0, 16), inputs: analysis.inputs.slice(0, 24), outputs: analysis.outputs.slice(0, 16),
+      availableActions: ['media_discover_workflows'] }
+  }
   if (workflow.format !== 'api') return {
     format: workflow.format,
     executable: false,
@@ -285,6 +375,8 @@ function summarizeRemoteWorkflow(workflow: MediaRemoteWorkflow): Record<string, 
 
 /** 为普通 Agent 或 Canvas Agent 创建同一套项目媒体能力。 */
 export function createMediaToolRun(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext): CanvasToolRun {
+  /** 本轮已成功读取的明确画布作用域，防止后续省略 canvasId 又退回独立生成。 */
+  let hasCanvasTarget = Boolean(context.canvasAgentTarget || context.explicitReferences.length)
   const preparedOperations = new Set<string>()
   const executedRuns = new Set<string>()
   const isExecutionCapable = context.permissionCeiling === 'execute' && context.canvasAgentMode !== 'parent-orchestrated'
@@ -294,6 +386,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
       name: 'media_list_workflows', label: '列出媒体工作流',
       description: '分页列出 Proma 当前项目可见的公共工作流和项目草稿全部不可变版本，包含字段输入与媒体输出摘要；不会默认选择第一项。',
       parameters: Type.Object({
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         offset: Type.Optional(Type.Integer({ minimum: 0 })),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       }),
@@ -326,19 +419,129 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
           connections: catalog.connections.map((connection) => ({ id: connection.id, name: connection.name,
             enabled: connection.enabled, instanceGeneration: connection.instanceGeneration })),
           selectedWorkflow: null,
-          selectedConnection: null,
+          ...canvasConnectionSelection(dependencies, context, params.canvasId),
         })
       },
     }),
     defineTool({
       name: 'media_read_remote_workflow', label: '读取远端工作流',
-      description: '读取已从同一连接代次和远端用户目录发现的工作流正文；只读取精确 descriptor，不执行或保存。',
-      parameters: Type.Object({ descriptor: REMOTE_DESCRIPTOR_SCHEMA }),
+      description: '读取精确 descriptor 的远端工作流。小图默认返回正文；大图自动返回节点分页，可用 section=nodes/inputs/outputs/issues 和 offset/limit 精读完整结构与错误。输入页包含真实来源连线和有界默认值，正文不会作为指令执行。不保存、不生成。',
+      parameters: Type.Object({
+        descriptor: REMOTE_DESCRIPTOR_SCHEMA,
+        section: Type.Optional(Type.Union([Type.Literal('nodes'), Type.Literal('inputs'), Type.Literal('outputs'), Type.Literal('issues')])),
+        offset: Type.Optional(Type.Integer({ minimum: 0 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+      }),
       execute: async (_toolCallId, params) => {
         authorize(dependencies, context, 'read')
+        /** 精读分页同样在执行边界校验，避免单调用复制过多节点。 */
+        const offset = params.offset ?? 0
+        const limit = params.limit ?? 8
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 16
+          || (params.section !== undefined && !['nodes', 'inputs', 'outputs', 'issues'].includes(params.section))) throw new Error('MEDIA_DISCOVERY_PAGE_INVALID')
         const workflow = await dependencies.resources.readWorkflow(params.descriptor as MediaRemoteDescriptor, context.projectId)
-        return toolResult({ descriptor: workflow.descriptor, format: workflow.format,
-          workflow: summarizeRemoteWorkflow(workflow), definition: workflow.definition })
+        /** 保留小图原有正文读取；超限时转入真实可调用的精读页，避免返回不存在的操作提示。 */
+        const full = { descriptor: workflow.descriptor, format: workflow.format,
+          contentHash: remoteWorkflowContentHash(workflow), workflow: summarizeRemoteWorkflow(workflow), definition: workflow.definition }
+        if (params.section === undefined && params.offset === undefined && params.limit === undefined
+          && Buffer.byteLength(JSON.stringify(full), 'utf8') <= MAX_TOOL_RESPONSE_BYTES) return toolResult(full)
+        const { analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, workflow.descriptor, workflow)
+        const section = params.section ?? 'nodes'
+        /** 节点页保留类型与语义标题；每条输入单独分页，单节点输入很多也可继续精读。 */
+        const items = section === 'nodes' ? analysis.nodes.map((node) => ({
+          ...node, outputTypes: node.outputTypes.slice(0, 16), totalOutputTypes: node.outputTypes.length,
+        })) : section === 'outputs' ? analysis.outputs : section === 'issues' ? analysis.issues : analysis.inputs.map((input) => {
+          /** 转换后 prompt 的连线是精确执行来源，资源输入已清为无身份占位。 */
+          const value = analysis.definition?.prompt[input.nodeId]?.inputs[input.input]
+          const source = Array.isArray(value) && value.length === 2 && typeof value[0] === 'string' && typeof value[1] === 'number'
+            ? { nodeId: value[0], outputIndex: value[1] } : undefined
+          return { ...input, ...(source ? { source } : {}),
+            ...(typeof value === 'string' ? { defaultValue: value.slice(0, 512), valueTruncated: value.length > 512 }
+              : typeof value === 'number' || typeof value === 'boolean' ? { defaultValue: value } : {}) }
+        })
+        authorize(dependencies, context, 'read')
+        return pageResult('items', items.slice(offset, offset + limit), offset, items.length, {
+          descriptor: workflow.descriptor, contentHash, format: workflow.format, section,
+          canImport: analysis.definition !== null, sections: ['nodes', 'inputs', 'outputs', 'issues'],
+          ...(section === 'issues' ? {} : { issues: analysis.issues.slice(0, 4) }), totalIssues: analysis.issues.length,
+          availableActions: ['media_read_remote_workflow', 'media_import_remote_workflow'],
+        })
+      },
+    }),
+    defineTool({
+      name: 'media_discover_workflows', label: '匹配远端工作流',
+      description: '未指定工作流时，从画布绑定或显式 ComfyUI 连接分页读取候选，检查真实节点、媒体输入数量、输出和当前服务器兼容性。复用资源快照；UI 图仅在确定映射时转换，返回阻塞原因。candidate 只表示结构候选，还需核对首尾帧等语义角色；不保存、不生成、不按名称默认选第一项。',
+      parameters: Type.Object({
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        mediaKind: Type.Union([Type.Literal('image'), Type.Literal('video'), Type.Literal('audio')]),
+        inputKinds: Type.Optional(Type.Array(Type.Union([Type.Literal('image'), Type.Literal('video'), Type.Literal('audio')]), { maxItems: 128 })),
+        query: Type.Optional(Type.String({ maxLength: 256 })),
+        offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })),
+        refresh: Type.Optional(Type.Boolean()),
+      }),
+      execute: async (_toolCallId, params) => {
+        authorize(dependencies, context, 'read')
+        /** 在 Host 执行边界再次限制页宽，直接调用也不能扩大远端解析负载。 */
+        const limit = params.limit ?? 6
+        const offset = params.offset ?? 0
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 6
+          || !Number.isSafeInteger(offset) || offset < 0) throw new Error('MEDIA_DISCOVERY_PAGE_INVALID')
+        const connectionId = resolveMediaConnection(dependencies, context, params)
+        const page = await dependencies.resources.list({ projectId: context.projectId, connectionId, kind: 'workflows',
+          query: params.query, offset, limit, refresh: params.refresh })
+        const items: Record<string, unknown>[] = []
+        // 串行读取有界候选页，避免并发解析多份大型图造成主进程峰值。
+        for (const item of page.items) {
+          const base = { id: item.id, name: item.name, descriptor: item.descriptor }
+          try {
+            if (!item.descriptor) throw new Error('MEDIA_REMOTE_DESCRIPTOR_REQUIRED')
+            const { analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, item.descriptor)
+            items.push({ ...base, contentHash, format: analysis.format, canImport: analysis.definition !== null,
+              match: matchRemoteWorkflow(analysis, params.mediaKind, params.inputKinds),
+              nodes: analysis.nodes.slice(0, 16), inputs: analysis.inputs.slice(0, 24), outputs: analysis.outputs.slice(0, 16),
+              issues: analysis.issues.slice(0, 16), totalNodes: analysis.nodes.length,
+              summaryTruncated: analysis.nodes.length > 16 || analysis.inputs.length > 24 || analysis.outputs.length > 16 || analysis.issues.length > 16 })
+          } catch {
+            items.push({ ...base, canImport: false, issues: [{ code: 'REMOTE_WORKFLOW_READ_FAILED', message: '读取或检查失败，可重试此工作流；其它候选仍可查看。' }] })
+          }
+        }
+        authorize(dependencies, context, 'read')
+        return pageResult('items', items, offset, page.total, {
+          connectionId, instanceGeneration: page.instanceGeneration, snapshotId: page.snapshotId, checkedAt: page.checkedAt,
+          capability: page.capability, snapshotOrigin: page.snapshotOrigin,
+          ...(page.syncError ? { syncError: page.syncError } : {}),
+          selectedWorkflow: null, availableActions: ['media_read_remote_workflow', 'media_import_remote_workflow'],
+        })
+      },
+    }),
+    defineTool({
+      name: 'media_import_remote_workflow', label: '接入远端工作流',
+      description: '将已发现且内容 hash 一致的远端工作流自动转换并登记为当前项目的不可变草稿。复用节点/资源/输出校验，清除旧远端素材引用。无需手写 JSON，不创建预设、不发布公共版本、不提交生成。',
+      parameters: Type.Object({
+        descriptor: REMOTE_DESCRIPTOR_SCHEMA,
+        expectedContentHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+        id: Type.String({ pattern: IDENTIFIER_PATTERN }), name: Type.String({ minLength: 1, maxLength: 120 }),
+        expectedConfigRevision: Type.Integer({ minimum: 0 }), expectedWorkflowRevision: Type.Integer({ minimum: 0 }),
+      }),
+      execute: async (_toolCallId, params) => {
+        authorize(dependencies, context, 'draft')
+        const descriptor = params.descriptor as MediaRemoteDescriptor
+        const { analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, descriptor)
+        if (contentHash !== params.expectedContentHash) throw new Error('MEDIA_REMOTE_WORKFLOW_CHANGED')
+        if (!analysis.definition) {
+          /** 仅传递分析器已生成的结构问题；完整列表仍必须通过分页读取。 */
+          throw new MediaRemoteWorkflowImportError(analysis.issues)
+        }
+        const item = saveProjectWorkflow(dependencies, context, { ...params, definition: analysis.definition })
+        // 成功回执只带有界身份和输入输出键，完整表单由 inspect 读取，避免保存后丢失版本回执。
+        return toolResult({ imported: true, id: item.id, name: item.name, revision: item.revision, hash: item.hash,
+          projectId: item.projectId, connectionId: descriptor.connectionId, contentHash,
+          inputs: analysis.definition.bindings.slice(0, 24).map((binding) => ({ key: binding.key, kind: binding.kind })),
+          outputs: analysis.definition.outputs.slice(0, 16).map((output) => ({ key: output.key, mediaType: output.mediaType })),
+          truncated: analysis.definition.bindings.length > 24 || analysis.definition.outputs.length > 16,
+          availableActions: ['media_match_assets', 'media_inspect_workflow',
+            ...(hasCanvasTarget ? ['canvas_update_image_config', 'canvas_update_media_config'] : ['media_prepare_run'])] })
       },
     }),
     defineTool({
@@ -428,7 +631,8 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
       name: 'media_list_resources', label: '查询媒体资源',
       description: '分页查询已连接 ComfyUI 的节点、模型、工作流或 assets。节点、模型、工作流首次拉取后持久保存，默认搜索和分页读取本地快照；需要更新目录时显式设置 refresh=true。同一快照也供画布使用。保留来源能力与精确 descriptor，不把可发现误报为可执行。',
       parameters: Type.Object({
-        connectionId: Type.String({ pattern: IDENTIFIER_PATTERN }),
+        connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         kind: Type.Union([Type.Literal('nodes'), Type.Literal('models'), Type.Literal('workflows'), Type.Literal('assets')]),
         query: Type.Optional(Type.String({ maxLength: 256 })), folder: Type.Optional(Type.String({ maxLength: 256 })),
         offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -439,7 +643,9 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         if (params.kind === 'workflows' && params.limit !== undefined && params.limit > 20) throw new Error('MEDIA_RESOURCE_LIMIT_INVALID')
         /** 工作流页需要逐项读取摘要，缺省收紧为 10；其它资源维持 30。 */
         const limit = params.limit ?? (params.kind === 'workflows' ? 10 : 30)
-        const page = await dependencies.resources.list({ ...params, limit, projectId: context.projectId })
+        const connectionId = resolveMediaConnection(dependencies, context, params)
+        const { canvasId: _canvasId, ...query } = params
+        const page = await dependencies.resources.list({ ...query, connectionId, limit, projectId: context.projectId })
         const items = await Promise.all(page.items.map(async (item) => {
           const base = {
             id: item.id,
@@ -471,18 +677,20 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     defineTool({
       name: 'media_get_node_schema', label: '读取节点输入输出',
       description: '按已发现的准确 classType 从本地快照读取 ComfyUI 节点端口、标量约束、模型及安全选项；首次没有快照才拉取。可在编写工作流之前调用，需要更新时先调用 media_list_resources(kind=nodes, refresh=true)；不返回已有远端素材文件名。',
-      parameters: Type.Object({ connectionId: Type.String({ pattern: IDENTIFIER_PATTERN }),
+      parameters: Type.Object({ connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         classTypes: Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { minItems: 1, maxItems: 8 }) }),
       execute: async (_toolCallId, params) => {
         authorize(dependencies, context, 'read')
-        return toolResult(summarizeSchema(await dependencies.resources.getSchema(params.connectionId, context.projectId, params.classTypes)))
+        return toolResult(summarizeSchema(await dependencies.resources.getSchema(resolveMediaConnection(dependencies, context, params), context.projectId, params.classTypes)))
       },
     }),
     defineTool({
       name: 'media_inspect_workflow', label: '检查媒体工作流',
       description: '检查已保存工作流、完整定义或原始 ComfyUI API prompt，分页返回节点、绑定、输出和兼容问题。',
       parameters: Type.Object({
-        connectionId: Type.String({ pattern: IDENTIFIER_PATTERN }),
+        connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         workflowId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })), workflowRevision: Type.Optional(Type.Integer({ minimum: 1 })),
         definition: Type.Optional(Type.Unknown()), prompt: Type.Optional(Type.Unknown()),
         offset: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
@@ -492,7 +700,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         authorize(dependencies, context, 'read')
         const definition = resolveWorkflow(dependencies, context, params)
         const classTypes = Object.values(definition.prompt).map((node) => node.class_type)
-        const objectInfo = await dependencies.resources.getSchema(params.connectionId, context.projectId, classTypes)
+        const objectInfo = await dependencies.resources.getSchema(resolveMediaConnection(dependencies, context, params), context.projectId, classTypes)
         const inspection = inspectMediaWorkflow(definition, objectInfo, { offset: params.offset, limit: params.limit })
         const selectedClasses = new Set(inspection.nodes.map((node) => node.classType))
         return toolResult({ ...inspection, ...(params.includeSchema ? { schema: summarizeSchema(Object.fromEntries(Object.entries(objectInfo).filter(([name]) => selectedClasses.has(name)))) } : {}) })
@@ -523,21 +731,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         definition: Type.Unknown(),
       }),
       execute: async (_toolCallId, params) => {
-        authorize(dependencies, context, 'draft')
-        const catalog = dependencies.configuration.listProject(context.projectId)
-        const branchPrefix = createHash('sha256').update(JSON.stringify([context.sessionId, context.runStartedAt])).digest('hex').slice(0, 24)
-        const expectedPrefix = `branch-${branchPrefix}-`
-        const id = context.canvasAgentMode === 'parent-orchestrated'
-          ? params.id.startsWith(expectedPrefix)
-            ? params.id
-            : params.id.startsWith('branch-')
-              ? (() => { throw new Error('MEDIA_WORKFLOW_DRAFT_SCOPE_INVALID') })()
-              : `${expectedPrefix}${params.id.slice(0, 80)}`
-          : params.id
-        if (latestRevision(catalog.workflows, id) !== params.expectedWorkflowRevision) throw new Error('MEDIA_WORKFLOW_DRAFT_CONFLICT')
-        const definition = parseMediaWorkflowDefinition(params.definition)
-        authorize(dependencies, context, 'draft')
-        const item = savedWorkflow(dependencies.configuration.saveWorkflow({ id, name: params.name, projectId: context.projectId, definition }, params.expectedConfigRevision), id)
+        const item = saveProjectWorkflow(dependencies, context, params)
         return toolResult({ id: item.id, name: item.name, revision: item.revision, hash: item.hash, projectId: item.projectId })
       },
     }),
@@ -603,13 +797,14 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     }),
     defineTool({
       name: 'media_prepare_run', label: '准备媒体生成',
-      description: '固定已发布预设或项目私有 API workflow 草稿 revision、输入素材版本和发起主体，只做静态预检。两类来源严格互斥。父编排必须指定直接下游 targetNodeId，并先把节点输入固定为 literal 或稳定正式素材；不要引用自己本轮尚未提交的 agent.text。准备后由父调度器提交同一 run。',
+      description: '仅用于无 Canvas 目标的独立任务，或父工作流接管准备。面向画布生成时先创建/复用图片、音频、视频卡片，用 canvas_update_image_config/canvas_update_media_config 保存版本和参数，再 canvas_run_nodes。独立任务固定已发布预设或项目 API workflow 版本、素材版本和主体，只做静态预检。父编排必须指定直接下游 targetNodeId，由父调度器提交同一 run。',
       parameters: Type.Object({
         profileId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         profileRevision: Type.Optional(Type.Integer({ minimum: 1 })),
         workflowId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         workflowRevision: Type.Optional(Type.Integer({ minimum: 1 })),
         connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
+        canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         mediaKind: Type.Optional(Type.Union([Type.Literal('image'), Type.Literal('video'), Type.Literal('audio')])),
         inputs: Type.Record(Type.String({ pattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$' }), Type.Unknown()),
         targetNodeId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
@@ -622,7 +817,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         if (profileSelected === draftSelected
           || (profileSelected && (params.profileId === undefined || params.profileRevision === undefined))
           || (draftSelected && (params.workflowId === undefined || params.workflowRevision === undefined
-            || params.connectionId === undefined || params.mediaKind === undefined))) {
+            || params.mediaKind === undefined))) {
           throw new Error('MEDIA_RUN_SOURCE_INVALID')
         }
         const operationId = createHash('sha256').update(JSON.stringify([context.projectId, context.sessionId, context.runStartedAt, toolCallId])).digest('hex')
@@ -630,12 +825,14 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         authorize(dependencies, context, 'prepare')
         const parentMode = context.canvasAgentMode === 'parent-orchestrated'
         if (parentMode && (!dependencies.prepareParentRun || !params.targetNodeId || !context.parentWorkflow)) throw new Error('MEDIA_PARENT_HANDOFF_REQUIRED')
-        if (!parentMode && params.targetNodeId) throw new Error('MEDIA_CANVAS_TARGET_USE_CANVAS_TOOLS')
+        /** 明确 Canvas 目标或本轮节点引用须先保存节点配置，防止错误与参数只留在独立任务里。 */
+        if (!parentMode && (params.targetNodeId || resolveMediaCanvasId(context, params.canvasId)
+          || hasCanvasTarget)) throw new Error('MEDIA_CANVAS_TARGET_USE_CANVAS_TOOLS')
         const inputs = params.inputs as Record<string, MediaInputValue>
         const selector = profileSelected
           ? { profileId: params.profileId!, profileRevision: params.profileRevision! }
           : { workflowId: params.workflowId!, workflowRevision: params.workflowRevision!,
-              connectionId: params.connectionId!, mediaKind: params.mediaKind! }
+              connectionId: resolveMediaConnection(dependencies, context, params), mediaKind: params.mediaKind! }
         const snapshot = parentMode
           ? await dependencies.prepareParentRun!(context, { targetNodeId: params.targetNodeId!, operationId, inputs,
               ...selector } as PrepareCanvasMediaHandoffInput, originFor(context))
@@ -646,7 +843,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
                 if (!dependencies.runs.prepareDraft) throw new Error('MEDIA_DRAFT_RUN_UNAVAILABLE')
                 return dependencies.runs.prepareDraft({ projectId: context.projectId, operationId, inputs,
                 workflowId: params.workflowId!, workflowRevision: params.workflowRevision!,
-                connectionId: params.connectionId!, mediaKind: params.mediaKind! }, originFor(context))
+                connectionId: selector.connectionId!, mediaKind: params.mediaKind! }, originFor(context))
               })()
         preparedOperations.add(operationId)
         return toolResult(snapshot as unknown as Record<string, unknown>)
@@ -783,6 +980,11 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     execute: async (...args: Parameters<typeof tool.execute>) => {
       try {
         const result = await tool.execute(...args)
+        /** 目录、模型和字段检查共用画布作用域，后续省略参数也不能退回独立生成。 */
+        if (['media_list_workflows', 'media_list_resources', 'media_discover_workflows',
+          'media_inspect_workflow', 'media_get_node_schema', 'media_list_api_models'].includes(tool.name)
+          && args[1] && typeof args[1] === 'object' && 'canvasId' in args[1]
+          && typeof args[1].canvasId === 'string') hasCanvasTarget = true
         if (!isExecutionCapable && result.details && typeof result.details === 'object' && !Array.isArray(result.details)) {
           const details = result.details as Record<string, unknown>
           if (Array.isArray(details.availableActions)) {
@@ -794,6 +996,8 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         }
         return result
       } catch (error) {
+        /** 仅放行由本模块创建的脱敏结构错误，禁止回显任意异常正文。 */
+        if (error instanceof MediaWorkflowValidationError || error instanceof MediaRemoteWorkflowImportError) throw error
         const message = error instanceof Error ? error.message : ''
         const code = /^(?:MEDIA|COMFY|CANVAS)_[A-Z_]+(?::|$)/.exec(message)?.[0].replace(/:$/, '') ?? 'MEDIA_OPERATION_FAILED'
         throw new Error(code === 'COMFY_UI_WORKFLOW_UNSUPPORTED' ? `${code}: 请从 ComfyUI 导出 API Format 工作流` : code)
@@ -801,7 +1005,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     },
   }))
   return {
-    systemPromptAppend: '媒体任务先列出公共工作流、API 模型和可用资源，再显式选择精确版本、连接与素材；不要默认选择第一项。远端资源可发现不代表可执行，读取、导入、保存和运行必须使用返回的精确身份。项目草稿保持项目隔离；公共发布必须明确声明 publishIntent。旧 profile 工具仅用于兼容历史流程。准备不会生成，执行和取消需要用户单次批准。只有 media_import_local_file 可接收 Shell 或 Skill 在当前会话授权根生成的明确本地文件路径；已有资产需要交给 ffmpeg 或分析 Skill 时使用 media_get_asset_file，并原样传入 MediaAssetRef。其它媒体工具不要传入项目 ID、Agent 身份、本地路径、远端素材名或凭据。',
+    systemPromptAppend: '面向画布生成时，先用 canvas_get_context 和 canvas_read 复用目标卡片；尚无卡片时图片用 canvas_create_artifact，音视频用 canvas_create_media 创建，再发现与分析工作流。通过 media_list_workflows(canvasId) 读取画布绑定服务器和本地工作流，并查询 API 模型。没有指定工作流时主动调用 media_discover_workflows，传入目标媒体类型与真实媒体输入数量；普通 Agent 传 canvasId，画布 Agent 自动使用固定画布。未绑定时保留待配置卡片，请用户选择服务器，不默认选第一台。根据候选真实节点、标题、输入角色和输出分析适配性，不按文件名或数量相同直接认定首尾帧匹配。UI 格式先走转换分析。选定可导入候选后，用精确 descriptor 和 contentHash 调用 media_import_remote_workflow 保存项目草稿，再通过 media_inspect_workflow 和 media_match_assets 读取真实字段、默认值和素材。立即用 canvas_update_image_config 或 canvas_update_media_config 固定工作流版本、连接和已知 typed 输入，缺失字段省略并留给用户补齐；不能虚构素材或连线。分析失败时在原卡片 preparation 中保存错误码及节点、字段、中文原因，原始响应和凭据不得写入诊断。参数满足要求且用户已要求生成时，清除 preparation 并调用 canvas_run_nodes，原卡片展示进度、错误和产物。普通画布任务不走独立 media_prepare_run；无 Canvas 目标的独立媒体任务和父编排 handoff 保持原入口。项目草稿保持项目隔离，公共发布必须明确声明 publishIntent。发现、导入和保存不会生成，执行和取消仍遵守批准边界。旧 profile 仅兼容历史流程。只有 media_import_local_file 可接收 Shell 或 Skill 在当前授权根生成的明确本地文件路径；已有资产交给 ffmpeg 或分析 Skill 时使用 media_get_asset_file，并原样传入 MediaAssetRef。其它媒体工具不要传入项目 ID、Agent 身份、本地路径、远端素材名或凭据。',
     piCustomTools: visible,
     allowedToolNames: visible.map((tool) => tool.name),
     allowedToolNamesMode: 'extend',

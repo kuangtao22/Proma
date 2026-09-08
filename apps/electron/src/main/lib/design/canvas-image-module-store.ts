@@ -257,6 +257,8 @@ export function createCanvasImageModuleStore(
       'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode', 'adoptedAssetId',
       ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'mediaWorkflow')
         ? ['mediaWorkflow'] : []),
+      ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'preparation')
+        ? ['preparation'] : []),
     ]
     const config = hasExactKeys(rawConfig, configKeys)
       ? parseCanvasImageModuleConfig(rawConfig)
@@ -322,6 +324,7 @@ export function createCanvasImageModuleStore(
         prompt: input.prompt,
         selectedModelProfileId: input.selectedModelProfileId,
         ...(input.mediaWorkflow ? { mediaWorkflow: structuredClone(input.mediaWorkflow) } : {}),
+        preparation: input.preparation ?? null,
         aspectRatio: input.aspectRatio,
         imageSize: input.imageSize,
         contextMode: input.contextMode,

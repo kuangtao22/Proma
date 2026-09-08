@@ -9,19 +9,21 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 
-/** 画布范围只读模型目录，并通过父组件的文档 CAS 保存。 */
+/** 画布媒体配置统一入口；模型范围和服务器绑定分别通过父组件的文档 CAS 保存。 */
 export interface CanvasMediaModelPickerProps {
   projectId: string
   scope?: CanvasMediaModelScope
   disabled?: boolean
-  getImageModelSelection: DesignAdapter['getImageModelSelection']
+  getImageModelSelection?: DesignAdapter['getImageModelSelection']
   listMediaApiModelProfiles?: DesignAdapter['listMediaApiModelProfiles']
   onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
+  /** 已连接画布绑定状态的服务器控件，与模型多选保持独立。 */
+  connectionPicker?: React.ReactNode
   onChange: (scope: CanvasMediaModelScope) => void
 }
 
-/** 顶部多选 API 模型候选；不修改项目旧单选偏好，也不为节点挑选执行模型。 */
-export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageModelSelection, listMediaApiModelProfiles, onImageModelProfilesChanged, onChange }: CanvasMediaModelPickerProps): React.ReactElement {
+/** 同一弹层管理服务器与 API 模型候选，不为节点自动挑选执行模型。 */
+export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageModelSelection, listMediaApiModelProfiles, onImageModelProfilesChanged, connectionPicker, onChange }: CanvasMediaModelPickerProps): React.ReactElement {
   /** 目录响应按请求代次接管，防止切换项目后旧请求覆盖当前选择器。 */
   const requestVersion = React.useRef(0)
   const [options, setOptions] = React.useState<CanvasMediaModelOption[]>([])
@@ -37,8 +39,8 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
     setLoading(true)
     setError(null)
     try {
-      const [selection, catalog] = await Promise.all([getImageModelSelection(projectId), listMediaApiModelProfiles?.()])
-      if (version === requestVersion.current) setOptions(buildCanvasMediaModelOptions(catalog, selection.options))
+      const [selection, catalog] = await Promise.all([getImageModelSelection?.(projectId), listMediaApiModelProfiles?.()])
+      if (version === requestVersion.current) setOptions(buildCanvasMediaModelOptions(catalog, selection?.options ?? []))
     } catch {
       if (version === requestVersion.current) setError('媒体模型加载失败')
     } finally {
@@ -67,15 +69,21 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
   }
   return <Popover>
     <PopoverTrigger asChild>
-      <Button type="button" size="icon-sm" variant="ghost" className="size-8 shrink-0" aria-label={`本画布可用媒体模型${loading ? '' : `：${selection.availableIds.length} 个`}`} title="本画布可用媒体模型">
+      <Button type="button" size="icon-sm" variant="ghost" className="size-8 shrink-0" aria-label={`画布媒体配置${loading ? '' : `：${selection.availableIds.length} 个可用模型`}`} title="画布媒体配置">
         <SlidersHorizontal aria-hidden="true" />
       </Button>
     </PopoverTrigger>
-    <PopoverContent align="center" side="bottom" className="w-80 max-w-[calc(100vw-2rem)] p-3">
+    {/* 嵌套服务器下拉会测量触发器尺寸，父层保留淡入和平移，避免缩放引发重复尺寸通知。 */}
+    <PopoverContent align="center" side="bottom" collisionPadding={8} aria-label="画布媒体配置" className="max-h-[calc(100vh-5rem)] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto p-3 data-[state=open]:zoom-in-100 data-[state=closed]:zoom-out-100">
       <div className="mb-3 flex items-center justify-between gap-2">
-        <h3 className="text-sm font-medium">可用媒体模型</h3>
-        <Button type="button" size="icon-sm" variant="ghost" aria-label="管理媒体模型" title="管理媒体模型" onClick={() => { setSettingsTab('media'); setSettingsOpen(true) }}><Settings2 aria-hidden="true" /></Button>
+        <h3 className="text-sm font-medium">画布媒体配置</h3>
+        <Button type="button" size="icon-sm" variant="ghost" aria-label="管理媒体配置" title="管理媒体配置" onClick={() => { setSettingsTab('media'); setSettingsOpen(true) }}><Settings2 aria-hidden="true" /></Button>
       </div>
+      {connectionPicker ? <div className="mb-3 space-y-2 border-b border-border pb-3">
+        <h4 className="text-xs font-medium">ComfyUI 服务器</h4>
+        {connectionPicker}
+      </div> : null}
+      <h4 className="mb-2 text-xs font-medium">可用媒体模型</h4>
       <Input aria-label="搜索媒体模型" placeholder="搜索媒体模型" value={query} onChange={(event) => setQuery(event.target.value)} />
       <div role="group" aria-label="媒体类型" className="mt-2 grid grid-cols-4 gap-1">
         {(['all', 'image', 'audio', 'video'] as const).map((value) => <Button key={value} type="button" variant={kind === value ? 'secondary' : 'ghost'} size="sm" className="h-7 px-1 text-xs" aria-pressed={kind === value} onClick={() => setKind(value)}>{({ all: '全部', image: '图片', audio: '音频', video: '视频' })[value]}</Button>)}

@@ -32,6 +32,10 @@ export interface ComfyNodeSchema {
   output: string[]
   output_name?: string[]
   output_is_list?: boolean[]
+  /** 输出匹配类型；长度必须与 output 一致，null 表示没有匹配类型。 */
+  output_matchtypes?: (string | null)[]
+  /** 官方 widget 序列化顺序，按 required/optional 分组保存。 */
+  input_order?: { required: string[]; optional: string[]; hidden: string[] }
   input_is_list?: boolean
   output_node?: boolean
   category?: string
@@ -335,6 +339,37 @@ export function parseComfyObjectInfo(value: unknown): ComfyObjectInfo {
         || !rawSchema.output_is_list.every((item) => item === null || typeof item === 'boolean')) throw new Error('COMFY_OBJECT_INFO_INVALID')
       return rawSchema.output_is_list.map((item) => item === true)
     })()
+    const outputMatchTypes = rawSchema.output_matchtypes === undefined || rawSchema.output_matchtypes === null ? undefined : (() => {
+      if (!Array.isArray(rawSchema.output_matchtypes) || rawSchema.output_matchtypes.length !== output.length
+        || !rawSchema.output_matchtypes.every((item) => item === null || (typeof item === 'string' && isSafeLabel(item)))) {
+        throw new Error('COMFY_OBJECT_INFO_INVALID')
+      }
+      return rawSchema.output_matchtypes as (string | null)[]
+    })()
+    const inputOrder = rawSchema.input_order === undefined ? undefined : (() => {
+      if (!isRecord(rawSchema.input_order) || Object.keys(rawSchema.input_order).some((key) => key !== 'required' && key !== 'optional' && key !== 'hidden')
+        || !Object.hasOwn(rawSchema.input_order, 'required')
+        || !Array.isArray(rawSchema.input_order.required)
+        || (rawSchema.input_order.optional !== undefined && !Array.isArray(rawSchema.input_order.optional))
+        || (rawSchema.input_order.hidden !== undefined && !Array.isArray(rawSchema.input_order.hidden))
+        || rawSchema.input_order.required.some((item) => typeof item !== 'string' || !isSafeKey(item))
+        || (Array.isArray(rawSchema.input_order.optional)
+          && rawSchema.input_order.optional.some((item) => typeof item !== 'string' || !isSafeKey(item)))) {
+        throw new Error('COMFY_OBJECT_INFO_INVALID')
+      }
+      const required = rawSchema.input_order.required as string[]
+      const optional = (rawSchema.input_order.optional ?? []) as string[]
+      const hidden = (rawSchema.input_order.hidden ?? []) as string[]
+      if (hidden.some((item) => typeof item !== 'string' || !isSafeKey(item))
+        || new Set([...required, ...optional, ...hidden]).size !== required.length + optional.length + hidden.length) throw new Error('COMFY_OBJECT_INFO_INVALID')
+      const requiredInputs = rawSchema.input.required ?? {}
+      const optionalInputs = rawSchema.input.optional ?? {}
+      if (required.some((name) => !Object.hasOwn(requiredInputs, name))
+        || optional.some((name) => !Object.hasOwn(optionalInputs, name))) throw new Error('COMFY_OBJECT_INFO_INVALID')
+      const hiddenInputs = rawSchema.input.hidden ?? {}
+      if (hidden.some((name) => !Object.hasOwn(hiddenInputs, name))) throw new Error('COMFY_OBJECT_INFO_INVALID')
+      return { required: [...required], optional: [...optional], hidden: [...hidden] }
+    })()
     /** input 内或兼容顶层返回的隐藏输入。 */
     const rawHidden = rawSchema.hidden ?? rawSchema.input.hidden
     /** 解析后的隐藏输入映射。 */
@@ -367,6 +402,8 @@ export function parseComfyObjectInfo(value: unknown): ComfyObjectInfo {
       output,
       ...(outputName ? { output_name: outputName } : {}),
       ...(outputIsList ? { output_is_list: outputIsList } : {}),
+      ...(outputMatchTypes ? { output_matchtypes: outputMatchTypes } : {}),
+      ...(inputOrder ? { input_order: inputOrder } : {}),
       ...(inputIsList === undefined ? {} : { input_is_list: inputIsList }),
       ...(rawSchema.output_node === undefined ? {} : { output_node: rawSchema.output_node }),
       ...(parseOptionalText(rawSchema.category) === undefined ? {} : { category: parseOptionalText(rawSchema.category) }),

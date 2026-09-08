@@ -471,6 +471,8 @@ export function createCanvasImageModuleController(
           prompt: draft.prompt,
           selectedModelProfileId: draft.selectedModelProfileId,
           ...(draft.mediaWorkflow ? { mediaWorkflow: structuredClone(draft.mediaWorkflow) } : {}),
+          /** 用户提交修订后清除上一版分析诊断，完整参数仍由运行预检验证。 */
+          preparation: null,
           aspectRatio: draft.aspectRatio,
           imageSize: draft.imageSize,
           contextMode: draft.contextMode,

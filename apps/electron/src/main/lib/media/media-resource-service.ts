@@ -58,7 +58,7 @@ interface SourceSnapshot {
 }
 
 /** 节点来源快照。 */
-interface NodeSnapshot extends SourceSnapshot { schema: ComfyObjectInfo }
+interface NodeSnapshot extends SourceSnapshot { schema: ComfyObjectInfo; schemaFormatVersion: number }
 /** 模型快照保存全部目录的文件名，不读取权重文件。 */
 interface ModelSnapshot extends SourceSnapshot { folders: string[]; models: Record<string, string[]> }
 /** UserData 工作流目录快照，不包含工作流正文。 */
@@ -81,6 +81,8 @@ const MODEL_SYNC_CONCURRENCY = 4
 const MAX_MODEL_FOLDERS = 256
 const DEFAULT_REMOTE_ASSET_BYTES = 64 * 1024 * 1024
 const MAX_REMOTE_ASSET_BYTES = 128 * 1024 * 1024
+/** 节点 schema 快照格式；递增后旧快照只在首次读取时迁移一次。 */
+const NODE_SCHEMA_FORMAT_VERSION = 2
 
 /** 清洗发现用 schema，只有受控模型字段可公开资源枚举。 */
 function publicSchema(classType: string, schema: ComfyNodeSchema): ComfyNodeSchema {
@@ -140,7 +142,9 @@ function snapshotRecord(value: unknown): Record<string, unknown> & SourceSnapsho
 /** 还原节点快照时使用严格 schema 校验，损坏数据不降级为有效目录。 */
 function parseNodeSnapshot(value: unknown): NodeSnapshot {
   const record = snapshotRecord(value)
-  return { id: record.id, checkedAt: record.checkedAt, capability: record.capability, schema: parseComfyObjectInfo(record.schema) }
+  const schemaFormatVersion = record.schemaFormatVersion === undefined ? 1 : record.schemaFormatVersion
+  if (schemaFormatVersion !== 1 && schemaFormatVersion !== NODE_SCHEMA_FORMAT_VERSION) throw new Error('MEDIA_RESOURCE_SNAPSHOT_INVALID')
+  return { id: record.id, checkedAt: record.checkedAt, capability: record.capability, schema: parseComfyObjectInfo(record.schema), schemaFormatVersion }
 }
 
 /** 还原完整模型目录并检查每个目录都有可序列化的名称列表。 */
@@ -194,6 +198,8 @@ export class MediaResourceService {
   private readonly catalogs = new Map<string, SourceSnapshot>()
   /** 首次拉取与显式同步共用一个在途请求。 */
   private readonly catalogRequests = new Map<string, Promise<SourceSnapshot>>()
+  /** 当前服务实例已经尝试过旧节点 schema 迁移的缓存键。 */
+  private readonly nodeSchemaMigrationAttempts = new Set<string>()
 
   constructor(private readonly dependencies: MediaResourceServiceDependencies) {}
 
@@ -400,9 +406,15 @@ export class MediaResourceService {
 
   /** 节点来源按需加载。 */
   private async loadNodes(context: ResourceContext, refresh: boolean): Promise<NodeSnapshot> {
-    return await this.catalog(this.key(context, 'object-info'), refresh, parseNodeSnapshot, async () => {
+    const key = this.key(context, 'object-info')
+    const cached = this.readCatalog(key, parseNodeSnapshot) as NodeSnapshot | null
+    const needsMigration = cached?.schemaFormatVersion !== undefined && cached.schemaFormatVersion < NODE_SCHEMA_FORMAT_VERSION
+      && !this.nodeSchemaMigrationAttempts.has(key)
+    if (needsMigration) this.nodeSchemaMigrationAttempts.add(key)
+    if (cached && !refresh && !needsMigration) return { ...cached, snapshotOrigin: 'local' }
+    return await this.catalog(key, refresh || needsMigration, parseNodeSnapshot, async () => {
       const schema = parseComfyObjectCatalog(await context.client.objectInfo())
-      return { id: createHash('sha256').update(JSON.stringify(schema)).digest('hex'), checkedAt: Date.now(), capability: 'available', schema }
+      return { id: createHash('sha256').update(JSON.stringify(schema)).digest('hex'), checkedAt: Date.now(), capability: 'available', schema, schemaFormatVersion: NODE_SCHEMA_FORMAT_VERSION }
     })
   }
 

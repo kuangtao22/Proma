@@ -181,6 +181,40 @@ describe('媒体运行进度控制器', () => {
 })
 
 describe('Canvas AV 节点进度控制器', () => {
+  test('Given 空媒体卡片或分析失败 When 加载和收到配置更新 Then 原卡片显示待配置及诊断且修复后清除', async () => {
+    /** 以模块事件模拟错误保存和修复，不额外发起远端任务或轮询。 */
+    const target = mediaTarget()
+    const snapshot = mediaSnapshot(target, [])
+    const listener: { current?: (event: CanvasMediaModuleChangedEvent) => void } = {}
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({
+      projectId: target.projectId,
+      canvasMediaLoad: async () => structuredClone(snapshot),
+      onCanvasMediaChanged: (callback) => { listener.current = callback; return () => undefined },
+      onMediaRunChanged: () => () => undefined,
+      acquireProjectWatch: async () => undefined,
+      releaseProjectWatch: async () => undefined,
+      onChange: (progress) => projections.push(new Map(progress)),
+    })
+    controller.setTargets([target])
+    controller.start()
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.phaseLabel).toBe('待配置')
+    snapshot.config.preparation = { code: 'UI_SUBGRAPH_INPUT_MISMATCH', message: '节点 105 输入数量不一致。' }
+    listener.current?.({ target, revision: 2 })
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)).toMatchObject({ phase: 'pending', phaseLabel: '待配置',
+      nodeProgressLabel: 'UI_SUBGRAPH_INPUT_MISMATCH · 节点 105 输入数量不一致。' })
+    snapshot.config.preparation = null
+    snapshot.config.workflow = { workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'gpu-1' }
+    listener.current?.({ target, revision: 3 })
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)).toEqual({ phase: 'pending', phaseLabel: '参数待检查' })
+    controller.dispose()
+    await controller.whenIdle()
+    expect(projections.at(-1)?.size).toBe(0)
+  })
+
   test('Given 画布没有 AV 目标 When 控制器启动和释放 Then 不申请空项目 watch', async () => {
     const calls: string[] = []
     const controller = createCanvasMediaNodeProgressController({

@@ -52,7 +52,12 @@ const run = (overrides: Partial<MediaRunSnapshot> = {}): MediaRunSnapshot => ({
   profileRevision: 2, createdAt: 1, updatedAt: 2, outputs: [], error: null, progress: null, ...overrides,
 })
 
-function harness(options: { existing?: MediaRunSnapshot | null; definition?: MediaWorkflowDefinition; assets?: DesignAsset[] } = {}) {
+function harness(options: {
+  existing?: MediaRunSnapshot | null
+  definition?: MediaWorkflowDefinition
+  assets?: DesignAsset[]
+  workflowProjectId?: string | null
+} = {}) {
   /** 记录跨服务调用，验证恢复幂等与首次输入投影。 */
   const calls: Array<{ name: string; value?: unknown }> = []
   let current = options.existing ?? null
@@ -67,7 +72,7 @@ function harness(options: { existing?: MediaRunSnapshot | null; definition?: Med
         }
       },
       getWorkflow: () => ({
-        id: 'workflow-1', name: '公共图片工作流', projectId: null, revision: 3,
+        id: 'workflow-1', name: '图片工作流', projectId: options.workflowProjectId ?? null, revision: 3,
         hash: 'a'.repeat(64), definition, createdAt: 1,
       }),
       resolveConnectionVersion: () => ({ connection: { id: 'connection-1', instanceGeneration: 'generation-1' } }),
@@ -126,6 +131,23 @@ describe('media design execution', () => {
       workflowId: 'workflow-1', workflowRevision: 3, mediaKind: 'image', inputs: workflowSnapshot.inputs,
     })
     expect(calls.some((call) => call.name === 'prepare')).toBe(false)
+  })
+
+  test('Given 当前项目图片工作流草稿与固定快照 When 首次执行 Then 进入原 prepareDraft 合同', async () => {
+    /** 返回当前项目工作流的图片执行适配器与调用记录。 */
+    const { execution, calls } = harness({ definition: workflow([]), workflowProjectId: 'project-1' })
+    await execution.runImage(job({ imageModelSnapshot: workflowSnapshot }))
+    expect(calls.find((call) => call.name === 'prepareDraft')?.value).toMatchObject({
+      projectId: 'project-1', workflowId: 'workflow-1', workflowRevision: 3, connectionId: 'connection-1',
+    })
+  })
+
+  test('Given 其他项目图片工作流草稿与固定快照 When 首次执行 Then 在提交前拒绝', async () => {
+    /** 返回其他项目工作流的图片执行适配器与调用记录。 */
+    const { execution, calls } = harness({ definition: workflow([]), workflowProjectId: 'project-2' })
+    await expect(execution.runImage(job({ imageModelSnapshot: workflowSnapshot })))
+      .rejects.toThrow('MEDIA_CANVAS_MODEL_SNAPSHOT_MISMATCH')
+    expect(calls.some((call) => call.name === 'prepareDraft')).toBe(false)
   })
 
   test('Given 公共工作流产生多个输出, When 创建图片运行, Then 提示改用媒体节点且不提交', async () => {

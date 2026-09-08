@@ -7,6 +7,7 @@ import type {
   CanvasMediaModuleSnapshot,
   CanvasMediaOutputBinding,
   CanvasMediaOutputPreview,
+  CanvasMediaPreparationIssue,
   CanvasMediaTarget,
   ExportCanvasMediaOutputInput,
   ExportCanvasMediaOutputResult,
@@ -18,7 +19,22 @@ import type {
   RunCanvasMediaModuleInput,
   SaveCanvasMediaModuleInput,
 } from '@proma/shared'
+import { validateMediaWorkflowFieldValue } from '@proma/shared'
 import type { MediaRunOrigin } from '../media/media-run-service'
+import { MediaWorkflowValidationError } from '../media/media-workflow-error'
+
+/** 可安全持久化并向调用方抛出的工作流准备错误。 */
+export class CanvasMediaPreparationError extends Error {
+  readonly issue: CanvasMediaPreparationIssue
+
+  constructor(issue: CanvasMediaPreparationIssue) {
+    /** 所有动态定位字段即使上游合同变化也不能突破持久化消息上限。 */
+    const boundedIssue = { ...issue, message: issue.message.slice(0, 2_048) }
+    super(`${boundedIssue.code}: ${boundedIssue.message}`)
+    this.name = 'CanvasMediaPreparationError'
+    this.issue = boundedIssue
+  }
+}
 
 /** operation 固化工作流 selector；outputIndex 是节点 history 数组索引，不是 UI 顺序。 */
 export interface CanvasMediaOperationOutput extends CanvasMediaOutputBinding {
@@ -359,6 +375,7 @@ export class CanvasMediaService {
       updatedAt: this.now(),
       profile: input.profile ? { ...input.profile } : null,
       workflow: input.workflow ? { ...input.workflow } : null,
+      preparation: input.preparation ? { ...input.preparation } : null,
       inputs: structuredClone(input.inputs),
       outputs: structuredClone(input.outputs),
       adoptedOutputs: structuredClone(adoptedOutputs),
@@ -407,89 +424,95 @@ export class CanvasMediaService {
       }
     } else {
       if (state.config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
-      const sourceRef: MediaRunSourceReference = options.preparedSourceRef ?? (state.config.workflow
-        ? {
-            kind: 'project-draft-revision',
-            workflowId: state.config.workflow.workflowId,
-            workflowRevision: state.config.workflow.workflowRevision,
-            connectionId: state.config.workflow.connectionId,
-            mediaKind: state.config.mediaKind,
-          }
-        : state.config.profile
-          ? { kind: 'profile-version', profileId: state.config.profile.profileId, profileRevision: state.config.profile.profileRevision }
-          : (() => { throw new Error('CANVAS_MEDIA_SOURCE_REQUIRED') })())
-      let workflow: MediaWorkflowDefinition
-      if (sourceRef.kind === 'profile-version') {
-        if (state.config.profile?.profileId !== sourceRef.profileId
-          || state.config.profile.profileRevision !== sourceRef.profileRevision) throw new Error('CANVAS_MEDIA_PROFILE_MISMATCH')
-        const resolved = this.dependencies.configuration.resolveProfile(
-          sourceRef.profileId, sourceRef.profileRevision, input.projectId,
-        )
-        if (resolved.profile.id !== sourceRef.profileId || resolved.profile.revision !== sourceRef.profileRevision
-          || resolved.profile.mediaKind !== state.config.mediaKind) throw new Error('CANVAS_MEDIA_PROFILE_MISMATCH')
-        workflow = resolved.workflow.definition
-      } else {
-        if (sourceRef.mediaKind !== state.config.mediaKind) {
-          throw new Error('CANVAS_MEDIA_DRAFT_KIND_MISMATCH')
-        }
-        if (options.preparedRunId) {
-          if (!this.dependencies.runs.getWorkflowDefinition) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
-          workflow = this.dependencies.runs.getWorkflowDefinition(input.projectId, options.preparedRunId)
-        } else {
-          workflow = this.resolvePublicWorkflow(state.config, sourceRef, input.projectId)
-        }
-      }
-      const operationOutputs = this.resolveOperationOutputs(state.config.outputs, workflow)
-      const resolvedInputs = await this.dependencies.resolveWorkflowInputs(input, state.config.revision)
-      await this.dependencies.authorizeTarget(input, 'run')
-      options.signal?.throwIfAborted()
-      const freshState = await this.dependencies.store.load(input)
-      if (freshState.config.revision !== state.config.revision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
-      const inputs = resolvedMediaInputs(state.config, resolvedInputs)
-      assertExpectedInputHashes(inputs, options.expectedInputHashes)
-      if (options.preparedRunId && options.preparedActor) {
-        /** 父工作流只能接管同主体预备且 typed-DAG 输入完全一致的运行。 */
+      state = await this.clearPreparationForRetry(input, state)
+      try {
+        const sourceRef: MediaRunSourceReference = options.preparedSourceRef ?? (state.config.workflow
+          ? {
+              kind: 'project-draft-revision',
+              workflowId: state.config.workflow.workflowId,
+              workflowRevision: state.config.workflow.workflowRevision,
+              connectionId: state.config.workflow.connectionId,
+              mediaKind: state.config.mediaKind,
+            }
+          : state.config.profile
+            ? { kind: 'profile-version', profileId: state.config.profile.profileId, profileRevision: state.config.profile.profileRevision }
+            : (() => { throw new Error('CANVAS_MEDIA_SOURCE_REQUIRED') })())
+        let workflow: MediaWorkflowDefinition
         if (sourceRef.kind === 'profile-version') {
-          if (!this.dependencies.runs.claimPrepared) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
-          run = await this.dependencies.runs.claimPrepared({ projectId: input.projectId, runId: options.preparedRunId,
-            profileId: sourceRef.profileId, profileRevision: sourceRef.profileRevision, inputs }, options.preparedActor, origin)
+          if (state.config.profile?.profileId !== sourceRef.profileId
+            || state.config.profile.profileRevision !== sourceRef.profileRevision) throw new Error('CANVAS_MEDIA_PROFILE_MISMATCH')
+          const resolved = this.dependencies.configuration.resolveProfile(
+            sourceRef.profileId, sourceRef.profileRevision, input.projectId,
+          )
+          if (resolved.profile.id !== sourceRef.profileId || resolved.profile.revision !== sourceRef.profileRevision
+            || resolved.profile.mediaKind !== state.config.mediaKind) throw new Error('CANVAS_MEDIA_PROFILE_MISMATCH')
+          workflow = resolved.workflow.definition
         } else {
-          if (!this.dependencies.runs.claimPreparedDraft) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
-          run = await this.dependencies.runs.claimPreparedDraft({ projectId: input.projectId, runId: options.preparedRunId,
-            workflowId: sourceRef.workflowId, workflowRevision: sourceRef.workflowRevision,
-            connectionId: sourceRef.connectionId, mediaKind: sourceRef.mediaKind, inputs }, options.preparedActor, origin)
+          if (sourceRef.mediaKind !== state.config.mediaKind) {
+            throw new Error('CANVAS_MEDIA_DRAFT_KIND_MISMATCH')
+          }
+          if (options.preparedRunId) {
+            if (!this.dependencies.runs.getWorkflowDefinition) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
+            workflow = this.dependencies.runs.getWorkflowDefinition(input.projectId, options.preparedRunId)
+          } else {
+            workflow = this.resolveAuthorizedWorkflow(state.config, sourceRef, input.projectId)
+          }
         }
-      } else {
-        /** 手动运行继续用 operationId 幂等 prepare，并由 MediaRun 校验完整输入与来源。 */
-        run = sourceRef.kind === 'profile-version'
-          ? await this.dependencies.runs.prepare({
-              projectId: input.projectId,
-              operationId: input.operationId,
-              profileId: sourceRef.profileId,
-              profileRevision: sourceRef.profileRevision,
-              inputs,
-            }, origin)
-          : await this.dependencies.runs.prepareDraft({
-              projectId: input.projectId,
-              operationId: input.operationId,
-              workflowId: sourceRef.workflowId,
-              workflowRevision: sourceRef.workflowRevision,
-              connectionId: sourceRef.connectionId,
-              mediaKind: sourceRef.mediaKind,
-              inputs,
-            }, origin)
+        const operationOutputs = this.resolveOperationOutputs(state.config.outputs, workflow)
+        const resolvedInputs = await this.dependencies.resolveWorkflowInputs(input, state.config.revision)
+        await this.dependencies.authorizeTarget(input, 'run')
+        options.signal?.throwIfAborted()
+        const freshState = await this.dependencies.store.load(input)
+        if (freshState.config.revision !== state.config.revision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
+        const inputs = resolvedMediaInputs(state.config, resolvedInputs)
+        assertExpectedInputHashes(inputs, options.expectedInputHashes)
+        if (options.preparedRunId && options.preparedActor) {
+          /** 父工作流只能接管同主体预备且 typed-DAG 输入完全一致的运行。 */
+          if (sourceRef.kind === 'profile-version') {
+            if (!this.dependencies.runs.claimPrepared) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
+            run = await this.dependencies.runs.claimPrepared({ projectId: input.projectId, runId: options.preparedRunId,
+              profileId: sourceRef.profileId, profileRevision: sourceRef.profileRevision, inputs }, options.preparedActor, origin)
+          } else {
+            if (!this.dependencies.runs.claimPreparedDraft) throw new Error('CANVAS_MEDIA_PREPARED_HANDOFF_UNAVAILABLE')
+            run = await this.dependencies.runs.claimPreparedDraft({ projectId: input.projectId, runId: options.preparedRunId,
+              workflowId: sourceRef.workflowId, workflowRevision: sourceRef.workflowRevision,
+              connectionId: sourceRef.connectionId, mediaKind: sourceRef.mediaKind, inputs }, options.preparedActor, origin)
+          }
+        } else {
+          /** 手动运行继续用 operationId 幂等 prepare，并由 MediaRun 校验完整输入与来源。 */
+          run = sourceRef.kind === 'profile-version'
+            ? await this.dependencies.runs.prepare({
+                projectId: input.projectId,
+                operationId: input.operationId,
+                profileId: sourceRef.profileId,
+                profileRevision: sourceRef.profileRevision,
+                inputs,
+              }, origin)
+            : await this.dependencies.runs.prepareDraft({
+                projectId: input.projectId,
+                operationId: input.operationId,
+                workflowId: sourceRef.workflowId,
+                workflowRevision: sourceRef.workflowRevision,
+                connectionId: sourceRef.connectionId,
+                mediaKind: sourceRef.mediaKind,
+                inputs,
+              }, origin)
+        }
+        await this.dependencies.authorizeTarget(input, 'run')
+        operation = {
+          operationId: input.operationId,
+          runId: run.id,
+          sourceConfigRevision: state.config.revision,
+          sourceRef,
+          ...(sourceRef.kind === 'profile-version' ? { profile: { profileId: sourceRef.profileId, profileRevision: sourceRef.profileRevision } } : {}),
+          outputs: operationOutputs,
+          createdAt: this.now(),
+        }
+        state = await this.appendOperation(input, state, operation)
+      } catch (error) {
+        await this.persistPreparationIssue(input, state, error)
+        throw error
       }
-      await this.dependencies.authorizeTarget(input, 'run')
-      operation = {
-        operationId: input.operationId,
-        runId: run.id,
-        sourceConfigRevision: state.config.revision,
-        sourceRef,
-        ...(sourceRef.kind === 'profile-version' ? { profile: { profileId: sourceRef.profileId, profileRevision: sourceRef.profileRevision } } : {}),
-        outputs: operationOutputs,
-        createdAt: this.now(),
-      }
-      state = await this.appendOperation(input, state, operation)
     }
     if (!isTerminal(run)) {
       await this.dependencies.authorizeTarget(input, 'run')
@@ -500,8 +523,8 @@ export class CanvasMediaService {
     return run
   }
 
-  /** 新手动运行只接受公共工作流，并在 prepareDraft 前锁定完整输入输出合同和连接身份。 */
-  private resolvePublicWorkflow(
+  /** 新手动运行只接受公共或当前项目工作流，并在 prepareDraft 前锁定完整输入输出合同和连接身份。 */
+  private resolveAuthorizedWorkflow(
     config: CanvasMediaModuleConfig,
     sourceRef: Extract<MediaRunSourceReference, { kind: 'project-draft-revision' }>,
     projectId: string,
@@ -519,14 +542,9 @@ export class CanvasMediaService {
       projectId,
     )
     if (workflow.id !== sourceRef.workflowId || workflow.revision !== sourceRef.workflowRevision
-      || workflow.projectId !== null) throw new Error('CANVAS_MEDIA_WORKFLOW_MISMATCH')
+      || (workflow.projectId !== null && workflow.projectId !== projectId)) throw new Error('CANVAS_MEDIA_WORKFLOW_MISMATCH')
     const connection = this.dependencies.configuration.resolveConnection(sourceRef.connectionId, projectId)
     if (connection.connection.id !== sourceRef.connectionId) throw new Error('CANVAS_MEDIA_CONNECTION_MISMATCH')
-    if (config.inputs.length !== workflow.definition.bindings.length
-      || config.inputs.some((input, index) => {
-        const binding = workflow.definition.bindings[index]
-        return !binding || input.key !== binding.key || input.kind !== binding.kind
-      })) throw new Error('CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH')
     if (config.outputs.length !== workflow.definition.outputs.length
       || config.outputs.some((output, index) => {
         const selector = workflow.definition.outputs[index]
@@ -535,7 +553,106 @@ export class CanvasMediaService {
       || !config.outputs.some((output) => output.role === 'primary' && output.mediaKind === config.mediaKind)) {
       throw new Error('CANVAS_MEDIA_OUTPUT_CONTRACT_MISMATCH')
     }
+    this.assertDraftWorkflowInputContract(config, workflow.definition)
     return workflow.definition
+  }
+
+  /** 新 draft 运行前验证显式输入；可选标量继续由 MediaRun 从固定 prompt 回退。 */
+  private assertDraftWorkflowInputContract(
+    config: CanvasMediaModuleConfig,
+    workflow: MediaWorkflowDefinition,
+  ): void {
+    /** 按稳定 key 匹配，允许 UI 保存部分输入且不要求填写顺序与工作流一致。 */
+    const inputsByKey = new Map(config.inputs.map((input) => [input.key, input]))
+    for (const binding of workflow.bindings) {
+      const input = inputsByKey.get(binding.key)
+      const label = binding.field?.label ?? binding.key
+      if (!input) {
+        if (binding.field?.required === false
+          && (binding.kind === 'text' || binding.kind === 'number' || binding.kind === 'boolean')) continue
+        throw new CanvasMediaPreparationError({
+          code: 'CANVAS_MEDIA_INPUT_REQUIRED',
+          message: `待配置输入“${label}”（key=${binding.key}，nodeId=${binding.nodeId}，input=${binding.input}）。`,
+        })
+      }
+      if (input.kind !== binding.kind) {
+        throw new CanvasMediaPreparationError({
+          code: 'CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH',
+          message: `输入“${label}”类型不匹配（key=${binding.key}，nodeId=${binding.nodeId}，input=${binding.input}）。`,
+        })
+      }
+      if (input.source.type === 'literal'
+        && (input.kind === 'text' || input.kind === 'number' || input.kind === 'boolean')) {
+        const problem = validateMediaWorkflowFieldValue(binding, input.source.value)
+        if (problem) {
+          throw new CanvasMediaPreparationError({
+            code: 'CANVAS_MEDIA_INPUT_INVALID',
+            message: `${problem}（key=${binding.key}，nodeId=${binding.nodeId}，input=${binding.input}）`,
+          })
+        }
+      }
+    }
+    const workflowKeys = new Set(workflow.bindings.map((binding) => binding.key))
+    if ([...inputsByKey.keys()].some((key) => !workflowKeys.has(key))) {
+      throw new CanvasMediaPreparationError({
+        code: 'CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH',
+        message: '媒体输入包含工作流未声明的字段，请重新检查输入绑定。',
+      })
+    }
+  }
+
+  /** 重试清除诊断只推进状态版本，保留父工作流冻结的业务配置版本。 */
+  private async clearPreparationForRetry(
+    target: CanvasMediaTarget,
+    state: CanvasMediaModuleState,
+  ): Promise<CanvasMediaModuleState> {
+    if (!state.config.preparation) return state
+    await this.dependencies.authorizeTarget(target, 'run')
+    const fresh = await this.dependencies.store.load(target)
+    if (fresh.revision !== state.revision || fresh.config.revision !== state.config.revision) {
+      throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
+    }
+    return await this.dependencies.store.compareAndSwap(target, state.revision, {
+      ...state,
+      revision: state.revision + 1,
+      config: {
+        ...state.config,
+        updatedAt: this.now(),
+        preparation: null,
+      },
+    })
+  }
+
+  /** 准备失败只在原状态仍精确有效时记录安全诊断，任何记录失败都不能覆盖原异常。 */
+  private async persistPreparationIssue(
+    target: CanvasMediaTarget,
+    state: CanvasMediaModuleState,
+    error: unknown,
+  ): Promise<void> {
+    const issue = error instanceof CanvasMediaPreparationError
+      ? error.issue
+      : error instanceof MediaWorkflowValidationError
+        ? { code: 'MEDIA_WORKFLOW_INVALID', message: error.message.slice(0, 2_048) }
+        : {
+          code: 'CANVAS_MEDIA_PREPARATION_FAILED',
+          message: '媒体工作流准备失败，请检查工作流、连接和输入配置。',
+        }
+    try {
+      await this.dependencies.authorizeTarget(target, 'run')
+      const fresh = await this.dependencies.store.load(target)
+      if (fresh.revision !== state.revision || fresh.config.revision !== state.config.revision) return
+      await this.dependencies.store.compareAndSwap(target, state.revision, {
+        ...state,
+        revision: state.revision + 1,
+        config: {
+          ...state.config,
+          updatedAt: this.now(),
+          preparation: { ...issue },
+        },
+      })
+    } catch {
+      /** 错误记录是 best-effort；并发编辑、撤权或磁盘失败时继续抛出原始运行错误。 */
+    }
   }
 
   /** 把普通 Agent 已成功的独立 run 登记为候选，不迁移执行所有权或自动采用输出。 */

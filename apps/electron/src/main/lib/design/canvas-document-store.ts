@@ -18,6 +18,7 @@ import {
   createEmptyCanvasDocument,
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
+  isCanvasComfyUiConnectionId,
   parseCanvasAgentOutputPointer,
   parseCanvasMediaModelScope,
   parseCanvasEdgeRelation,
@@ -699,6 +700,10 @@ function assertUniqueIds(items: readonly { id: string }[], message: string): voi
 export function parseCanvasDocument(value: unknown, target: CanvasTarget): ParsedCanvasDocument {
   /** 新范围属于 Canvas 文档，旧文件缺省不发生写入迁移。 */
   const hasScope = isRecord(value) && Object.hasOwn(value, 'mediaModelScope')
+  /** 新连接字段仅属于当前 schema；历史文档继续以字段缺省形式兼容。 */
+  const hasComfyUiConnection = isRecord(value)
+    && value.schemaVersion === CANVAS_DOCUMENT_VERSION
+    && Object.hasOwn(value, 'comfyuiConnectionId')
   const fields = [
     'schemaVersion',
     'projectId',
@@ -710,6 +715,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     'createdAt',
     'updatedAt',
     ...(hasScope ? ['mediaModelScope'] : []),
+    ...(hasComfyUiConnection ? ['comfyuiConnectionId'] : []),
   ] as const
   if (!isRecord(value)
     || !hasExactKeys(value, fields)
@@ -725,7 +731,10 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     || !isTimestamp(value.updatedAt)
     || value.updatedAt < value.createdAt
     || !Array.isArray(value.nodes)
-    || !Array.isArray(value.edges)) {
+    || !Array.isArray(value.edges)
+    || (hasComfyUiConnection
+      && value.comfyuiConnectionId !== null
+      && !isCanvasComfyUiConnectionId(value.comfyuiConnectionId))) {
     throw new Error('CANVAS_DOCUMENT_INVALID')
   }
   /** 基础字段通过后使用局部变量保持 unknown 收窄稳定。 */
@@ -786,6 +795,7 @@ export function parseCanvasDocument(value: unknown, target: CanvasTarget): Parse
     revision,
     viewport,
     ...(hasScope ? { mediaModelScope: parseCanvasMediaModelScope(value.mediaModelScope) } : {}),
+    ...(hasComfyUiConnection ? { comfyuiConnectionId: value.comfyuiConnectionId as string | null } : {}),
     nodes,
     edges,
     createdAt: value.createdAt,
@@ -891,6 +901,11 @@ function validateCanvasMutations(
     }
     if (mutation.type === 'set-media-model-scope' && hasExactKeys(mutation, ['type', 'scope'])) {
       parseCanvasMediaModelScope(mutation.scope)
+      continue
+    }
+    if (mutation.type === 'set-comfyui-connection'
+      && hasExactKeys(mutation, ['type', 'connectionId'])
+      && (mutation.connectionId === null || isCanvasComfyUiConnectionId(mutation.connectionId))) {
       continue
     }
     if (mutation.type === 'move-nodes' && hasExactKeys(mutation, ['type', 'positions'])

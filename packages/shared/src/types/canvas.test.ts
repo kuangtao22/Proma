@@ -14,11 +14,13 @@ import {
   parseCanvasImageJobActivities,
   parseCanvasWebviewTarget,
   parseCanvasImageModuleConfig,
+  parseCanvasImageMediaWorkflow,
   parseCanvasImageModuleSnapshot,
   parseCanvasImageCandidateBatch,
   parseCanvasImageCandidateBatchSummary,
   parseAdoptCanvasImageCandidateBatchInput,
   parseReleaseCanvasImageMediaInput,
+  parseSaveCanvasImageModuleInput,
   parseCreateCanvasContentNodeInput,
   parseDeleteCanvasNodeInput,
   parseRestoreCanvasNodeInput,
@@ -411,6 +413,28 @@ function createDocument(): CanvasDocument {
 }
 
 describe('Canvas 图共享合同', () => {
+  test('Given 画布绑定 ComfyUI 服务器 When 归约 mutation 并解析公开快照 Then 保留显式绑定与不绑定状态', () => {
+    const bound = applyCanvasMutations(createDocument(), [{
+      type: 'set-comfyui-connection',
+      connectionId: 'connection-1',
+    }])
+    expect(bound.comfyuiConnectionId).toBe('connection-1')
+    expect(parseCanvasWorkspaceSnapshot({ document: bound, writable: true, nodeIssues: [] })
+      .document.comfyuiConnectionId).toBe('connection-1')
+
+    const unbound = applyCanvasMutations(bound, [{
+      type: 'set-comfyui-connection',
+      connectionId: null,
+    }])
+    expect(unbound.comfyuiConnectionId).toBeNull()
+  })
+
+  test('Given 公开画布绑定字段非法 When 严格解析 Then fail closed', () => {
+    const document = { ...createDocument(), comfyuiConnectionId: 42 }
+    expect(() => parseCanvasWorkspaceSnapshot({ document, writable: true, nodeIssues: [] }))
+      .toThrow('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
+  })
+
   test.each(['audio', 'video'] as const)('Given %s 快照含 Host 采用版本 When Renderer 严格解析 Then 保留只读 revision', (kind) => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', now)
     document.nodes = [{
@@ -991,6 +1015,40 @@ describe('Canvas 图共享合同', () => {
       mediaWorkflow: { ...config.mediaWorkflow, inputs: { image: { kind: 'asset', asset: {
         assetId: 'asset-1', revision: 1, hash: 'bad', mediaKind: 'image',
       } } } },
+    })).toThrow('CANVAS_IMAGE_WORKFLOW_INVALID')
+  })
+
+  test('Given 图片配置包含待配置错误 When 解析与保存 Then 支持严格诊断和显式清除', () => {
+    const base = {
+      schemaVersion: 2, kind: 'image', contentId: 'module-1', revision: 0,
+      createdAt: 10, updatedAt: 10, prompt: '主视觉', selectedModelProfileId: null,
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: null,
+    } as const
+    const preparation = { code: 'WORKFLOW_INPUT_REQUIRED', message: '节点 12 缺少输入 image。' }
+    expect(parseCanvasImageModuleConfig({ ...base, preparation }).preparation).toEqual(preparation)
+    expect(parseSaveCanvasImageModuleInput({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', imageModuleId: 'module-1',
+      expectedConfigRevision: 0, prompt: '主视觉', selectedModelProfileId: null,
+      preparation: null, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto',
+    }).preparation).toBeNull()
+    expect(() => parseCanvasImageModuleConfig({
+      ...base, preparation: { code: 'bad', message: '错误' },
+    })).toThrow('CANVAS_MEDIA_PREPARATION_INVALID')
+  })
+
+  test('Given 工作流绑定 key 含冒号或达到 256 字符 When 保存图片配置 Then 与媒体工作流合同一致', () => {
+    const longKey = `A${':'.repeat(255)}`
+    const workflow = parseCanvasImageMediaWorkflow({
+      workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'connection-1',
+      inputs: {
+        'subgraph:12:image': { kind: 'scalar', value: 'image.png' },
+        [longKey]: { kind: 'scalar', value: true },
+      },
+    })
+    expect(Object.keys(workflow.inputs)).toEqual(['subgraph:12:image', longKey])
+    expect(() => parseCanvasImageMediaWorkflow({
+      workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'connection-1',
+      inputs: { [`A${':'.repeat(256)}`]: { kind: 'scalar', value: true } },
     })).toThrow('CANVAS_IMAGE_WORKFLOW_INVALID')
   })
 

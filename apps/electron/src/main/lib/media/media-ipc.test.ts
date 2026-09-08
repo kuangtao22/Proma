@@ -6,6 +6,68 @@ import { EventEmitter } from 'node:events'
 import type { MediaRunEvent } from '@proma/shared'
 
 describe('媒体设置 IPC 授权', () => {
+  test('Given 远端 UI 工作流 When 设置页读取详情 Then IPC 复用转换分析并只返回安全问题', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const descriptor = { connectionId: 'gpu', instanceGeneration: 'v1', remoteUser: 'default', source: 'user-data' as const, id: 'workflow-1', workflowPath: 'workflow-1.json' }
+    /** 模拟正文读取成功而节点接口暂时不可用。 */
+    let schemaUnavailable = false
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => undefined,
+      configuration: { read: () => ({ schemaVersion: 2, revision: 0, connections: [], workflows: [], profiles: [] }), saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: {
+        probe: async () => { throw new Error('unused') },
+        list: async () => { throw new Error('unused') },
+        readWorkflow: async () => ({ descriptor, format: 'ui', definition: {
+          nodes: [{ id: 1, type: 'MissingNode', inputs: [{ name: 'token', link: null }], widgets_values: ['Bearer should-not-leak'] }],
+          links: [],
+        } }),
+        getSchema: async () => { if (schemaUnavailable) throw new Error('Bearer schema-secret'); return {} },
+      },
+      getRun: () => { throw new Error('unused') },
+    })
+    try {
+      const result = await handlers.get(MEDIA_IPC_CHANNELS.READ_REMOTE_WORKFLOW)!({} as IpcMainInvokeEvent, descriptor) as {
+        analysis?: { convertible: boolean; definition: unknown; issues: Array<{ code: string; nodeId?: string }> }
+      }
+      expect(result.analysis).toMatchObject({ convertible: false, definition: null })
+      expect(result.analysis?.issues).toContainEqual(expect.objectContaining({ code: 'NODE_CLASS_UNKNOWN', nodeId: '1' }))
+      expect(JSON.stringify(result.analysis)).not.toContain('Bearer should-not-leak')
+      schemaUnavailable = true
+      const offline = await handlers.get(MEDIA_IPC_CHANNELS.READ_REMOTE_WORKFLOW)!({} as IpcMainInvokeEvent, descriptor) as {
+        definition: unknown; analysis: { convertible: boolean; issues: Array<{ code: string }> }
+      }
+      expect(offline.definition).toBeDefined()
+      expect(offline.analysis.convertible).toBeFalse()
+      expect(offline.analysis.issues).toContainEqual(expect.objectContaining({ code: 'REMOTE_WORKFLOW_SCHEMA_UNAVAILABLE' }))
+      expect(JSON.stringify(offline.analysis)).not.toContain('schema-secret')
+    } finally { registration.dispose() }
+  })
+
+  test('Given 工作流读取抛出远端异常 When IPC 收口 Then 主进程记录原异常与安全身份且 Renderer 只收到稳定错误码', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const descriptor = { connectionId: 'gpu', instanceGeneration: 'v1', remoteUser: 'secret-user', source: 'user-data' as const, id: 'workflow-safe-id', workflowPath: 'workflow.json' }
+    const caughtError = new Error('Authorization: Bearer should-not-reach-renderer')
+    const logs: Array<{ message: string; error: unknown }> = []
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => undefined,
+      configuration: { read: () => ({ schemaVersion: 2, revision: 0, connections: [], workflows: [], profiles: [] }), saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') }, readWorkflow: async () => { throw caughtError }, getSchema: async () => ({}) },
+      onBackgroundError: (message, error) => { logs.push({ message, error }) },
+      getRun: () => { throw new Error('unused') },
+    })
+    try {
+      await expect(handlers.get(MEDIA_IPC_CHANNELS.READ_REMOTE_WORKFLOW)!({} as IpcMainInvokeEvent, descriptor))
+        .rejects.toThrow('MEDIA_REMOTE_WORKFLOW_READ_FAILED')
+      expect(logs).toEqual([{ message: '[媒体工作流] 详情分析失败 id=workflow-safe-id source=user-data', error: caughtError }])
+      expect(logs[0]?.message).not.toContain('secret-user')
+      expect(logs[0]?.message).not.toContain('Bearer')
+    } finally { registration.dispose() }
+  })
+
   test('Given 资源预览和本地导入 When 主窗口读取 Then 媒体验签且导入始终检查项目', async () => {
     const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
     let authorized = true

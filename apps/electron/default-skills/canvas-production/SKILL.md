@@ -2,7 +2,7 @@
 name: canvas-production
 description: Proma 画布生产与 Agent 编排 Skill。用户希望创建或迭代网页原型、图片设计稿、文档、产品套图、整套交互视觉稿、漫剧分镜、程序规划或其他需要多个可关联产物的任务时使用。负责判断是否进入画布、规划节点与关系、按需读取和局部更新产物，并通过 Proma 内置 canvas_* 工具执行；普通代码修改、一次性文本回答或不需要长期产物图的任务不要强行转入画布。
 group: proma
-version: "1.0.12"
+version: "1.0.15"
 ---
 
 # 画布生产
@@ -145,12 +145,18 @@ WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存
 
 ### 5.2 统一媒体与 ComfyUI
 
-1. 用 `media_list_api_models` 查询当前画布允许的可执行 API 模型，用 `media_list_profiles` / `media_list_workflows` 发现服务连接和公共工作流。没有全局默认工作流，按多图、图加音频、视频等真实输入组合选型。
-2. 用 `media_list_resources` 和 `media_get_node_schema` 查看所选连接的模型与节点；读取远端工作流用 `media_read_remote_workflow`。必须核对工作流 JSON 的真实节点输入、资源与输出兼容性，不能把目录中存在等同于 Proma 已完整适配。
+面向画布生成时，先通过 `canvas_read` 复用已有目标卡片；没有卡片时，图片用 `canvas_create_artifact`、音视频用 `canvas_create_media` 创建。卡片必须早于工作流分析和生成存在，不能等待成功才挂接，也不因缺少参数或转换失败删除重建。
+
+1. 用 `media_list_api_models` 查询当前画布允许的可执行 API 模型，用 `media_list_workflows(canvasId)` 读取画布绑定的 ComfyUI 服务和本地工作流。普通 Agent 传入当前画布 ID，画布 Agent 自动使用固定画布。服务器未绑定或失效时让用户在画布顶部选择；不擅自修改绑定，也不默认选择第一台服务器。API 模型列表为空不表示 ComfyUI 没有工作流。
+2. 用户未指定工作流时，主动调用 `media_discover_workflows`，提供输出 `mediaKind` 和实际素材 `inputKinds`（例如首尾两帧为两项 image），按页检查候选。目录与正文复用资源快照，只有明确需要更新时使用 `refresh=true`。结合节点标题、输入、连接及输出核实首尾帧等语义角色，数量匹配不能替代语义判断。UI 格式先尝试已有转换器，不能仅凭格式要求用户手写本地工作流；无法转换时报告具体节点、控件或连接问题。选定候选后原样传入 descriptor、contentHash 到 `media_import_remote_workflow`，保存项目草稿即可使用，无需发布为公共版本或创建预设。内容变化时重新发现与核查。需要深入检查时使用 `media_read_remote_workflow` / `media_get_node_schema`。
 3. 用 `media_inspect_workflow` 检查缺失参数，用 `media_match_assets` 匹配项目素材。用户附件通过 `media_list_sources` / `media_import_assets` 导入，本地 Shell/Skill 的明确产物通过 `media_import_local_file` 导入。上传和远端素材标识填充由 prepare 链路完成，不猜测远端文件名。
-4. 图片通过 `canvas_update_image_config` 固定公共工作流版本、连接和输入；音视频通过 `canvas_create_media`、`canvas_update_media_config` 固定 typed 输入与输出。保存后再运行，进度通过 `canvas_inspect_media` 或 `media_get_run` / `media_wait_run` 获取。
+4. 图片通过 `canvas_update_image_config` 固定公共或当前项目工作流版本、连接和输入；音视频通过 `canvas_update_media_config` 固定 typed 输入与输出。根据真实 `nodeId + input` 绑定填入已知参数、默认值和稳定素材引用；缺少的字段先省略，立即保存待配置草稿，让用户在原卡片查看和补齐。不要猜测素材或把未知映射当成可执行字段。已有任务保留准备时的连接，不能因为画布默认连接改变而改派。只有字段完整并符合用户生成意图时调用 `canvas_run_nodes`；普通画布任务不得直接调用独立 `media_prepare_run`。无 Canvas 目标的媒体任务与父编排 handoff 仍可使用准备入口。
 5. 独立远端任务可用 `canvas_attach_media_run` 回到画布。普通 Agent 或手动画布 Agent 需要把素材交给 Shell/ffmpeg 时，用 `media_get_asset_file` 传入精确资产引用，取得当前授权根内经过校验的本地文件。本地剪辑成品使用 `media_import_local_file` 导入，再用 `canvas_attach_media_assets` 按已配置的完整输出 key 回填候选，最后调用 `canvas_adopt_media_candidate` 采用。候选、正式采用与远端任务成功是不同事实。
 6. `metadataOnly` 只证明时长、尺寸、编码等技术信息，不能表示 Agent 已观看视频或听取音频。内容检查须使用当前真实可用的分析工具或保留用户验收。
+
+工作流无法转换或参数准备失败时，用对应节点更新工具的 `preparation: {code, message}` 保存有界错误码和节点、字段、中文原因，保留原参数；不得写入原始服务响应、路径或凭据。只有更新诊断时省略其它字段。解决后传 `preparation: null` 清除，并继续编辑和运行同一节点。进度、失败及输出留在原卡片，不把“已保存草稿”描述为“已经可以生成”。
+
+远端工作流摘要被截断时，用 `media_read_remote_workflow` 的 `section=nodes/inputs/outputs/issues` 和 `offset/limit` 分页精读；沿 `nextOffset` 继续，输入页的 `source` 表示真实连线。导入或准备失败时报告错误码、节点、字段和原因；导入错误的完整列表从 `section=issues` 读取，不将转换器限制误报为服务器缺少节点。导入成功回执只返回固定版本和输入输出键，完整字段通过 `media_inspect_workflow` 读取，不能把摘要未显示的节点当作不存在。
 
 ### 6. 复读与继续迭代
 

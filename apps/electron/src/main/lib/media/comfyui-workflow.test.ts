@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ComfyObjectInfo, MediaWorkflowDefinition } from '../../../../../../packages/shared/src/types/media-workflow'
-import { COMFY_CORE_NODE_CONTRACTS, compileComfyWorkflow, parseComfyApiWorkflow, validateComfyWorkflow } from './comfyui-workflow'
+import { COMFY_CORE_NODE_CONTRACTS, compileComfyWorkflow, expandComfyNodeInputs, parseComfyApiWorkflow, validateComfyWorkflow } from './comfyui-workflow'
 
 const objectInfo: ComfyObjectInfo = {
   LoadImage: {
@@ -49,6 +49,86 @@ const definition: MediaWorkflowDefinition = {
 }
 
 describe('ComfyUI static workflow', () => {
+  test('Given V3 prefix 自增模板 When 展开 Then 生成有界 ref_image 输入名并保留类型', () => {
+    /** MiniMax H3 真实 schema 通过 prefix 而非 names 声明参考图输入。 */
+    const schema: ComfyObjectInfo = { MiniMaxH3ReferenceToVideo: {
+      input: {
+        required: { prompt: ['STRING'] },
+        optional: { ref_images: ['COMFY_AUTOGROW_V3', {
+          template: { input: { required: { ref_image: ['IMAGE'] } }, prefix: 'ref_image_', min: 0, max: 3 },
+        }] },
+      },
+      output: ['LATENT'],
+    } }
+    const expanded = expandComfyNodeInputs(schema.MiniMaxH3ReferenceToVideo!, { prompt: 'ship' })
+    expect(expanded.ordered.map((input) => input.name)).toEqual([
+      'prompt', 'ref_images.ref_image_0', 'ref_images.ref_image_1', 'ref_images.ref_image_2',
+    ])
+    expect(expanded.optional['ref_images.ref_image_0']).toEqual(['IMAGE'])
+    expect(expanded.optional['ref_images.ref_image_3']).toBeUndefined()
+    expect(expanded.optional.ref_images).toBeUndefined()
+
+    /** 前缀与模板输入名不一致时无法证明 API 字段名称，保留容器供后续校验阻断。 */
+    const invalidSchema = structuredClone(schema)
+    invalidSchema.MiniMaxH3ReferenceToVideo!.input.optional!.ref_images![1]!.template = {
+      input: { required: { ref_image: ['IMAGE'] } }, prefix: 'image_', min: 0, max: 3,
+    }
+    expect(expandComfyNodeInputs(invalidSchema.MiniMaxH3ReferenceToVideo!, { prompt: 'ship' }).ordered.map((input) => input.name))
+      .toEqual(['prompt', 'ref_images'])
+  })
+
+  test('Given V3 具名自增输入 When 使用有限模板中的联合类型连接 Then 校验通过并拒绝未知名称', () => {
+    /** 自增容器只展开模板允许的输入名，不产生 values 本身的执行字段。 */
+    const schema: ComfyObjectInfo = { ...objectInfo,
+      Integer: { input: { required: { value: ['INT'] } }, output: ['INT'] },
+      Math: { input: { required: { expression: ['STRING'], values: ['COMFY_AUTOGROW_V3', {
+        template: { input: { required: { value: ['FLOAT,INT,BOOLEAN'] } }, names: ['a', 'b'], min: 1 },
+      }] } }, output: ['INT'] },
+    }
+    const graph = { ...definition, prompt: { ...definition.prompt,
+      '3': { class_type: 'Integer', inputs: { value: 1 } },
+      '4': { class_type: 'Math', inputs: { expression: 'a', 'values.a': ['3', 0] } },
+    } } as MediaWorkflowDefinition
+    expect(validateComfyWorkflow(graph, schema).issues).toEqual([])
+    graph.prompt['4']!.inputs['values.other'] = ['3', 0]
+    expect(validateComfyWorkflow(graph, schema).issues).toContainEqual(expect.objectContaining({ code: 'INPUT_UNKNOWN', nodeId: '4', input: 'values.other' }))
+    delete graph.prompt['4']!.inputs['values.a']
+    expect(validateComfyWorkflow(graph, schema).issues).toContainEqual(expect.objectContaining({ code: 'INPUT_REQUIRED', nodeId: '4', input: 'values.a' }))
+  })
+
+  test('Given V3 输出跟随输入模板 When 图片穿过匹配类型节点 Then 精确推导输出并阻止错误模板', () => {
+    /** 保留原始 output_matchtypes 后才能证明该输出沿用哪个输入类型。 */
+    const schema: ComfyObjectInfo = { ...objectInfo,
+      Resize: { input: { required: { media: ['COMFY_MATCHTYPE_V3', { template: {
+        template_id: 'media_type', allowed_types: 'IMAGE,MASK',
+      } }] } }, output: ['COMFY_MATCHTYPE_V3'], output_matchtypes: ['media_type'] },
+    }
+    const graph: MediaWorkflowDefinition = { ...definition, prompt: { ...definition.prompt,
+      '3': { class_type: 'Resize', inputs: { media: ['1', 0] } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['3', 0], filename_prefix: 'Proma' } },
+    } }
+    expect(validateComfyWorkflow(graph, schema).issues).toEqual([])
+    graph.prompt['3']!.inputs.media = ['1', 1]
+    expect(validateComfyWorkflow(graph, schema).issues).toContainEqual(expect.objectContaining({ code: 'LINK_TYPE_INVALID', nodeId: '2', input: 'images' }))
+    schema.Resize!.output_matchtypes = ['missing']
+    expect(validateComfyWorkflow(graph, schema).valid).toBeFalse()
+  })
+
+  test('Given 同一类型模板的多个输入 When 图片与蒙版冲突或模板连线成环 Then 拒绝且保持有界', () => {
+    const mediaInput = ['COMFY_MATCHTYPE_V3', { template: { template_id: 'media', allowed_types: 'IMAGE,MASK' } }] as const
+    const schema: ComfyObjectInfo = { ...objectInfo, Merge: {
+      input: { required: { first: [mediaInput[0], mediaInput[1]], second: [mediaInput[0], mediaInput[1]] } },
+      output: ['COMFY_MATCHTYPE_V3'], output_matchtypes: ['media'],
+    } }
+    const graph: MediaWorkflowDefinition = { ...definition, prompt: { ...definition.prompt,
+      '3': { class_type: 'Merge', inputs: { first: ['1', 0], second: ['1', 1] } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['3', 0], filename_prefix: 'Proma' } },
+    } }
+    expect(validateComfyWorkflow(graph, schema).issues).toContainEqual(expect.objectContaining({ code: 'LINK_TYPE_INVALID', nodeId: '3', input: 'second' }))
+    graph.prompt['3']!.inputs.second = ['3', 0]
+    expect(validateComfyWorkflow(graph, schema).issues).toContainEqual(expect.objectContaining({ code: 'WORKFLOW_CYCLE' }))
+  })
+
   test('Given 已知节点含尚未适配的 V3 多选参数 When 校验 Then 不因命中核心合同而放行', () => {
     /** 未归一为枚举的 COMBO 表示当前无法处理的选择语义。 */
     const multiselect: ComfyObjectInfo = { ...objectInfo,

@@ -376,7 +376,7 @@ describe('Canvas 生图模块 controller', () => {
     controller.updateDraft({ prompt: '本地新提示词' })
 
     const pendingCommit = controller.commitDraft()
-    expect(fixture.saveCalls[0]).toMatchObject({ expectedConfigRevision: 7, prompt: '本地新提示词' })
+    expect(fixture.saveCalls[0]).toMatchObject({ expectedConfigRevision: 7, prompt: '本地新提示词', preparation: null })
     fixture.saveQueue[0]?.resolve(config(moduleTarget, 8, '服务端规范提示词'))
     await pendingCommit
 

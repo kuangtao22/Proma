@@ -8,6 +8,7 @@ import { ComfyUIClient, ComfyUIError } from './comfyui-client'
 import type { ComfyHistoryPrompt, ComfyOutputReference, ComfyUploadResult } from './comfyui-client'
 import { COMFY_CORE_NODE_CONTRACTS, compileComfyWorkflow, validateComfyWorkflow } from './comfyui-workflow'
 import type { ComfyBindingValue } from './comfyui-workflow'
+import { MediaWorkflowValidationError } from './media-workflow-error'
 import { MediaConfigStore } from './media-config-store'
 import { acquireMediaFileLock } from './media-file-lock'
 import { readMediaJsonFile } from './media-json-file'
@@ -737,7 +738,7 @@ export class MediaRunService {
   /** 静态未适配或不兼容问题必须发生在上传之前。 */
   private assertValid(workflow: MediaWorkflowDefinition, schema: ComfyObjectInfo): void {
     const validation = validateComfyWorkflow(workflow, schema)
-    if (!validation.valid) throw new Error(`MEDIA_WORKFLOW_INVALID:${validation.issues.map((issue) => issue.code).join(',')}`)
+    if (!validation.valid) throw new MediaWorkflowValidationError(validation.issues)
   }
 
   /** 素材读取依赖 Host 的稳定文件身份授权，再对实际内容复验 hash。 */

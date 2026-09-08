@@ -28,6 +28,7 @@ import type {
   CanvasImageJobActivity,
   RebuildCanvasAgentNodeInput,
   RebuildCanvasAgentNodeResult,
+  MediaSettingsSnapshot,
 } from '@proma/shared'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { ArchiveRestore, History, LoaderCircle, RotateCcw } from 'lucide-react'
@@ -89,6 +90,11 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { addCanvasNodeReferences } from '@/lib/agent-message-queue'
 import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
+import {
+  buildCanvasComfyUiConnectionOptions,
+  CanvasComfyUiConnectionPicker,
+  resolveInheritableCanvasComfyUiConnection,
+} from './CanvasComfyUiConnectionPicker'
 import { CanvasNodeWorkbenchOverlay } from './CanvasNodeWorkbenchOverlay'
 import type { CanvasWorkbenchSize } from './CanvasNodeWorkbenchOverlay'
 import {
@@ -2110,6 +2116,7 @@ interface CanvasImageNodeWorkbenchProps {
   onDirtyChange: (nodeId: string, dirty: boolean) => void
   onRegisterDraftCommitter: RegisterNativeCanvasWorkbenchDraftCommitter
   mediaProgressByJobId: ReadonlyMap<string, MediaRunProgressProjection>
+  defaultComfyuiConnectionId?: string | null
 }
 
 /** 只在图片节点展开时挂载模块状态、模型目录和媒体授权。 */
@@ -2122,6 +2129,7 @@ function CanvasImageNodeWorkbench({
   onDirtyChange,
   onRegisterDraftCommitter,
   mediaProgressByJobId,
+  defaultComfyuiConnectionId,
 }: CanvasImageNodeWorkbenchProps): React.ReactElement {
   /** 图片节点的四元业务身份。 */
   const imageTarget = React.useMemo(() => ({
@@ -2150,7 +2158,7 @@ function CanvasImageNodeWorkbench({
   const modelState = projectModelStates.get(target.projectId) ?? fallbackModelState
   /** 模型广播和手动重试命令。 */
   const modelSelection = useDesignImageModelSelection(target.projectId, adapter)
-  /** 公共工作流、连接和项目素材由媒体主进程边界一次并行读取。 */
+  /** 可用工作流、连接和项目素材由媒体主进程边界一次并行读取。 */
   const [mediaCatalog, setMediaCatalog] = React.useState<{
     workflows: import('@proma/shared').MediaWorkflowVersion[]
     connections: import('@proma/shared').MediaConnectionSummary[]
@@ -2162,10 +2170,13 @@ function CanvasImageNodeWorkbench({
     void Promise.all([adapter.mediaGetSettings(), adapter.mediaListAssets(target.projectId)])
       .then(([settings, assets]) => {
         if (!active) return
-        /** 图片节点只展示未归档公共工作流；项目私有草稿继续由媒体节点管理。 */
+        /** 图片节点可展示公共和当前项目工作流；最终作用域由工作台按 projectId 收口。 */
         const archived = new Set(settings.archivedWorkflowIds ?? [])
         setMediaCatalog({
-          workflows: settings.workflows.filter((workflow) => workflow.projectId === null && !archived.has(workflow.id)),
+          workflows: settings.workflows.filter((workflow) => (
+            (workflow.projectId === null || workflow.projectId === target.projectId)
+            && !archived.has(workflow.id)
+          )),
           connections: settings.connections.filter((connection) => connection.archivedAt === undefined),
           assets,
         })
@@ -2289,6 +2300,7 @@ function CanvasImageNodeWorkbench({
       mediaWorkflows={mediaCatalog.workflows}
       mediaConnections={mediaCatalog.connections}
       mediaAssets={mediaCatalog.assets}
+      defaultComfyuiConnectionId={defaultComfyuiConnectionId}
       onMediaWorkflowChange={(workflow) => imageModule.updateDraft({ mediaWorkflow: workflow })}
       onDraftChange={imageModule.updateDraft}
       onGenerate={generate}
@@ -2584,6 +2596,8 @@ export function NativeCanvasWorkspace({
   const removeAgentCanvasViewState = useSetAtom(removeAgentCanvasViewStateAtom)
   const updateAgentCanvasViewState = useSetAtom(updateAgentCanvasViewStateAtom)
   const setComposerCanvasReferences = useSetAtom(agentCanvasNodeReferencesAtomFamily(sessionId))
+  /** 设置弹层开关用于关闭后按需刷新全局媒体目录。 */
+  const settingsOpen = useAtomValue(settingsOpenAtom)
   const store = useStore()
   const runningSessionIds = useAtomValue(canvasAgentRunningSessionIdsAtom)
   /** 项目级 Job 只提供轻量任务事实，不读取图片正文或历史详情。 */
@@ -2659,6 +2673,28 @@ export function NativeCanvasWorkspace({
     () => createNativeCanvasMediaWorkbenchAdapter(adapter),
     [adapter],
   )
+  /** 顶部服务器选择器读取全局目录；失效当前项由纯选项投影继续保留。 */
+  const [canvasComfyUiCatalog, setCanvasComfyUiCatalog] = React.useState<{
+    connections: MediaSettingsSnapshot['connections']
+    loading: boolean
+  }>({ connections: [], loading: true })
+
+  React.useEffect(() => {
+    let active = true
+    if (!adapter.mediaGetSettings) {
+      setCanvasComfyUiCatalog({ connections: [], loading: false })
+      return () => { active = false }
+    }
+    setCanvasComfyUiCatalog((current) => ({ ...current, loading: true }))
+    void adapter.mediaGetSettings()
+      .then((settings) => {
+        if (active) setCanvasComfyUiCatalog({ connections: settings.connections, loading: false })
+      })
+      .catch(() => {
+        if (active) setCanvasComfyUiCatalog({ connections: [], loading: false })
+      })
+    return () => { active = false }
+  }, [adapter.mediaGetSettings, settingsOpen, target.canvasId, target.projectId])
 
   React.useEffect(() => {
     if (!adapter.listJobs || !adapter.onChanged) return
@@ -2794,6 +2830,26 @@ export function NativeCanvasWorkspace({
   const viewDocument = React.useMemo(() => state.snapshot
     ? { ...state.snapshot.document, viewport: viewState.viewport }
     : null, [state.snapshot, viewState.viewport])
+  /** 先确定唯一当前文档，再读取字段，显式 null 不得回退到其它快照。 */
+  const activeCanvasDocument = viewDocument ?? state.snapshot?.document
+  /** undefined 表示升级前未设置，UI 按明确不绑定处理。 */
+  const canvasComfyUiConnectionId = activeCanvasDocument?.comfyuiConnectionId ?? null
+  /** 启用目录与当前失效绑定合并，避免目录变化静默改写用户选择。 */
+  const canvasComfyUiConnectionOptions = React.useMemo(
+    () => buildCanvasComfyUiConnectionOptions(
+      canvasComfyUiCatalog.connections,
+      canvasComfyUiConnectionId,
+    ),
+    [canvasComfyUiCatalog.connections, canvasComfyUiConnectionId],
+  )
+  /** 新工作流只继承仍启用的连接，失效绑定仅作为用户可见历史事实保留。 */
+  const inheritableCanvasComfyUiConnectionId = React.useMemo(
+    () => resolveInheritableCanvasComfyUiConnection(
+      canvasComfyUiConnectionOptions,
+      canvasComfyUiConnectionId,
+    ),
+    [canvasComfyUiConnectionId, canvasComfyUiConnectionOptions],
+  )
   /** 工作区快照只建立一次素材预览索引，所有折叠卡片共享且不触发图片模块 LOAD。 */
   const imagePreviews = React.useMemo(() => new Map(
     (state.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
@@ -3858,6 +3914,7 @@ export function NativeCanvasWorkspace({
           onDirtyChange={updateWorkbenchDirty}
           onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
           mediaProgressByJobId={mediaProgressByJobId}
+          defaultComfyuiConnectionId={inheritableCanvasComfyUiConnectionId}
         />
       )
     } else if ((node.kind === 'audio' || node.kind === 'video') && mediaWorkbenchAdapter) {
@@ -3872,6 +3929,7 @@ export function NativeCanvasWorkspace({
           }}
           writable={workspaceWritable}
           adapter={mediaWorkbenchAdapter}
+          defaultComfyuiConnectionId={inheritableCanvasComfyUiConnectionId}
         />
       )
     } else if (node.kind === 'document' && documentWorkbenchAdapter && state.snapshot) {
@@ -3934,6 +3992,7 @@ export function NativeCanvasWorkspace({
     imageWorkbenchAdapter,
     mediaWorkbenchAdapter,
     mediaProgressByJobId,
+    inheritableCanvasComfyUiConnectionId,
     documentWorkbenchAdapter,
     webviewWorkbenchAdapter,
     registerWorkbenchDraftCommitter,
@@ -4020,16 +4079,24 @@ export function NativeCanvasWorkspace({
               className="relative h-full min-w-0"
             >
               <NativeCanvasToolbar
-                mediaModelPicker={adapter.getImageModelSelection ? <CanvasMediaModelPicker
-                  key={`${target.projectId}:${target.canvasId}`}
-                  projectId={target.projectId}
-                  scope={(viewDocument ?? state.snapshot.document).mediaModelScope}
-                  disabled={!workspaceWritable}
-                  getImageModelSelection={adapter.getImageModelSelection}
-                  listMediaApiModelProfiles={adapter.listMediaApiModelProfiles}
-                  onImageModelProfilesChanged={adapter.onImageModelProfilesChanged}
-                  onChange={(scope) => controllerRef.current?.enqueueMutation({ type: 'set-media-model-scope', scope })}
-                /> : undefined}
+                mediaModelPicker={adapter.getImageModelSelection || adapter.mediaGetSettings ? <CanvasMediaModelPicker
+                    key={`${target.projectId}:${target.canvasId}`}
+                    projectId={target.projectId}
+                    scope={(viewDocument ?? state.snapshot.document).mediaModelScope}
+                    disabled={!workspaceWritable}
+                    getImageModelSelection={adapter.getImageModelSelection}
+                    listMediaApiModelProfiles={adapter.listMediaApiModelProfiles}
+                    onImageModelProfilesChanged={adapter.onImageModelProfilesChanged}
+                    connectionPicker={adapter.mediaGetSettings ? <CanvasComfyUiConnectionPicker
+                      connections={canvasComfyUiConnectionOptions}
+                      connectionId={canvasComfyUiConnectionId}
+                      disabled={!workspaceWritable || canvasComfyUiCatalog.loading}
+                      onChange={(connectionId) => controllerRef.current?.enqueueMutation({
+                        type: 'set-comfyui-connection', connectionId,
+                      })}
+                    /> : undefined}
+                    onChange={(scope) => controllerRef.current?.enqueueMutation({ type: 'set-media-model-scope', scope })}
+                  /> : undefined}
                 activeTool={viewState.activeTool}
                 writable={workspaceWritable}
                 canAdd={canCreateNode}

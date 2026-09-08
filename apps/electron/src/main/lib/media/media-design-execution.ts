@@ -111,7 +111,8 @@ function resolveWorkflow(job: DesignJobRecord, configuration: MediaDesignConfigu
     const workflow = configuration.getWorkflow(snapshot.workflowId, snapshot.workflowRevision, job.projectId)
     const connection = configuration.resolveConnectionVersion(snapshot.connectionId, snapshot.instanceGeneration).connection
     if (workflow.id !== snapshot.workflowId || workflow.revision !== snapshot.workflowRevision
-      || workflow.hash !== snapshot.workflowHash || workflow.projectId !== null
+      || workflow.hash !== snapshot.workflowHash
+      || (workflow.projectId !== null && workflow.projectId !== job.projectId)
       || connection.id !== snapshot.connectionId || connection.instanceGeneration !== snapshot.instanceGeneration
       || workflow.definition.outputs.length !== 1 || workflow.definition.outputs[0]?.mediaType !== 'image') {
       throw new Error('MEDIA_CANVAS_MODEL_SNAPSHOT_MISMATCH')

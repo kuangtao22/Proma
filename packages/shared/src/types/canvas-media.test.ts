@@ -212,6 +212,38 @@ describe('Canvas 通用媒体合同', () => {
     expect(Object.hasOwn(parsed, 'workflow')).toBeFalse()
   })
 
+  test('Given 待配置错误存在或显式清除 When 解析媒体配置与保存命令 Then 严格保留安全诊断', () => {
+    const preparation = {
+      code: 'UI_SUBGRAPH_INPUT_MISMATCH',
+      message: '节点 105 的输入 image 与工作流定义不一致。',
+    }
+    expect(parseCanvasMediaModuleConfig({ ...createConfig(), preparation }).preparation).toEqual(preparation)
+    expect(parseSaveCanvasMediaModuleInput({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      mediaModuleId: 'media-1', mediaKind: 'video',
+      expectedConfigRevision: 0,
+      profile: null,
+      preparation: null,
+      inputs: [{ key: 'prompt', kind: 'text', source: { type: 'literal', value: '海边日落' } }],
+      outputs: [{ key: 'video', mediaKind: 'video', role: 'primary', order: 0 }],
+    }).preparation).toBeNull()
+  })
+
+  test('Given 待配置错误越界 When 严格解析 Then 拒绝未知字段与不安全内容', () => {
+    const invalidIssues = [
+      { code: 'lowercase', message: '错误' },
+      { code: `A${'B'.repeat(96)}`, message: '错误' },
+      { code: 'WORKFLOW_INVALID', message: '' },
+      { code: 'WORKFLOW_INVALID', message: '错'.repeat(2_049) },
+      { code: 'WORKFLOW_INVALID', message: '错误', secret: 'token' },
+    ]
+    for (const preparation of invalidIssues) {
+      expect(() => parseCanvasMediaModuleConfig({ ...createConfig(), preparation })).toThrow(
+        'CANVAS_MEDIA_PREPARATION_INVALID',
+      )
+    }
+  })
+
   test('Given audio/video 节点 When 解析工作区与创建命令 Then 只接受 mediaModuleId 图引用', () => {
     const snapshot = parseCanvasWorkspaceSnapshot({
       document: {

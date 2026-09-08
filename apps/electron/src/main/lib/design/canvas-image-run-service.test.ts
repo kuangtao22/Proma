@@ -6,6 +6,7 @@ import type {
   CanvasTarget,
   CreateDesignJobInput,
   DesignJobRecord,
+  SaveCanvasImageModuleInput,
 } from '@proma/shared'
 import type { DesignJobChangedListener } from './design-job-manager'
 import {
@@ -13,6 +14,7 @@ import {
   type CanvasImageBatchWaitInput,
 } from './canvas-image-run-service'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
+import { MediaWorkflowValidationError } from '../media/media-workflow-error'
 
 const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
 const context: CanvasToolRunContext = {
@@ -85,6 +87,7 @@ function createJob(
 }
 
 interface HarnessOptions {
+  saveConfig?: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   loadConfig?: (node: Extract<CanvasNode, { kind: 'image' }>) => CanvasImageModuleConfig
   preflight?: (input: CreateDesignJobInput) => Promise<void>
   createOnce?: (
@@ -126,6 +129,10 @@ function createHarness(options: HarnessOptions = {}) {
       },
     },
     imageModules: {
+      save: async (input) => {
+        calls.push(`save:${input.nodeId}`)
+        return options.saveConfig ? options.saveConfig(input) : createConfig(createImageNode(input.nodeId))
+      },
       load: async (imageTarget) => {
         calls.push(`load:${imageTarget.nodeId}`)
         const node = createImageNode(imageTarget.nodeId)
@@ -238,6 +245,57 @@ function createHarness(options: HarnessOptions = {}) {
 }
 
 describe('Canvas 图片统一运行服务', () => {
+  test('Given 图片工作流缺少素材 When 预检失败 Then 在原配置版本记录安全诊断且不创建任务', async () => {
+    /** 缺字段错误只记录可信绑定定位，第三方原始 message 不进入配置。 */
+    const node = createImageNode('image-pending')
+    const saves: SaveCanvasImageModuleInput[] = []
+    const harness = createHarness({
+      preflight: async () => { throw new MediaWorkflowValidationError([
+        { code: 'INPUT_REQUIRED', nodeId: '12', input: 'image', message: 'Bearer secret' },
+      ]) },
+      saveConfig: async (input) => { saves.push(input); return createConfig(node) },
+    })
+    const result = await harness.service.run(context, target, [node], 'pending-workflow')
+    expect(result.tasks[0]).toMatchObject({ status: 'failed' })
+    expect(saves).toHaveLength(1)
+    expect(saves[0]).toMatchObject({ expectedConfigRevision: createConfig(node).revision,
+      preparation: { code: 'MEDIA_WORKFLOW_INVALID', message: expect.stringContaining('INPUT_REQUIRED@12.image') } })
+    expect(JSON.stringify(saves)).not.toContain('Bearer secret')
+    expect(harness.jobs.size).toBe(0)
+  })
+
+  test('Given 图片预检失败期间配置已经变化 When 诊断保存冲突 Then 保留原预检结果并不覆盖新配置', async () => {
+    /** Store 的 expectedConfigRevision CAS 冲突不可被诊断写入重试绕过。 */
+    const harness = createHarness({
+      preflight: async () => { throw new MediaWorkflowValidationError([
+        { code: 'INPUT_REQUIRED', nodeId: '12', input: 'image', message: 'required' },
+      ]) },
+      saveConfig: async () => { throw new Error('CANVAS_IMAGE_CONFIG_REVISION_CONFLICT') },
+    })
+    const result = await harness.service.run(context, target, [createImageNode('image-pending')], 'pending-conflict')
+    expect(result.tasks[0]).toMatchObject({ status: 'failed', error: expect.stringContaining('INPUT_REQUIRED@12.image') })
+    expect(harness.calls.filter((call) => call.startsWith('save:'))).toHaveLength(1)
+    expect(harness.jobs.size).toBe(0)
+  })
+
+  test('Given 图片有历史准备错误 When 重试预检通过 Then 清除旧错误并用新配置版本创建任务', async () => {
+    /** 重试无需先改参数，外部服务恢复后也能消除历史诊断。 */
+    const node = createImageNode('image-retry')
+    const original = { ...createConfig(node), preparation: { code: 'MEDIA_WORKFLOW_INVALID', message: '旧诊断' } }
+    const saves: SaveCanvasImageModuleInput[] = []
+    const harness = createHarness({
+      loadConfig: () => original,
+      saveConfig: async (input) => {
+        saves.push(input)
+        return { ...original, revision: original.revision + 1, preparation: null }
+      },
+    })
+    const result = await harness.service.run(context, target, [node], 'retry-preparation')
+    expect(saves[0]).toMatchObject({ preparation: null, expectedConfigRevision: original.revision })
+    expect(result.tasks[0]).toMatchObject({ status: 'started' })
+    expect([...harness.jobs.values()][0]?.canvasImageConfigRevision).toBe(original.revision + 1)
+  })
+
   test('Given Agent 图片节点选择公共工作流 When 批量预检 Then 原样透传工作流且不伪造 profile', async () => {
     const node = createImageNode('image-workflow')
     /** 完整输入包含标量和素材，验证运行服务不做字段猜测或裁剪。 */

@@ -1094,6 +1094,19 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.imageSaveInputs).toHaveLength(0)
   })
 
+  test('Given 图片工作流分析失败 When 只记录待配置诊断 Then 保留图片参数且不提交生成', async () => {
+    /** 原卡片保存分析错误，避免工作流不可转换时丢失用户上下文。 */
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const preparation = { code: 'UI_SUBGRAPH_INPUT_MISMATCH', message: '节点 105 的子图输入与定义不一致。' }
+    await executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3,
+      expectedConfigRevision: 4, preparation,
+    })
+    expect(fixture.imageSaveInputs[0]).toMatchObject({ preparation, prompt: '旧提示词', selectedModelProfileId: 'model-1' })
+    expect(fixture.runInputs).toHaveLength(0)
+  })
+
   test('Given Agent 选择公共图片工作流 When 更新图片配置 Then 清除 profile 并保存完整媒体输入', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
@@ -1489,6 +1502,29 @@ describe('普通 Agent Canvas Tool Provider', () => {
       outputs: [{ key: 'primary', mediaKind: 'audio', role: 'primary', order: 0 }],
     })
     expect(fixture.canvasMediaInputs.at(-1)).toMatchObject({ operation: 'save', input: { profile: null } })
+  })
+
+  test('Given 已创建媒体卡片 When 工作流分析失败后记录诊断 Then 保留原配置并允许原卡片继续编辑', async () => {
+    /** 用既有模块快照验证仅写诊断不覆盖已有输入、预设和输出。 */
+    const fixture = createFixture()
+    fixture.dependencies.documents.load = () => ({
+      document: { ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
+        nodes: [{ id: 'video-1', kind: 'video', title: '镜头', position: { x: 0, y: 0 }, mediaModuleId: 'media-video-1' }] },
+      writable: true, nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const preparation = { code: 'UI_SUBGRAPH_INPUT_MISMATCH', message: '节点 105 的子图输入数量不一致。' }
+    await executeTool(run.piCustomTools, 'canvas_update_media_config', {
+      canvasId: 'canvas-1', nodeId: 'video-1', baseRevision: 3, expectedConfigRevision: 2, preparation,
+    })
+    expect(fixture.canvasMediaInputs.at(-1)).toMatchObject({ operation: 'save', input: {
+      preparation, profile: { profileId: 'profile-1', profileRevision: 1 }, inputs: [],
+      outputs: [{ key: 'primary', mediaKind: 'video', role: 'primary', order: 0 }],
+    } })
+    expect(fixture.canvasMediaInputs.filter((entry) => entry.operation === 'run')).toHaveLength(0)
+    await expect(executeTool(run.piCustomTools, 'canvas_update_media_config', {
+      canvasId: 'canvas-1', nodeId: 'video-1', baseRevision: 3, expectedConfigRevision: 1, preparation,
+    })).rejects.toThrow('CANVAS_MEDIA_CONFIG_CONFLICT')
   })
 
   test('Given 父编排 child 创建产物 When 登记动态后继 Then 只传 Host 创建结果且登记失败保留创建事实', async () => {
@@ -2030,6 +2066,14 @@ describe('普通 Agent Canvas Tool Provider', () => {
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3,
       operations: [{ type: 'set-media-model-scope', scope: { mode: 'all-enabled' } }] })).rejects.toThrow('CANVAS_MEDIA_MODEL_SCOPE_USER_MANAGED')
+    expect(fixture.batchInputs).toHaveLength(0)
+  })
+
+  test('Given Agent 有运行权限 When 尝试改写画布 ComfyUI 连接 Then 保留用户绑定', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'set-comfyui-connection', connectionId: 'other-server' }] })).rejects.toThrow('CANVAS_COMFYUI_CONNECTION_USER_MANAGED')
     expect(fixture.batchInputs).toHaveLength(0)
   })
 

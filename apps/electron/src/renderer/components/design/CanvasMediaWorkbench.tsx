@@ -43,16 +43,21 @@ export interface CanvasMediaWorkflowInputDraft {
   sourceType: 'literal' | 'canvas-output'
   value: string
   asset: MediaAssetRef | null
-  nodeId: string
+  /** ComfyUI 工作流中真实输入节点，用于向用户定位字段。 */
+  bindingNodeId: string
+  /** ComfyUI 工作流中真实 input 名称，用于向用户定位字段。 */
+  bindingInput: string
+  /** 选择 Canvas 输出来源时填写的画布节点，不得与工作流节点混用。 */
+  sourceNodeId: string
   outputKey: string
 }
 
 /** 从权威配置创建可编辑草稿，资产只保存稳定 assetId。 */
-function createInputDrafts(
+export function createInputDrafts(
   config: CanvasMediaModuleConfig,
   workflow: MediaWorkflowVersion | undefined,
 ): CanvasMediaWorkflowInputDraft[] {
-  const initial = workflow ? createCanvasMediaWorkflowDraft(workflow) : config.inputs.map((input): CanvasMediaWorkflowInputDraft => ({
+  const initial = workflow ? createCanvasMediaWorkflowDraft(workflow, {}, false) : config.inputs.map((input): CanvasMediaWorkflowInputDraft => ({
     key: input.key,
     kind: input.kind,
     label: input.key,
@@ -61,7 +66,9 @@ function createInputDrafts(
     sourceType: 'literal',
     value: '',
     asset: null,
-    nodeId: '',
+    bindingNodeId: '',
+    bindingInput: input.key,
+    sourceNodeId: '',
     outputKey: defaultOutputKey(input.kind),
   }))
   return initial.map((draft) => {
@@ -70,7 +77,7 @@ function createInputDrafts(
     return input.source.type === 'canvas-output'
     ? {
         ...draft, sourceType: 'canvas-output', value: '', asset: null,
-        nodeId: input.source.nodeId, outputKey: input.source.outputKey,
+        sourceNodeId: input.source.nodeId, outputKey: input.source.outputKey,
       }
     : {
         ...draft, sourceType: 'literal',
@@ -80,7 +87,7 @@ function createInputDrafts(
         asset: input.kind === 'image' || input.kind === 'audio' || input.kind === 'video'
           ? input.source.value
           : null,
-        nodeId: '', outputKey: '',
+        sourceNodeId: '', outputKey: '',
       }
   })
 }
@@ -98,6 +105,7 @@ function defaultOutputKey(kind: CanvasMediaInputBinding['kind']): string {
 export function createCanvasMediaWorkflowDraft(
   workflow: MediaWorkflowVersion,
   values: Record<string, MediaInputValue> = {},
+  usePromptDefaults = true,
 ): CanvasMediaWorkflowInputDraft[] {
   return workflow.definition.bindings.map((binding): CanvasMediaWorkflowInputDraft => {
     if (!binding.field) throw new Error(`工作流输入 ${binding.key} 缺少字段合同。`)
@@ -105,7 +113,7 @@ export function createCanvasMediaWorkflowDraft(
     const promptValue = workflow.definition.prompt[binding.nodeId]?.inputs[binding.input]
     const scalar = provided?.kind === 'scalar'
       ? provided.value
-      : typeof promptValue === 'string' || typeof promptValue === 'number' || typeof promptValue === 'boolean'
+      : usePromptDefaults && (typeof promptValue === 'string' || typeof promptValue === 'number' || typeof promptValue === 'boolean')
         ? promptValue
         : binding.kind === 'boolean' ? false : ''
     const asset = provided?.kind === 'asset' && provided.asset.mediaKind === binding.kind
@@ -123,7 +131,9 @@ export function createCanvasMediaWorkflowDraft(
       sourceType: 'literal',
       value: asset?.assetId ?? String(scalar),
       asset,
-      nodeId: '',
+      bindingNodeId: binding.nodeId,
+      bindingInput: binding.input,
+      sourceNodeId: '',
       outputKey: defaultOutputKey(binding.kind),
     }
   })
@@ -156,6 +166,31 @@ export function buildCanvasMediaWorkflowValues(
   return { values, error: null }
 }
 
+/** 将当前草稿中可验证的字段转换为部分值，未完成字段留待运行前校验。 */
+export function buildCanvasMediaWorkflowPartialValues(
+  workflow: MediaWorkflowVersion,
+  drafts: readonly CanvasMediaWorkflowInputDraft[],
+): { values: Record<string, MediaInputValue>; errors: Record<string, string> } {
+  const values: Record<string, MediaInputValue> = {}
+  const errors: Record<string, string> = {}
+  for (const binding of workflow.definition.bindings) {
+    const draft = drafts.find((item) => item.key === binding.key && item.kind === binding.kind)
+    if (!draft || draft.sourceType !== 'literal') { errors[binding.key] = `输入 ${binding.key} 尚未填写。`; continue }
+    if (binding.kind === 'image' || binding.kind === 'audio' || binding.kind === 'video') {
+      if (!draft.asset || draft.asset.mediaKind !== binding.kind) errors[binding.key] = `输入 ${draft.label} 需要选择素材。`
+      else values[binding.key] = { kind: 'asset', asset: draft.asset }
+      continue
+    }
+    const value = binding.kind === 'number'
+      ? draft.value.trim() === '' ? Number.NaN : Number(draft.value)
+      : binding.kind === 'boolean' ? draft.value === 'true' : draft.value
+    const problem = validateMediaWorkflowFieldValue(binding, value)
+    if (problem) errors[binding.key] = problem
+    else values[binding.key] = { kind: 'scalar', value }
+  }
+  return { values, errors }
+}
+
 /** 校验音视频表单中的直接值；Canvas 输出由 Host resolver 在运行前验证。 */
 export function validateCanvasMediaWorkflowDrafts(
   workflow: MediaWorkflowVersion,
@@ -166,7 +201,7 @@ export function validateCanvasMediaWorkflowDrafts(
     const draft = drafts[index]
     if (!draft || draft.key !== binding.key || draft.kind !== binding.kind) return `输入 ${binding.key} 与工作流合同不一致。`
     if (draft.sourceType === 'canvas-output') {
-      if (!draft.nodeId || !draft.outputKey) return `输入 ${draft.label} 的 Canvas 来源不完整。`
+      if (!draft.sourceNodeId || !draft.outputKey) return `输入 ${draft.label} 的 Canvas 来源不完整。`
       continue
     }
     if (binding.kind === 'image' || binding.kind === 'audio' || binding.kind === 'video') {
@@ -182,7 +217,7 @@ export function validateCanvasMediaWorkflowDrafts(
   return null
 }
 
-/** 把公共工作流版本转换为音视频节点配置，不为媒体字段猜测或默认选择素材。 */
+/** 把可用工作流版本转换为音视频节点配置，不为媒体字段猜测或默认选择素材。 */
 export function createCanvasMediaWorkflowSelectionDraft(
   target: CanvasMediaTarget,
   workflow: MediaWorkflowVersion,
@@ -199,39 +234,35 @@ export function createCanvasMediaWorkflowSelectionDraft(
   return { inputs, outputs }
 }
 
-/** 严格构造保存输入；未完成的来源字段留在草稿中而不会进入 IPC。 */
-function buildInputs(
-  drafts: CanvasMediaWorkflowInputDraft[],
+/** 只保存当前已完成且合法的输入，保留工作流其余字段待后续补全。 */
+export function buildPartialInputs(
+  workflow: MediaWorkflowVersion,
+  drafts: readonly CanvasMediaWorkflowInputDraft[],
 ): CanvasMediaInputBinding[] {
-  return drafts.map((draft): CanvasMediaInputBinding => {
-    if (draft.sourceType === 'canvas-output') {
-      if (!draft.nodeId || !draft.outputKey || draft.kind === 'number' || draft.kind === 'boolean') {
-        throw new Error(`输入 ${draft.key} 的 Canvas 来源不完整。`)
-      }
-      return {
-        key: draft.key,
-        kind: draft.kind,
-        source: { type: 'canvas-output', nodeId: draft.nodeId, outputKey: draft.outputKey },
-      }
-    }
-    if (draft.kind === 'text') return { key: draft.key, kind: 'text', source: { type: 'literal', value: draft.value } }
-    if (draft.kind === 'number') {
-      const value = Number(draft.value)
-      if (!Number.isFinite(value)) throw new Error(`输入 ${draft.key} 必须是数字。`)
-      return { key: draft.key, kind: 'number', source: { type: 'literal', value } }
-    }
-    if (draft.kind === 'boolean') {
-      return { key: draft.key, kind: 'boolean', source: { type: 'literal', value: draft.value === 'true' } }
-    }
-    const asset = draft.asset
-    if (!asset || asset.mediaKind !== draft.kind) throw new Error(`输入 ${draft.label} 缺少可用素材。`)
-    return {
+  const partial = buildCanvasMediaWorkflowPartialValues(workflow, drafts).values
+  const literalInputs = workflow.definition.bindings.flatMap((binding): CanvasMediaInputBinding[] => {
+    const value = partial[binding.key]
+    if (!value) return []
+    return [{
+      key: binding.key,
+      kind: binding.kind,
+      source: value.kind === 'asset'
+        ? { type: 'literal', value: { ...value.asset } }
+        : { type: 'literal', value: value.value },
+    } as CanvasMediaInputBinding]
+  })
+  const canvasInputs = drafts.flatMap((draft): CanvasMediaInputBinding[] => {
+    if (draft.sourceType !== 'canvas-output' || !draft.sourceNodeId || !draft.outputKey
+      || draft.kind === 'number' || draft.kind === 'boolean') return []
+    return [{
       key: draft.key,
       kind: draft.kind,
-      source: { type: 'literal', value: {
-        assetId: asset.assetId, revision: asset.revision, hash: asset.hash, mediaKind: asset.mediaKind,
-      } },
-    }
+      source: { type: 'canvas-output', nodeId: draft.sourceNodeId, outputKey: draft.outputKey },
+    }]
+  })
+  return workflow.definition.bindings.flatMap((binding) => {
+    const input = [...literalInputs, ...canvasInputs].find((candidate) => candidate.key === binding.key)
+    return input ? [input] : []
   })
 }
 
@@ -247,12 +278,88 @@ export function createCanvasMediaWorkflowSelection(
   return `${workflow.id}:${workflow.revision}`
 }
 
-/** 按 Select 的完整身份精确解析公共工作流 revision。 */
+/** 按 Select 的完整身份精确解析工作流 revision。 */
 export function resolveCanvasMediaWorkflow(
   workflows: readonly MediaWorkflowVersion[],
   selection: string,
 ): MediaWorkflowVersion | undefined {
   return workflows.find((workflow) => createCanvasMediaWorkflowSelection(workflow) === selection)
+}
+
+/**
+ * 解析音视频工作流首次使用的连接。
+ * @param savedConnectionId 节点配置中已经保存的连接。
+ * @param defaultConnectionId 画布当前默认连接。
+ * @returns 已保存连接优先，否则继承默认；均无值时返回空选择。
+ */
+export function resolveCanvasMediaWorkflowConnection(
+  savedConnectionId: string | null | undefined,
+  defaultConnectionId: string | null | undefined,
+): string {
+  return savedConnectionId ?? defaultConnectionId ?? ''
+}
+
+/**
+ * 仅让尚未形成配置的干净草稿跟随稍晚到达的画布默认连接。
+ * @param currentConnectionId 当前工作台本地连接选择。
+ * @param defaultConnectionId 画布最新默认连接。
+ * @param hasPersistedConfiguration 节点是否已有保存配置。
+ * @param hasLocalWorkflowSelection 用户是否已在本地选择工作流。
+ * @param dirty 用户是否已修改当前草稿。
+ * @returns 可安全应用的连接；已有配置或本地编辑时保持当前值。
+ */
+export function resolveDelayedCanvasDefaultConnection(
+  currentConnectionId: string,
+  defaultConnectionId: string | null | undefined,
+  hasPersistedConfiguration: boolean,
+  hasLocalWorkflowSelection: boolean,
+  dirty: boolean,
+): string {
+  if (hasPersistedConfiguration || hasLocalWorkflowSelection || dirty) return currentConnectionId
+  return defaultConnectionId ?? ''
+}
+
+/**
+ * 在默认连接异步变化时同步一个仍可继承默认值的本地草稿。
+ * @param currentConnectionId 当前本地连接。
+ * @param defaultConnectionId 画布最新默认连接。
+ * @param hasPersistedConfiguration 是否已有权威配置。
+ * @param hasLocalWorkflowSelection 是否已选择本地工作流。
+ * @param dirty 是否已有用户编辑。
+ * @param onChange 仅在可继承值真实变化时更新本地连接。
+ */
+export function useDelayedCanvasDefaultConnection(
+  currentConnectionId: string,
+  defaultConnectionId: string | null | undefined,
+  hasPersistedConfiguration: boolean,
+  hasLocalWorkflowSelection: boolean,
+  dirty: boolean,
+  onChange: (connectionId: string) => void,
+): void {
+  React.useEffect(() => {
+    /** 当前规则允许应用的连接值。 */
+    const nextConnectionId = resolveDelayedCanvasDefaultConnection(
+      currentConnectionId,
+      defaultConnectionId,
+      hasPersistedConfiguration,
+      hasLocalWorkflowSelection,
+      dirty,
+    )
+    if (nextConnectionId !== currentConnectionId) onChange(nextConnectionId)
+  }, [currentConnectionId, defaultConnectionId, dirty, hasLocalWorkflowSelection, hasPersistedConfiguration, onChange])
+}
+
+/**
+ * 过滤音视频节点可见的工作流作用域。
+ * @param workflows 全局媒体目录中的工作流版本。
+ * @param projectId 当前画布所属项目。
+ * @returns 公共工作流与当前项目工作流，保持原目录顺序。
+ */
+export function selectCanvasMediaWorkflowsForProject(
+  workflows: readonly MediaWorkflowVersion[],
+  projectId: string,
+): MediaWorkflowVersion[] {
+  return workflows.filter((workflow) => workflow.projectId === null || workflow.projectId === projectId)
 }
 
 /** 优先展示活跃运行；没有活跃运行时展示最近更新的终态运行。 */
@@ -291,6 +398,11 @@ export class CanvasMediaDraftLoadGuard {
   /** 保存成功或目标切换后允许权威配置重新建立草稿。 */
   markClean(): void {
     this.dirty = false
+  }
+
+  /** 返回当前草稿是否存在尚未保存的用户修改。 */
+  isDirty(): boolean {
+    return this.dirty
   }
 
   /** 判断异步回调是否仍属于当前目标的最后一轮读取。 */
@@ -430,6 +542,23 @@ export function CanvasMediaWorkflowForm({
   React.useEffect(() => { active.current = true; return () => { active.current = false } }, [])
   React.useEffect(() => { setImportedAssets([]); setImportError(null) }, [projectId])
   const availableAssets = [...assets, ...importedAssets.filter((item) => !assets.some((asset) => asset.id === item.id))]
+  const fieldErrors = React.useMemo(() => {
+    const errors: Record<string, string> = {}
+    for (const input of inputs) {
+      if (input.sourceType === 'canvas-output') {
+        if (!input.sourceNodeId || !input.outputKey) errors[input.key] = '待填写 Canvas 来源。'
+      } else if (input.kind === 'image' || input.kind === 'audio' || input.kind === 'video') {
+        if (!input.asset) errors[input.key] = '待选择素材。'
+      } else if (input.kind === 'number') {
+        const value = Number(input.value)
+        if (input.value.trim() === '' || !Number.isFinite(value)) errors[input.key] = '待填写有效数值。'
+        else if (input.min !== undefined && value < input.min) errors[input.key] = `不能小于 ${input.min}。`
+        else if (input.max !== undefined && value > input.max) errors[input.key] = `不能大于 ${input.max}。`
+      }
+      else if (input.kind === 'text' && input.required && input.value.trim() === '') errors[input.key] = '待填写必填文本。'
+    }
+    return errors
+  }, [inputs])
   /** 原生选择器返回后仍校验原槽位和项目，防止迟到文件填入另一个工作流。 */
   const importAsset = async (index: number, input: CanvasMediaWorkflowInputDraft): Promise<void> => {
     if (!projectId || (input.kind !== 'image' && input.kind !== 'audio' && input.kind !== 'video')) return
@@ -444,17 +573,14 @@ export function CanvasMediaWorkflowForm({
       if (active.current && projectId === current.current.projectId) setImportError(error instanceof Error ? error.message : '媒体导入失败')
     } finally { if (active.current) setImportingKey(null) }
   }
-  return (
-    <section className="space-y-3" aria-label="工作流输入">
-      <h3 className="text-sm font-medium">输入</h3>
-      {importError ? <p role="alert" className="text-xs text-destructive">{importError}</p> : null}
-      {inputs.length === 0 ? <p className="text-xs text-muted-foreground">当前工作流没有输入。</p> : inputs.map((input, index) => {
+  /** 渲染单个真实绑定字段；高级字段由外层统一折叠。 */
+  const renderInput = (input: CanvasMediaWorkflowInputDraft, index: number): React.ReactElement => {
         /** 单点更新保持父组件对 dirty 草稿的唯一所有权。 */
         const update = (changes: Partial<CanvasMediaWorkflowInputDraft>): void => onInputChange(index, { ...input, ...changes })
         const mediaInput = input.kind === 'image' || input.kind === 'audio' || input.kind === 'video'
         return (
           <div key={input.key} className="grid min-w-0 gap-2 border-b border-border pb-3 sm:grid-cols-[minmax(0,120px)_minmax(0,120px)_minmax(0,1fr)]">
-            <Label className="pt-2 text-xs">{input.label}{input.required ? ' *' : ''}</Label>
+            <Label className="pt-2 text-xs">{input.label}{input.required ? ' *' : ''}<span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">节点 {input.bindingNodeId || '?'} · {input.bindingInput || input.key}</span></Label>
             {allowCanvasOutput && (mediaInput || input.kind === 'text') ? (
               <Select value={input.sourceType} disabled={!writable || busy} onValueChange={(value: 'literal' | 'canvas-output') => update({ sourceType: value })}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
@@ -463,7 +589,7 @@ export function CanvasMediaWorkflowForm({
             ) : <div className="hidden sm:block" />}
             {input.sourceType === 'canvas-output' ? (
               <div className="grid grid-cols-2 gap-2">
-                <Input aria-label={`${input.label} 来源节点`} placeholder="节点 ID" value={input.nodeId} disabled={!writable || busy} onChange={(event) => update({ nodeId: event.target.value })} />
+                <Input aria-label={`${input.label} 来源节点`} placeholder="节点 ID" value={input.sourceNodeId} disabled={!writable || busy} onChange={(event) => update({ sourceNodeId: event.target.value })} />
                 <Input aria-label={`${input.label} 输出 key`} placeholder="输出 key" value={input.outputKey} disabled={!writable || busy} onChange={(event) => update({ outputKey: event.target.value })} />
               </div>
             ) : mediaInput ? (
@@ -493,9 +619,26 @@ export function CanvasMediaWorkflowForm({
                 onChange={(event) => update({ value: event.target.value })}
               />
             )}
+            {fieldErrors[input.key] ? <p className="sm:col-start-3 text-xs text-amber-600" role="status">{fieldErrors[input.key]}</p> : null}
           </div>
         )
-      })}
+  }
+  /** 生成类标量统一收进一个高级参数区域，减少长工作流的视觉噪音。 */
+  const advanced = inputs.map((input, index) => ({ input, index })).filter(({ input }) => (
+    input.controlType === 'number' || input.controlType === 'boolean' || input.controlType === 'seed'
+      || input.controlType === 'width' || input.controlType === 'height'
+  ))
+  const basic = inputs.map((input, index) => ({ input, index })).filter(({ input }) => !advanced.some((item) => item.input.key === input.key))
+  const advancedProblemCount = advanced.filter(({ input }) => fieldErrors[input.key]).length
+  return (
+    <section className="space-y-3" aria-label="工作流输入">
+      <h3 className="text-sm font-medium">输入</h3>
+      {importError ? <p role="alert" className="text-xs text-destructive">{importError}</p> : null}
+      {inputs.length === 0 ? <p className="text-xs text-muted-foreground">当前工作流没有输入。</p> : basic.map(({ input, index }) => renderInput(input, index))}
+      {advanced.length > 0 ? <details className="rounded-sm border border-border px-3 py-2">
+        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">高级参数{advancedProblemCount > 0 ? ` · ${advancedProblemCount} 项待配置` : ''}</summary>
+        <div className="space-y-3 pt-3">{advanced.map(({ input, index }) => renderInput(input, index))}</div>
+      </details> : null}
     </section>
   )
 }
@@ -505,11 +648,17 @@ export function CanvasMediaWorkbench({
   target,
   writable,
   adapter,
+  defaultComfyuiConnectionId = null,
 }: {
   target: CanvasMediaTarget
   writable: boolean
   adapter: CanvasMediaWorkbenchAdapter
+  /** 新工作流草稿继承的画布默认连接。 */
+  defaultComfyuiConnectionId?: string | null
 }): React.ReactElement {
+  /** 默认连接只供尚未保存连接的干净草稿读取，切换默认不会直接重置当前编辑。 */
+  const defaultConnectionRef = React.useRef(defaultComfyuiConnectionId)
+  defaultConnectionRef.current = defaultComfyuiConnectionId
   /** 固定目标对象，避免父组件普通重渲染触发重复 LOAD。 */
   const stableTarget = React.useMemo<CanvasMediaTarget>(() => ({
     projectId: target.projectId,
@@ -578,7 +727,10 @@ export function CanvasMediaWorkbench({
               revision: nextSnapshot.config.workflow.workflowRevision,
             })
           : '')
-        setConnectionSelection(nextSnapshot.config.workflow?.connectionId ?? '')
+        setConnectionSelection(resolveCanvasMediaWorkflowConnection(
+          nextSnapshot.config.workflow?.connectionId,
+          defaultConnectionRef.current,
+        ))
       }
     } catch (cause) {
       if (loadGuardRef.current.isCurrent(generation)) {
@@ -634,28 +786,44 @@ export function CanvasMediaWorkbench({
   }, [adapter, load, mediaWatchRegistry, stableTarget])
   React.useEffect(() => () => { void previewLeaseOwner.release() }, [previewLeaseOwner])
 
-  const workflows = (settings?.workflows ?? []).filter((workflow) => workflow.projectId === null
-    && workflow.definition.outputs.some((output) => output.mediaType === stableTarget.mediaKind)
+  const workflows = selectCanvasMediaWorkflowsForProject(
+    settings?.workflows ?? [],
+    stableTarget.projectId,
+  ).filter((workflow) => workflow.definition.outputs.some((output) => output.mediaType === stableTarget.mediaKind)
     && (!(settings?.archivedWorkflowIds ?? []).includes(workflow.id)
       || workflow.id === snapshot?.config.workflow?.workflowId))
   const connections = (settings?.connections ?? []).filter((connection) => connection.enabled
     && connection.archivedAt === undefined)
+  /** 未完成 LOAD，或旧预设、工作流、残留输入输出存在时，都不能继承新默认。 */
+  const hasPersistedConfiguration = snapshot === null || Boolean(
+    snapshot.config.profile
+    || snapshot.config.workflow
+    || snapshot.config.inputs.length
+    || snapshot.config.outputs.length,
+  )
+  useDelayedCanvasDefaultConnection(
+    connectionSelection,
+    defaultComfyuiConnectionId,
+    hasPersistedConfiguration,
+    workflowSelection !== '',
+    loadGuardRef.current.isDirty(),
+    setConnectionSelection,
+  )
 
   /** 保存当前草稿并返回提交后的配置 revision。 */
   const save = React.useCallback(async (): Promise<CanvasMediaModuleConfig> => {
     if (!snapshot || !settings) throw new Error('媒体模块尚未加载。')
     const workflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
-    if (!workflow) throw new Error('请选择公共工作流。')
+    if (!workflow) throw new Error('请选择工作流。')
     const connection = connections.find((item) => item.id === connectionSelection)
     if (!connection) throw new Error('请选择已启用的连接。')
-    const inputProblem = validateCanvasMediaWorkflowDrafts(workflow, inputs)
-    if (inputProblem) throw new Error(inputProblem)
     const config = await adapter.canvasMediaSave({
       ...stableTarget,
       expectedConfigRevision: snapshot.config.revision,
       profile: null,
       workflow: { workflowId: workflow.id, workflowRevision: workflow.revision, connectionId: connection.id },
-      inputs: buildInputs(inputs),
+      preparation: null,
+      inputs: buildPartialInputs(workflow, inputs),
       outputs,
     })
     /** 配置已经持久化；即使随后启动运行失败，也不能继续把相同草稿标成未保存。 */
@@ -697,31 +865,38 @@ export function CanvasMediaWorkbench({
   const activeRun = snapshot.runs.find(isActiveRun)
   const displayRun = getCanvasMediaDisplayRun(snapshot.runs)
   const runProgress = displayRun ? projectMediaRunProgress(displayRun) : null
-  /** 每个公共工作流的最高 revision 只用于标注，不会自动切换当前历史版本。 */
+  /** 每个可用工作流的最高 revision 只用于标注，不会自动切换当前历史版本。 */
   const latestWorkflowRevisions = new Map<string, number>()
   for (const workflow of workflows) {
     latestWorkflowRevisions.set(workflow.id, Math.max(latestWorkflowRevisions.get(workflow.id) ?? 0, workflow.revision))
   }
   const canSaveWorkflow = Boolean(workflowSelection && connectionSelection)
   const canRunLegacyProfile = Boolean(snapshot.config.profile && !snapshot.config.workflow && !workflowSelection)
+  const selectedWorkflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
+  const workflowValidationError = selectedWorkflow
+    ? validateCanvasMediaWorkflowDrafts(selectedWorkflow, inputs)
+    : '请选择工作流。'
+  const canRunWorkflow = canSaveWorkflow && workflowValidationError === null
+  const preparation = snapshot.config.preparation
+  const runError = displayRun?.error?.trim() || null
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">
         <Select value={workflowSelection} disabled={!writable || busy} onValueChange={(value) => {
           const workflow = resolveCanvasMediaWorkflow(workflows, value)
-          if (!workflow) { setError('公共工作流版本不可用。'); return }
+          if (!workflow) { setError('工作流版本不可用。'); return }
           try {
             const draft = createCanvasMediaWorkflowSelectionDraft(stableTarget, workflow)
             loadGuardRef.current.markDirty()
             setWorkflowSelection(value); setInputs(draft.inputs); setOutputs(draft.outputs); setError(null)
           } catch (cause) { setError(getCanvasMediaErrorMessage(cause, '工作流不可用。')) }
         }}>
-          <SelectTrigger className="w-full min-w-0 sm:w-auto sm:min-w-52"><SelectValue placeholder="选择公共工作流" /></SelectTrigger>
+          <SelectTrigger className="w-full min-w-0 sm:w-auto sm:min-w-52"><SelectValue placeholder="选择工作流" /></SelectTrigger>
           <SelectContent>{workflows.map((workflow) => {
             const current = workflow.id === snapshot.config.workflow?.workflowId
               && workflow.revision === snapshot.config.workflow.workflowRevision
             const latest = workflow.revision === latestWorkflowRevisions.get(workflow.id)
-            return <SelectItem key={createCanvasMediaWorkflowSelection(workflow)} value={createCanvasMediaWorkflowSelection(workflow)}>{workflow.name} · v{workflow.revision}{latest ? ' · 最新' : ''}{current ? ' · 当前' : ''}</SelectItem>
+            return <SelectItem key={createCanvasMediaWorkflowSelection(workflow)} value={createCanvasMediaWorkflowSelection(workflow)}>{workflow.name}{workflow.projectId === null ? '' : ' · 项目'} · v{workflow.revision}{latest ? ' · 最新' : ''}{current ? ' · 当前' : ''}</SelectItem>
           })}</SelectContent>
         </Select>
         <Select value={connectionSelection} disabled={!writable || busy} onValueChange={(value) => {
@@ -735,17 +910,22 @@ export function CanvasMediaWorkbench({
         {activeRun ? (
           <Button size="sm" variant="outline" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaCancel({ ...stableTarget, runId: activeRun.id }))}><Square />取消</Button>
         ) : (
-          <Button size="sm" disabled={!writable || busy || (!canSaveWorkflow && !canRunLegacyProfile)} onClick={() => void execute(async () => {
+          <Button size="sm" disabled={!writable || busy || (!canRunWorkflow && !canRunLegacyProfile)} title={!canRunLegacyProfile && workflowValidationError ? workflowValidationError : undefined} onClick={() => void execute(async () => {
             if (canRunLegacyProfile) {
               await adapter.canvasMediaRun({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, operationId: crypto.randomUUID() })
             } else {
+              const workflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
+              const inputProblem = workflow ? validateCanvasMediaWorkflowDrafts(workflow, inputs) : '请选择工作流。'
+              if (inputProblem) { setError(inputProblem); return }
               await saveAndRunCanvasMedia(stableTarget, crypto.randomUUID(), save, adapter.canvasMediaRun)
             }
           }, { commitDraft: true })}><Play />运行</Button>
         )}
         {runProgress ? <div className="w-full min-w-0 text-left text-xs sm:ml-auto sm:w-auto sm:text-right" role="status" aria-live="polite"><p className="font-medium text-foreground">{runProgress.phaseLabel}</p>{runProgress.nodeProgressLabel ? <p className="truncate text-muted-foreground sm:max-w-64" title={runProgress.nodeProgressLabel}>{runProgress.nodeProgressLabel}</p> : null}</div> : null}
       </div>
+      {preparation ? <p className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700" role="status">待配置：{preparation.message}</p> : null}
       {error ? <p className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
+      {!error && runError ? <p className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive" role="alert">运行失败：{runError}</p> : null}
       <ScrollArea className="min-h-0 flex-1">
         <div className="space-y-5 p-4">
           <CanvasMediaWorkflowForm

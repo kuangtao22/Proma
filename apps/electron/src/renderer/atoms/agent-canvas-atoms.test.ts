@@ -9,9 +9,86 @@ import {
   removeAgentCanvasViewStateAtom,
   resolveAgentCanvasWorkbenchSize,
   updateAgentCanvasViewStateAtom,
+  type AgentCanvasViewStateUpdate,
 } from './agent-canvas-atoms'
 
 describe('Agent Canvas 视图状态隔离', () => {
+  test('Given 已初始化的会话视图 When 收到空更新或相同字段 Then 保留状态引用且不通知订阅者', () => {
+    /** 真实 Jotai store 用于检测空更新是否仍触发画布订阅。 */
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    store.set(initializeAgentCanvasViewStateAtom, { key, viewport: { x: 0, y: 0, zoom: 1 } })
+    /** 覆盖对象、函数及显式重复值三种合法无变化输入。 */
+    const updates: AgentCanvasViewStateUpdate[] = [
+      {},
+      () => ({}),
+      (current) => ({ workbenchDraft: current.workbenchDraft, viewport: current.viewport }),
+    ]
+    const originalStates = store.get(agentCanvasViewStatesAtom)
+    let notifications = 0
+    const unsubscribe = store.sub(agentCanvasViewStatesAtom, () => { notifications += 1 })
+    try {
+      for (const update of updates) store.set(updateAgentCanvasViewStateAtom, { key, update })
+      expect(notifications).toBe(0)
+      expect(store.get(agentCanvasViewStatesAtom)).toBe(originalStates)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  test('Given 工作台在视图变化后重复上报已知状态 When 编辑并保存草稿 Then 每次真实变化只通知一次', () => {
+    /** 订阅后再次上报空更新，复现工作台 Effect 与父视图之间的反馈链。 */
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    store.set(initializeAgentCanvasViewStateAtom, { key, viewport: { x: 0, y: 0, zoom: 1 } })
+    store.set(updateAgentCanvasViewStateAtom, { key, update: { expandedNodeId: 'node-a' } })
+    let notifications = 0
+    const unsubscribe = store.sub(agentCanvasViewStatesAtom, () => {
+      notifications += 1
+      /** 失败时有界退出，防止回归测试本身进入无限循环。 */
+      if (notifications < 10) store.set(updateAgentCanvasViewStateAtom, { key, update: () => ({}) })
+    })
+    try {
+      store.set(updateAgentCanvasViewStateAtom, {
+        key,
+        update: { workbenchDraft: { nodeId: 'node-a', dirty: true } },
+      })
+      expect(notifications).toBe(1)
+      expect(store.get(agentCanvasViewStatesAtom).get(key)?.workbenchDraft)
+        .toEqual({ nodeId: 'node-a', dirty: true })
+
+      store.set(updateAgentCanvasViewStateAtom, { key, update: { workbenchDraft: null } })
+      expect(notifications).toBe(2)
+      expect(store.get(agentCanvasViewStatesAtom).get(key)?.workbenchDraft).toBeNull()
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  test('Given 旧屏幕尺寸尚未迁移 When 连续收到空更新 Then 首次完成迁移且不重复通知', () => {
+    /** 空业务更新仍须完成 HMR 遗留尺寸的一次性迁移。 */
+    const store = createStore()
+    const key = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')
+    const legacy = createInitialAgentCanvasViewState({ x: 0, y: 0, zoom: 2 })
+    delete legacy.workbenchSizeSpace
+    legacy.workbenchSizesByNodeId = { 'node-a': { width: 1_000, height: 720 } }
+    store.set(agentCanvasViewStatesAtom, new Map([[key, legacy]]))
+    let notifications = 0
+    const unsubscribe = store.sub(agentCanvasViewStatesAtom, () => { notifications += 1 })
+    try {
+      store.set(updateAgentCanvasViewStateAtom, { key, update: () => ({}) })
+      expect(notifications).toBe(1)
+      expect(store.get(agentCanvasViewStatesAtom).get(key)).toMatchObject({
+        workbenchSizeSpace: 'canvas',
+        workbenchSizesByNodeId: { 'node-a': { width: 500, height: 360 } },
+      })
+      store.set(updateAgentCanvasViewStateAtom, { key, update: () => ({}) })
+      expect(notifications).toBe(1)
+    } finally {
+      unsubscribe()
+    }
+  })
+
   test('Given 同一项目画布的两个 Agent 会话 When 分别更新视口和选区 Then 视图状态互不污染', () => {
     const store = createStore()
     const firstKey = createAgentCanvasViewKey('session-a', 'project-a', 'canvas-a')

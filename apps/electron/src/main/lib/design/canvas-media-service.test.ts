@@ -18,6 +18,7 @@ import {
   type CanvasMediaModuleStore,
 } from './canvas-media-service'
 import type { MediaRunOrigin } from '../media/media-run-service'
+import { MediaWorkflowValidationError } from '../media/media-workflow-error'
 import { createCanvasMediaStore } from './canvas-media-store'
 
 const target: CanvasMediaTarget = {
@@ -150,6 +151,7 @@ function createService(
   runOrigin: MediaRunOrigin = { actor: { sessionId: 'session-1', runStartedAt: 1, mode: 'project-agent' } },
   runInputs: Record<string, MediaInputValue> = { prompt: { kind: 'scalar', value: '生成短片' } },
   draft?: {
+    projectId?: string | null
     workflow: import('@proma/shared').MediaWorkflowDefinition
     prepare(input: {
       projectId: string
@@ -173,7 +175,8 @@ function createService(
       resolveProfile: () => ({
         profile: { id: 'profile-1', revision: 3, mediaKind: 'video' },
         workflow: { definition: {
-          schemaVersion: 1, prompt: {}, bindings: [],
+          schemaVersion: 1, prompt: {},
+          bindings: [{ key: 'prompt', kind: 'text', nodeId: '1', input: 'text' }],
           outputs: [
             { key: 'video', nodeId: '1', outputIndex: 0, mediaType: 'video' },
             { key: 'audio', nodeId: '2', outputIndex: 0, mediaType: 'audio' },
@@ -181,8 +184,9 @@ function createService(
           ],
         } },
       }),
-      getWorkflow: () => ({ id: 'public-video', revision: 2, projectId: null, definition: draft?.workflow ?? {
-        schemaVersion: 1, prompt: {}, bindings: [],
+      getWorkflow: () => ({ id: 'public-video', revision: 2, projectId: draft?.projectId ?? null, definition: draft?.workflow ?? {
+        schemaVersion: 1, prompt: {},
+        bindings: [{ key: 'prompt', kind: 'text', nodeId: '1', input: 'text' }],
         outputs: [
           { key: 'video', nodeId: '1', outputIndex: 0, mediaType: 'video' },
           { key: 'audio', nodeId: '2', outputIndex: 0, mediaType: 'audio' },
@@ -203,7 +207,8 @@ function createService(
         kind: 'profile-version', profileId: currentRun.profileId!, profileRevision: currentRun.profileRevision!,
       }),
       getWorkflowDefinition: () => ({
-        schemaVersion: 1, prompt: {}, bindings: [],
+        schemaVersion: 1, prompt: {},
+        bindings: [{ key: 'prompt', kind: 'text', nodeId: '1', input: 'text' }],
         outputs: [
           { key: 'video', nodeId: '1', outputIndex: 0, mediaType: 'video' },
           { key: 'audio', nodeId: '2', outputIndex: 0, mediaType: 'audio' },
@@ -373,6 +378,245 @@ describe('Canvas 通用媒体服务', () => {
     expect(store.current().operations).toEqual([])
   })
 
+  test('Given 工作流仍缺少必填输入 When 启动运行 Then 抛出可定位错误并持久化待配置状态', async () => {
+    const savedConfig = {
+      ...config(),
+      profile: null,
+      workflow: { workflowId: 'public-video', workflowRevision: 2, connectionId: 'gpu' },
+      inputs: [],
+    }
+    const workflow: import('@proma/shared').MediaWorkflowDefinition = {
+      schemaVersion: 1,
+      prompt: { '12': { class_type: 'LoadImage', inputs: { image: '' } } },
+      bindings: [{
+        key: 'first_frame', kind: 'image', nodeId: '12', input: 'image', loader: 'LoadImage',
+        field: {
+          classType: 'LoadImage', valueKind: 'string', label: '首帧', controlType: 'image', required: true,
+        },
+      }],
+      outputs: config().outputs.map((output, index) => ({
+        key: output.key, nodeId: String(index + 2), outputIndex: 0, mediaType: output.mediaKind,
+      })),
+    }
+    let prepareCount = 0
+    const store = createStore({ config: savedConfig })
+    const service = createService(store, run('running'), undefined, undefined,
+      undefined, undefined, undefined, undefined, {
+        workflow,
+        prepare: async () => { prepareCount += 1; return run('running') },
+      })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'missing-input' }, origin,
+    )).rejects.toThrow('CANVAS_MEDIA_INPUT_REQUIRED')
+
+    expect(prepareCount).toBe(0)
+    expect(store.current().config.preparation).toEqual({
+      code: 'CANVAS_MEDIA_INPUT_REQUIRED',
+      message: expect.stringMatching(/首帧.*first_frame.*12.*image/),
+    })
+    expect(store.current().operations).toEqual([])
+    expect(store.current().candidates).toEqual([])
+  })
+
+  test('Given draft 只缺可选标量 When 启动运行 Then 保留 MediaRun 的固定 prompt 回退语义', async () => {
+    const savedConfig = {
+      ...config(),
+      profile: null,
+      workflow: { workflowId: 'public-video', workflowRevision: 2, connectionId: 'gpu' },
+      inputs: [],
+    }
+    const workflow: import('@proma/shared').MediaWorkflowDefinition = {
+      schemaVersion: 1,
+      prompt: { '1': { class_type: 'TextNode', inputs: { text: '默认提示词' } } },
+      bindings: [{
+        key: 'prompt', kind: 'text', nodeId: '1', input: 'text',
+        field: {
+          classType: 'TextNode', valueKind: 'string', label: '提示词', controlType: 'text', required: false,
+        },
+      }],
+      outputs: config().outputs.map((output, index) => ({
+        key: output.key, nodeId: String(index + 2), outputIndex: 0, mediaType: output.mediaKind,
+      })),
+    }
+    let prepareCount = 0
+    const service = createService(
+      createStore({ config: savedConfig }),
+      run('running'),
+      undefined,
+      async () => ({ ready: true, bindings: [] }),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { workflow, prepare: async () => { prepareCount += 1; return run('running') } },
+    )
+
+    await service.run({ ...target, expectedConfigRevision: 2, operationId: 'optional-input' }, origin)
+
+    expect(prepareCount).toBe(1)
+  })
+
+  test('Given draft 数字输入超出字段范围 When 启动运行 Then 在调用 prepareDraft 前抛出可定位错误', async () => {
+    const savedConfig = {
+      ...config(),
+      profile: null,
+      workflow: { workflowId: 'public-video', workflowRevision: 2, connectionId: 'gpu' },
+      inputs: [{ key: 'steps', kind: 'number' as const, source: { type: 'literal' as const, value: 100 } }],
+    }
+    const workflow: import('@proma/shared').MediaWorkflowDefinition = {
+      schemaVersion: 1,
+      prompt: { '8': { class_type: 'Sampler', inputs: { steps: 20 } } },
+      bindings: [{
+        key: 'steps', kind: 'number', nodeId: '8', input: 'steps',
+        field: {
+          classType: 'Sampler', valueKind: 'number', label: '采样步数', controlType: 'number',
+          required: true, min: 1, max: 50, step: 1,
+        },
+      }],
+      outputs: config().outputs.map((output, index) => ({
+        key: output.key, nodeId: String(index + 2), outputIndex: 0, mediaType: output.mediaKind,
+      })),
+    }
+    let prepareCount = 0
+    const store = createStore({ config: savedConfig })
+    const service = createService(store, run('running'), undefined, undefined,
+      undefined, undefined, undefined, undefined, {
+        workflow,
+        prepare: async () => { prepareCount += 1; return run('running') },
+      })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'invalid-range' }, origin,
+    )).rejects.toThrow('CANVAS_MEDIA_INPUT_INVALID')
+    expect(prepareCount).toBe(0)
+    expect(store.current().config.preparation?.message).toMatch(/采样步数.*steps.*8/)
+  })
+
+  test('Given 可信工作流校验错误 When 准备失败 Then 保留安全节点定位且不写入原始错误正文', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      throw new MediaWorkflowValidationError([
+        { code: 'INPUT_REQUIRED', nodeId: '12', input: 'image', message: 'Bearer secret' },
+      ])
+    })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'validation-error' }, origin,
+    )).rejects.toThrow('INPUT_REQUIRED@12.image')
+
+    expect(store.current().config.preparation).toEqual({
+      code: 'MEDIA_WORKFLOW_INVALID',
+      message: expect.stringContaining('INPUT_REQUIRED@12.image'),
+    })
+    expect(JSON.stringify(store.current().config.preparation)).not.toContain('Bearer secret')
+  })
+
+  test('Given 未知准备异常包含敏感正文 When 运行失败 Then 仅持久化稳定中文错误并继续抛出原异常', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      throw new Error('token=secret-value')
+    })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'unknown-error' }, origin,
+    )).rejects.toThrow('token=secret-value')
+
+    expect(store.current().config.preparation).toEqual({
+      code: 'CANVAS_MEDIA_PREPARATION_FAILED',
+      message: '媒体工作流准备失败，请检查工作流、连接和输入配置。',
+    })
+    expect(JSON.stringify(store.current().config.preparation)).not.toContain('secret-value')
+  })
+
+  test('Given 准备期间用户已保存新配置 When 旧运行迟到失败 Then 不覆盖新配置', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      const before = await store.load(target)
+      await store.compareAndSwap(target, before.revision, {
+        ...before,
+        revision: before.revision + 1,
+        config: { ...before.config, revision: before.config.revision + 1, updatedAt: 3 },
+      })
+      throw new Error('迟到失败')
+    })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'late-error' }, origin,
+    )).rejects.toThrow('迟到失败')
+
+    expect(store.current().config.revision).toBe(3)
+    expect(store.current().config).not.toHaveProperty('preparation')
+  })
+
+  test('Given 历史待配置错误 When 用户重试成功 Then 先清除错误且不阻断运行', async () => {
+    const store = createStore({
+      config: {
+        ...config(),
+        preparation: { code: 'CANVAS_MEDIA_PREPARATION_FAILED', message: '旧错误' },
+      },
+    })
+    const service = createService(store, run())
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'retry' }, origin,
+    )).resolves.toMatchObject({ id: 'run-1', phase: 'succeeded' })
+
+    expect(store.current().config.preparation).toBeNull()
+    expect(store.current().config.revision).toBe(2)
+    expect(store.current().operations[0]?.sourceConfigRevision).toBe(2)
+  })
+
+  test('Given 父工作流固定配置版本 When 准备失败后重载并重试 Then 诊断不改变配置身份且原 operation 可继续', async () => {
+    /** 真实 Store 验证诊断经过持久化后仍保留父工作流绑定的配置版本。 */
+    const fixture = createPersistentStore(createStore().current())
+    try {
+      const failingService = createService(fixture.store, run(), undefined, async () => {
+        throw new MediaWorkflowValidationError([
+          { code: 'INPUT_REQUIRED', nodeId: '12', input: 'image', message: '缺少素材' },
+        ])
+      })
+      const input = { ...target, expectedConfigRevision: 2, operationId: 'persistent-retry' }
+      await expect(failingService.run(input, origin)).rejects.toThrow('INPUT_REQUIRED@12.image')
+      const failed = await fixture.store.load(target)
+      expect(failed.config.revision).toBe(input.expectedConfigRevision)
+      expect(failed.config.preparation?.code).toBe('MEDIA_WORKFLOW_INVALID')
+      expect(failed.revision).toBeGreaterThan(1)
+
+      /** 模拟恢复后重新创建服务，仍使用第一次计划固定的配置与 operation。 */
+      const recoveredService = createService(fixture.store, run())
+      await expect(recoveredService.run(input, origin)).resolves.toMatchObject({ id: 'run-1' })
+      const recovered = await fixture.store.load(target)
+      expect(recovered.config.revision).toBe(input.expectedConfigRevision)
+      expect(recovered.config.preparation).toBeNull()
+      expect(recovered.operations).toMatchObject([
+        { operationId: input.operationId, sourceConfigRevision: input.expectedConfigRevision },
+      ])
+    } finally {
+      fixture.cleanup()
+    }
+  })
+
+  test('Given 配置保存前存在历史待配置错误 When 普通保存 Then 显式清除错误', async () => {
+    const store = createStore({
+      config: {
+        ...config(),
+        preparation: { code: 'CANVAS_MEDIA_PREPARATION_FAILED', message: '旧错误' },
+      },
+    })
+    const service = createService(store, run())
+
+    const saved = await service.save({
+      ...target,
+      expectedConfigRevision: 2,
+      profile: { profileId: 'profile-1', profileRevision: 3 },
+      inputs: config().inputs,
+      outputs: config().outputs,
+    })
+
+    expect(saved.preparation).toBeNull()
+  })
+
   test('Given workflow 预检输入哈希不匹配 When 启动新运行 Then 在 prepare 前拒绝漂移', async () => {
     const store = createStore()
     const service = createService(store, run())
@@ -465,6 +709,63 @@ describe('Canvas 通用媒体服务', () => {
     expect(prepared).toEqual([{ operationId: 'manual-draft', workflowId: 'public-video', connectionId: 'gpu' }])
   })
 
+  test('Given 当前项目工作流草稿和显式连接 When 手动运行 Then 复用原 prepareDraft 合同', async () => {
+    /** 与画布配置输入输出顺序完全一致的项目工作流定义。 */
+    const workflow: import('@proma/shared').MediaWorkflowDefinition = {
+      schemaVersion: 1,
+      prompt: { '1': { class_type: 'TextNode', inputs: { text: '生成短片' } } },
+      bindings: [{ key: 'prompt', kind: 'text', nodeId: '1', input: 'text' }],
+      outputs: config().outputs.map((output, index) => ({
+        key: output.key, nodeId: String(index + 2), outputIndex: 0, mediaType: output.mediaKind,
+      })),
+    }
+    /** 指向当前项目不可变草稿的画布配置。 */
+    const savedConfig = { ...config(), profile: null, workflow: {
+      workflowId: 'public-video', workflowRevision: 2, connectionId: 'gpu',
+    } }
+    /** 记录实际提交，验证项目草稿不会绕过既有输入输出合同。 */
+    const prepared: string[] = []
+    /** 返回当前项目草稿的手动媒体运行服务。 */
+    const service = createService(createStore({ config: savedConfig }), run('running'), undefined, undefined,
+      undefined, undefined, undefined, undefined, {
+        projectId: 'project-1', workflow,
+        prepare: async (input) => { prepared.push(input.operationId); return run('running') },
+      })
+
+    await service.run({ ...target, expectedConfigRevision: 2, operationId: 'project-draft' }, origin)
+
+    expect(prepared).toEqual(['project-draft'])
+  })
+
+  test('Given 其他项目工作流草稿 When 手动运行 Then 在 prepareDraft 前拒绝', async () => {
+    /** 与画布配置输入输出顺序完全一致的外部项目工作流定义。 */
+    const workflow: import('@proma/shared').MediaWorkflowDefinition = {
+      schemaVersion: 1,
+      prompt: { '1': { class_type: 'TextNode', inputs: { text: '生成短片' } } },
+      bindings: [{ key: 'prompt', kind: 'text', nodeId: '1', input: 'text' }],
+      outputs: config().outputs.map((output, index) => ({
+        key: output.key, nodeId: String(index + 2), outputIndex: 0, mediaType: output.mediaKind,
+      })),
+    }
+    /** 指向其他项目草稿但伪装成当前配置的输入。 */
+    const savedConfig = { ...config(), profile: null, workflow: {
+      workflowId: 'public-video', workflowRevision: 2, connectionId: 'gpu',
+    } }
+    /** 统计越权工作流是否进入运行准备。 */
+    let prepareCount = 0
+    /** 返回其他项目草稿的手动媒体运行服务。 */
+    const service = createService(createStore({ config: savedConfig }), run('running'), undefined, undefined,
+      undefined, undefined, undefined, undefined, {
+        projectId: 'project-2', workflow,
+        prepare: async () => { prepareCount += 1; return run('running') },
+      })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'foreign-draft' }, origin,
+    )).rejects.toThrow('CANVAS_MEDIA_WORKFLOW_MISMATCH')
+    expect(prepareCount).toBe(0)
+  })
+
   test('Given 公共工作流输入合同已变化 When 手动运行 Then 在 prepareDraft 前拒绝旧草稿', async () => {
     const workflow: import('@proma/shared').MediaWorkflowDefinition = {
       schemaVersion: 1,
@@ -486,7 +787,7 @@ describe('Canvas 通用媒体服务', () => {
 
     await expect(service.run(
       { ...target, expectedConfigRevision: 2, operationId: 'stale-draft' }, origin,
-    )).rejects.toThrow('CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH')
+    )).rejects.toThrow('CANVAS_MEDIA_INPUT_REQUIRED')
     expect(prepareCount).toBe(0)
   })
 

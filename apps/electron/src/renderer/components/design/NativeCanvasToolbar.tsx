@@ -156,7 +156,7 @@ export function NativeCanvasToolbar({
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <nav
         aria-label="Canvas 工具栏"
-        className="absolute left-1/2 top-3 z-10 flex max-w-[calc(100%-1rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-1 rounded-[8px] border border-border/70 bg-background/95 p-1 shadow-md backdrop-blur"
+        className="absolute left-1/2 top-3 z-10 flex w-max max-w-[calc(100%-1rem)] -translate-x-1/2 flex-wrap items-center justify-center gap-1 rounded-[8px] border border-border/70 bg-background/95 p-1 shadow-md backdrop-blur"
         onPointerDown={(event) => event.stopPropagation()}
       >
         {mediaModelPicker}

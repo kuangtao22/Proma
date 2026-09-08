@@ -27,6 +27,61 @@ function client(overrides: Partial<typeof defaultClient> = {}): typeof defaultCl
 }
 
 describe('ComfyUI 资源目录', () => {
+  test('Given 旧节点 schema 快照 When 首次迁移失败 Then 保留旧内容且同实例不重复请求', async () => {
+    let reads = 0
+    const stored = new Map<string, unknown>([['legacy-key', {
+      id: 'a'.repeat(64), checkedAt: 1, capability: 'available', schema,
+    }]])
+    const service = new MediaResourceService({
+      resolveConnection: () => ({ connection: { id: 'gpu', instanceGeneration: 'v1', baseUrl: 'http://localhost/' }, headers: {} }),
+      createClient: () => ({ ...defaultClient, objectInfo: async () => { reads += 1; throw new Error('offline') } }),
+      snapshots: {
+        read: (_key, parse) => {
+          const value = stored.get('legacy-key')
+          return value === undefined ? null : parse(value)
+        },
+        write: () => undefined,
+      },
+    })
+    const first = await service.list({ connectionId: 'gpu', kind: 'nodes' })
+    const second = await service.list({ connectionId: 'gpu', kind: 'nodes' })
+    expect(first.total).toBe(2)
+    expect(second.total).toBe(2)
+    expect(reads).toBe(1)
+  })
+
+  test('Given 旧节点 schema 快照 When 迁移成功 Then 持久化新版本且重建服务不再联网；显式刷新仍可重试', async () => {
+    const legacy = { id: 'a'.repeat(64), checkedAt: 1, capability: 'available', schema }
+    const stored = new Map<string, unknown>([['legacy-key', legacy]])
+    let reads = 0
+    let fail = true
+    const snapshots = {
+      read: <T,>(_key: string, parse: (value: unknown) => T): T | null => parse(stored.get('legacy-key')),
+      write: (_key: string, value: unknown) => { stored.set('legacy-key', value) },
+    }
+    const create = () => new MediaResourceService({
+      resolveConnection: () => ({ connection: { id: 'gpu', instanceGeneration: 'v1', baseUrl: 'http://localhost/' }, headers: {} }),
+      createClient: () => ({ ...defaultClient, objectInfo: async () => {
+        reads += 1
+        if (fail) throw new Error('offline')
+        return schema
+      } }),
+      snapshots,
+    })
+    const failedService = create()
+    await failedService.list({ connectionId: 'gpu', kind: 'nodes' })
+    await failedService.list({ connectionId: 'gpu', kind: 'nodes', refresh: true })
+    expect(reads).toBe(2)
+    fail = false
+    await failedService.list({ connectionId: 'gpu', kind: 'nodes', refresh: true })
+    expect(reads).toBe(3)
+    expect((stored.get('legacy-key') as { schemaFormatVersion: number }).schemaFormatVersion).toBe(2)
+
+    const rebuiltService = create()
+    await rebuiltService.list({ connectionId: 'gpu', kind: 'nodes' })
+    expect(reads).toBe(3)
+  })
+
   test('Given 原生节点的 schema 被标记不兼容 When 查询目录 Then 保持可见且不能标成支持执行', async () => {
     /** 即使 class_type 命中本地已知合同，也要尊重当前实例的 schema 状态。 */
     const service = new MediaResourceService({

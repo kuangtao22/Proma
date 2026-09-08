@@ -566,6 +566,19 @@ describe('媒体运行完整链路', () => {
     expect(fixture.calls.upload).toBe(0)
   })
 
+  test('Given 静态工作流连接无效 When 准备 Then 返回脱敏定位并且尚未上传或提交', async () => {
+    const fixture = harness()
+    /** 新版本故意引用不存在的来源节点，覆盖真实 validator 的结构化问题。 */
+    const invalidDefinition = fixture.configuration.getWorkflow('wf', 1, 'project-a').definition
+    invalidDefinition.prompt['2'] = { class_type: 'SaveImage', inputs: { images: ['missing-node', 0], filename_prefix: 'Proma' } }
+    fixture.configuration.saveWorkflow({ id: 'wf', name: '图片', projectId: 'project-a', definition: invalidDefinition }, 3)
+    fixture.configuration.saveProfile({ id: 'preset', name: '图片', connectionId: 'gpu', workflowId: 'wf', workflowRevision: 2, mediaKind: 'image', projectId: 'project-a', enabled: true }, 4)
+
+    await expect(fixture.create().prepare({ ...input(), profileRevision: 2 })).rejects.toThrow('MEDIA_WORKFLOW_INVALID:LINK_NODE_UNKNOWN@2.images:连接来源节点不存在')
+    expect(fixture.calls.upload).toBe(0)
+    expect(fixture.calls.submit).toBe(0)
+  })
+
   test('Given 已有操作 ID When 输入改变或过期 revision Then 不覆盖旧运行', async () => {
     const fixture = harness()
     const prepared = await fixture.create().prepare(input())

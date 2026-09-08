@@ -4,6 +4,7 @@ import type { MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourcePage, Med
 import * as mediaSettingsModule from './MediaSettings'
 
 interface ExpectedMediaSettingsModule {
+  formatMediaError: (error: unknown) => string
   buildSaveMediaConnectionInput: (draft: {
     id: string
     name: string
@@ -40,6 +41,7 @@ interface ExpectedMediaSettingsModule {
     definition: MediaWorkflowDefinition
     invalidated: false
   }
+  RemoteWorkflowContent: (props: { remote: MediaRemoteWorkflow; onImport: () => void }) => React.ReactElement
   MediaSettingsTabsView: (props: { activeTab: 'models' | 'connections' | 'workflows'; onTabChange: (tab: 'models' | 'connections' | 'workflows') => void }) => React.ReactElement
   parseMediaWorkflowImportText: (text: string) => MediaWorkflowDefinition
   isCurrentMediaResourceRequest: (requestRevision: number, currentRevision: number) => boolean
@@ -99,6 +101,12 @@ function createPrivateWorkflow(): MediaWorkflowVersion {
 }
 
 describe('MediaSettings 已确认交互合同', () => {
+  test('Given 远端工作流详情读取失败 When Renderer 展示错误 Then 提供可操作的同步重试提示', () => {
+    const { formatMediaError } = getExpectedModule()
+    expect(formatMediaError(new Error('MEDIA_REMOTE_WORKFLOW_READ_FAILED')))
+      .toContain('重新同步工作流列表后重试')
+  })
+
   test('Given 新连接 When 保存 Then 不要求项目授权并保留可选 Comfy 用户名', () => {
     const { buildSaveMediaConnectionInput } = getExpectedModule()
     expect(buildSaveMediaConnectionInput({
@@ -176,6 +184,112 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(draft.definition.outputs).toEqual([])
     expect(() => createRemoteWorkflowDraft({ descriptor, format: 'ui', definition: {} }, 'UI 图', 'ui-copy'))
       .toThrow('UI 工作流不能直接执行')
+  })
+
+  test('Given ComfyUI UI 工作流 When 打开详情 Then 使用只读代码编辑器且不触发导入', () => {
+    /** 详情必须保留执行器不识别的 UI 字段。 */
+    const { RemoteWorkflowContent } = getExpectedModule()
+    /** 包含节点、连线及自定义尾部数据的远端正文。 */
+    const remote: MediaRemoteWorkflow = {
+      descriptor: { connectionId: 'connection-1', instanceGeneration: 'generation-1', remoteUser: '', source: 'user-data', id: 'ui', workflowPath: 'ui.json' },
+      format: 'ui',
+      definition: {
+        nodes: [{ id: 1, type: 'LoadImage', widgets_values: ['source.png'] }, { id: 2, type: 'SaveImage' }],
+        links: [[1, 1, 0, 2, 0, 'IMAGE']],
+        extra: { lastField: '完整的末尾内容' },
+      },
+    }
+    /** 渲染本身不得进入创建草稿流程。 */
+    const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => { throw new Error('不应自动导入') }} />)
+    expect(html).toContain('ComfyUI UI 格式')
+    expect(html).toContain('data-json-code-editor')
+    expect(html).toContain('aria-label="完整工作流 JSON"')
+    expect(html).not.toContain('<pre')
+    expect(html).toContain('aria-label="复制完整工作流 JSON"')
+    expect(html).toContain('仅预览')
+    expect(html).not.toContain('role="alert"')
+    expect(html).not.toContain('导入公共草稿')
+  })
+
+  test('Given API 工作流 When 打开详情 Then 提供代码编辑器和独立导入入口', () => {
+    /** API 正文可以预览，也可以由用户显式导入。 */
+    const { RemoteWorkflowContent } = getExpectedModule()
+    /** API 图保留提示词与节点输入。 */
+    const remote: MediaRemoteWorkflow = {
+      descriptor: { connectionId: 'connection-1', instanceGeneration: 'generation-1', remoteUser: '', source: 'user-data', id: 'api', workflowPath: 'api.json' },
+      format: 'api',
+      definition: { '1': { class_type: 'CLIPTextEncode', inputs: { text: '完整提示词' } } },
+    }
+    /** 首次渲染不能隐式创建草稿。 */
+    const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => { throw new Error('不应自动导入') }} />)
+    expect(html).toContain('ComfyUI API 格式')
+    expect(html).toContain('data-json-code-editor')
+    expect(html).toContain('导入公共草稿')
+  })
+
+  test('Given UI 工作流已可靠转换 When 打开详情 Then 显示分析状态、可定位错误并允许导入转换定义', () => {
+    const { RemoteWorkflowContent, createRemoteWorkflowDraft } = getExpectedModule()
+    const remote = {
+      descriptor: { connectionId: 'connection-1', instanceGeneration: 'generation-1', remoteUser: '', source: 'user-data' as const, id: 'ui', workflowPath: 'ui.json' },
+      format: 'ui' as const,
+      definition: { nodes: [{ id: 1, type: 'SaveImage' }], links: [] },
+      analysis: {
+        format: 'ui' as const,
+        convertible: true,
+        definition: {
+          schemaVersion: 1 as const,
+          prompt: { '1': { class_type: 'SaveImage', inputs: {} } },
+          bindings: [],
+          outputs: [{ key: 'result', nodeId: '1', outputIndex: 0, mediaType: 'image' as const }],
+        },
+        issues: [{ code: 'TEST_WARNING', nodeId: '1', input: 'images', message: '可定位原因' }],
+        nodes: [], inputs: [], outputs: [],
+      },
+    } as unknown as MediaRemoteWorkflow
+    const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => undefined} />)
+    expect(html).toContain('已转换并通过校验')
+    expect(html).toContain('TEST_WARNING')
+    expect(html).toContain('节点 1')
+    expect(html).toContain('字段 images')
+    expect(html).toContain('导入公共草稿')
+    const draft = createRemoteWorkflowDraft(remote, 'UI 流程', 'ui-copy')
+    expect(draft.definition.prompt['1']?.class_type).toBe('SaveImage')
+  })
+
+  test('Given 远端工作流不可转换 When 打开详情 Then 展示阻塞问题且不提供导入入口', () => {
+    const { RemoteWorkflowContent } = getExpectedModule()
+    const remote = {
+      descriptor: { connectionId: 'connection-1', instanceGeneration: 'generation-1', remoteUser: '', source: 'user-data' as const, id: 'blocked', workflowPath: 'blocked.json' },
+      format: 'ui' as const,
+      definition: { nodes: [], links: [] },
+      analysis: {
+        format: 'ui' as const, convertible: false, definition: null,
+        issues: [{ code: 'UI_SUBGRAPH_UNSUPPORTED', message: '包含暂不支持的子图' }],
+        nodes: [], inputs: [], outputs: [],
+      },
+    } as unknown as MediaRemoteWorkflow
+    const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => undefined} />)
+    expect(html).toContain('暂不可导入')
+    expect(html).toContain('UI_SUBGRAPH_UNSUPPORTED')
+    expect(html).toContain('包含暂不支持的子图')
+    expect(html).not.toContain('导入公共草稿')
+  })
+
+  test('Given 未识别格式及包含 HTML 的正文 When 预览 Then 仍显示原始内容并按文本转义', () => {
+    /** 预览不依赖可执行格式，也不能将正文作为 HTML 注入。 */
+    const { RemoteWorkflowContent } = getExpectedModule()
+    /** 未识别对象中的文本保持只读。 */
+    const remote: MediaRemoteWorkflow = {
+      descriptor: { connectionId: 'connection-1', instanceGeneration: 'generation-1', remoteUser: '', source: 'user-data', id: 'unknown', workflowPath: 'unknown.json' },
+      format: 'unknown',
+      definition: { custom: '<script>alert(1)</script>' },
+    }
+    /** HTML 转义后的静态预览。 */
+    const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => undefined} />)
+    expect(html).toContain('未识别格式')
+    expect(html).toContain('data-json-code-editor')
+    expect(html).not.toContain('<script>')
+    expect(html).not.toContain('导入公共草稿')
   })
 
   test('Given 已显示资源页 When 切换四类资源或连接 Then 清空旧页并回到第一页', () => {

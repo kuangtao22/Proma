@@ -104,6 +104,8 @@ export function createCanvasMediaNodeProgressController(
   let targetsByNodeId = new Map<string, CanvasMediaTarget>()
   /** 每个节点保存完整公开运行列表，避免非最新运行事件被误归属。 */
   let runsByNodeId = new Map<string, MediaRunSnapshot[]>()
+  /** 配置诊断独立于运行历史，即使尚未创建 run 也能在原卡片展示。 */
+  const configurationByNodeId = new Map<string, { configured: boolean; issue: CanvasMediaModuleSnapshot['config']['preparation'] }>()
   /** 每个模块独立递增读取代次，拒绝乱序事件刷新。 */
   const requestGenerations = new Map<string, number>()
   /** 最近异步读取链供测试和卸载收口。 */
@@ -128,12 +130,20 @@ export function createCanvasMediaNodeProgressController(
   /** 仅有真实 AV 目标时申请项目 watch，空画布不向 Host 发送空项目 ID。 */
   let watchRequested = false
 
-  /** 发布仅包含已有运行事实的轻量投影。 */
+  /** 发布运行与配置的轻量投影，活跃任务优先，准备失败不会伪装成生成任务失败。 */
   const publish = (): void => {
     const progress = new Map<string, MediaRunProgressProjection>()
     for (const [nodeId, runs] of runsByNodeId) {
       const run = selectCanvasMediaNodeRun(runs)
-      if (run) progress.set(nodeId, projectMediaRunProgress(run))
+      /** 配置摘要只来自已有模块 LOAD，不为卡片状态额外请求服务器。 */
+      const configuration = configurationByNodeId.get(nodeId)
+      if (run && isActiveMediaRun(run)) progress.set(nodeId, projectMediaRunProgress(run))
+      else if (configuration?.issue) progress.set(nodeId, {
+        phase: 'pending', phaseLabel: '待配置',
+        nodeProgressLabel: `${configuration.issue.code} · ${configuration.issue.message}`,
+      })
+      else if (run) progress.set(nodeId, projectMediaRunProgress(run))
+      else progress.set(nodeId, { phase: 'pending', phaseLabel: configuration?.configured ? '参数待检查' : '待配置' })
     }
     dependencies.onChange(progress)
   }
@@ -159,6 +169,10 @@ export function createCanvasMediaNodeProgressController(
           || createCanvasMediaTargetKey(currentTarget) !== targetKey
           || createCanvasMediaTargetKey(snapshot.target) !== targetKey) return
         runsByNodeId.set(target.nodeId, snapshot.runs)
+        configurationByNodeId.set(target.nodeId, {
+          configured: Boolean(snapshot.config.profile || snapshot.config.workflow),
+          issue: snapshot.config.preparation,
+        })
         publish()
       } catch {
         /** 卡片进度属于增强信息；读取失败保留现有节点状态。 */
@@ -251,6 +265,7 @@ export function createCanvasMediaNodeProgressController(
         const next = nextTargets.get(nodeId)
         if (!next || createCanvasMediaTargetKey(next) !== createCanvasMediaTargetKey(previous)) {
           runsByNodeId.delete(nodeId)
+          configurationByNodeId.delete(nodeId)
           requestGenerations.set(createCanvasMediaTargetKey(previous), (
             requestGenerations.get(createCanvasMediaTargetKey(previous)) ?? 0
           ) + 1)
@@ -273,6 +288,7 @@ export function createCanvasMediaNodeProgressController(
       releaseRun = null
       targetsByNodeId.clear()
       runsByNodeId.clear()
+      configurationByNodeId.clear()
       publish()
       pending = Promise.all([
         pending.catch(() => undefined),

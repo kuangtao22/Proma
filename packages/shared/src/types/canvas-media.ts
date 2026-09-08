@@ -37,6 +37,12 @@ export interface CanvasMediaWorkflowReference {
   connectionId: string
 }
 
+/** 工作流尚未可执行时可安全展示和持久化的有限诊断。 */
+export interface CanvasMediaPreparationIssue {
+  code: string
+  message: string
+}
+
 /** 标量与媒体输入通过判别联合保持工作流绑定类型。 */
 export type CanvasMediaInputBinding =
   | { key: string; kind: 'text'; source: { type: 'literal'; value: string } }
@@ -87,6 +93,8 @@ export interface CanvasMediaModuleConfig {
   profile: CanvasMediaProfileReference | null
   /** 旧配置可能没有此字段；新工作流配置保存 null 或固定公共工作流引用。 */
   workflow?: CanvasMediaWorkflowReference | null
+  /** 缺省兼容旧配置；null 表示已显式清除历史待配置错误。 */
+  preparation?: CanvasMediaPreparationIssue | null
   inputs: CanvasMediaInputBinding[]
   outputs: CanvasMediaOutputBinding[]
   adoptedOutputs: CanvasMediaAdoptedOutput[]
@@ -133,6 +141,8 @@ export interface SaveCanvasMediaModuleInput extends CanvasMediaTarget {
   profile: CanvasMediaProfileReference | null
   /** 新保存使用公共工作流引用；旧 profile 调用方可省略。 */
   workflow?: CanvasMediaWorkflowReference | null
+  /** null 表示清除历史待配置错误；缺省由普通保存同样清除。 */
+  preparation?: CanvasMediaPreparationIssue | null
   inputs: CanvasMediaInputBinding[]
   outputs: CanvasMediaOutputBinding[]
 }
@@ -206,6 +216,8 @@ const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/
 const HASH_PATTERN = /^[0-9a-f]{64}$/
 const MAX_BINDINGS = 128
+const PREPARATION_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,95}$/
+const MAX_PREPARATION_MESSAGE_LENGTH = 2_048
 
 /** 判断未知值是无额外字段的普通对象。 */
 function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -223,6 +235,18 @@ function isNonNegativeInteger(value: unknown): value is number {
 /** 判断媒体类别属于统一协议。 */
 function isMediaKind(value: unknown): value is MediaKind {
   return value === 'image' || value === 'audio' || value === 'video'
+}
+
+/** 严格解析可公开的待配置错误，禁止附带凭据或任意底层异常字段。 */
+export function parseCanvasMediaPreparationIssue(value: unknown): CanvasMediaPreparationIssue | null {
+  if (value === null) return null
+  if (!hasExactKeys(value, ['code', 'message'])
+    || typeof value.code !== 'string' || !PREPARATION_CODE_PATTERN.test(value.code)
+    || typeof value.message !== 'string' || value.message.length < 1
+    || value.message.length > MAX_PREPARATION_MESSAGE_LENGTH) {
+    throw new Error('CANVAS_MEDIA_PREPARATION_INVALID')
+  }
+  return { code: value.code, message: value.message }
 }
 
 /** 严格解析不可变资产引用。 */
@@ -427,9 +451,11 @@ function parseBindings<T>(value: unknown, parse: (item: unknown) => T, identity:
 
 /** 严格解析通用媒体模块配置。 */
 export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleConfig {
+  const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
   const keys = [
     'schemaVersion', 'contentId', 'mediaKind', 'revision', 'createdAt', 'updatedAt',
     'profile', ...(value && typeof value === 'object' && Object.hasOwn(value, 'workflow') ? ['workflow'] : []),
+    ...(hasPreparation ? ['preparation'] : []),
     'inputs', 'outputs', 'adoptedOutputs',
   ]
   if (!hasExactKeys(value, keys)
@@ -493,6 +519,7 @@ export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleC
     updatedAt: value.updatedAt,
     profile,
     ...(value.workflow === undefined ? {} : { workflow }),
+    ...(hasPreparation ? { preparation: parseCanvasMediaPreparationIssue(value.preparation) } : {}),
     inputs,
     outputs,
     adoptedOutputs,
@@ -568,9 +595,11 @@ export function parseAttachCanvasMediaImportedAssetsInput(value: unknown): Attac
 
 /** 严格解析完整配置保存命令，并复用配置解析器验证输入输出合同。 */
 export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMediaModuleInput {
+  const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
   const keys = [
     'projectId', 'canvasId', 'nodeId', 'mediaModuleId', 'mediaKind',
     'expectedConfigRevision', 'profile', ...(value && typeof value === 'object' && Object.hasOwn(value, 'workflow') ? ['workflow'] : []),
+    ...(hasPreparation ? ['preparation'] : []),
     'inputs', 'outputs',
   ]
   if (!hasExactKeys(value, keys) || !isNonNegativeInteger(value.expectedConfigRevision)) {
@@ -587,6 +616,7 @@ export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMedia
       updatedAt: 0,
       profile: value.profile,
       ...(value.workflow === undefined ? {} : { workflow: value.workflow }),
+      ...(hasPreparation ? { preparation: value.preparation } : {}),
       inputs: value.inputs,
       outputs: value.outputs,
       adoptedOutputs: [],
@@ -596,6 +626,7 @@ export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMedia
       expectedConfigRevision: value.expectedConfigRevision,
       profile: parsed.profile,
       ...(value.workflow === undefined ? {} : { workflow: parsed.workflow ?? null }),
+      ...(hasPreparation ? { preparation: parsed.preparation ?? null } : {}),
       inputs: parsed.inputs,
       outputs: parsed.outputs,
     }

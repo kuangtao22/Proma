@@ -10,6 +10,10 @@ import type {
 import type { AgentSessionMeta } from './agent'
 import type { SDKMessage } from './agent'
 import type { MediaInputValue } from './media'
+import {
+  parseCanvasMediaPreparationIssue,
+  type CanvasMediaPreparationIssue,
+} from './canvas-media'
 import { parseCanvasMediaModelScope } from './canvas-media-model-scope'
 
 /** 原生 Canvas 图文档使用的固定 IPC 通道。 */
@@ -685,6 +689,11 @@ export function resolveCanvasEdgeBinding(
   return { state: 'unresolved' }
 }
 
+/** 判断未知值是否符合媒体服务使用的稳定连接 ID 合同。 */
+export function isCanvasComfyUiConnectionId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value)
+}
+
 /** 一个项目中单个 Canvas 会话的独立图文档。 */
 export interface CanvasDocument {
   schemaVersion: typeof CANVAS_DOCUMENT_VERSION
@@ -694,6 +703,8 @@ export interface CanvasDocument {
   viewport: DesignViewport
   /** 当前画布新任务的 API 模型候选范围；缺省兼容全部启用模式。 */
   mediaModelScope?: import('./canvas-media-model-scope').CanvasMediaModelScope
+  /** 当前画布新建 ComfyUI 工作流默认继承的全局连接；null 表示明确不绑定。 */
+  comfyuiConnectionId?: string | null
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   createdAt: number
@@ -710,6 +721,12 @@ export interface SetCanvasViewportMutation {
 export interface SetCanvasMediaModelScopeMutation {
   type: 'set-media-model-scope'
   scope: import('./canvas-media-model-scope').CanvasMediaModelScope
+}
+
+/** 显式更改当前画布的新任务默认 ComfyUI 连接，已有配置与运行不受影响。 */
+export interface SetCanvasComfyUiConnectionMutation {
+  type: 'set-comfyui-connection'
+  connectionId: string | null
 }
 
 /** 单个节点的稳定 ID 与目标位置。 */
@@ -759,6 +776,7 @@ export interface SetCanvasWebviewDevicePresetMutation {
 export type CanvasMutation =
   | SetCanvasViewportMutation
   | SetCanvasMediaModelScopeMutation
+  | SetCanvasComfyUiConnectionMutation
   | MoveCanvasNodesMutation
   | UpsertCanvasNodesMutation
   | RemoveCanvasNodesMutation
@@ -1086,6 +1104,8 @@ export interface CanvasImageModuleConfig {
   prompt: string
   selectedModelProfileId: string | null
   mediaWorkflow?: CanvasImageMediaWorkflow
+  /** 缺省兼容旧配置；null 表示已显式清除历史待配置错误。 */
+  preparation?: CanvasMediaPreparationIssue | null
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
   contextMode: DesignContextMode
@@ -1098,6 +1118,8 @@ export interface SaveCanvasImageModuleInput extends CanvasImageTarget {
   prompt: string
   selectedModelProfileId: string | null
   mediaWorkflow?: CanvasImageMediaWorkflow
+  /** null 表示清除历史待配置错误；缺省由普通保存同样清除。 */
+  preparation?: CanvasMediaPreparationIssue | null
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
   contextMode: DesignContextMode
@@ -2259,7 +2281,7 @@ export function parseCanvasImageMediaWorkflow(value: unknown): CanvasImageMediaW
   }
   /** 输入 key 与数量均有界，避免配置或 journal 被手工膨胀。 */
   const entries = Object.entries(value.inputs)
-  if (entries.length > 128 || entries.some(([key]) => !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(key))) {
+  if (entries.length > 128 || entries.some(([key]) => !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(key))) {
     throw new Error('CANVAS_IMAGE_WORKFLOW_INVALID')
   }
   return {
@@ -2331,11 +2353,14 @@ export function parseReleaseCanvasImageMediaInput(value: unknown): ReleaseCanvas
 export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleConfig {
   /** 可选工作流字段只在真实存在时进入 exact-key 合同。 */
   const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
+  /** 待配置错误允许旧数据缺省，但存在时必须符合共享安全边界。 */
+  const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
   /** v2 图片配置允许的完整字段集合。 */
   const keys = [
     'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
     'adoptedAssetId', ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
+    ...(hasPreparation ? ['preparation'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || value.schemaVersion !== 2
@@ -2363,6 +2388,7 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
     ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
+    ...(hasPreparation ? { preparation: parseCanvasMediaPreparationIssue(value.preparation) } : {}),
     aspectRatio: value.aspectRatio,
     imageSize: value.imageSize,
     contextMode: value.contextMode,
@@ -2873,11 +2899,14 @@ export function parseCanvasImageModuleSnapshot(value: unknown): CanvasImageModul
 export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImageModuleInput {
   /** 可选工作流字段按实际存在性参与 exact-key 校验。 */
   const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
+  /** 显式 preparation 允许只保存安全诊断或清除旧诊断。 */
+  const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
   /** 图片保存命令允许的完整字段集合。 */
   const keys = [
     'projectId', 'canvasId', 'nodeId', 'imageModuleId', 'expectedConfigRevision',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
     ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
+    ...(hasPreparation ? ['preparation'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || !isCanvasLifecycleId(value.projectId)
@@ -2902,6 +2931,7 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
     ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
+    ...(hasPreparation ? { preparation: parseCanvasMediaPreparationIssue(value.preparation) } : {}),
     aspectRatio: value.aspectRatio,
     imageSize: value.imageSize,
     contextMode: value.contextMode,
@@ -3613,11 +3643,15 @@ function parseCanvasWorkspaceImagePreview(value: unknown): CanvasImagePreview {
 function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
   /** 可选范围字段仅在真实存在时参与 exact-key 合同。 */
   const hasScope = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaModelScope')
+  /** 连接字段允许旧文档缺省，但一旦存在必须是 null 或安全稳定 ID。 */
+  const hasComfyUiConnection = value !== null && typeof value === 'object'
+    && Object.hasOwn(value, 'comfyuiConnectionId')
   /** Canvas 文档只允许当前 v4 的完整公开字段集合。 */
   const keys = [
     'schemaVersion', 'projectId', 'canvasId', 'revision', 'viewport',
     'nodes', 'edges', 'createdAt', 'updatedAt',
     ...(hasScope ? ['mediaModelScope'] : []),
+    ...(hasComfyUiConnection ? ['comfyuiConnectionId'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
     || value.schemaVersion !== CANVAS_DOCUMENT_VERSION
@@ -3631,6 +3665,9 @@ function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
     || value.viewport.zoom <= 0
     || !Array.isArray(value.nodes)
     || !Array.isArray(value.edges)
+    || (hasComfyUiConnection
+      && value.comfyuiConnectionId !== null
+      && !isCanvasComfyUiConnectionId(value.comfyuiConnectionId))
     || !isCanvasNonNegativeInteger(value.createdAt)
     || !isCanvasNonNegativeInteger(value.updatedAt)) {
     throw new Error('CANVAS_WORKSPACE_SNAPSHOT_INVALID')
@@ -3659,6 +3696,7 @@ function parseCanvasWorkspaceDocument(value: unknown): CanvasDocument {
     revision: value.revision,
     viewport: { x: value.viewport.x, y: value.viewport.y, zoom: value.viewport.zoom },
     ...(hasScope ? { mediaModelScope: parseCanvasMediaModelScope(value.mediaModelScope) } : {}),
+    ...(hasComfyUiConnection ? { comfyuiConnectionId: value.comfyuiConnectionId as string | null } : {}),
     nodes,
     edges,
     createdAt: value.createdAt,
@@ -3863,6 +3901,9 @@ export function applyCanvasMutations(
         break
       case 'set-media-model-scope':
         next.mediaModelScope = parseCanvasMediaModelScope(mutation.scope)
+        break
+      case 'set-comfyui-connection':
+        next.comfyuiConnectionId = mutation.connectionId
         break
       case 'move-nodes': {
         /** 本次批量移动中每个节点 ID 对应的最终位置。 */

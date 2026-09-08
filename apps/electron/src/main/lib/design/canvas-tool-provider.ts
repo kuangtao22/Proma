@@ -80,6 +80,12 @@ const MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES = 4_096
 /** 临时 Skill 只接受稳定名称或 slug，禁止路径和空白。 */
 const MAX_AGENT_RUN_SKILLS = 16
 const STABLE_AGENT_SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/
+/** 节点可保存的有界配置诊断；只记录分析原因，不包含凭据或原始服务响应。 */
+const MEDIA_PREPARATION_SCHEMA = Type.Union([
+  Type.Null(),
+  Type.Object({ code: Type.String({ pattern: '^[A-Z][A-Z0-9_]{0,95}$' }),
+    message: Type.String({ minLength: 1, maxLength: 2048 }) }, { additionalProperties: false }),
+])
 const CANVAS_NODE_KINDS: CanvasNode['kind'][] = ['agent', 'image', 'audio', 'video', 'document', 'webview']
 
 /** renderer 手动运行的 Canvas Agent 仅继承 Task 8 前已有的固定能力。 */
@@ -1132,6 +1138,7 @@ export function createCanvasToolRun(
             const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
             /** 媒体候选范围由用户导航选择，普通生成工具不能扩大或改写该范围。 */
             if (operations.some((operation) => operation.type === 'set-media-model-scope')) throw new Error('CANVAS_MEDIA_MODEL_SCOPE_USER_MANAGED')
+            if (operations.some((operation) => operation.type === 'set-comfyui-connection')) throw new Error('CANVAS_COMFYUI_CONNECTION_USER_MANAGED')
             const document = dependencies.documents.load(target).document
             if (context.canvasAgentMode === 'parent-orchestrated' && context.parentWorkflow
               && operations.some((operation) => operation.type === 'upsert-nodes'
@@ -1437,12 +1444,13 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_update_image_config', label: '更新生图节点配置',
-      description: '局部更新已有生图节点的提示词、模型、画幅、尺寸或上下文；只保存配置，不会自动生图。',
+      description: '局部更新已有生图节点的提示词、模型、工作流、画幅或上下文；工作流输入可先保存已知值，运行前必须补齐。分析失败用 preparation 保存错误码、节点/字段和中文原因，修复后传 null 清除。只保存配置，不会自动生图。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeId: Type.String({ minLength: 1, maxLength: 128 }),
         baseRevision: Type.Integer({ minimum: 0 }),
         expectedConfigRevision: Type.Integer({ minimum: 0 }),
+        preparation: Type.Optional(MEDIA_PREPARATION_SCHEMA),
         prompt: Type.Optional(Type.String({ maxLength: 256 * 1024 })),
         selectedModelProfileId: Type.Optional(Type.Union([
           Type.String({ minLength: 1, maxLength: 128 }),
@@ -1454,7 +1462,7 @@ export function createCanvasToolRun(
             workflowRevision: Type.Integer({ minimum: 1 }),
             connectionId: Type.String({ minLength: 1, maxLength: 128 }),
             inputs: Type.Record(
-              Type.String({ pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' }),
+              Type.String({ pattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$' }),
               Type.Union([
                 Type.Object({ kind: Type.Literal('scalar'), value: Type.Union([
                   Type.String(), Type.Number(), Type.Boolean(),
@@ -1492,7 +1500,8 @@ export function createCanvasToolRun(
             && params.mediaWorkflow === undefined
             && params.aspectRatio === undefined
             && params.imageSize === undefined
-            && params.contextMode === undefined) {
+            && params.contextMode === undefined
+            && params.preparation === undefined) {
             throw new Error('CANVAS_IMAGE_CONFIG_PATCH_REQUIRED')
           }
           /** fresh 图用于验证节点类别并解析可信图片模块身份。 */
@@ -1528,6 +1537,7 @@ export function createCanvasToolRun(
             prompt: params.prompt ?? currentConfig.prompt,
             selectedModelProfileId,
             ...(mediaWorkflow ? { mediaWorkflow } : {}),
+            preparation: params.preparation === undefined ? currentConfig.preparation ?? null : params.preparation,
             aspectRatio: params.aspectRatio ?? currentConfig.aspectRatio,
             imageSize: params.imageSize ?? currentConfig.imageSize,
             contextMode: params.contextMode ?? currentConfig.contextMode,
@@ -1545,12 +1555,13 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_update_media_config', label: '更新媒体节点配置',
-      description: '以配置 revision 保存音视频节点的 typed 输入与有序输出；workflow 固定公共工作流版本和连接，profile 仅兼容旧预设且两者互斥。保存不提交生成；公共工作流须先通过 media_list_profiles 和 media_inspect_workflow 发现与检查。',
+      description: '以配置 revision 保存音视频卡片；workflow 固定公共或当前项目的工作流版本和连接，profile 仅兼容旧预设且两者互斥。先用 media_list_workflows/media_inspect_workflow 读取真实输入输出，inputs 可先只填已知值，缺失项留待配置，运行前必须补齐。省略字段保留现状；更换工作流时同时提供新的 inputs/outputs。分析失败用 preparation 保存错误码、节点/字段和中文原因，修复后传 null 清除。保存不提交生成。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeId: Type.String({ minLength: 1, maxLength: 128 }),
         baseRevision: Type.Integer({ minimum: 0 }),
         expectedConfigRevision: Type.Integer({ minimum: 0 }),
+        preparation: Type.Optional(MEDIA_PREPARATION_SCHEMA),
         profile: Type.Optional(Type.Union([Type.Null(), Type.Object({
           profileId: Type.String({ minLength: 1, maxLength: 128 }),
           profileRevision: Type.Integer({ minimum: 1 }),
@@ -1559,8 +1570,8 @@ export function createCanvasToolRun(
           workflowId: Type.String({ minLength: 1, maxLength: 128 }), workflowRevision: Type.Integer({ minimum: 1 }),
           connectionId: Type.String({ minLength: 1, maxLength: 128 }),
         })])),
-        inputs: Type.Array(Type.Unknown(), { maxItems: 128 }),
-        outputs: Type.Array(Type.Unknown(), { minItems: 1, maxItems: 128 }),
+        inputs: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 128 })),
+        outputs: Type.Optional(Type.Array(Type.Unknown(), { maxItems: 128 })),
       }),
       execute: async (_toolCallId, params) => {
         dependencies.access.authorizeRead(context)
@@ -1571,13 +1582,20 @@ export function createCanvasToolRun(
           const document = dependencies.documents.load(canvasTarget).document
           if (document.revision !== params.baseRevision) throw new Error('CANVAS_REVISION_CONFLICT')
           const mediaTarget = requireCanvasMediaTarget(document, canvasTarget, params.nodeId)
+          /** 在相同配置 revision 上合并局部诊断或草稿，避免覆盖已填输入与正式输出。 */
+          const current = (await dependencies.canvasMedia.load(mediaTarget)).config
+          if (current.revision !== params.expectedConfigRevision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
+          if (params.profile && params.workflow) throw new Error('CANVAS_MEDIA_SOURCE_CONFLICT')
+          if (params.profile === undefined && params.workflow === undefined && params.inputs === undefined
+            && params.outputs === undefined && params.preparation === undefined) throw new Error('CANVAS_MEDIA_CONFIG_PATCH_REQUIRED')
           const input = parseSaveCanvasMediaModuleInput({
             ...mediaTarget,
             expectedConfigRevision: params.expectedConfigRevision,
-            profile: params.profile ?? null,
-            ...(params.workflow === undefined ? {} : { workflow: params.workflow }),
-            inputs: params.inputs,
-            outputs: params.outputs,
+            profile: params.workflow ? null : params.profile === undefined ? current.profile : params.profile,
+            workflow: params.profile ? null : params.workflow === undefined ? current.workflow ?? null : params.workflow,
+            preparation: params.preparation === undefined ? current.preparation ?? null : params.preparation,
+            inputs: params.inputs ?? current.inputs,
+            outputs: params.outputs ?? current.outputs,
           })
           const config = await dependencies.canvasMedia.save(input)
           return toolResult({
@@ -2159,7 +2177,7 @@ export function createCanvasToolRun(
 
 创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，图片画幅、尺寸、模型或上下文通过 canvas_update_image_config 局部修改，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片运行结果只代表候选已创建或正在生成；可用 canvas_get_image_candidates 读取真实候选缩略图，用户已授权采用时用 canvas_adopt_image_candidates 提交精确 candidateHash，否则等待验收，不得描述为已正式替换。
 
-音频和视频先用 canvas_create_media 创建空模块，再通过媒体资源工具检查当前连接、节点、模型和工作流，并用 canvas_update_media_config 固定预设版本、typed 输入来源和输出角色。只有用户明确要求生成时才调用 canvas_run_nodes；进度通过 canvas_inspect_media 的 phase/progress 查询。运行成功只产生候选，必须用 canvas_adopt_media_candidate 明确采用输出。已授权本地后期产物可经 media_import_local_file 登记，再用 canvas_attach_media_assets 按完整输出 key 回填候选，最后明确采用。metadataOnly 结果不表示你已观看视频或听取音频，内容质量判断必须使用可用的分析工具并保留证据。
+面向画布的媒体生成先创建或复用对应卡片，再分析工作流。图片用 canvas_create_artifact，音视频用 canvas_create_media；不要等待生成成功才建立节点。通过媒体资源工具检查连接、真实输入输出和素材，立即用 canvas_update_image_config 或 canvas_update_media_config 固定工作流版本、连接与已知值。缺少素材或参数时先保存部分 typed 输入，在原卡片补齐；分析失败保留卡片，用 preparation 记录错误码和具体节点/字段原因，不伪造可执行绑定。修复后传 preparation:null 清除。只有参数完整且用户明确要求生成时才调用 canvas_run_nodes；进度与错误通过原节点查询。运行成功只产生候选，必须用 canvas_adopt_media_candidate 明确采用输出。已授权本地后期产物可经 media_import_local_file 登记，再用 canvas_attach_media_assets 按完整输出 key 回填候选，最后明确采用。metadataOnly 结果不表示你已观看视频或听取音频，内容质量判断必须使用可用的分析工具并保留证据。
 
 用户只要求核对、检查或评审画布图片时保持只读：先用 canvas_list_nodes 分页枚举同一 revision 的全部图片节点，再用 canvas_inspect_images 每批最多四张读取当前正式采用缩略图。检查未采用候选或历史版本时，先用 canvas_read 获取 jobHistory 中成功任务的 id，再用 canvas_inspect_images 的 versions=[{nodeId,jobId}] 精确看图，无需先采用或要求用户截图。不存在的版本不得用正式图替代。不得只比较提示词或使用当前画布截图后声称已完成全量视觉核对；未明确要求修正时，不更新提示词、不运行节点、不采用候选。
 

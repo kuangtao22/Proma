@@ -6,6 +6,48 @@ import {
   parseMediaWorkflowDefinition,
 } from './media-workflow'
 
+test('Given V3 输出类型模板 When 解析并重读 object_info Then 保留精确模板且拒绝长度不一致', () => {
+  /** 输出必须携带对应输入模板身份，不能从显示类型猜测。 */
+  const raw = { Resize: { input: { required: { image: ['COMFY_MATCHTYPE_V3', {
+    template: { template_id: 'media', allowed_types: 'IMAGE,MASK' },
+  }] } }, output: ['COMFY_MATCHTYPE_V3', 'INT'], output_matchtypes: ['media', null] } }
+  const parsed = parseComfyObjectInfo(raw)
+  expect(parsed.Resize?.output_matchtypes).toEqual(['media', null])
+  expect(parseComfyObjectInfo(parsed)).toEqual(parsed)
+  expect(() => parseComfyObjectInfo({ Resize: { ...raw.Resize, output_matchtypes: ['media'] } }))
+    .toThrow('COMFY_OBJECT_INFO_INVALID')
+})
+
+test('Given 官方输入序列元数据 When 解析并重读 object_info Then 保持顺序且拒绝重复或未知结构', () => {
+  const raw = {
+    WidgetNode: {
+      input: { required: { prompt: ['STRING'] }, optional: { enabled: ['BOOLEAN'] } },
+      output: ['IMAGE'],
+      input_order: { required: ['prompt'], optional: ['enabled'] },
+    },
+  }
+  const parsed = parseComfyObjectInfo(raw)
+  expect(parsed.WidgetNode?.input_order).toEqual({ required: ['prompt'], optional: ['enabled'], hidden: [] })
+  expect(parseComfyObjectInfo(parsed)).toEqual(parsed)
+  expect(() => parseComfyObjectInfo({ WidgetNode: { ...raw.WidgetNode, input_order: { required: ['prompt', 'prompt'], optional: [] } } }))
+    .toThrow('COMFY_OBJECT_INFO_INVALID')
+  expect(() => parseComfyObjectInfo({ WidgetNode: { ...raw.WidgetNode, input_order: { required: ['missing'], optional: [] } } }))
+    .toThrow('COMFY_OBJECT_INFO_INVALID')
+})
+
+test('Given 真实 V3 节点的空输出模板和隐藏输入顺序 When 解析 Then 不误标为不兼容', () => {
+  const parsed = parseComfyObjectInfo({
+    PrimitiveInt: { input: { required: { value: ['INT'] } }, output: ['INT'], output_matchtypes: null,
+      input_order: { required: ['value'] } },
+    SaveVideo: { input: { required: { video: ['VIDEO'] }, hidden: { prompt: 'PROMPT' } }, output: ['VIDEO'],
+      output_matchtypes: null, input_order: { required: ['video'], hidden: ['prompt'] } },
+  })
+  expect(parsed.PrimitiveInt?.input_order).toEqual({ required: ['value'], optional: [], hidden: [] })
+  expect(parsed.SaveVideo?.input_order?.hidden).toEqual(['prompt'])
+  expect(parsed.PrimitiveInt?.output_matchtypes).toBeUndefined()
+  expect(parseComfyObjectInfo(parsed)).toEqual(parsed)
+})
+
 describe('ComfyUI shared protocol parsers', () => {
   test('Given 合法 API 图 When 解析 Then 保留节点链接与元数据', () => {
     expect(parseComfyPrompt({

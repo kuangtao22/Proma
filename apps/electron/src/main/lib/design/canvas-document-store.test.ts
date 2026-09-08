@@ -178,6 +178,37 @@ describe('CanvasDocumentStore', () => {
     expect(() => fixture.store.mutate(target, 0, [{ type: 'set-media-model-scope', scope: { mode: 'all-enabled' } }])).toThrow()
   })
 
+  test('Given 旧文档未绑定服务器 When 设置、重载并解除默认连接 Then 兼容缺省且完整 roundtrip', () => {
+    const fixture = createFixture()
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    expect(fixture.store.load(target).document.comfyuiConnectionId).toBeUndefined()
+
+    const bound = fixture.store.mutate(target, 0, [{
+      type: 'set-comfyui-connection', connectionId: 'connection-1',
+    }])
+    expect(bound.comfyuiConnectionId).toBe('connection-1')
+    expect(fixture.store.load(target).document.comfyuiConnectionId).toBe('connection-1')
+
+    const unbound = fixture.store.mutate(target, bound.revision, [{
+      type: 'set-comfyui-connection', connectionId: null,
+    }])
+    expect(unbound.comfyuiConnectionId).toBeNull()
+    expect(fixture.store.load(target).document.comfyuiConnectionId).toBeNull()
+  })
+
+  test.each([['空字符串', ''], ['超长 ID', 'c'.repeat(257)], ['错误类型', 1]])(
+    'Given %s ComfyUI 绑定 When 提交 mutation 或解析文档 Then 严格拒绝',
+    (_label, connectionId) => {
+      const fixture = createFixture()
+      const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+      expect(() => fixture.store.mutate(target, 0, [{
+        type: 'set-comfyui-connection', connectionId,
+      } as unknown as CanvasMutation])).toThrow('CANVAS_MUTATION_INVALID')
+      const document = { ...createConnectedDocument(), comfyuiConnectionId: connectionId }
+      expect(() => parseCanvasDocument(document, target)).toThrow('CANVAS_DOCUMENT_INVALID')
+    },
+  )
+
   test('Given 上游来源达到共享上限 When 解析权威文档 Then 接受上限并拒绝再多一个', () => {
     const document = createConnectedDocument()
     /** 使用共享常量生成边界输入，避免测试与 parser 各自维护数字。 */

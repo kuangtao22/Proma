@@ -10,11 +10,17 @@ import type {
   MediaWorkflowVersion,
 } from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
+import * as React from 'react'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
 import {
   CanvasMediaPreviewLeaseOwner,
   CanvasMediaDraftLoadGuard,
+  CanvasMediaWorkflowForm,
   CanvasMediaWorkbench,
+  buildPartialInputs,
   buildCanvasMediaWorkflowValues,
+  createInputDrafts,
   createCanvasMediaWorkflowDraft,
   createCanvasMediaWorkflowSelection,
   createCanvasMediaWorkflowSelectionDraft,
@@ -23,11 +29,84 @@ import {
   getCanvasMediaErrorMessage,
   releaseCanvasMediaPreview,
   replaceCanvasMediaPreview,
+  resolveDelayedCanvasDefaultConnection,
   resolveCanvasMediaWorkflow,
+  resolveCanvasMediaWorkflowConnection,
+  selectCanvasMediaWorkflowsForProject,
   saveAndRunCanvasMedia,
+  useDelayedCanvasDefaultConnection,
   validateCanvasMediaWorkflowDrafts,
   type CanvasMediaWorkbenchAdapter,
 } from './CanvasMediaWorkbench'
+
+interface MinimalEventTarget {
+  addEventListener: () => void
+  removeEventListener: () => void
+}
+
+/** 创建只运行 Effect 的最小 React 宿主，验证默认连接延迟更新。 */
+function createHookRoot(): {
+  render: (node: React.ReactElement) => void
+  unmount: () => void
+  restore: () => void
+} {
+  /** React DOM 所需的最小事件目标。 */
+  const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
+  class FakeHtmlIFrameElement {}
+  /** Hook 测试不生成 DOM，仅提供 React DOM 初始化要求的宿主字段。 */
+  const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement }
+  const fakeDocument = {
+    ...eventTarget,
+    nodeType: 9,
+    defaultView: fakeWindow,
+    activeElement: null,
+    body: null,
+    documentElement: { namespaceURI: 'http://www.w3.org/1999/xhtml' },
+  }
+  const container = {
+    ...eventTarget,
+    nodeType: 1,
+    tagName: 'DIV',
+    namespaceURI: 'http://www.w3.org/1999/xhtml',
+    ownerDocument: fakeDocument,
+  }
+  /** 保存测试前全局对象，卸载后完整恢复。 */
+  const globals = globalThis as unknown as { window?: unknown; document?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean }
+  const previousWindow = globals.window
+  const previousDocument = globals.document
+  const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT
+  globals.window = fakeWindow
+  globals.document = fakeDocument
+  globals.IS_REACT_ACT_ENVIRONMENT = true
+  /** 当前测试使用的 React 根。 */
+  const root = createRoot(container as unknown as Element)
+  return {
+    render: (node) => { root.render(node) },
+    unmount: () => { root.unmount() },
+    restore: () => {
+      globals.window = previousWindow
+      globals.document = previousDocument
+      globals.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment
+    },
+  }
+}
+
+/** 通过真实 Effect 暴露空草稿当前继承的连接。 */
+function DelayedDefaultConnectionProbe({
+  defaultConnectionId,
+  dirty = false,
+  onValue,
+}: {
+  defaultConnectionId: string | null
+  dirty?: boolean
+  onValue: (connectionId: string) => void
+}): null {
+  /** Probe 内部连接状态与真实工作台保持同一初始化方式。 */
+  const [connectionId, setConnectionId] = React.useState('')
+  useDelayedCanvasDefaultConnection(connectionId, defaultConnectionId, false, false, dirty, setConnectionId)
+  React.useEffect(() => onValue(connectionId), [connectionId, onValue])
+  return null
+}
 
 /** 测试使用的完整视频节点目标。 */
 const target: CanvasMediaTarget = {
@@ -136,6 +215,51 @@ function createAdapter(snapshot = createSnapshot()): CanvasMediaWorkbenchAdapter
 }
 
 describe('CanvasMediaWorkbench', () => {
+  test('Given 新音视频配置有画布默认连接 When 建立草稿 Then 继承默认且不覆盖已保存连接', () => {
+    expect(resolveCanvasMediaWorkflowConnection(null, 'connection-default')).toBe('connection-default')
+    expect(resolveCanvasMediaWorkflowConnection('connection-saved', 'connection-default')).toBe('connection-saved')
+  })
+
+  test('Given 默认连接稍晚到达 When 音视频草稿仍空白干净 Then 跟随默认；已有选择或编辑时保持当前值', () => {
+    expect(resolveDelayedCanvasDefaultConnection('', 'connection-late', false, false, false)).toBe('connection-late')
+    expect(resolveDelayedCanvasDefaultConnection('connection-old-default', 'connection-new-default', false, false, false))
+      .toBe('connection-new-default')
+    expect(resolveDelayedCanvasDefaultConnection('connection-user', 'connection-new-default', false, false, true))
+      .toBe('connection-user')
+    expect(resolveDelayedCanvasDefaultConnection('connection-user', 'connection-new-default', false, true, false))
+      .toBe('connection-user')
+    expect(resolveDelayedCanvasDefaultConnection('connection-saved', 'connection-new-default', true, false, false))
+      .toBe('connection-saved')
+  })
+
+  test('Given 工作台先以空默认挂载 When 默认异步变化且草稿随后标脏 Then Effect 只更新干净阶段', async () => {
+    /** 记录真实 Effect 提交后的连接变化。 */
+    const values: string[] = []
+    /** Probe 每次连接真实改变后写入记录。 */
+    const onValue = (connectionId: string): void => { values.push(connectionId) }
+    /** 当前测试使用的无 DOM 子节点 React 宿主。 */
+    const host = createHookRoot()
+    try {
+      await act(async () => { host.render(<DelayedDefaultConnectionProbe defaultConnectionId={null} onValue={onValue} />) })
+      await act(async () => { host.render(<DelayedDefaultConnectionProbe defaultConnectionId="connection-late" onValue={onValue} />) })
+      await act(async () => { host.render(<DelayedDefaultConnectionProbe defaultConnectionId="connection-new" onValue={onValue} />) })
+      await act(async () => { host.render(<DelayedDefaultConnectionProbe defaultConnectionId="connection-ignored" dirty onValue={onValue} />) })
+      expect(values).toEqual(['', 'connection-late', 'connection-new'])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 公共、当前项目与其它项目工作流并存 When 音视频节点列目录 Then 不泄漏其它项目草稿', () => {
+    const workflow = createWorkflow()
+    expect(selectCanvasMediaWorkflowsForProject([
+      workflow,
+      { ...workflow, id: 'workflow-project', projectId: target.projectId },
+      { ...workflow, id: 'workflow-other', projectId: 'project-2' },
+    ], target.projectId).map((item) => item.id)).toEqual(['workflow-1', 'workflow-project'])
+  })
+
   test('Given 工作台首次渲染 When 异步快照尚未返回 Then 显示加载态', () => {
     const html = renderToStaticMarkup(
       <CanvasMediaWorkbench target={target} writable adapter={createAdapter()} />,
@@ -154,11 +278,13 @@ describe('CanvasMediaWorkbench', () => {
     expect(draft.inputs).toEqual([
       {
         key: 'prompt', kind: 'text', label: '提示词', controlType: 'text', required: true,
-        sourceType: 'literal', value: '默认提示词', asset: null, nodeId: '', outputKey: 'agent.text',
+        sourceType: 'literal', value: '默认提示词', asset: null,
+        bindingNodeId: '1', bindingInput: 'text', sourceNodeId: '', outputKey: 'agent.text',
       },
       {
         key: 'source', kind: 'image', label: '参考图', controlType: 'image', required: true,
-        sourceType: 'literal', value: '', asset: null, nodeId: '', outputKey: 'image.asset',
+        sourceType: 'literal', value: '', asset: null,
+        bindingNodeId: '2', bindingInput: 'image', sourceNodeId: '', outputKey: 'image.asset',
       },
     ])
     expect(draft.outputs).toEqual([
@@ -198,14 +324,57 @@ describe('CanvasMediaWorkbench', () => {
     expect(validateCanvasMediaWorkflowDrafts(workflow, drafts)).toBe('输入 参考图 需要选择素材。')
   })
 
+  test('Given 只保存已知字段和完整 Canvas 来源 When 重新加载 Then 保留值且缺失字段为空', () => {
+    const workflow = createWorkflow()
+    const drafts = createCanvasMediaWorkflowDraft(workflow)
+    const partialDrafts = drafts.map((draft) => draft.key === 'source'
+      ? { ...draft, sourceType: 'canvas-output' as const, sourceNodeId: 'image-node-7', outputKey: 'image.asset' }
+      : { ...draft, value: '用户提示词' })
+    const inputs = buildPartialInputs(workflow, partialDrafts)
+    expect(inputs).toEqual([
+      { key: 'prompt', kind: 'text', source: { type: 'literal', value: '用户提示词' } },
+      { key: 'source', kind: 'image', source: { type: 'canvas-output', nodeId: 'image-node-7', outputKey: 'image.asset' } },
+    ])
+
+    const config = { ...createSnapshot().config, workflow: {
+      workflowId: workflow.id, workflowRevision: workflow.revision, connectionId: 'connection-1',
+    }, inputs: inputs.slice(0, 1) }
+    const reloaded = createInputDrafts(config, workflow)
+    expect(reloaded[0]?.value).toBe('用户提示词')
+    expect(reloaded[1]).toMatchObject({ value: '', asset: null, bindingNodeId: '2', bindingInput: 'image' })
+  })
+
+  test('Given 基础字段和多个生成参数 When 渲染表单 Then 使用一个高级折叠组并显示真实绑定位置', () => {
+    const workflow = createWorkflow()
+    workflow.definition.prompt['4'] = { class_type: 'KSampler', inputs: { seed: 1, steps: 20 } }
+    workflow.definition.bindings.push(
+      { key: 'seed', kind: 'number', nodeId: '4', input: 'seed', field: {
+        classType: 'KSampler', valueKind: 'number', label: '种子', controlType: 'seed', required: true,
+      } },
+      { key: 'steps', kind: 'number', nodeId: '4', input: 'steps', field: {
+        classType: 'KSampler', valueKind: 'number', label: '步数', controlType: 'number', required: true,
+      } },
+    )
+    const html = renderToStaticMarkup(<CanvasMediaWorkflowForm
+      inputs={createCanvasMediaWorkflowDraft(workflow)} assets={[]} writable busy={false} onInputChange={() => undefined}
+    />)
+    expect(html.match(/<details/g)?.length).toBe(1)
+    expect(html).toContain('高级参数')
+    expect(html).toContain('节点 1 · text')
+    expect(html).toContain('节点 4 · seed')
+    expect(html).toContain('待选择素材。')
+  })
+
   test('Given 草稿已修改且后台模块事件返回 When LOAD 完成 Then 刷新快照但不覆盖草稿', () => {
     const guard = new CanvasMediaDraftLoadGuard()
     const initial = guard.begin()
     expect(guard.accept(initial, false)).toEqual({ accepted: true, replaceDraft: true })
     guard.markDirty()
+    expect(guard.isDirty()).toBeTrue()
     const refresh = guard.begin()
     expect(guard.accept(refresh, true)).toEqual({ accepted: true, replaceDraft: false })
     guard.markClean()
+    expect(guard.isDirty()).toBeFalse()
     const saved = guard.begin()
     expect(guard.accept(saved, true)).toEqual({ accepted: true, replaceDraft: true })
   })

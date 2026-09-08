@@ -39,9 +39,11 @@ import { cn } from '@/lib/utils'
 import { DesignTaskDetailsView } from './DesignTaskDetails'
 import {
   buildCanvasMediaWorkflowValues,
+  buildCanvasMediaWorkflowPartialValues,
   CanvasMediaWorkflowForm,
   createCanvasMediaWorkflowDraft,
   type CanvasMediaWorkflowInputDraft,
+  useDelayedCanvasDefaultConnection,
 } from './CanvasMediaWorkbench'
 import type { MediaRunProgressProjection } from './use-media-run-progress'
 
@@ -60,15 +62,17 @@ export interface CanvasImageWorkbenchProps {
   imageModelOptions: ImageGenerationModelOption[]
   imageModelLoadState: CanvasImageModelLoadState
   imageModelError?: string | null
-  /** 图片节点可直接选择的公共工作流版本。 */
+  /** 图片节点可直接选择的公共或当前项目工作流版本。 */
   mediaWorkflows?: MediaWorkflowVersion[]
-  /** 当前可用连接，选择公共工作流时必须由用户显式指定。 */
+  /** 当前可用连接，选择工作流时必须有已保存或继承的明确值。 */
   mediaConnections?: MediaConnectionSummary[]
   /** 当前项目已经授权并登记的媒体素材。 */
   mediaAssets?: MediaAssetRecord[]
-  /** 独立保存的公共工作流选择；null 表示使用旧模型 profile。 */
+  /** 独立保存的工作流选择；null 表示使用旧模型 profile。 */
   mediaWorkflow?: CanvasImageMediaWorkflow | null
-  /** 保存公共工作流选择及完整显式输入。 */
+  /** 新工作流在首次建立本地草稿时继承的画布默认连接。 */
+  defaultComfyuiConnectionId?: string | null
+  /** 保存工作流选择及完整显式输入。 */
   onMediaWorkflowChange?: (workflow: CanvasImageMediaWorkflow | null) => void
   onDraftChange: (patch: Partial<Omit<CanvasImageModuleDraft, 'dirty'>>) => void
   onGenerate: () => void
@@ -89,7 +93,7 @@ export interface CanvasImageWorkbenchProps {
   mediaProgressByJobId?: ReadonlyMap<string, MediaRunProgressProjection>
 }
 
-/** 公共工作流编辑器复用统一动态表单，不允许图片节点引用未提交 Canvas 输出。 */
+/** 工作流编辑器复用统一动态表单，不允许图片节点引用未提交 Canvas 输出。 */
 function CanvasImageWorkflowEditor({
   projectId,
   workflow,
@@ -98,6 +102,7 @@ function CanvasImageWorkflowEditor({
   assets,
   writable,
   busy,
+  defaultComfyuiConnectionId,
   onChange,
   onValidationChange,
 }: {
@@ -108,43 +113,62 @@ function CanvasImageWorkflowEditor({
   assets: readonly MediaAssetRecord[]
   writable: boolean
   busy: boolean
+  defaultComfyuiConnectionId?: string | null
   onChange(workflow: CanvasImageMediaWorkflow | null): void
   onValidationChange(error: string | null): void
 }): React.ReactElement {
   /** 外部已保存选择只按真实业务基线同步，父组件创建等价对象时不得覆盖本地未完成草稿。 */
   const externalBaseline = createCanvasImageWorkflowBaseline(workflow, workflows)
-  /** 本地选择允许在必填字段完成前存在，不把不合法 inputs 写入父级配置。 */
+  /** 本地选择允许在必填字段完成前存在，父级只接收当前已完成的字段。 */
   const [workflowSelection, setWorkflowSelection] = React.useState(
     workflow ? `${workflow.workflowId}:${workflow.workflowRevision}` : '',
   )
   /** 当前连接选择在 workflow 写入前也需要留在本地。 */
-  const [connectionId, setConnectionId] = React.useState(workflow?.connectionId ?? '')
+  const [connectionId, setConnectionId] = React.useState(
+    resolveCanvasImageWorkflowConnection(workflow, defaultComfyuiConnectionId),
+  )
   /** 当前版本定义驱动完整表单，不按字段 key 猜测语义。 */
   const selected = workflows.find((item) => `${item.id}:${item.revision}` === workflowSelection)
   const [inputs, setInputs] = React.useState<CanvasMediaWorkflowInputDraft[]>(
-    selected ? createCanvasMediaWorkflowDraft(selected, workflow?.inputs) : [],
+    selected ? createCanvasMediaWorkflowDraft(selected, workflow?.inputs, workflow === null) : [],
   )
   /** 已消费的外部基线用于区分真实配置变化与父组件普通重渲染。 */
   const consumedBaseline = React.useRef(externalBaseline)
+  /** 记录尚未提升到父配置的本地操作，防止默认连接覆盖用户选择或半成品表单。 */
+  const draftDirtyRef = React.useRef(false)
+  /** 先登记本地即将发布的基线，防止父级同步回传部分配置时重置当前表单。 */
+  const publishWorkflow = React.useCallback((next: CanvasImageMediaWorkflow): void => {
+    consumedBaseline.current = createCanvasImageWorkflowBaseline(next, workflows)
+    onChange(next)
+  }, [onChange, workflows])
 
   React.useEffect(() => {
     if (consumedBaseline.current === externalBaseline) return
     consumedBaseline.current = externalBaseline
+    draftDirtyRef.current = false
     setWorkflowSelection(workflow ? `${workflow.workflowId}:${workflow.workflowRevision}` : '')
-    setConnectionId(workflow?.connectionId ?? '')
+    setConnectionId(resolveCanvasImageWorkflowConnection(workflow, defaultComfyuiConnectionId))
     const next = workflow
       ? workflows.find((item) => item.id === workflow.workflowId && item.revision === workflow.workflowRevision)
       : undefined
-    setInputs(next ? createCanvasMediaWorkflowDraft(next, workflow?.inputs) : [])
-  }, [externalBaseline, workflow, workflows])
+    setInputs(next ? createCanvasMediaWorkflowDraft(next, workflow?.inputs, false) : [])
+  }, [defaultComfyuiConnectionId, externalBaseline, workflow, workflows])
+
+  useDelayedCanvasDefaultConnection(
+    connectionId,
+    defaultComfyuiConnectionId,
+    workflow !== null,
+    workflowSelection !== '',
+    draftDirtyRef.current,
+    setConnectionId,
+  )
 
   React.useEffect(() => {
     onValidationChange(selected ? buildCanvasMediaWorkflowValues(selected, inputs).error : null)
   }, [inputs, onValidationChange, selected])
 
-  /** 同一 ID 只展示最新公共版本，项目私有草稿不进入图片节点选择器。 */
-  const latestPublic = [...workflows]
-    .filter((item) => item.projectId === null)
+  /** 同一 ID 只展示当前作用域最新版本，避免历史 revision 挤占紧凑列表。 */
+  const latestAvailable = [...selectCanvasImageWorkflowsForProject(workflows, projectId)]
     .sort((left, right) => left.name.localeCompare(right.name) || right.revision - left.revision)
     .filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index)
 
@@ -153,10 +177,11 @@ function CanvasImageWorkflowEditor({
       <div className="space-y-1.5">
         <Label className="text-xs">ComfyUI 连接</Label>
         <Select value={connectionId} disabled={!writable || busy || connections.length === 0} onValueChange={(value) => {
+          draftDirtyRef.current = true
           setConnectionId(value)
           if (!selected) return
           const next = buildCanvasImageMediaWorkflowChange(selected, inputs, value)
-          if (next) onChange(next)
+          if (next) publishWorkflow(next)
         }}>
           <SelectTrigger className="h-8 rounded-sm px-2 text-xs"><SelectValue placeholder="选择连接" /></SelectTrigger>
           <SelectContent>{connections.map((item) => (
@@ -165,23 +190,26 @@ function CanvasImageWorkflowEditor({
         </Select>
       </div>
       <div className="space-y-1.5">
-        <Label className="text-xs">公共工作流</Label>
+        <Label className="text-xs">工作流</Label>
         <Select value={workflowSelection}
-          disabled={!writable || busy || !connectionId || latestPublic.length === 0}
+          disabled={!writable || busy || !connectionId || latestAvailable.length === 0}
           onValueChange={(value) => {
-            const next = latestPublic.find((item) => `${item.id}:${item.revision}` === value)
+            const next = latestAvailable.find((item) => `${item.id}:${item.revision}` === value)
             if (!next) return
+            draftDirtyRef.current = true
             const drafts = createCanvasMediaWorkflowDraft(next)
             const built = buildCanvasMediaWorkflowValues(next, drafts)
             setWorkflowSelection(value)
             setInputs(drafts)
             onValidationChange(built.error)
             const change = buildCanvasImageMediaWorkflowChange(next, drafts, connectionId)
-            if (change) onChange(change)
+            if (change) publishWorkflow(change)
           }}>
           <SelectTrigger className="h-8 rounded-sm px-2 text-xs"><SelectValue placeholder="选择工作流" /></SelectTrigger>
-          <SelectContent>{latestPublic.map((item) => (
-            <SelectItem key={`${item.id}:${item.revision}`} value={`${item.id}:${item.revision}`}>{item.name}</SelectItem>
+          <SelectContent>{latestAvailable.map((item) => (
+            <SelectItem key={`${item.id}:${item.revision}`} value={`${item.id}:${item.revision}`}>
+              {item.name}{item.projectId === null ? '' : ' · 项目'}
+            </SelectItem>
           ))}</SelectContent>
         </Select>
       </div>
@@ -192,12 +220,13 @@ function CanvasImageWorkflowEditor({
         writable={writable}
         busy={busy}
         onInputChange={(index, input) => {
+          draftDirtyRef.current = true
           const next = inputs.map((item, itemIndex) => itemIndex === index ? input : item)
           const built = buildCanvasMediaWorkflowValues(selected, next)
           setInputs(next)
           onValidationChange(built.error)
           const change = buildCanvasImageMediaWorkflowChange(selected, next, connectionId)
-          if (change) onChange(change)
+          if (change) publishWorkflow(change)
         }}
       /> : null}
     </div>
@@ -229,8 +258,34 @@ export function createCanvasImageWorkflowBaseline(
 }
 
 /**
+ * 解析图片工作流首次使用的连接。
+ * @param workflow 已保存的图片工作流配置。
+ * @param defaultConnectionId 画布当前默认连接。
+ * @returns 已保存连接优先，否则继承画布默认；均无值时返回空选择。
+ */
+export function resolveCanvasImageWorkflowConnection(
+  workflow: CanvasImageMediaWorkflow | null,
+  defaultConnectionId: string | null | undefined,
+): string {
+  return workflow?.connectionId ?? defaultConnectionId ?? ''
+}
+
+/**
+ * 过滤图片节点可见的工作流作用域。
+ * @param workflows 全局媒体目录中的工作流版本。
+ * @param projectId 当前画布所属项目。
+ * @returns 公共工作流与当前项目工作流，保持原目录顺序。
+ */
+export function selectCanvasImageWorkflowsForProject(
+  workflows: readonly MediaWorkflowVersion[],
+  projectId: string,
+): MediaWorkflowVersion[] {
+  return workflows.filter((workflow) => workflow.projectId === null || workflow.projectId === projectId)
+}
+
+/**
  * 仅把完整合法的图片工作流草稿提升为父级配置。
- * @param workflow 当前选择的公共工作流版本。
+ * @param workflow 当前选择的工作流版本。
  * @param inputs 本地可包含未完成字段的输入草稿。
  * @param connectionId 用户明确选择的 ComfyUI 连接。
  * @returns 合法完整配置；未完成时返回 null 并继续保留本地草稿。
@@ -241,8 +296,7 @@ export function buildCanvasImageMediaWorkflowChange(
   connectionId: string,
 ): CanvasImageMediaWorkflow | null {
   if (!connectionId) return null
-  const built = buildCanvasMediaWorkflowValues(workflow, inputs)
-  if (built.error) return null
+  const built = buildCanvasMediaWorkflowPartialValues(workflow, inputs)
   return {
     workflowId: workflow.id,
     workflowRevision: workflow.revision,
@@ -387,6 +441,7 @@ export function CanvasImageWorkbench({
   mediaConnections = EMPTY_MEDIA_CONNECTIONS,
   mediaAssets = EMPTY_MEDIA_ASSETS,
   mediaWorkflow = null,
+  defaultComfyuiConnectionId = null,
   onMediaWorkflowChange,
   onDraftChange,
   onGenerate,
@@ -483,6 +538,7 @@ export function CanvasImageWorkbench({
     || !draft.prompt.trim()
     || (!mediaWorkflow && !selectedModel?.available)
     || Boolean(workflowValidationError)
+    || Boolean(snapshot.config.preparation)
     || comfyAutoSizeUnsupported
   /** 图片任务、素材采用和配置保存共用错误通道，主操作区必须始终给出可见反馈。 */
   const operationError = state.error
@@ -647,6 +703,11 @@ export function CanvasImageWorkbench({
               当前画布为只读状态
             </p>
           )}
+          {snapshot.config.preparation ? (
+            <p className="rounded-sm border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700" role="status">
+              待配置：{snapshot.config.preparation.message}
+            </p>
+          ) : null}
 
           <div className="space-y-1.5">
             <Label htmlFor="canvas-image-prompt" className="text-xs">提示词</Label>
@@ -701,16 +762,18 @@ export function CanvasImageWorkbench({
             )}
           </div>
 
-          {onMediaWorkflowChange && (mediaWorkflows.length > 0 || mediaWorkflow) ? (
+          {onMediaWorkflowChange
+          && (selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId).length > 0 || mediaWorkflow) ? (
             <CanvasImageWorkflowEditor
               key={workflowEditorGeneration}
               projectId={snapshot.target.projectId}
               workflow={mediaWorkflow}
-              workflows={mediaWorkflows}
+              workflows={selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId)}
               connections={mediaConnections}
               assets={mediaAssets}
               writable={writable}
               busy={Boolean(activeJob) || state.saveState === 'saving'}
+              defaultComfyuiConnectionId={defaultComfyuiConnectionId}
               onValidationChange={setWorkflowValidationError}
               onChange={(next) => {
                 if (next && !mediaWorkflow) onDraftChange({ selectedModelProfileId: null })

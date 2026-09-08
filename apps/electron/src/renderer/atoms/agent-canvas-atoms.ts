@@ -438,8 +438,12 @@ export const updateAgentCanvasViewStateAtom = atom(
     /** 函数更新也只接触迁移后的状态，避免调用方把旧空间标记带回。 */
     const migratedCurrent = { ...current, ...migration }
     const update = typeof input.update === 'function' ? input.update(migratedCurrent) : input.update
+    /** 迁移也属于真实变化；空更新或重复字段值不能重新通知工作台 Effect。 */
+    const next = { ...migratedCurrent, ...update }
+    if ((Object.keys(next) as Array<keyof AgentCanvasViewState>)
+      .every((key) => Object.is(current[key], next[key]))) return
     const nextStates = new Map(states)
-    nextStates.set(input.key, { ...migratedCurrent, ...update })
+    nextStates.set(input.key, next)
     set(agentCanvasViewStatesAtom, nextStates)
   },
 )

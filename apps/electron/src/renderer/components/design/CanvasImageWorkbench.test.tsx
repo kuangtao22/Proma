@@ -14,8 +14,10 @@ import {
   buildCanvasImageMediaWorkflowChange,
   CanvasImageWorkbench,
   createCanvasImageWorkflowBaseline,
+  resolveCanvasImageWorkflowConnection,
+  selectCanvasImageWorkflowsForProject,
 } from './CanvasImageWorkbench'
-import { createCanvasMediaWorkflowDraft } from './CanvasMediaWorkbench'
+import { createCanvasMediaWorkflowDraft, resolveDelayedCanvasDefaultConnection } from './CanvasMediaWorkbench'
 
 /** 创建 Canvas 生图工作台使用的模型选项。 */
 function createModelOption(): ImageGenerationModelOption {
@@ -26,6 +28,20 @@ function createModelOption(): ImageGenerationModelOption {
     executor: 'openai-images',
     channelId: 'channel-1',
     available: true,
+  }
+}
+
+/** 创建用于目录作用域测试的最小图片工作流。 */
+function createWorkflowFixture(): MediaWorkflowVersion {
+  return {
+    id: 'workflow-1', name: '图片工作流', projectId: null, revision: 1,
+    hash: 'a'.repeat(64), createdAt: 1,
+    definition: {
+      schemaVersion: 1,
+      prompt: {},
+      bindings: [],
+      outputs: [{ key: 'image', nodeId: 'save', outputIndex: 0, mediaType: 'image' }],
+    },
   }
 }
 
@@ -185,6 +201,34 @@ function renderWorkbench(
 }
 
 describe('Canvas 生图工作台', () => {
+  test('Given 新图片工作流有画布默认连接 When 初始化 Then 继承默认；已有连接始终优先', () => {
+    expect(resolveCanvasImageWorkflowConnection(null, 'connection-default')).toBe('connection-default')
+    expect(resolveCanvasImageWorkflowConnection({
+      workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'connection-saved', inputs: {},
+    }, 'connection-default')).toBe('connection-saved')
+  })
+
+  test('Given 默认连接稍晚到达 When 图片工作流草稿仍空白干净 Then 跟随默认且不覆盖用户编辑', () => {
+    expect(resolveDelayedCanvasDefaultConnection('', 'connection-late', false, false, false)).toBe('connection-late')
+    expect(resolveDelayedCanvasDefaultConnection('connection-old-default', 'connection-new-default', false, false, false))
+      .toBe('connection-new-default')
+    expect(resolveDelayedCanvasDefaultConnection('connection-user', 'connection-new-default', false, false, true))
+      .toBe('connection-user')
+    expect(resolveDelayedCanvasDefaultConnection('connection-user', 'connection-new-default', false, true, false))
+      .toBe('connection-user')
+    expect(resolveDelayedCanvasDefaultConnection('connection-saved', 'connection-new-default', true, false, false))
+      .toBe('connection-saved')
+  })
+
+  test('Given 公共、当前项目与其它项目工作流并存 When 图片节点列目录 Then 仅保留前两者', () => {
+    const workflow = createWorkflowFixture()
+    expect(selectCanvasImageWorkflowsForProject([
+      workflow,
+      { ...workflow, id: 'workflow-project', projectId: 'project-1' },
+      { ...workflow, id: 'workflow-other', projectId: 'project-2' },
+    ], 'project-1').map((item) => item.id)).toEqual(['workflow-1', 'workflow-project'])
+  })
+
   test('Given 多字段工作流只完成首个字段 When 提升配置 Then 保留本地草稿且不覆盖外部基线', () => {
     const workflow: MediaWorkflowVersion = {
       id: 'workflow-multi', name: '多字段工作流', projectId: null, revision: 1,
@@ -209,7 +253,10 @@ describe('Canvas 生图工作台', () => {
     const drafts = createCanvasMediaWorkflowDraft(workflow)
     /** 首字段已完成但第二字段仍为空，不能把空 inputs 提升到父配置。 */
     const partialDrafts = drafts.map((draft, index) => index === 0 ? { ...draft, value: '第一段' } : draft)
-    expect(buildCanvasImageMediaWorkflowChange(workflow, partialDrafts, 'connection-1')).toBeNull()
+    expect(buildCanvasImageMediaWorkflowChange(workflow, partialDrafts, 'connection-1')).toEqual({
+      workflowId: 'workflow-multi', workflowRevision: 1, connectionId: 'connection-1',
+      inputs: { first: { kind: 'scalar', value: '第一段' } },
+    })
 
     /** 等价父对象必须产生同一基线，避免普通重渲染清空本地未完成字段。 */
     const external = {
@@ -236,6 +283,36 @@ describe('Canvas 生图工作台', () => {
         second: { kind: 'scalar', value: '第二段' },
       },
     })
+  })
+
+  test('Given 已保存图片工作流缺少字段 When 重建表单 Then 已清空字段保持为空而不回填模板默认值', () => {
+    const workflow = createWorkflowFixture()
+    workflow.definition.prompt.text = { class_type: 'TextNode', inputs: { text: '模板默认描述' } }
+    workflow.definition.bindings = [{ key: 'prompt', kind: 'text', nodeId: 'text', input: 'text', field: {
+      classType: 'TextNode', valueKind: 'string', label: '提示词', controlType: 'text', required: true,
+    } }]
+    const fresh = createCanvasMediaWorkflowDraft(workflow)
+    const persisted = createCanvasMediaWorkflowDraft(workflow, {}, false)
+
+    expect(fresh[0]?.value).toBe('模板默认描述')
+    expect(persisted[0]?.value).toBe('')
+  })
+
+  test('Given 工作流分析错误已持久化 When 打开图片节点 Then 原位显示原因并禁止生成', () => {
+    const current = createState()
+    const state = {
+      ...current,
+      snapshot: current.snapshot ? {
+        ...current.snapshot,
+        config: { ...current.snapshot.config, preparation: {
+          code: 'UI_SUBGRAPH_INPUT_MISMATCH', message: '节点 105 的输入数量不一致。',
+        } },
+      } : null,
+    }
+    const html = renderWorkbench(state)
+
+    expect(html).toContain('待配置：节点 105 的输入数量不一致。')
+    expect(html).toMatch(/<button(?=[^>]*disabled="")[^>]*>[^<]*(?:<svg[\s\S]*?<\/svg>)?生成图片<\/button>/u)
   })
 
   test('Given Comfy 模型仍选择 auto 尺寸 When 渲染配置 Then 禁止提交并明确要求固定尺寸', () => {
@@ -379,7 +456,7 @@ describe('Canvas 生图工作台', () => {
     })
 
     expect(html).toContain('ComfyUI 连接')
-    expect(html).toContain('公共工作流')
+    expect(html).toContain('工作流')
     expect(html).toContain('画面描述')
     expect(html).toContain('参考素材')
     expect(html).toContain('安静的首页')

@@ -1,9 +1,10 @@
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { MEDIA_IPC_CHANNELS } from '@proma/shared'
-import type { MediaAssetRecord, MediaKind, MediaConfiguration, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourceQuery, MediaRunEvent, MediaRunSnapshot, MediaSettingsSnapshot } from '@proma/shared'
+import type { ComfyObjectInfo, MediaAssetRecord, MediaKind, MediaConfiguration, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourceQuery, MediaRunEvent, MediaRunSnapshot, MediaSettingsSnapshot } from '@proma/shared'
 import type { MediaConfigStore } from './media-config-store'
 import type { MediaResourceService } from './media-resource-service'
 import { detectMediaFileSignature } from './media-file-probe'
+import { analyzeRemoteWorkflow, getRemoteWorkflowClassTypes } from './media-remote-workflow-analysis'
 
 /** 媒体管理 IPC 的可注入授权与服务边界。 */
 export interface MediaIpcOptions {
@@ -13,7 +14,10 @@ export interface MediaIpcOptions {
   configuration: Pick<MediaConfigStore, 'read' | 'saveConnection' | 'saveWorkflow' | 'saveProfile'> & Partial<Pick<MediaConfigStore, 'archive'>>
   resources: Pick<MediaResourceService, 'probe' | 'list'>
     & { readWorkflow?: (descriptor: MediaRemoteDescriptor) => Promise<MediaRemoteWorkflow> }
+    & { getSchema?: (connectionId: string, projectId: string, classTypes: string[]) => Promise<ComfyObjectInfo> }
     & Partial<Pick<MediaResourceService, 'readRemoteAsset'>>
+  /** 主进程保留原始异常用于排障，调用方不得把认证对象放入 message。 */
+  onBackgroundError?(message: string, error: unknown): void
   importLocalAsset?(event: IpcMainInvokeEvent, projectId: string, kind: MediaKind): Promise<MediaAssetRecord | null>
   listAssets?(projectId: string): Promise<MediaAssetRecord[]>
   getRun(projectId: string, runId: string): MediaRunSnapshot
@@ -86,10 +90,31 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
     if (!options.configuration.archive) throw new Error('MEDIA_CONFIGURATION_UNAVAILABLE')
     return mediaSettingsSnapshot(options.configuration.archive({ kind: input.kind, id: inputId(input.id) }, Number(envelope.expectedRevision)))
   })
-  handle(MEDIA_IPC_CHANNELS.READ_REMOTE_WORKFLOW, (value) => {
-    if (!options.resources.readWorkflow) throw new Error('MEDIA_RESOURCE_UNSUPPORTED')
+  handle(MEDIA_IPC_CHANNELS.READ_REMOTE_WORKFLOW, async (value) => {
+    if (!options.resources.readWorkflow || !options.resources.getSchema) throw new Error('MEDIA_RESOURCE_UNSUPPORTED')
     const descriptor = inputRecord(value, ['connectionId', 'instanceGeneration', 'remoteUser', 'source', 'id', 'workflowPath', 'assetId', 'filename', 'subfolder', 'type', 'loaderPath', 'contentHash'])
-    return options.resources.readWorkflow(descriptor as unknown as MediaRemoteDescriptor)
+    /** 只记录稳定资源身份，不把 descriptor 中潜在的用户字段或认证上下文写入日志。 */
+    const safeDescriptor = descriptor as unknown as MediaRemoteDescriptor
+    try {
+      const workflow = await options.resources.readWorkflow(safeDescriptor)
+      const classTypes = getRemoteWorkflowClassTypes(workflow)
+      try {
+        const schema = classTypes.length > 0
+          ? await options.resources.getSchema(safeDescriptor.connectionId, '', classTypes)
+          : {}
+        return { ...workflow, analysis: analyzeRemoteWorkflow(workflow, schema) }
+      } catch (schemaError) {
+        // 正文已读取成功，节点接口故障不能同时阻止用户查看和复制原始工作流。
+        options.onBackgroundError?.('[媒体工作流] 节点接口暂不可用', schemaError)
+        return { ...workflow, analysis: {
+          format: workflow.format, convertible: false, definition: null, nodes: [], inputs: [], outputs: [],
+          issues: [{ code: 'REMOTE_WORKFLOW_SCHEMA_UNAVAILABLE', message: '无法读取服务器节点信息，暂不能完成兼容性分析；请同步工作节点后重新打开详情。' }],
+        } }
+      }
+    } catch (caughtError) {
+      options.onBackgroundError?.(`[媒体工作流] 详情分析失败 id=${safeDescriptor.id} source=${safeDescriptor.source}`, caughtError)
+      throw new Error('MEDIA_REMOTE_WORKFLOW_READ_FAILED')
+    }
   })
   handle(MEDIA_IPC_CHANNELS.READ_REMOTE_ASSET, async (value, event) => {
     if (!options.resources.readRemoteAsset) throw new Error('MEDIA_RESOURCE_UNSUPPORTED')

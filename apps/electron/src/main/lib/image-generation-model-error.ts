@@ -1,3 +1,5 @@
+import { MediaWorkflowValidationError } from './media/media-workflow-error'
+
 /** Renderer 与任务 journal 可安全展示的生图模型业务错误前缀。 */
 const SAFE_IMAGE_MODEL_ERROR_PREFIXES = [
   '生图模型 profiles ',
@@ -21,8 +23,9 @@ const SAFE_IMAGE_MODEL_ERROR_PREFIXES = [
 
 /** 判断错误是否是不含主进程路径和凭据的稳定模型业务错误。 */
 export function isSafeImageModelBusinessError(error: unknown): error is Error {
-  return error instanceof Error
-    && SAFE_IMAGE_MODEL_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix))
+  return error instanceof MediaWorkflowValidationError
+    || (error instanceof Error
+      && SAFE_IMAGE_MODEL_ERROR_PREFIXES.some((prefix) => error.message.startsWith(prefix)))
 }
 
 /**

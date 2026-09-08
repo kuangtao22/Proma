@@ -2048,6 +2048,7 @@ export function registerIpcHandlers(): void {
     assertProject: (projectId) => { if (!getAgentWorkspace(projectId)) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED') },
     configuration: getMediaConfiguration(),
     resources: mediaResources,
+    onBackgroundError: (message, error) => console.error(message, error),
     listAssets: (projectId) => mediaAssets.list(projectId),
     importLocalAsset: async (event, projectId, kind) => {
       /** 原生选择器只授权本次文件；异步返回后重新检查窗口与项目写权限。 */
@@ -3628,6 +3629,11 @@ export function registerIpcHandlers(): void {
         const scope = canvasId ? canvasDocumentStore.requireStableAuthoritativeDocument({ projectId: current.projectId, canvasId }).mediaModelScope : undefined
         return buildCanvasMediaModelOptions(imageModels.listMediaApiCatalog(), imageModels.listOptions(current.projectId))
           .filter((model) => isCanvasMediaModelAllowed(scope, model.profileId))
+      },
+      getCanvasConnection: (current, canvasId) => {
+        canvasToolAccess.authorizeRead(current)
+        canvasToolAccess.requireLinkedCanvas(current, canvasId)
+        return canvasDocumentStore.requireStableAuthoritativeDocument({ projectId: current.projectId, canvasId }).comfyuiConnectionId ?? null
       },
       prepareParentRun: (current, input, origin) => canvasMediaHandoff.prepare(current, input, origin),
     }, context),

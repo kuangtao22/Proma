@@ -259,4 +259,22 @@ describe('Canvas 图片模块 Store', () => {
     expect(switched.selectedModelProfileId).toBe('profile-1')
     expect(switched).not.toHaveProperty('mediaWorkflow')
   })
+
+  test('Given 图片准备错误已保存 When 普通保存或显式清除 Then 持久化清除且旧配置仍兼容', async () => {
+    const fixture = createFixture()
+    fixture.seed({
+      schemaVersion: 2, kind: 'image', contentId: target.imageModuleId, revision: 0,
+      createdAt: 100, updatedAt: 100, prompt: '', selectedModelProfileId: null,
+      preparation: { code: 'WORKFLOW_INPUT_REQUIRED', message: '节点 12 缺少输入 image。' },
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto', adoptedAssetId: null,
+    })
+
+    const saved = await fixture.store.save({
+      ...target, expectedConfigRevision: 0, prompt: '已修复', selectedModelProfileId: null,
+      preparation: null, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none',
+    })
+
+    expect(saved.preparation).toBeNull()
+    expect((await fixture.store.load(target)).preparation).toBeNull()
+  })
 })

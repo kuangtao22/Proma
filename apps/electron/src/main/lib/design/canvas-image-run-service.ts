@@ -3,6 +3,7 @@ import type {
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageTarget,
+  CanvasMediaPreparationIssue,
   CanvasNode,
   CanvasRunNodesBatchEntrySummary,
   CanvasRunNodesBatchSummary,
@@ -12,6 +13,7 @@ import type {
   CanvasToolNodeRunResult,
   CreateDesignJobInput,
   DesignJobRecord,
+  SaveCanvasImageModuleInput,
 } from '@proma/shared'
 import type {
   CanvasImageCandidateBatchChangedListener,
@@ -21,6 +23,7 @@ import type { DesignJobChangedListener, DesignJobManager } from './design-job-ma
 import { reportCanvasImageDiagnostic } from './canvas-image-diagnostics'
 import { isSafeDesignStableId } from './design-paths'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
+import { MediaWorkflowValidationError } from '../media/media-workflow-error'
 
 const MAX_IMAGE_RUN_TASKS = 32
 const ACTIVE_JOB_STATUSES = new Set<DesignJobRecord['status']>(['queued', 'running'])
@@ -68,6 +71,8 @@ export interface CanvasImageRunServiceDependencies {
   }
   imageModules: {
     load: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
+    /** 预检失败只按原配置 revision 写回诊断，不改写节点或已有产物。 */
+    save: (input: SaveCanvasImageModuleInput) => Promise<CanvasImageModuleConfig>
   }
   imageJobs: Pick<
     DesignJobManager,
@@ -231,6 +236,18 @@ function assertWaitInput(input: CanvasImageBatchWaitInput): void {
 export function createCanvasImageRunService(
   dependencies: CanvasImageRunServiceDependencies,
 ): CanvasImageRunService {
+  /** 按原配置 revision 保存或清除准备诊断，返回后续任务必须使用的新配置。 */
+  const savePreparation = (
+    imageTarget: CanvasImageTarget,
+    config: CanvasImageModuleConfig,
+    preparation: CanvasMediaPreparationIssue | null,
+  ): Promise<CanvasImageModuleConfig> => dependencies.imageModules.save({
+    ...imageTarget, expectedConfigRevision: config.revision,
+    prompt: config.prompt, selectedModelProfileId: config.selectedModelProfileId,
+    ...(config.mediaWorkflow ? { mediaWorkflow: config.mediaWorkflow } : {}),
+    aspectRatio: config.aspectRatio, imageSize: config.imageSize, contextMode: config.contextMode,
+    preparation,
+  })
   /** 读取批次并逐项复核持久化 Job 仍属于同一 Canvas 与批次。 */
   const loadOwnedBatch = async (
     input: Pick<CanvasImageBatchWaitInput, 'projectId' | 'canvasId' | 'batchId' | 'taskIds'>,
@@ -351,10 +368,13 @@ export function createCanvasImageRunService(
             nodeId: node.id,
             imageModuleId: node.imageModuleId,
           }
+          /** 诊断必须绑定实际参与预检的配置，读取失败时不得猜测写入目标。 */
+          let preflightConfig: CanvasImageModuleConfig | undefined
           try {
             /** 配置与预检使用相同快照，避免固化输入漂移。 */
-            const config = await dependencies.imageModules.load(imageTarget)
+            let config = await dependencies.imageModules.load(imageTarget)
             assertOwnedImageConfig(config, imageTarget)
+            preflightConfig = config
             if ((config.selectedModelProfileId ? 1 : 0) + (config.mediaWorkflow ? 1 : 0) !== 1) {
               throw new Error('CANVAS_IMAGE_MODEL_REQUIRED')
             }
@@ -379,6 +399,10 @@ export function createCanvasImageRunService(
               ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
             }
             await dependencies.imageJobs.preflightCanvasImage(input)
+            if (config.preparation) {
+              config = await savePreparation(imageTarget, config, null)
+              input.canvasImageConfigRevision = config.revision
+            }
             prepared.push({
               node,
               imageTarget,
@@ -387,6 +411,15 @@ export function createCanvasImageRunService(
               jobId: createImageJobId(context, operationId, target.canvasId, node.id),
             })
           } catch (error) {
+            if (preflightConfig && error instanceof MediaWorkflowValidationError) {
+              try {
+                await savePreparation(imageTarget, preflightConfig, {
+                  code: 'MEDIA_WORKFLOW_INVALID', message: error.message.slice(0, 2048),
+                })
+              } catch {
+                // CAS 冲突或模块移除时保留新配置，原预检错误仍由本次任务回执返回。
+              }
+            }
             for (const candidate of imageNodes) {
               taskByNodeId.set(candidate.id, candidate.id === node.id
                 ? { nodeId: candidate.id, status: 'failed', error: canvasNodeRunError(error) }

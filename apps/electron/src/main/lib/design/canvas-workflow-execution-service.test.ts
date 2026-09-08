@@ -132,6 +132,8 @@ function createRealImageRunHarness(options: { completeOnStart?: boolean } = {}):
     serializer: { run: async (_target, effect) => effect() },
     guard: { runWorkspaceWrite: async (_projectId, effect) => effect() },
     imageModules: {
+      /** 本夹具不产生工作流字段错误，诊断保存属于未使用分支。 */
+      save: async () => { throw new Error('TEST_UNUSED_PREPARATION_SAVE') },
       load: async (imageTarget): Promise<CanvasImageModuleConfig> => ({
         schemaVersion: 2,
         kind: 'image',

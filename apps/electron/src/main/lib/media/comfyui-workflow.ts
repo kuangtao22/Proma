@@ -199,12 +199,14 @@ function isExternalLocator(value: JsonValue): boolean {
 function requiresResourceContract(input: string, value: JsonValue, schema: ComfyNodeInputSchema): boolean {
   if (hasUploadFlag(schema)) return true
   if (Array.isArray(schema[0])) return false
-  return schema[0] === 'STRING' && (RESOURCE_INPUT_NAME_PATTERN.test(input) || isExternalLocator(value))
+  return schema[0].split(',').includes('STRING') && (RESOURCE_INPUT_NAME_PATTERN.test(input) || isExternalLocator(value))
 }
 
 /** 判断未显式适配节点的字面量是否属于本地可静态验证的 API 类型。 */
 function supportsInstalledNodeLiteral(value: JsonValue, schema: ComfyNodeInputSchema): boolean {
   if (Array.isArray(schema[0])) return true
+  if (schema[0].includes(',')) return schema[0].split(',').every((type) => COMFY_LITERAL_INPUT_TYPES.has(type))
+    && schema[0].split(',').some((type) => supportsInstalledNodeLiteral(value, [type, schema[1]]))
   if (!COMFY_LITERAL_INPUT_TYPES.has(schema[0])) return false
   if (schema[0] === 'STRING' || schema[0] === 'COMFY_DYNAMICCOMBO_V3') return typeof value === 'string'
   if (schema[0] === 'BOOLEAN') return typeof value === 'boolean'
@@ -239,6 +241,7 @@ function matchesInputType(value: JsonValue, schema: ComfyNodeInputSchema): boole
   /** schema 第一项为基础类型名或枚举列表。 */
   const type = schema[0]
   if (Array.isArray(type)) return type.some((candidate) => candidate === value)
+  if (type.includes(',')) return type.split(',').some((part) => matchesInputType(value, [part, schema[1]]))
   if (type === 'STRING') return typeof value === 'string'
   if (type === 'INT') return typeof value === 'number' && Number.isSafeInteger(value)
   if (type === 'FLOAT' || type === 'NUMBER') return typeof value === 'number' && Number.isFinite(value)
@@ -268,24 +271,84 @@ function findDynamicOption(schema: ComfyNodeInputSchema, selected: string): Json
   return option !== null && !Array.isArray(option) && typeof option === 'object' ? option : undefined
 }
 
-/** 展开选中动态分支的扁平输入名，例如 format.codec。 */
-function expandNodeInputs(
+/** 按前端序列化顺序保留的输入声明，供 UI 转换和 API 校验共用。 */
+export interface ComfyDeclaredInput {
+  name: string
+  schema: ComfyNodeInputSchema
+  required: boolean
+}
+
+/** 展开选中动态分支的扁平输入名，同时保留 widget 的深度优先顺序。 */
+export function expandComfyNodeInputs(
   schema: ComfyNodeSchema,
   values: Record<string, JsonValue>,
-): { required: Record<string, ComfyNodeInputSchema>; optional: Record<string, ComfyNodeInputSchema> } {
+): { required: Record<string, ComfyNodeInputSchema>; optional: Record<string, ComfyNodeInputSchema>; ordered: ComfyDeclaredInput[] } {
   /** 展开后的必填输入。 */
   const required: Record<string, ComfyNodeInputSchema> = {}
   /** 展开后的可选输入。 */
   const optional: Record<string, ComfyNodeInputSchema> = {}
+  /** 动态分支的可选控件也紧跟父控件，不移动到其它必填控件之后。 */
+  const ordered: ComfyDeclaredInput[] = []
   /** 递归复制一层输入并解析当前动态选择。 */
   const append = (inputMap: Record<string, ComfyNodeInputSchema>, target: 'required' | 'optional', prefix = '', depth = 0): void => {
     if (depth > 4) return
-    for (const [name, inputSchema] of Object.entries(inputMap)) {
+    /** 顶层顺序以服务声明为准；未声明顺序的旧 schema 保持原有插入顺序。 */
+    const inputNames = prefix ? Object.keys(inputMap) : [...new Set([...(schema.input_order?.[target] ?? []), ...Object.keys(inputMap)])]
+    for (const name of inputNames) {
+      const inputSchema = inputMap[name]
+      if (!inputSchema) continue
       /** ComfyUI API prompt 使用点号表示动态分支路径。 */
       const fullName = prefix ? `${prefix}.${name}` : name
+      if (inputSchema[0] === 'COMFY_AUTOGROW_V3') {
+        /** 仅展开有界具名或前缀式的单输入模板，不猜测自定义输入生成规则。 */
+        const template = inputSchema[1]?.template
+        if (template && typeof template === 'object' && !Array.isArray(template)) {
+          const templateInput = template.input
+          const names = template.names
+          const prefixName = template.prefix
+          const min = template.min ?? 0
+          const max = template.max ?? (Array.isArray(names) ? names.length : 0)
+          if (templateInput && typeof templateInput === 'object' && !Array.isArray(templateInput)
+            && typeof min === 'number' && Number.isSafeInteger(min)
+            && typeof max === 'number' && Number.isSafeInteger(max) && min >= 0 && max >= min && max <= 128) {
+            const requiredTemplate = templateInput.required
+            const optionalTemplate = templateInput.optional
+            /** 模板必须只含一个公开执行输入，才能证明每个自增字段的类型。 */
+            const entries = requiredTemplate && typeof requiredTemplate === 'object' && !Array.isArray(requiredTemplate)
+              ? Object.entries(requiredTemplate) : []
+            const templateName = entries[0]?.[0]
+            const templateSchema = entries[0]?.[1]
+            /** names 与 prefix 是两种互斥的前端命名协议。 */
+            const generatedNames = Array.isArray(names) && prefixName === undefined
+              && names.length > 0 && names.length <= 128
+              && names.every((item) => typeof item === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(item))
+              && new Set(names).size === names.length && max <= names.length
+              ? names.slice(0, max)
+              : typeof prefixName === 'string' && names === undefined && templateName !== undefined
+                /** 最大索引为 127，前缀最多 125 字符才不会生成超过 128 字符的字段名。 */
+                && /^[A-Za-z0-9_-]{1,125}$/.test(prefixName) && prefixName === `${templateName}_`
+                ? Array.from({ length: max }, (_, index) => `${prefixName}${index}`)
+                : undefined
+            if (entries.length === 1 && typeof templateName === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(templateName)
+              && isInputSchema(templateSchema)
+              && (!optionalTemplate || (typeof optionalTemplate === 'object' && !Array.isArray(optionalTemplate) && Object.keys(optionalTemplate).length === 0))
+              && generatedNames !== undefined) {
+              for (let index = 0; index < max; index += 1) {
+                /** prefix 模板按服务声明生成 ref_image_0 等稳定路径。 */
+                const childName = `${fullName}.${generatedNames[index]}`
+                const childRequired = target === 'required' && index < min
+                ;(childRequired ? required : optional)[childName] = templateSchema
+                ordered.push({ name: childName, schema: templateSchema, required: childRequired })
+              }
+              continue
+            }
+          }
+        }
+      }
       /** 当前 schema 应写入的必填或可选映射。 */
       const targetMap = target === 'required' ? required : optional
       targetMap[fullName] = inputSchema
+      ordered.push({ name: fullName, schema: inputSchema, required: target === 'required' })
       /** 当前动态分支选择值。 */
       const selected = values[fullName]
       if (inputSchema[0] !== 'COMFY_DYNAMICCOMBO_V3' || typeof selected !== 'string') continue
@@ -309,7 +372,58 @@ function expandNodeInputs(
   }
   append(schema.input.required, 'required')
   append(schema.input.optional ?? {}, 'optional')
-  return { required, optional }
+  return { required, optional, ordered }
+}
+
+/** 提取 V3 匹配输入的模板身份和有界允许类型。 */
+function matchTypeTemplate(schema: ComfyNodeInputSchema): { id: string; allowed: string[] } | undefined {
+  if (schema[0] !== 'COMFY_MATCHTYPE_V3') return undefined
+  const template = schema[1]?.template
+  if (!template || typeof template !== 'object' || Array.isArray(template)
+    || typeof template.template_id !== 'string' || typeof template.allowed_types !== 'string') return undefined
+  const allowed = template.allowed_types.split(',')
+  if (!template.template_id || allowed.length > 64 || allowed.some((type) => !type || type.startsWith('COMFY_') || type === '*')) return undefined
+  return { id: template.template_id, allowed }
+}
+
+/** 为一次校验建立输出类型推导器，模板跟随真实连线，缓存避免重复遍历。 */
+function createOutputTypeResolver(prompt: ComfyPrompt, objectInfo: ComfyObjectInfo): (nodeId: string, outputIndex: number) => string | undefined {
+  const cache = new Map<string, string | undefined>()
+  const resolving = new Set<string>()
+  /** 推导单一输出类型；循环、缺少模板或冲突时返回 undefined。 */
+  const resolve = (nodeId: string, outputIndex: number): string | undefined => {
+    const key = `${nodeId}\0${outputIndex}`
+    if (cache.has(key)) return cache.get(key)
+    if (resolving.has(key) || resolving.size >= 512) return undefined
+    const node = prompt[nodeId]
+    const schema = node ? objectInfo[node.class_type] : undefined
+    const type = schema?.output[outputIndex]
+    if (type !== 'COMFY_MATCHTYPE_V3') return type
+    const templateId = schema?.output_matchtypes?.[outputIndex]
+    if (!node || !schema || !templateId) return undefined
+    resolving.add(key)
+    const declarations = expandComfyNodeInputs(schema, node.inputs).ordered
+    const templateInputs = declarations.filter((input) => matchTypeTemplate(input.schema)?.id === templateId)
+    let resolved: string | undefined
+    let valid = templateInputs.length > 0
+    for (const input of templateInputs) {
+      const value = node.inputs[input.name]
+      if (value === undefined && !input.required) continue
+      const link = value === undefined ? undefined : parseLink(value, prompt)
+      const sourceType = link ? resolve(link[0], link[1]) : undefined
+      const template = matchTypeTemplate(input.schema)!
+      if (!sourceType || !sourceType.split(',').every((part) => template.allowed.includes(part))
+        || (resolved !== undefined && resolved !== sourceType)) {
+        valid = false
+        break
+      }
+      resolved = sourceType
+    }
+    resolving.delete(key)
+    cache.set(key, valid ? resolved : undefined)
+    return cache.get(key)
+  }
+  return resolve
 }
 
 /** 判断数值字面量是否满足远端 schema 的 min/max。 */
@@ -404,6 +518,8 @@ export function validateComfyWorkflow(
   /** 图中首个环路。 */
   const cycle = findCycle(definition.prompt)
   if (cycle.length > 0) addIssue({ code: 'WORKFLOW_CYCLE', message: `工作流存在环路：${cycle.join(' -> ')}` })
+  /** 当前图的模板输出推导共享缓存。 */
+  const resolveOutputType = createOutputTypeResolver(definition.prompt, objectInfo)
 
   /** 被绑定覆盖的节点输入。 */
   const boundInputs = new Set<string>()
@@ -435,7 +551,7 @@ export function validateComfyWorkflow(
       addIssue({ code: 'NODE_CLASS_UNSAFE', nodeId, message: `节点声明了未适配的输出副作用：${node.class_type}` })
     }
     /** 依据当前 prompt 选择展开后的静态输入集合。 */
-    const expandedInputs = expandNodeInputs(schema, node.inputs)
+    const expandedInputs = expandComfyNodeInputs(schema, node.inputs)
     for (const input of Object.keys(expandedInputs.required)) {
       if (!Object.hasOwn(node.inputs, input) && !boundInputs.has(`${nodeId}\0${input}`)) {
         addIssue({ code: 'INPUT_REQUIRED', nodeId, input, message: `缺少必填输入：${input}` })
@@ -443,6 +559,8 @@ export function validateComfyWorkflow(
     }
     /** 节点全部可识别的输入 schema。 */
     const allInputs = { ...expandedInputs.optional, ...expandedInputs.required }
+    /** 同一模板的所有已连接输入必须推导出相同类型，即使该节点输出未被引用。 */
+    const matchedInputTypes = new Map<string, string>()
     for (const [input, value] of Object.entries(node.inputs)) {
       if (Object.hasOwn(schema.input.hidden ?? {}, input)) {
         addIssue({ code: 'INPUT_HIDDEN', nodeId, input, message: `禁止用户填入隐藏输入：${input}` })
@@ -465,11 +583,20 @@ export function validateComfyWorkflow(
           addIssue({ code: 'OUTPUT_INDEX_INVALID', nodeId, input, message: `输出索引越界：${link[0]}[${link[1]}]` })
         } else if (sourceSchema) {
           /** 上游端口类型。 */
-          const sourceType = sourceSchema.output[link[1]]
+          const sourceType = resolveOutputType(link[0], link[1])
           /** 当前输入要求的类型；枚举输入不接受链接。 */
           const targetType = inputSchema[0]
-          if (typeof targetType !== 'string' || sourceType !== targetType) {
+          const allowedTypes = targetType === 'COMFY_MATCHTYPE_V3'
+            ? matchTypeTemplate(inputSchema)?.allowed : typeof targetType === 'string' ? targetType.split(',') : undefined
+          if (!sourceType || !allowedTypes || !sourceType.split(',').every((part) => allowedTypes.includes(part))) {
             addIssue({ code: 'LINK_TYPE_INVALID', nodeId, input, message: `链接类型不兼容：${sourceType ?? 'unknown'} -> ${Array.isArray(targetType) ? 'enum' : targetType}` })
+          }
+          const template = matchTypeTemplate(inputSchema)
+          if (template && sourceType) {
+            const previousType = matchedInputTypes.get(template.id)
+            if (previousType && previousType !== sourceType) {
+              addIssue({ code: 'LINK_TYPE_INVALID', nodeId, input, message: `同一模板的输入类型冲突：${template.id}（${previousType} / ${sourceType}）` })
+            } else matchedInputTypes.set(template.id, sourceType)
           }
           if (sourceSchema.output_is_list?.[link[1]] === true || schema.input_is_list === true) {
             addIssue({ code: 'LINK_LIST_UNSUPPORTED', nodeId, input, message: `链接包含尚未适配的 list 语义：${link[0]}[${link[1]}]` })
@@ -536,7 +663,7 @@ export function validateComfyWorkflow(
     /** 当前节点的远端 schema。 */
     const nodeSchema = node ? objectInfo[node.class_type] : undefined
     /** 当前节点依据动态选择展开后的输入。 */
-    const expandedInputs = node && nodeSchema ? expandNodeInputs(nodeSchema, node.inputs) : undefined
+    const expandedInputs = node && nodeSchema ? expandComfyNodeInputs(nodeSchema, node.inputs) : undefined
     /** 绑定目标的实时输入 schema。 */
     const inputSchema = expandedInputs ? { ...expandedInputs.optional, ...expandedInputs.required }[binding.input] : undefined
     /** 标量绑定对应的 ComfyUI 基础类型。 */
@@ -554,7 +681,8 @@ export function validateComfyWorkflow(
         && nodeContract.resourceInput.input === binding.input)
     /** 标量绑定必须落在类型相容且非隐藏的公开输入。 */
     const validScalarBinding = expectedTypes.length === 0 || (!resourceTarget && inputSchema !== undefined && typeof inputSchema[0] === 'string'
-      && expectedTypes.includes(inputSchema[0]) && !Object.hasOwn(objectInfo[node?.class_type ?? '']?.input.hidden ?? {}, binding.input))
+      && inputSchema[0].split(',').every((type) => expectedTypes.includes(type))
+      && !Object.hasOwn(objectInfo[node?.class_type ?? '']?.input.hidden ?? {}, binding.input))
     /** 已安装处理节点允许公开基础标量绑定；媒体资源仍必须命中显式 loader 合同。 */
     const installedScalarTarget = nodeContract !== undefined || (nodeSchema !== undefined && nodeSchema.output_node !== true
       && binding.kind !== 'image' && binding.kind !== 'audio' && binding.kind !== 'video'
@@ -701,10 +829,12 @@ function applyBinding(
   }
   if (value.kind !== 'text' && value.kind !== 'number' && value.kind !== 'boolean') throw new Error('MEDIA_BINDING_INVALID')
   assertFieldValue(binding, value.value)
+  /** 动态分支的标量绑定与静态检查使用同一展开结果。 */
+  const expandedInputs = expandComfyNodeInputs(nodeSchema, node.inputs)
   /** 目标公开输入的实时 schema。 */
   const schema = {
-    ...nodeSchema.input.optional,
-    ...nodeSchema.input.required,
+    ...expandedInputs.optional,
+    ...expandedInputs.required,
   }[binding.input]
   if (!schema || Object.hasOwn(nodeSchema.input.hidden ?? {}, binding.input)
     || (!nodeContract && requiresResourceContract(binding.input, node.inputs[binding.input] ?? null, schema))) {
@@ -716,7 +846,7 @@ function applyBinding(
   /** 标量类别允许的 ComfyUI 类型。 */
   const allowedSchemaTypes = binding.kind === 'text' ? ['STRING']
     : binding.kind === 'number' ? ['INT', 'FLOAT', 'NUMBER'] : ['BOOLEAN']
-  if (typeof schema[0] !== 'string' || !allowedSchemaTypes.includes(schema[0])) throw new Error('MEDIA_BINDING_SCHEMA_INVALID')
+  if (typeof schema[0] !== 'string' || !schema[0].split(',').every((type) => allowedSchemaTypes.includes(type))) throw new Error('MEDIA_BINDING_SCHEMA_INVALID')
   if (schema[0] === 'INT' && typeof value.value === 'number' && !Number.isSafeInteger(value.value)) {
     throw new Error('MEDIA_BINDING_INTEGER_INVALID')
   }

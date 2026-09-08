@@ -4,11 +4,13 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
+  Check,
   ChevronLeft,
   ChevronRight,
   Copy,
   Eye,
   FileJson,
+  Folder,
   Loader2,
   Pencil,
   Plus,
@@ -49,13 +51,17 @@ import {
 import { mediaSettingsFocusAtom } from '@/atoms/settings-tab'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { JsonCodeEditor } from '@/components/ui/json-code-editor'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
+import { copyTextToClipboard } from '@/lib/clipboard'
 import { MediaApiModelSettings } from './MediaApiModelSettings'
+import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
 
 /** Renderer 可读取的工作流文件上限。 */
@@ -138,9 +144,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** 将异常整理为用户可见文本。 */
-function formatMediaError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+/** 将稳定错误码整理为用户可操作文本，其它表单错误保留原有说明。 */
+export function formatMediaError(error: unknown): string {
+  /** Electron IPC 拒绝后的稳定消息。 */
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('MEDIA_REMOTE_WORKFLOW_READ_FAILED')) {
+    return '工作流详情读取或兼容性分析失败，请重新同步工作流列表后重试。'
+  }
+  if (message.includes('MEDIA_REMOTE_WORKFLOW_NOT_IMPORTABLE')) {
+    return '当前工作流未通过转换校验，请查看详情中的问题定位后重试。'
+  }
+  return message
 }
 
 /** 创建稳定 ID。 */
@@ -276,7 +290,13 @@ export function createRemoteWorkflowDraft(
   name: string,
   id: string,
 ): MediaWorkflowDraft {
-  if (remote.format === 'ui') throw new Error('ComfyUI UI 工作流不能直接执行，请先在 ComfyUI 导出 API 格式')
+  if (remote.analysis?.definition) {
+    /** 采用主进程已通过实时 schema 与执行校验的转换定义。 */
+    const definition = cloneDefinition(remote.analysis.definition)
+    return { id, name, definitionText: JSON.stringify(definition, null, 2), definition, invalidated: false, parseError: null }
+  }
+  if (remote.analysis && !remote.analysis.convertible) throw new Error('当前工作流未通过转换校验，请查看详情中的问题定位')
+  if (remote.format === 'ui') throw new Error('ComfyUI UI 工作流不能直接执行；尚未完成转换分析，暂不能导入')
   if (remote.format !== 'api') throw new Error('无法确认远端工作流格式，不能导入为可执行模板')
   /** 远端 API 图经现有严格解析器形成公共定义草稿。 */
   const definition = parseMediaWorkflowImportText(JSON.stringify(remote.definition))
@@ -550,16 +570,19 @@ function EmptyState({ children }: { children: React.ReactNode }): React.ReactEle
 export function MediaSettingsTabsView({
   activeTab,
   onTabChange,
+  focusActiveTab = false,
 }: {
   activeTab: MediaSettingsTab
   onTabChange: (tab: MediaSettingsTab) => void
+  /** 用户切页后恢复活动页签焦点，初次进入设置时不抢焦点。 */
+  focusActiveTab?: boolean
 }): React.ReactElement {
   return (
     <Tabs value={activeTab} onValueChange={(value) => onTabChange(value as MediaSettingsTab)}>
-      <TabsList className="grid h-9 w-full grid-cols-3 rounded-md p-0.5">
-        <TabsTrigger value="models" className="min-w-0 px-2 text-xs">媒体模型</TabsTrigger>
-        <TabsTrigger value="connections" className="min-w-0 px-2 text-xs">服务连接</TabsTrigger>
-        <TabsTrigger value="workflows" className="min-w-0 px-2 text-xs">公共工作流</TabsTrigger>
+      <TabsList aria-label="媒体配置" className="max-w-full">
+        <TabsTrigger value="models" autoFocus={focusActiveTab && activeTab === 'models'}>媒体模型</TabsTrigger>
+        <TabsTrigger value="connections" autoFocus={focusActiveTab && activeTab === 'connections'}>服务连接</TabsTrigger>
+        <TabsTrigger value="workflows" autoFocus={focusActiveTab && activeTab === 'workflows'}>公共工作流</TabsTrigger>
       </TabsList>
     </Tabs>
   )
@@ -831,6 +854,95 @@ function WorkflowEditor({
   )
 }
 
+/** 展示完整工作流正文；UI/未知格式只预览，API 格式才提供显式导入入口。 */
+export function RemoteWorkflowContent({ remote, onImport }: {
+  remote: MediaRemoteWorkflow
+  onImport: () => void
+}): React.ReactElement {
+  /** 仅在正文变化时序列化，保留节点、连线及未知扩展字段。 */
+  const definitionText = React.useMemo(() => JSON.stringify(remote.definition, null, 2), [remote.definition])
+  /** 完整正文的复制反馈。 */
+  const [copied, setCopied] = React.useState(false)
+  /** 复制或导入错误属于当前详情，不污染资源目录的读取状态。 */
+  const [error, setError] = React.useState<string | null>(null)
+  /** 格式识别只决定导入能力，不阻止查看原始内容。 */
+  const formatLabel = remote.format === 'ui' ? 'ComfyUI UI 格式' : remote.format === 'api' ? 'ComfyUI API 格式' : '未识别格式'
+  /** 主进程分析结果同时决定状态、错误展示和导入能力。 */
+  const analysis = remote.analysis
+  const canImport = analysis ? analysis.definition !== null && analysis.convertible : remote.format === 'api'
+  const analysisLabel = analysis
+    ? canImport ? '已转换并通过校验' : '暂不可导入'
+    : remote.format === 'api' ? '尚未执行远端兼容性分析' : '仅预览'
+  /** 使用现有跨平台剪贴板封装复制完整 JSON，并报告失败。 */
+  const copyDefinition = async (): Promise<void> => {
+    setError(null)
+    try {
+      await copyTextToClipboard(definitionText)
+      setCopied(true)
+    } catch (copyError) {
+      setError(formatMediaError(copyError))
+    }
+  }
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 px-4 py-2">
+        <span className="text-xs text-muted-foreground">{formatLabel} · {analysisLabel}</span>
+        <Button type="button" size="icon-sm" variant="ghost" aria-label="复制完整工作流 JSON" title={copied ? '已复制' : '复制完整工作流 JSON'} onClick={() => void copyDefinition()}>{copied ? <Check /> : <Copy />}</Button>
+      </div>
+      {error && <div className="px-3 pb-2"><MediaError message={error} /></div>}
+      {analysis && analysis.issues.length > 0 && (
+        <div className="max-h-40 shrink-0 space-y-1 overflow-y-auto border-y border-border/60 bg-muted/20 px-4 py-2" aria-label="工作流分析问题">
+          {analysis.issues.map((issue, index) => (
+            <div key={`${issue.code}-${issue.nodeId ?? ''}-${issue.input ?? ''}-${index}`} className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+              <span className="font-mono text-foreground">{issue.code}</span>
+              {issue.nodeId && <span> · 节点 {issue.nodeId}</span>}
+              {issue.input && <span> · 字段 {issue.input}</span>}
+              <span>：{issue.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <JsonCodeEditor value={definitionText} className="min-h-0 flex-1 border-y border-border/60" />
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 px-4 py-3">
+        {canImport ? (
+          <Button type="button" size="sm" variant="outline" onClick={() => {
+            setError(null)
+            try { onImport() } catch (importError) { setError(formatMediaError(importError)) }
+          }}><Copy />导入公共草稿</Button>
+        ) : <span className="text-xs text-muted-foreground">{analysis?.issues[0]?.message ?? (remote.format === 'ui' ? '当前 UI 工作流暂不可导入，请查看分析问题。' : '无法确认工作流格式，暂不可导入为可执行模板。')}</span>}
+      </div>
+    </div>
+  )
+}
+
+/** 打开弹窗时按 descriptor 读取单个工作流；关闭、换页或换连接后忽略迟到响应。 */
+function RemoteWorkflowPreview({ descriptor, onImport }: {
+  descriptor: MediaRemoteDescriptor
+  onImport: (remote: MediaRemoteWorkflow) => void
+}): React.ReactElement {
+  /** 当前详情读取到的完整正文。 */
+  const [remote, setRemote] = React.useState<MediaRemoteWorkflow | null>(null)
+  /** 正文读取错误独立于目录查询，重试只读取当前文件。 */
+  const [error, setError] = React.useState<string | null>(null)
+  /** 用户显式重试时重新发起读取。 */
+  const [attempt, setAttempt] = React.useState(0)
+  React.useEffect(() => {
+    /** 只有本次挂载的请求可以更新预览。 */
+    let active = true
+    setRemote(null)
+    setError(null)
+    void window.electronAPI.mediaReadRemoteWorkflow(descriptor).then((result) => {
+      if (active) setRemote(result)
+    }).catch((readError: unknown) => {
+      if (active) setError(formatMediaError(readError))
+    })
+    return () => { active = false }
+  }, [descriptor, attempt])
+  if (error) return <div className="p-3"><MediaError message={error} onRetry={() => setAttempt((current) => current + 1)} /></div>
+  if (!remote) return <div role="status" className="flex items-center gap-2 p-3 text-xs text-muted-foreground"><Loader2 className="size-4 animate-spin" />正在读取工作流内容...</div>
+  return <RemoteWorkflowContent remote={remote} onImport={() => onImport(remote)} />
+}
+
 /** 连接下方的四类远端资源浏览器。 */
 function ResourceBrowser({
   connection,
@@ -843,20 +955,22 @@ function ResourceBrowser({
   locked: boolean
   probe: MediaConnectionProbe | null
   onProbe: (connectionId: string) => Promise<void>
-  onImportWorkflow: (descriptor: MediaRemoteDescriptor, name: string) => Promise<void>
+  onImportWorkflow: (remote: MediaRemoteWorkflow, name: string) => void
 }): React.ReactElement {
   /** 资源查询条件在切换页面时保持。 */
   const [state, setState] = React.useState<MediaResourceBrowserState>({ connectionId: connection?.id ?? '', kind: 'models', query: '', folder: '', offset: 0 })
   /** 当前权威资源页。 */
   const [page, setPage] = React.useState<MediaResourcePage | null>(null)
-  /** 展开的资源 ID。 */
+  /** 独立保存已验证的模型目录，翻页与搜索清空结果时保持左侧导航稳定。 */
+  const [modelFolders, setModelFolders] = React.useState<string[]>([])
+  /** 当前详情资源 ID，工作流使用弹窗，其它资源保留行内详情。 */
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
+  /** 记录实际点击的条目，关闭弹窗后恢复键盘焦点与列表位置。 */
+  const detailTriggerRef = React.useRef<HTMLButtonElement | null>(null)
   /** 查询错误。 */
   const [error, setError] = React.useState<string | null>(null)
   /** 查询加载状态。 */
   const [loading, setLoading] = React.useState(false)
-  /** 正在读取并导入的远端工作流 ID。 */
-  const [importingId, setImportingId] = React.useState<string | null>(null)
   /** 查询代次用于拒绝迟到响应。 */
   const requestRevisionRef = React.useRef(0)
   /** 始终指向最新筛选，避免防抖回调读取旧闭包。 */
@@ -869,6 +983,7 @@ function ResourceBrowser({
     if (!locked) return
     requestRevisionRef.current += 1
     setPage(null)
+    setModelFolders([])
     setSelectedId(null)
     setError(null)
   }, [locked])
@@ -901,6 +1016,7 @@ function ResourceBrowser({
       const result = await window.electronAPI.mediaListResources(createMediaResourceQuery(requestState, refresh, offset))
       if (!isCurrentMediaResourceRequest(requestRevision, requestRevisionRef.current)) return
       setPage(result)
+      if (requestState.kind === 'models') setModelFolders(getMediaResourceModelFolders(result))
       setState((current) => ({ ...current, offset }))
       setSelectedId(null)
     } catch (loadError) {
@@ -924,9 +1040,7 @@ function ResourceBrowser({
   const selected = page?.items.find((item) => item.id === selectedId)
   /** 四类资源标签。 */
   const resourceLabels: Readonly<Record<MediaResourceKind, string>> = { models: '模型', nodes: '工作节点', workflows: '工作流', assets: '资源库' }
-  /** 当前模型快照携带的完整目录。 */
-  const modelFolders = getMediaResourceModelFolders(page)
-  /** 空筛选时后端读取首个真实模型目录，选择器必须显示同一目录。 */
+  /** 空筛选时后端读取首个真实模型目录，左侧选中态必须对应同一目录。 */
   const selectedModelFolder = state.folder || modelFolders[0] || ''
   /** 快照时间来自上次成功同步，失败重试不会改写。 */
   const snapshotTime = page?.checkedAt ? new Date(page.checkedAt).toLocaleString() : null
@@ -942,12 +1056,6 @@ function ResourceBrowser({
       ? `刷新失败，正在显示上次查询结果：${formatMediaRemoteCapability(page.syncError)}`
       : `同步失败，正在显示上次本地快照：${formatMediaRemoteCapability(page.syncError)}`
     : null
-  /** 通过稳定 descriptor 读取远端工作流正文，再交给公共草稿编辑器。 */
-  const importWorkflow = async (descriptor: MediaRemoteDescriptor, name: string, id: string): Promise<void> => {
-    setImportingId(id)
-    setError(null)
-    try { await onImportWorkflow(descriptor, name) } catch (importError) { setError(formatMediaError(importError)) } finally { setImportingId(null) }
-  }
   return (
     <div className="space-y-3">
       <h3 className="text-sm font-medium">资源快照</h3>
@@ -959,37 +1067,91 @@ function ResourceBrowser({
             {!locked && probe?.connectionId === state.connectionId && <span className="text-xs text-muted-foreground">连接正常</span>}
             <Button type="button" size="sm" variant="outline" disabled={locked || !state.connectionId} onClick={() => void onProbe(state.connectionId)}><TestTube2 />测试连接</Button>
           </div>
-          <Tabs value={state.kind} onValueChange={(kind) => changeFilters({ kind: kind as MediaResourceKind, folder: '' })}>
-            <TabsList className="grid h-9 w-full grid-cols-4 rounded-md p-0.5">{(Object.keys(resourceLabels) as MediaResourceKind[]).map((kind) => <TabsTrigger key={kind} value={kind} className="min-w-0 px-1 text-xs">{resourceLabels[kind]}</TabsTrigger>)}</TabsList>
-          </Tabs>
-          {state.kind === 'models' && modelFolders.length ? <Select value={selectedModelFolder} onValueChange={(folder) => changeFilters({ folder })}><SelectTrigger><SelectValue placeholder="选择模型目录" /></SelectTrigger><SelectContent>{modelFolders.map((folder) => <SelectItem key={folder} value={folder}>{folder}</SelectItem>)}</SelectContent></Select> : null}
-          <div className="flex gap-2">
-            <div className="relative min-w-0 flex-1"><Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" /><Input className="pl-9" value={state.query} placeholder="搜索当前资源" disabled={locked} onChange={(event) => changeFilters({ query: event.target.value })} /></div>
-            <Button type="button" size="icon" variant="outline" disabled={locked || loading || !state.connectionId} aria-label={refreshLabel} title={refreshLabel} onClick={() => void load(true, 0)}>{loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}</Button>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <Tabs value={state.kind} onValueChange={(kind) => changeFilters({ kind: kind as MediaResourceKind, folder: '' })}>
+              <TabsList aria-label="资源类型" className="max-w-full">{(Object.keys(resourceLabels) as MediaResourceKind[]).map((kind) => <TabsTrigger key={kind} value={kind}>{resourceLabels[kind]}</TabsTrigger>)}</TabsList>
+            </Tabs>
+            <div className="ml-auto flex min-w-0 max-w-full items-center gap-2">
+              <div className="relative min-w-0 w-64"><Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" /><Input className="pl-9" value={state.query} placeholder="搜索当前资源" disabled={locked} onChange={(event) => changeFilters({ query: event.target.value })} /></div>
+              <Button type="button" size="icon" variant="outline" className="shrink-0" disabled={locked || loading || !state.connectionId} aria-label={refreshLabel} title={refreshLabel} onClick={() => void load(true, 0)}>{loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}</Button>
+            </div>
           </div>
-          {pageStatus && <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{pageStatus.sourceLabel}</span>{snapshotTime && <span>{pageStatus.timeLabel}：{snapshotTime}</span>}</div>}
+          {(pageStatus || state.kind === 'models') && <div className="flex min-h-4 flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"><span>{pageStatus?.sourceLabel}</span>{pageStatus && snapshotTime && <span>{pageStatus.timeLabel}：{snapshotTime}</span>}</div>}
           {syncErrorMessage && <MediaError message={syncErrorMessage} />}
           {capabilityMessage && <MediaError message={capabilityMessage} />}
           {error && <MediaError message={error} onRetry={() => void load(false)} />}
         </div>
-        {locked || !page ? <EmptyState>{connection ? loading ? state.kind === 'assets' ? '正在查询远端资源...' : '正在读取资源快照...' : state.kind === 'assets' ? '暂无远端资源，点击刷新后获取' : '暂无资源快照，点击同步后获取' : '先保存当前服务连接'}</EmptyState> : page.items.length === 0 ? <EmptyState>{state.kind === 'assets' ? '没有匹配的远端资源' : '快照中没有匹配的资源'}</EmptyState> : (
-          <div className="border-t border-border/60">
-            {page.items.map((item) => (
-              <div key={item.id} className="border-b border-border/60 last:border-b-0">
-                <button type="button" className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-muted/30" onClick={() => setSelectedId((current) => current === item.id ? null : item.id)}>
-                  <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{item.name}</span><span className="block truncate text-xs text-muted-foreground">{item.category || '未分类'}</span></span>
-                  <span className={cn('text-[11px]', item.supported ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground')}>{item.supported ? '已支持' : '只读'}</span>
-                </button>
-                {selected?.id === item.id && <div className="border-t border-border/60 bg-muted/20"><pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words p-3 text-[11px] leading-5 text-muted-foreground">{JSON.stringify(item.schema ?? item.metadata ?? item.descriptor ?? {}, null, 2)}</pre>{state.kind === 'assets' && item.descriptor && <RemoteAssetPreview key={item.id} descriptor={item.descriptor} name={item.name} />}{state.kind === 'workflows' && item.descriptor && <div className="flex justify-end border-t border-border/60 p-2"><Button type="button" size="sm" variant="outline" disabled={importingId !== null} onClick={() => void importWorkflow(item.descriptor!, item.name, item.id)}>{importingId === item.id ? <Loader2 className="animate-spin" /> : <Copy />}读取并导入公共草稿</Button></div>}</div>}
-              </div>
-            ))}
-            <div className="flex items-center justify-between px-4 py-3 text-xs text-muted-foreground">
-              <span>{state.offset + 1}-{Math.min(state.offset + page.items.length, page.total)} / {page.total}</span>
-              <div className="flex gap-1"><Button type="button" size="icon-sm" variant="ghost" disabled={loading || state.offset === 0} aria-label="上一页" onClick={() => void load(false, Math.max(0, state.offset - 50))}><ChevronLeft /></Button><Button type="button" size="icon-sm" variant="ghost" disabled={loading || page.nextOffset === null} aria-label="下一页" onClick={() => { if (page.nextOffset !== null) void load(false, page.nextOffset) }}><ChevronRight /></Button></div>
+        <div className={cn('border-t border-border/60', state.kind === 'models' && 'grid h-[32rem] grid-cols-[minmax(8rem,24%)_minmax(0,1fr)]')}>
+          {state.kind === 'models' && (
+            <aside className="flex min-h-0 min-w-0 flex-col border-r border-border/60 bg-muted/10">
+              <h4 className="flex h-10 shrink-0 items-center border-b border-border/60 px-3 text-xs font-medium text-muted-foreground">模型目录</h4>
+              <nav aria-label="模型目录" className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
+                {!locked && modelFolders.length > 0 ? modelFolders.map((folder) => (
+                  <button
+                    key={folder}
+                    type="button"
+                    aria-current={folder === selectedModelFolder ? 'true' : undefined}
+                    title={folder}
+                    className={cn('flex min-h-9 w-full items-start gap-2 rounded-md px-2 py-2 text-left text-xs transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring', folder === selectedModelFolder ? 'bg-accent font-medium text-accent-foreground' : 'text-muted-foreground hover:text-foreground')}
+                    onClick={() => { if (folder !== selectedModelFolder) changeFilters({ folder }) }}
+                  >
+                    <Folder className="size-4 shrink-0" aria-hidden="true" />
+                    <span className="min-w-0 break-all leading-4">{folder}</span>
+                  </button>
+                )) : <p className="px-2 py-4 text-xs text-muted-foreground">{locked ? '保存后可查看目录' : loading ? '正在读取目录...' : '暂无模型目录'}</p>}
+              </nav>
+            </aside>
+          )}
+          <div className={cn('min-w-0', state.kind === 'models' && 'flex min-h-0 flex-col')}>
+            {state.kind === 'models' && <h4 className="flex h-10 shrink-0 items-center border-b border-border/60 px-4 text-xs font-medium"><span className="min-w-0 truncate" title={locked ? undefined : selectedModelFolder}>{!locked && selectedModelFolder ? selectedModelFolder : '模型'}</span></h4>}
+            <div className={cn(state.kind === 'models' && 'min-h-0 flex-1 overflow-y-auto')}>
+              {locked || !page ? <EmptyState>{connection ? loading ? state.kind === 'assets' ? '正在查询远端资源...' : '正在读取资源快照...' : state.kind === 'assets' ? '暂无远端资源，点击刷新后获取' : '暂无资源快照，点击同步后获取' : '先保存当前服务连接'}</EmptyState> : page.items.length === 0 ? <EmptyState>{state.kind === 'assets' ? '没有匹配的远端资源' : '快照中没有匹配的资源'}</EmptyState> : (
+                <div>
+                  {page.items.map((item) => (
+                    <div key={item.id} className="border-b border-border/60 last:border-b-0">
+                      <button type="button" aria-haspopup={state.kind === 'workflows' ? 'dialog' : undefined} aria-expanded={selected?.id === item.id} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-muted/30" onClick={(event) => {
+                        detailTriggerRef.current = event.currentTarget
+                        setSelectedId((current) => state.kind === 'workflows' ? item.id : current === item.id ? null : item.id)
+                      }}>
+                        <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{item.name}</span><span className="block truncate text-xs text-muted-foreground">{item.category || '未分类'}</span></span>
+                        <span className={cn('text-[11px]', item.supported ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground')}>{item.supported ? '已支持' : '只读'}</span>
+                      </button>
+                      {state.kind !== 'workflows' && selected?.id === item.id && (
+                        <div className="border-t border-border/60 bg-muted/20">
+                          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words p-3 text-[11px] leading-5 text-muted-foreground">{JSON.stringify(item.schema ?? item.metadata ?? item.descriptor ?? {}, null, 2)}</pre>
+                          {state.kind === 'assets' && item.descriptor && <RemoteAssetPreview key={item.id} descriptor={item.descriptor} name={item.name} />}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  <div className="flex items-center justify-between px-4 py-3 text-xs text-muted-foreground">
+                    <span>{state.offset + 1}-{Math.min(state.offset + page.items.length, page.total)} / {page.total}</span>
+                    <div className="flex gap-1"><Button type="button" size="icon-sm" variant="ghost" disabled={loading || state.offset === 0} aria-label="上一页" onClick={() => void load(false, Math.max(0, state.offset - 50))}><ChevronLeft /></Button><Button type="button" size="icon-sm" variant="ghost" disabled={loading || page.nextOffset === null} aria-label="下一页" onClick={() => { if (page.nextOffset !== null) void load(false, page.nextOffset) }}><ChevronRight /></Button></div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
-        )}
+        </div>
       </SettingsCard>
+      <Dialog open={!locked && state.kind === 'workflows' && Boolean(selected)} onOpenChange={(open) => { if (!open) setSelectedId(null) }}>
+        <DialogContent
+          className="flex h-[min(80vh,48rem)] w-[calc(100vw-2rem)] max-w-5xl flex-col gap-0 overflow-hidden rounded-lg p-0"
+          aria-describedby={undefined}
+          onCloseAutoFocus={(event) => {
+            if (!detailTriggerRef.current?.isConnected) return
+            event.preventDefault()
+            detailTriggerRef.current.focus({ preventScroll: true })
+          }}
+        >
+          <DialogHeader className="shrink-0 border-b border-border/60 px-4 py-4 pr-12 text-left">
+            <DialogTitle className="truncate text-sm tracking-normal" title={selected?.name}>{selected?.name ?? '工作流详情'}</DialogTitle>
+          </DialogHeader>
+          {!locked && state.kind === 'workflows' && selected && (selected.descriptor ? (
+            <RemoteWorkflowPreview key={`${page?.snapshotId}:${selected.id}`} descriptor={selected.descriptor} onImport={(remote) => onImportWorkflow(remote, selected.name)} />
+          ) : <div className="p-4"><MediaError message="工作流缺少有效的文件标识，请同步工作流列表后重试。" /></div>)}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -998,6 +1160,9 @@ function ResourceBrowser({
 export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {}): React.ReactElement {
   /** 当前平级页签；草稿位于父级，因此切换不丢失。 */
   const [activeTab, setActiveTab] = React.useState<MediaSettingsTab>('models')
+  /** 只为用户发起的切页恢复焦点，避免导航随各页标题重挂载后中断键盘操作。 */
+  const restoreTabFocusRef = React.useRef(false)
+  React.useEffect(() => { restoreTabFocusRef.current = false }, [activeTab])
   /** 各列表的搜索独立保存，不影响编辑草稿。 */
   const [connectionQuery, setConnectionQuery] = React.useState('')
   const [workflowQuery, setWorkflowQuery] = React.useState('')
@@ -1104,10 +1269,8 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
     } catch (error) { setFormError(formatMediaError(error)) } finally { setBusyAction(null) }
   }
 
-  /** 按 descriptor 读取远端工作流；只有 API 图可进入独立公共草稿。 */
-  const importRemoteWorkflow = async (descriptor: MediaRemoteDescriptor, name: string): Promise<void> => {
-    /** 主进程完成认证与稳定身份校验后的远端正文。 */
-    const remote = await window.electronAPI.mediaReadRemoteWorkflow(descriptor)
+  /** 将用户已预览的 API 正文复制为公共草稿，复用严格校验且无需再次远端读取。 */
+  const importRemoteWorkflow = (remote: MediaRemoteWorkflow, name: string): void => {
     setWorkflowDraft(createRemoteWorkflowDraft(remote, name, createMediaId('workflow')))
     setActiveTab('workflows')
   }
@@ -1142,39 +1305,71 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
   /** 旧项目私有版本作为只读来源展示。 */
   const privateWorkflows = snapshot?.workflows.filter((workflow) => workflow.projectId !== null) ?? []
 
-  return (
-    <div className="min-w-0 max-w-full space-y-6">
-      <MediaSettingsTabsView activeTab={activeTab} onTabChange={setActiveTab} />
+  /** 返回连接列表并释放本地草稿，已保存配置保持不变。 */
+  const cancelConnectionDraft = (): void => {
+    setConnectionDraft(null)
+    setConnectionBaseline(null)
+    setResourcesLocked(false)
+    setFormError(null)
+  }
+  /** 返回工作流列表，清除未发布草稿与当前表单错误。 */
+  const cancelWorkflowDraft = (): void => {
+    setWorkflowDraft(null)
+    setFormError(null)
+  }
+
+  /** 各列表工具栏左侧共用的页签，右侧由当前列表提供搜索筛选。 */
+  const navigation = (
+    <MediaSettingsTabsView activeTab={activeTab} focusActiveTab={restoreTabFocusRef.current} onTabChange={(tab) => {
+      restoreTabFocusRef.current = tab !== activeTab
+      setActiveTab(tab)
+    }} />
+  )
+  /** 错误独占工具栏下方一行，避免挤压导航和搜索。 */
+  const notices = (
+    <>
       {loadError && <MediaError message={loadError} onRetry={() => { setLoading(true); void loadSettings() }} />}
       {formError && !connectionDraft && !workflowDraft && <MediaError message={formError} />}
+    </>
+  )
 
-      {activeTab === 'models' && <MediaApiModelSettings />}
+  return (
+    <div className="min-w-0 max-w-full space-y-6">
+      {activeTab === 'models' && <MediaApiModelSettings navigation={navigation}>{notices}</MediaApiModelSettings>}
 
       {activeTab === 'connections' && (
         <div className="space-y-8">
-          <SettingsSection title="服务连接" action={<Button type="button" size="sm" disabled={loading || busyAction !== null || connectionDraft !== null} onClick={() => {
+          <MediaSettingsPage title={connectionDraft ? (connectionBaseline ? '编辑服务连接' : '添加服务连接') : '服务连接'} onBack={connectionDraft ? cancelConnectionDraft : undefined} busy={busyAction !== null} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || connectionDraft !== null} onClick={() => {
             setFormError(null)
             setConnectionBaseline(null)
             setConnectionDraft({ id: createMediaId('connection'), name: '', baseUrl: '', enabled: true, authKind: 'none', headerName: '', credential: '', credentialConfigured: false, comfyUser: '' })
             setResourcesLocked(true)
           }}><Plus />添加连接</Button>}>
-            {!connectionDraft && <Input className="mb-3" aria-label="搜索连接" placeholder="搜索连接名称或地址" value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} />}
-            {connectionDraft ? <div className="space-y-8"><ConnectionEditor draft={connectionDraft} baseline={connectionBaseline} busy={busyAction !== null} error={formError} onChange={(draft, identityChanged) => { setConnectionDraft(draft); setResourcesLocked(identityChanged) }} onCancel={() => { setConnectionDraft(null); setConnectionBaseline(null); setResourcesLocked(false); setFormError(null) }} onSave={() => void saveConnection()} /><ResourceBrowser key={connectionDraft.id} connection={resolveEditedMediaConnection(connections, connectionBaseline)} locked={resourcesLocked || connectionBaseline === null} probe={probe} onProbe={probeConnection} onImportWorkflow={importRemoteWorkflow} /></div> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取连接...</EmptyState></SettingsCard> : connections.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存服务连接</EmptyState></SettingsCard> : (
+            {!connectionDraft && <div className="flex flex-wrap items-center justify-between gap-3">
+              {navigation}
+              <Input className="w-64 max-w-full" aria-label="搜索连接" placeholder="搜索连接名称或地址" value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} />
+            </div>}
+            {notices}
+            {connectionDraft ? <div className="space-y-8"><ConnectionEditor draft={connectionDraft} baseline={connectionBaseline} busy={busyAction !== null} error={formError} onChange={(draft, identityChanged) => { setConnectionDraft(draft); setResourcesLocked(identityChanged) }} onCancel={cancelConnectionDraft} onSave={() => void saveConnection()} /><ResourceBrowser key={connectionDraft.id} connection={resolveEditedMediaConnection(connections, connectionBaseline)} locked={resourcesLocked || connectionBaseline === null} probe={probe} onProbe={probeConnection} onImportWorkflow={importRemoteWorkflow} /></div> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取连接...</EmptyState></SettingsCard> : connections.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存服务连接</EmptyState></SettingsCard> : (
               <SettingsCard>{filteredConnections.map((connection) => <SettingsRow key={connection.id} label={connection.name} icon={<Server className="size-5 text-muted-foreground" />} description={`${connection.baseUrl}${connection.comfyUser ? ` · 用户 ${connection.comfyUser}` : ''}${probe?.connectionId === connection.id ? ` · 连接正常${probe.nodeCount > 0 ? ` · 本地 ${probe.nodeCount} 个节点` : ''}` : ''}`}><div className="flex flex-wrap items-center justify-end gap-1"><Switch aria-label={`启用 ${connection.name}`} checked={connection.enabled} disabled={busyAction !== null} onCheckedChange={(enabled) => void toggleConnection(connection, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${connection.name}`} title="测试连接" disabled={busyAction !== null} onClick={() => void probeConnection(connection.id)}>{busyAction === `probe:${connection.id}` ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${connection.name}`} title="复制" disabled={busyAction !== null} onClick={() => { const draft = connectionToDraft(connection); setConnectionBaseline(null); setConnectionDraft({ ...draft, id: createMediaId('connection'), name: `${draft.name} 副本`, credentialConfigured: false }); setResourcesLocked(true) }}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${connection.name}`} title="编辑" disabled={busyAction !== null} onClick={() => { const draft = connectionToDraft(connection); setConnectionBaseline(draft); setConnectionDraft(draft); setResourcesLocked(false) }}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${connection.name}`} title="删除" disabled={busyAction !== null} onClick={() => setArchiveTarget({ kind: 'connection', id: connection.id, name: connection.name })}><Trash2 /></Button></div></SettingsRow>)}{!filteredConnections.length && <EmptyState>没有匹配的连接</EmptyState>}</SettingsCard>
             )}
-          </SettingsSection>
+          </MediaSettingsPage>
         </div>
       )}
 
       {activeTab === 'workflows' && (
         <div className="space-y-8">
-          <SettingsSection title="公共工作流" action={<Button type="button" size="sm" disabled={loading || busyAction !== null || workflowDraft !== null} onClick={() => { setFormError(null); setWorkflowDraft({ id: createMediaId('workflow'), name: '', definitionText: '', definition: null, invalidated: true, parseError: null }) }}><Plus />添加工作流</Button>}>
-            {!workflowDraft && <Input className="mb-3" aria-label="搜索公共工作流" placeholder="搜索名称、输入或输出类型" value={workflowQuery} onChange={(event) => setWorkflowQuery(event.target.value)} />}
-            {workflowDraft ? <WorkflowEditor draft={workflowDraft} busy={busyAction !== null} error={formError} onChange={(draft) => { setWorkflowDraft(draft); setFormError(null) }} onCancel={() => { setWorkflowDraft(null); setFormError(null) }} onSave={() => void saveWorkflow(false)} onSaveAndOpen={onOpenWorkflowInCanvas ? () => void saveWorkflow(true) : undefined} /> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取工作流...</EmptyState></SettingsCard> : publicWorkflows.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存公共工作流</EmptyState></SettingsCard> : (
+          <MediaSettingsPage title={workflowDraft ? (publicWorkflows.some((workflow) => workflow.id === workflowDraft.id) ? '编辑公共工作流' : '添加公共工作流') : '公共工作流'} onBack={workflowDraft ? cancelWorkflowDraft : undefined} busy={busyAction !== null} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || workflowDraft !== null} onClick={() => { setFormError(null); setWorkflowDraft({ id: createMediaId('workflow'), name: '', definitionText: '', definition: null, invalidated: true, parseError: null }) }}><Plus />添加工作流</Button>}>
+            {!workflowDraft && <div className="flex flex-wrap items-center justify-between gap-3">
+              {navigation}
+              <Input className="w-64 max-w-full" aria-label="搜索公共工作流" placeholder="搜索名称、输入或输出类型" value={workflowQuery} onChange={(event) => setWorkflowQuery(event.target.value)} />
+            </div>}
+            {notices}
+            {workflowDraft ? <WorkflowEditor draft={workflowDraft} busy={busyAction !== null} error={formError} onChange={(draft) => { setWorkflowDraft(draft); setFormError(null) }} onCancel={cancelWorkflowDraft} onSave={() => void saveWorkflow(false)} onSaveAndOpen={onOpenWorkflowInCanvas ? () => void saveWorkflow(true) : undefined} /> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取工作流...</EmptyState></SettingsCard> : publicWorkflows.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存公共工作流</EmptyState></SettingsCard> : (
               <SettingsCard>{filteredWorkflows.map((workflow) => <SettingsRow key={workflow.id} label={workflow.name} icon={<Workflow className="size-5 text-muted-foreground" />} description={`r${workflow.revision} · ${workflowSummary(workflow)}`}><div className="flex items-center gap-1"><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${workflow.name}`} title="复制" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow, true))}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${workflow.name}`} title="发布新版本" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow))}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${workflow.name}`} title="归档" disabled={busyAction !== null} onClick={() => setArchiveTarget({ kind: 'workflow', id: workflow.id, name: workflow.name })}><Trash2 /></Button></div></SettingsRow>)}{!filteredWorkflows.length && <EmptyState>没有匹配的工作流</EmptyState>}</SettingsCard>
             )}
-          </SettingsSection>
-          {privateWorkflows.length > 0 && <SettingsSection title="项目历史" description="旧项目私有版本只读保留，可清洗资源引用后复制为公共版本。"><SettingsCard>{privateWorkflows.map((workflow) => <SettingsRow key={`${workflow.id}:${workflow.revision}`} label={workflow.name} description={`${workflow.projectId} · r${workflow.revision} · 只读来源`}><Button type="button" size="sm" variant="outline" disabled={busyAction !== null || workflowDraft !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow, true))}><Copy />复制为公共</Button></SettingsRow>)}</SettingsCard></SettingsSection>}
+          </MediaSettingsPage>
+          {!workflowDraft && privateWorkflows.length > 0 && <SettingsSection title="项目历史" description="旧项目私有版本只读保留，可清洗资源引用后复制为公共版本。"><SettingsCard>{privateWorkflows.map((workflow) => <SettingsRow key={`${workflow.id}:${workflow.revision}`} label={workflow.name} description={`${workflow.projectId} · r${workflow.revision} · 只读来源`}><Button type="button" size="sm" variant="outline" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow, true))}><Copy />复制为公共</Button></SettingsRow>)}</SettingsCard></SettingsSection>}
         </div>
       )}
 
