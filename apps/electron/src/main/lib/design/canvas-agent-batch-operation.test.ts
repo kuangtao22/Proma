@@ -3,9 +3,11 @@ import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasBatchOperationEnvelope, CanvasDocument, CanvasMutation, CanvasTrashEntry } from '@proma/shared'
 import {
   createCanvasAgentBatchOperationService,
+  type CanvasAgentBatchOperationDependencies,
   type CanvasBatchOperationIntent,
 } from './canvas-agent-batch-operation'
 import { createCanvasTransactionArchive } from './canvas-transaction-archive'
+import type { StableDirectoryNativeRequest, StableDirectoryNativeResult } from '../stable-directory-native-host'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 
@@ -227,7 +229,138 @@ function batch(): CanvasBatchOperationEnvelope {
   }
 }
 
+/** 构造使用生产扫描与原生归档协议的旧 committed intent 测试夹具。 */
+function createNativeArchiveFixture(options: {
+  changeBeforeRemove?: boolean
+  omitTrailingNewline?: boolean
+  reorderPreparedResource?: boolean
+} = {}) {
+  /** 复现现场中 parser 会重排的 preparedResources 字段顺序。 */
+  const preparedResource = options.reorderPreparedResource
+    ? { nodeId: 'legacy-agent', state: 'ready', createdByOperation: true, trashEntries: null, kind: 'agent-session', resourceId: 'legacy-agent-session' }
+    : { nodeId: 'legacy-agent', kind: 'agent-session', resourceId: 'legacy-agent-session', state: 'ready', createdByOperation: true, trashEntries: null }
+  /** 旧文件可分别模拟无尾换行或嵌套字段顺序变化。 */
+  const serializedIntent = JSON.stringify({
+    state: 'committed',
+    source: { toolCallId: 'legacy-tool-call', sessionId: 'legacy-session', runStartedAt: 88 },
+    operations: [],
+    expectedGraphSha256: '0'.repeat(64),
+    preparedResources: [preparedResource],
+    baseRevision: 7,
+    target,
+    operationId: '33333333-3333-4333-8333-333333333333',
+    schemaVersion: 1,
+  }, null, 2)
+  /** activeContent 保留 helper 实际扫描到的完整 UTF-8 正文。 */
+  const rawIntent = options.omitTrailingNewline ? serializedIntent : `${serializedIntent}\n`
+  /** 模拟 transactions 中仍活动的原始正文。 */
+  let activeContent: string | null = rawIntent
+  /** 记录 transaction-archive 中按原文写入的正文。 */
+  const archived = new Map<string, string>()
+  /** 标记真实磁盘变化只注入一次。 */
+  let changed = false
+  /** 模拟 stable-directory helper 的扫描、归档读写与严格删除协议。 */
+  const runStableDirectoryNative = async (request: StableDirectoryNativeRequest): Promise<StableDirectoryNativeResult> => {
+    const roots = [{ requestedPath: '/canvas', canonicalPath: '/canvas', isDirectory: true, volume: 'volume-1', fileId: 'canvas-1' }]
+    if (request.mode === 'canvas-intent-scan') {
+      return {
+        roots,
+        entries: activeContent === null ? [] : [{
+          rootIndex: 0,
+          name: 'canvas-batch-33333333-3333-4333-8333-333333333333.json',
+          path: '/canvas/transactions/canvas-batch-33333333-3333-4333-8333-333333333333.json',
+          isDirectory: false,
+          size: Buffer.byteLength(activeContent),
+          content: activeContent,
+        }],
+      }
+    }
+    if (request.mode === 'canvas-content-write') {
+      archived.set(request.fileName!, request.content!)
+      return { roots, entries: [], writeOutcome: { commitVisible: true, durabilityUncertain: false } }
+    }
+    if (request.mode === 'canvas-content-read') {
+      const content = archived.get(request.fileName!)
+      return {
+        roots,
+        entries: [],
+        readOutcome: content === undefined
+          ? { status: 'missing' }
+          : { status: 'ok', content, size: Buffer.byteLength(content), volume: 'volume-1', fileId: request.fileName! },
+      }
+    }
+    if (request.mode === 'canvas-intent-remove') {
+      if (options.changeBeforeRemove && !changed) {
+        changed = true
+        activeContent = rawIntent.replace('"committed"', '"prepared"')
+      }
+      if (activeContent !== request.content) {
+        return { roots, entries: [], writeOutcome: { commitVisible: false, durabilityUncertain: false, error: 'CAS_MISMATCH' } }
+      }
+      activeContent = null
+      return { roots, entries: [], writeOutcome: { commitVisible: true, durabilityUncertain: false } }
+    }
+    throw new Error(`UNEXPECTED_NATIVE_MODE:${request.mode}`)
+  }
+  /** 终态 reconcile 不触发图和资源副作用，最小依赖只提供读取事实。 */
+  const document = { ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 7 }
+  /** 使用真实 scan/archive 路径创建服务，仅替换原生 helper 进程。 */
+  const service = createCanvasAgentBatchOperationService({
+    store: {
+      load: () => ({ document, writable: true as const, nodeIssues: [] }),
+      loadWithDirectoryCapability: () => ({
+        snapshot: { document, writable: true as const, nodeIssues: [] },
+        openSingleChildDirectory: () => ({
+          path: '/canvas/transactions',
+          rootPath: '/canvas',
+          assertValid: () => undefined,
+          authorizeOpenedRoots: () => true,
+        }),
+      }),
+      planBatchOperations: () => { throw new Error('不应规划终态事务') },
+      mutate: () => { throw new Error('不应修改终态事务') },
+    },
+    runExclusive: async (_target, effect) => effect(),
+    publish: () => undefined,
+    runStableDirectoryNative,
+    contentLifecycle: {
+      inspectBatchContent: async () => { throw new Error('不应检查终态事务资源') },
+      prepareBatchContent: async () => { throw new Error('不应准备终态事务资源') },
+      cleanupBatchContent: async () => { throw new Error('不应清理终态事务资源') },
+      prepareBatchDeletions: async () => { throw new Error('不应移动终态事务资源') },
+      restoreBatchDeletions: async () => { throw new Error('不应恢复终态事务资源') },
+      assertBatchAgentNodeIdle: () => { throw new Error('不应检查终态事务 Agent') },
+    },
+    agentNodeCreation: {
+      inspectBatchSession: () => { throw new Error('不应检查终态事务会话') },
+      prepareBatchSession: () => { throw new Error('不应准备终态事务会话') },
+      cleanupBatchSession: () => { throw new Error('不应清理终态事务会话') },
+    },
+  } satisfies CanvasAgentBatchOperationDependencies)
+  return { archived, getActiveContent: () => activeContent, rawIntent, service }
+}
+
 describe('CanvasAgentBatchOperationService', () => {
+  test.each([
+    ['无尾换行', { omitTrailingNewline: true }],
+    ['preparedResources 字段顺序与 parser 不同', { reorderPreparedResource: true }],
+  ] as const)('Given 旧 committed intent %s When 生产扫描归档 Then 原文 CAS 删除成功', async (_case, options) => {
+    const fixture = createNativeArchiveFixture(options)
+
+    await fixture.service.reconcile(target)
+
+    expect(fixture.getActiveContent()).toBeNull()
+    expect([...fixture.archived.values()]).toEqual([fixture.rawIntent, fixture.rawIntent])
+  })
+
+  test('Given 扫描后 active intent 正文真实变化 When 生产归档删除 Then 严格 CAS 拒绝删除', async () => {
+    const fixture = createNativeArchiveFixture({ changeBeforeRemove: true })
+
+    await expect(fixture.service.reconcile(target)).rejects.toThrow('CANVAS_TRANSACTION_ARCHIVE_REMOVE_FAILED')
+
+    expect(fixture.getActiveContent()).not.toBe(fixture.rawIntent)
+  })
+
   test('Given 三节点两边 When 执行 Then 只提交一次且 revision 7 到 8', async () => {
     const fixture = createFixture()
     const result = await fixture.service.execute(batch())

@@ -22,7 +22,7 @@ import type {
   RestoreCanvasNodeInput,
 } from '@proma/shared'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
-import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
+import type { StableDirectoryNativeHost, StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
 import type { PrepareCanvasNodeContentInput } from './canvas-node-content-store'
 import type {
   CanvasDocumentMigrationCapability,
@@ -71,6 +71,12 @@ export interface CanvasContentNodeIntent {
   updatedAt: number
 }
 
+/** 单次稳定扫描返回的严格 intent 与同一 active 文件原始正文。 */
+interface ScannedCanvasContentNodeIntent {
+  intent: CanvasContentNodeIntent
+  content: string
+}
+
 /** 已提交图必须先发布再传播的稳定错误。 */
 export class CanvasNodeLifecyclePublishedError extends Error {
   /**
@@ -115,6 +121,8 @@ export interface CanvasContentNodeLifecycleDependencies {
   randomUUID?: () => string
   scanIntents?: (target: CanvasTarget) => Promise<CanvasContentNodeIntent[]>
   writeIntent?: (intent: CanvasContentNodeIntent) => Promise<StableDirectoryNativeWriteOutcome>
+  /** 测试可替换原生 helper，生产默认使用进程级稳定目录执行器。 */
+  runStableDirectoryNative?: StableDirectoryNativeHost['run']
   /** 测试注入的终态归档器；生产绑定本次迁移 capability。 */
   archive?: CanvasTransactionArchive
 }
@@ -439,50 +447,72 @@ function snapshot(document: CanvasDocument): CanvasWorkspaceSnapshot {
 export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNodeLifecycleDependencies): CanvasContentNodeLifecycle {
   const now = dependencies.now ?? Date.now
   const randomUUID = dependencies.randomUUID ?? createRandomUUID
+  /** 扫描、写入与原生归档共享同一可替换执行边界。 */
+  const runNative = dependencies.runStableDirectoryNative ?? runStableDirectoryNative
 
   /** 取得与当前 Canvas 根绑定的归档器。 */
   const archiveFor = (capability: CanvasDocumentMigrationCapability): CanvasTransactionArchive | null => {
     if (dependencies.archive) return dependencies.archive
     if (dependencies.scanIntents) return null
-    return createNativeCanvasTransactionArchive(capability.openSingleChildDirectory('transactions'))
+    return createNativeCanvasTransactionArchive(capability.openSingleChildDirectory('transactions'), { run: runNative })
   }
 
   /** 读取全部 content intent；生产路径只解析固定前缀并忽略 Agent 文件。 */
-  const scan = async (target: CanvasTarget, capability: CanvasDocumentMigrationCapability): Promise<CanvasContentNodeIntent[]> => {
-    if (dependencies.scanIntents) return dependencies.scanIntents(target)
+  const scan = async (target: CanvasTarget, capability: CanvasDocumentMigrationCapability): Promise<ScannedCanvasContentNodeIntent[]> => {
+    if (dependencies.scanIntents) {
+      return (await dependencies.scanIntents(target)).map((intent) => ({
+        intent,
+        content: `${JSON.stringify(intent, null, 2)}\n`,
+      }))
+    }
     const directory = capability.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_CONTENT_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
-    const intents: CanvasContentNodeIntent[] = []
+    const result = await runNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_CONTENT_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
+    const intents: ScannedCanvasContentNodeIntent[] = []
     for (const entry of result.entries.sort((left, right) => left.name.localeCompare(right.name))) {
       const match = CONTENT_INTENT_NAME.exec(entry.name)
       if (!match) continue
       if (entry.isDirectory || typeof entry.content !== 'string' || Buffer.byteLength(entry.content) > MAX_CONTENT_INTENT_BYTES) throw new Error('CANVAS_CONTENT_INTENT_INVALID')
-      intents.push(parseCanvasContentNodeIntent(JSON.parse(entry.content) as unknown, target, match[1]!))
+      intents.push({
+        intent: parseCanvasContentNodeIntent(JSON.parse(entry.content) as unknown, target, match[1]!),
+        content: entry.content,
+      })
     }
     directory.assertValid()
     return intents
   }
 
   /** 写入一阶段 intent，并对耐久性未确认执行同目录精确重扫。 */
-  const write = async (intent: CanvasContentNodeIntent, capability: CanvasDocumentMigrationCapability): Promise<Error | undefined> => {
+  const write = async (
+    intent: CanvasContentNodeIntent,
+    capability: CanvasDocumentMigrationCapability,
+    recordVisibleContent?: (operationId: string, content: string) => void,
+  ): Promise<Error | undefined> => {
+    /** content 同时用于原生写入与本轮归档 CAS，禁止写后重新序列化。 */
+    const content = `${JSON.stringify(intent, null, 2)}\n`
     const outcome = dependencies.writeIntent
       ? await dependencies.writeIntent(intent)
       : await (async () => {
           const directory = capability.openSingleChildDirectory('transactions')
-          const result = await runStableDirectoryNative({ mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions', fileName: `content-node-${intent.operationId}.json`, content: `${JSON.stringify(intent, null, 2)}\n`, maxEntries: MAX_CONTENT_INTENTS }, directory.authorizeOpenedRoots)
+          const result = await runNative({ mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions', fileName: `content-node-${intent.operationId}.json`, content, maxEntries: MAX_CONTENT_INTENTS }, directory.authorizeOpenedRoots)
           if (!result.writeOutcome) throw new Error('CANVAS_CONTENT_INTENT_WRITE_FAILED')
           return result.writeOutcome
         })()
     if (!outcome.commitVisible) throw new Error(`CANVAS_CONTENT_INTENT_WRITE_FAILED: ${outcome.error}`)
+    recordVisibleContent?.(intent.operationId, content)
     if (!outcome.durabilityUncertain) return undefined
     const rescanned = await scan({ projectId: intent.projectId, canvasId: intent.canvasId }, capability)
-    const visible = rescanned.some((candidate) => JSON.stringify(candidate) === JSON.stringify(intent))
+    const visible = rescanned.some((candidate) => JSON.stringify(candidate.intent) === JSON.stringify(intent))
     if (!visible) throw new Error('CANVAS_CONTENT_INTENT_COMMIT_UNCONFIRMED')
     return new Error(`CANVAS_CONTENT_INTENT_DURABILITY_UNCERTAIN: ${outcome.error}`)
   }
 
   /** 推进一个未完成 intent，所有阶段均可安全重放。 */
-  const advance = async (original: CanvasContentNodeIntent, initial: CanvasDocument, capability: CanvasDocumentMigrationCapability): Promise<{ intent: CanvasContentNodeIntent; document: CanvasDocument; changed: boolean; publishRequired: boolean; error?: Error }> => {
+  const advance = async (
+    original: CanvasContentNodeIntent,
+    initial: CanvasDocument,
+    capability: CanvasDocumentMigrationCapability,
+    recordVisibleContent?: (operationId: string, content: string) => void,
+  ): Promise<{ intent: CanvasContentNodeIntent; document: CanvasDocument; changed: boolean; publishRequired: boolean; error?: Error }> => {
     /** 即使测试注入或未来内部调用绕过扫描，也在副作用前重新执行完整严格解析。 */
     let intent = parseCanvasContentNodeIntent(
       original,
@@ -500,7 +530,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       intent = transition(intent, 'committed', now)
       publishRequired = true
       try {
-        return await write(intent, capability)
+        return await write(intent, capability, recordVisibleContent)
       } catch (error) {
         if (error instanceof Error) return error
         throw error
@@ -527,7 +557,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           }
         }
         intent = transition(intent, 'content-created', now)
-        const error = await write(intent, capability)
+        const error = await write(intent, capability, recordVisibleContent)
         if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'content-created') {
@@ -552,7 +582,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           await dependencies.contentStore.assertContent(target, identity)
         }
         intent = transition(intent, 'content-created', now)
-        const error = await write(intent, capability)
+        const error = await write(intent, capability, recordVisibleContent)
         if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'content-created') {
@@ -589,7 +619,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
           if (!entries.some((entry) => entry.trashId === intent.trashId)) throw error
         }
         intent = transition(intent, 'trashed', now)
-        const error = await write(intent, capability)
+        const error = await write(intent, capability, recordVisibleContent)
         if (error) return { intent, document, changed, publishRequired, error }
       }
       if (intent.state === 'trashed') {
@@ -607,7 +637,7 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
       const restored = await dependencies.contentStore.restoreFromTrash(target, intent.trashId!)
       if (JSON.stringify(restored) !== JSON.stringify(intent.trashEntry)) throw new Error('CANVAS_CONTENT_IDENTITY_CONFLICT')
       intent = transition(intent, 'restored', now)
-      const error = await write(intent, capability)
+      const error = await write(intent, capability, recordVisibleContent)
       if (error) return { intent, document, changed, publishRequired, error }
     }
     if (intent.state === 'restored') {
@@ -626,18 +656,20 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
   /** 单次扫描并按 operationId 确定性推进全部历史事务。 */
   const reconcileInternal = async (target: CanvasTarget): Promise<{ result: CanvasContentNodeReconciliationResult; capability: CanvasDocumentMigrationCapability; intents: CanvasContentNodeIntent[] }> => {
     const capability = dependencies.store.loadWithMigrationCapability(target)
-    const intents = await scan(target, capability)
+    const scannedIntents = await scan(target, capability)
     const finalIntents: CanvasContentNodeIntent[] = []
+    /** 本次扫描或可见写入证明的 active 精确正文，只在本轮对账内有效。 */
+    const activeContents = new Map(scannedIntents.map(({ intent, content }) => [intent.operationId, content]))
     let document = capability.snapshot.document
     let changed = false
     let publishRequired = false
     let error: unknown
-    for (const original of [...intents].sort((left, right) => left.operationId.localeCompare(right.operationId))) {
+    for (const { intent: original } of [...scannedIntents].sort((left, right) => left.intent.operationId.localeCompare(right.intent.operationId))) {
       if (original.state === 'committed') {
         finalIntents.push(original)
         continue
       }
-      const advanced = await advance(original, document, capability)
+      const advanced = await advance(original, document, capability, (operationId, content) => activeContents.set(operationId, content))
       finalIntents.push(advanced.intent)
       document = advanced.document
       changed ||= advanced.changed
@@ -646,10 +678,11 @@ export function createCanvasContentNodeLifecycle(dependencies: CanvasContentNode
     }
     if (!error) {
       try {
-        await archiveFor(capability)?.archiveEntries(finalIntents.map((intent) => ({
-          name: `content-node-${intent.operationId}.json`,
-          content: `${JSON.stringify(intent, null, 2)}\n`,
-        })))
+        await archiveFor(capability)?.archiveEntries(finalIntents.map((intent) => {
+          const content = activeContents.get(intent.operationId)
+          if (content === undefined) throw new Error('CANVAS_CONTENT_INTENT_ARCHIVE_CONTENT_MISSING')
+          return { name: `content-node-${intent.operationId}.json`, content }
+        }))
       } catch (archiveError) {
         /** 归档失败仍返回已提交图与 publication，由 IPC 在锁外先发布再传播错误。 */
         error = archiveError

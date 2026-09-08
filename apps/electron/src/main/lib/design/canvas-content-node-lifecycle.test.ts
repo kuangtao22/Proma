@@ -11,6 +11,7 @@ import type {
 import { createCanvasContentNodeLifecycle, parseCanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 import type { CanvasContentNodeIntent } from './canvas-content-node-lifecycle'
 import { createCanvasTransactionArchive } from './canvas-transaction-archive'
+import type { StableDirectoryNativeRequest, StableDirectoryNativeResult } from '../stable-directory-native-host'
 
 /** 创建可观察的内存生命周期环境，避免测试依赖真实磁盘正文。 */
 function createFixture(options: {
@@ -26,12 +27,20 @@ function createFixture(options: {
   enableArchive?: boolean
   /** 首次 active 删除失败，用于验证归档错误不会吞掉已提交 publication。 */
   failArchiveRemoveOnce?: boolean
+  /** 通过生产扫描协议返回的 active intent 原始正文。 */
+  rawIntent?: string
+  /** 归档删除前模拟 active 正文被其它进程改写。 */
+  changeRawBeforeRemove?: boolean
 } = {}) {
   /** 当前权威图文档。 */
   let document = createEmptyCanvasDocument('project-1', 'canvas-1', 10)
   /** 按 operationId 持久化的 intent tombstone。 */
   const intents = new Map<string, CanvasContentNodeIntent>()
   const archived = new Map<string, string>()
+  /** 原生扫描模式下保留 active 文件的精确正文。 */
+  let activeRaw = options.rawIntent ?? null
+  /** 真实内容变化只在首次删除前注入一次。 */
+  let rawChanged = false
   /** 回收区的公开业务条目。 */
   const trash = new Map<string, CanvasTrashEntry>()
   /** 共享内容从回收区回到活动目录的真实物理移动次数。 */
@@ -53,7 +62,10 @@ function createFixture(options: {
   const store = {
     loadWithMigrationCapability: () => ({
       snapshot: { document, writable: true as const, nodeIssues: [] }, migratedFrom: migrationPending ? 1 as const : undefined,
-      legacyContentSeeds: migrationPending ? options.migratedSeeds ?? [] : [], openSingleChildDirectory: () => { throw new Error('unused') },
+      legacyContentSeeds: migrationPending ? options.migratedSeeds ?? [] : [],
+      openSingleChildDirectory: () => ({
+        path: '/canvas/transactions', rootPath: '/canvas', assertValid: () => undefined, authorizeOpenedRoots: () => true,
+      }),
       commitMigration: () => { migrationCommits += 1; migrationPending = false; return document },
     }),
     mutate: (_target: object, expectedRevision: number, mutations: CanvasMutation[]) => {
@@ -103,23 +115,55 @@ function createFixture(options: {
   }
   /** 每次删除使用独立回收身份。 */
   let uuidCounter = 0
+  /** 原生扫描测试只模拟 content intent 所需的 scan/write 两种请求。 */
+  const runStableDirectoryNative = async (request: StableDirectoryNativeRequest): Promise<StableDirectoryNativeResult> => {
+    const roots = [{ requestedPath: '/canvas', canonicalPath: '/canvas', isDirectory: true, volume: 'volume-1', fileId: 'canvas-1' }]
+    if (request.mode === 'canvas-intent-scan') {
+      return {
+        roots,
+        entries: activeRaw === null ? [] : [{
+          rootIndex: 0,
+          name: 'content-node-41414141-4141-4141-8141-414141414141.json',
+          path: '/canvas/transactions/content-node-41414141-4141-4141-8141-414141414141.json',
+          isDirectory: false,
+          size: Buffer.byteLength(activeRaw),
+          content: activeRaw,
+        }],
+      }
+    }
+    if (request.mode === 'canvas-intent-write') {
+      activeRaw = request.content!
+      return { roots, entries: [], writeOutcome: { commitVisible: true, durabilityUncertain: false } }
+    }
+    throw new Error(`UNEXPECTED_NATIVE_MODE:${request.mode}`)
+  }
   /** 每次构造都模拟一次新的主进程生命周期服务实例。 */
   const createService = () => createCanvasContentNodeLifecycle({
     store, contentStore,
-    scanIntents: async () => { scanCount += 1; return [...intents.values()] },
-    writeIntent: async (intent) => {
-      const outcome = options.writeOutcome?.(intent) ?? { commitVisible: true, durabilityUncertain: false }
-      if (outcome.commitVisible) intents.set(intent.operationId, structuredClone(intent))
-      return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
-    },
-    ...(options.enableArchive ? {
+    ...(options.rawIntent === undefined ? {
+      scanIntents: async () => { scanCount += 1; return [...intents.values()] },
+      writeIntent: async (intent: CanvasContentNodeIntent) => {
+        const outcome = options.writeOutcome?.(intent) ?? { commitVisible: true, durabilityUncertain: false }
+        if (outcome.commitVisible) intents.set(intent.operationId, structuredClone(intent))
+        return outcome as { commitVisible: true; durabilityUncertain: false } | { commitVisible: false; durabilityUncertain: false; error: string } | { commitVisible: true; durabilityUncertain: true; error: string }
+      },
+    } : { runStableDirectoryNative }),
+    ...(options.enableArchive || options.rawIntent !== undefined ? {
       archive: createCanvasTransactionArchive({
         writeArchived: async (fileName, content) => { archived.set(fileName, content) },
         readArchived: async (fileName) => archived.get(fileName) ?? null,
-        removeActive: async (fileName) => {
+        removeActive: async (fileName, expectedContent) => {
           if (options.failArchiveRemoveOnce) {
             options.failArchiveRemoveOnce = false
             throw new Error('CONTENT_ARCHIVE_FAILED')
+          }
+          if (options.rawIntent !== undefined) {
+            if (options.changeRawBeforeRemove && !rawChanged) {
+              rawChanged = true
+              activeRaw = `${activeRaw} `
+            }
+            if (activeRaw !== expectedContent) throw new Error('CONTENT_ARCHIVE_FAILED')
+            activeRaw = null
           }
           const match = /^content-node-([0-9a-f-]{36})\.json$/i.exec(fileName)
           if (match) intents.delete(match[1]!)
@@ -153,6 +197,7 @@ function createFixture(options: {
     setDocument: (next: CanvasDocument) => { document = next },
     getMigrationCommits: () => migrationCommits,
     getScanCount: () => scanCount,
+    getActiveRaw: () => activeRaw,
   }
 }
 
@@ -171,7 +216,56 @@ function createIntentNode(kind: CanvasContentKind, position = { x: 1, y: 2 }): T
   return { ...base, kind, prototypeId: 'content-strict', contentRevision: 0, devicePreset: 'desktop' }
 }
 
+/** 构造字段顺序不同于 parser 输出的旧内容事务正文。 */
+function createRawContentIntent(state: 'prepared' | 'committed'): string {
+  return JSON.stringify({
+    state,
+    operation: 'create',
+    node: { title: '旧文档', position: { y: 2, x: 1 }, id: 'legacy-node', contentRevision: 0, documentId: 'legacy-content', kind: 'document' },
+    canvasId: target.canvasId,
+    projectId: target.projectId,
+    operationId: '41414141-4141-4141-8141-414141414141',
+    schemaVersion: 1,
+    expectedRevision: 0,
+    updatedAt: 10,
+    createdAt: 10,
+  })
+}
+
 describe('CanvasContentNodeLifecycle', () => {
+  test('Given 旧格式 committed content intent When 对账归档 Then 使用扫描原文删除', async () => {
+    const rawIntent = createRawContentIntent('committed')
+    const fixture = createFixture({ rawIntent })
+
+    const reconciled = await fixture.service.reconcile(target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(fixture.getActiveRaw()).toBeNull()
+    expect([...fixture.archived.values()]).toEqual([rawIntent])
+  })
+
+  test('Given 旧格式 prepared content intent When 同轮推进 committed Then 归档使用最新写入正文', async () => {
+    const rawIntent = createRawContentIntent('prepared')
+    const fixture = createFixture({ rawIntent })
+
+    const reconciled = await fixture.service.reconcile(target)
+
+    const archivedContent = [...fixture.archived.values()][0]!
+    expect(reconciled.error).toBeUndefined()
+    expect(archivedContent).not.toBe(rawIntent)
+    expect(JSON.parse(archivedContent)).toMatchObject({ state: 'committed', updatedAt: 101 })
+  })
+
+  test('Given 扫描后 committed content intent 正文真实变化 When 归档删除 Then CAS 拒绝', async () => {
+    const rawIntent = createRawContentIntent('committed')
+    const fixture = createFixture({ rawIntent, changeRawBeforeRemove: true })
+
+    const reconciled = await fixture.service.reconcile(target)
+
+    expect(reconciled.error).toHaveProperty('message', 'CONTENT_ARCHIVE_FAILED')
+    expect(fixture.getActiveRaw()).not.toBeNull()
+  })
+
   test('Given 批量内容准备 When 首次创建、复用并回滚 Then 只回收本轮 active 内容', async () => {
     const fixture = createFixture()
     const input = { kind: 'document' as const, contentId: 'batch-content' }

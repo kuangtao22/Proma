@@ -1849,7 +1849,7 @@ describe('stable directory native host', () => {
     const root = mkdtempSync(join(tmpdir(), 'proma-native-transaction-archive-'))
     const canvasRoot = join(root, 'canvas')
     const fileName = 'content-node-11111111-1111-4111-8111-111111111111.json'
-    const content = '{"state":"committed"}'
+    const content = '{"state":"committed","schemaVersion":1}'
     mkdirSync(canvasRoot)
     try {
       await expect(runStableDirectoryNative({
@@ -1869,6 +1869,16 @@ describe('stable directory native host', () => {
         entryId: 'aa', fileName,
       }, () => true, { helperPath: () => nativeHelperPath })
       expect(read.readOutcome).toMatchObject({ status: 'ok', content })
+      /** 语义相同但字段顺序不同不能充当原文 CAS 证明，失败后须保留活动事务。 */
+      const reordered = await runStableDirectoryNative({
+        mode: 'canvas-intent-remove', roots: [canvasRoot], childName: 'transactions',
+        fileName, content: '{"schemaVersion":1,"state":"committed"}', maxEntries: 512,
+      }, () => true, { helperPath: () => nativeHelperPath })
+      expect(reordered.writeOutcome).toMatchObject({
+        commitVisible: false,
+        error: 'canvas intent removal content changed',
+      })
+      expect(readFileSync(join(canvasRoot, 'transactions', fileName), 'utf8')).toBe(content)
       await expect(runStableDirectoryNative({
         mode: 'canvas-intent-remove', roots: [canvasRoot], childName: 'transactions',
         fileName, content, maxEntries: 512,

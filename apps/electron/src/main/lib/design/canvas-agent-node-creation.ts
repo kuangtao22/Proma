@@ -145,6 +145,8 @@ interface CanvasAgentNodeReconciledState extends CanvasAgentNodeReconciliationRe
 interface CanvasAgentNodeIntentCollection {
   creation: CanvasAgentNodeCreationIntent[]
   rebuild: CanvasAgentNodeRebuildIntent[]
+  /** 本次稳定扫描读到的原始字节，供未推进终态执行严格删除 CAS。 */
+  contentByFileName: Map<string, string>
 }
 
 /** 文件名解析后确定的事务类别与 operation 身份。 */
@@ -211,6 +213,8 @@ export class CanvasAgentNodePublishedError extends Error {
 
 /** intent 写入完成后的可信确认结果。 */
 interface CanvasIntentWriteConfirmation {
+  /** 本轮实际交给 writer/helper 的正文，用作后续严格删除 CAS。 */
+  content: string
   durabilityError?: Error
 }
 
@@ -488,7 +492,7 @@ function readIntentFile<TIntent extends CanvasAgentNodeDurableIntent>(
   parse: (raw: string, target: CanvasTarget, operationId: string) => TIntent,
   afterIntentLstat?: (filePath: string) => void,
   afterIntentRead?: (filePath: string) => void,
-): TIntent {
+): { intent: TIntent; content: string } {
   /** O_NOFOLLOW 在不支持的平台退化为 0，随后 lstat 仍拒绝链接。 */
   const noFollow = constants.O_NOFOLLOW ?? 0
   let descriptor: number | null = null
@@ -522,7 +526,7 @@ function readIntentFile<TIntent extends CanvasAgentNodeDurableIntent>(
       throw new Error('Canvas Agent 创建事务损坏：读取期间文件变化')
     }
     directoryIdentity.assertValid()
-    return parse(raw, target, operationId)
+    return { intent: parse(raw, target, operationId), content: raw }
   } finally {
     if (descriptor !== null) closeSync(descriptor)
   }
@@ -874,7 +878,11 @@ export class CanvasAgentNodeCreationService {
   ): Promise<CanvasAgentNodeIntentCollection> {
     directoryIdentity.assertValid()
     /** 当前扫描内解析出的创建和重建事务。 */
-    const intents: CanvasAgentNodeIntentCollection = { creation: [], rebuild: [] }
+    const intents: CanvasAgentNodeIntentCollection = {
+      creation: [],
+      rebuild: [],
+      contentByFileName: new Map(),
+    }
     if (!this.readTransactionsDirectory) {
       const result = await this.runNative({
         mode: 'canvas-intent-scan',
@@ -898,6 +906,7 @@ export class CanvasAgentNodeCreationService {
         } else {
           intents.rebuild.push(parseRebuildIntentJson(entry.content, target, parsedEntry.operationId))
         }
+        intents.contentByFileName.set(entry.name, entry.content)
       }
       directoryIdentity.assertValid()
       return intents
@@ -914,7 +923,7 @@ export class CanvasAgentNodeCreationService {
       if (!entry.isFile()) throw new Error('Canvas Agent 节点事务损坏：目录项类型无效')
       const filePath = join(directoryIdentity.path, entry.name)
       if (parsedEntry.kind === 'creation') {
-        intents.creation.push(readIntentFile(
+        const read = readIntentFile(
           filePath,
           target,
           parsedEntry.operationId,
@@ -922,9 +931,11 @@ export class CanvasAgentNodeCreationService {
           parseIntentJson,
           this.dependencies.afterIntentLstat,
           this.dependencies.afterIntentRead,
-        ))
+        )
+        intents.creation.push(read.intent)
+        intents.contentByFileName.set(entry.name, read.content)
       } else {
-        intents.rebuild.push(readIntentFile(
+        const read = readIntentFile(
           filePath,
           target,
           parsedEntry.operationId,
@@ -932,7 +943,9 @@ export class CanvasAgentNodeCreationService {
           parseRebuildIntentJson,
           this.dependencies.afterIntentLstat,
           this.dependencies.afterIntentRead,
-        ))
+        )
+        intents.rebuild.push(read.intent)
+        intents.contentByFileName.set(entry.name, read.content)
       }
     }
     directoryIdentity.assertValid()
@@ -954,39 +967,44 @@ export class CanvasAgentNodeCreationService {
     if (!filePattern.test(fileName)) throw new Error('Canvas Agent intent 路径无效')
     if (this.writeIntentFile) {
       const filePath = join(identity.path, fileName)
+      /** safe-file 当前写入格式不附加末尾换行。 */
+      const content = JSON.stringify(intent, null, 2)
       identity.assertValid()
       const outcome = await this.writeIntentFile(
         filePath,
         intent,
         { beforeRename: identity.assertValid },
       )
-      return this.confirmIntentWrite(identity, intent, outcome ?? {
+      return this.confirmIntentWrite(identity, intent, content, outcome ?? {
         commitVisible: true,
         durabilityUncertain: false,
       })
     }
+    /** 原生 helper 写入格式是缩进 JSON 加单个末尾换行。 */
+    const content = `${JSON.stringify(intent, null, 2)}\n`
     const result = await this.runNative({
       mode: 'canvas-intent-write',
       roots: [identity.rootPath],
       childName: 'transactions',
       fileName,
-      content: `${JSON.stringify(intent, null, 2)}\n`,
+      content,
       maxEntries: MAX_AGENT_NODE_INTENTS,
     }, identity.authorizeOpenedRoots)
     if (!result.writeOutcome) throw new Error('Canvas Agent intent helper 未返回写入结果')
-    return this.confirmIntentWrite(identity, intent, result.writeOutcome)
+    return this.confirmIntentWrite(identity, intent, content, result.writeOutcome)
   }
 
   /** 对结构化写结果执行失败传播或 rename 后可见性重扫。 */
   private async confirmIntentWrite(
     identity: CanvasTrustedDirectoryCapability,
     intent: CanvasAgentNodeDurableIntent,
+    content: string,
     outcome: StableDirectoryNativeWriteOutcome,
   ): Promise<CanvasIntentWriteConfirmation> {
     if (!outcome.commitVisible) {
       throw new Error(`CANVAS_INTENT_WRITE_FAILED: ${outcome.error ?? 'intent 未提交'}`)
     }
-    if (!outcome.durabilityUncertain) return {}
+    if (!outcome.durabilityUncertain) return { content }
     /** rename 已发生时只信任同一稳定目录 capability 的重新扫描结果。 */
     const rescanned = await this.readIntents({
       projectId: intent.projectId,
@@ -1008,6 +1026,7 @@ export class CanvasAgentNodeCreationService {
       throw new Error('CANVAS_INTENT_COMMIT_UNCONFIRMED: rename 后未找到精确 intent')
     }
     return {
+      content,
       durabilityError: new Error(
         `CANVAS_INTENT_DURABILITY_UNCERTAIN: ${outcome.error ?? '目录持久性未确认'}`,
       ),
@@ -1043,12 +1062,15 @@ export class CanvasAgentNodeCreationService {
     intent: CanvasAgentNodeCreationIntent
     document: CanvasDocument
     publishRequired: boolean
+    content?: string
     error?: Error
   }> {
     let intent = originalIntent
     let document = initialDocument
     /** 只有 committed 成功越过发布屏障后，既有 revision 才允许对外发布。 */
     let publishRequired = false
+    /** 最后一次成功可见写入的精确正文。 */
+    let content: string | undefined
     this.dependencies.assertModelAvailable(intent.channelId, intent.modelId)
 
     if (intent.state === 'prepared') {
@@ -1070,8 +1092,9 @@ export class CanvasAgentNodeCreationService {
       }
       intent = this.transitionIntent(intent, 'session-created')
       const confirmation = await this.writeIntent(identity, intent)
+      content = confirmation.content
       if (confirmation.durabilityError) {
-        return { intent, document, publishRequired, error: confirmation.durabilityError }
+        return { intent, document, publishRequired, content, error: confirmation.durabilityError }
       }
     }
 
@@ -1114,12 +1137,13 @@ export class CanvasAgentNodeCreationService {
       /** committed 是唯一发布屏障；写失败时调用方不得广播或返回 document。 */
       intent = this.transitionIntent(intent, 'committed')
       const confirmation = await this.writeIntent(identity, intent)
+      content = confirmation.content
       publishRequired = true
       if (confirmation.durabilityError) {
-        return { intent, document, publishRequired, error: confirmation.durabilityError }
+        return { intent, document, publishRequired, content, error: confirmation.durabilityError }
       }
     }
-    return { intent, document, publishRequired }
+    return { intent, document, publishRequired, ...(content === undefined ? {} : { content }) }
   }
 
   /** 在最新文档上把 prepared/session-created 重建推进到 committed。 */
@@ -1131,12 +1155,15 @@ export class CanvasAgentNodeCreationService {
     intent: CanvasAgentNodeRebuildIntent
     document: CanvasDocument
     publishRequired: boolean
+    content?: string
     error?: Error
   }> {
     let intent = originalIntent
     let document = initialDocument
     /** 节点引用换绑后必须越过 committed 屏障才能对外发布。 */
     let publishRequired = false
+    /** 最后一次成功可见写入的精确正文。 */
+    let content: string | undefined
     this.dependencies.assertModelAvailable(intent.channelId, intent.modelId)
 
     if (intent.state === 'prepared') {
@@ -1158,8 +1185,9 @@ export class CanvasAgentNodeCreationService {
       }
       intent = this.transitionRebuildIntent(intent, 'session-created')
       const confirmation = await this.writeIntent(identity, intent)
+      content = confirmation.content
       if (confirmation.durabilityError) {
-        return { intent, document, publishRequired, error: confirmation.durabilityError }
+        return { intent, document, publishRequired, content, error: confirmation.durabilityError }
       }
     }
 
@@ -1191,11 +1219,12 @@ export class CanvasAgentNodeCreationService {
       publishRequired = true
       intent = this.transitionRebuildIntent(intent, 'committed')
       const confirmation = await this.writeIntent(identity, intent)
+      content = confirmation.content
       if (confirmation.durabilityError) {
-        return { intent, document, publishRequired, error: confirmation.durabilityError }
+        return { intent, document, publishRequired, content, error: confirmation.durabilityError }
       }
     }
-    return { intent, document, publishRequired }
+    return { intent, document, publishRequired, ...(content === undefined ? {} : { content }) }
   }
 
   /** 在同一次 Store LOAD capability 上完成目标 Canvas 对账。 */
@@ -1218,6 +1247,14 @@ export class CanvasAgentNodeCreationService {
     const nodeIssues: CanvasNodeIssue[] = []
     /** 一次目录扫描同时提供创建与重建事务。 */
     const scannedIntents = await this.readIntents(target, identity)
+    /** 归档删除 CAS 默认使用 scan 原文，本轮推进成功后仅替换对应文件正文。 */
+    const archiveContentByFileName = scannedIntents.contentByFileName
+    /** 归档严格要求来自 scan 或本轮成功写入的真实正文，禁止重新序列化兜底。 */
+    const requireArchiveContent = (fileName: string): string => {
+      const content = archiveContentByFileName.get(fileName)
+      if (content === undefined) throw new Error('Canvas Agent 事务归档缺少原始正文')
+      return content
+    }
     /** 重建数组保留全部历史 operation，最新节点事务会被对账后值替换。 */
     const rebuildIntents = [...scannedIntents.rebuild]
     /** 每个节点只由 createdAt 最新的 rebuild intent 约束当前 session。 */
@@ -1247,6 +1284,12 @@ export class CanvasAgentNodeCreationService {
         ))
         if (index >= 0) rebuildIntents[index] = intent
         latestRebuildByNodeId.set(intent.nodeId, intent)
+        if (advanced.content !== undefined) {
+          archiveContentByFileName.set(
+            `agent-node-rebuild-${intent.operationId}.json`,
+            advanced.content,
+          )
+        }
         if (advanced.error) {
           reconciliationError = advanced.error
           break
@@ -1273,6 +1316,9 @@ export class CanvasAgentNodeCreationService {
         intent = advanced.intent
         document = advanced.document
         documentChanged ||= advanced.publishRequired
+        if (advanced.content !== undefined) {
+          archiveContentByFileName.set(`agent-node-${intent.operationId}.json`, advanced.content)
+        }
         if (advanced.error) {
           reconciliationError = advanced.error
           intents.push(intent)
@@ -1285,6 +1331,10 @@ export class CanvasAgentNodeCreationService {
           /** committed 后节点缺失代表用户删除引用，必须永久 detached。 */
           intent = this.transitionIntent(intent, 'detached')
           const confirmation = await this.writeIntent(identity, intent)
+          archiveContentByFileName.set(
+            `agent-node-${intent.operationId}.json`,
+            confirmation.content,
+          )
           if (confirmation.durabilityError) {
             reconciliationError = confirmation.durabilityError
             intents.push(intent)
@@ -1355,12 +1405,12 @@ export class CanvasAgentNodeCreationService {
             aliases: [
               ...(intent.state === 'committed' ? [`agent-node-${intent.sessionId}.json`] : []),
             ],
-            content: `${JSON.stringify(intent, null, 2)}\n`,
+            content: requireArchiveContent(`agent-node-${intent.operationId}.json`),
           })),
           ...rebuildIntents.map((intent) => ({
             name: `agent-node-rebuild-${intent.operationId}.json`,
             aliases: [`agent-node-rebuild-${intent.replacementSessionId}.json`],
-            content: `${JSON.stringify(intent, null, 2)}\n`,
+            content: requireArchiveContent(`agent-node-rebuild-${intent.operationId}.json`),
           })),
         ])
       } catch (error) {

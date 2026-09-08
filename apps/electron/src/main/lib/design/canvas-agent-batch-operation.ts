@@ -11,7 +11,7 @@ import type {
 } from '@proma/shared'
 import { parseCanvasTrashEntry } from '@proma/shared'
 import { runStableDirectoryNative } from '../stable-directory-native-host'
-import type { StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
+import type { StableDirectoryNativeHost, StableDirectoryNativeWriteOutcome } from '../stable-directory-native-host'
 import type { CanvasDocumentStore, CanvasTrustedDirectoryCapability } from './canvas-document-store'
 import type { CanvasContentNodeLifecycle } from './canvas-content-node-lifecycle'
 import type { CanvasAgentNodeCreationService } from './canvas-agent-node-creation'
@@ -57,6 +57,12 @@ export interface CanvasBatchOperationIntent {
   operations: CanvasMutation[]
 }
 
+/** 单次稳定扫描中已严格解析的 intent 与同一文件原始正文。 */
+interface ScannedCanvasBatchOperationIntent {
+  intent: CanvasBatchOperationIntent
+  content: string
+}
+
 export interface CanvasAgentBatchOperationDependencies {
   store: {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
@@ -72,6 +78,8 @@ export interface CanvasAgentBatchOperationDependencies {
   publish: (target: CanvasTarget, document: CanvasDocument, source: CanvasChangeSource) => void | Promise<void>
   scanIntents?: (target: CanvasTarget) => Promise<CanvasBatchOperationIntent[]>
   writeIntent?: (intent: CanvasBatchOperationIntent) => Promise<StableDirectoryNativeWriteOutcome>
+  /** 测试可替换原生 helper，生产默认使用进程级稳定目录执行器。 */
+  runStableDirectoryNative?: StableDirectoryNativeHost['run']
   /** 测试注入的终态归档器；生产绑定目标 Canvas 根。 */
   archive?: CanvasTransactionArchive
   contentLifecycle: Pick<CanvasContentNodeLifecycle, 'inspectBatchContent' | 'prepareBatchContent' | 'cleanupBatchContent' | 'prepareBatchDeletions' | 'restoreBatchDeletions' | 'assertBatchAgentNodeIdle'>
@@ -469,6 +477,8 @@ function contentInput(node: CanvasNode) {
 export function createCanvasAgentBatchOperationService(dependencies: CanvasAgentBatchOperationDependencies) {
   const randomUUID = dependencies.randomUUID ?? createRandomUUID
   const now = dependencies.now ?? Date.now
+  /** 测试可替换原生 helper；扫描、写入与归档必须共享同一执行边界。 */
+  const runNative = dependencies.runStableDirectoryNative ?? runStableDirectoryNative
 
   /** 取得测试归档器，或为生产目录创建精确分片访问。 */
   const archiveFor = (target: CanvasTarget): CanvasTransactionArchive | null => {
@@ -476,7 +486,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     if (dependencies.scanIntents || dependencies.writeIntent) return null
     const loaded = dependencies.store.loadWithDirectoryCapability?.(target)
     return loaded
-      ? createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'))
+      ? createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'), { run: runNative })
       : null
   }
 
@@ -537,18 +547,26 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
   }
 
   /** 使用稳定目录 helper 扫描批量 intent，测试可注入内存实现。 */
-  const scan = async (target: CanvasTarget): Promise<CanvasBatchOperationIntent[]> => {
-    if (dependencies.scanIntents) return dependencies.scanIntents(target)
+  const scan = async (target: CanvasTarget): Promise<ScannedCanvasBatchOperationIntent[]> => {
+    if (dependencies.scanIntents) {
+      return (await dependencies.scanIntents(target)).map((intent) => ({
+        intent,
+        content: `${JSON.stringify(intent, null, 2)}\n`,
+      }))
+    }
     const loaded = dependencies.store.loadWithDirectoryCapability?.(target)
     if (!loaded) throw new Error('CANVAS_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_BATCH_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
-    const intents: CanvasBatchOperationIntent[] = []
+    const result = await runNative({ mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions', maxDepth: 0, maxEntries: MAX_BATCH_INTENT_SCAN_ENTRIES, maxOutputBytes: 40 * 1024 * 1024 }, directory.authorizeOpenedRoots)
+    const intents: ScannedCanvasBatchOperationIntent[] = []
     for (const entry of result.entries) {
       const match = BATCH_INTENT_PATTERN.exec(entry.name)
       if (!match) continue
       if (entry.isDirectory || typeof entry.content !== 'string') throw new Error('CANVAS_BATCH_INTENT_INVALID')
-      intents.push(parseIntent(JSON.parse(entry.content), target, match[1]!))
+      intents.push({
+        intent: parseIntent(JSON.parse(entry.content), target, match[1]!),
+        content: entry.content,
+      })
     }
     directory.assertValid()
     return intents
@@ -560,7 +578,7 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     source: CanvasChangeSource,
   ): Promise<CanvasBatchOperationIntent | null> => {
     /** source 三元组必须全部一致，同 toolCallId 的其它运行不构成重放。 */
-    const matches = (await scan(target)).filter((intent) => (
+    const matches = (await scan(target)).map((entry) => entry.intent).filter((intent) => (
       intent.source.sessionId === source.sessionId
       && intent.source.runStartedAt === source.runStartedAt
       && intent.source.toolCallId === source.toolCallId
@@ -585,13 +603,13 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
       const loaded = dependencies.store.loadWithDirectoryCapability?.(intent.target)
       if (!loaded) throw new Error('CANVAS_BATCH_DIRECTORY_CAPABILITY_MISSING')
       const directory: CanvasTrustedDirectoryCapability = loaded.openSingleChildDirectory('transactions')
-      const result = await runStableDirectoryNative({ mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions', fileName: `canvas-batch-${intent.operationId}.json`, content: `${JSON.stringify(intent, null, 2)}\n`, maxEntries: MAX_BATCH_INTENTS }, directory.authorizeOpenedRoots)
+      const result = await runNative({ mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions', fileName: `canvas-batch-${intent.operationId}.json`, content: `${JSON.stringify(intent, null, 2)}\n`, maxEntries: MAX_BATCH_INTENTS }, directory.authorizeOpenedRoots)
       if (!result.writeOutcome) throw new Error('CANVAS_BATCH_INTENT_WRITE_FAILED')
       outcome = result.writeOutcome
     }
     if (!outcome.commitVisible) throw new Error(`CANVAS_BATCH_INTENT_WRITE_FAILED: ${outcome.error ?? 'intent 未提交'}`)
     if (!outcome.durabilityUncertain) return
-    const visible = (await scan(intent.target)).some((candidate) => JSON.stringify(candidate) === JSON.stringify(intent))
+    const visible = (await scan(intent.target)).some((candidate) => JSON.stringify(candidate.intent) === JSON.stringify(intent))
     if (!visible) throw new Error('CANVAS_BATCH_INTENT_COMMIT_UNCONFIRMED')
     throw new CanvasBatchRecoveryRequiredError(`CANVAS_BATCH_INTENT_DURABILITY_UNCERTAIN: ${outcome.error ?? '目录持久性未确认'}`)
   }
@@ -753,7 +771,8 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
     let operationId = ''
     const publications: CanvasBatchPublication[] = []
     try {
-      for (const original of await scan(target)) {
+      for (const scanned of await scan(target)) {
+        const original = scanned.intent
         operationId = original.operationId
         if (original.state === 'committed' || original.state === 'rolled-back') continue
         /** 只有仍处于 base 的权威图才能证明并执行磁盘资源计划。 */
@@ -784,10 +803,10 @@ export function createCanvasAgentBatchOperationService(dependencies: CanvasAgent
         }
       }
       const terminal = await scan(target)
-      await archiveFor(target)?.archiveEntries(terminal.map((intent) => ({
+      await archiveFor(target)?.archiveEntries(terminal.map(({ intent, content }) => ({
         name: `canvas-batch-${intent.operationId}.json`,
         aliases: [createCanvasBatchReplayArchiveName(intent.source)],
-        content: `${JSON.stringify(intent, null, 2)}\n`,
+        content,
       })))
     } catch (error) {
       const causeError = error instanceof CanvasBatchOperationPublishedError

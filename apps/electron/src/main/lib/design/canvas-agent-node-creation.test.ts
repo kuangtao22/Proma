@@ -27,6 +27,16 @@ const OPERATION_ID = '11111111-1111-4111-8111-111111111111'
 const SESSION_ID = '22222222-2222-4222-8222-222222222222'
 const REBUILD_OPERATION_ID = '55555555-5555-4555-8555-555555555555'
 const REPLACEMENT_SESSION_ID = '66666666-6666-4666-8666-666666666666'
+/** 同一测试进程只构建一次真实 helper，避免多个 native 回归重复编译。 */
+let nativeHelperBuilt = false
+
+/** 确保真实 native helper 已按当前源码构建。 */
+function buildNativeHelper(): void {
+  if (nativeHelperBuilt) return
+  const appDir = resolve(import.meta.dir, '../../../..')
+  execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+  nativeHelperBuilt = true
+}
 
 /** 创建可变内存文档与真实 intent 目录组合的测试夹具。 */
 function createHarness(options: {
@@ -46,6 +56,8 @@ function createHarness(options: {
   sessionIds?: string[]
   /** 首次非空终态归档失败，用于验证已提交 revision 仍随对账结果返回。 */
   failArchiveOnce?: boolean
+  /** 在真实 helper 删除 active 前修改测试文件，验证 expectedContent CAS 继续 fail closed。 */
+  beforeNativeIntentRemove?: (paths: { canvasRoot: string; transactionsDir: string }) => void
 } = {}) {
   /** 测试目标的双重身份。 */
   const target: CanvasTarget = {
@@ -174,16 +186,17 @@ function createHarness(options: {
     } : {}),
     ...(options.nativeIntentIo
       ? {
-          runStableDirectoryNative: (request, authorize) => runStableDirectoryNative(
-            request,
-            authorize,
-            {
+          runStableDirectoryNative: (request, authorize) => {
+            if (request.mode === 'canvas-intent-remove') {
+              options.beforeNativeIntentRemove?.({ canvasRoot, transactionsDir })
+            }
+            return runStableDirectoryNative(request, authorize, {
               helperPath: () => resolve(
                 import.meta.dir,
                 `../../../../resources/stable-directory/stable-directory-helper${process.platform === 'win32' ? '.exe' : ''}`,
               ),
-            },
-          ),
+            })
+          },
         }
       : {
           readTransactionsDirectory: (directoryPath: string) => {
@@ -307,8 +320,7 @@ describe('Canvas Agent 节点创建事务', () => {
   })
 
   test('Given 生产 native intent I/O When 创建并重放同一 operation Then helper 扫描写入且只创建一次 session', async () => {
-    const appDir = resolve(import.meta.dir, '../../../..')
-    execFileSync(process.execPath, [resolve(appDir, 'scripts/build-stable-directory-native.ts')], { stdio: 'pipe' })
+    buildNativeHelper()
     const harness = createHarness({ nativeIntentIo: true })
 
     const first = await harness.createService().create(createInput(harness.target))
@@ -324,6 +336,161 @@ describe('Canvas Agent 节点创建事务', () => {
       .find((path) => existsSync(path))
     expect(archivedIntent).toBeDefined()
     expect(JSON.parse(readFileSync(archivedIntent!, 'utf8'))).toMatchObject({ state: 'committed' })
+  }, 30_000)
+
+  test('Given 旧格式 committed Agent intent When LOAD 归档 Then 原始字节用于删除 active', async () => {
+    buildNativeHelper()
+    const harness = createHarness({ nativeIntentIo: true })
+    /** 使用非生产缩进与字段顺序，复现 parser 重建正文导致 expectedContent 漂移。 */
+    const legacyContent = JSON.stringify({
+      updatedAt: 10,
+      state: 'committed',
+      schemaVersion: 1,
+      operationId: OPERATION_ID,
+      projectId: harness.target.projectId,
+      canvasId: harness.target.canvasId,
+      nodeId: 'node-1',
+      sessionId: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      position: { x: 120, y: 80 },
+      createdAt: 1,
+    })
+    writeFileSync(harness.intentPath, legacyContent, 'utf8')
+    harness.sessions.set(SESSION_ID, {
+      id: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      workspaceId: harness.target.projectId,
+      sourceCanvasProjectId: harness.target.projectId,
+      sourceCanvasId: harness.target.canvasId,
+      sourceCanvasNodeId: 'node-1',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    harness.setDocument({
+      ...harness.getDocument(),
+      revision: 1,
+      nodes: [{
+        id: 'node-1',
+        kind: 'agent',
+        title: '首页设计 Agent',
+        position: { x: 120, y: 80 },
+        agentSessionId: SESSION_ID,
+      }],
+    })
+
+    const reconciled = await harness.createService().reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(existsSync(harness.intentPath)).toBe(false)
+    const archivedIntent = readdirSync(join(harness.canvasRoot, 'transaction-archive'))
+      .map((shard) => join(harness.canvasRoot, 'transaction-archive', shard, `agent-node-${OPERATION_ID}.json`))
+      .find((path) => existsSync(path))
+    expect(archivedIntent).toBeDefined()
+    expect(readFileSync(archivedIntent!, 'utf8')).toBe(legacyContent)
+  }, 30_000)
+
+  test('Given 旧格式 session-created Agent intent When 同轮推进 committed Then 归档使用最新写入字节', async () => {
+    buildNativeHelper()
+    const harness = createHarness({ nativeIntentIo: true })
+    /** 旧正文会在本轮被 committed 写替换，归档不得继续使用 scan 原文。 */
+    const legacyContent = JSON.stringify({
+      updatedAt: 9,
+      state: 'session-created',
+      schemaVersion: 1,
+      operationId: OPERATION_ID,
+      projectId: harness.target.projectId,
+      canvasId: harness.target.canvasId,
+      nodeId: 'node-1',
+      sessionId: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      position: { x: 120, y: 80 },
+      createdAt: 1,
+    })
+    writeFileSync(harness.intentPath, legacyContent, 'utf8')
+    harness.sessions.set(SESSION_ID, {
+      id: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      workspaceId: harness.target.projectId,
+      sourceCanvasProjectId: harness.target.projectId,
+      sourceCanvasId: harness.target.canvasId,
+      sourceCanvasNodeId: 'node-1',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const reconciled = await harness.createService().reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(reconciled.documentChanged).toBe(true)
+    expect(existsSync(harness.intentPath)).toBe(false)
+    const archivedIntent = readdirSync(join(harness.canvasRoot, 'transaction-archive'))
+      .map((shard) => join(harness.canvasRoot, 'transaction-archive', shard, `agent-node-${OPERATION_ID}.json`))
+      .find((path) => existsSync(path))
+    expect(archivedIntent).toBeDefined()
+    const archivedContent = readFileSync(archivedIntent!, 'utf8')
+    expect(archivedContent).not.toBe(legacyContent)
+    expect(archivedContent.endsWith('\n')).toBe(true)
+    expect(JSON.parse(archivedContent)).toMatchObject({ state: 'committed', updatedAt: 10 })
+  }, 30_000)
+
+  test('Given committed Agent intent 在 scan 后被改写 When 归档删除 Then native CAS 拒绝真实内容变化', async () => {
+    buildNativeHelper()
+    let contentChanged = false
+    const harness = createHarness({
+      nativeIntentIo: true,
+      beforeNativeIntentRemove: ({ transactionsDir }) => {
+        if (contentChanged) return
+        contentChanged = true
+        writeFileSync(join(transactionsDir, `agent-node-${OPERATION_ID}.json`), '{"changed":true}', 'utf8')
+      },
+    })
+    const committedContent = JSON.stringify({
+      schemaVersion: 1,
+      operationId: OPERATION_ID,
+      projectId: harness.target.projectId,
+      canvasId: harness.target.canvasId,
+      nodeId: 'node-1',
+      sessionId: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      position: { x: 120, y: 80 },
+      state: 'committed',
+      createdAt: 1,
+      updatedAt: 10,
+    })
+    writeFileSync(harness.intentPath, committedContent, 'utf8')
+    harness.sessions.set(SESSION_ID, {
+      id: SESSION_ID,
+      title: '首页设计 Agent',
+      channelId: 'channel-old',
+      workspaceId: harness.target.projectId,
+      sourceCanvasProjectId: harness.target.projectId,
+      sourceCanvasId: harness.target.canvasId,
+      sourceCanvasNodeId: 'node-1',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    harness.setDocument({
+      ...harness.getDocument(),
+      revision: 1,
+      nodes: [{
+        id: 'node-1',
+        kind: 'agent',
+        title: '首页设计 Agent',
+        position: { x: 120, y: 80 },
+        agentSessionId: SESSION_ID,
+      }],
+    })
+
+    const reconciled = await harness.createService().reconcile(harness.target)
+
+    expect(contentChanged).toBe(true)
+    expect(reconciled.error).toHaveProperty('message', 'CANVAS_TRANSACTION_ARCHIVE_REMOVE_FAILED')
+    expect(readFileSync(harness.intentPath, 'utf8')).toBe('{"changed":true}')
   }, 30_000)
 
   test('Given intent 在 lstat 后被同名新 inode 替换 When 打开读取 Then 拒绝 replacement', async () => {
