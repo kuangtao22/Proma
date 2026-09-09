@@ -1390,10 +1390,16 @@ export class AgentOrchestrator {
           return { behavior: 'deny', message }
         }
 
-        /** 付费或高影响工具即使在 bypassPermissions 下也必须按 toolUseID 逐次确认。 */
+        /** 付费或高影响工具按可信运行策略决定逐次确认或自动执行，plan 与中止始终优先拒绝。 */
         if (extensions.singleApprovalToolNames?.includes(toolName)) {
           if (currentMode === 'plan') {
             return { behavior: 'deny' as const, message: '计划模式下不能执行需要逐次批准的工具，请在计划获批后执行。' }
+          }
+          if (options.signal.aborted) {
+            return { behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID }
+          }
+          if (extensions.toolApprovalPolicy?.getMode(toolName) === 'automatic') {
+            return { behavior: 'allow' as const, updatedInput: input, toolUseID: options.toolUseID }
           }
           const result = await permissionService.requestSingleApproval(
             sessionId,
@@ -1404,6 +1410,13 @@ export class AgentOrchestrator {
               if (denyStaleToolRun()) return
               this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
             },
+            extensions.toolApprovalPolicy ? {
+              policy: extensions.toolApprovalPolicy,
+              onResolved: (requestId, behavior) => {
+                if (denyStaleToolRun()) return
+                this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_resolved', requestId, behavior } })
+              },
+            } : undefined,
           )
           return revalidateSingleApprovalResult(result, denyStaleToolRun, getPermissionMode)
         }

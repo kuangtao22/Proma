@@ -200,6 +200,8 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
         ...(prepared.extensions.singleApprovalToolNames ?? []),
         ...canvasRun.singleApprovalToolNames,
       ],
+      /** 用户保存的媒体授权策略随同工具进入运行，避免普通 Agent 丢失自主权限。 */
+      ...(canvasRun.toolApprovalPolicy ? { toolApprovalPolicy: canvasRun.toolApprovalPolicy } : {}),
       allowedToolNamesMode: canvasRun.allowedToolNamesMode,
     },
   }

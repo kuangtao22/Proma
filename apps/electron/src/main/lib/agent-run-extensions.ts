@@ -2,6 +2,14 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { ImageGenerationModelSnapshot } from '@proma/shared'
 import type { ResolveImageGenerationRoute } from './image-generation-runtime'
 
+/** 高影响工具的动态审批策略，只能作用于本轮显式列入逐次审批名单的工具。 */
+export interface AgentToolApprovalPolicy {
+  /** 返回指定工具当前应逐次询问，还是由 Agent 自动执行。 */
+  getMode(toolName: string): 'ask' | 'automatic'
+  /** 订阅策略变化；返回值用于在工具审批结束时释放监听。 */
+  subscribe(listener: () => void): () => void
+}
+
 /**
  * 仅主进程内部传递的单次 Agent 运行扩展。
  * 不经过 IPC、会话 JSONL 或全局工具配置持久化。
@@ -25,6 +33,8 @@ export interface AgentRunExtensions {
   toolCallLimits?: Readonly<Record<string, number>>
   /** 即使处于 bypassPermissions，也必须按 toolUseID 逐次请求用户批准的工具名。 */
   singleApprovalToolNames?: readonly string[]
+  /** 仅对 singleApprovalToolNames 生效的可信动态审批策略。 */
+  toolApprovalPolicy?: AgentToolApprovalPolicy
   /** 工具参数校验和次数占位后、真实执行前的同步运行守卫。 */
   beforeToolCall?: (toolName: string, input: Readonly<Record<string, unknown>>) => void
   /** Design 可信图片工具在执行前回传的真实摘要和精确提示词。 */

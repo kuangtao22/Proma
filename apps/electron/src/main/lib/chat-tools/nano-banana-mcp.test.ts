@@ -39,6 +39,9 @@ interface TestToolResultDetails {
   toolUseId?: string
   generated?: boolean
   imageAttachments?: AgentToolResultImage[]
+  error?: {
+    message: string
+  }
 }
 
 interface TestToolDefinition {
@@ -204,6 +207,54 @@ describe('Nano Banana Pi 工具附件来源', () => {
     expect(succeeded.terminate).toBe(true)
     expect(failed.terminate).toBe(true)
     expect(failed.content[0]?.text).toContain('upstream timed out')
+  })
+
+  test('Given GPT Image 服务返回 503 When Design 图片工具结束 Then 返回可信失败结构且保留服务错误', async () => {
+    fetchImplementation = async () => new Response(JSON.stringify({
+      error: { message: 'No available compatible accounts' },
+    }), { status: 503, headers: { 'content-type': 'application/json' } })
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-gpt-unavailable',
+      name: 'GPT Image 2',
+      executor: 'openai-images',
+      channelId: 'channel-gpt',
+      modelId: 'gpt-image-2',
+    }
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-gpt-unavailable',
+      trustedImageRoute,
+      resolveTrustedImageRoute: (snapshot) => {
+        if (snapshot.executor !== 'openai-images') throw new Error('测试预期 OpenAI Images 路由')
+        return {
+          executor: 'openai-images',
+          snapshot,
+          baseUrl: 'https://images.example.test/v1',
+          apiKey: 'gpt-secret',
+        }
+      },
+    }) as unknown as TestToolDefinition[]
+
+    const result = await tool!.execute('tool-gpt-unavailable', {
+      designSummary: '验证上游账户不可用时的失败传播。',
+      prompt: 'draw',
+    })
+
+    expect(result.terminate).toBe(true)
+    expect(result.content[0]?.text).toContain('生图服务请求失败 (503)')
+    expect(result.content[0]?.text).toContain('No available compatible accounts')
+    expect(result.details).toEqual({
+      source: 'proma-nano-banana',
+      toolUseId: 'tool-gpt-unavailable',
+      generated: false,
+      imageAttachments: [],
+      error: {
+        message: '生图服务请求失败 (503)：No available compatible accounts',
+      },
+    })
+    expect(saveAttachmentMock).toHaveBeenCalledTimes(0)
   })
 
   test('Given Design 可信工具缺少摘要 When 执行 Then 在网络和捕获前拒绝', async () => {

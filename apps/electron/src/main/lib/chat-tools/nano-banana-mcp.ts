@@ -94,6 +94,10 @@ interface NanoBananaToolResultDetails {
   toolUseId: string
   generated: boolean
   imageAttachments: AgentToolResultImage[]
+  /** 与工具文本一致的失败诊断，供运行时可靠识别本次失败。 */
+  error?: {
+    message: string
+  }
 }
 
 // ===== Gemini API 调用 =====
@@ -499,10 +503,16 @@ export function buildPiNanoBananaTools(
         if (error instanceof Error && error.name === 'AbortError') throw error
         const message = error instanceof Error ? error.message : String(error)
         console.error('[Nano Banana Pi 工具] 执行失败:', error)
-        const toolResult = {
+        const toolResult: AgentToolResult<NanoBananaToolResultDetails> = {
           content: [{ type: 'text', text: `图片生成失败: ${message}` }],
-          details: { generated: false },
-        } as AgentToolResult<unknown>
+          details: {
+            source: 'proma-nano-banana',
+            toolUseId: toolCallId,
+            generated: false,
+            imageAttachments: [],
+            error: { message },
+          },
+        }
         /** 失败同样终止本轮，避免一次性付费工具被模型自行重试。 */
         return ctx.trustedImageRoute ? { ...toolResult, terminate: true } : toolResult
       }

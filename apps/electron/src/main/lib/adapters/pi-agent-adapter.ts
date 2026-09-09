@@ -1367,11 +1367,14 @@ export function installRuntimeGuardHooks(session: AgentSession, guard: AgentRunt
       ...resultAfterPreviousHooks,
       content: sanitizedContent,
     })
+    /** 当前调用是否携带 Nano Banana 自己签发的失败诊断。 */
+    const nanoBananaFailure = isTrustedNanoBananaFailure(context.toolCall.name, context.toolCall.id, resultAfterPreviousHooks.details)
 
     if (
       !previousResult
       && guardedResult.terminate === context.result.terminate
       && sanitizedContent === context.result.content
+      && !nanoBananaFailure
     ) {
       return undefined
     }
@@ -1380,6 +1383,7 @@ export function installRuntimeGuardHooks(session: AgentSession, guard: AgentRunt
       ...previousResult,
       content: sanitizedContent,
       terminate: guardedResult.terminate,
+      ...(nanoBananaFailure ? { isError: true } : {}),
     }
   }
 
@@ -1393,6 +1397,19 @@ export function installRuntimeGuardHooks(session: AgentSession, guard: AgentRunt
     }
     return previousSnapshot
   }
+}
+
+/** 仅把 Nano Banana 自己签发且与当前调用绑定的上游失败提升为 Pi 错误。 */
+function isTrustedNanoBananaFailure(toolName: string, toolUseId: string, details: unknown): boolean {
+  if (toolName !== 'mcp__nano_banana__generate_image' || !isRecord(details)) return false
+  if (details.source !== 'proma-nano-banana' || details.toolUseId !== toolUseId || details.generated !== false) return false
+  if (!Array.isArray(details.imageAttachments) || details.imageAttachments.length !== 0) return false
+  return isRecord(details.error) && typeof details.error.message === 'string' && details.error.message.trim().length > 0
+}
+
+/** 把未知结构收窄为普通对象，避免错误详情参与运行时控制时抛出异常。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 export class PiAgentAdapter implements AgentProviderAdapter {

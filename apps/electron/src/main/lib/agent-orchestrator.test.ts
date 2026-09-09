@@ -386,6 +386,25 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(body.slice(approvalIndex, bypassIndex)).toContain('await permissionService.requestSingleApproval(')
     expect(body.slice(approvalIndex, bypassIndex)).toContain('return denyStaleToolRun() ?? result')
     expect(body.slice(approvalIndex, bypassIndex)).toContain("currentMode === 'plan'")
+    expect(body.slice(approvalIndex, bypassIndex)).toContain('options.signal.aborted')
+    expect(body.slice(approvalIndex, bypassIndex)).toContain("extensions.toolApprovalPolicy?.getMode(toolName) === 'automatic'")
+    expect(body.slice(approvalIndex, bypassIndex)).toContain('toolUseID: options.toolUseID')
+    expect(body.slice(approvalIndex, bypassIndex)).toContain('policy: extensions.toolApprovalPolicy')
+    expect(body.slice(approvalIndex, bypassIndex)).toContain("type: 'permission_resolved'")
+  })
+
+  test('Given 非媒体高风险工具 When 存在媒体自动审批策略 Then 仍走各自逐次审批分支', () => {
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const start = source.indexOf('const canUseTool = async')
+    const end = source.indexOf('// 13. 构建 Adapter 查询选项', start)
+    const body = source.slice(start, end)
+    const policyIndex = body.indexOf("extensions.toolApprovalPolicy?.getMode(toolName) === 'automatic'")
+    const serverOpsIndex = body.indexOf("if (toolName === 'server_exec' || toolName === 'server_docker_action' || toolName === 'server_files_mutate')")
+
+    expect(policyIndex).toBeGreaterThan(body.indexOf('extensions.singleApprovalToolNames?.includes(toolName)'))
+    expect(policyIndex).toBeLessThan(serverOpsIndex)
+    expect(body.slice(serverOpsIndex, body.indexOf('// 视觉助手', serverOpsIndex)))
+      .not.toContain('toolApprovalPolicy')
   })
 
   test('Given bypass 模式的文件和容器变更 When 进入权限边界 Then 先逐次审批并复核当前运行代次', () => {

@@ -23,6 +23,7 @@ import {
   isDangerousCommand,
   hasDangerousStructure,
 } from '@proma/shared'
+import type { AgentToolApprovalPolicy } from './agent-run-extensions'
 
 /** SDK PermissionBehavior */
 type PermissionBehavior = 'allow' | 'deny'
@@ -115,6 +116,15 @@ interface PendingPermission {
   request: PermissionRequest
   /** SDK 工具调用身份，确保审批结果只释放对应调用。 */
   toolUseID?: string
+  /** 移除 abort 与动态策略监听，确保任一终态后不再响应迟到事件。 */
+  cleanup?: () => void
+}
+
+/** 动态自动批准只在编排器已经判定为逐次审批工具后传入。 */
+interface DynamicSingleApprovalOptions {
+  policy: AgentToolApprovalPolicy
+  /** 审批卡片已展示后自动释放时，通知 Renderer 清理对应 UI。 */
+  onResolved(requestId: string, behavior: PermissionBehavior): void
 }
 
 /** 会话级白名单 */
@@ -224,6 +234,24 @@ export class AgentPermissionService {
   /** 会话级白名单 Map（sessionId → SessionWhitelist） */
   private sessionWhitelists = new Map<string, SessionWhitelist>()
 
+  /** 原子消费一个待处理请求，并在 resolve 前释放全部监听。 */
+  private settlePending(requestId: string, result: PermissionResult): PendingPermission | undefined {
+    const pending = this.pendingPermissions.get(requestId)
+    if (!pending) return undefined
+    this.pendingPermissions.delete(requestId)
+    pending.cleanup?.()
+    pending.resolve(result)
+    return pending
+  }
+
+  /** 丢弃尚未展示成功的审批请求，并释放其全部监听。 */
+  private discardPending(requestId: string): void {
+    const pending = this.pendingPermissions.get(requestId)
+    if (!pending) return
+    this.pendingPermissions.delete(requestId)
+    pending.cleanup?.()
+  }
+
   /**
    * 创建 canUseTool 回调（auto 模式及 escalation 场景使用）
    *
@@ -285,20 +313,74 @@ export class AgentPermissionService {
     input: Record<string, unknown>,
     options: CanUseToolOptions,
     sendToRenderer: (request: PermissionRequest) => void,
+    dynamic?: DynamicSingleApprovalOptions,
   ): Promise<PermissionResult> {
     const request: PermissionRequest = {
       ...this.buildPermissionRequest(sessionId, toolName, input, options),
       dangerLevel: 'dangerous',
       allowAlways: false,
     }
-    sendToRenderer(request)
     return new Promise<PermissionResult>((resolve) => {
-      this.pendingPermissions.set(request.requestId, { resolve, request, toolUseID: options.toolUseID })
-      options.signal.addEventListener('abort', () => {
-        if (!this.pendingPermissions.has(request.requestId)) return
-        this.pendingPermissions.delete(request.requestId)
-        resolve({ behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID })
-      }, { once: true })
+      let requestSent = false
+      let unsubscribePolicy: (() => void) | undefined
+      /** 中止与策略变化共用 settle，避免同一 toolUseID 被重复释放。 */
+      const onAbort = (): void => {
+        this.settlePending(request.requestId, {
+          behavior: 'deny', message: '操作已中止', toolUseID: options.toolUseID,
+        })
+      }
+      const approveIfAutomatic = (): void => {
+        let mode: 'ask' | 'automatic'
+        try {
+          mode = dynamic?.policy.getMode(toolName) ?? 'ask'
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const settled = this.settlePending(request.requestId, {
+            behavior: 'deny', message: `审批策略读取失败：${message}`, toolUseID: options.toolUseID,
+          })
+          if (settled && requestSent) dynamic?.onResolved(request.requestId, 'deny')
+          return
+        }
+        if (mode !== 'automatic') return
+        const settled = this.settlePending(request.requestId, {
+          behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID,
+        })
+        if (settled && requestSent) dynamic?.onResolved(request.requestId, 'allow')
+      }
+      this.pendingPermissions.set(request.requestId, {
+        resolve,
+        request,
+        toolUseID: options.toolUseID,
+        cleanup: () => {
+          options.signal.removeEventListener('abort', onAbort)
+          unsubscribePolicy?.()
+        },
+      })
+      options.signal.addEventListener('abort', onAbort, { once: true })
+      /** AbortSignal 不会向迟注册的监听器回放事件，必须在自动批准前同步复核。 */
+      if (options.signal.aborted) {
+        onAbort()
+        return
+      }
+      try {
+        if (dynamic) {
+          unsubscribePolicy = dynamic.policy.subscribe(approveIfAutomatic)
+          /** subscribe 可同步触发 listener；这种情况下立即释放刚返回的取消订阅函数。 */
+          if (!this.pendingPermissions.has(request.requestId)) {
+            unsubscribePolicy()
+            return
+          }
+          approveIfAutomatic()
+          if (!this.pendingPermissions.has(request.requestId)) return
+        }
+        requestSent = true
+        sendToRenderer(request)
+        /** 覆盖策略在展示审批卡片的同一调用栈中变化但订阅未通知的实现。 */
+        approveIfAutomatic()
+      } catch (error) {
+        this.discardPending(request.requestId)
+        throw error
+      }
     })
   }
 
@@ -318,12 +400,11 @@ export class AgentPermissionService {
       this.addToWhitelist(sessionId, pending.request.toolName, pending.request.toolInput)
     }
 
-    pending.resolve(
+    this.settlePending(requestId,
       behavior === 'allow'
         ? { behavior: 'allow' as const, updatedInput: pending.request.toolInput, toolUseID: pending.toolUseID }
         : { behavior: 'deny' as const, message: '用户拒绝了此操作', toolUseID: pending.toolUseID }
     )
-    this.pendingPermissions.delete(requestId)
     return sessionId
   }
 
@@ -342,8 +423,7 @@ export class AgentPermissionService {
   clearSessionPending(sessionId: string): void {
     for (const [requestId, pending] of this.pendingPermissions) {
       if (pending.request.sessionId === sessionId) {
-        pending.resolve({ behavior: 'deny' as const, message: '会话已结束', toolUseID: pending.toolUseID })
-        this.pendingPermissions.delete(requestId)
+        this.settlePending(requestId, { behavior: 'deny' as const, message: '会话已结束', toolUseID: pending.toolUseID })
       }
     }
   }

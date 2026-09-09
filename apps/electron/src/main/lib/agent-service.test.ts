@@ -62,6 +62,7 @@ describe('Agent service 迁移准入', () => {
     expect(source).toContain('prepareAgentRun(createAgentQueueNowInput(candidate), {}, webContents.id)')
     expect(source).toContain('...(dialogOwnerWebContentsId !== undefined ? { dialogOwnerWebContentsId } : {})')
     expect(source).toContain('prepared.references')
+    expect(source).toContain('toolApprovalPolicy: canvasRun.toolApprovalPolicy')
     expect(source).toContain('isEligibleProjectAgent(sessionMeta, sessionMeta.workspaceId)')
     expect(source).toContain("((prepared.input as AgentSendInput).permissionModeOverride ?? sessionMeta.permissionMode) === 'plan'")
     expect(source).not.toContain('resolveCanvasToolUserIntent')

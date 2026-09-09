@@ -5,9 +5,31 @@ import {
   revalidateSingleApprovalResult,
   type CanUseToolOptions,
 } from './agent-permission-service'
+import type { AgentToolApprovalPolicy } from './agent-run-extensions'
 
 function permissionOptions(signal: AbortSignal, toolUseID: string): CanUseToolOptions {
   return { signal, toolUseID, displayName: '删除分组', description: '删除 Todo 分组' }
+}
+
+/** 提供可切换且可观察订阅清理的媒体工具审批策略。 */
+function approvalPolicy(initialMode: 'ask' | 'automatic' = 'ask'): AgentToolApprovalPolicy & {
+  setMode(mode: 'ask' | 'automatic'): void
+  listenerCount(): number
+} {
+  let mode = initialMode
+  const listeners = new Set<() => void>()
+  return {
+    getMode: () => mode,
+    subscribe: (listener) => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    setMode: (nextMode) => {
+      mode = nextMode
+      for (const listener of [...listeners]) listener()
+    },
+    listenerCount: () => listeners.size,
+  }
 }
 
 describe('服务器远程命令权限', () => {
@@ -128,6 +150,168 @@ test('Given 两个逐次审批工具调用 When 只批准其中一个 Then 结�
   expect(service.getPendingRequestOwner(requestIds[1]!)).toBe('session-canvas')
   expect(service.respondToPermission(requestIds[1]!, 'deny', false)).toBe('session-canvas')
   expect(await second).toMatchObject({ behavior: 'deny', toolUseID: 'tool-run-2' })
+})
+
+test('Given 媒体审批策略已经自动 When 请求逐次审批 Then 不展示审批并保留工具调用身份', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy('automatic')
+  const requests: unknown[] = []
+  const resolved: string[] = []
+  const result = await service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(new AbortController().signal, 'tool-media-auto'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: (requestId) => { resolved.push(requestId) } },
+  )
+
+  expect(result).toEqual({
+    behavior: 'allow', updatedInput: { runId: 'run-1' }, toolUseID: 'tool-media-auto',
+  })
+  expect(requests).toEqual([])
+  expect(resolved).toEqual([])
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 媒体审批正在等待 When 策略切换为自动 Then 释放当前请求并通知 UI 清理', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const requests: Array<{ requestId: string }> = []
+  const resolved: Array<{ requestId: string; behavior: string }> = []
+  const pending = service.requestSingleApproval(
+    'session-media', 'canvas_run_nodes', { nodeIds: ['video-1'] },
+    permissionOptions(new AbortController().signal, 'tool-media-switch'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: (requestId, behavior) => { resolved.push({ requestId, behavior }) } },
+  )
+  expect(requests).toHaveLength(1)
+  expect(policy.listenerCount()).toBe(1)
+
+  policy.setMode('automatic')
+
+  expect(await pending).toEqual({
+    behavior: 'allow', updatedInput: { nodeIds: ['video-1'] }, toolUseID: 'tool-media-switch',
+  })
+  expect(resolved).toEqual([{ requestId: requests[0]!.requestId, behavior: 'allow' }])
+  expect(service.getPendingRequestOwner(requests[0]!.requestId)).toBeNull()
+  expect(service.respondToPermission(requests[0]!.requestId, 'deny', false)).toBeNull()
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 动态媒体审批正在等待 When 工具调用中止 Then 拒绝并清理策略监听', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const controller = new AbortController()
+  const requests: Array<{ requestId: string }> = []
+  const resolved: string[] = []
+  const pending = service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(controller.signal, 'tool-media-abort'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: (requestId) => { resolved.push(requestId) } },
+  )
+
+  controller.abort()
+
+  expect(await pending).toEqual({ behavior: 'deny', message: '操作已中止', toolUseID: 'tool-media-abort' })
+  expect(service.getPendingRequestOwner(requests[0]!.requestId)).toBeNull()
+  expect(policy.listenerCount()).toBe(0)
+  policy.setMode('automatic')
+  expect(resolved).toEqual([])
+})
+
+test('Given 动态媒体审批正在等待 When 会话结束 Then 拒绝并清理策略监听', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const requests: Array<{ requestId: string }> = []
+  const pending = service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(new AbortController().signal, 'tool-media-session-end'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: () => {} },
+  )
+
+  service.clearSessionPending('session-media')
+
+  expect(await pending).toEqual({ behavior: 'deny', message: '会话已结束', toolUseID: 'tool-media-session-end' })
+  expect(service.getPendingRequestOwner(requests[0]!.requestId)).toBeNull()
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 审批卡片发送失败 When 动态审批初始化退出 Then 拒绝 Promise 且不遗留监听', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const requestError = new Error('renderer unavailable')
+  const pending = service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(new AbortController().signal, 'tool-media-renderer-error'),
+    () => { throw requestError },
+    { policy, onResolved: () => {} },
+  )
+
+  await expect(pending).rejects.toBe(requestError)
+  expect(service.getPendingRequests()).toEqual([])
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 工具调用进入审批前已经中止 When 策略为自动 Then 优先拒绝且不订阅策略', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy('automatic')
+  const controller = new AbortController()
+  const requests: unknown[] = []
+  controller.abort()
+
+  const result = await service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(controller.signal, 'tool-media-pre-abort'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: () => {} },
+  )
+
+  expect(result).toEqual({ behavior: 'deny', message: '操作已中止', toolUseID: 'tool-media-pre-abort' })
+  expect(requests).toEqual([])
+  expect(service.getPendingRequests()).toEqual([])
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 动态审批策略订阅抛错 When 初始化审批 Then 拒绝 Promise 且清理 pending', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const policyError = new Error('policy subscribe failed')
+  policy.subscribe = () => { throw policyError }
+
+  const pending = service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(new AbortController().signal, 'tool-media-subscribe-error'),
+    () => {},
+    { policy, onResolved: () => {} },
+  )
+
+  await expect(pending).rejects.toBe(policyError)
+  expect(service.getPendingRequests()).toEqual([])
+  expect(policy.listenerCount()).toBe(0)
+})
+
+test('Given 等待期间策略读取失败 When 收到策略变化 Then 拒绝当前调用并清理审批 UI', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const requests: Array<{ requestId: string }> = []
+  const resolved: Array<{ requestId: string; behavior: string }> = []
+  const pending = service.requestSingleApproval(
+    'session-media', 'media_execute_run', { runId: 'run-1' },
+    permissionOptions(new AbortController().signal, 'tool-media-policy-event-error'),
+    (request) => { requests.push(request) },
+    { policy, onResolved: (requestId, behavior) => { resolved.push({ requestId, behavior }) } },
+  )
+  policy.getMode = () => { throw new Error('config unavailable') }
+
+  policy.setMode('automatic')
+
+  expect(await pending).toEqual({
+    behavior: 'deny', message: '审批策略读取失败：config unavailable', toolUseID: 'tool-media-policy-event-error',
+  })
+  expect(resolved).toEqual([{ requestId: requests[0]!.requestId, behavior: 'deny' }])
+  expect(service.getPendingRequests()).toEqual([])
+  expect(policy.listenerCount()).toBe(0)
 })
 
 test('Given bypass 发起单次审批后切到 plan When 用户批准 Then fresh mode 拒绝且工具零副作用', async () => {
