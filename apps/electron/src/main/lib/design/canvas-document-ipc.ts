@@ -127,7 +127,7 @@ import type {
   CanvasToolRun,
 } from './canvas-tool-provider'
 import { createCanvasToolRun } from './canvas-tool-provider'
-import { paginateCanvasOperationRecords, type CanvasOperationToolHandlers } from './canvas-operation-tools'
+import { CANVAS_TASK_WAIT_MAX_MS, paginateCanvasOperationRecords, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import type { CanvasTaskOperationService } from './canvas-task-operation-service'
 import { waitForCanvasImageTaskTerminal } from './canvas-task-waiter'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
@@ -1903,7 +1903,7 @@ export function registerCanvasDocumentIpcHandlers(
             canvasId: input.canvasId,
             nodeId: input.nodeId,
             jobId: result.replacementJobId,
-            waitMs: 30_000,
+            waitMs: CANVAS_TASK_WAIT_MAX_MS,
             reason: '重试已提交，必须继续查询同一 replacementJobId 直到终态。',
           },
         }

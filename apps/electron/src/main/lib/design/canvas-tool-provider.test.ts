@@ -975,7 +975,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     const fixture = createFixture()
     fixture.dependencies.operations = { getTask: async () => ({ status: 'running' }) }
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
-    for (const rule of ['replacementJobId', 'waitMs=30000', '已提交不等于完成', '实际错误', '已有采用授权']) {
+    for (const rule of ['replacementJobId', 'waitMs=60000', '已提交不等于完成', '实际错误', '已有采用授权']) {
       expect(run.systemPromptAppend).toContain(rule)
     }
   })

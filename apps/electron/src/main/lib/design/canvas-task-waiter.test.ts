@@ -63,6 +63,18 @@ describe('Canvas 图片任务有界等待', () => {
     expect(source.listenerCount).toBe(0)
   })
 
+  test('Given 图片服务超过旧 30 秒才完成 When 等待 60 秒窗口 Then 返回成功而不是误报超时', async () => {
+    const source = createSource(createJob('running'))
+    const waiting = waitForCanvasImageTaskTerminal(target, 60, {
+      readCurrent: source.read,
+      subscribe: source.subscribe,
+    })
+    setTimeout(() => { source.emit(createJob('succeeded')) }, 35)
+
+    await expect(waiting).resolves.toEqual({ outcome: 'terminal', status: 'succeeded' })
+    expect(source.listenerCount).toBe(0)
+  })
+
   test('Given 目标持续运行或调用被取消 When 等待结束 Then 超时与取消都释放监听器', async () => {
     const timeoutSource = createSource(createJob('running'))
     await expect(waitForCanvasImageTaskTerminal(target, 5, {

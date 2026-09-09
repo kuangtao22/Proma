@@ -150,7 +150,7 @@ describe('Canvas 操作工具', () => {
       .rejects.toThrow('CANVAS_OPERATION_RESPONSE_TOO_LARGE')
   })
 
-  test('Given 图片任务查询带等待时间 When 校验输入 Then 只接受 0 到 30000 毫秒整数', async () => {
+  test('Given 图片任务查询带等待时间 When 校验输入 Then 只接受 0 到 60000 毫秒整数', async () => {
     const received: unknown[] = []
     const tools = createCanvasOperationTools(
       { getTask: async (input) => { received.push(input); return { status: 'running' } } },
@@ -159,9 +159,9 @@ describe('Canvas 操作工具', () => {
       () => 'operation-1',
     )
 
-    await executeOperation(tools, 'canvas_get_task', { ...createValidInputs().canvas_get_task!, waitMs: 30_000 })
-    expect(received).toEqual([{ ...createValidInputs().canvas_get_task!, waitMs: 30_000, projectId: 'project-1' }])
-    for (const waitMs of [-1, 30_001, 1.5]) {
+    await executeOperation(tools, 'canvas_get_task', { ...createValidInputs().canvas_get_task!, waitMs: 60_000 })
+    expect(received).toEqual([{ ...createValidInputs().canvas_get_task!, waitMs: 60_000, projectId: 'project-1' }])
+    for (const waitMs of [-1, 60_001, 1.5]) {
       await expect(executeOperation(tools, 'canvas_get_task', {
         ...createValidInputs().canvas_get_task!, waitMs,
       })).rejects.toThrow('CANVAS_OPERATION_INPUT_INVALID')

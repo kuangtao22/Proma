@@ -4178,7 +4178,7 @@ describe('原生 Canvas 文档 IPC', () => {
 
       expect(result.details).toMatchObject({
         originalJobId: 'job-a', replacementJobId: 'job-retry',
-        nextAction: { tool: 'canvas_get_task', canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, jobId: 'job-retry', waitMs: 30_000 },
+        nextAction: { tool: 'canvas_get_task', canvasId: 'canvas-1', nodeId: imageTargetA.nodeId, jobId: 'job-retry', waitMs: 60_000 },
       })
     } finally { context.registration.dispose() }
   })

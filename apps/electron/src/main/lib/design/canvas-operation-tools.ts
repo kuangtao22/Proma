@@ -10,6 +10,8 @@ import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
 /** 新工具只接受稳定业务标识，路径必须走单独授权字段。 */
 const stableId = Type.String({ minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$' })
+/** 图片服务通常需要几十秒返回；等待上限覆盖正常长耗时，同时仍保持工具调用有界。 */
+export const CANVAS_TASK_WAIT_MAX_MS = 60_000
 /** 所有版本均为不可变引用，图片通过成功任务解析真实素材。 */
 const versionReference = Type.Union([
   Type.Object({ kind: Type.Literal('image'), jobId: stableId }, { additionalProperties: false }),
@@ -24,7 +26,7 @@ const explicitIntent = { intent: Type.Literal('explicit') }
 /** 查询任务可分别分页尝试记录和日志；默认只读摘要。 */
 const taskReadSchema = Type.Object({
   ...nodeTarget, jobId: stableId, ...pagination,
-  waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 30_000 })),
+  waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: CANVAS_TASK_WAIT_MAX_MS })),
   logs: Type.Optional(Type.Object(pagination, { additionalProperties: false })),
 }, { additionalProperties: false })
 /** 停止和原快照重试共享精确任务身份。 */
@@ -229,7 +231,7 @@ export function createCanvasOperationTools(
         )
       : undefined
   return [
-    ...define('canvas_get_task', '查看图片任务', '查看指定节点任务的真实状态、尝试、最终提示词和按需日志，不重新生成。waitMs 可在 0 到 30000 毫秒内等待同一 job 进入终态；超时且仍在运行时继续用同一 job 查询，成功后再看图，失败时报告真实 error。', taskReadSchema, handlers.getTask, false),
+    ...define('canvas_get_task', '查看图片任务', `查看指定节点任务的真实状态、尝试、最终提示词和按需日志，不重新生成。waitMs 可在 0 到 ${CANVAS_TASK_WAIT_MAX_MS} 毫秒内等待同一 job 进入终态；超时且仍在运行时继续用同一 job 查询，成功后再看图，失败时报告真实 error。`, taskReadSchema, handlers.getTask, false),
     ...define('canvas_cancel_task', '停止图片任务', '停止明确指定的现有任务；返回实际终态，不保证远端已取消或费用退回。', taskWriteSchema, handlers.cancelTask, true),
     ...define('canvas_retry_task', '重试图片任务', '按原任务固化模型、提示词和输入重试，可能产生模型费用；返回 replacementJobId 后必须调用 canvas_get_task 并沿同一 replacementJobId 等待真实终态。', taskWriteSchema, handlers.retryTask, true),
     ...define('canvas_list_versions', '查看产物版本', '分页列出节点可用版本及当前采用状态，为检查和明确采用提供准确引用。', versionsSchema, handlers.listVersions, false),

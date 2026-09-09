@@ -56,7 +56,7 @@ import { CANVAS_IMAGE_CANDIDATE_TOOL_NAMES, createCanvasImageCandidateTools } fr
 import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import type { CanvasMediaService } from './canvas-media-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
-import { createCanvasOperationTools, type CanvasOperationToolHandlers } from './canvas-operation-tools'
+import { CANVAS_TASK_WAIT_MAX_MS, createCanvasOperationTools, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import { MEDIA_TOOL_NAMES } from '../media/media-tool-provider'
 import {
   canvasNodeCapabilityRegistry,
@@ -2321,7 +2321,7 @@ export function createCanvasToolRun(
     : ''
   /** 有真实任务查询能力时才要求有界等待；提交回执不能替代终态与内容验收。 */
   const taskFollowUpPrompt = availableToolNames.has('canvas_get_task')
-    ? '\n\n异步图片生成或重试返回 jobId / replacementJobId 后，已提交不等于完成。除用户只要求后台提交外，继续使用 canvas_get_task，waitMs=30000 等待新任务终态，优先执行回执中的 nextAction；超时仍为 running/queued 时等待同一任务，不另行生成。成功后按精确版本看图，已有采用授权时按原范围采用并继续；失败时报告实际错误，保留原卡片和素材。503 或无可用账号属于渠道阻塞，不是提示词或节点损坏，不反复提交付费重试。停止、撤权或预算耗尽时明确报告未完成状态，不承诺不存在的后台唤醒。只读等待不需要重新申请生成授权。'
+    ? `\n\n异步图片生成或重试返回 jobId / replacementJobId 后，已提交不等于完成。除用户只要求后台提交外，继续使用 canvas_get_task，waitMs=${CANVAS_TASK_WAIT_MAX_MS} 等待新任务终态，优先执行回执中的 nextAction；超时仍为 running/queued 时等待同一任务，不另行生成。成功后按精确版本看图，已有采用授权时按原范围采用并继续；失败时报告实际错误，保留原卡片和素材。503 或无可用账号属于渠道阻塞，不是提示词或节点损坏，不反复提交付费重试。停止、撤权或预算耗尽时明确报告未完成状态，不承诺不存在的后台唤醒。只读等待不需要重新申请生成授权。`
     : ''
   /** 直接入边由 SEND 对账快照转换为权威引用，标题只作为 JSON 数据展示。 */
   const canvasAgentPrompt = context.canvasAgentTarget
