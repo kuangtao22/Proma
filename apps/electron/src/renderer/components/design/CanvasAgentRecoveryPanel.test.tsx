@@ -16,8 +16,8 @@ describe('Canvas Agent 坏节点恢复面板', () => {
       />,
     )
 
-    expect(html).toContain('此节点关联的 Agent 会话不可用。')
-    expect(html).toContain('新会话将从空白对话开始，旧对话记录不会删除。')
+    expect(html).toContain('此节点关联的 Agent 会话或模型配置不可用。')
+    expect(html).toContain('重建会话会使用当前启用的模型，从空白对话开始；旧对话记录不会删除。')
     expect(html).toContain('重建会话')
     expect(html).toContain('删除节点')
     expect(html).toContain('aria-label="关闭恢复面板"')

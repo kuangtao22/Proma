@@ -41,9 +41,9 @@ export function CanvasAgentRecoveryPanel({
         <span className="flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
           <TriangleAlert className="size-5" aria-hidden="true" />
         </span>
-        <h3 className="mt-4 text-sm font-medium text-foreground">此节点关联的 Agent 会话不可用。</h3>
+        <h3 className="mt-4 text-sm font-medium text-foreground">此节点关联的 Agent 会话或模型配置不可用。</h3>
         <p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-          新会话将从空白对话开始，旧对话记录不会删除。
+          重建会话会使用当前启用的模型，从空白对话开始；旧对话记录不会删除。
         </p>
         {error ? <p className="mt-3 text-xs text-destructive" role="alert">{error}</p> : null}
         <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
