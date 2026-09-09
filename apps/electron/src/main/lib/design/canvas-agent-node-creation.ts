@@ -1398,9 +1398,23 @@ export class CanvasAgentNodeCreationService {
           }
         }
       }
-      /** 没有事务证据的手工/旧图节点继续交给兼容路径，不凭空标坏。 */
-      if (!activeCreation && !activeRebuild && !archivedCreation && !archivedRebuild) continue
       const session = this.dependencies.getSession(node.agentSessionId)
+      /** 没有事务证据的手工/旧图节点仍检查已存在 session 的模型可用性；缺少 session 仍保留兼容路径。 */
+      const hasTransactionEvidence = Boolean(activeCreation || activeRebuild || archivedCreation || archivedRebuild)
+      if (!hasTransactionEvidence) {
+        if (session
+          && hasValidCanvasAgentOwnership(session)
+          && session.id === node.agentSessionId
+          && session.title === node.title
+          && session.workspaceId === target.projectId
+          && session.sourceCanvasProjectId === target.projectId
+          && session.sourceCanvasId === target.canvasId
+          && session.sourceCanvasNodeId === node.id
+          && !sessionModelIsAvailable(session, this.dependencies.assertModelAvailable)) {
+          nodeIssues.push(createUnavailableSessionIssue(node.id))
+        }
+        continue
+      }
       if (!session
         || !hasValidCanvasAgentOwnership(session)
         || session.id !== node.agentSessionId

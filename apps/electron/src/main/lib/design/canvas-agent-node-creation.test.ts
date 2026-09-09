@@ -833,6 +833,43 @@ describe('Canvas Agent 节点创建事务', () => {
     }])
   })
 
+  test('Given 无事务凭据的旧 Agent 节点绑定的模型已停用 When LOAD 对账 Then 仍标记为可重建节点问题', async () => {
+    const harness = createHarness()
+    const legacyNodeId = 'legacy-agent'
+    harness.setDocument({
+      ...createEmptyCanvasDocument(harness.target.projectId, harness.target.canvasId, 1),
+      revision: 2,
+      nodes: [{
+        id: legacyNodeId,
+        kind: 'agent',
+        title: '旧短视频分镜 Agent',
+        position: { x: 0, y: 0 },
+        agentSessionId: SESSION_ID,
+      }],
+    })
+    harness.sessions.set(SESSION_ID, {
+      id: SESSION_ID,
+      title: '旧短视频分镜 Agent',
+      channelId: 'channel-old',
+      modelId: 'model-disabled',
+      workspaceId: harness.target.projectId,
+      sourceCanvasProjectId: harness.target.projectId,
+      sourceCanvasId: harness.target.canvasId,
+      sourceCanvasNodeId: legacyNodeId,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const reconciled = await harness.createService().reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(reconciled.snapshot.nodeIssues).toEqual([{
+      nodeId: legacyNodeId,
+      code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }])
+  })
+
   test('Given session-created 未完成事务的 session 缺失 When LOAD 对账 Then 继续 fail closed', async () => {
     const harness = createHarness({ failIntentState: 'committed' })
     const service = harness.createService()
