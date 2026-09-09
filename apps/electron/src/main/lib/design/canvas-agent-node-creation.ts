@@ -597,6 +597,20 @@ function createUnavailableSessionIssue(nodeId: string): CanvasNodeIssue {
   }
 }
 
+/** 判断已有 Agent session 绑定的渠道和模型当前是否仍可执行。 */
+function sessionModelIsAvailable(
+  session: AgentSessionMeta | undefined,
+  assertModelAvailable: CanvasAgentNodeCreationDependencies['assertModelAvailable'],
+): boolean {
+  if (!session?.channelId) return false
+  try {
+    assertModelAvailable(session.channelId, session.modelId)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** 判断 replacement session 是否完整匹配 rebuild intent。 */
 function sessionMatchesRebuildIntent(
   session: AgentSessionMeta | undefined,
@@ -1299,10 +1313,9 @@ export class CanvasAgentNodeCreationService {
         const node = document.nodes.find((candidate) => candidate.id === intent.nodeId)
         if (node) {
           assertNodeMatchesRebuildIntent(node, intent)
-          if (!sessionMatchesRebuildIntent(
-            this.dependencies.getSession(intent.replacementSessionId),
-            intent,
-          )) {
+          const session = this.dependencies.getSession(intent.replacementSessionId)
+          if (!sessionMatchesRebuildIntent(session, intent)
+            || !sessionModelIsAvailable(session, this.dependencies.assertModelAvailable)) {
             nodeIssues.push(createUnavailableSessionIssue(node.id))
           }
         }
@@ -1348,8 +1361,10 @@ export class CanvasAgentNodeCreationService {
             assertCommittedNodeMatchesIntent(node, intent)
           }
           /** committed 后连线属于可编辑图状态；删线或删除源节点时下游 Agent 合法转为独立节点。 */
+          const session = this.dependencies.getSession(intent.sessionId)
           if (!rebuildIntent
-            && !sessionMatchesIntent(this.dependencies.getSession(intent.sessionId), intent)) {
+            && (!sessionMatchesIntent(session, intent)
+              || !sessionModelIsAvailable(session, this.dependencies.assertModelAvailable))) {
             nodeIssues.push(createUnavailableSessionIssue(node.id))
           }
         }
@@ -1393,7 +1408,8 @@ export class CanvasAgentNodeCreationService {
         || session.workspaceId !== target.projectId
         || session.sourceCanvasProjectId !== target.projectId
         || session.sourceCanvasId !== target.canvasId
-        || session.sourceCanvasNodeId !== node.id) {
+        || session.sourceCanvasNodeId !== node.id
+        || !sessionModelIsAvailable(session, this.dependencies.assertModelAvailable)) {
         nodeIssues.push(createUnavailableSessionIssue(node.id))
       }
     }

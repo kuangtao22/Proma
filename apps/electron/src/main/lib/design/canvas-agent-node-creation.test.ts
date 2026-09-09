@@ -815,6 +815,24 @@ describe('Canvas Agent 节点创建事务', () => {
     }])
   })
 
+  test('Given committed 节点绑定的模型已停用 When LOAD 对账 Then 标记为可重建节点问题', async () => {
+    const harness = createHarness()
+    const service = harness.createService()
+    await service.create(createInput(harness.target))
+    const session = harness.sessions.get(SESSION_ID)
+    if (!session) throw new Error('测试 session 未创建')
+    harness.sessions.set(SESSION_ID, { ...session, modelId: 'model-disabled' })
+
+    const reconciled = await service.reconcile(harness.target)
+
+    expect(reconciled.error).toBeUndefined()
+    expect(reconciled.snapshot.nodeIssues).toEqual([{
+      nodeId: 'node-1',
+      code: 'AGENT_SESSION_UNAVAILABLE',
+      allowedActions: ['rebuild-agent-session', 'remove-node'],
+    }])
+  })
+
   test('Given session-created 未完成事务的 session 缺失 When LOAD 对账 Then 继续 fail closed', async () => {
     const harness = createHarness({ failIntentState: 'committed' })
     const service = harness.createService()

@@ -252,7 +252,15 @@ export function createCanvasAgentExecutionService(
         const channelId = config.channelId ?? currentOwner.session.channelId
         const modelId = config.channelId === null ? currentOwner.session.modelId : config.modelId
         if (!channelId || !modelId) throw new Error('CANVAS_AGENT_MODEL_UNAVAILABLE')
-        dependencies.assertModelAvailable(channelId, modelId)
+        try {
+          dependencies.assertModelAvailable(channelId, modelId)
+        } catch (error) {
+          /** 历史 session 可能绑定已停用模型；提示用户通过节点恢复面板换绑当前模型。 */
+          throw new Error(
+            'CANVAS_AGENT_MODEL_UNAVAILABLE: 当前 Canvas Agent 绑定的模型已失效，请打开节点并点击“重建会话”使用当前启用的模型。',
+            { cause: error },
+          )
+        }
         const previous = generations.get(key)
         const runGeneration = previous?.sessionId === currentOwner.session.id ? previous.generation + 1 : 1
         const inputReferences = listCanvasAgentBoundInputReferences(currentSnapshot.document, currentOwner.node.id)
