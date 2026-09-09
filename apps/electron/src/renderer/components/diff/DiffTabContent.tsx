@@ -1047,6 +1047,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     cachedScrollPosition,
     restoredScrollKey,
     scrollKey,
+    editorReady: liveMarkdownReadyKey === scrollKey,
   })
 
   const invalidatePendingPreviewScrollRestore = React.useCallback(() => {
@@ -1822,6 +1823,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
           rootRef={scrollContainerRef}
           contentKey={findContentKey}
           unsupportedReason={isPdf ? '暂不支持 PDF 搜索' : undefined}
+          markdownEditorRef={isMarkdown ? markdownEditorRef : undefined}
           onOpenChange={setFindOpen}
         />
         <MarkdownToc
