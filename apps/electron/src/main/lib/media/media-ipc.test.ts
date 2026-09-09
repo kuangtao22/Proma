@@ -5,7 +5,189 @@ import { registerMediaIpcHandlers } from './media-ipc'
 import { EventEmitter } from 'node:events'
 import type { MediaRunEvent } from '@proma/shared'
 
+/** 测试使用的完整图片引用，字段与 Renderer 公开合同一致。 */
+const imageAsset = {
+  assetId: 'asset-1',
+  revision: 1,
+  hash: 'a'.repeat(64),
+  mediaKind: 'image' as const,
+}
+
 describe('媒体设置 IPC 授权', () => {
+  test('Given 当前项目图片引用 When 读取本地缩略图 Then 返回受控图片字节并复核项目', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const projectChecks: string[] = []
+    const reads: unknown[] = []
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: (projectId) => { projectChecks.push(projectId) },
+      configuration: { read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      readAssetThumbnail: async (projectId, asset) => {
+        reads.push([projectId, asset])
+        return { bytes: new Uint8Array([1, 2, 3]), contentType: 'image/webp' }
+      },
+      getRun: () => { throw new Error('unused') },
+    })
+
+    try {
+      const result = await handlers.get(MEDIA_IPC_CHANNELS.READ_ASSET_THUMBNAIL)!(
+        { sender: {} } as IpcMainInvokeEvent,
+        { projectId: 'project-1', asset: imageAsset },
+      )
+      expect(result).toEqual({ bytes: new Uint8Array([1, 2, 3]), contentType: 'image/webp' })
+      expect(reads).toEqual([['project-1', imageAsset]])
+      expect(projectChecks).toEqual(['project-1', 'project-1'])
+    } finally { registration.dispose() }
+  })
+
+  test('Given 非图片或伪造缩略图参数 When 读取 Then 在访问项目和磁盘前拒绝', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    let projectChecks = 0
+    let reads = 0
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => { projectChecks += 1 },
+      configuration: { read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      readAssetThumbnail: async () => { reads += 1; throw new Error('unused') },
+      getRun: () => { throw new Error('unused') },
+    })
+    /** 统一通过 Promise 捕获同步参数错误与异步读取错误。 */
+    const invoke = (input: unknown): Promise<unknown> => Promise.resolve().then(() => handlers.get(MEDIA_IPC_CHANNELS.READ_ASSET_THUMBNAIL)!({ sender: {} } as IpcMainInvokeEvent, input))
+
+    try {
+      for (const input of [
+        { projectId: 'project-1', asset: { ...imageAsset, mediaKind: 'video' } },
+        { projectId: 'project-1', asset: { ...imageAsset, hash: 'not-a-hash' } },
+        { projectId: 'project-1', asset: { ...imageAsset, revision: 0 } },
+        { projectId: 'project-1', asset: { ...imageAsset, internalPath: '/tmp/private' } },
+        { projectId: '../project-1', asset: imageAsset },
+        { projectId: 'project-1', asset: imageAsset, extra: true },
+      ]) await expect(invoke(input)).rejects.toThrow('MEDIA_IPC_INPUT_INVALID')
+      expect(projectChecks).toBe(0)
+      expect(reads).toBe(0)
+    } finally { registration.dispose() }
+  })
+
+  test('Given 图片读取期间窗口或项目撤权 When 返回字节 Then 不向 Renderer 泄露结果', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    let senderAuthorized = true
+    let projectAuthorized = true
+    let releaseRead: (() => void) | undefined
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => senderAuthorized,
+      assertProject: () => { if (!projectAuthorized) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED') },
+      configuration: { read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      readAssetThumbnail: async () => {
+        await new Promise<void>((resolve) => { releaseRead = resolve })
+        return { bytes: new Uint8Array([1]), contentType: 'image/png' }
+      },
+      getRun: () => { throw new Error('unused') },
+    })
+
+    try {
+      const senderRevoked = handlers.get(MEDIA_IPC_CHANNELS.READ_ASSET_THUMBNAIL)!({ sender: {} } as IpcMainInvokeEvent, { projectId: 'project-1', asset: imageAsset })
+      senderAuthorized = false
+      releaseRead?.()
+      await expect(senderRevoked).rejects.toThrow('MEDIA_ACCESS_DENIED')
+
+      senderAuthorized = true
+      const projectRevoked = handlers.get(MEDIA_IPC_CHANNELS.READ_ASSET_THUMBNAIL)!({ sender: {} } as IpcMainInvokeEvent, { projectId: 'project-1', asset: imageAsset })
+      projectAuthorized = false
+      releaseRead?.()
+      await expect(projectRevoked).rejects.toThrow('MEDIA_PROJECT_NOT_AUTHORIZED')
+    } finally { registration.dispose() }
+  })
+  test('Given 旧配置未包含授权模式 When 获取设置 Then 返回每次询问', () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => undefined,
+      configuration: { read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      getRun: () => { throw new Error('unused') },
+    })
+
+    try {
+      expect(handlers.get(MEDIA_IPC_CHANNELS.GET_SETTINGS)!({} as IpcMainInvokeEvent)).toMatchObject({ authorizationMode: 'ask' })
+    } finally { registration.dispose() }
+  })
+
+  test('Given 主窗口保存授权模式 When 参数合法 Then 透传 CAS 且不要求项目授权', () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const calls: unknown[] = []
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => { throw new Error('不应要求项目') },
+      configuration: { read: () => ({ schemaVersion: 2, revision: 3, authorizationMode: 'ask', connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') },
+        saveAuthorizationMode: (mode, expectedRevision) => {
+          calls.push([mode, expectedRevision])
+          return { schemaVersion: 2, revision: 4, authorizationMode: 'automatic', connections: [], workflows: [], profiles: [] }
+        } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      getRun: () => { throw new Error('unused') },
+    })
+
+    try {
+      expect(handlers.get(MEDIA_IPC_CHANNELS.SAVE_AUTHORIZATION)!({} as IpcMainInvokeEvent, { mode: 'automatic', expectedRevision: 3 }))
+        .toMatchObject({ revision: 4, authorizationMode: 'automatic' })
+      expect(calls).toEqual([['automatic', 3]])
+    } finally { registration.dispose() }
+  })
+
+  test('Given 授权保存请求非法、未授权或能力缺失 When 调用 Then 在写入前返回稳定错误', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    let authorized = true
+    let writes = 0
+    const registration = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => authorized,
+      assertProject: () => undefined,
+      configuration: { read: () => ({ schemaVersion: 2, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') },
+        saveAuthorizationMode: () => { writes += 1; throw new Error('不应调用') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      getRun: () => { throw new Error('unused') },
+    })
+    const invoke = (input: unknown): unknown => handlers.get(MEDIA_IPC_CHANNELS.SAVE_AUTHORIZATION)!({} as IpcMainInvokeEvent, input)
+
+    try {
+      for (const input of [
+        { mode: 'always', expectedRevision: 0 }, { mode: 'ask', expectedRevision: -1 },
+        { mode: 'ask', expectedRevision: 0, extra: true },
+      ]) await expect(Promise.resolve().then(() => invoke(input))).rejects.toThrow('MEDIA_IPC_INPUT_INVALID')
+      authorized = false
+      await expect(Promise.resolve().then(() => invoke({ mode: 'ask', expectedRevision: 0 }))).rejects.toThrow('MEDIA_ACCESS_DENIED')
+      expect(writes).toBe(0)
+    } finally { registration.dispose() }
+
+    authorized = true
+    const unavailable = registerMediaIpcHandlers({
+      ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
+      isAuthorizedSender: () => true,
+      assertProject: () => undefined,
+      configuration: { read: () => ({ schemaVersion: 2, revision: 0, connections: [], workflows: [], profiles: [] }),
+        saveConnection: () => { throw new Error('unused') }, saveWorkflow: () => { throw new Error('unused') }, saveProfile: () => { throw new Error('unused') } },
+      resources: { probe: async () => { throw new Error('unused') }, list: async () => { throw new Error('unused') } },
+      getRun: () => { throw new Error('unused') },
+    })
+    try {
+      await expect(Promise.resolve().then(() => invoke({ mode: 'ask', expectedRevision: 0 }))).rejects.toThrow('MEDIA_CONFIGURATION_UNAVAILABLE')
+    } finally { unavailable.dispose() }
+  })
+
   test('Given 远端 UI 工作流 When 设置页读取详情 Then IPC 复用转换分析并只返回安全问题', async () => {
     const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
     const descriptor = { connectionId: 'gpu', instanceGeneration: 'v1', remoteUser: 'default', source: 'user-data' as const, id: 'workflow-1', workflowPath: 'workflow-1.json' }

@@ -3,6 +3,7 @@ import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type {
   ComfyPrompt,
   MediaAssetRef,
+  MediaAuthorizationMode,
   MediaApiModelCapability,
   MediaApiModelExecutionSupport,
   MediaConfiguration,
@@ -20,7 +21,7 @@ import { Type } from 'typebox'
 import { createHash } from 'node:crypto'
 import type { TSchema } from 'typebox'
 import type { CanvasToolRun, CanvasToolRunContext } from '../design/canvas-tool-provider'
-import { COMFY_CORE_NODE_CONTRACTS } from './comfyui-workflow'
+import { COMFY_CORE_NODE_CONTRACTS, validateComfyWorkflow } from './comfyui-workflow'
 import type { MediaConfigStore } from './media-config-store'
 import type { MediaAssetFile } from './media-source-service'
 import type { MediaResourceService } from './media-resource-service'
@@ -38,12 +39,22 @@ const MAX_RUNS_PER_TURN = 8
 const MAX_ASSET_RESULTS = 100
 const IDENTIFIER_PATTERN = '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 
+/** 用户媒体自主策略只覆盖生成与工作流运行控制，不放宽其它工具的强制审批。 */
+const MEDIA_AUTOMATION_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'media_execute_run', 'media_cancel_run', 'canvas_run_nodes', 'canvas_run_workflow',
+  'canvas_retry_task', 'canvas_resume_workflow', 'canvas_cancel_workflow', 'canvas_cancel_media_run',
+])
+
+/** 新建意图区分当次对话确认与用户在设置中授予的自主权限。 */
+const WORKFLOW_CREATION_INTENT_SCHEMA = Type.Union([Type.Literal('user-confirmed'), Type.Literal('automatic-policy')])
+
 /** 首版固定注册的媒体工具；来源导入工具仅在 Host 提供适配器时追加。 */
 export const MEDIA_TOOL_NAMES = [
   'media_list_workflows',
   'media_list_resources',
   'media_read_remote_workflow',
   'media_discover_workflows',
+  'media_use_remote_workflow',
   'media_import_remote_workflow',
   'media_import_remote_asset',
   'media_list_api_models',
@@ -51,6 +62,7 @@ export const MEDIA_TOOL_NAMES = [
   'media_inspect_workflow',
   'media_match_assets',
   'media_save_workflow_draft',
+  'media_save_local_workflow',
   'media_publish_workflow',
   'media_list_profiles',
   'media_save_profile',
@@ -81,7 +93,8 @@ export interface MediaApiModelCandidate {
 
 /** Agent 工具只依赖 Host 已授权的窄接口，不能自行解析项目路径或远端凭据。 */
 export interface MediaToolProviderDependencies {
-  configuration: Pick<MediaConfigStore, 'listProject' | 'read' | 'getWorkflow' | 'saveWorkflow' | 'saveProfile' | 'resolveProfile'>
+  configuration: Pick<MediaConfigStore, 'listProject' | 'read' | 'getWorkflow' | 'saveWorkflow' | 'cacheRemoteWorkflow' | 'saveProfile' | 'resolveProfile'>
+    & Partial<Pick<MediaConfigStore, 'subscribeAuthorizationMode'>>
   resources: Pick<MediaResourceService, 'list' | 'getSchema' | 'readWorkflow' | 'readRemoteAsset'>
   runs: Pick<MediaRunService, 'prepare' | 'get' | 'getOrigin' | 'cancel'> & Partial<Pick<MediaRunService, 'prepareDraft'>>
   supervisor: Pick<MediaRunSupervisor, 'start' | 'watch' | 'wait'>
@@ -306,6 +319,28 @@ async function inspectRemoteWorkflow(dependencies: MediaToolProviderDependencies
   return { remote, analysis, contentHash: remoteWorkflowContentHash(remote) }
 }
 
+/** 新旧接入工具共用远端复核、幂等执行快照与有界回执，不创建用户模板。 */
+async function useRemoteWorkflowSnapshot(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext,
+  descriptor: MediaRemoteDescriptor, expectedContentHash: string, hasCanvasTarget: boolean): Promise<AgentToolResult<unknown>> {
+  authorize(dependencies, context, 'draft')
+  /** 执行快照来源取自 Host 复核过的远端正文，而非 Agent 构造的图。 */
+  const { remote, analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, descriptor)
+  if (contentHash !== expectedContentHash) throw new Error('MEDIA_REMOTE_WORKFLOW_CHANGED')
+  if (!analysis.definition) throw new MediaRemoteWorkflowImportError(analysis.issues)
+  authorize(dependencies, context, 'draft')
+  /** 稳定身份由存储层生成；同内容重试不会增添模板或新版本。 */
+  const item = dependencies.configuration.cacheRemoteWorkflow({ projectId: context.projectId,
+    name: (remote.descriptor.workflowPath ?? remote.descriptor.id).slice(-120), descriptor: remote.descriptor,
+    contentHash, definition: analysis.definition })
+  return toolResult({ id: item.id, name: item.name, revision: item.revision, hash: item.hash,
+    connectionId: descriptor.connectionId, source: 'comfyui-server', contentHash,
+    inputs: item.definition.bindings.slice(0, 24).map((binding) => ({ key: binding.key, kind: binding.kind })),
+    outputs: item.definition.outputs.slice(0, 16).map((output) => ({ key: output.key, mediaType: output.mediaType })),
+    truncated: item.definition.bindings.length > 24 || item.definition.outputs.length > 16,
+    availableActions: ['media_inspect_workflow', 'media_match_assets',
+      ...(hasCanvasTarget ? ['canvas_update_image_config', 'canvas_update_media_config'] : ['media_prepare_run'])] })
+}
+
 /** 比较真实媒体输入数量和输出类型；具体首尾帧等角色仍由 Agent 阅读节点语义判断。 */
 function matchRemoteWorkflow(analysis: RemoteWorkflowAnalysis, mediaKind: MediaKind, inputKinds?: MediaKind[]) {
   const inputCounts = { image: 0, audio: 0, video: 0 }
@@ -321,10 +356,24 @@ function matchRemoteWorkflow(analysis: RemoteWorkflowAnalysis, mediaKind: MediaK
     status: !analysis.definition ? 'blocked' : !matchesOutput || matchesInputs === false ? 'incompatible' : 'candidate' }
 }
 
-/** 两种草稿入口共用项目隔离、父编排分支身份与配置 CAS。 */
+/** 每次读取用户保存的最新生成授权，旧配置保持逐次确认。 */
+function mediaAuthorizationMode(dependencies: MediaToolProviderDependencies): MediaAuthorizationMode {
+  return dependencies.configuration.read().authorizationMode === 'automatic' ? 'automatic' : 'ask'
+}
+
+/** 新建许可来自当次对话或当前自主策略，Agent 声明本身不能打开自主模式。 */
+function assertWorkflowCreationIntent(dependencies: MediaToolProviderDependencies, intent: unknown): void {
+  if (intent === 'user-confirmed') return
+  if (intent === 'automatic-policy' && mediaAuthorizationMode(dependencies) === 'automatic') return
+  throw new Error('MEDIA_WORKFLOW_CREATION_CONFIRMATION_REQUIRED')
+}
+
+/** 旧草稿入口保留项目隔离、父编排分支身份与配置 CAS。 */
 function saveProjectWorkflow(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, input: {
   id: string; name: string; definition: unknown; expectedConfigRevision: number; expectedWorkflowRevision: number
+  creationIntent?: 'user-confirmed' | 'automatic-policy'
 }): MediaWorkflowVersion {
+  if (input.expectedWorkflowRevision === 0) assertWorkflowCreationIntent(dependencies, input.creationIntent)
   authorize(dependencies, context, 'draft')
   const catalog = dependencies.configuration.listProject(context.projectId)
   const branchPrefix = createHash('sha256').update(JSON.stringify([context.sessionId, context.runStartedAt])).digest('hex').slice(0, 24)
@@ -380,11 +429,13 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
   const preparedOperations = new Set<string>()
   const executedRuns = new Set<string>()
   const isExecutionCapable = context.permissionCeiling === 'execute' && context.canvasAgentMode !== 'parent-orchestrated'
+  /** 仅跟踪同轮连续读取的候选页；最多保留 16 组查询，不扫描或轮询远端目录。 */
+  const discoveryScans = new Map<string, { nextOffset: number; candidates: number; blocked: number }>()
 
   const tools: ToolDefinition[] = [
     defineTool({
       name: 'media_list_workflows', label: '列出媒体工作流',
-      description: '分页列出 Proma 当前项目可见的公共工作流和项目草稿全部不可变版本，包含字段输入与媒体输出摘要；不会默认选择第一项。',
+      description: '读取画布绑定的 ComfyUI 服务器及本地已保存模板摘要。新任务优先用 media_discover_workflows 查询服务器；内部执行快照不作为可复用模板推荐，不默认选择第一项。',
       parameters: Type.Object({
         canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         offset: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -395,7 +446,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         const catalog = dependencies.configuration.listProject(context.projectId)
         const latest = new Map<string, number>()
         for (const item of catalog.workflows) latest.set(item.id, Math.max(latest.get(item.id) ?? 0, item.revision))
-        const workflows = catalog.workflows.map((summary) => {
+        const workflows = catalog.workflows.filter((summary) => !summary.remoteSource).map((summary) => {
           const workflow = dependencies.configuration.getWorkflow(summary.id, summary.revision, context.projectId)
           return {
             id: workflow.id,
@@ -419,6 +470,9 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
           connections: catalog.connections.map((connection) => ({ id: connection.id, name: connection.name,
             enabled: connection.enabled, instanceGeneration: connection.instanceGeneration })),
           selectedWorkflow: null,
+          preferredSource: 'comfyui-server',
+          authorizationMode: mediaAuthorizationMode(dependencies),
+          availableActions: ['media_discover_workflows'],
           ...canvasConnectionSelection(dependencies, context, params.canvasId),
         })
       },
@@ -464,7 +518,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
           descriptor: workflow.descriptor, contentHash, format: workflow.format, section,
           canImport: analysis.definition !== null, sections: ['nodes', 'inputs', 'outputs', 'issues'],
           ...(section === 'issues' ? {} : { issues: analysis.issues.slice(0, 4) }), totalIssues: analysis.issues.length,
-          availableActions: ['media_read_remote_workflow', 'media_import_remote_workflow'],
+          availableActions: ['media_read_remote_workflow', 'media_use_remote_workflow'],
         })
       },
     }),
@@ -491,58 +545,108 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
         const page = await dependencies.resources.list({ projectId: context.projectId, connectionId, kind: 'workflows',
           query: params.query, offset, limit, refresh: params.refresh })
         const items: Record<string, unknown>[] = []
+        /** 本页结构候选与不能判断的工作流数量，不把读取/转换失败算成不匹配。 */
+        let candidates = 0
+        let blocked = 0
         // 串行读取有界候选页，避免并发解析多份大型图造成主进程峰值。
         for (const item of page.items) {
           const base = { id: item.id, name: item.name, descriptor: item.descriptor }
           try {
             if (!item.descriptor) throw new Error('MEDIA_REMOTE_DESCRIPTOR_REQUIRED')
             const { analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, item.descriptor)
+            /** 候选仍需由 Agent 核对输入角色与用户目标。 */
+            const match = matchRemoteWorkflow(analysis, params.mediaKind, params.inputKinds)
+            if (match.status === 'candidate') candidates += 1
+            if (match.status === 'blocked') blocked += 1
             items.push({ ...base, contentHash, format: analysis.format, canImport: analysis.definition !== null,
-              match: matchRemoteWorkflow(analysis, params.mediaKind, params.inputKinds),
+              match,
               nodes: analysis.nodes.slice(0, 16), inputs: analysis.inputs.slice(0, 24), outputs: analysis.outputs.slice(0, 16),
               issues: analysis.issues.slice(0, 16), totalNodes: analysis.nodes.length,
               summaryTruncated: analysis.nodes.length > 16 || analysis.inputs.length > 24 || analysis.outputs.length > 16 || analysis.issues.length > 16 })
           } catch {
+            blocked += 1
             items.push({ ...base, canImport: false, issues: [{ code: 'REMOTE_WORKFLOW_READ_FAILED', message: '读取或检查失败，可重试此工作流；其它候选仍可查看。' }] })
           }
         }
         authorize(dependencies, context, 'read')
-        return pageResult('items', items, offset, page.total, {
+        /** 查询条件与服务器快照身份共同固定一次扫描，不能把不同筛选结果拼成完整目录。 */
+        const scanKey = JSON.stringify([connectionId, page.instanceGeneration, page.remoteUser, page.snapshotId,
+          params.mediaKind, params.inputKinds, params.query ?? ''])
+        /** 只有从第一页连续读取的结果才证明整个目录已检查。 */
+        const priorScan = offset === 0 ? { nextOffset: 0, candidates: 0, blocked: 0 } : discoveryScans.get(scanKey)
+        const contiguous = priorScan?.nextOffset === offset
+        const scan = { nextOffset: offset + items.length,
+          candidates: candidates + (contiguous ? priorScan.candidates : 0),
+          blocked: blocked + (contiguous ? priorScan.blocked : 0) }
+        if (contiguous) {
+          if (!discoveryScans.has(scanKey) && discoveryScans.size >= 16) discoveryScans.delete(discoveryScans.keys().next().value!)
+          discoveryScans.set(scanKey, scan)
+        }
+        /** 不可用、部分页、筛选结果或转换问题均不能宣称服务器没有匹配工作流。 */
+        const status = (page.capability !== undefined && page.capability !== 'available') || page.syncError ? 'unavailable'
+          : scan.candidates > 0 ? 'candidates'
+            : !contiguous || page.nextOffset !== null || scan.nextOffset < page.total || Boolean(params.query?.trim()) ? 'incomplete'
+              : scan.blocked > 0 ? 'blocked' : 'no-match'
+        /** 自主授权只改变无匹配后的确认流程，不把未完成检查当成新建依据。 */
+        const authorizationMode = mediaAuthorizationMode(dependencies)
+        const canCreateWorkflowAutomatically = status === 'no-match' && authorizationMode === 'automatic'
+        const discovery = { status, requiresUserConfirmation: status === 'no-match' && !canCreateWorkflowAutomatically,
+          canCreateWorkflowAutomatically,
+          message: status === 'no-match' ? canCreateWorkflowAutomatically
+            ? '未找到匹配的服务器工作流。用户已选择 Agent 自主执行，可根据当前服务器实际模型和节点生成工作流，校验后以 creationIntent=automatic-policy 保存本地并继续任务，无需再次询问。'
+            : '未找到匹配的服务器工作流。是否根据当前服务器已有的模型和节点生成工作流，并保存到本地？等待用户确认后再创建。'
+            : status === 'unavailable' ? '服务器目录不可用或同步失败，请先处理连接问题，不能据此判断没有匹配工作流。'
+              : status === 'blocked' ? '存在无法读取或转换的工作流，请说明具体原因并继续检查，不能据此自动新建。'
+                : status === 'incomplete' ? '尚未完成完整目录检查，请继续分页；有名称筛选时需清除筛选后再判断。'
+                  : `请核对候选的真实输入角色与目标；确认适用后直接使用服务器工作流。完整检查后所有候选都不适用时说明原因，${authorizationMode === 'automatic' ? '按自主授权根据服务器实际资源新建。' : '先询问用户是否新建。'}` }
+        /** 字节预算可能截短本页，实际交付游标同样参与完整扫描证明。 */
+        const result = pageResult('items', items, offset, page.total, {
           connectionId, instanceGeneration: page.instanceGeneration, snapshotId: page.snapshotId, checkedAt: page.checkedAt,
           capability: page.capability, snapshotOrigin: page.snapshotOrigin,
           ...(page.syncError ? { syncError: page.syncError } : {}),
-          selectedWorkflow: null, availableActions: ['media_read_remote_workflow', 'media_import_remote_workflow'],
+          discovery,
+          authorizationMode,
+          selectedWorkflow: null, availableActions: ['media_read_remote_workflow', 'media_use_remote_workflow'],
         })
+        const delivered = result.details as { items?: Record<string, unknown>[] }
+        if (!delivered.items) {
+          discoveryScans.delete(scanKey)
+          return result
+        }
+        if (delivered.items.length < items.length) {
+          if (contiguous) {
+            discoveryScans.set(scanKey, { nextOffset: offset + delivered.items.length,
+              candidates: priorScan.candidates + delivered.items.filter((item) => (item.match as { status?: string } | undefined)?.status === 'candidate').length,
+              blocked: priorScan.blocked + delivered.items.filter((item) => item.canImport === false).length })
+          }
+          return toolResult({ ...delivered, discovery: status === 'unavailable' ? discovery
+            : { status: 'incomplete', requiresUserConfirmation: false, canCreateWorkflowAutomatically: false,
+              message: '本页摘要受大小限制，请沿 nextOffset 继续检查，尚不能判断服务器没有匹配工作流。' } })
+        }
+        return result
       },
     }),
     defineTool({
+      name: 'media_use_remote_workflow', label: '使用服务器工作流',
+      description: '直接使用已发现的服务器工作流。Host 自动解析并复用不可变执行快照，返回卡片配置所需版本；无需创建、导入或发布本地模板，不提交生成。内容变化时重新发现并核对。',
+      parameters: Type.Object({
+        descriptor: REMOTE_DESCRIPTOR_SCHEMA,
+        contentHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
+      }),
+      execute: async (_toolCallId, params) => useRemoteWorkflowSnapshot(dependencies, context,
+        params.descriptor as MediaRemoteDescriptor, params.contentHash, hasCanvasTarget),
+    }),
+    defineTool({
       name: 'media_import_remote_workflow', label: '接入远端工作流',
-      description: '将已发现且内容 hash 一致的远端工作流自动转换并登记为当前项目的不可变草稿。复用节点/资源/输出校验，清除旧远端素材引用。无需手写 JSON，不创建预设、不发布公共版本、不提交生成。',
+      description: '兼容历史接入调用，当前等同于 media_use_remote_workflow：Host 自动复用远端执行快照，不创建项目草稿或本地模板。旧 id/name/revision 参数仅保留调用兼容，请始终使用回执返回的新身份。',
       parameters: Type.Object({
         descriptor: REMOTE_DESCRIPTOR_SCHEMA,
         expectedContentHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
         id: Type.String({ pattern: IDENTIFIER_PATTERN }), name: Type.String({ minLength: 1, maxLength: 120 }),
         expectedConfigRevision: Type.Integer({ minimum: 0 }), expectedWorkflowRevision: Type.Integer({ minimum: 0 }),
       }),
-      execute: async (_toolCallId, params) => {
-        authorize(dependencies, context, 'draft')
-        const descriptor = params.descriptor as MediaRemoteDescriptor
-        const { analysis, contentHash } = await inspectRemoteWorkflow(dependencies, context, descriptor)
-        if (contentHash !== params.expectedContentHash) throw new Error('MEDIA_REMOTE_WORKFLOW_CHANGED')
-        if (!analysis.definition) {
-          /** 仅传递分析器已生成的结构问题；完整列表仍必须通过分页读取。 */
-          throw new MediaRemoteWorkflowImportError(analysis.issues)
-        }
-        const item = saveProjectWorkflow(dependencies, context, { ...params, definition: analysis.definition })
-        // 成功回执只带有界身份和输入输出键，完整表单由 inspect 读取，避免保存后丢失版本回执。
-        return toolResult({ imported: true, id: item.id, name: item.name, revision: item.revision, hash: item.hash,
-          projectId: item.projectId, connectionId: descriptor.connectionId, contentHash,
-          inputs: analysis.definition.bindings.slice(0, 24).map((binding) => ({ key: binding.key, kind: binding.kind })),
-          outputs: analysis.definition.outputs.slice(0, 16).map((output) => ({ key: output.key, mediaType: output.mediaType })),
-          truncated: analysis.definition.bindings.length > 24 || analysis.definition.outputs.length > 16,
-          availableActions: ['media_match_assets', 'media_inspect_workflow',
-            ...(hasCanvasTarget ? ['canvas_update_image_config', 'canvas_update_media_config'] : ['media_prepare_run'])] })
-      },
+      execute: async (_toolCallId, params) => useRemoteWorkflowSnapshot(dependencies, context,
+        params.descriptor as MediaRemoteDescriptor, params.expectedContentHash, hasCanvasTarget),
     }),
     defineTool({
       name: 'media_import_remote_asset', label: '导入远端素材',
@@ -723,11 +827,43 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
       },
     }),
     defineTool({
+      name: 'media_save_local_workflow', label: '保存本地工作流',
+      description: '新任务先检查服务器工作流，无匹配时根据实际模型和节点新建。authorizationMode=ask 时先取得用户同意并传 creationIntent=user-confirmed；automatic 时可直接新建并传 automatic-policy，Host 会复核当前设置。保存前校验真实节点接口、模型枚举、连线与输出；保存为本机跨项目复用模板，不提交生成。',
+      parameters: Type.Object({
+        id: Type.String({ pattern: IDENTIFIER_PATTERN }), name: Type.String({ minLength: 1, maxLength: 120 }),
+        connectionId: Type.String({ pattern: IDENTIFIER_PATTERN }),
+        creationIntent: WORKFLOW_CREATION_INTENT_SCHEMA,
+        expectedConfigRevision: Type.Integer({ minimum: 0 }), expectedWorkflowRevision: Type.Integer({ minimum: 0 }),
+        definition: Type.Unknown(),
+      }),
+      execute: async (_toolCallId, params) => {
+        assertWorkflowCreationIntent(dependencies, params.creationIntent)
+        authorize(dependencies, context, 'publish')
+        /** 只读取当前图实际引用的节点 schema，模型名称必须匹配服务器的枚举。 */
+        const definition = parseMediaWorkflowDefinition(params.definition)
+        const connectionId = resolveMediaConnection(dependencies, context, params)
+        const classTypes = [...new Set(Object.values(definition.prompt).map((node) => node.class_type))]
+        const objectInfo = await dependencies.resources.getSchema(connectionId, context.projectId, classTypes)
+        /** 服务器读取期间可能撤回自主授权，落盘前不能继续使用旧策略。 */
+        assertWorkflowCreationIntent(dependencies, params.creationIntent)
+        const validation = validateComfyWorkflow(definition, objectInfo)
+        if (!validation.valid) throw new MediaWorkflowValidationError(validation.issues)
+        const configuration = dependencies.configuration.read()
+        if (latestRevision(configuration.workflows, params.id) !== params.expectedWorkflowRevision) throw new Error('MEDIA_WORKFLOW_PUBLISH_CONFLICT')
+        authorize(dependencies, context, 'publish')
+        const item = savedWorkflow(dependencies.configuration.saveWorkflow({ id: params.id, name: params.name,
+          projectId: null, definition }, params.expectedConfigRevision), params.id)
+        return toolResult({ id: item.id, name: item.name, revision: item.revision, hash: item.hash,
+          connectionId, source: 'local-template', saved: true })
+      },
+    }),
+    defineTool({
       name: 'media_save_workflow_draft', label: '保存媒体工作流草稿',
-      description: '把有界 ComfyUI API 图保存为当前项目的不可变草稿版本；不上传素材，也不执行生成。',
+      description: '仅兼容项目旧流程；新建旧草稿须传 creationIntent=user-confirmed 或在用户已开启自主模式时传 automatic-policy。新任务直接使用服务器工作流，无匹配时按当前生成授权策略处理，并改用 media_save_local_workflow 保存。此入口不上传素材或执行生成。',
       parameters: Type.Object({
         id: Type.String({ pattern: IDENTIFIER_PATTERN }), name: Type.String({ minLength: 1, maxLength: 120 }),
         expectedConfigRevision: Type.Integer({ minimum: 0 }), expectedWorkflowRevision: Type.Integer({ minimum: 0 }),
+        creationIntent: Type.Optional(WORKFLOW_CREATION_INTENT_SCHEMA),
         definition: Type.Unknown(),
       }),
       execute: async (_toolCallId, params) => {
@@ -971,7 +1107,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     - (toolOrder.get(right.name) ?? Number.MAX_SAFE_INTEGER))
 
   /** schema 可见性和运行时守卫使用同一模式投影；未来新增工具默认不会进入列表。 */
-  const executionOnlyTools = ['media_execute_run', 'media_cancel_run', 'media_publish_workflow', 'media_save_profile', 'media_import_local_file']
+  const executionOnlyTools = ['media_execute_run', 'media_cancel_run', 'media_publish_workflow', 'media_save_local_workflow', 'media_save_profile', 'media_import_local_file']
   const visible = tools.filter((tool) => (
     (isExecutionCapable || !executionOnlyTools.includes(tool.name))
     && (context.canvasAgentMode !== 'parent-orchestrated' || tool.name !== 'media_get_asset_file')
@@ -1005,10 +1141,22 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     },
   }))
   return {
-    systemPromptAppend: '面向画布生成时，先用 canvas_get_context 和 canvas_read 复用目标卡片；尚无卡片时图片用 canvas_create_artifact，音视频用 canvas_create_media 创建，再发现与分析工作流。通过 media_list_workflows(canvasId) 读取画布绑定服务器和本地工作流，并查询 API 模型。没有指定工作流时主动调用 media_discover_workflows，传入目标媒体类型与真实媒体输入数量；普通 Agent 传 canvasId，画布 Agent 自动使用固定画布。未绑定时保留待配置卡片，请用户选择服务器，不默认选第一台。根据候选真实节点、标题、输入角色和输出分析适配性，不按文件名或数量相同直接认定首尾帧匹配。UI 格式先走转换分析。选定可导入候选后，用精确 descriptor 和 contentHash 调用 media_import_remote_workflow 保存项目草稿，再通过 media_inspect_workflow 和 media_match_assets 读取真实字段、默认值和素材。立即用 canvas_update_image_config 或 canvas_update_media_config 固定工作流版本、连接和已知 typed 输入，缺失字段省略并留给用户补齐；不能虚构素材或连线。分析失败时在原卡片 preparation 中保存错误码及节点、字段、中文原因，原始响应和凭据不得写入诊断。参数满足要求且用户已要求生成时，清除 preparation 并调用 canvas_run_nodes，原卡片展示进度、错误和产物。普通画布任务不走独立 media_prepare_run；无 Canvas 目标的独立媒体任务和父编排 handoff 保持原入口。项目草稿保持项目隔离，公共发布必须明确声明 publishIntent。发现、导入和保存不会生成，执行和取消仍遵守批准边界。旧 profile 仅兼容历史流程。只有 media_import_local_file 可接收 Shell 或 Skill 在当前授权根生成的明确本地文件路径；已有资产交给 ffmpeg 或分析 Skill 时使用 media_get_asset_file，并原样传入 MediaAssetRef。其它媒体工具不要传入项目 ID、Agent 身份、本地路径、远端素材名或凭据。',
+    systemPromptAppend: `面向画布生成时，先用 canvas_get_context 和 canvas_read 复用目标卡片；尚无卡片时图片用 canvas_create_artifact，音视频用 canvas_create_media 创建，再发现与分析工作流。通过 media_list_workflows(canvasId) 读取画布绑定服务器、当前 authorizationMode，并查询 API 模型。
+生成授权由用户设置决定：ask 为每次确认；automatic 为 Agent 自主执行，已授权你围绕当前任务连续选型、配置、生成、检查和采用合适候选后继续，不要对已授权的常规步骤反复询问。自主权限不代表无限重试或扩大任务范围，仍遵守当前预算、计划模式、项目边界及用户停止要求；提交结果未知时只恢复原任务，不重复提交。采用前完成实际可用的内容检查，不把 metadataOnly 当成看过视频或听过音频，也不跳过工具要求的版本与候选身份。
+新任务优先查看 ComfyUI 服务器工作流：除用户明确指定本地模板或恢复原任务外，必须先调用 media_discover_workflows，传入目标媒体类型与真实媒体输入数量；普通 Agent 传 canvasId，画布 Agent 自动使用固定画布。未绑定时保留待配置卡片，请用户选择服务器，不默认选第一台。根据真实节点、标题、输入角色和输出核对语义适配性，不按文件名或数量相同认定首尾帧匹配。UI 格式先走转换分析。选定候选后，用精确 descriptor 和 contentHash 调用 media_use_remote_workflow 直接使用，Host 自动保留内部执行快照，无需用户创建、导入、发布模板，也不要另存项目草稿。再用 media_inspect_workflow 和 media_match_assets 读取真实字段、默认值和素材。
+分页未完成须继续 nextOffset，名称筛选无结果须清除筛选；目录读取失败、同步失败和转换失败都不能当作没有匹配。完整检查仍无语义匹配时说明缺口：ask 模式先询问用户是否根据服务器已有模型和节点生成工作流并保存本地，明确同意后传 creationIntent=user-confirmed；automatic 模式可直接生成并传 creationIntent=automatic-policy，无需再次确认。两种模式都必须用 media_list_resources 查询实际 models/nodes，用 media_get_node_schema 和 media_inspect_workflow 验证接口、模型枚举、连线与输出，再调用 media_save_local_workflow 保存本地模板，禁止虚构模型或节点。权限以工具回执和 Host 最新设置为准，不能自行改变授权模式。
+立即用 canvas_update_image_config 或 canvas_update_media_config 固定工作流版本、连接和已知 typed 输入，缺失字段省略并留给用户补齐；不能虚构素材或连线。分析失败时在原卡片 preparation 中保存错误码及节点、字段、中文原因，原始响应和凭据不得写入诊断。参数满足要求且用户已要求生成时，清除 preparation 并调用 canvas_run_nodes，原卡片展示进度、错误和产物。普通画布任务不走独立 media_prepare_run；无 Canvas 目标的独立媒体任务和父编排 handoff 保持原入口。
+发现、使用和保存不会生成，执行和取消按当前生成授权处理；旧导入、项目草稿、公共发布和 profile 工具只兼容用户明确要求维护的历史流程，不作为新任务默认路径。只有 media_import_local_file 可接收 Shell 或 Skill 在当前授权根生成的明确本地文件路径；已有资产交给 ffmpeg 或分析 Skill 时使用 media_get_asset_file，并原样传入 MediaAssetRef。其它媒体工具不要传入项目 ID、Agent 身份、本地路径、远端素材名或凭据。`,
     piCustomTools: visible,
     allowedToolNames: visible.map((tool) => tool.name),
     allowedToolNamesMode: 'extend',
     singleApprovalToolNames: isExecutionCapable ? ['media_execute_run', 'media_cancel_run'] : [],
+    toolApprovalPolicy: {
+      /** 策略只对明确列出的工具及可执行上下文生效，实时读取用户设置。 */
+      getMode: (toolName) => isExecutionCapable && MEDIA_AUTOMATION_TOOL_NAMES.has(toolName)
+        ? mediaAuthorizationMode(dependencies) : 'ask',
+      /** 仅等待审批时订阅设置事件，不轮询配置或远端服务器。 */
+      subscribe: (listener) => dependencies.configuration.subscribeAuthorizationMode?.(listener) ?? (() => {}),
+    },
   }
 }

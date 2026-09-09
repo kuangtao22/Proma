@@ -13,13 +13,15 @@ interface MediaSettingsPageProps {
   onBack?: () => void
   /** 写入或资源操作期间禁止离开表单。 */
   busy?: boolean
+  /** 页面标题下方的跨列表与编辑态公共内容。 */
+  headerContent?: ReactNode
   /** 当前页面的列表或表单内容。 */
   children: ReactNode
 }
 
 /** 根据返回回调切换列表标题与编辑标题，复用模型配置表单的字号和按钮样式。 */
-export function MediaSettingsPage({ title, action, onBack, busy, children }: MediaSettingsPageProps): ReactElement {
-  if (!onBack) return <SettingsSection title={title} action={action}>{children}</SettingsSection>
+export function MediaSettingsPage({ title, action, onBack, busy, headerContent, children }: MediaSettingsPageProps): ReactElement {
+  if (!onBack) return <SettingsSection title={title} action={action}>{headerContent}{children}</SettingsSection>
 
   return (
     <div className="space-y-6">
@@ -29,6 +31,7 @@ export function MediaSettingsPage({ title, action, onBack, busy, children }: Med
         </Button>
         <h3 className="min-w-0 flex-1 break-words text-lg font-medium text-foreground">{title}</h3>
       </div>
+      {headerContent}
       {children}
     </div>
   )

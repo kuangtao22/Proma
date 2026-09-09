@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import type { ComfyObjectInfo, MediaAssetRecord, MediaAssetRef, MediaProjectCatalog, MediaRemoteDescriptor, MediaRunSnapshot, MediaWorkflowDefinition } from '@proma/shared'
+import type { ComfyObjectInfo, MediaAssetRecord, MediaAssetRef, MediaProjectCatalog, MediaRemoteDescriptor, MediaRunSnapshot, MediaWorkflowDefinition, MediaWorkflowVersion } from '@proma/shared'
 import type { CanvasToolRunContext } from '../design/canvas-tool-provider'
 import { createMediaToolRun, MEDIA_TOOL_NAMES, type MediaToolProviderDependencies } from './media-tool-provider'
 import { MediaWorkflowValidationError } from './media-workflow-error'
@@ -53,6 +53,8 @@ function fixture(options: { largeResources?: boolean; withSources?: boolean; wit
   const importedLocalFiles: Array<{ path: string; mediaKind: 'image' | 'audio' | 'video' }> = []
   const resolvedAssetFiles: MediaAssetRef[] = []
   const modelScopes: Array<string | undefined> = []
+  /** 自动接入只保存内部快照，独立观察其与用户模板写入的区别。 */
+  const cachedWorkflows: MediaWorkflowVersion[] = []
   const catalog = (): MediaProjectCatalog => ({
     revision: configRevision,
     connections: [{ id: 'gpu', name: 'GPU', driver: 'comfyui', enabled: true, revision: 1, instanceGeneration: 'instance-1', credentialConfigured: true }],
@@ -67,6 +69,14 @@ function fixture(options: { largeResources?: boolean; withSources?: boolean; wit
   const dependencies: MediaToolProviderDependencies = {
     authorize: (_runContext, operation, runId) => { calls.push({ operation, ...(runId ? { runId } : {}) }) },
     configuration: {
+      cacheRemoteWorkflow: (input) => {
+        /** 模拟 Host 已规范化的稳定快照回执，持久化去重另由真实 Store 测试覆盖。 */
+        const cached: MediaWorkflowVersion = { id: 'remote-snapshot', name: input.name, projectId: input.projectId,
+          revision: 1, hash: 'f'.repeat(64), createdAt: 1, definition: input.definition,
+          remoteSource: { descriptor: input.descriptor, contentHash: input.contentHash } }
+        cachedWorkflows.push(cached)
+        return cached
+      },
       listProject: () => catalog(),
       read: () => ({ schemaVersion: 1, ...catalog(), connections: [], workflows: workflowRevision ? [{ ...catalog().workflows[0]!, definition: workflow }] : [] }),
       getWorkflow: () => ({ ...catalog().workflows[0]!, definition: workflow }),
@@ -181,11 +191,224 @@ function fixture(options: { largeResources?: boolean; withSources?: boolean; wit
       },
     } : {}),
   }
-  return { dependencies, calls, prepared, publishedProjectIds, importedDescriptors, importedLocalFiles, resolvedAssetFiles, modelScopes }
+  return { dependencies, calls, prepared, publishedProjectIds, importedDescriptors, importedLocalFiles, resolvedAssetFiles, modelScopes, cachedWorkflows }
 }
 
 describe('媒体 Agent 工具提供器', () => {
-  test('Given 服务器已有 API 工作流 When 自动发现并导入 Then 按真实 I/O 匹配并生成项目草稿而不执行', async () => {
+  test('Given 用户切换生成授权 When 同一 Agent 再次调用 Then 仅媒体与画布运行工具读取最新策略', () => {
+    /** 同轮修改设置，验证工具策略不是启动时的旧快照。 */
+    const f = fixture()
+    const read = f.dependencies.configuration.read
+    let authorizationMode: 'ask' | 'automatic' = 'ask'
+    f.dependencies.configuration.read = () => ({ ...read(), authorizationMode })
+    const run = createMediaToolRun(f.dependencies, context)
+    expect(run.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+    authorizationMode = 'automatic'
+    for (const name of ['media_execute_run', 'media_cancel_run', 'canvas_run_nodes', 'canvas_run_workflow', 'canvas_resume_workflow', 'canvas_retry_task']) {
+      expect(run.toolApprovalPolicy?.getMode(name)).toBe('automatic')
+    }
+    expect(run.toolApprovalPolicy?.getMode('server_exec')).toBe('ask')
+    expect(createMediaToolRun(f.dependencies, { ...context, permissionCeiling: 'plan' }).toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+    authorizationMode = 'ask'
+    expect(run.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+  })
+
+  test('Given 自主模式且远端完整目录无匹配 When 发现结束 Then 允许根据真实资源新建而不再要求对话确认', async () => {
+    /** 空目录是真实无匹配，筛选结果仍不能授予自动新建。 */
+    const f = fixture()
+    const read = f.dependencies.configuration.read
+    f.dependencies.configuration.read = () => ({ ...read(), authorizationMode: 'automatic' })
+    f.dependencies.resources.list = async (input) => ({ connectionId: input.connectionId, instanceGeneration: 'instance-1',
+      remoteUser: 'user-1', source: 'user-data', snapshotId: 'empty', checkedAt: 1, capability: 'available',
+      total: 0, nextOffset: null, items: [] })
+    const run = createMediaToolRun(f.dependencies, context)
+    const result = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video' })
+    expect(result.details).toMatchObject({ authorizationMode: 'automatic', discovery: {
+      status: 'no-match', requiresUserConfirmation: false, canCreateWorkflowAutomatically: true,
+    } })
+    const filtered = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', query: 'video' })
+    expect(filtered.details).toMatchObject({ discovery: { status: 'incomplete', canCreateWorkflowAutomatically: false } })
+    expect(f.publishedProjectIds).toEqual([])
+  })
+
+  test('Given 自主模式工作流保存 When 模式在节点读取期间被收回 Then 保存前重新检查并拒绝', async () => {
+    /** 模拟跨网络等待期间用户撤回自动授权，不允许旧策略继续写入。 */
+    const f = fixture()
+    const read = f.dependencies.configuration.read
+    let authorizationMode: 'ask' | 'automatic' = 'automatic'
+    /** 确认已进入异步服务器读取后撤回，而非入口提前拒绝。 */
+    let schemaRead = false
+    f.dependencies.configuration.read = () => ({ ...read(), authorizationMode })
+    f.dependencies.resources.getSchema = async () => {
+      schemaRead = true
+      authorizationMode = 'ask'
+      return schema
+    }
+    const run = createMediaToolRun(f.dependencies, context)
+    await expect(executeTool(run.piCustomTools, 'media_save_local_workflow', {
+      id: 'local', name: '本地模板', connectionId: 'gpu', definition: workflow, creationIntent: 'automatic-policy',
+      expectedConfigRevision: 3, expectedWorkflowRevision: 0,
+    })).rejects.toThrow('MEDIA_WORKFLOW_CREATION_CONFIRMATION_REQUIRED')
+    expect(schemaRead).toBe(true)
+    expect(f.publishedProjectIds).toEqual([])
+  })
+
+  test('Given 服务器已有可用工作流 When 直接使用 Then Host 创建执行快照且无需模板 ID 或发布', async () => {
+    /** 完整的远端图和节点接口，确保接入经过真实分析器。 */
+    const f = fixture()
+    f.dependencies.resources.getSchema = async () => ({
+      LoadImage: { input: { required: { image: [['source.png']] } }, output: ['IMAGE', 'MASK'] },
+      SaveImage: schema.SaveImage!,
+    })
+    f.dependencies.resources.readWorkflow = async (descriptor) => ({ descriptor, format: 'api', definition: {
+      '1': { class_type: 'LoadImage', inputs: { image: 'source.png' } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['1', 0], filename_prefix: 'Proma' } },
+    } })
+    /** 用户只选择远端身份与发现时的内容版本。 */
+    const run = createMediaToolRun(f.dependencies, context)
+    const found = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'image', inputKinds: ['image'] })
+    const candidate = (found.details as { items: Array<{ descriptor: MediaRemoteDescriptor; contentHash: string }> }).items[0]!
+    const used = await executeTool(run.piCustomTools, 'media_use_remote_workflow', candidate)
+    expect(used.details).toMatchObject({ id: 'remote-snapshot', revision: 1, connectionId: 'gpu', source: 'comfyui-server' })
+    expect(f.cachedWorkflows).toHaveLength(1)
+    expect(f.cachedWorkflows[0]?.definition.prompt['1']?.inputs.image).toBe('')
+    expect(f.publishedProjectIds).toEqual([])
+    expect(f.prepared).toEqual([])
+    await expect(executeTool(run.piCustomTools, 'media_use_remote_workflow', { ...candidate, contentHash: '0'.repeat(64) }))
+      .rejects.toThrow('MEDIA_REMOTE_WORKFLOW_CHANGED')
+    expect(f.cachedWorkflows).toHaveLength(1)
+  })
+
+  test('Given 未过滤的远端目录确认无匹配 When 发现结束 Then 提醒征求生成许可且不自动保存', async () => {
+    const f = fixture()
+    f.dependencies.resources.list = async (input) => ({ connectionId: input.connectionId, instanceGeneration: 'instance-1',
+      remoteUser: 'user-1', source: 'user-data', snapshotId: 'empty', checkedAt: 1, capability: 'available',
+      total: 0, nextOffset: null, items: [] })
+    const run = createMediaToolRun(f.dependencies, context)
+    const result = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video' })
+    expect(result.details).toMatchObject({ discovery: { status: 'no-match', requiresUserConfirmation: true } })
+    expect(JSON.stringify(result.details)).toContain('是否根据当前服务器已有的模型和节点生成工作流')
+    expect(f.publishedProjectIds).toEqual([])
+    const filtered = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', query: 'minimax' })
+    expect(filtered.details).toMatchObject({ discovery: { status: 'incomplete', requiresUserConfirmation: false } })
+  })
+
+  test('Given 分页未完成或目录失败 When 没有候选 Then 不把未知结果当作无匹配', async () => {
+    const f = fixture()
+    /** 返回可观察的两页空结果；第二页失败不能提供新建许可。 */
+    f.dependencies.resources.list = async (input) => ({ connectionId: input.connectionId, instanceGeneration: 'instance-1',
+      remoteUser: 'user-1', source: 'user-data', snapshotId: 'partial', checkedAt: 1,
+      capability: input.offset ? 'failed' : 'available', total: 2, nextOffset: input.offset ? null : 1, items: [] })
+    const run = createMediaToolRun(f.dependencies, context)
+    const first = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', limit: 1 })
+    expect(first.details).toMatchObject({ discovery: { status: 'incomplete', requiresUserConfirmation: false } })
+    const last = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', limit: 1, offset: 1 })
+    expect(last.details).toMatchObject({ discovery: { status: 'unavailable', requiresUserConfirmation: false } })
+  })
+
+  test('Given 用户未同意新建 When 保存本地工作流 Then 在读取服务器或写入前拒绝', async () => {
+    const f = fixture()
+    const run = createMediaToolRun(f.dependencies, context)
+    await expect(executeTool(run.piCustomTools, 'media_save_local_workflow', {
+      id: 'local', name: '本地模板', connectionId: 'gpu', definition: workflow,
+      expectedConfigRevision: 3, expectedWorkflowRevision: 0,
+    })).rejects.toThrow('MEDIA_WORKFLOW_CREATION_CONFIRMATION_REQUIRED')
+    expect(f.publishedProjectIds).toEqual([])
+  })
+
+  test('Given 历史草稿工具被用来新建工作流 When 没有用户确认 Then 普通与父编排调用都不能绕过确认', async () => {
+    for (const canvasAgentMode of [undefined, 'parent-orchestrated'] as const) {
+      const f = fixture()
+      const run = createMediaToolRun(f.dependencies, { ...context, canvasAgentMode })
+      await expect(executeTool(run.piCustomTools, 'media_save_workflow_draft', {
+        id: 'legacy', name: '项目旧流程', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow,
+      })).rejects.toThrow('MEDIA_WORKFLOW_CREATION_CONFIRMATION_REQUIRED')
+      expect(f.publishedProjectIds).toEqual([])
+    }
+  })
+
+  test('Given 连续两页均不匹配 When 完成全部页检查 Then 才允许提示用户确认新建', async () => {
+    const f = fixture()
+    /** 原资源页只生成稳定描述符，测试按页替换目录总数与游标。 */
+    const listPage = f.dependencies.resources.list
+    f.dependencies.resources.list = async (input) => ({ ...await listPage(input), total: 2, nextOffset: input.offset ? null : 1 })
+    f.dependencies.resources.getSchema = async () => ({
+      LoadImage: { input: { required: { image: [['source.png']] } }, output: ['IMAGE', 'MASK'] }, SaveImage: schema.SaveImage!,
+    })
+    f.dependencies.resources.readWorkflow = async (descriptor) => ({ descriptor, format: 'api', definition: {
+      '1': { class_type: 'LoadImage', inputs: { image: 'source.png' } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['1', 0], filename_prefix: 'Proma' } },
+    } })
+    const run = createMediaToolRun(f.dependencies, context)
+    const first = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', limit: 1 })
+    expect(first.details).toMatchObject({ discovery: { status: 'incomplete' }, nextOffset: 1 })
+    const last = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', limit: 1, offset: 1 })
+    expect(last.details).toMatchObject({ discovery: { status: 'no-match', requiresUserConfirmation: true }, nextOffset: null })
+
+    /** 响应字节预算截短末页时，尚未交给 Agent 的条目不能算作已完成检查。 */
+    f.dependencies.resources.list = async (input) => {
+      const page = await listPage(input)
+      return { ...page, total: 2, nextOffset: null, items: [
+        { ...page.items[0]!, name: 'a'.repeat(18000) }, { ...page.items[0]!, name: 'b'.repeat(18000) },
+      ] }
+    }
+    const bounded = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video' })
+    expect(bounded.details).toMatchObject({ discovery: { status: 'incomplete', requiresUserConfirmation: false }, nextOffset: 1 })
+  })
+
+  test('Given 用户同意新建但节点连线类型不匹配 When 保存本地工作流 Then 暴露校验原因且不写入', async () => {
+    const f = fixture()
+    const run = createMediaToolRun(f.dependencies, context)
+    await expect(executeTool(run.piCustomTools, 'media_save_local_workflow', {
+      id: 'local', name: '本地模板', connectionId: 'gpu', definition: workflow, creationIntent: 'user-confirmed',
+      expectedConfigRevision: 3, expectedWorkflowRevision: 0,
+    })).rejects.toThrow('LINK_TYPE_INVALID')
+    expect(f.publishedProjectIds).toEqual([])
+  })
+
+  test('Given 生成图引用服务器没有的模型或节点 When 确认保存 Then 拒绝虚构资源并返回可定位原因', async () => {
+    for (const missing of ['model', 'node'] as const) {
+      /** 两类缺失分别验证服务器枚举和节点存在性，均不得落盘。 */
+      const f = fixture()
+      const definition = structuredClone(workflow)
+      if (missing === 'model') definition.prompt['1']!.inputs.ckpt_name = 'not-installed.safetensors'
+      else definition.prompt['1']!.class_type = 'NotInstalledNode'
+      const run = createMediaToolRun(f.dependencies, context)
+      await expect(executeTool(run.piCustomTools, 'media_save_local_workflow', {
+        id: 'local', name: '本地模板', connectionId: 'gpu', definition, creationIntent: 'user-confirmed',
+        expectedConfigRevision: 3, expectedWorkflowRevision: 0,
+      })).rejects.toThrow(missing === 'model' ? 'INPUT_ENUM_INVALID@1.ckpt_name' : 'NODE_CLASS_UNKNOWN@1')
+      expect(f.publishedProjectIds).toEqual([])
+    }
+  })
+
+  test.each(['user-confirmed', 'automatic-policy'] as const)('Given 新建已通过 %s 授权且图匹配服务器接口 When 保存本地工作流 Then 创建模板而不提交生成', async (creationIntent) => {
+    const f = fixture()
+    /** 自主策略来自可信配置，不能只靠 Agent 参数提升权限。 */
+    const read = f.dependencies.configuration.read
+    if (creationIntent === 'automatic-policy') f.dependencies.configuration.read = () => ({ ...read(), authorizationMode: 'automatic' })
+    f.dependencies.resources.getSchema = async () => ({
+      LoadImage: { input: { required: { image: [['source.png']] } }, output: ['IMAGE', 'MASK'] },
+      SaveImage: schema.SaveImage!,
+    })
+    /** 使用明确上传槽，模板不携带服务器素材文件名。 */
+    const definition: MediaWorkflowDefinition = { schemaVersion: 1, prompt: {
+      '1': { class_type: 'LoadImage', inputs: { image: '' } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['1', 0], filename_prefix: 'Proma' } },
+    }, bindings: [{ key: 'source', nodeId: '1', input: 'image', kind: 'image', loader: 'LoadImage' }],
+    outputs: [{ key: 'main', nodeId: '2', outputIndex: 0, mediaType: 'image' }] }
+    const run = createMediaToolRun(f.dependencies, context)
+    const saved = await executeTool(run.piCustomTools, 'media_save_local_workflow', {
+      id: 'local', name: '本地模板', connectionId: 'gpu', definition, creationIntent,
+      expectedConfigRevision: 3, expectedWorkflowRevision: 0,
+    })
+    expect(saved.details).toMatchObject({ source: 'local-template', saved: true })
+    expect(f.publishedProjectIds).toEqual([null])
+    expect(f.prepared).toEqual([])
+    expect(createMediaToolRun(f.dependencies, { ...context, permissionCeiling: 'plan' }).allowedToolNames).not.toContain('media_save_local_workflow')
+  })
+
+  test('Given 历史会话仍调用远端导入 When 接入已有工作流 Then 复用内部快照而不再创建项目草稿', async () => {
     const f = fixture()
     f.dependencies.getCanvasConnection = () => 'gpu'
     /** 使用有效图片连线，验证整个导入链经过真实结构校验。 */
@@ -208,8 +431,9 @@ describe('媒体 Agent 工具提供器', () => {
       descriptor: candidate.descriptor, expectedContentHash: candidate.contentHash,
       id: 'remote-draft', name: '远端图片流程', expectedConfigRevision: 3, expectedWorkflowRevision: 0,
     })
-    expect(imported.details).toMatchObject({ id: 'remote-draft', revision: 1, projectId: 'project-1', connectionId: 'gpu' })
-    expect(f.publishedProjectIds).toEqual(['project-1'])
+    expect(imported.details).toMatchObject({ id: 'remote-snapshot', revision: 1, source: 'comfyui-server', connectionId: 'gpu' })
+    expect(f.publishedProjectIds).toEqual([])
+    expect(f.cachedWorkflows).toHaveLength(1)
     expect(f.prepared).toEqual([])
     const mismatched = await executeTool(run.piCustomTools, 'media_discover_workflows', { connectionId: 'gpu', mediaKind: 'video', inputKinds: ['image', 'image'] })
     expect(mismatched.details).toMatchObject({ items: [{ match: { matchesOutput: false, matchesInputs: false } }] })
@@ -217,7 +441,7 @@ describe('媒体 Agent 工具提供器', () => {
       descriptor: candidate.descriptor, expectedContentHash: '0'.repeat(64),
       id: 'remote-draft', name: '远端图片流程', expectedConfigRevision: 4, expectedWorkflowRevision: 1,
     })).rejects.toThrow('MEDIA_REMOTE_WORKFLOW_CHANGED')
-    expect(f.publishedProjectIds).toHaveLength(1)
+    expect(f.cachedWorkflows).toHaveLength(1)
   })
 
   test('Given 远端目录单个文件无法读取 When 分页发现 Then 保留失败条目与后续游标且不扫描整库', async () => {
@@ -252,7 +476,7 @@ describe('媒体 Agent 工具提供器', () => {
     expect(reads).toBe(0)
   })
 
-  test('Given 合法工作流包含长节点身份和多输入输出 When 导入项目草稿 Then 成功回执保留版本且不超过预算', async () => {
+  test('Given 合法工作流包含长节点身份和多输入输出 When 使用服务器工作流 Then 成功回执保留版本且不超过预算', async () => {
     const f = fixture()
     /** 达到合法字段边界的静态第三方节点，复现完整元数据超出 32 KiB。 */
     const classType = 'C'.repeat(256)
@@ -277,9 +501,9 @@ describe('媒体 Agent 工具提供器', () => {
       expectedContentHash: createHash('sha256').update(JSON.stringify(prompt)).digest('hex'),
       id: 'large-draft', name: '大型工作流', expectedConfigRevision: 3, expectedWorkflowRevision: 0,
     })
-    expect(result.details).toMatchObject({ imported: true, id: 'large-draft', revision: 1, connectionId: 'gpu' })
+    expect(result.details).toMatchObject({ source: 'comfyui-server', id: 'remote-snapshot', revision: 1, connectionId: 'gpu' })
     expect(Buffer.byteLength(JSON.stringify(result.details), 'utf8')).toBeLessThanOrEqual(32 * 1024)
-    expect(f.publishedProjectIds).toEqual(['project-1'])
+    expect(f.publishedProjectIds).toEqual([])
     expect(f.prepared).toEqual([])
   })
 
@@ -477,7 +701,7 @@ describe('媒体 Agent 工具提供器', () => {
     const f = fixture()
     const run = createMediaToolRun(f.dependencies, context)
     await executeTool(run.piCustomTools, 'media_save_workflow_draft', {
-      id: 'draft', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow,
+      id: 'draft', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow, creationIntent: 'user-confirmed',
     })
     const result = await executeTool(run.piCustomTools, 'media_list_workflows', { offset: 0, limit: 10 })
     expect(result.details).toMatchObject({
@@ -552,7 +776,7 @@ describe('媒体 Agent 工具提供器', () => {
     const run = createMediaToolRun(f.dependencies, context)
     expect(run.allowedToolNames).toEqual([...MEDIA_TOOL_NAMES])
     expect(run.singleApprovalToolNames).toEqual(['media_execute_run', 'media_cancel_run'])
-    const saved = await executeTool(run.piCustomTools, 'media_save_workflow_draft', { id: 'draft', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow })
+    const saved = await executeTool(run.piCustomTools, 'media_save_workflow_draft', { id: 'draft', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow, creationIntent: 'user-confirmed' })
     expect(saved.details).toMatchObject({ id: 'draft', revision: 1 })
     const profile = await executeTool(run.piCustomTools, 'media_save_profile', { id: 'profile', name: '图片', connectionId: 'gpu', workflowId: 'draft', workflowRevision: 1, mediaKind: 'image', enabled: true, expectedConfigRevision: 4 })
     expect(profile.details).toMatchObject({ id: 'profile', revision: 1 })
@@ -621,7 +845,7 @@ describe('媒体 Agent 工具提供器', () => {
       parentWorkflow: { runId: 'b'.repeat(48), parentSessionId: 'parent-session' } }
     const run = createMediaToolRun(f.dependencies, parentContext)
     const first = await executeTool(run.piCustomTools, 'media_save_workflow_draft', {
-      id: 'shot', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow,
+      id: 'shot', name: '草稿', expectedConfigRevision: 3, expectedWorkflowRevision: 0, definition: workflow, creationIntent: 'user-confirmed',
     })
     const firstId = (first.details as { id: string }).id
     const second = await executeTool(run.piCustomTools, 'media_save_workflow_draft', {

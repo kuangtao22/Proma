@@ -1,9 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourcePage, MediaResourceQuery, MediaWorkflowDefinition, MediaWorkflowVersion } from '@proma/shared'
+import type { MediaAuthorizationMode, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourcePage, MediaResourceQuery, MediaWorkflowDefinition, MediaWorkflowVersion } from '@proma/shared'
 import * as mediaSettingsModule from './MediaSettings'
 
 interface ExpectedMediaSettingsModule {
+  selectLocalMediaWorkflows: (workflows: readonly MediaWorkflowVersion[], archivedIds?: readonly string[]) => MediaWorkflowVersion[]
   formatMediaError: (error: unknown) => string
   buildSaveMediaConnectionInput: (draft: {
     id: string
@@ -43,6 +44,13 @@ interface ExpectedMediaSettingsModule {
   }
   RemoteWorkflowContent: (props: { remote: MediaRemoteWorkflow; onImport: () => void }) => React.ReactElement
   MediaSettingsTabsView: (props: { activeTab: 'models' | 'connections' | 'workflows'; onTabChange: (tab: 'models' | 'connections' | 'workflows') => void }) => React.ReactElement
+  MediaAuthorizationControl: (props: {
+    mode?: MediaAuthorizationMode
+    saving: boolean
+    disabled?: boolean
+    error: string | null
+    onChange: (mode: MediaAuthorizationMode) => void
+  }) => React.ReactElement
   parseMediaWorkflowImportText: (text: string) => MediaWorkflowDefinition
   isCurrentMediaResourceRequest: (requestRevision: number, currentRevision: number) => boolean
   createMediaResourceQuery: (
@@ -101,6 +109,20 @@ function createPrivateWorkflow(): MediaWorkflowVersion {
 }
 
 describe('MediaSettings 已确认交互合同', () => {
+  test('Given 模板、内部远端快照和旧项目版本 When 打开本地工作流列表 Then 只显示用户保存模板的最新未归档版本', () => {
+    const { selectLocalMediaWorkflows } = getExpectedModule()
+    /** 历史记录保持原对象，过滤不得迁移或改写项目归属。 */
+    const historical = createPrivateWorkflow()
+    const local = { ...historical, id: 'local', projectId: null, revision: 1 }
+    const latest = { ...local, revision: 2 }
+    const remote: MediaWorkflowVersion = { ...local, id: 'remote', remoteSource: {
+      descriptor: { connectionId: 'gpu', instanceGeneration: 'instance-1', remoteUser: 'default', source: 'user-data', id: 'remote.json', workflowPath: 'remote.json' },
+      contentHash: 'a'.repeat(64),
+    } }
+    expect(selectLocalMediaWorkflows([historical, local, latest, remote])).toEqual([latest])
+    expect(selectLocalMediaWorkflows([historical, local, latest, remote], ['local'])).toEqual([])
+    expect(historical.projectId).toBe('project-1')
+  })
   test('Given 远端工作流详情读取失败 When Renderer 展示错误 Then 提供可操作的同步重试提示', () => {
     const { formatMediaError } = getExpectedModule()
     expect(formatMediaError(new Error('MEDIA_REMOTE_WORKFLOW_READ_FAILED')))
@@ -208,7 +230,7 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(html).toContain('aria-label="复制完整工作流 JSON"')
     expect(html).toContain('仅预览')
     expect(html).not.toContain('role="alert"')
-    expect(html).not.toContain('导入公共草稿')
+    expect(html).not.toContain('另存为本地工作流')
   })
 
   test('Given API 工作流 When 打开详情 Then 提供代码编辑器和独立导入入口', () => {
@@ -224,7 +246,7 @@ describe('MediaSettings 已确认交互合同', () => {
     const html = renderToStaticMarkup(<RemoteWorkflowContent remote={remote} onImport={() => { throw new Error('不应自动导入') }} />)
     expect(html).toContain('ComfyUI API 格式')
     expect(html).toContain('data-json-code-editor')
-    expect(html).toContain('导入公共草稿')
+    expect(html).toContain('另存为本地工作流')
   })
 
   test('Given UI 工作流已可靠转换 When 打开详情 Then 显示分析状态、可定位错误并允许导入转换定义', () => {
@@ -251,7 +273,7 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(html).toContain('TEST_WARNING')
     expect(html).toContain('节点 1')
     expect(html).toContain('字段 images')
-    expect(html).toContain('导入公共草稿')
+    expect(html).toContain('另存为本地工作流')
     const draft = createRemoteWorkflowDraft(remote, 'UI 流程', 'ui-copy')
     expect(draft.definition.prompt['1']?.class_type).toBe('SaveImage')
   })
@@ -272,7 +294,7 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(html).toContain('暂不可导入')
     expect(html).toContain('UI_SUBGRAPH_UNSUPPORTED')
     expect(html).toContain('包含暂不支持的子图')
-    expect(html).not.toContain('导入公共草稿')
+    expect(html).not.toContain('另存为本地工作流')
   })
 
   test('Given 未识别格式及包含 HTML 的正文 When 预览 Then 仍显示原始内容并按文本转义', () => {
@@ -289,7 +311,7 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(html).toContain('未识别格式')
     expect(html).toContain('data-json-code-editor')
     expect(html).not.toContain('<script>')
-    expect(html).not.toContain('导入公共草稿')
+    expect(html).not.toContain('另存为本地工作流')
   })
 
   test('Given 已显示资源页 When 切换四类资源或连接 Then 清空旧页并回到第一页', () => {
@@ -366,8 +388,41 @@ describe('MediaSettings 已确认交互合同', () => {
     const html = renderToStaticMarkup(<MediaSettingsTabsView activeTab="models" onTabChange={() => undefined} />)
     expect(html).toContain('媒体模型')
     expect(html).toContain('服务连接')
-    expect(html).toContain('公共工作流')
+    expect(html).toContain('本地工作流')
+    expect(html).not.toContain('公共工作流')
     expect(html).not.toContain('媒体预设')
+  })
+
+  test('Given 授权模式缺失或已设为自动 When 渲染全局控件 Then 默认每次确认并准确说明授权范围', () => {
+    const { MediaAuthorizationControl } = getExpectedModule()
+    const askHtml = renderToStaticMarkup(<MediaAuthorizationControl saving={false} error={null} onChange={() => undefined} />)
+    expect(askHtml).toContain('生成授权')
+    expect(askHtml).toContain('每次确认')
+    expect(askHtml).toContain('控制媒体生成和任务所需的工作流创建、保存')
+    expect(askHtml).not.toContain('无限重试')
+    const automaticHtml = renderToStaticMarkup(<MediaAuthorizationControl mode="automatic" saving={false} error={null} onChange={() => undefined} />)
+    expect(automaticHtml).toContain('Agent 自主执行')
+  })
+
+  test('Given 授权策略正在保存或保存失败 When 渲染 Then 禁用控件、显示进度并抛出错误', () => {
+    const { MediaAuthorizationControl } = getExpectedModule()
+    const savingHtml = renderToStaticMarkup(<MediaAuthorizationControl mode="ask" saving error={null} onChange={() => undefined} />)
+    expect(savingHtml).toContain('aria-label="生成授权策略"')
+    expect(savingHtml).toContain('disabled=""')
+    expect(savingHtml).toContain('aria-label="正在保存生成授权策略"')
+    expect(savingHtml).toContain('motion-reduce:animate-none')
+    const errorHtml = renderToStaticMarkup(<MediaAuthorizationControl mode="ask" saving={false} error="配置已变化，请重试" onChange={() => undefined} />)
+    expect(errorHtml).toContain('role="alert"')
+    expect(errorHtml).toContain('配置已变化，请重试')
+  })
+
+  test('Given 窄屏媒体设置 When 渲染授权控件 Then 文案和选择器可换行且选择器宽度稳定', () => {
+    const { MediaAuthorizationControl } = getExpectedModule()
+    const html = renderToStaticMarkup(<MediaAuthorizationControl mode="ask" saving={false} error={null} onChange={() => undefined} />)
+    expect(html).toContain('flex-col')
+    expect(html).toContain('sm:flex-row')
+    expect(html).toContain('w-full')
+    expect(html).toContain('sm:w-48')
   })
 
   test('Given UI graph、无效 JSON 或超限文本 When 导入 Then 返回明确错误', () => {

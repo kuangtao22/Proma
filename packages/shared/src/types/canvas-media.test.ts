@@ -43,6 +43,15 @@ function createConfig() {
 }
 
 describe('Canvas 通用媒体合同', () => {
+  test('Given 默认首选来源 When 配置往返解析 Then 保留来源且拒绝未知模式', () => {
+    const output = { ...createConfig().outputs[0]!, candidateId: 'candidate-1', runId: 'run-1',
+      asset: { assetId: 'video-1', revision: 1, hash: 'a'.repeat(64), mediaKind: 'video' }, selectionOrigin: 'initial' }
+    expect(parseCanvasMediaModuleConfig({ ...createConfig(), adoptedOutputs: [output] }).adoptedOutputs[0])
+      .toMatchObject({ selectionOrigin: 'initial' })
+    expect(() => parseCanvasMediaModuleConfig({ ...createConfig(), adoptedOutputs: [{ ...output, selectionOrigin: 'accepted' }] }))
+      .toThrow('CANVAS_MEDIA_OUTPUT_INVALID')
+  })
+
   test('Given 固定预设和多输出配置 When 解析 Then 保留 key、类型、角色与顺序并深拷贝资产', () => {
     const raw = createConfig()
     const parsed = parseCanvasMediaModuleConfig(raw)
@@ -191,6 +200,76 @@ describe('Canvas 通用媒体合同', () => {
       inputs: [{ key: 'prompt', kind: 'text', source: { type: 'literal', value: '海边日落' } }],
       outputs: [],
     })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID')
+  })
+
+  test('Given 工作流输出缺少角色和顺序 When 保存草稿 Then 返回可定位且不含原始值的字段诊断', () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      mediaModuleId: 'media-1', mediaKind: 'video' as const,
+    }
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...target,
+      expectedConfigRevision: 0,
+      profile: null,
+      inputs: [],
+      outputs: [{ key: '92.video', mediaKind: 'video' }],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: outputs[0] 缺少 role、order')
+  })
+
+  test('Given 工作流已绑定但输出合同为空 When 保存草稿 Then 明确要求至少一项输出', () => {
+    expect(() => parseSaveCanvasMediaModuleInput({
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      mediaModuleId: 'media-1', mediaKind: 'video', expectedConfigRevision: 0,
+      profile: null,
+      workflow: { workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'gpu-main' },
+      inputs: [],
+      outputs: [],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: outputs 至少需要 1 项')
+  })
+
+  test('Given 输出 key 重复、顺序不连续或主输出无效 When 保存草稿 Then 返回对应合同诊断', () => {
+    const base = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      mediaModuleId: 'media-1', mediaKind: 'video' as const, expectedConfigRevision: 0,
+      profile: null,
+      inputs: [],
+    }
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...base,
+      outputs: [
+        { key: 'video', mediaKind: 'video', role: 'primary', order: 0 },
+        { key: 'video', mediaKind: 'image', role: 'preview', order: 1 },
+      ],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: outputs[1].key 与前项重复')
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...base,
+      outputs: [
+        { key: 'video', mediaKind: 'video', role: 'primary', order: 0 },
+        { key: 'poster', mediaKind: 'image', role: 'preview', order: 2 },
+      ],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: outputs[1].order 必须为 1')
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...base,
+      outputs: [{ key: 'video', mediaKind: 'video', role: 'preview', order: 0 }],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: outputs 必须且只能有 1 项 primary')
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...base,
+      outputs: [{ key: 'audio', mediaKind: 'audio', role: 'primary', order: 0 }],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: primary 输出的 mediaKind 必须为 video')
+  })
+
+  test('Given 输入字段错误 When 保存草稿 Then 返回可操作原因且完整空输入草稿仍可保存', () => {
+    const base = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      mediaModuleId: 'media-1', mediaKind: 'video' as const, expectedConfigRevision: 0,
+      profile: null,
+      outputs: [{ key: 'video', mediaKind: 'video' as const, role: 'primary' as const, order: 0 }],
+    }
+    expect(() => parseSaveCanvasMediaModuleInput({
+      ...base,
+      inputs: [{ key: 'prompt', kind: 'text' }],
+    })).toThrow('CANVAS_MEDIA_SAVE_INPUT_INVALID: inputs[0] 缺少 source')
+    expect(parseSaveCanvasMediaModuleInput({ ...base, inputs: [] }).inputs).toEqual([])
   })
 
   test('Given 公共工作流版本和连接 When 保存配置 Then 固定引用且拒绝与旧 profile 混用', () => {

@@ -2416,6 +2416,68 @@
 /* ===== Design XYFlow 画布 =====
  * 全部颜色复用 Proma 主题语义变量，确保内置主题和用户主题都能自然适配。
  */
+/* 媒体详情按工作台宽度分栏，两侧分别滚动，主操作不随长表单移出视口。 */
+.canvas-media-workbench-container {
+  container: media-workbench / inline-size;
+}
+
+.canvas-media-workbench-layout {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 0.85fr) minmax(0, 1.15fr);
+}
+
+@container media-workbench (min-width: 720px) {
+  .canvas-media-workbench-layout {
+    grid-template-columns: minmax(0, 1.15fr) minmax(18rem, 0.85fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .canvas-media-preview-pane {
+    border-bottom-width: 0;
+    border-right-width: 1px;
+  }
+}
+
+/* 同一工作流表单可放在全宽区域或配置侧栏，不使用整个窗口的断点判断字段宽度。 */
+.canvas-media-form-container {
+  container: media-form / inline-size;
+}
+
+.canvas-media-form-field {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.canvas-media-form-source-empty {
+  display: none;
+}
+
+.canvas-media-form-value,
+.canvas-media-form-error {
+  grid-column: 1 / -1;
+}
+
+@container media-form (min-width: 600px) {
+  .canvas-media-form-field {
+    grid-template-columns: minmax(0, 120px) minmax(0, 120px) minmax(0, 1fr);
+  }
+
+  .canvas-media-form-source-empty {
+    display: block;
+  }
+
+  .canvas-media-form-source {
+    width: 100%;
+  }
+
+  .canvas-media-form-value,
+  .canvas-media-form-error {
+    grid-column: 3;
+  }
+}
+
 .design-canvas .react-flow {
   --xy-background-color: hsl(var(--content-area));
   --xy-background-pattern-dots-color: hsl(var(--border));

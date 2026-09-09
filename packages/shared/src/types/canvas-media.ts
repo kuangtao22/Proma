@@ -73,6 +73,8 @@ export interface CanvasMediaAdoptedOutput extends CanvasMediaOutputBinding {
   candidateId: string
   runId: string
   asset: MediaAssetRef
+  /** 自动首选只初始化当前版本；缺省表示用户或 Agent 已明确采用，可作为工作流验收事实。 */
+  selectionOrigin?: 'initial'
 }
 
 /** Shell/Skill 本地产物候选的可信来源；路径不会进入持久化合同。 */
@@ -219,6 +221,20 @@ const MAX_BINDINGS = 128
 const PREPARATION_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,95}$/
 const MAX_PREPARATION_MESSAGE_LENGTH = 2_048
 
+/** 保存边界内部使用的受信字段错误，只携带代码定义的诊断文本。 */
+class CanvasMediaFieldValidationError extends Error {
+  constructor(code: string, readonly detail: string) {
+    super(code)
+    this.name = 'CanvasMediaFieldValidationError'
+  }
+}
+
+/** 按调用模式抛出原错误码或带字段位置的受信错误。 */
+function throwFieldValidationError(code: string, detail: string | undefined): never {
+  if (detail) throw new CanvasMediaFieldValidationError(code, detail)
+  throw new Error(code)
+}
+
 /** 判断未知值是无额外字段的普通对象。 */
 function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -316,9 +332,24 @@ function parseLocalImportSource(value: unknown): CanvasMediaLocalImportSource {
 }
 
 /** 严格解析类型化输入并隔离资产引用。 */
-function parseInput(value: unknown): CanvasMediaInputBinding {
-  if (!hasExactKeys(value, ['key', 'kind', 'source'])
-    || typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)) throw new Error('CANVAS_MEDIA_INPUT_INVALID')
+function parseInput(value: unknown, fieldPath?: string): CanvasMediaInputBinding {
+  const requiredKeys = ['key', 'kind', 'source'] as const
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throwFieldValidationError('CANVAS_MEDIA_INPUT_INVALID', fieldPath ? `${fieldPath} 必须为对象` : undefined)
+  }
+  const missingKeys = requiredKeys.filter((key) => !Object.hasOwn(value, key))
+  if (missingKeys.length > 0) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_INPUT_INVALID',
+      fieldPath ? `${fieldPath} 缺少 ${missingKeys.join('、')}` : undefined,
+    )
+  }
+  if (!hasExactKeys(value, requiredKeys)) {
+    throwFieldValidationError('CANVAS_MEDIA_INPUT_INVALID', fieldPath ? `${fieldPath} 包含未知字段` : undefined)
+  }
+  if (typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)) {
+    throwFieldValidationError('CANVAS_MEDIA_INPUT_INVALID', fieldPath ? `${fieldPath}.key 格式无效` : undefined)
+  }
   if (hasExactKeys(value.source, ['type', 'nodeId', 'outputKey'])
     && value.source.type === 'canvas-output'
     && (value.kind === 'text' || isMediaKind(value.kind))
@@ -331,7 +362,10 @@ function parseInput(value: unknown): CanvasMediaInputBinding {
     }
   }
   if (!hasExactKeys(value.source, ['type', 'value']) || value.source.type !== 'literal') {
-    throw new Error('CANVAS_MEDIA_INPUT_INVALID')
+    throwFieldValidationError(
+      'CANVAS_MEDIA_INPUT_INVALID',
+      fieldPath ? `${fieldPath}.source 与 kind 不匹配` : undefined,
+    )
   }
   if (value.kind === 'text' && typeof value.source.value === 'string' && value.source.value.length <= 100_000) {
     return { key: value.key, kind: 'text', source: { type: 'literal', value: value.source.value } }
@@ -343,26 +377,57 @@ function parseInput(value: unknown): CanvasMediaInputBinding {
     return { key: value.key, kind: 'boolean', source: { type: 'literal', value: value.source.value } }
   }
   if (isMediaKind(value.kind)) {
-    const asset = parseAssetReference(value.source.value)
+    let asset: MediaAssetRef
+    try {
+      asset = parseAssetReference(value.source.value)
+    } catch {
+      throwFieldValidationError(
+        'CANVAS_MEDIA_INPUT_INVALID',
+        fieldPath ? `${fieldPath}.source.value 不是有效媒体资产引用` : undefined,
+      )
+    }
     if (asset.mediaKind === value.kind) {
       return { key: value.key, kind: value.kind, source: { type: 'literal', value: asset } }
     }
   }
-  throw new Error('CANVAS_MEDIA_INPUT_INVALID')
+  throwFieldValidationError(
+    'CANVAS_MEDIA_INPUT_INVALID',
+    fieldPath ? `${fieldPath}.source.value 与 kind 不匹配` : undefined,
+  )
 }
 
 /** 严格解析有序输出角色。 */
-function parseOutput(value: unknown): CanvasMediaOutputBinding {
+function parseOutput(value: unknown, fieldPath?: string): CanvasMediaOutputBinding {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath} 必须为对象` : undefined)
+  }
   const keys = value && typeof value === 'object' && Object.hasOwn(value, 'bundle')
     ? ['key', 'mediaKind', 'role', 'order', 'bundle']
     : ['key', 'mediaKind', 'role', 'order']
-  if (!hasExactKeys(value, keys)
-    || typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)
-    || !isMediaKind(value.mediaKind)
-    || (value.role !== 'primary' && value.role !== 'preview' && value.role !== 'auxiliary')
-    || !isNonNegativeInteger(value.order)
-    || (value.bundle !== undefined && (typeof value.bundle !== 'string' || !ID_PATTERN.test(value.bundle)))) {
-    throw new Error('CANVAS_MEDIA_OUTPUT_INVALID')
+  const missingKeys = ['key', 'mediaKind', 'role', 'order'].filter((key) => !Object.hasOwn(value, key))
+  if (missingKeys.length > 0) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_OUTPUT_INVALID',
+      fieldPath ? `${fieldPath} 缺少 ${missingKeys.join('、')}` : undefined,
+    )
+  }
+  if (!hasExactKeys(value, keys)) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath} 包含未知字段` : undefined)
+  }
+  if (typeof value.key !== 'string' || !KEY_PATTERN.test(value.key)) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath}.key 格式无效` : undefined)
+  }
+  if (!isMediaKind(value.mediaKind)) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath}.mediaKind 无效` : undefined)
+  }
+  if (value.role !== 'primary' && value.role !== 'preview' && value.role !== 'auxiliary') {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath}.role 无效` : undefined)
+  }
+  if (!isNonNegativeInteger(value.order)) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath}.order 必须为非负整数` : undefined)
+  }
+  if (value.bundle !== undefined && (typeof value.bundle !== 'string' || !ID_PATTERN.test(value.bundle))) {
+    throwFieldValidationError('CANVAS_MEDIA_OUTPUT_INVALID', fieldPath ? `${fieldPath}.bundle 格式无效` : undefined)
   }
   return {
     key: value.key,
@@ -439,18 +504,38 @@ export function parseCanvasMediaCandidate(value: unknown): CanvasMediaCandidate 
 }
 
 /** 解析绑定数组并要求 key 唯一、输出顺序连续。 */
-function parseBindings<T>(value: unknown, parse: (item: unknown) => T, identity: (item: T) => string): T[] {
+function parseBindings<T>(
+  value: unknown,
+  parse: (item: unknown, fieldPath?: string) => T,
+  identity: (item: T) => string,
+  fieldPath?: string,
+): T[] {
   if (!Array.isArray(value) || value.length > MAX_BINDINGS
     || !Array.from({ length: value.length }, (_, index) => Object.hasOwn(value, index)).every(Boolean)) {
-    throw new Error('CANVAS_MEDIA_BINDINGS_INVALID')
+    throwFieldValidationError(
+      'CANVAS_MEDIA_BINDINGS_INVALID',
+      fieldPath ? `${fieldPath} 必须为不超过 ${MAX_BINDINGS} 项的连续数组` : undefined,
+    )
   }
-  const bindings = value.map(parse)
-  if (new Set(bindings.map(identity)).size !== bindings.length) throw new Error('CANVAS_MEDIA_BINDINGS_INVALID')
+  const bindings = value.map((item, index) => parse(item, fieldPath ? `${fieldPath}[${index}]` : undefined))
+  const identities = new Set<string>()
+  const duplicateIndex = bindings.findIndex((binding) => {
+    const bindingIdentity = identity(binding)
+    if (identities.has(bindingIdentity)) return true
+    identities.add(bindingIdentity)
+    return false
+  })
+  if (duplicateIndex >= 0) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_BINDINGS_INVALID',
+      fieldPath ? `${fieldPath}[${duplicateIndex}].key 与前项重复` : undefined,
+    )
+  }
   return bindings
 }
 
 /** 严格解析通用媒体模块配置。 */
-export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleConfig {
+function parseCanvasMediaModuleConfigValue(value: unknown, includeFieldDiagnostics: boolean): CanvasMediaModuleConfig {
   const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
   const keys = [
     'schemaVersion', 'contentId', 'mediaKind', 'revision', 'createdAt', 'updatedAt',
@@ -467,8 +552,8 @@ export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleC
     || !isNonNegativeInteger(value.updatedAt)) {
     throw new Error('CANVAS_MEDIA_CONFIG_INVALID')
   }
-  const inputs = parseBindings(value.inputs, parseInput, (input) => input.key)
-  const outputs = parseBindings(value.outputs, parseOutput, (output) => output.key)
+  const inputs = parseBindings(value.inputs, parseInput, (input) => input.key, includeFieldDiagnostics ? 'inputs' : undefined)
+  const outputs = parseBindings(value.outputs, parseOutput, (output) => output.key, includeFieldDiagnostics ? 'outputs' : undefined)
   if (!Array.isArray(value.adoptedOutputs)) throw new Error('CANVAS_MEDIA_CONFIG_INVALID')
   /** 正式输出的深解析由服务按候选和输出合同再次校验，此处先锁定 key 唯一与公共字段。 */
   const adoptedOutputs = parseBindings(value.adoptedOutputs, (item): CanvasMediaAdoptedOutput => {
@@ -483,13 +568,15 @@ export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleC
     })
     if (!hasExactKeys(record, [
       'key', 'mediaKind', 'role', 'order', ...(record.bundle === undefined ? [] : ['bundle']),
-      'candidateId', 'runId', 'asset',
+      'candidateId', 'runId', 'asset', ...(record.selectionOrigin === undefined ? [] : ['selectionOrigin']),
     ])
+      || (record.selectionOrigin !== undefined && record.selectionOrigin !== 'initial')
       || typeof record.candidateId !== 'string' || !ID_PATTERN.test(record.candidateId)
       || typeof record.runId !== 'string' || !ID_PATTERN.test(record.runId)) throw new Error('CANVAS_MEDIA_OUTPUT_INVALID')
     const asset = parseAssetReference(record.asset)
     if (asset.mediaKind !== binding.mediaKind) throw new Error('CANVAS_MEDIA_OUTPUT_INVALID')
-    return { ...binding, candidateId: record.candidateId, runId: record.runId, asset }
+    return { ...binding, candidateId: record.candidateId, runId: record.runId, asset,
+      ...(record.selectionOrigin === 'initial' ? { selectionOrigin: 'initial' as const } : {}) }
   }, (output) => output.key)
   const profile = value.profile === null ? null : parseProfile(value.profile)
   const workflow = value.workflow === undefined || value.workflow === null
@@ -497,11 +584,31 @@ export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleC
     : parseWorkflowReference(value.workflow)
   if (profile && workflow) throw new Error('CANVAS_MEDIA_SOURCE_CONFLICT')
   if ((profile !== null || workflow !== null || inputs.length > 0 || outputs.length > 0 || adoptedOutputs.length > 0)
-    && (outputs.length === 0
-      || outputs.some((output, index) => output.order !== index)
-      || outputs.filter((output) => output.role === 'primary').length !== 1
-      || outputs.find((output) => output.role === 'primary')?.mediaKind !== value.mediaKind)) {
-    throw new Error('CANVAS_MEDIA_OUTPUT_INVALID')
+    && outputs.length === 0) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_OUTPUT_INVALID',
+      includeFieldDiagnostics ? 'outputs 至少需要 1 项' : undefined,
+    )
+  }
+  const invalidOrderIndex = outputs.findIndex((output, index) => output.order !== index)
+  if (invalidOrderIndex >= 0) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_OUTPUT_INVALID',
+      includeFieldDiagnostics ? `outputs[${invalidOrderIndex}].order 必须为 ${invalidOrderIndex}` : undefined,
+    )
+  }
+  const primaryOutputs = outputs.filter((output) => output.role === 'primary')
+  if (outputs.length > 0 && primaryOutputs.length !== 1) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_OUTPUT_INVALID',
+      includeFieldDiagnostics ? 'outputs 必须且只能有 1 项 primary' : undefined,
+    )
+  }
+  if (primaryOutputs[0] && primaryOutputs[0].mediaKind !== value.mediaKind) {
+    throwFieldValidationError(
+      'CANVAS_MEDIA_OUTPUT_INVALID',
+      includeFieldDiagnostics ? `primary 输出的 mediaKind 必须为 ${value.mediaKind}` : undefined,
+    )
   }
   for (const adopted of adoptedOutputs) {
     const binding = outputs.find((output) => output.key === adopted.key)
@@ -524,6 +631,11 @@ export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleC
     outputs,
     adoptedOutputs,
   }
+}
+
+/** 严格解析持久化媒体配置，并保持既有稳定错误码。 */
+export function parseCanvasMediaModuleConfig(value: unknown): CanvasMediaModuleConfig {
+  return parseCanvasMediaModuleConfigValue(value, false)
 }
 
 /** 严格解析通用媒体目标。 */
@@ -607,7 +719,7 @@ export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMedia
   }
   const target = parseTargetFields(value)
   try {
-    const parsed = parseCanvasMediaModuleConfig({
+    const parsed = parseCanvasMediaModuleConfigValue({
       schemaVersion: 1,
       contentId: target.mediaModuleId,
       mediaKind: target.mediaKind,
@@ -620,7 +732,7 @@ export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMedia
       inputs: value.inputs,
       outputs: value.outputs,
       adoptedOutputs: [],
-    })
+    }, true)
     return {
       ...target,
       expectedConfigRevision: value.expectedConfigRevision,
@@ -631,6 +743,9 @@ export function parseSaveCanvasMediaModuleInput(value: unknown): SaveCanvasMedia
       outputs: parsed.outputs,
     }
   } catch (error) {
+    if (error instanceof CanvasMediaFieldValidationError) {
+      throw new Error(`CANVAS_MEDIA_SAVE_INPUT_INVALID: ${error.detail}`, { cause: error })
+    }
     throw new Error('CANVAS_MEDIA_SAVE_INPUT_INVALID', { cause: error })
   }
 }

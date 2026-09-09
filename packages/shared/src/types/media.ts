@@ -3,6 +3,9 @@ import type { MediaWorkflowDefinition } from './media-workflow'
 /** 媒体产物类别，音乐归属 audio。 */
 export type MediaKind = 'image' | 'video' | 'audio'
 
+/** 媒体生成前的全局授权策略。 */
+export type MediaAuthorizationMode = 'ask' | 'automatic'
+
 /** 主进程根据公开认证方式解析独立密文引用。 */
 export type MediaConnectionAuth = { kind: 'none' } | { kind: 'bearer' } | { kind: 'header'; headerName: string }
 
@@ -26,6 +29,12 @@ export interface MediaConnection {
   updatedAt: number
 }
 
+/** Host 自动缓存的远端工作流来源，固定原始正文与远端身份。 */
+export interface MediaWorkflowRemoteSource {
+  descriptor: MediaRemoteDescriptor
+  contentHash: string
+}
+
 /** 不可变的 API 工作流版本，null 表示用户管理的公共模板。 */
 export interface MediaWorkflowVersion {
   id: string
@@ -35,6 +44,8 @@ export interface MediaWorkflowVersion {
   hash: string
   definition: MediaWorkflowDefinition
   createdAt: number
+  /** 存在时表示内部运行快照，不是用户管理的本地模板。 */
+  remoteSource?: MediaWorkflowRemoteSource
 }
 
 /** 预设固定连接引用与工作流版本，不保存远端素材名或密钥。 */
@@ -55,6 +66,8 @@ export interface MediaProfile {
 export interface MediaConfiguration {
   schemaVersion: 1 | 2
   revision: number
+  /** 旧配置缺失时由主进程归一为每次询问。 */
+  authorizationMode?: MediaAuthorizationMode
   connections: MediaConnection[]
   workflows: MediaWorkflowVersion[]
   profiles: MediaProfile[]
@@ -333,16 +346,18 @@ export interface MediaResourcePage {
 /** 媒体管理与运行通道，主进程和 preload 共用常量。 */
 export const MEDIA_IPC_CHANNELS = {
   GET_SETTINGS: 'media:get-settings', SAVE_CONNECTION: 'media:save-connection', SAVE_WORKFLOW: 'media:save-workflow', SAVE_PROFILE: 'media:save-profile',
+  SAVE_AUTHORIZATION: 'media:save-authorization',
   PROBE_CONNECTION: 'media:probe-connection', LIST_RESOURCES: 'media:list-resources', GET_RUN: 'media:get-run',
   GET_JOB_RUN: 'media:get-job-run', WATCH_PROJECT: 'media:watch-project', UNWATCH_PROJECT: 'media:unwatch-project', RUN_CHANGED: 'media:run-changed',
   ARCHIVE_CONFIGURATION: 'media:archive-configuration', READ_REMOTE_WORKFLOW: 'media:read-remote-workflow',
   READ_REMOTE_ASSET: 'media:read-remote-asset', IMPORT_LOCAL_ASSET: 'media:import-local-asset',
-  LIST_ASSETS: 'media:list-assets',
+  LIST_ASSETS: 'media:list-assets', READ_ASSET_THUMBNAIL: 'media:read-asset-thumbnail',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
 export interface MediaPreloadApi {
   mediaGetSettings(): Promise<MediaSettingsSnapshot>
+  mediaSaveAuthorizationMode(mode: MediaAuthorizationMode, expectedRevision: number): Promise<MediaSettingsSnapshot>
   mediaSaveConnection(input: SaveMediaConnectionInput, expectedRevision: number): Promise<MediaSettingsSnapshot>
   mediaSaveWorkflow(input: SaveMediaWorkflowInput, expectedRevision: number): Promise<MediaSettingsSnapshot>
   mediaSaveProfile(input: SaveMediaProfileInput, expectedRevision: number): Promise<MediaSettingsSnapshot>
@@ -356,6 +371,8 @@ export interface MediaPreloadApi {
   mediaImportLocalAsset(projectId: string, mediaKind: MediaKind): Promise<MediaAssetRecord | null>
   /** 只列出当前项目权威媒体素材的元信息，不读取文件正文。 */
   mediaListAssets(projectId: string): Promise<MediaAssetRecord[]>
+  /** 读取完整引用对应的受管图片缩略图，不回退到原图。 */
+  mediaReadAssetThumbnail(projectId: string, asset: MediaAssetRef): Promise<{ bytes: Uint8Array; contentType: string }>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>
   mediaGetJobRun(projectId: string, jobId: string): Promise<MediaRunSnapshot | null>
   mediaWatchProject(projectId: string): Promise<void>

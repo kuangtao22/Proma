@@ -4,8 +4,10 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import { validateToolArguments } from '@earendil-works/pi-ai'
 import type { ComfyObjectInfo, JsonObject, MediaAssetRef, MediaRemoteDescriptor, MediaRunSnapshot } from '@proma/shared'
 import type { CanvasToolRunContext } from '../design/canvas-tool-provider'
+import { AgentPermissionService } from '../agent-permission-service'
 import { createCanvasMediaWorkflowDraft } from '../../../renderer/components/design/CanvasMediaWorkbench'
 import { MediaConfigStore } from './media-config-store'
 import { MediaResourceService } from './media-resource-service'
@@ -68,11 +70,13 @@ async function executeTool(
   /** 当前调用对应的工具定义。 */
   const tool = tools.find((candidate) => candidate.name === name)
   if (!tool) throw new Error(`工具不存在: ${name}`)
-  return tool.execute(toolCallId, input as never, undefined as never, undefined as never, undefined as never)
+  /** 穿透 Pi 实际参数校验，避免工具 schema 与执行器各自通过却无法真实调用。 */
+  const validated = validateToolArguments(tool, { type: 'toolCall', id: toolCallId, name, arguments: input })
+  return tool.execute(toolCallId, validated as never, undefined as never, undefined as never, undefined as never)
 }
 
-describe('远端工作流发现、导入与准备集成', () => {
-  test('Given 画布绑定连接和真实 UI 工作流 When 发现并导入 Then 画布必须经卡片准备且独立任务仍可固定资产与实例', async () => {
+describe('远端工作流直接使用与运行准备集成', () => {
+  test('Given 画布绑定连接和真实 UI 工作流 When 直接使用 Then 自动快照可复用且卡片字段与任务恢复保持完整', async () => {
     /** 隔离的真实 MediaConfigStore 数据根。 */
     const root = mkdtempSync(join(tmpdir(), 'proma-remote-workflow-integration-'))
     temporaryDirectories.push(root)
@@ -196,19 +200,28 @@ describe('远端工作流发现、导入与准备集成', () => {
     expect((secondDiscovery.details as { items: unknown[] }).items).toHaveLength(2)
     expect(calls).toMatchObject({ directories: 1, goodBodies: 1, schemas: 1, uploads: 0, submits: 0 })
 
-    /** 导入使用发现时的完整 descriptor 与内容 hash。 */
-    const imported = await executeTool(toolRun.piCustomTools, 'media_import_remote_workflow', {
+    /** 直接使用远端身份，Host 分配内部快照 ID，不要求先创建本地模板。 */
+    const imported = await executeTool(toolRun.piCustomTools, 'media_use_remote_workflow', {
       descriptor: candidate.descriptor,
-      expectedContentHash: candidate.contentHash,
-      id: 'remote-image-draft', name: '远端图片草稿',
-      expectedConfigRevision: 1, expectedWorkflowRevision: 0,
+      contentHash: candidate.contentHash,
     }, 'import-1')
     expect(imported.details).toMatchObject({
-      imported: true, id: 'remote-image-draft', revision: 1, projectId: 'project-1', connectionId: 'gpu',
+      source: 'comfyui-server', revision: 1, connectionId: 'gpu',
     })
+    /** 运行引用使用 Host 回执中的精确身份，重复接入必须复用同一版本。 */
+    const workflowId = (imported.details as { id: string }).id
+    const cachedRevision = configuration.read().revision
+    const reused = await executeTool(toolRun.piCustomTools, 'media_use_remote_workflow', {
+      descriptor: candidate.descriptor, contentHash: candidate.contentHash,
+    }, 'use-again')
+    expect(reused.details).toMatchObject({ id: workflowId, revision: 1 })
+    expect(configuration.read().revision).toBe(cachedRevision)
+    expect(configuration.read().workflows.filter((item) => !item.remoteSource)).toEqual([])
+    expect(configuration.read().profiles).toEqual([])
 
-    /** 真实配置中刚导入的当前项目不可变工作流。 */
-    const savedWorkflow = configuration.getWorkflow('remote-image-draft', 1, 'project-1')
+    /** 模拟 Store 重启，执行快照和 Renderer 所需字段仍然可读。 */
+    const savedWorkflow = new MediaConfigStore(root).getWorkflow(workflowId, 1, 'project-1')
+    expect(savedWorkflow.remoteSource).toMatchObject({ descriptor: candidate.descriptor, contentHash: candidate.contentHash })
     /** Renderer 画布草稿转换结果，证明每个分析绑定都带可消费字段合同。 */
     const canvasDrafts = createCanvasMediaWorkflowDraft(savedWorkflow, {
       '1.image': { kind: 'asset', asset },
@@ -221,13 +234,13 @@ describe('远端工作流发现、导入与准备集成', () => {
 
     /** 面向画布的本轮不能跳过节点配置直接创建独立运行。 */
     await expect(executeTool(toolRun.piCustomTools, 'media_prepare_run', {
-      canvasId: 'canvas-1', workflowId: 'remote-image-draft', workflowRevision: 1,
+      canvasId: 'canvas-1', workflowId, workflowRevision: 1,
       mediaKind: 'image', inputs: { '1.image': { kind: 'asset', asset } },
     }, 'prepare-canvas')).rejects.toThrow('MEDIA_CANVAS_TARGET_USE_CANVAS_TOOLS')
     /** 独立会话没有 Canvas 目标，仍可显式使用固定连接准备同一项目工作流。 */
     const standalone = createMediaToolRun(dependencies, { ...context, sessionId: 'standalone-session' })
     const prepared = await executeTool(standalone.piCustomTools, 'media_prepare_run', {
-      connectionId: 'gpu', workflowId: 'remote-image-draft', workflowRevision: 1,
+      connectionId: 'gpu', workflowId, workflowRevision: 1,
       mediaKind: 'image', inputs: { '1.image': { kind: 'asset', asset } },
     }, 'prepare-standalone')
     /** 真实 prepareDraft 返回的持久运行快照。 */
@@ -235,7 +248,7 @@ describe('远端工作流发现、导入与准备集成', () => {
     expect(snapshot).toMatchObject({
       projectId: 'project-1', phase: 'prepared',
       sourceRef: {
-        kind: 'project-draft-revision', workflowId: 'remote-image-draft', workflowRevision: 1,
+        kind: 'project-draft-revision', workflowId, workflowRevision: 1,
         connectionId: 'gpu', mediaKind: 'image',
       },
     })
@@ -247,6 +260,42 @@ describe('远端工作流发现、导入与准备集成', () => {
     }
     expect(manifest.instanceGeneration).toBe(instanceGeneration)
     expect(manifest.inputs).toMatchObject({ '1.image': { kind: 'asset', asset } })
+    /** 明确同意后另存本地模板，内部快照不转为模板，也不改写原运行。 */
+    const local = await executeTool(standalone.piCustomTools, 'media_save_local_workflow', {
+      id: 'saved-local-workflow', name: '本地缩放模板', connectionId: 'gpu', creationIntent: 'user-confirmed',
+      expectedConfigRevision: cachedRevision, expectedWorkflowRevision: 0, definition: savedWorkflow.definition,
+    }, 'save-local')
+    expect(local.details).toMatchObject({ source: 'local-template', saved: true, id: 'saved-local-workflow' })
+    expect(configuration.read().workflows.filter((item) => !item.remoteSource)).toMatchObject([{ id: 'saved-local-workflow', projectId: null }])
+    expect(configuration.getWorkflow('saved-local-workflow', 1, 'project-2').definition.prompt['1']?.inputs.image).toBe('')
+
+    /** 穿透真实配置事件、Provider 动态策略与单次审批服务，验证切换后原调用继续。 */
+    const permissions = new AgentPermissionService()
+    const requests: string[] = []
+    const resolved: string[] = []
+    const controller = new AbortController()
+    expect(standalone.toolApprovalPolicy).toBeDefined()
+    const approval = permissions.requestSingleApproval('standalone-session', 'media_execute_run', { runId: snapshot.id },
+      { signal: controller.signal, toolUseID: 'execute-policy-1' }, (request) => { requests.push(request.requestId) },
+      { policy: standalone.toolApprovalPolicy!, onResolved: (requestId) => { resolved.push(requestId) } })
+    expect(permissions.getPendingRequests()).toHaveLength(1)
+    configuration.saveAuthorizationMode('automatic', configuration.read().revision)
+    expect(await approval).toMatchObject({ behavior: 'allow', toolUseID: 'execute-policy-1', updatedInput: { runId: snapshot.id } })
+    expect(resolved).toEqual(requests)
+    expect(permissions.getPendingRequests()).toEqual([])
+    expect(new MediaConfigStore(root).read().authorizationMode).toBe('automatic')
+
+    /** 自主许可通过 Pi 真实 schema 校验后可保存新模板，不伪装成对话确认。 */
+    await executeTool(standalone.piCustomTools, 'media_save_local_workflow', {
+      id: 'automatic-local-workflow', name: '自主缩放模板', connectionId: 'gpu', creationIntent: 'automatic-policy',
+      expectedConfigRevision: configuration.read().revision, expectedWorkflowRevision: 0, definition: savedWorkflow.definition,
+    }, 'save-automatic-local')
+    expect(configuration.getWorkflow('automatic-local-workflow', 1, 'project-2').projectId).toBeNull()
+    configuration.saveAuthorizationMode('ask', configuration.read().revision)
+    expect(standalone.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+    expect(standalone.toolApprovalPolicy?.getMode('server_exec')).toBe('ask')
+    /** 授权设置不改变已经冻结的任务内容，也不会自行调用远端生成端点。 */
+    expect(runs.get('project-1', snapshot.id).phase).toBe('prepared')
     expect(calls.uploads).toBe(0)
     expect(calls.submits).toBe(0)
   })

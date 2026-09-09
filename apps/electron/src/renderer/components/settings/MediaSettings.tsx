@@ -25,6 +25,7 @@ import {
 import type {
   MediaConnectionAuth,
   MediaConnectionProbe,
+  MediaAuthorizationMode,
   MediaRemoteCapability,
   MediaResourceKind,
   MediaResourcePage,
@@ -62,7 +63,7 @@ import { cn } from '@/lib/utils'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { MediaApiModelSettings } from './MediaApiModelSettings'
 import { MediaSettingsPage } from './MediaSettingsPage'
-import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
+import { SettingsCard, SettingsRow } from './primitives'
 
 /** Renderer 可读取的工作流文件上限。 */
 export const MEDIA_WORKFLOW_IMPORT_MAX_BYTES = 2 * 1024 * 1024
@@ -582,9 +583,50 @@ export function MediaSettingsTabsView({
       <TabsList aria-label="媒体配置" className="max-w-full">
         <TabsTrigger value="models" autoFocus={focusActiveTab && activeTab === 'models'}>媒体模型</TabsTrigger>
         <TabsTrigger value="connections" autoFocus={focusActiveTab && activeTab === 'connections'}>服务连接</TabsTrigger>
-        <TabsTrigger value="workflows" autoFocus={focusActiveTab && activeTab === 'workflows'}>公共工作流</TabsTrigger>
+        <TabsTrigger value="workflows" autoFocus={focusActiveTab && activeTab === 'workflows'}>本地工作流</TabsTrigger>
       </TabsList>
     </Tabs>
+  )
+}
+
+/** 三个媒体配置页共享的生成授权控件。 */
+export function MediaAuthorizationControl({
+  mode = 'ask',
+  saving,
+  disabled = false,
+  error,
+  onChange,
+}: {
+  mode?: MediaAuthorizationMode
+  saving: boolean
+  disabled?: boolean
+  error: string | null
+  onChange: (mode: MediaAuthorizationMode) => void
+}): React.ReactElement {
+  /** 当前模式对应的可见标签，确保服务端渲染和加载期间也能明确显示。 */
+  const modeLabel = mode === 'automatic' ? 'Agent 自主执行' : '每次确认'
+  return (
+    <div className="space-y-2 border-y border-border/60 py-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-foreground">生成授权</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">控制媒体生成和任务所需的工作流创建、保存</p>
+        </div>
+        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto">
+          {saving && <Loader2 aria-label="正在保存生成授权策略" className="size-4 shrink-0 animate-spin text-muted-foreground motion-reduce:animate-none" />}
+          <Select value={mode} disabled={disabled || saving} onValueChange={(value) => onChange(value as MediaAuthorizationMode)}>
+            <SelectTrigger aria-label="生成授权策略" className="w-full sm:w-48">
+              <SelectValue>{modeLabel}</SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ask">每次确认</SelectItem>
+              <SelectItem value="automatic">Agent 自主执行</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+      {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+    </div>
   )
 }
 
@@ -908,7 +950,7 @@ export function RemoteWorkflowContent({ remote, onImport }: {
           <Button type="button" size="sm" variant="outline" onClick={() => {
             setError(null)
             try { onImport() } catch (importError) { setError(formatMediaError(importError)) }
-          }}><Copy />导入公共草稿</Button>
+          }}><Copy />另存为本地工作流</Button>
         ) : <span className="text-xs text-muted-foreground">{analysis?.issues[0]?.message ?? (remote.format === 'ui' ? '当前 UI 工作流暂不可导入，请查看分析问题。' : '无法确认工作流格式，暂不可导入为可执行模板。')}</span>}
       </div>
     </div>
@@ -1157,6 +1199,19 @@ function ResourceBrowser({
 }
 
 /** 统一媒体设置页。 */
+/** 从配置历史中选择用户主动保存的最新本地模板，不展示内部快照或迁移旧项目数据。 */
+export function selectLocalMediaWorkflows(workflows: readonly MediaWorkflowVersion[], archivedIds: readonly string[] = []): MediaWorkflowVersion[] {
+  /** 同一模板只展示最新修订，完整历史继续供已绑定卡片和任务恢复。 */
+  const latest = new Map<string, MediaWorkflowVersion>()
+  for (const workflow of workflows) {
+    if (workflow.projectId !== null || workflow.remoteSource || archivedIds.includes(workflow.id)) continue
+    /** 已收集的旧修订。 */
+    const current = latest.get(workflow.id)
+    if (!current || workflow.revision > current.revision) latest.set(workflow.id, workflow)
+  }
+  return [...latest.values()]
+}
+
 export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {}): React.ReactElement {
   /** 当前平级页签；草稿位于父级，因此切换不丢失。 */
   const [activeTab, setActiveTab] = React.useState<MediaSettingsTab>('models')
@@ -1174,6 +1229,8 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
   const [loadError, setLoadError] = React.useState<string | null>(null)
   /** 当前互斥动作名称。 */
   const [busyAction, setBusyAction] = React.useState<string | null>(null)
+  /** 生成授权保存失败独立显示，不污染连接或工作流草稿。 */
+  const [authorizationError, setAuthorizationError] = React.useState<string | null>(null)
   /** 连接独立草稿。 */
   const [connectionDraft, setConnectionDraft] = React.useState<MediaConnectionDraft | null>(null)
   /** 连接编辑基线。 */
@@ -1203,6 +1260,29 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
     setActiveTab('models')
     setFocusedSection(null)
   }, [focusedSection, setFocusedSection])
+
+  /** 使用当前配置 revision 保存生成授权，失败后刷新权威快照以消解并发修改。 */
+  const saveAuthorizationMode = async (mode: MediaAuthorizationMode): Promise<void> => {
+    /** 缺失字段兼容旧配置，默认按每次确认处理。 */
+    const currentMode = snapshot?.authorizationMode ?? 'ask'
+    if (!snapshot || busyAction || mode === currentMode) return
+    setBusyAction('authorization-save')
+    setAuthorizationError(null)
+    try {
+      setSnapshot(await window.electronAPI.mediaSaveAuthorizationMode(mode, snapshot.revision))
+    } catch (error) {
+      setAuthorizationError(formatMediaError(error))
+      setLoadError(null)
+      try {
+        /** 保存失败可能来自 revision 冲突，重新读取后继续展示真实配置。 */
+        setSnapshot(await window.electronAPI.mediaGetSettings())
+      } catch (refreshError) {
+        setLoadError(formatMediaError(refreshError))
+      }
+    } finally {
+      setBusyAction(null)
+    }
+  }
 
   /** 保存连接并只在成功后替换权威列表。 */
   const saveConnection = async (): Promise<void> => {
@@ -1279,18 +1359,8 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
   const connections = snapshot?.connections.filter((connection) => connection.archivedAt === undefined) ?? []
   /** 连接过滤只读取本地列表，不触发远端探测。 */
   const filteredConnections = connections.filter((connection) => `${connection.name} ${connection.baseUrl} ${connection.comfyUser ?? ''}`.toLocaleLowerCase().includes(connectionQuery.trim().toLocaleLowerCase()))
-  /** 公共工作流只展示每个 ID 最新版本。 */
-  const publicWorkflows = React.useMemo(() => {
-    /** 按 ID 收集的最新版本。 */
-    const latest = new Map<string, MediaWorkflowVersion>()
-    for (const workflow of snapshot?.workflows ?? []) {
-      if (workflow.projectId !== null || snapshot?.archivedWorkflowIds?.includes(workflow.id)) continue
-      /** 已收集的版本。 */
-      const current = latest.get(workflow.id)
-      if (!current || workflow.revision > current.revision) latest.set(workflow.id, workflow)
-    }
-    return [...latest.values()]
-  }, [snapshot])
+  /** 本地管理只展示显式保存模板，远端执行快照仍可由原卡片读取。 */
+  const publicWorkflows = React.useMemo(() => selectLocalMediaWorkflows(snapshot?.workflows ?? [], snapshot?.archivedWorkflowIds), [snapshot])
   /** 按输入种类计数，保留多图和混合媒体区别。 */
   const workflowSummary = (workflow: MediaWorkflowVersion): string => {
     const labels = { image: '图片', audio: '音频', video: '视频', text: '文本', number: '数值', boolean: '开关' }
@@ -1302,8 +1372,6 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
   }
   /** 工作流可按名称、输入组合与输出类型检索。 */
   const filteredWorkflows = publicWorkflows.filter((workflow) => `${workflow.name} ${workflowSummary(workflow)}`.toLocaleLowerCase().includes(workflowQuery.trim().toLocaleLowerCase()))
-  /** 旧项目私有版本作为只读来源展示。 */
-  const privateWorkflows = snapshot?.workflows.filter((workflow) => workflow.projectId !== null) ?? []
 
   /** 返回连接列表并释放本地草稿，已保存配置保持不变。 */
   const cancelConnectionDraft = (): void => {
@@ -1332,14 +1400,24 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
       {formError && !connectionDraft && !workflowDraft && <MediaError message={formError} />}
     </>
   )
+  /** 所有媒体配置页面在各自标题下方展示同一全局授权策略。 */
+  const authorizationControl = (
+    <MediaAuthorizationControl
+      mode={snapshot?.authorizationMode ?? 'ask'}
+      saving={busyAction === 'authorization-save'}
+      disabled={loading || busyAction !== null}
+      error={authorizationError}
+      onChange={(mode) => { void saveAuthorizationMode(mode) }}
+    />
+  )
 
   return (
     <div className="min-w-0 max-w-full space-y-6">
-      {activeTab === 'models' && <MediaApiModelSettings navigation={navigation}>{notices}</MediaApiModelSettings>}
+      {activeTab === 'models' && <MediaApiModelSettings navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
 
       {activeTab === 'connections' && (
         <div className="space-y-8">
-          <MediaSettingsPage title={connectionDraft ? (connectionBaseline ? '编辑服务连接' : '添加服务连接') : '服务连接'} onBack={connectionDraft ? cancelConnectionDraft : undefined} busy={busyAction !== null} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || connectionDraft !== null} onClick={() => {
+          <MediaSettingsPage title={connectionDraft ? (connectionBaseline ? '编辑服务连接' : '添加服务连接') : '服务连接'} onBack={connectionDraft ? cancelConnectionDraft : undefined} busy={busyAction !== null} headerContent={authorizationControl} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || connectionDraft !== null} onClick={() => {
             setFormError(null)
             setConnectionBaseline(null)
             setConnectionDraft({ id: createMediaId('connection'), name: '', baseUrl: '', enabled: true, authKind: 'none', headerName: '', credential: '', credentialConfigured: false, comfyUser: '' })
@@ -1359,17 +1437,16 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
 
       {activeTab === 'workflows' && (
         <div className="space-y-8">
-          <MediaSettingsPage title={workflowDraft ? (publicWorkflows.some((workflow) => workflow.id === workflowDraft.id) ? '编辑公共工作流' : '添加公共工作流') : '公共工作流'} onBack={workflowDraft ? cancelWorkflowDraft : undefined} busy={busyAction !== null} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || workflowDraft !== null} onClick={() => { setFormError(null); setWorkflowDraft({ id: createMediaId('workflow'), name: '', definitionText: '', definition: null, invalidated: true, parseError: null }) }}><Plus />添加工作流</Button>}>
+          <MediaSettingsPage title={workflowDraft ? (publicWorkflows.some((workflow) => workflow.id === workflowDraft.id) ? '编辑本地工作流' : '添加本地工作流') : '本地工作流'} onBack={workflowDraft ? cancelWorkflowDraft : undefined} busy={busyAction !== null} headerContent={authorizationControl} action={<Button type="button" size="sm" disabled={loading || busyAction !== null || workflowDraft !== null} onClick={() => { setFormError(null); setWorkflowDraft({ id: createMediaId('workflow'), name: '', definitionText: '', definition: null, invalidated: true, parseError: null }) }}><Plus />添加工作流</Button>}>
             {!workflowDraft && <div className="flex flex-wrap items-center justify-between gap-3">
               {navigation}
-              <Input className="w-64 max-w-full" aria-label="搜索公共工作流" placeholder="搜索名称、输入或输出类型" value={workflowQuery} onChange={(event) => setWorkflowQuery(event.target.value)} />
+              <Input className="w-64 max-w-full" aria-label="搜索本地工作流" placeholder="搜索名称、输入或输出类型" value={workflowQuery} onChange={(event) => setWorkflowQuery(event.target.value)} />
             </div>}
             {notices}
-            {workflowDraft ? <WorkflowEditor draft={workflowDraft} busy={busyAction !== null} error={formError} onChange={(draft) => { setWorkflowDraft(draft); setFormError(null) }} onCancel={cancelWorkflowDraft} onSave={() => void saveWorkflow(false)} onSaveAndOpen={onOpenWorkflowInCanvas ? () => void saveWorkflow(true) : undefined} /> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取工作流...</EmptyState></SettingsCard> : publicWorkflows.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存公共工作流</EmptyState></SettingsCard> : (
+            {workflowDraft ? <WorkflowEditor draft={workflowDraft} busy={busyAction !== null} error={formError} onChange={(draft) => { setWorkflowDraft(draft); setFormError(null) }} onCancel={cancelWorkflowDraft} onSave={() => void saveWorkflow(false)} onSaveAndOpen={onOpenWorkflowInCanvas ? () => void saveWorkflow(true) : undefined} /> : loading && !snapshot ? <SettingsCard divided={false}><EmptyState><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取工作流...</EmptyState></SettingsCard> : publicWorkflows.length === 0 ? <SettingsCard divided={false}><EmptyState>尚未保存本地工作流</EmptyState></SettingsCard> : (
               <SettingsCard>{filteredWorkflows.map((workflow) => <SettingsRow key={workflow.id} label={workflow.name} icon={<Workflow className="size-5 text-muted-foreground" />} description={`r${workflow.revision} · ${workflowSummary(workflow)}`}><div className="flex items-center gap-1"><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${workflow.name}`} title="复制" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow, true))}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${workflow.name}`} title="发布新版本" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow))}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${workflow.name}`} title="归档" disabled={busyAction !== null} onClick={() => setArchiveTarget({ kind: 'workflow', id: workflow.id, name: workflow.name })}><Trash2 /></Button></div></SettingsRow>)}{!filteredWorkflows.length && <EmptyState>没有匹配的工作流</EmptyState>}</SettingsCard>
             )}
           </MediaSettingsPage>
-          {!workflowDraft && privateWorkflows.length > 0 && <SettingsSection title="项目历史" description="旧项目私有版本只读保留，可清洗资源引用后复制为公共版本。"><SettingsCard>{privateWorkflows.map((workflow) => <SettingsRow key={`${workflow.id}:${workflow.revision}`} label={workflow.name} description={`${workflow.projectId} · r${workflow.revision} · 只读来源`}><Button type="button" size="sm" variant="outline" disabled={busyAction !== null} onClick={() => setWorkflowDraft(workflowToDraft(workflow, true))}><Copy />复制为公共</Button></SettingsRow>)}</SettingsCard></SettingsSection>}
         </div>
       )}
 

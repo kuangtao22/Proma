@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { MediaAuthorizationMode, MediaRemoteDescriptor, MediaWorkflowDefinition } from '@proma/shared'
 import { writeJsonFileAtomic } from '../safe-file'
 import { MediaConfigStore } from './media-config-store'
 
 /** 每个用例使用独立配置目录。 */
 let directory = ''
 /** 最小的声明式图片工作流。 */
-const workflow = {
+const workflow: MediaWorkflowDefinition = {
   schemaVersion: 1,
   prompt: { '1': { class_type: 'SaveImage', inputs: { filename_prefix: 'Proma' } } },
   bindings: [],
@@ -26,6 +27,10 @@ function store(): MediaConfigStore { return new MediaConfigStore(directory, encr
 /** 连接写入命令，不以 URL 中的用户名或查询参数承载认证。 */
 function connection() {
   return { id: 'gpu', name: '远程 GPU', driver: 'comfyui', baseUrl: 'https://gpu.example/comfy', enabled: true, projectIds: ['project-a'], auth: { kind: 'bearer' }, credential: 'secret-token' }
+}
+/** 构造绑定当前连接身份的远端工作流描述符。 */
+function remoteDescriptor(instanceGeneration: string, workflowPath = 'workflows/example.json'): MediaRemoteDescriptor {
+  return { connectionId: 'gpu', instanceGeneration, remoteUser: '', source: 'user-data', id: workflowPath, workflowPath }
 }
 
 beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'proma-media-config-')) })
@@ -124,6 +129,60 @@ describe('媒体连接配置', () => {
   })
 })
 
+describe('媒体生成授权模式', () => {
+  test('Given 旧配置未保存授权模式 When 读取 Then 统一归一为每次询问', () => {
+    mkdirSync(join(directory, 'media'), { recursive: true })
+    writeJsonFileAtomic(join(directory, 'media', 'config.json'), {
+      schemaVersion: 1, revision: 7, connections: [], workflows: [], profiles: [],
+    })
+
+    expect(store().read().authorizationMode).toBe('ask')
+  })
+
+  test('Given 当前配置 revision When 保存自动授权 Then 原子持久化并可在重启后读取', () => {
+    const saved = store().saveAuthorizationMode('automatic', 0)
+
+    expect(saved).toMatchObject({ revision: 1, authorizationMode: 'automatic' })
+    expect(store().read()).toMatchObject({ revision: 1, authorizationMode: 'automatic' })
+  })
+
+  test('Given 非法授权模式 When 保存 Then 拒绝且不推进 revision', () => {
+    const invalidMode = 'always' as unknown as MediaAuthorizationMode
+
+    expect(() => store().saveAuthorizationMode(invalidMode, 0)).toThrow('MEDIA_AUTHORIZATION_MODE_INVALID')
+    expect(store().read()).toMatchObject({ revision: 0, authorizationMode: 'ask' })
+  })
+
+  test('Given 旧窗口 revision When 修改授权模式 Then 保留已保存模式', () => {
+    store().saveAuthorizationMode('automatic', 0)
+
+    expect(() => store().saveAuthorizationMode('ask', 0)).toThrow('MEDIA_CONFIG_CONFLICT')
+    expect(store().read()).toMatchObject({ revision: 1, authorizationMode: 'automatic' })
+  })
+
+  test('Given 授权模式订阅 When 保存变化、幂等、失败和退订 Then 仅持久化变化后通知', () => {
+    const configurationStore = store()
+    const observed: string[] = []
+    const unsubscribe = configurationStore.subscribeAuthorizationMode(() => {
+      const configuration = configurationStore.read()
+      observed.push(`${configuration.revision}:${configuration.authorizationMode}`)
+    })
+
+    expect(configurationStore.saveAuthorizationMode('ask', 0).revision).toBe(0)
+    expect(observed).toEqual([])
+    expect(configurationStore.saveAuthorizationMode('automatic', 0).revision).toBe(1)
+    expect(observed).toEqual(['1:automatic'])
+    expect(configurationStore.saveAuthorizationMode('automatic', 1).revision).toBe(1)
+    expect(() => configurationStore.saveAuthorizationMode('ask', 0)).toThrow('MEDIA_CONFIG_CONFLICT')
+    expect(() => configurationStore.saveAuthorizationMode('invalid' as unknown as MediaAuthorizationMode, 1)).toThrow('MEDIA_AUTHORIZATION_MODE_INVALID')
+    expect(observed).toEqual(['1:automatic'])
+
+    unsubscribe()
+    configurationStore.saveAuthorizationMode('ask', 1)
+    expect(observed).toEqual(['1:automatic'])
+  })
+})
+
 describe('媒体工作流与预设版本', () => {
   test('Given 项目模板已发布 When 保存新版本 Then 历史版本可按精确 revision 解析', () => {
     store().saveConnection(connection(), 0)
@@ -151,5 +210,107 @@ describe('媒体工作流与预设版本', () => {
     config.profiles.reverse()
     writeJsonFileAtomic(join(directory, 'media', 'config.json'), config)
     expect(() => store().resolveProfile('preset', 1, 'project-a')).toThrow('MEDIA_PROFILE_DISABLED')
+  })
+
+  test('Given 远端工作流首次缓存 When 重启读取 Then 保留来源身份且项目目录可读取真实标记', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const snapshot = store().cacheRemoteWorkflow({
+      projectId: 'project-a',
+      name: '服务器工作流',
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration),
+      contentHash: 'a'.repeat(64),
+      definition: workflow,
+    })
+
+    expect(snapshot.projectId).toBe('project-a')
+    expect(snapshot.revision).toBe(1)
+    expect(snapshot.remoteSource).toEqual({
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration),
+      contentHash: 'a'.repeat(64),
+    })
+    expect(store().getWorkflow(snapshot.id, snapshot.revision, 'project-a').remoteSource).toEqual(snapshot.remoteSource)
+    expect(store().listProject('project-a').workflows[0]?.remoteSource).toEqual(snapshot.remoteSource)
+  })
+
+  test('Given 相同远端正文已经缓存 When 再次使用 Then 复用版本且不推进配置 revision', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const input = {
+      projectId: 'project-a',
+      name: '服务器工作流',
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration),
+      contentHash: 'b'.repeat(64),
+      definition: workflow,
+    }
+    const first = store().cacheRemoteWorkflow(input)
+    const revision = store().read().revision
+    const second = store().cacheRemoteWorkflow(input)
+
+    expect(second).toEqual(first)
+    expect(store().read().revision).toBe(revision)
+    expect(store().read().workflows).toHaveLength(1)
+  })
+
+  test('Given 同一路径远端正文变化 When 再次缓存 Then 创建新快照且旧引用继续可取', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const descriptor = remoteDescriptor(savedConnection.instanceGeneration)
+    const first = store().cacheRemoteWorkflow({ projectId: 'project-a', name: '第一版', descriptor,
+      contentHash: 'c'.repeat(64), definition: workflow })
+    const changedDefinition = { ...workflow, prompt: { '1': { class_type: 'SaveImage', inputs: { filename_prefix: 'changed' } } } }
+    const second = store().cacheRemoteWorkflow({ projectId: 'project-a', name: '第二版', descriptor,
+      contentHash: 'd'.repeat(64), definition: changedDefinition })
+
+    expect(second.id).not.toBe(first.id)
+    expect(second.revision).toBe(1)
+    expect(store().getWorkflow(first.id, 1, 'project-a').name).toBe('第一版')
+    expect(store().getWorkflow(second.id, 1, 'project-a').name).toBe('第二版')
+  })
+
+  test('Given 相同远端正文用于不同项目 When 缓存 Then 身份和读取范围不串用', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const input = { name: '服务器工作流', descriptor: remoteDescriptor(savedConnection.instanceGeneration),
+      contentHash: 'e'.repeat(64), definition: workflow }
+    const projectA = store().cacheRemoteWorkflow({ ...input, projectId: 'project-a' })
+    const projectB = store().cacheRemoteWorkflow({ ...input, projectId: 'project-b' })
+
+    expect(projectB.id).not.toBe(projectA.id)
+    expect(() => store().getWorkflow(projectA.id, 1, 'project-b')).toThrow('MEDIA_WORKFLOW_NOT_AUTHORIZED')
+    expect(store().getWorkflow(projectB.id, 1, 'project-b').projectId).toBe('project-b')
+  })
+
+  test('Given 描述符身份过期或路径非法 When 缓存 Then 不创建远端快照', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const base = { projectId: 'project-a', name: '服务器工作流', contentHash: 'f'.repeat(64), definition: workflow }
+    expect(() => store().cacheRemoteWorkflow({ ...base,
+      descriptor: { ...remoteDescriptor(savedConnection.instanceGeneration), instanceGeneration: 'stale' } })).toThrow('MEDIA_REMOTE_RESOURCE_STALE')
+    expect(() => store().cacheRemoteWorkflow({ ...base,
+      descriptor: { ...remoteDescriptor(savedConnection.instanceGeneration), remoteUser: 'other-user' } })).toThrow('MEDIA_REMOTE_RESOURCE_STALE')
+    expect(() => store().cacheRemoteWorkflow({ ...base,
+      descriptor: { ...remoteDescriptor(savedConnection.instanceGeneration), source: 'assets-api', assetId: 'asset-1' } })).toThrow('MEDIA_REMOTE_RESOURCE_INVALID')
+    expect(() => store().cacheRemoteWorkflow({ ...base,
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration, '../private.json') })).toThrow('MEDIA_REMOTE_RESOURCE_INVALID')
+    expect(store().read().workflows).toHaveLength(0)
+  })
+
+  test('Given 远端快照已经缓存 When 普通保存使用相同 ID Then 禁止覆盖内部快照', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    const snapshot = store().cacheRemoteWorkflow({ projectId: 'project-a', name: '服务器工作流',
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration), contentHash: '1'.repeat(64), definition: workflow })
+
+    expect(() => store().saveWorkflow({ id: snapshot.id, name: '手工覆盖', projectId: 'project-a', definition: workflow }, store().read().revision))
+      .toThrow('MEDIA_WORKFLOW_REMOTE_SNAPSHOT_IMMUTABLE')
+  })
+
+  test('Given 落盘远端来源被篡改为 Assets 描述符 When 重启读取 Then 拒绝损坏配置', () => {
+    const savedConnection = store().saveConnection(connection(), 0).connections[0]!
+    store().cacheRemoteWorkflow({ projectId: 'project-a', name: '服务器工作流',
+      descriptor: remoteDescriptor(savedConnection.instanceGeneration), contentHash: '2'.repeat(64), definition: workflow })
+    const config = store().read()
+    config.workflows[0]!.remoteSource!.descriptor = {
+      connectionId: 'gpu', instanceGeneration: savedConnection.instanceGeneration, remoteUser: '',
+      source: 'assets-api', id: 'asset-1', assetId: 'asset-1',
+    }
+    writeJsonFileAtomic(join(directory, 'media', 'config.json'), config)
+
+    expect(() => store().read()).toThrow('MEDIA_CONFIG_INVALID')
   })
 })

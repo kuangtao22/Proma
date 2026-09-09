@@ -242,7 +242,7 @@ import { createCanvasImageRunService } from './lib/design/canvas-image-run-servi
 import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
 import { createCanvasWorkflowRunStore } from './lib/design/canvas-workflow-run-store'
 import { createCanvasArtifactExportService } from './lib/design/canvas-artifact-export-service'
-import { createCanvasWorkflowMediaAdapter } from './lib/design/canvas-workflow-runtime-adapters'
+import { createCanvasWorkflowMediaAdapter, findCanvasWorkflowConfirmedMediaOutput } from './lib/design/canvas-workflow-runtime-adapters'
 import { createCanvasWorkflowResumeScheduler, shouldResumeCanvasWorkflow } from './lib/design/canvas-workflow-resume-scheduler'
 import { createCanvasMediaHandoffStore } from './lib/design/canvas-media-handoff-store'
 import { createCanvasMediaHandoffService } from './lib/design/canvas-media-handoff-service'
@@ -449,6 +449,7 @@ import { MediaRunService } from './lib/media/media-run-service'
 import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
 import { MediaDesignAssets } from './lib/media/media-design-assets'
 import { MediaAssetService } from './lib/media/media-asset-service'
+import { MediaAssetThumbnailService } from './lib/media/media-asset-thumbnail-service'
 import { MediaSourceService } from './lib/media/media-source-service'
 import { assertMediaProbeAvailable } from './lib/media/media-file-probe'
 import { createMediaToolRun } from './lib/media/media-tool-provider'
@@ -2050,6 +2051,7 @@ export function registerIpcHandlers(): void {
     resources: mediaResources,
     onBackgroundError: (message, error) => console.error(message, error),
     listAssets: (projectId) => mediaAssets.list(projectId),
+    readAssetThumbnail: async (projectId, asset) => mediaAssetThumbnails.read(projectId, asset),
     importLocalAsset: async (event, projectId, kind) => {
       /** 原生选择器只授权本次文件；异步返回后重新检查窗口与项目写权限。 */
       const assertAccess = (): BrowserWindow => {
@@ -2564,6 +2566,8 @@ export function registerIpcHandlers(): void {
   const mediaAssets = new MediaAssetService({ pathResolver: designPathResolver, store: designStore, images: mediaImages,
     resolveImagePath: (projectId, assetId) => designAssetService.resolveAssetPath(projectId, assetId),
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect) })
+  /** Renderer 缩略图读取复用统一素材引用校验和现有受管图片缩略图。 */
+  const mediaAssetThumbnails = new MediaAssetThumbnailService({ assets: mediaAssets, thumbnails: designAssetService })
   /** 懒初始化晚于数据根 gate；每个副作用阶段都重新核对项目和发起主体。 */
   const mediaRuns = new MediaRunService({
     configuration: getMediaConfiguration(),
@@ -2785,26 +2789,42 @@ export function registerIpcHandlers(): void {
     applyCanvasProjection: async (target, expectedRevision, nodes) => (
       canvasDocumentStore.mutate(target, expectedRevision, [{ type: 'upsert-nodes', nodes: [...nodes] }])
     ),
-    validateCandidate: async (batch, entry) => {
+    validateCandidate: async (batch, entry, allowPendingOutput = false) => {
       const job = designJobManager.getProjectJob(batch.projectId, entry.jobId)
       const canvasTarget = job?.target?.kind === 'canvas-image' ? job.target : undefined
       const asset = entry.candidateAssetId
         ? designStore.requireStableAuthoritativeDocument(batch.projectId).assets
           .find((candidate) => candidate.id === entry.candidateAssetId)
         : undefined
+      /** 首次采用发生在 Job 清除 terminal pending 前，必须以 Manager 内部提交事实证明输出。 */
+      const pendingOutput = allowPendingOutput && !!entry.candidateAssetId
+        && designJobManager.isPendingCanvasImageOutput(batch.projectId, entry.jobId, entry.candidateAssetId)
       if (!job
-        || job.status !== 'succeeded'
+        || (job.status !== 'succeeded' && !pendingOutput)
         || !canvasTarget
         || canvasTarget.canvasId !== batch.canvasId
         || canvasTarget.nodeId !== entry.nodeId
         || canvasTarget.imageModuleId !== entry.imageModuleId
-        || job.outputAssetId !== entry.candidateAssetId
+        || (!pendingOutput && job.outputAssetId !== entry.candidateAssetId)
         || !asset
         || asset.sourceJobId !== job.id) {
         throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
       }
       /** 采用前校验权威原图仍存在且内容一致，避免只凭候选元数据提交正式版本。 */
       await designAssetService.verifyStoredAsset(batch.projectId, asset.id)
+    },
+    publishAdoption: ({ document, imageTargets }) => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try {
+          contents.send(CANVAS_IPC_CHANNELS.CHANGED, {
+            projectId: document.projectId, canvasId: document.canvasId,
+            revision: document.revision, cause: 'graph',
+          })
+          for (const target of imageTargets) contents.send(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, target)
+        } catch (error) {
+          console.error('[Canvas 图片首选] 单窗口采用事实广播失败:', error)
+        }
+      }
     },
     retryEntry: async (batch, entry) => {
       const replacement = designJobManager.retry(batch.projectId, entry.jobId)
@@ -3122,7 +3142,10 @@ export function registerIpcHandlers(): void {
           catch { console.warn('[Canvas 媒体] 正式采用已提交，单窗口广播未完成') }
         }
       }
-      queueMicrotask(() => { void resumeAdoptedCanvasWorkflows(target).catch(() => console.warn('[Canvas 媒体] 待采用工作流将在后续显式恢复时重试')) })
+      /** 默认首选更新卡片版本，不把尚未验收的成片自动放行给下游。 */
+      if (projection.outputs.some((output) => output.selectionOrigin !== 'initial')) {
+        queueMicrotask(() => { void resumeAdoptedCanvasWorkflows(target).catch(() => console.warn('[Canvas 媒体] 待采用工作流将在后续显式恢复时重试')) })
+      }
     },
     authorizeTarget: (target, operation) => {
       if (!getAgentWorkspace(target.projectId)) throw new Error('CANVAS_MEDIA_ACCESS_DENIED')
@@ -3301,7 +3324,8 @@ export function registerIpcHandlers(): void {
       const run = canvasWorkflowRuns.get(input, input.workflowRunId)
       if (!shouldResumeCanvasWorkflow(run) || run.owner.sessionId !== input.ownerSessionId) return
       await canvasWorkflowExecutionService.resume({ projectId: run.projectId, sessionId: run.owner.sessionId,
-        runStartedAt: run.owner.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] }, { ...input, runId: run.id })
+        runStartedAt: run.owner.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] },
+      { ...input, runId: run.id }, undefined, { automatic: true })
     },
     onError: () => console.warn('[Canvas 工作流] 期限恢复暂未完成，保留原运行记录'),
   })
@@ -3319,18 +3343,12 @@ export function registerIpcHandlers(): void {
     imageRuns: canvasImageRunService,
     workflowRuns: canvasWorkflowRuns,
     isImageCandidateAdopted: async (input) => {
-      /** 原 batch/task 和当前正式模块必须双向一致，迟到的其它候选不能推进工作流。 */
-      const batch = await canvasImageCandidateBatchService.load(input)
-      const entry = batch.entries.find((candidate) => candidate.nodeId === input.nodeId && candidate.jobId === input.taskId)
-      const node = canvasDocumentStore.load(input).document.nodes.find((candidate) => candidate.id === input.nodeId)
-      if (!entry || !entry.candidateAssetId || entry.status !== 'adopted'
-        || node?.kind !== 'image' || node.imageModuleId !== entry.imageModuleId
-        || node.adoptedAssetId !== entry.candidateAssetId) return { adopted: false, artifactHash: null, committedAt: null }
-      const config = await canvasImageModuleStore.load({ ...input, imageModuleId: node.imageModuleId })
-      if (config.adoptedAssetId !== entry.candidateAssetId) return { adopted: false, artifactHash: null, committedAt: null }
+      /** 由采用服务核对原任务、图、模块和不可变 receipt，重放不改写实际采用时间。 */
+      const adoption = await canvasImageCandidateBatchService.getCandidateAdoption({ ...input, jobId: input.taskId })
+      if (!adoption) return { adopted: false, artifactHash: null, committedAt: null }
       return { adopted: true,
-        artifactHash: createHash('sha256').update(JSON.stringify(['image-asset', entry.candidateAssetId])).digest('hex'),
-        committedAt: batch.adoption?.committedAt ?? batch.updatedAt }
+        artifactHash: createHash('sha256').update(JSON.stringify(['image-asset', adoption.assetId])).digest('hex'),
+        committedAt: adoption.committedAt }
     },
     recoverAgentExecution: async (input) => {
       /** 正式输出必须位于原 user anchor 与下一条 user 消息之间，不能误用后续轮次。 */
@@ -3354,7 +3372,7 @@ export function registerIpcHandlers(): void {
       const node = canvasDocumentStore.load(query).document.nodes.find((item) => item.id === query.nodeId)
       if (!node || (node.kind !== 'audio' && node.kind !== 'video')) return { adopted: false, artifactHash: null, committedAt: null }
       const state = await canvasMediaStore.load({ ...query, mediaModuleId: node.mediaModuleId, mediaKind: node.kind })
-      const adopted = state.config.adoptedOutputs.find((output) => output.key === query.outputKey && output.runId === query.mediaRunId)
+      const adopted = findCanvasWorkflowConfirmedMediaOutput(state.config.adoptedOutputs, query.mediaRunId, query.outputKey)
       if (!adopted) return { adopted: false, artifactHash: null, committedAt: null }
       mediaAssets.getRecord(query.projectId, adopted.asset)
       return { adopted: true, artifactHash: adopted.asset.hash, committedAt: state.config.updatedAt }
@@ -3446,7 +3464,7 @@ export function registerIpcHandlers(): void {
         try {
           await canvasWorkflowExecutionService.resume({ projectId: run.projectId, sessionId: run.owner.sessionId,
             runStartedAt: run.owner.runStartedAt, permissionCeiling: 'execute', explicitReferences: [] },
-          { projectId: run.projectId, canvasId: run.canvasId, runId: run.id })
+          { projectId: run.projectId, canvasId: run.canvasId, runId: run.id }, undefined, { automatic: true })
         } catch (error) {
           if (!(error instanceof Error && error.message === 'CANVAS_WORKFLOW_ACTIVE')) console.warn('[Canvas 工作流] 原运行恢复暂未完成')
         }

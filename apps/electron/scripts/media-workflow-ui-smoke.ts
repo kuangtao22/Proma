@@ -33,6 +33,54 @@ async function click(window: BrowserWindow, label: string): Promise<void> {
   })()`)
 }
 
+/** 通过真实 Radix Select 选择生成授权策略。 */
+async function selectAuthorization(window: BrowserWindow, label: '每次确认' | 'Agent 自主执行'): Promise<void> {
+  await click(window, '生成授权策略')
+  await waitFor(window, `[...document.querySelectorAll('[role="option"]')].some((option) => option.textContent?.trim() === ${JSON.stringify(label)})`, `缺少授权选项：${label}`)
+  await window.webContents.executeJavaScript(`(() => {
+    const option = [...document.querySelectorAll('[role="option"]')].find((item) => item.textContent?.trim() === ${JSON.stringify(label)});
+    option.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, pointerType: 'mouse' }));
+    option.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerType: 'mouse' }));
+    option.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0, pointerType: 'mouse' }));
+    option.click();
+  })()`)
+}
+
+/** 验证全局授权在所有页签可见，并覆盖保存中、成功、失败及 CAS revision 刷新。 */
+async function verifyAuthorization(window: BrowserWindow, width: number): Promise<void> {
+  window.setContentSize(width, 820)
+  await window.loadURL(`${fixtureUrl}?theme=dark`)
+  for (const tab of ['媒体模型', '服务连接', '本地工作流']) {
+    await click(window, tab)
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const trigger = document.querySelector('[aria-label="生成授权策略"]');
+      const title = [...document.querySelectorAll('p')].find((node) => node.textContent?.trim() === '生成授权');
+      const rect = trigger?.getBoundingClientRect();
+      return Boolean(title && rect && rect.width > 0 && rect.left >= 0 && rect.right <= innerWidth)
+        && document.documentElement.scrollWidth <= innerWidth;
+    })()`), true, `${width}px 下 ${tab} 未显示完整授权控件`)
+  }
+
+  await window.webContents.executeJavaScript("window.__mediaWorkflowSmoke.authorizationSaveMode = 'deferred'")
+  await selectAuthorization(window, 'Agent 自主执行')
+  await waitFor(window, "document.querySelector('[aria-label=\"生成授权策略\"]')?.disabled && document.querySelector('[aria-label=\"正在保存生成授权策略\"]')", '授权保存中未禁用控件或显示进度')
+  assert.deepEqual(await window.webContents.executeJavaScript(`({
+    count: window.__mediaWorkflowSmoke.authorizationSaveCount,
+    expectedRevision: window.__mediaWorkflowSmoke.authorizationExpectedRevision,
+  })`), { count: 1, expectedRevision: 1 })
+  await window.webContents.executeJavaScript('window.__mediaWorkflowSmoke.releaseAuthorizationSave()')
+  await waitFor(window, "document.querySelector('[aria-label=\"生成授权策略\"]')?.textContent.includes('Agent 自主执行') && !document.querySelector('[aria-label=\"生成授权策略\"]')?.disabled", '授权保存成功后未接管新快照')
+
+  await window.webContents.executeJavaScript("window.__mediaWorkflowSmoke.authorizationSaveMode = 'fail'")
+  await selectAuthorization(window, '每次确认')
+  await waitFor(window, "document.querySelector('[role=alert]')?.textContent.includes('测试授权保存失败')", '授权保存失败没有抛出可见错误')
+  assert.deepEqual(await window.webContents.executeJavaScript(`({
+    count: window.__mediaWorkflowSmoke.authorizationSaveCount,
+    expectedRevision: window.__mediaWorkflowSmoke.authorizationExpectedRevision,
+    label: document.querySelector('[aria-label="生成授权策略"]')?.textContent?.trim(),
+  })`), { count: 2, expectedRevision: 2, label: 'Agent 自主执行' })
+}
+
 /** 验证整个设置导航链，最终回到稳定工作流列表。 */
 async function openWorkflows(window: BrowserWindow, theme: string): Promise<void> {
   await window.loadURL(`${fixtureUrl}?theme=${theme}`)
@@ -40,6 +88,55 @@ async function openWorkflows(window: BrowserWindow, theme: string): Promise<void
   await click(window, '编辑 测试服务')
   await click(window, '工作流')
   await waitFor(window, "[...document.querySelectorAll('button')].some((button) => button.textContent?.startsWith('ui.json'))", '工作流列表未就绪')
+}
+
+/** 验证本地工作流只展示用户模板，并保留新的标题、搜索框和添加入口。 */
+async function verifyLocalWorkflows(window: BrowserWindow, theme: string, width: number): Promise<void> {
+  window.setContentSize(width, 820)
+  await window.loadURL(`${fixtureUrl}?theme=${theme}`)
+  await click(window, '本地工作流')
+  await waitFor(window, "document.body.textContent.includes('本地通用模板')", '本地模板未显示')
+  const result = await window.webContents.executeJavaScript(`(() => {
+    const text = document.body.textContent ?? '';
+    const title = [...document.querySelectorAll('h2,h3,h4')].find((node) => node.textContent?.trim() === '本地工作流');
+    const search = document.querySelector('[aria-label="搜索本地工作流"]');
+    const add = [...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === '添加工作流');
+    const fits = [title, search, add].every((element) => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.left >= 0 && rect.right <= innerWidth;
+    });
+    return {
+      title: Boolean(title), search: Boolean(search), add: Boolean(add), fits,
+      noOverflow: document.documentElement.scrollWidth <= innerWidth,
+      localVisible: text.includes('本地通用模板'),
+      remoteHidden: !text.includes('内部远端快照'),
+      legacyHidden: !text.includes('旧项目私有记录') && !text.includes('项目历史'),
+    };
+  })()`)
+  assert.deepEqual(result, { title: true, search: true, add: true, fits: true, noOverflow: true,
+    localVisible: true, remoteHidden: true, legacyHidden: true })
+  await window.webContents.executeJavaScript('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+  assert.equal(await window.webContents.executeJavaScript(`(() => {
+    const active = document.querySelector('[role="tab"][data-state="active"]');
+    return active?.textContent?.trim() === '本地工作流' && document.body.textContent.includes('本地通用模板');
+  })()`), true, '截图前本地工作流页签状态不稳定')
+  const screenshot = await window.webContents.capturePage()
+  assert.equal(screenshot.isEmpty(), false)
+  await writeFile(`/private/tmp/media-workflow-local-${theme}-${width}.png`, screenshot.toPNG())
+}
+
+/** 切换两个已保存连接，验证远端工作流目录按连接身份独立浏览。 */
+async function verifyConnectionSwitch(window: BrowserWindow): Promise<void> {
+  await openWorkflows(window, 'dark')
+  await click(window, '返回列表')
+  await click(window, '编辑 备用服务')
+  await click(window, '工作流')
+  await waitFor(window, "[...document.querySelectorAll('button')].some((button) => button.textContent?.startsWith('backup.json'))", '备用服务工作流列表未就绪')
+  assert.equal(await window.webContents.executeJavaScript(`(() => {
+    const text = document.body.textContent ?? '';
+    return text.includes('backup.json') && !text.includes('ui.json') && !text.includes('api.json');
+  })()`), true, '切换连接后仍显示上一服务的工作流')
 }
 
 /** 用点击条目打开详情，不能退回行内展开。 */
@@ -91,8 +188,8 @@ async function verifyInteractions(window: BrowserWindow): Promise<void> {
   assert.equal(await window.webContents.executeJavaScript(`(() => {
     const issues = document.querySelector('[aria-label="工作流分析问题"]')?.textContent ?? '';
     return issues.includes('UI_WIDGET_UNMAPPED') && issues.includes('节点 5') && issues.includes('字段 image')
-      && ![...document.querySelectorAll('[role=dialog] button')].some((button) => button.textContent.includes('导入公共草稿'));
-  })()`), true, '阻塞问题缺少定位或仍允许导入')
+      && ![...document.querySelectorAll('[role=dialog] button')].some((button) => button.textContent.includes('另存为本地工作流'));
+  })()`), true, '阻塞问题缺少定位或仍允许另存')
   await closeWithEscape(window)
   assert.equal(await window.webContents.executeJavaScript("document.activeElement?.textContent?.startsWith('ui.json')"), true, '关闭后焦点没有回到原条目')
   await openFile(window)
@@ -118,13 +215,21 @@ async function verifyInteractions(window: BrowserWindow): Promise<void> {
   await verifyEditor(window)
   await closeWithEscape(window)
   await openFile(window, 'api.json')
-  await click(window, '导入公共草稿')
-  await waitFor(window, "!document.querySelector('[role=dialog]') && document.body.textContent.includes('工作流名称')", '导入后未进入公共草稿或弹窗未关闭')
+  await waitFor(window, "[...document.querySelectorAll('[role=dialog] button')].some((button) => button.textContent?.trim() === '另存为本地工作流')", 'API 工作流缺少显式另存入口')
+  await window.webContents.executeJavaScript(`Promise.all(document.getAnimations()
+    .filter((animation) => Number.isFinite(animation.effect?.getComputedTiming().endTime))
+    .map((animation) => animation.finished.catch(() => undefined)))`)
+  await window.webContents.executeJavaScript('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+  const saveLocalScreenshot = await window.webContents.capturePage()
+  assert.equal(saveLocalScreenshot.isEmpty(), false)
+  await writeFile('/private/tmp/media-workflow-save-local.png', saveLocalScreenshot.toPNG())
+  await click(window, '另存为本地工作流')
+  await waitFor(window, "!document.querySelector('[role=dialog]') && document.body.textContent.includes('添加本地工作流')", '另存后未进入本地工作流草稿或弹窗未关闭')
   await openWorkflows(window, 'light')
   await openFile(window, 'converted.json')
   await waitFor(window, "document.body.textContent.includes('已转换并通过校验')", '可转换 UI 未展示校验状态')
-  await click(window, '导入公共草稿')
-  await waitFor(window, "!document.querySelector('[role=dialog]') && document.body.textContent.includes('工作流名称')", '可转换 UI 未进入公共草稿')
+  await click(window, '另存为本地工作流')
+  await waitFor(window, "!document.querySelector('[role=dialog]') && document.body.textContent.includes('添加本地工作流')", '可转换 UI 未进入本地工作流草稿')
 }
 
 /** 截图前检查弹窗、编辑器、关闭按钮均在视口内。 */
@@ -165,10 +270,15 @@ async function run(): Promise<void> {
     if (event.level === 'error') console.error(`[Media workflow renderer] ${event.message}`)
   })
   try {
+    await verifyAuthorization(window, 1180)
+    await verifyAuthorization(window, 430)
+    await verifyLocalWorkflows(window, 'dark', 1180)
+    await verifyLocalWorkflows(window, 'light', 430)
+    await verifyConnectionSwitch(window)
     await verifyInteractions(window)
     await capture(window, 'dark', 1180)
     await capture(window, 'light', 430)
-    console.log('[Media workflow smoke] PASS: 问题定位、阻塞导入、UI/API 导入、弹窗交互、完整复制、只读、虚拟化及双主题尺寸验证通过')
+    console.log('[Media workflow smoke] PASS: 全局授权保存、窄屏布局、本地模板过滤、连接切换、显式另存、问题定位、弹窗交互、完整复制、只读、虚拟化及双主题尺寸验证通过')
   } finally {
     window.destroy()
     await rm(userDataPath, { recursive: true, force: true })

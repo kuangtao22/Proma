@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { MediaConfiguration, MediaConnection, MediaConnectionAuth, MediaProfile, MediaProjectCatalog, MediaWorkflowVersion } from '@proma/shared'
+import type { MediaAuthorizationMode, MediaConfiguration, MediaConnection, MediaConnectionAuth, MediaProfile, MediaProjectCatalog, MediaRemoteDescriptor, MediaWorkflowDefinition, MediaWorkflowRemoteSource, MediaWorkflowVersion } from '@proma/shared'
 import { parseMediaWorkflowDefinition } from '@proma/shared'
 import { getConfigDir } from '../config-paths'
 import { removeFileAtomic, writeJsonFileAtomicSecure } from '../safe-file'
@@ -34,6 +34,17 @@ const unavailableStorage: MediaSecureStorage = {
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/
 /** 保存和恢复凭据使用同一个最终序列化字节预算。 */
 const credentialMaximumBytes = 32 * 1024
+/** 远端正文和规范化工作流都使用完整 SHA-256 指纹。 */
+const sha256Pattern = /^[a-f0-9]{64}$/
+
+/** Host 缓存远端执行快照所需的可信输入。 */
+export interface CacheRemoteWorkflowInput {
+  projectId: string
+  name: string
+  descriptor: MediaRemoteDescriptor
+  contentHash: string
+  definition: MediaWorkflowDefinition
+}
 
 /** 解析普通对象并拒绝未声明的字段。 */
 function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -126,6 +137,57 @@ function workflowHash(definition: MediaWorkflowVersion['definition']): string {
   return createHash('sha256').update(JSON.stringify(definition)).digest('hex')
 }
 
+/** 递归规范化对象键顺序，避免 JSON 属性顺序改变远端快照身份。 */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, canonicalValue(nested)]))
+  }
+  return value
+}
+
+/** 计算不受对象属性顺序影响的工作流定义指纹。 */
+function canonicalWorkflowHash(definition: MediaWorkflowDefinition): string {
+  return createHash('sha256').update(JSON.stringify(canonicalValue(definition))).digest('hex')
+}
+
+/** 校验远端工作流路径，允许目录层级但拒绝绝对路径和目录穿越。 */
+function workflowPath(value: unknown): string {
+  if (typeof value !== 'string' || !value || value.length > 1024 || value.startsWith('/')
+    || /^[A-Za-z]:\//.test(value) || value.includes('\\') || /[\x00-\x1f\x7f]/.test(value)
+    || value.split('/').some((segment) => !segment || segment === '.' || segment === '..')) {
+    throw new Error('MEDIA_REMOTE_RESOURCE_INVALID')
+  }
+  return value
+}
+
+/** 严格解析仅来自 UserData 的远端工作流描述符。 */
+function remoteWorkflowDescriptor(value: unknown): MediaRemoteDescriptor {
+  let input: Record<string, unknown>
+  try {
+    input = record(value, ['connectionId', 'instanceGeneration', 'remoteUser', 'source', 'id', 'workflowPath'])
+  } catch { throw new Error('MEDIA_REMOTE_RESOURCE_INVALID') }
+  if (input.source !== 'user-data' || typeof input.remoteUser !== 'string'
+    || input.remoteUser.length > 128 || !/^[\x20-\x7e]*$/.test(input.remoteUser)) throw new Error('MEDIA_REMOTE_RESOURCE_INVALID')
+  const path = workflowPath(input.workflowPath)
+  if (input.id !== path) throw new Error('MEDIA_REMOTE_RESOURCE_INVALID')
+  try {
+    return { connectionId: identifier(input.connectionId), instanceGeneration: identifier(input.instanceGeneration),
+      remoteUser: input.remoteUser, source: 'user-data', id: path, workflowPath: path }
+  } catch { throw new Error('MEDIA_REMOTE_RESOURCE_INVALID') }
+}
+
+/** 严格解析落盘的远端来源标记，旧工作流没有该字段时保持兼容。 */
+function parseRemoteSource(value: unknown): MediaWorkflowRemoteSource {
+  let input: Record<string, unknown>
+  try { input = record(value, ['descriptor', 'contentHash']) } catch { throw new Error('MEDIA_CONFIG_INVALID') }
+  if (typeof input.contentHash !== 'string' || !sha256Pattern.test(input.contentHash)) throw new Error('MEDIA_CONFIG_INVALID')
+  try {
+    return { descriptor: remoteWorkflowDescriptor(input.descriptor), contentHash: input.contentHash }
+  } catch { throw new Error('MEDIA_CONFIG_INVALID') }
+}
+
 /** 公共模板以参数槽代替媒体文件名；模型文件枚举保持原有精确值。 */
 function makePublicDefinition(definition: MediaWorkflowVersion['definition']): void {
   for (const [nodeId, node] of Object.entries(definition.prompt)) {
@@ -150,11 +212,12 @@ function makePublicDefinition(definition: MediaWorkflowVersion['definition']): v
 
 /** 验证工作流历史记录的内容与指纹一致。 */
 function parseWorkflow(value: unknown): MediaWorkflowVersion {
-  const input = record(value, ['id', 'name', 'projectId', 'revision', 'hash', 'definition', 'createdAt'])
+  const input = record(value, ['id', 'name', 'projectId', 'revision', 'hash', 'definition', 'createdAt', 'remoteSource'])
   const definition = parseMediaWorkflowDefinition(input.definition)
   if (input.hash !== workflowHash(definition)) throw new Error('MEDIA_CONFIG_INVALID')
   return { id: identifier(input.id), name: name(input.name), projectId: input.projectId === null ? null : identifier(input.projectId),
-    revision: integer(input.revision, 1), hash: input.hash as string, definition, createdAt: integer(input.createdAt) }
+    revision: integer(input.revision, 1), hash: input.hash as string, definition, createdAt: integer(input.createdAt),
+    ...(input.remoteSource === undefined ? {} : { remoteSource: parseRemoteSource(input.remoteSource) }) }
 }
 
 /** 严格解析固定工作流版本的媒体预设。 */
@@ -166,12 +229,20 @@ function parseProfile(value: unknown): MediaProfile {
     projectId: identifier(input.projectId), enabled: boolean(input.enabled), createdAt: integer(input.createdAt) }
 }
 
+/** 严格解析媒体生成授权模式，拒绝宽松字符串转换。 */
+function parseAuthorizationMode(value: unknown): MediaAuthorizationMode {
+  if (value !== 'ask' && value !== 'automatic') throw new Error('MEDIA_AUTHORIZATION_MODE_INVALID')
+  return value
+}
+
 /** 统一媒体配置；写入串行化，密钥单独加密，所有读操作重新读取磁盘。 */
 export class MediaConfigStore {
   /** 当前数据根下的媒体配置目录。 */
   private readonly directory: string
   /** 系统加密器只在主进程持有。 */
   private readonly secureStorage: MediaSecureStorage
+  /** Host 单例内的授权模式变化监听器，不跨进程轮询。 */
+  private readonly authorizationModeListeners = new Set<() => void>()
 
   constructor(configDir = getConfigDir(), secureStorage: MediaSecureStorage = unavailableStorage) {
     this.directory = join(configDir, 'media')
@@ -182,13 +253,13 @@ export class MediaConfigStore {
   read(): MediaConfiguration {
     const path = join(this.directory, 'config.json')
     try { lstatSync(path) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { schemaVersion: 2, revision: 0, connections: [], workflows: [], profiles: [], connectionHistory: [], archivedWorkflowIds: [] }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { schemaVersion: 2, revision: 0, authorizationMode: 'ask', connections: [], workflows: [], profiles: [], connectionHistory: [], archivedWorkflowIds: [] }
       throw error
     }
     try {
-      const input = record(readMediaJsonFile(path, 32 * 1024 * 1024), ['schemaVersion', 'revision', 'connections', 'workflows', 'profiles', 'connectionHistory', 'archivedWorkflowIds'])
+      const input = record(readMediaJsonFile(path, 32 * 1024 * 1024), ['schemaVersion', 'revision', 'authorizationMode', 'connections', 'workflows', 'profiles', 'connectionHistory', 'archivedWorkflowIds'])
       if (input.schemaVersion !== 1 && input.schemaVersion !== 2) throw new Error('MEDIA_CONFIG_INVALID')
-      const configuration: MediaConfiguration = { schemaVersion: 2, revision: integer(input.revision),
+      const configuration: MediaConfiguration = { schemaVersion: 2, revision: integer(input.revision), authorizationMode: parseAuthorizationMode(input.authorizationMode ?? 'ask'),
         connections: array(input.connections, 256).map(parseConnection), workflows: array(input.workflows, 4096).map(parseWorkflow),
         profiles: array(input.profiles, 4096).map(parseProfile),
         connectionHistory: array(input.connectionHistory ?? [], 4096).map(parseConnection),
@@ -209,6 +280,30 @@ export class MediaConfigStore {
     } catch (error) { throw new Error('MEDIA_CONFIG_INVALID', { cause: error }) }
   }
 
+  /** 保存全局媒体授权模式；相同值保持幂等，不推进配置版本。 */
+  saveAuthorizationMode(value: unknown, expectedRevision: number): MediaConfiguration {
+    const mode = parseAuthorizationMode(value)
+    let changed = false
+    const configuration = this.mutate(expectedRevision, (current) => {
+      if ((current.authorizationMode ?? 'ask') === mode) return undefined
+      current.authorizationMode = mode
+      changed = true
+      return current
+    })
+    if (changed) {
+      for (const listener of [...this.authorizationModeListeners]) {
+        try { listener() } catch { /* 已提交配置不能因观察者异常表现为保存失败。 */ }
+      }
+    }
+    return configuration
+  }
+
+  /** 订阅已持久化的授权模式变化，返回幂等退订函数。 */
+  subscribeAuthorizationMode(listener: () => void): () => void {
+    this.authorizationModeListeners.add(listener)
+    return () => { this.authorizationModeListeners.delete(listener) }
+  }
+
   /** 返回公共目录及当前项目旧草稿，任务授权仍由调用方 Host 检查。 */
   listProject(projectId = ''): MediaProjectCatalog {
     const configuration = this.read()
@@ -216,7 +311,8 @@ export class MediaConfigStore {
       connections: configuration.connections.filter((item) => item.archivedAt === undefined).map((item) => ({ id: item.id, name: item.name,
         driver: item.driver, enabled: item.enabled, revision: item.revision, instanceGeneration: item.instanceGeneration, credentialConfigured: !!item.credentialRef })),
       workflows: configuration.workflows.filter((item) => (item.projectId === null || item.projectId === projectId) && !configuration.archivedWorkflowIds?.includes(item.id)).map((item) => ({
-        id: item.id, name: item.name, revision: item.revision, projectId: item.projectId, hash: item.hash, createdAt: item.createdAt })),
+        id: item.id, name: item.name, revision: item.revision, projectId: item.projectId, hash: item.hash, createdAt: item.createdAt,
+        ...(item.remoteSource ? { remoteSource: item.remoteSource } : {}) })),
       profiles: configuration.profiles.filter((item) => item.projectId === projectId) }
   }
 
@@ -301,6 +397,7 @@ export class MediaConfigStore {
       const id = identifier(input.id)
       const previous = configuration.workflows.filter((item) => item.id === id)
       const projectId = input.projectId === null || input.projectId === undefined ? null : identifier(input.projectId)
+      if (previous.some((item) => item.remoteSource !== undefined)) throw new Error('MEDIA_WORKFLOW_REMOTE_SNAPSHOT_IMMUTABLE')
       if (previous.some((item) => item.projectId !== projectId)) throw new Error('MEDIA_WORKFLOW_SCOPE_CONFLICT')
       const definition = parseMediaWorkflowDefinition(input.definition)
       if (projectId === null) makePublicDefinition(definition)
@@ -308,6 +405,40 @@ export class MediaConfigStore {
       configuration.workflows.push(workflow)
       return configuration
     })
+  }
+
+  /** 自动缓存绑定远端身份的执行快照；相同内容命中时不写盘也不推进配置版本。 */
+  cacheRemoteWorkflow(value: CacheRemoteWorkflowInput): MediaWorkflowVersion {
+    const projectId = identifier(value.projectId)
+    const workflowName = name(value.name)
+    const descriptor = remoteWorkflowDescriptor(value.descriptor)
+    if (typeof value.contentHash !== 'string' || !sha256Pattern.test(value.contentHash)) throw new Error('MEDIA_REMOTE_RESOURCE_INVALID')
+    const definition = parseMediaWorkflowDefinition(value.definition)
+    const definitionHash = canonicalWorkflowHash(definition)
+    const identityHash = createHash('sha256').update(JSON.stringify({ projectId, descriptor,
+      contentHash: value.contentHash, definitionHash })).digest('hex')
+    const id = `remote-workflow-${identityHash}`
+    let snapshot: MediaWorkflowVersion | undefined
+    this.mutateCurrent((configuration) => {
+      const connection = configuration.connections.find((item) => item.id === descriptor.connectionId)
+      if (!connection || connection.instanceGeneration !== descriptor.instanceGeneration
+        || (connection.comfyUser ?? '') !== descriptor.remoteUser) throw new Error('MEDIA_REMOTE_RESOURCE_STALE')
+      if (!connection.enabled || connection.archivedAt !== undefined) throw new Error('MEDIA_CONNECTION_DISABLED')
+      const existing = configuration.workflows.find((item) => item.id === id && item.revision === 1)
+      if (existing) {
+        if (existing.projectId !== projectId || !existing.remoteSource
+          || existing.remoteSource.contentHash !== value.contentHash
+          || canonicalWorkflowHash(existing.definition) !== definitionHash) throw new Error('MEDIA_CONFIG_INVALID')
+        snapshot = existing
+        return undefined
+      }
+      snapshot = parseWorkflow({ id, name: workflowName, projectId, revision: 1, hash: workflowHash(definition), definition,
+        createdAt: Date.now(), remoteSource: { descriptor, contentHash: value.contentHash } })
+      configuration.workflows.push(snapshot)
+      return configuration
+    })
+    if (!snapshot) throw new Error('MEDIA_CONFIG_INVALID')
+    return snapshot
   }
 
   /** 查询精确模板版本，并复核项目可见性。 */
@@ -363,8 +494,18 @@ export class MediaConfigStore {
   }
 
   /** 同步短事务只持有配置锁，不在锁内执行远程请求。 */
-  private mutate(expectedRevision: number, update: (configuration: MediaConfiguration) => MediaConfiguration): MediaConfiguration {
+  private mutate(expectedRevision: number, update: (configuration: MediaConfiguration) => MediaConfiguration | undefined): MediaConfiguration {
     integer(expectedRevision)
+    return this.mutateLocked(expectedRevision, update)
+  }
+
+  /** Host 内部事务总是基于锁内最新配置，不要求调用方持有 Renderer CAS 版本。 */
+  private mutateCurrent(update: (configuration: MediaConfiguration) => MediaConfiguration | undefined): MediaConfiguration {
+    return this.mutateLocked(undefined, update)
+  }
+
+  /** 在同一文件锁内执行 CAS 或 Host 幂等事务，undefined 表示无需提交。 */
+  private mutateLocked(expectedRevision: number | undefined, update: (configuration: MediaConfiguration) => MediaConfiguration | undefined): MediaConfiguration {
     mkdirSync(this.directory, { recursive: true })
     let release: () => void
     try { release = acquireMediaFileLock(join(this.directory, 'config.lock')) } catch (error) {
@@ -373,7 +514,7 @@ export class MediaConfigStore {
     }
     try {
       const previous = this.read()
-      if (previous.revision !== expectedRevision) throw new Error('MEDIA_CONFIG_CONFLICT')
+      if (expectedRevision !== undefined && previous.revision !== expectedRevision) throw new Error('MEDIA_CONFIG_CONFLICT')
       /** 首次升级前保存原始 v1 文件；后续写入不得覆盖迁移证据。 */
       const configPath = join(this.directory, 'config.json')
       if (existsSync(configPath)) {
@@ -383,6 +524,7 @@ export class MediaConfigStore {
       }
       this.collectUnusedCredentials(previous)
       const next = update(previous)
+      if (!next) return previous
       next.revision += 1
       if (next.connections.length > 256 || next.workflows.length > 4096 || next.profiles.length > 4096
         || (next.connectionHistory?.length ?? 0) > 4096) throw new Error('MEDIA_CONFIG_LIMIT')

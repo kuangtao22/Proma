@@ -22,6 +22,8 @@ import { SettingsCard } from './primitives'
 interface MediaApiModelSettingsProps {
   /** 与搜索筛选同一行的媒体配置页签。 */
   navigation?: React.ReactNode
+  /** 标题下方的全局媒体设置。 */
+  headerContent?: React.ReactNode
   /** 工具栏下方的公共状态提示。 */
   children?: React.ReactNode
 }
@@ -184,6 +186,7 @@ export function MediaApiModelCatalogView({
   loading = false,
   onSaveProfiles,
   navigation,
+  headerContent,
   children,
 }: MediaApiModelCatalogViewProps): React.ReactElement {
   /** 当前单条编辑草稿。 */
@@ -257,6 +260,7 @@ export function MediaApiModelCatalogView({
       title={draft ? (existing ? '编辑媒体模型' : '添加媒体模型') : '媒体模型'}
       onBack={draft ? () => setDraft(null) : undefined}
       busy={saving}
+      headerContent={headerContent}
       action={
         <Button type="button" size="sm" disabled={loading || saving || draft !== null} onClick={() => setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now()))}>
           <Plus size={16} />
@@ -328,7 +332,7 @@ export function MediaApiModelCatalogView({
 }
 
 /** 从主进程统一目录加载并保存 API 媒体模型。 */
-export function MediaApiModelSettings({ navigation, children }: MediaApiModelSettingsProps): React.ReactElement {
+export function MediaApiModelSettings({ navigation, headerContent, children }: MediaApiModelSettingsProps): React.ReactElement {
   /** 当前权威 API 媒体模型目录。 */
   const [catalog, setCatalog] = React.useState<MediaApiModelCatalogResult | null>(null)
   /** 渠道公开摘要只用于选择稳定 channelId，不包含秘密。 */
@@ -395,7 +399,7 @@ export function MediaApiModelSettings({ navigation, children }: MediaApiModelSet
   }
 
   return (
-    <MediaApiModelCatalogView entries={catalog?.entries ?? []} channelOptions={channelOptions} loading={loading && !catalog} saving={saving} onSaveProfiles={saveProfiles} navigation={navigation}>
+    <MediaApiModelCatalogView entries={catalog?.entries ?? []} channelOptions={channelOptions} loading={loading && !catalog} saving={saving} onSaveProfiles={saveProfiles} navigation={navigation} headerContent={headerContent}>
       {children}
       {error && <div role="alert" className="mb-3 flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{error}</span><Button type="button" size="sm" variant="outline" disabled={loading || saving} onClick={() => void load()}>重新加载</Button></div>}
     </MediaApiModelCatalogView>

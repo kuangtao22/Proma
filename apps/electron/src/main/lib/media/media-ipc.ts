@@ -1,6 +1,6 @@
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { MEDIA_IPC_CHANNELS } from '@proma/shared'
-import type { ComfyObjectInfo, MediaAssetRecord, MediaKind, MediaConfiguration, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourceQuery, MediaRunEvent, MediaRunSnapshot, MediaSettingsSnapshot } from '@proma/shared'
+import type { ComfyObjectInfo, MediaAssetRecord, MediaAssetRef, MediaKind, MediaConfiguration, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourceQuery, MediaRunEvent, MediaRunSnapshot, MediaSettingsSnapshot } from '@proma/shared'
 import type { MediaConfigStore } from './media-config-store'
 import type { MediaResourceService } from './media-resource-service'
 import { detectMediaFileSignature } from './media-file-probe'
@@ -11,7 +11,7 @@ export interface MediaIpcOptions {
   ipc: { handle(channel: string, handler: (event: IpcMainInvokeEvent, input?: unknown) => unknown): void; removeHandler(channel: string): void }
   isAuthorizedSender(event: IpcMainInvokeEvent): boolean
   assertProject(projectId: string): void
-  configuration: Pick<MediaConfigStore, 'read' | 'saveConnection' | 'saveWorkflow' | 'saveProfile'> & Partial<Pick<MediaConfigStore, 'archive'>>
+  configuration: Pick<MediaConfigStore, 'read' | 'saveConnection' | 'saveWorkflow' | 'saveProfile'> & Partial<Pick<MediaConfigStore, 'archive' | 'saveAuthorizationMode'>>
   resources: Pick<MediaResourceService, 'probe' | 'list'>
     & { readWorkflow?: (descriptor: MediaRemoteDescriptor) => Promise<MediaRemoteWorkflow> }
     & { getSchema?: (connectionId: string, projectId: string, classTypes: string[]) => Promise<ComfyObjectInfo> }
@@ -20,6 +20,7 @@ export interface MediaIpcOptions {
   onBackgroundError?(message: string, error: unknown): void
   importLocalAsset?(event: IpcMainInvokeEvent, projectId: string, kind: MediaKind): Promise<MediaAssetRecord | null>
   listAssets?(projectId: string): Promise<MediaAssetRecord[]>
+  readAssetThumbnail?(projectId: string, asset: MediaAssetRef): Promise<{ bytes: Uint8Array; contentType: string }>
   getRun(projectId: string, runId: string): MediaRunSnapshot
   getJobRun?(projectId: string, jobId: string): MediaRunSnapshot | null
 }
@@ -36,10 +37,20 @@ function inputId(value: unknown): string {
   return value
 }
 
+/** 严格解析 Renderer 提供的四字段图片引用，拒绝额外路径或媒体类型。 */
+function inputImageAssetRef(value: unknown): MediaAssetRef {
+  const asset = inputRecord(value, ['assetId', 'revision', 'hash', 'mediaKind'])
+  if (asset.mediaKind !== 'image'
+    || !Number.isSafeInteger(asset.revision) || Number(asset.revision) <= 0
+    || typeof asset.hash !== 'string' || !/^[a-f0-9]{64}$/.test(asset.hash)) throw new Error('MEDIA_IPC_INPUT_INVALID')
+  return { assetId: inputId(asset.assetId), revision: Number(asset.revision), hash: asset.hash, mediaKind: 'image' }
+}
+
 /** 管理页可以编辑授权范围，但永远不取得密文引用。 */
 export function mediaSettingsSnapshot(configuration: MediaConfiguration): MediaSettingsSnapshot {
   const { connectionHistory: _history, ...publicConfiguration } = configuration
-  return { ...publicConfiguration, workflows: configuration.workflows.filter((workflow) => !configuration.archivedWorkflowIds?.includes(workflow.id)),
+  return { ...publicConfiguration, authorizationMode: configuration.authorizationMode ?? 'ask',
+    workflows: configuration.workflows.filter((workflow) => !configuration.archivedWorkflowIds?.includes(workflow.id)),
     connections: configuration.connections.filter((connection) => connection.archivedAt === undefined).map((connection) => {
     const { credentialRef, projectIds: _legacyScope, ...publicConnection } = connection
     return { ...publicConnection, credentialConfigured: !!credentialRef }
@@ -69,6 +80,13 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
     channels.push(channel)
   }
   handle(MEDIA_IPC_CHANNELS.GET_SETTINGS, () => mediaSettingsSnapshot(options.configuration.read()))
+  handle(MEDIA_IPC_CHANNELS.SAVE_AUTHORIZATION, (value) => {
+    const envelope = inputRecord(value, ['mode', 'expectedRevision'])
+    if ((envelope.mode !== 'ask' && envelope.mode !== 'automatic')
+      || !Number.isSafeInteger(envelope.expectedRevision) || Number(envelope.expectedRevision) < 0) throw new Error('MEDIA_IPC_INPUT_INVALID')
+    if (!options.configuration.saveAuthorizationMode) throw new Error('MEDIA_CONFIGURATION_UNAVAILABLE')
+    return mediaSettingsSnapshot(options.configuration.saveAuthorizationMode(envelope.mode, Number(envelope.expectedRevision)))
+  })
   for (const [channel, method] of [
     [MEDIA_IPC_CHANNELS.SAVE_CONNECTION, 'saveConnection'], [MEDIA_IPC_CHANNELS.SAVE_WORKFLOW, 'saveWorkflow'], [MEDIA_IPC_CHANNELS.SAVE_PROFILE, 'saveProfile'],
   ] as const) {
@@ -141,6 +159,18 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
     if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
     options.assertProject(projectId)
     return assets
+  })
+  handle(MEDIA_IPC_CHANNELS.READ_ASSET_THUMBNAIL, async (value, event) => {
+    const input = inputRecord(value, ['projectId', 'asset'])
+    const projectId = inputId(input.projectId)
+    const asset = inputImageAssetRef(input.asset)
+    options.assertProject(projectId)
+    if (!options.readAssetThumbnail) throw new Error('MEDIA_ASSETS_UNAVAILABLE')
+    const thumbnail = await options.readAssetThumbnail(projectId, asset)
+    /** 异步磁盘读取结束后 fresh-check，撤权窗口不能收到已读入内存的内容。 */
+    if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
+    options.assertProject(projectId)
+    return thumbnail
   })
   handle(MEDIA_IPC_CHANNELS.PROBE_CONNECTION, (value) => {
     const input = inputRecord(value, ['connectionId', 'projectId'])
