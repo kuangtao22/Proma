@@ -21,6 +21,7 @@ import {
   NATIVE_CANVAS_NODE_WIDTH,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
+  patchNativeCanvasFlowNodeRuntimeState,
 } from './native-canvas-model'
 
 describe('原生 Canvas 大画布性能预算', () => {
@@ -184,6 +185,40 @@ describe('原生 Canvas 大画布性能预算', () => {
     )
     expect(movedActiveNodes[500]?.position).toEqual(movedActiveDocument.nodes[500]?.position)
     expect(movedActiveNodes[500]?.measured).toEqual(currentNodes[500]?.measured)
+  })
+
+  test('Given 1,000 个节点 When 单个媒体进度变化 Then 运行态局部投影只创建一个新节点', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = Array.from({ length: 1_000 }, (_, index) => ({
+      id: `video-${index}`,
+      kind: 'video' as const,
+      title: `视频 ${index}`,
+      mediaModuleId: `media-module-${index}`,
+      position: { x: index * 320, y: 0 },
+    }))
+    const previousNodes = toNativeCanvasFlowNodes(document)
+    const currentNodes = previousNodes.map((node, index) => index === 321
+      ? { ...node, dragging: true }
+      : node)
+    const progress = {
+      phase: 'running' as const,
+      phaseLabel: '运行中',
+      nodeProgressLabel: '当前节点 KSampler · 42/100',
+    }
+    const nextNodes = currentNodes.map((node, index) => index === 321
+      ? patchNativeCanvasFlowNodeRuntimeState(node, document.nodes[index]!, {
+          nodeIssues: [],
+          runningSessionIds: new Set<string>(),
+          nodeActivityStates: new Map([['video-321', 'running' as const]]),
+          mediaProgressByNodeId: new Map([['video-321', progress]]),
+        })
+      : node)
+
+    expect(nextNodes.filter((node, index) => node !== currentNodes[index])).toHaveLength(1)
+    expect(nextNodes[321]?.data.activityState).toBe('running')
+    expect(nextNodes[321]?.data.mediaProgress).toEqual(progress)
+    expect(nextNodes[321]?.dragging).toBe(true)
+    expect(nextNodes[320]).toBe(currentNodes[320])
   })
 
   test('Given WebView 回调每次 render 都更新 When 通过稳定桥调用 Then 使用最新预览与设备实现', async () => {

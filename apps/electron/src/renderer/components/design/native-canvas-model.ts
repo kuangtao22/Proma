@@ -255,6 +255,67 @@ export type NativeCanvasFlowNode =
   | NativeCanvasWebviewFlowNode
 
 /**
+ * 只更新单个节点的运行时展示字段，保留 XYFlow 已附加的局部状态。
+ * @param flowNode 当前 XYFlow 节点，可能包含拖动和测量字段。
+ * @param canvasNode 当前权威 Canvas 节点。
+ * @param options 运行态映射与故障节点索引。
+ * @returns 运行态未变化时复用原节点，否则返回仅替换 data 的节点。
+ */
+export function patchNativeCanvasFlowNodeRuntimeState(
+  flowNode: NativeCanvasFlowNode,
+  canvasNode: CanvasNode,
+  options: Pick<NativeCanvasProjectionOptions, 'nodeIssues' | 'runningSessionIds' | 'nodeActivityStates' | 'mediaProgressByNodeId' | 'imageCandidateNodeIds'>,
+): NativeCanvasFlowNode {
+  /** 媒体阶段和 Workspace 活动态共享同一优先级合并规则。 */
+  const mediaProgress = options.mediaProgressByNodeId?.get(canvasNode.id)
+  const activityState = resolveProjectedCanvasNodeActivityState(
+    options.nodeActivityStates?.get(canvasNode.id),
+    mediaProgress,
+  )
+  const data = { ...flowNode.data } as Record<string, unknown>
+  let changed = data.activityState !== activityState
+  data.activityState = activityState
+
+  if (canvasNode.kind === 'agent' && flowNode.type === 'canvasAgent') {
+    /** 故障优先于运行态，保持与完整投影相同的状态语义。 */
+    const unavailable = options.nodeIssues.some((issue) => issue.nodeId === canvasNode.id)
+    const status = unavailable
+      ? 'unavailable'
+      : options.runningSessionIds.has(canvasNode.agentSessionId) ? 'running' : 'idle'
+    changed = changed || data.status !== status || data.statusLabel !== AGENT_STATUS_LABELS[status]
+    data.status = status
+    data.statusLabel = AGENT_STATUS_LABELS[status]
+    data.summary = unavailable ? '需要重建或删除节点' : '独立 Agent 会话'
+  } else if (canvasNode.kind === 'image' && flowNode.type === 'canvasImage') {
+    /** 生图节点的媒体阶段可能每次事件都变化，缺失时必须删除旧阶段字段。 */
+    changed = changed || data.mediaProgress !== mediaProgress
+    if (mediaProgress) data.mediaProgress = mediaProgress
+    else delete data.mediaProgress
+    const hasPendingCandidate = !canvasNode.adoptedAssetId
+      && options.imageCandidateNodeIds?.has(canvasNode.id) === true
+    const statusLabel = canvasNode.adoptedAssetId ? '已有素材' : hasPendingCandidate ? '待采用' : '待创作'
+    const summary = canvasNode.adoptedAssetId
+      ? '已采用画布素材'
+      : hasPendingCandidate ? '已生成，尚未设为默认' : '尚未生成图片'
+    changed = changed || data.statusLabel !== statusLabel || data.summary !== summary
+    data.statusLabel = statusLabel
+    data.summary = summary
+  } else if ((canvasNode.kind === 'audio' || canvasNode.kind === 'video') && flowNode.type === 'canvasMedia') {
+    /** 音视频节点只在成功阶段展示已有结果，其余阶段继续显示待创作。 */
+    changed = changed || data.mediaProgress !== mediaProgress
+    if (mediaProgress) data.mediaProgress = mediaProgress
+    else delete data.mediaProgress
+    const succeeded = mediaProgress?.phase === 'succeeded'
+    const statusLabel = succeeded ? '已有结果' : '待创作'
+    const summary = succeeded ? '已有生成结果' : canvasNode.kind === 'audio' ? '尚未生成音频' : '尚未生成视频'
+    changed = changed || data.statusLabel !== statusLabel || data.summary !== summary
+    data.statusLabel = statusLabel
+    data.summary = summary
+  }
+  return changed ? { ...flowNode, data } as NativeCanvasFlowNode : flowNode
+}
+
+/**
  * 根据已验证图片尺寸计算生图节点高度。
  * @param preview 工作区 LOAD 返回的轻量安全预览元数据。
  * @returns 标题栏加受限预览区的总高度；无效尺寸回退固定高度。

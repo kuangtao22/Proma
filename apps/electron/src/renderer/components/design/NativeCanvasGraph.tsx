@@ -48,6 +48,7 @@ import {
   createViewportCanvasMutation,
   resolveNativeCanvasImageNodeHeight,
   resolveNativeCanvasNodeSize,
+  patchNativeCanvasFlowNodeRuntimeState,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
 } from './native-canvas-model'
@@ -694,6 +695,31 @@ export function NativeCanvasGraph({
   }
   /** 上一次纯投影不含 XYFlow 局部字段，用于判断哪些权威展示字段真实变化。 */
   const projectedFlowNodesRef = React.useRef(initialFlowNodeProjectionRef.current)
+  /** 运行态快路径按节点索引更新，避免为每次进度事件重建全图数组。 */
+  const flowNodeIndexByIdRef = React.useRef(new Map(
+    initialFlowNodeProjectionRef.current.map((node, index) => [node.id, index] as const),
+  ))
+  /** 权威节点按 ID 索引只在结构变化时重建，运行态事件直接常数时间读取。 */
+  const canvasNodeByIdRef = React.useRef(new Map(document.nodes.map((node) => [node.id, node] as const)))
+  /** 上一次投影的静态输入；节点/边数组变化时才需要完整投影。 */
+  const projectionStaticInputsRef = React.useRef({
+    canvasId: document.canvasId,
+    nodes: document.nodes,
+    edges: document.edges,
+    nodeIssues,
+    imageCandidateNodeIds,
+    imagePreviews,
+    pendingWebviewDeviceNodeIds,
+    canCreateChild,
+    writable,
+    selectedNodeIdSet: controlledSelectedNodeIdSet,
+  })
+  /** 上一次运行态输入，用于求出真正受影响的节点 ID 集合。 */
+  const runtimeProjectionInputsRef = React.useRef({
+    runningSessionIds,
+    nodeActivityStates,
+    mediaProgressByNodeId,
+  })
   /** 画布切换时禁止把同名节点的局部几何带入另一个 Canvas。 */
   const projectedCanvasIdRef = React.useRef(document.canvasId)
   const [flowNodes, setFlowNodes] = React.useState<NativeCanvasFlowNode[]>(initialFlowNodeProjectionRef.current)
@@ -732,7 +758,102 @@ export function NativeCanvasGraph({
   }, [])
 
   React.useEffect(() => {
-    /** 权威文档变化时同步稳定展示字段与选中态。 */
+    const previousStaticInputs = projectionStaticInputsRef.current
+    const previousRuntimeInputs = runtimeProjectionInputsRef.current
+    const staticInputsUnchanged = previousStaticInputs.canvasId === document.canvasId
+      && previousStaticInputs.nodes === document.nodes
+      && previousStaticInputs.edges === document.edges
+      && previousStaticInputs.nodeIssues === nodeIssues
+      && previousStaticInputs.imageCandidateNodeIds === imageCandidateNodeIds
+      && previousStaticInputs.imagePreviews === imagePreviews
+      && previousStaticInputs.pendingWebviewDeviceNodeIds === pendingWebviewDeviceNodeIds
+      && previousStaticInputs.canCreateChild === canCreateChild
+      && previousStaticInputs.writable === writable
+      && previousStaticInputs.selectedNodeIdSet === controlledSelectedNodeIdSet
+    const runtimeInputsChanged = previousRuntimeInputs.runningSessionIds !== runningSessionIds
+      || previousRuntimeInputs.nodeActivityStates !== nodeActivityStates
+      || previousRuntimeInputs.mediaProgressByNodeId !== mediaProgressByNodeId
+
+    if (staticInputsUnchanged && !runtimeInputsChanged) {
+      /** 仅 viewport 或父级无关状态变化时，节点投影无需重新计算。 */
+      return
+    }
+
+    if (staticInputsUnchanged && runtimeInputsChanged) {
+      /** 运行态事件只触碰实际变更的节点，保留其余节点和 XYFlow 局部字段。 */
+      const changedNodeIds = new Set<string>()
+      const collectMapKeys = (
+        before: ReadonlyMap<string, unknown> | undefined,
+        after: ReadonlyMap<string, unknown> | undefined,
+      ): void => {
+        for (const nodeId of before?.keys() ?? []) changedNodeIds.add(nodeId)
+        for (const nodeId of after?.keys() ?? []) changedNodeIds.add(nodeId)
+      }
+      if (previousRuntimeInputs.nodeActivityStates !== nodeActivityStates) {
+        collectMapKeys(previousRuntimeInputs.nodeActivityStates, nodeActivityStates)
+      }
+      if (previousRuntimeInputs.mediaProgressByNodeId !== mediaProgressByNodeId) {
+        collectMapKeys(previousRuntimeInputs.mediaProgressByNodeId, mediaProgressByNodeId)
+      }
+      if (previousRuntimeInputs.runningSessionIds !== runningSessionIds) {
+        /** Agent 运行集合变化通常只发生在开始/结束时，此处按会话身份筛选 Agent。 */
+        const changedSessions = new Set([...previousRuntimeInputs.runningSessionIds, ...runningSessionIds])
+        for (const node of document.nodes) {
+          if (node.kind === 'agent' && changedSessions.has(node.agentSessionId)) changedNodeIds.add(node.id)
+        }
+      }
+      const nextFlowNodes = flowNodesRef.current.slice()
+      const nextProjection = projectedFlowNodesRef.current.slice()
+      let nodesChanged = false
+      for (const nodeId of changedNodeIds) {
+        const index = flowNodeIndexByIdRef.current.get(nodeId)
+        const canvasNode = canvasNodeByIdRef.current.get(nodeId)
+        if (index === undefined || !canvasNode) continue
+        const currentNode = nextFlowNodes[index]
+        const previousNode = nextProjection[index]
+        if (!currentNode || !previousNode) continue
+        const patchedCurrentNode = patchNativeCanvasFlowNodeRuntimeState(currentNode, canvasNode, {
+          nodeIssues,
+          runningSessionIds,
+          nodeActivityStates,
+          mediaProgressByNodeId,
+          imageCandidateNodeIds,
+        })
+        const patchedProjectionNode = patchNativeCanvasFlowNodeRuntimeState(previousNode, canvasNode, {
+          nodeIssues,
+          runningSessionIds,
+          nodeActivityStates,
+          mediaProgressByNodeId,
+          imageCandidateNodeIds,
+        })
+        nodesChanged = nodesChanged || patchedCurrentNode !== currentNode || patchedProjectionNode !== previousNode
+        nextFlowNodes[index] = patchedCurrentNode
+        nextProjection[index] = patchedProjectionNode
+      }
+      projectedFlowNodesRef.current = nextProjection
+      if (!nodesChanged) {
+        runtimeProjectionInputsRef.current = { runningSessionIds, nodeActivityStates, mediaProgressByNodeId }
+        return
+      }
+      flowNodesRef.current = nextFlowNodes
+      setFlowNodes(nextFlowNodes)
+      projectionStaticInputsRef.current = {
+        canvasId: document.canvasId,
+        nodes: document.nodes,
+        edges: document.edges,
+        nodeIssues,
+        imageCandidateNodeIds,
+        imagePreviews,
+        pendingWebviewDeviceNodeIds,
+        canCreateChild,
+        writable,
+        selectedNodeIdSet: controlledSelectedNodeIdSet,
+      }
+      runtimeProjectionInputsRef.current = { runningSessionIds, nodeActivityStates, mediaProgressByNodeId }
+      return
+    }
+
+    /** 结构、配置或选区变化时同步稳定展示字段与选中态。 */
     const nextNodes = toNativeCanvasFlowNodes(document, {
       nodeIssues,
       runningSessionIds,
@@ -760,8 +881,23 @@ export function NativeCanvasGraph({
       : nextNodes
     projectedCanvasIdRef.current = document.canvasId
     projectedFlowNodesRef.current = nextNodes
+    flowNodeIndexByIdRef.current = new Map(reconciledNodes.map((node, index) => [node.id, index] as const))
+    canvasNodeByIdRef.current = new Map(document.nodes.map((node) => [node.id, node] as const))
     flowNodesRef.current = reconciledNodes
     setFlowNodes(reconciledNodes)
+    projectionStaticInputsRef.current = {
+      canvasId: document.canvasId,
+      nodes: document.nodes,
+      edges: document.edges,
+      nodeIssues,
+      imageCandidateNodeIds,
+      imagePreviews,
+      pendingWebviewDeviceNodeIds,
+      canCreateChild,
+      writable,
+      selectedNodeIdSet: controlledSelectedNodeIdSet,
+    }
+    runtimeProjectionInputsRef.current = { runningSessionIds, nodeActivityStates, mediaProgressByNodeId }
   }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateNodeIds, imagePreviews, mediaProgressByNodeId, nodeActivityStates, nodeIssues, pendingWebviewDeviceNodeIds, referenceNode, runningSessionIds, webviewDevicePresetChange, webviewPreviewLoader, workbenchNodeChange, writable, projectionCallbackBridge])
 
   React.useEffect(() => {
