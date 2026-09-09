@@ -322,6 +322,10 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
 
   /** 当前注册器已见过的窗口 owner。 */
   const owners = new Map<string, ServerOpsOwnerWindow>()
+  /** 当前文件页代次按窗口和主机隔离；对象身份用于失效等待中的旧请求。 */
+  const fileOwners = new Map<string, { windowId: number }>()
+  /** 同一窗口/主机复用稳定 runtime key，但重新打开必须等待旧资源清理 ACK。 */
+  const closingFileOwners = new Map<string, Promise<void>>()
   /** 日志公开 stream 到窗口 owner 的定向路由。 */
   const ownersByStream = new Map<string, string>()
   /** 成功安装的 handler；注册失败时只回滚本次实际拥有的通道。 */
@@ -364,7 +368,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
         try { options.logs?.disposeOwner(ownerKey) } catch { /* 窗口终态清理不能反向击穿 Electron。 */ }
         try { options.trustManagement?.disposeOwner(window.id) } catch { /* 独立清理未提交的信任候选。 */ }
         try { options.docker?.disposeOwner(window.id) } catch { /* 独立清理未提交的容器候选。 */ }
-        try { options.files?.closeOwner(window.id, `${ownerKey}:files`) } catch { /* 文件 owner 与日志、传输独立。 */ }
+        void closeWindowFileOwners(window.id).catch(() => undefined)
         try { options.console?.disposeOwner(window.id) } catch { /* 容器终端不能遗留后台 channel。 */ }
         void closeTransferOwner(window.id, ownerKey).catch(() => undefined)
         owners.delete(ownerKey)
@@ -377,6 +381,48 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
       owners.set(ownerKey, window)
     }
     return { ownerKey, window }
+  }
+
+  /** 在可信窗口和指定主机的当前页面代次执行操作，返回领域结果；旧清理未完成时等待。 */
+  async function withFileOwner<T>(event: IpcMainInvokeEvent, hostId: string, action: (windowId: number, fileOwnerKey: string) => T | Promise<T>): Promise<T> {
+    /** 仅由主进程推导 runtime owner，Renderer 不能指定窗口或权限身份。 */
+    const { ownerKey, window } = requireOwner(event)
+    const fileOwnerKey = `${ownerKey}:files:${hostId}`
+    const scope = fileOwners.get(fileOwnerKey) ?? { windowId: window.id }
+    fileOwners.set(fileOwnerKey, scope)
+    const closing = closingFileOwners.get(fileOwnerKey)
+    if (closing) await closing
+    if (fileOwners.get(fileOwnerKey) !== scope || window.isDestroyed()) throw new Error('SERVER_OPS_FILE_OWNER_CLOSED')
+    assertAuthorizedSender(event, options)
+    return await action(window.id, fileOwnerKey)
+  }
+
+  /** 同步撤销指定页面代次并返回真实清理屏障；重复关闭共享同一 Promise。 */
+  function closeFileOwner(windowId: number, fileOwnerKey: string): Promise<void> {
+    /** 先摘除作用域，使等待旧 ACK 的请求不能在页面关闭后继续打开目录。 */
+    const scope = fileOwners.get(fileOwnerKey)
+    fileOwners.delete(fileOwnerKey)
+    const existing = closingFileOwners.get(fileOwnerKey)
+    if (existing) return existing
+    if (!scope) return Promise.resolve()
+    /** closeOwner 先同步取消候选和在途请求，再等待 utility 释放远端资源。 */
+    let closing: Promise<void>
+    try { closing = Promise.resolve(options.files?.closeOwner(windowId, fileOwnerKey)) }
+    catch (error) { closing = Promise.reject(error) }
+    closingFileOwners.set(fileOwnerKey, closing)
+    void closing.finally(() => {
+      if (closingFileOwners.get(fileOwnerKey) === closing) closingFileOwners.delete(fileOwnerKey)
+    }).catch(() => undefined)
+    return closing
+  }
+
+  /** 关闭窗口拥有的全部主机文件页；各项清理独立发起，返回整体完成状态。 */
+  async function closeWindowFileOwners(windowId: number): Promise<void> {
+    /** 快照防止同步摘除 owner 影响迭代，失败也不跳过其它主机。 */
+    const results = await Promise.allSettled([...fileOwners].filter(([, scope]) => scope.windowId === windowId)
+      .map(([key]) => closeFileOwner(windowId, key)))
+    const failure = results.find((result) => result.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
   }
 
   installHandler(SERVER_OPS_IPC_CHANNELS.LIST_HOSTS, (event) => {
@@ -447,43 +493,38 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   installHandler(SERVER_OPS_FILE_CHANNELS.LIST, async (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsFileListInput(input)
-    const { ownerKey } = requireOwner(event)
     if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
-    return parseServerOpsFileListResult(await options.files.list(`${ownerKey}:files`, parsed))
+    return await withFileOwner(event, parsed.hostId, async (_windowId, ownerKey) => parseServerOpsFileListResult(await options.files!.list(ownerKey, parsed)))
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.PREVIEW, async (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsFilePreviewInput(input)
-    const { ownerKey } = requireOwner(event)
     if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
-    return parseServerOpsFilePreviewResult(await options.files.preview(`${ownerKey}:files`, parsed))
+    return await withFileOwner(event, parsed.hostId, async (_windowId, ownerKey) => parseServerOpsFilePreviewResult(await options.files!.preview(ownerKey, parsed)))
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.PREPARE, async (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsFileMutationInput(input)
-    const { ownerKey, window } = requireOwner(event)
     if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
-    return parseServerOpsFileCandidate(await options.files.prepare(window.id, `${ownerKey}:files`, parsed))
+    return await withFileOwner(event, parsed.hostId, async (windowId, ownerKey) => parseServerOpsFileCandidate(await options.files!.prepare(windowId, ownerKey, parsed)))
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.COMMIT, async (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsFileCommitInput(input)
-    const { ownerKey, window } = requireOwner(event)
     if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
-    return parseServerOpsFileMutationResult(await options.files.commit(window.id, `${ownerKey}:files`, parsed))
+    return await withFileOwner(event, parsed.hostId, async (windowId, ownerKey) => parseServerOpsFileMutationResult(await options.files!.commit(windowId, ownerKey, parsed)))
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.CANCEL, (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsFileCancelInput(input)
-    const { ownerKey, window } = requireOwner(event)
     if (!options.files) throw new Error('SERVER_OPS_FILES_UNAVAILABLE')
-    options.files.cancel(window.id, `${ownerKey}:files`, parsed)
+    return withFileOwner(event, parsed.hostId, (windowId, ownerKey) => options.files!.cancel(windowId, ownerKey, parsed))
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.CLOSE_OWNER, (event, input) => {
     assertAuthorizedSender(event, options)
-    parseServerOpsFileOwnerInput(input)
+    const parsed = parseServerOpsFileOwnerInput(input)
     const { ownerKey, window } = requireOwner(event)
-    options.files?.closeOwner(window.id, `${ownerKey}:files`)
+    return closeFileOwner(window.id, `${ownerKey}:files:${parsed.hostId}`)
   })
   installHandler(SERVER_OPS_CONSOLE_IPC_CHANNELS.START, async (event, input) => {
     assertAuthorizedSender(event, options)
@@ -864,7 +905,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
       try { removeClosedListener(window, listener) } catch { /* 继续回滚其它 listener。 */ }
       try { options.trustManagement?.disposeOwner(window.id) } catch { /* 候选清理不阻断回滚。 */ }
       try { options.docker?.disposeOwner(window.id) } catch { /* 容器候选清理不阻断回滚。 */ }
-      try { options.files?.closeOwner(window.id, `window:${window.id}:files`) } catch { /* 继续回滚其它 owner。 */ }
+      void closeWindowFileOwners(window.id).catch(() => undefined)
       try { options.console?.disposeOwner(window.id) } catch { /* 继续回滚其它 owner。 */ }
       void closeTransferOwner(window.id, `window:${window.id}`).catch(() => undefined)
     }
@@ -899,7 +940,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
         try { removeClosedListener(window, listener) } catch (error) { firstError ??= error }
         try { options.trustManagement?.disposeOwner(window.id) } catch (error) { firstError ??= error }
         try { options.docker?.disposeOwner(window.id) } catch (error) { firstError ??= error }
-        try { options.files?.closeOwner(window.id, `window:${window.id}:files`) } catch (error) { firstError ??= error }
+        void closeWindowFileOwners(window.id).catch(() => undefined)
         try { options.console?.disposeOwner(window.id) } catch (error) { firstError ??= error }
         void closeTransferOwner(window.id, `window:${window.id}`).catch(() => undefined)
       }

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { app } from 'electron'
+import { app, BrowserWindow, ipcMain } from 'electron'
 import type { ServerOpsHost } from '@proma/shared'
 import { ServerOpsAuditStore } from '../src/main/lib/server-ops/server-ops-audit-store'
 import { ServerOpsConnectionService } from '../src/main/lib/server-ops/server-ops-connection-service'
@@ -12,6 +12,8 @@ import { ServerOpsFileService } from '../src/main/lib/server-ops/server-ops-file
 import { ServerOpsHostTrustStore } from '../src/main/lib/server-ops/server-ops-host-trust-store'
 import type { ServerOpsConfigTransaction } from '../src/main/lib/server-ops/server-ops-config-transaction'
 import { ServerOpsRuntimeClient } from '../src/main/lib/server-ops/server-ops-runtime-client'
+import { ServerOpsAgentAccessStore } from '../src/main/lib/server-ops/server-ops-agent-access-store'
+import { registerServerOpsIpcHandlers } from '../src/main/lib/server-ops/server-ops-ipc'
 import {
   startServerOpsSftpServerFixture,
   type ServerOpsSftpServerFixture,
@@ -28,15 +30,6 @@ let fixture: ServerOpsSftpServerFixture | undefined
 let runtime: ServerOpsRuntimeClient | undefined
 let connections: ServerOpsConnectionService | undefined
 let files: ServerOpsFileService | undefined
-
-/** 等待 utility 处理无响应的 close-owner 消息，超时视为资源泄漏。 */
-async function waitForOwnerRelease(): Promise<void> {
-  const deadline = Date.now() + 2_000
-  while (fixture && fixture.openHandleCount() !== 0 && Date.now() < deadline) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 20))
-  }
-  assert.equal(fixture?.openHandleCount(), 0)
-}
 
 /** 通过真实 Electron utility IPC 和 localhost ssh2 执行完整文件操作链。 */
 async function runSmoke(): Promise<void> {
@@ -99,6 +92,50 @@ async function runSmoke(): Promise<void> {
   })
   assert.equal(connected.phase, 'connected')
 
+  /** 在真实 Renderer/preload/IPC 中重现文件页 cleanup 后立即重新挂载的调用顺序。 */
+  const window = new BrowserWindow({ show: false, webPreferences: { preload: join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: true } })
+  const registration = registerServerOpsIpcHandlers({
+    ipc: ipcMain,
+    listAuthorizedWebContents: () => [window.webContents],
+    resolveOwnerWindow: (sender) => BrowserWindow.fromWebContents(sender),
+    hosts: {
+      ...hostStore,
+      list: () => [host],
+      upsert: () => { throw new Error('fixture 不编辑主机') },
+      remove: () => { throw new Error('fixture 不删除主机') },
+    },
+    credentials,
+    connections,
+    access: new ServerOpsAgentAccessStore(),
+    audit,
+    files,
+    requireUserVisibleSession: () => { throw new Error('fixture 不访问 Agent 会话') },
+  })
+  try {
+    await window.loadURL('data:text/html,<html><head><title>SFTP lifecycle smoke</title></head><body></body></html>')
+    /** 页面只访问 localhost 内存夹具，循环三次验证清理 ACK 与再次打开不会相互取消。 */
+    const lifecycle = await window.webContents.executeJavaScript(`(async () => {
+      const api = window.electronAPI;
+      const input = { hostId: 'files-fixture', path: '/root' };
+      const pages = [];
+      await api.listServerOpsFiles(input);
+      for (let index = 0; index < 3; index += 1) {
+        const closing = api.closeServerOpsFilesOwner({ hostId: input.hostId });
+        const reloading = api.listServerOpsFiles(input);
+        const [, page] = await Promise.all([closing, reloading]);
+        pages.push(page.entries.length);
+      }
+      await api.closeServerOpsFilesOwner({ hostId: input.hostId });
+      return pages;
+    })()`)
+    assert.deepEqual(lifecycle, [200, 200, 200])
+    assert.equal(fixture.openHandleCount(), 0)
+    console.log('[Server Ops files smoke] PASS: 真实 Renderer/preload/IPC 连续三次关闭并立即重读成功，清理 ACK 后远端 handle 为零')
+  } finally {
+    registration.dispose()
+    window.destroy()
+  }
+
   const listing = await files.list(ownerKey, { hostId: host.id, path: '/root' })
   assert.equal(listing.entries.length, 200)
   assert(listing.cursor)
@@ -156,13 +193,15 @@ async function runSmoke(): Promise<void> {
   assert.equal(fixture.hasPath('/root/smoke.txt'), false)
   assert.equal(fixture.hasPath('/root/smoke-dir'), false)
 
-  files.closeOwner(7, ownerKey)
-  await waitForOwnerRelease()
+  await files.closeOwner(7, ownerKey)
+  assert.equal(fixture.openHandleCount(), 0)
   console.log('[Server Ops files smoke] PASS: 真实 utility IPC 完成列表、UTF-8 预览、mkdir、save-as、删除与 owner 释放')
 }
 
 mkdirSync(join(configDir, 'electron-user-data'))
 app.setPath('userData', join(configDir, 'electron-user-data'))
+/** IPC 验证窗口关闭后继续执行文件服务验证，由统一 finish 负责结束隔离进程。 */
+app.on('window-all-closed', () => undefined)
 /** 有界 smoke 超时强制收口，避免失败时遗留 Electron 或 SSH 进程。 */
 const timeout = setTimeout(() => {
   console.error('[Server Ops files smoke] timeout')

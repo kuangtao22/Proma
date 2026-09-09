@@ -5,6 +5,8 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { registerServerOpsIpcHandlers } from './server-ops-ipc'
 import type { ServerOpsIpcOptions } from './server-ops-ipc'
 import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
+import { ServerOpsFileService } from './server-ops-file-service'
+import { ServerOpsSftpRuntimeError } from '../../../utility/server-ops/server-ops-sftp-runtime'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -186,16 +188,75 @@ describe('服务器运维 IPC', () => {
       prepare: async () => { throw new Error('unused') },
       commit: async () => { throw new Error('unused') },
       cancel: () => undefined,
-      closeOwner: (ownerId, ownerKey) => { calls.push({ closed: ownerId, ownerKey }) },
+      closeOwner: async (ownerId, ownerKey) => { calls.push({ closed: ownerId, ownerKey }) },
     } })
     await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, createSender(99), { hostId: 'host-1', path: '/' })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
     await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, fixture.sender, { hostId: 'host-1', path: '/', ownerKey: 'other' })).rejects.toThrow()
     expect(calls).toEqual([])
     await expect(invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, fixture.sender, { hostId: 'host-1', path: '/' })).resolves.toMatchObject({ entries: [] })
-    expect(calls).toContainEqual({ ownerKey: 'window:70:files', input: { hostId: 'host-1', path: '/' } })
+    expect(calls).toContainEqual({ ownerKey: 'window:70:files:host-1', input: { hostId: 'host-1', path: '/' } })
     fixture.closeOwner()
-    expect(calls).toContainEqual({ closed: 70, ownerKey: 'window:70:files' })
+    expect(calls).toContainEqual({ closed: 70, ownerKey: 'window:70:files:host-1' })
     fixture.registration.dispose()
+  })
+
+  test('Given 文件页清理尚未确认 When 立即重新挂载 Then 新读取等待清理且不会复用关闭中的 owner', async () => {
+    /** 真实文件服务配合可控清理屏障，复现 StrictMode 的挂载/清理/重挂载。 */
+    const fixture = createFileLifecycleHarness()
+    try {
+      await fixture.list('host-1')
+      /** 关闭与重挂载均在清理完成前保持等待，不能提前宣告成功或失败。 */
+      let closed = false
+      let loaded = false
+      const closing = fixture.close('host-1').then(() => { closed = true })
+      const reloading = fixture.list('host-1').then(() => { loaded = true })
+      // 提前订阅拒绝，旧实现的预期失败不得变成未处理 rejection。
+      void reloading.catch(() => undefined)
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      expect(closed).toBe(false)
+      expect(loaded).toBe(false)
+      expect(fixture.readOwners).toHaveLength(1)
+      fixture.finishCleanup()
+      await closing
+      await reloading
+      expect(loaded).toBe(true)
+      expect(fixture.readOwners).toHaveLength(2)
+    } finally { fixture.dispose() }
+  })
+
+  test('Given 同窗口切换主机 When 旧主机文件页迟到关闭 Then 新主机仍可读取且退出释放全部活动 owner', async () => {
+    /** 不同主机的浏览资源必须独立，旧主机关闭不应阻断当前主机。 */
+    const fixture = createFileLifecycleHarness()
+    try {
+      await fixture.list('host-1')
+      await fixture.list('host-2')
+      expect(fixture.readOwners[0]).not.toBe(fixture.readOwners[1])
+      const closing = fixture.close('host-1')
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      await expect(fixture.list('host-2')).resolves.toMatchObject({ hostId: 'host-2' })
+      fixture.finishCleanup()
+      await closing
+      fixture.registration.dispose()
+      expect(fixture.closedOwners).toEqual([fixture.readOwners[0]!, fixture.readOwners[1]!])
+    } finally { fixture.dispose() }
+  })
+
+  test('Given 重挂载读取正在等待旧清理 When 页面再次关闭 Then 迟到等待者不得重新打开远端目录', async () => {
+    /** 等待清理的读取也属于原页面代次，页面关闭后必须失效。 */
+    const fixture = createFileLifecycleHarness()
+    try {
+      await fixture.list('host-1')
+      const closing = fixture.close('host-1')
+      const reloading = fixture.list('host-1')
+      void reloading.catch(() => undefined)
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      const closingAgain = fixture.close('host-1')
+      await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      fixture.finishCleanup()
+      await Promise.all([closing, closingAgain])
+      await expect(reloading).rejects.toThrow('SERVER_OPS_FILE_OWNER_CLOSED')
+      expect(fixture.readOwners).toHaveLength(1)
+    } finally { fixture.dispose() }
   })
 
   test('Given 独立容器终端 When 输入带额外命令字段或窗口关闭 Then 严格拒绝并释放该窗口终端', async () => {
@@ -966,6 +1027,44 @@ describe('服务器运维 IPC', () => {
     expect(fixture.dialogCalls[1]?.defaultPath).not.toContain('..')
   })
 })
+
+/** 创建真实 IPC + 文件服务夹具；仅替代 SSH 传输，返回可手动完成的 owner 清理屏障。 */
+function createFileLifecycleHarness() {
+  /** 记录成功发往 SSH 的读取和关闭，用于验证跨主机及跨代次隔离。 */
+  const readOwners: string[] = []
+  const closedOwners: string[] = []
+  const closingOwners = new Set<string>()
+  /** 控制第一次远端清理 ACK；后续关闭共享已完成屏障。 */
+  let finishCleanup!: () => void
+  const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve })
+  const files = new ServerOpsFileService({
+    hosts: { get: (hostId) => ({ id: hostId, name: '测试服务器' }) },
+    connections: {
+      getActiveIdentity: (hostId) => ({ hostId, connectionId: `connection-${hostId}`, generation: 1 }),
+      sftp: async (input) => {
+        if (closingOwners.has(input.input.ownerKey)) throw new ServerOpsSftpRuntimeError('SERVER_OPS_SFTP_OWNER_CLOSED')
+        if (input.type !== 'list') throw new Error('unexpected SFTP operation')
+        readOwners.push(input.input.ownerKey)
+        return { type: 'list', requestId: 'request-1', result: { path: input.input.path, entries: [] } }
+      },
+      closeSftpOwner: async (ownerKey) => {
+        closedOwners.push(ownerKey)
+        closingOwners.add(ownerKey)
+        await cleanup
+        closingOwners.delete(ownerKey)
+      },
+    },
+    audit: { append: () => undefined },
+  })
+  /** 所有调用均穿过真实解析、窗口授权及文件服务边界。 */
+  const fixture = createAgentAccessHarness({ files })
+  return {
+    registration: fixture.registration, readOwners, closedOwners, finishCleanup,
+    list: (hostId: string) => invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.LIST, fixture.sender, { hostId, path: '/' }),
+    close: (hostId: string) => invoke(fixture.handlers, SERVER_OPS_FILE_CHANNELS.CLOSE_OWNER, fixture.sender, { hostId }),
+    dispose: () => { finishCleanup(); fixture.registration.dispose(); files.dispose() },
+  }
+}
 
 /** 创建覆盖观测、日志 owner 与导出边界的集中夹具。 */
 function createObservabilityHarness(options: { hostName?: string; startResult?: unknown; stopError?: Error; authorizeSecondWindow?: boolean } = {}) {

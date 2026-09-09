@@ -153,7 +153,7 @@ export class ServerOpsFileService {
         confirmationName: candidate.hostName,
       }, assertAuthorized)
     } finally {
-      this.closeOwner(ownerId, ownerKey)
+      void this.closeOwner(ownerId, ownerKey).catch(() => undefined)
     }
   }
 
@@ -215,12 +215,12 @@ export class ServerOpsFileService {
     this.removeCandidate(candidate.view.candidateId)
   }
 
-  /** 窗口或页面生命周期结束时清理候选与远程 owner 资源。 */
-  closeOwner(ownerId: number | string, ownerKey: string): void {
+  /** 撤销指定窗口/页面 owner 的候选和在途请求，返回远端资源清理完成的 Promise。 */
+  closeOwner(ownerId: number | string, ownerKey: string): Promise<void> {
     const stableOwnerKey = requireOwnerKey(ownerKey)
     this.ownerVersions.set(stableOwnerKey, (this.ownerVersions.get(stableOwnerKey) ?? 0) + 1)
     for (const candidate of [...this.candidates.values()]) if (candidate.ownerId === ownerId && candidate.ownerKey === stableOwnerKey) this.removeCandidate(candidate.view.candidateId)
-    void Promise.resolve(this.dependencies.connections.closeSftpOwner(stableOwnerKey)).catch(() => undefined)
+    return Promise.resolve(this.dependencies.connections.closeSftpOwner(stableOwnerKey))
   }
 
   /** Agent 只读调用结束后仅释放该次 SFTP owner，不需要伪造窗口 ID。 */
