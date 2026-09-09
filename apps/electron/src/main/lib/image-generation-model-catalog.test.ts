@@ -373,6 +373,21 @@ describe('ImageGenerationModelCatalog', () => {
     expect(workflowSnapshot).not.toHaveProperty('profileId')
   })
 
+  test('Given 已保存 GPT profile When 供应商改名后读取选项 Then 展示最新名称且不写入任务快照', () => {
+    channels = [createGPTImageChannel({ name: 'GPT-传贝' })]
+    decryptedKeys = { 'channel-gpt': 'secret-key' }
+    /** 同一目录实例须在每次读取时解析当前供应商名称。 */
+    const catalog = createCatalog()
+    catalog.replaceProfiles([createOpenAIProfile()])
+
+    expect(catalog.listOptions()[0]).toMatchObject({ channelName: 'GPT-传贝', name: 'GPT Image 2' })
+    channels = [createGPTImageChannel({ name: '新的供应商名称' })]
+    expect(catalog.listOptions()[0]).toMatchObject({ channelName: '新的供应商名称' })
+    expect(catalog.resolveAvailableSnapshot('profile-gpt')).not.toHaveProperty('channelName')
+    expect(readFileSync(configPath, 'utf8')).not.toContain('channelName')
+    expect(JSON.stringify(catalog.listOptions())).not.toContain('secret-key')
+  })
+
   test('Given 已保存 GPT profile 的渠道被删除 When 列出选项 Then 保留 profile 并说明不可用', () => {
     channels = [createGPTImageChannel()]
     decryptedKeys = { 'channel-gpt': 'secret-key' }
@@ -499,6 +514,20 @@ describe('ImageGenerationModelCatalog', () => {
 
     expect(() => createCatalog().assertSnapshotAvailable(snapshot)).not.toThrow()
     expect(snapshot.name).toBe('旧名称')
+  })
+
+  test('Given 模型切换渠道 When 旧任务重试与新建任务 Then 拒绝旧快照并允许当前渠道新快照', () => {
+    /** 模型名称与 ID 不变，仅渠道从旧服务切换到新服务。 */
+    channels = [createGPTImageChannel(), createGPTImageChannel({ id: 'channel-new' })]
+    decryptedKeys = { 'channel-gpt': 'test-key', 'channel-new': 'new-test-key' }
+    const catalog = createCatalog()
+    catalog.replaceProfiles([createOpenAIProfile()])
+    const original = catalog.resolveAvailableSnapshot('profile-gpt')
+    catalog.replaceProfiles([createOpenAIProfile({ channelId: 'channel-new' })])
+
+    expect(() => catalog.assertSnapshotAvailable(original)).toThrow('请按当前配置重新生成')
+    expect(catalog.resolveAvailableSnapshot('profile-gpt')).toMatchObject({ channelId: 'channel-new' })
+    expect(original).toMatchObject({ channelId: 'channel-gpt' })
   })
 
   test('Given 已固化快照 When 当前 profile 或凭据变化 Then 按稳定执行字段拒绝失效快照', () => {

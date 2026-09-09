@@ -162,6 +162,9 @@ export class ImageGenerationModelCatalog {
     const localOptions = loaded.profiles.map((profile) => toOption(
       profile,
       this.getAvailability(profile, state),
+      profile.executor === 'openai-images'
+        ? state.channels.find((channel) => channel.id === profile.channelId)?.name
+        : undefined,
     ))
     return projectId && this.dependencies.media
       ? [...localOptions, ...this.dependencies.media.listOptions(projectId).map((option) => ({ ...option }))]
@@ -295,7 +298,7 @@ export class ImageGenerationModelCatalog {
       return { executor: 'nano-banana', snapshot }
     }
     if (profile.executor !== 'openai-images' || snapshot.executor !== 'openai-images') {
-      throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}`)
+      throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}；模型或渠道已变更，请按当前配置重新生成`)
     }
     /** 可用性校验已经保证渠道存在。 */
     const channel = state.channels.find((candidate) => candidate.id === profile.channelId)
@@ -746,10 +749,11 @@ function hasNanoBananaApiKey(credentials: Record<string, string>): boolean {
   return (credentials.apiKey?.trim().length ?? 0) > 0
 }
 
-/** 把 profile 和可用性转换为不含敏感字段的选择项。 */
+/** 把 profile、可用性与当前供应商名称转换为不含敏感字段的选择项。 */
 function toOption(
   profile: ImageGenerationModelProfile,
   availability: AvailabilityResult,
+  channelName?: string,
 ): ImageGenerationModelOption {
   /** 两类选项共享的展示字段。 */
   const base = {
@@ -762,7 +766,7 @@ function toOption(
       : { unavailableReason: availability.unavailableReason }),
   }
   return profile.executor === 'openai-images'
-    ? { ...base, executor: 'openai-images', channelId: profile.channelId }
+    ? { ...base, executor: 'openai-images', channelId: profile.channelId, ...(channelName ? { channelName } : {}) }
     : { ...base, executor: 'nano-banana' }
 }
 
@@ -789,7 +793,7 @@ function assertProfileMatchesSnapshot(
     && (profile.executor !== 'openai-images'
       || (snapshot.executor === 'openai-images' && profile.channelId === snapshot.channelId))
   if (!matches) {
-    throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}`)
+    throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}；模型或渠道已变更，请按当前配置重新生成`)
   }
 }
 

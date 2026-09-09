@@ -19,7 +19,7 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.12"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.19"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -90,6 +90,24 @@ test('Given 用户只要求核对全部图片 When 读取 canvas-production Then
   expect(skill).toContain('不得使用画布截图')
   expect(skill).toContain('不更新提示词')
   expect(skill).toContain('不调用 `canvas_run_nodes`')
+})
+
+test('Given 用户授权审核并修复 When 读取 Skill Then 定义有界修复循环且读取故障不能导致重建', () => {
+  const skill = readCanvasProductionSkill()
+  for (const rule of ['审核并修复', '本任务授权', '最多两轮', '读取失败不等于内容错误',
+    'readError', 'missingNodeIds', 'omittedEdgeCount', '先验证新节点', '全部入边和出边',
+    '原工作流预算', '未复核', '不能通过新建运行重置预算']) {
+    expect(skill).toContain(rule)
+  }
+  expect(skill).not.toContain('该工具仍需要单次审批')
+})
+
+test('Given 图片异步生成或重试已提交 When 读取 Skill Then 继续等待终态并按已有授权复核', () => {
+  const skill = readCanvasProductionSkill()
+  for (const rule of ['replacementJobId', 'waitMs=30000', '已提交不等于完成',
+    '超时仍为 running', '原任务', 'No available compatible accounts', '实际错误', '已有采用授权']) {
+    expect(skill).toContain(rule)
+  }
 })
 
 test('Given Canvas Skill 负责语义编排 When 校验执行边界 Then 权限、破坏性操作和付费运行仍由工具层控制', () => {
