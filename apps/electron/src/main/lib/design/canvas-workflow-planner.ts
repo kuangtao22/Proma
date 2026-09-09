@@ -28,6 +28,8 @@ export interface CanvasWorkflowImageAdoptionQuery {
   nodeId: string
   batchId: string
   taskId: string
+  /** Host 区分明确继续与自动对账，不由 Renderer 或模型声明。 */
+  acceptInitialAdoption?: boolean
 }
 
 /** 已采用候选返回正式产物身份与提交时间。 */

@@ -49,7 +49,7 @@ describe('Canvas 节点下方详情', () => {
     ['agent', undefined, { width: 760, height: 640 }],
     ['image', undefined, { width: 960, height: 700 }],
     ['audio', undefined, { width: 720, height: 560 }],
-    ['video', undefined, { width: 960, height: 700 }],
+    ['video', undefined, { width: 840, height: 560 }],
     ['document', undefined, { width: 900, height: 700 }],
     ['webview', 'desktop', { width: 960, height: 720 }],
     ['webview', 'mobile', { width: 520, height: 720 }],
@@ -57,6 +57,38 @@ describe('Canvas 节点下方详情', () => {
     const node = createNode(kind)
     if (node.kind === 'webview' && preset) node.devicePreset = preset
     expect(resolveCanvasWorkbenchDefaultSize(node)).toEqual(expected)
+  })
+
+  test.each(['agent', 'image', 'audio', 'video', 'document', 'webview'] as const)(
+    'Given %s 节点在低倍缩放首次展开 When 计算详情大小 Then 默认世界尺寸不反向膨胀', (kind) => {
+      /** 低倍视口可容纳默认世界尺寸，不应反向放大详情外壳。 */
+      const expected = resolveCanvasWorkbenchDefaultSize(createNode(kind))
+      for (const zoom of [0.05, 0.15, 0.5, 1]) {
+        const html = renderToStaticMarkup(<CanvasNodeWorkbenchOverlay
+          node={createNode(kind)} dirty={false}
+          nodeBounds={{ id: `node-${kind}`, x: 40, y: 60, width: 288, height: 180 }}
+          viewport={{ x: 0, y: 0, zoom }} surfaceSize={{ width: 1_200, height: 800 }}
+          onDirtyChange={() => undefined} onClose={() => undefined}
+        />)
+        expect(html).toContain(`width:${expected.width}px;height:${expected.height}px`)
+      }
+    },
+  )
+
+  test('Given 两倍缩放的视口 When 首次打开视频详情 Then 仅缩小超过视口的默认尺寸', () => {
+    const html = renderToStaticMarkup(<CanvasNodeWorkbenchOverlay
+      node={createNode('video')} dirty={false}
+      nodeBounds={{ id: 'node-video', x: 40, y: 60, width: 288, height: 180 }}
+      viewport={{ x: 0, y: 0, zoom: 2 }} surfaceSize={{ width: 1_200, height: 800 }}
+      onDirtyChange={() => undefined} onClose={() => undefined}
+    />)
+    expect(html).toContain('width:588px;height:388px')
+  })
+
+  test('Given 旧缓存详情尺寸过大 When 展开 Then 提供可访问的恢复默认大小入口', () => {
+    const html = renderWorkbench('video')
+    expect(html).toContain('aria-label="恢复工作台默认大小"')
+    expect(html).toContain('title="恢复默认大小"')
   })
 
   test('Given 卡片移动或画布缩放 When 重渲染详情 Then 仅跟随卡片世界位置而不夹回视口', () => {
@@ -84,6 +116,16 @@ describe('Canvas 节点下方详情', () => {
       onDirtyChange={() => undefined} onClose={() => undefined}
     />)
     expect(html).toContain('width:900px;height:700px')
+  })
+
+  test('Given 视频详情保存了旧默认或用户尺寸 When 再次打开 Then 新默认不覆盖已保存尺寸', () => {
+    const html = renderToStaticMarkup(<CanvasNodeWorkbenchOverlay
+      node={createNode('video')} dirty={false}
+      nodeBounds={{ id: 'node-video', x: 40, y: 60, width: 288, height: 180 }}
+      surfaceSize={{ width: 1_200, height: 800 }} size={{ width: 960, height: 700 }}
+      onDirtyChange={() => undefined} onClose={() => undefined}
+    />)
+    expect(html).toContain('width:960px;height:700px')
   })
 
   test('Given 画布缩放为两倍 When 拖动尺寸手柄 Then 屏幕位移换算为画布尺寸', () => {

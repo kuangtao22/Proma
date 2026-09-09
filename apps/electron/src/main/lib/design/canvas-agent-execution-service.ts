@@ -184,6 +184,12 @@ function buildRunExtensions(
     allowedToolNamesMode: 'replace',
     ...(canvasRun ? {
       singleApprovalToolNames: canvasRun.singleApprovalToolNames.filter((name) => canvasToolNameSet.has(name)),
+      /** 只对当前 Agent 仍可调用的工具透传动态生成授权，父编排白名单不扩张。 */
+      ...(canvasRun.toolApprovalPolicy ? { toolApprovalPolicy: {
+        getMode: (toolName: string) => canvasToolNameSet.has(toolName)
+          ? canvasRun.toolApprovalPolicy!.getMode(toolName) : 'ask' as const,
+        subscribe: canvasRun.toolApprovalPolicy.subscribe,
+      } } : {}),
     } : {}),
   }
 }

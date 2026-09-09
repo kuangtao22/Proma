@@ -1,6 +1,6 @@
 import * as React from 'react'
 import type { CanvasLayoutRect, CanvasNode, CanvasNodeKind, DesignViewport } from '@proma/shared'
-import { MoveDiagonal2, X } from 'lucide-react'
+import { MoveDiagonal2, RotateCcw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 /** 工作台在画布坐标系中的宽高。 */
@@ -21,7 +21,7 @@ export interface CanvasWorkbenchResizeInput {
 /** 工作台常规最小宽高，已在高倍缩放下打开的更小尺寸不会跳大。 */
 const CANVAS_WORKBENCH_MIN_WIDTH = 360
 const CANVAS_WORKBENCH_MIN_HEIGHT = 320
-/** 世界尺寸保持有界，同时容纳 5% 缩放时首次展开的详情面积。 */
+/** 手动调整的世界尺寸保持有界，避免无限增大渲染区域。 */
 const CANVAS_WORKBENCH_MAX_DIMENSION = 32_768
 /** 卡片与详情之间的固定画布间距，随卡片共同缩放。 */
 const CANVAS_WORKBENCH_NODE_GAP = 12
@@ -96,24 +96,24 @@ export function calculateCanvasWorkbenchResize(input: CanvasWorkbenchResizeInput
   }
 }
 
-/** 根据节点类型返回首次打开所需的屏幕像素尺寸。 */
+/** 根据节点类型返回默认画布世界尺寸，与卡片共同缩放。 */
 export function resolveCanvasWorkbenchDefaultSize(node: CanvasNode): CanvasWorkbenchSize {
   if (node.kind === 'agent') return { width: 760, height: 640 }
   if (node.kind === 'image') return { width: 960, height: 700 }
   if (node.kind === 'audio') return { width: 720, height: 560 }
-  if (node.kind === 'video') return { width: 960, height: 700 }
+  if (node.kind === 'video') return { width: 840, height: 560 }
   if (node.kind === 'document') return { width: 900, height: 700 }
   return node.devicePreset === 'mobile' ? { width: 520, height: 720 } : { width: 960, height: 720 }
 }
 
-/** 将首次屏幕面积换算为画布尺寸；之后交由同一 viewport transform 缩放。 */
+/** 视口只约束首次可用世界面积，低倍缩放不能反向放大默认尺寸。 */
 function initialCanvasWorkbenchSize(node: CanvasNode, surface: CanvasWorkbenchSize, zoom: number): CanvasWorkbenchSize {
   const defaults = resolveCanvasWorkbenchDefaultSize(node)
   return {
-    width: Math.min(CANVAS_WORKBENCH_MAX_DIMENSION, Math.max(1,
-      Math.min(defaults.width, surface.width - CANVAS_WORKBENCH_INITIAL_MARGIN * 2)) / validCanvasScale(zoom)),
-    height: Math.min(CANVAS_WORKBENCH_MAX_DIMENSION, Math.max(1,
-      Math.min(defaults.height, surface.height - CANVAS_WORKBENCH_INITIAL_MARGIN * 2)) / validCanvasScale(zoom)),
+    width: Math.max(1, Math.min(defaults.width,
+      (surface.width - CANVAS_WORKBENCH_INITIAL_MARGIN * 2) / validCanvasScale(zoom))),
+    height: Math.max(1, Math.min(defaults.height,
+      (surface.height - CANVAS_WORKBENCH_INITIAL_MARGIN * 2) / validCanvasScale(zoom))),
   }
 }
 
@@ -158,7 +158,7 @@ function getCanvasNodeNextAction(kind: Exclude<CanvasNodeKind, 'agent'>): string
 /** 渲染与卡片共用画布变换的详情，仅调整大小，不支持独立移动。 */
 export function CanvasNodeWorkbenchOverlay(props: CanvasNodeWorkbenchOverlayProps): React.ReactElement {
   /** 初始尺寸只计算一次，避免 viewport 变化时反向抵消画布缩放。 */
-  const [initialSize] = React.useState(() => initialCanvasWorkbenchSize(
+  const [initialSize, setInitialSize] = React.useState(() => initialCanvasWorkbenchSize(
     props.node, props.surfaceSize ?? { width: 1_200, height: 800 }, props.viewport?.zoom ?? 1,
   ))
   /** 已保存尺寸不受当前可视范围限制。 */
@@ -204,6 +204,16 @@ export function CanvasNodeWorkbenchOverlay(props: CanvasNodeWorkbenchOverlayProp
   }, [initialSize, props.size])
   /** 非手势期间直接读取受控尺寸，避免等待 effect 产生一帧闪动。 */
   const renderedSize = resizeSessionRef.current === null ? effectiveSize : previewSize
+
+  /** 显式重置当前节点的几何缓存，保留正文挂载状态及其他节点的自定义尺寸。 */
+  const resetWorkbenchSize = (): void => {
+    /** 使用当前视口重算，不能复用旧版本初始化后留在内存中的膨胀尺寸。 */
+    const defaultSize = initialCanvasWorkbenchSize(
+      props.node, props.surfaceSize ?? { width: 1_200, height: 800 }, props.viewport?.zoom ?? 1,
+    )
+    if (props.size == null) setInitialSize(defaultSize)
+    else onSizeChangeRef.current?.(defaultSize)
+  }
 
   /** 捕获缩放手势并冻结当前比例；越界时指针仍可继续操作。 */
   const handleResizePointerDown = React.useCallback((event: React.PointerEvent<HTMLButtonElement>): void => {
@@ -255,9 +265,14 @@ export function CanvasNodeWorkbenchOverlay(props: CanvasNodeWorkbenchOverlayProp
   >
     <header className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
       <span className="min-w-0 truncate text-sm font-medium">{props.node.title}</span>
-      <Button type="button" size="icon" variant="ghost" aria-label={`收起${label}工作台`} onClick={props.onClose}>
-        <X className="size-4" aria-hidden="true" />
-      </Button>
+      <div className="flex shrink-0 items-center gap-1">
+        <Button type="button" size="icon" variant="ghost" aria-label="恢复工作台默认大小" title="恢复默认大小" onClick={resetWorkbenchSize}>
+          <RotateCcw className="size-4" aria-hidden="true" />
+        </Button>
+        <Button type="button" size="icon" variant="ghost" aria-label={`收起${label}工作台`} onClick={props.onClose}>
+          <X className="size-4" aria-hidden="true" />
+        </Button>
+      </div>
     </header>
     <div className="relative h-[calc(100%-2.75rem)] min-h-0 [&>aside]:static [&>aside]:h-full [&>aside]:max-w-none [&>aside]:border-l-0 [&>aside]:shadow-none [&>aside>header]:hidden">
       {props.children ?? <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-muted-foreground">

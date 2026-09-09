@@ -479,15 +479,22 @@ export function promoteStagedFile(
   }
 }
 
-/** 使用 no-follow 稳定句柄读取 picker/Agent 已授权的实际普通文件。 */
-function readAuthorizedImage(sourcePath: string): Buffer {
+/** 返回与读取预算对应的稳定错误，默认调用保持原有 64 MiB 文案。 */
+function imageSizeLimitError(maxBytes: number): Error {
+  return new Error(maxBytes === MAX_IMAGE_BYTES ? '图片不能超过 64 MiB' : `图片不能超过 ${maxBytes} 字节`)
+}
+
+/** 使用 no-follow 稳定句柄按给定字节预算读取 picker/Agent 已授权的实际普通文件。 */
+function readAuthorizedImage(sourcePath: string, maxBytes = MAX_IMAGE_BYTES): Buffer {
   if (!isAbsolute(sourcePath)) throw new Error('图片来源必须是绝对路径')
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_IMAGE_BYTES) throw new Error('图片读取上限无效')
   /** lstat 先拒绝末级符号链接和目录等非普通对象。 */
   const initialStat = lstatSync(sourcePath)
   if (!initialStat.isFile() || initialStat.isSymbolicLink()) {
     throw new Error('图片必须是实际普通文件')
   }
-  if (initialStat.size > MAX_IMAGE_BYTES) throw new Error('图片不能超过 64 MiB')
+  /** 打开前保留全局硬上限；更小的调用预算由稳定句柄复核。 */
+  if (initialStat.size > MAX_IMAGE_BYTES) throw imageSizeLimitError(MAX_IMAGE_BYTES)
 
   /** O_NOFOLLOW 在支持的平台阻断检查后替换为链接的竞态。 */
   const descriptor = openSync(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
@@ -496,11 +503,11 @@ function readAuthorizedImage(sourcePath: string): Buffer {
     const beforeStat = fstatSync(descriptor)
     if (!beforeStat.isFile()
       || beforeStat.dev !== initialStat.dev
-      || beforeStat.ino !== initialStat.ino
-      || beforeStat.size > MAX_IMAGE_BYTES) {
+      || beforeStat.ino !== initialStat.ino) {
       throw new Error('图片文件身份已变化')
     }
-    /** 文件大小已先受限，因此一次 Buffer 读取的内存上限固定为 64 MiB。 */
+    if (beforeStat.size > maxBytes) throw imageSizeLimitError(maxBytes)
+    /** 稳定句柄大小已按调用预算受限，因此一次 Buffer 读取不会越过该预算。 */
     const bytes = readFileSync(descriptor)
     const afterStat = fstatSync(descriptor)
     if (afterStat.dev !== beforeStat.dev
@@ -1226,16 +1233,17 @@ export class DesignAssetService {
    * 按权威素材身份读取当前受管缩略图。
    * @param projectId 已登记项目稳定 ID。
    * @param assetId 已存在于项目 Design 文档的素材 ID。
+   * @param maxBytes 可选同步读取预算；缺省时保持通用图片 64 MiB 上限。
    * @returns 通过普通文件与图片签名校验的缩略图字节和真实媒体类型。
    */
-  readStoredThumbnail(projectId: string, assetId: string): StoredDesignThumbnail {
+  readStoredThumbnail(projectId: string, assetId: string, maxBytes?: number): StoredDesignThumbnail {
     const document = this.dependencies.store.requireStableAuthoritativeDocument(projectId)
     const asset = document.assets.find((item) => item.id === assetId)
     if (!asset) throw new Error('DESIGN_ASSET_NOT_FOUND')
     try {
       /** 相对路径只来自已通过 Design Store schema 的权威素材记录。 */
       const thumbnailPath = this.resolveStoredAssetFiles(projectId, asset)[1]
-      const bytes = readAuthorizedImage(thumbnailPath)
+      const bytes = readAuthorizedImage(thumbnailPath, maxBytes)
       const format = detectImageFormat(bytes)
       return { bytes, mediaType: format.mediaType }
     } catch (error) {

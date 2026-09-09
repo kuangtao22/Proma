@@ -21,6 +21,44 @@ import type {
 
 const MAX_MEDIA_STATE_LENGTH = 2 * 1024 * 1024
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/
+/** 同进程所有 Store 实例共享模块队列，跨进程互斥仍由文件锁负责。 */
+const mediaModuleOperationTails = new Map<string, Promise<void>>()
+
+/** 完整模块身份避免同画布内不同音视频节点互相阻塞。 */
+function createMediaModuleOperationKey(target: CanvasMediaTarget): string {
+  return JSON.stringify([
+    target.projectId,
+    target.canvasId,
+    target.nodeId,
+    target.mediaModuleId,
+    target.mediaKind,
+  ])
+}
+
+/**
+ * 串行同进程对同一模块的 LOAD/CAS；失败仍释放后继，末尾完成后删除队列项。
+ * effect 内重新取得 capability，确保等待期间发生的撤权或节点替换会被复核。
+ */
+async function runMediaModuleOperation<Result>(
+  target: CanvasMediaTarget,
+  effect: () => Promise<Result>,
+): Promise<Result> {
+  /** 当前模块前序任务；前序失败只影响自身结果，不能毒化队列。 */
+  const key = createMediaModuleOperationKey(target)
+  const predecessor = mediaModuleOperationTails.get(key) ?? Promise.resolve()
+  /** 当前任务完成信号，同时作为后续任务等待的队尾。 */
+  let releaseTurn = (): void => undefined
+  const turn = new Promise<void>((resolve) => { releaseTurn = resolve })
+  const tail = predecessor.catch(() => undefined).then(() => turn)
+  mediaModuleOperationTails.set(key, tail)
+  await predecessor.catch(() => undefined)
+  try {
+    return await effect()
+  } finally {
+    releaseTurn()
+    if (mediaModuleOperationTails.get(key) === tail) mediaModuleOperationTails.delete(key)
+  }
+}
 
 /** Store 使用受管 Canvas 内容目录和 native 原子文件协议。 */
 export interface CanvasMediaStoreDependencies {
@@ -298,7 +336,7 @@ export function createCanvasMediaStore(dependencies: CanvasMediaStoreDependencie
   }
 
   return {
-    load: async (target) => {
+    load: (target) => runMediaModuleOperation(target, async () => {
       const capability = loadScope(target)
       const release = acquireMediaFileLock(join(capability.path, target.mediaModuleId, '.canvas-media.lock'))
       try {
@@ -306,8 +344,8 @@ export function createCanvasMediaStore(dependencies: CanvasMediaStoreDependencie
       } finally {
         release()
       }
-    },
-    compareAndSwap: async (target, expectedRevision, requested) => {
+    }),
+    compareAndSwap: (target, expectedRevision, requested) => runMediaModuleOperation(target, async () => {
       const capability = loadScope(target)
       /** 锁文件位于已验证模块目录，跨窗口和进程共享同一 CAS owner。 */
       const release = acquireMediaFileLock(join(capability.path, target.mediaModuleId, '.canvas-media.lock'))
@@ -333,6 +371,6 @@ export function createCanvasMediaStore(dependencies: CanvasMediaStoreDependencie
       } finally {
         release()
       }
-    },
+    }),
   }
 }

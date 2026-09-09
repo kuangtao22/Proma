@@ -109,6 +109,21 @@ describe('Design 素材安全服务', () => {
       .toThrow('DESIGN_ASSET_NOT_FOUND')
   })
 
+  test('Given 受管缩略图超过调用预算 When 读取 Then 在完整文件读取前按稳定大小拒绝', async () => {
+    const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
+    store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])
+    const thumbnailPath = join(paths.thumbnailsDir, basename(asset!.thumbnailRelativePath))
+    truncateSync(thumbnailPath, (512 * 1024) + 1)
+    /** 保留被公开稳定错误收口前的底层拒绝原因，用来证明命中读取前预算。 */
+    const warnings: string[] = []
+    service = createService({ warn: (message) => warnings.push(message) })
+
+    expect(() => service.readStoredThumbnail('project-1', asset!.id, 512 * 1024))
+      .toThrow('DESIGN_THUMBNAIL_UNAVAILABLE')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('图片不能超过 524288 字节')
+  })
+
   test('Given 候选元数据合法 When 原图完整、缺失或同尺寸篡改 Then 采用前验证只接受完整内容', async () => {
     const [asset] = await service.importAuthorizedFiles('project-1', [fixturePath], { kind: 'picker' })
     store.mutate('project-1', 0, [{ type: 'upsert-assets', assets: [asset!] }])

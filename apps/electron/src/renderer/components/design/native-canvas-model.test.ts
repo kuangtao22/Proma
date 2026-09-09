@@ -126,10 +126,71 @@ describe('原生 Canvas 纯投影', () => {
       onWorkbenchNodeChange: () => undefined,
     })
 
-    expect(nodes.find((node) => node.id === 'video-1')?.data.mediaProgress).toEqual({
-      phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+    expect(nodes.find((node) => node.id === 'video-1')?.data).toMatchObject({
+      activityState: 'running',
+      mediaProgress: {
+        phase: 'running', phaseLabel: '运行中', nodeProgressLabel: '当前节点 sampler · 4/20',
+      },
     })
   })
+
+  test.each(['audio', 'video'] as const)(
+    'Given %s 已生成成功 When 建立 Flow 数据 Then 卡片不再显示未生成占位',
+    (kind) => {
+      /** 同一音视频节点分别验证空状态与成功结果摘要。 */
+      const document = createDocument()
+      document.nodes.push({
+        id: 'media-1', kind, title: '媒体', position: { x: 0, y: 0 }, mediaModuleId: 'media-module',
+      })
+      expect(toNativeCanvasFlowNodes(document).find((node) => node.id === 'media-1')?.data).toMatchObject({
+        statusLabel: '待创作', summary: kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
+      })
+      /** 后端成功事实驱动展示，不将默认选择误报为人工验收。 */
+      const nodes = toNativeCanvasFlowNodes(document, {
+        nodeIssues: [],
+        runningSessionIds: new Set(),
+        canCreateChild: false,
+        onCreateChild: () => undefined,
+        onWorkbenchNodeChange: () => undefined,
+        mediaProgressByNodeId: new Map([['media-1', { phase: 'succeeded', phaseLabel: '生成完成' }]]),
+      })
+      expect(nodes.find((node) => node.id === 'media-1')?.data).toMatchObject({
+        activityState: 'idle', statusLabel: '已有结果', summary: '已有生成结果',
+      })
+    },
+  )
+
+  test.each([
+    ['pending', 'queued'],
+    ['prepared', 'queued'],
+    ['queued', 'queued'],
+    ['uploading', 'running'],
+    ['compiling', 'running'],
+    ['submitting', 'running'],
+    ['submission-unknown', 'running'],
+    ['running', 'running'],
+    ['collecting', 'running'],
+    ['collection-failed', 'running'],
+    ['cancel-requested', 'running'],
+    ['succeeded', 'idle'],
+    ['failed', 'idle'],
+    ['cancelled', 'idle'],
+  ] as const)(
+    'Given 媒体节点阶段为 %s When 建立 Flow 数据 Then 通用活动态投影为 %s',
+    (phase, expectedActivityState) => {
+      const document = createDocument()
+      const nodes = toNativeCanvasFlowNodes(document, {
+        nodeIssues: [],
+        runningSessionIds: new Set(),
+        mediaProgressByNodeId: new Map([['image-1', { phase, phaseLabel: phase }]]),
+        canCreateChild: false,
+        onCreateChild: () => undefined,
+        onWorkbenchNodeChange: () => undefined,
+      })
+
+      expect(nodes.find((node) => node.id === 'image-1')?.data.activityState).toBe(expectedActivityState)
+    },
+  )
 
   test('Given Agent 节点存在问题和运行快照 When 投影 Then unavailable 优先且不可扩展', () => {
     const document = createDocument()

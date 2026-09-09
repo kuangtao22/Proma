@@ -442,7 +442,7 @@ describe('Design Job Manager', () => {
     expect(candidateHarness.canvasAdoptionCount).toBe(1)
   })
 
-  test('Given 生产候选服务已接入 When Canvas 图片成功 Then 只登记候选且不自动采用', async () => {
+  test('Given 生产候选服务已接入 When Canvas 图片成功 Then 委托候选服务处理首选而不走旧采用适配器', async () => {
     const candidateHarness = createHarness({ withCandidateBatches: true })
     candidateHarness.messages = [createToolMessage('session-1/output.png')]
     const job = await candidateHarness.manager.createCanvasImage({
@@ -1041,6 +1041,21 @@ describe('Design Job Manager', () => {
     expect(harness.adoptedOutputs.get('image-module-a')).toBe('asset-output')
   })
 
+  test('Given Canvas 输出仍在提交阶段 When 自动首选校验 Then 仅精确项目与已落盘输出可通过', async () => {
+    harness.messages = [createToolMessage('session-1/output.png')]
+    harness.adoptOutputError = new Error('图片模块暂不可写')
+    /** 真实输出提交后留下 pending，用于验证自动采用不能只信任成功事件。 */
+    const job = await harness.manager.createCanvasImage(createCanvasImageInput('a'))
+    expect(harness.manager.isPendingCanvasImageOutput('project-1', job.id, 'asset-output')).toBe(false)
+    await harness.manager.run(job.id)
+    expect(harness.manager.isPendingCanvasImageOutput('project-1', job.id, 'asset-output')).toBe(true)
+    expect(harness.manager.isPendingCanvasImageOutput('project-other', job.id, 'asset-output')).toBe(false)
+    expect(harness.manager.isPendingCanvasImageOutput('project-1', job.id, 'asset-other')).toBe(false)
+    harness.adoptOutputError = undefined
+    await harness.manager.reconcilePendingTerminals('project-1')
+    expect(harness.manager.isPendingCanvasImageOutput('project-1', job.id, 'asset-output')).toBe(false)
+  })
+
   test('Given Canvas 输出已进入 terminal pending When 取消后对账 Then 拒绝取消并只采用一次', async () => {
     harness.messages = [createToolMessage('session-1/output.png')]
     harness.adoptOutputError = new Error('图片模块暂不可写')
@@ -1338,6 +1353,40 @@ describe('Design Job Manager', () => {
       designSummary: '根据真实项目首页整理视觉层级。',
       finalImagePrompt: 'A precise project homepage mockup...',
     })
+  })
+
+  test('Given GPT 图片渠道返回 503 When 收敛任务 Then 保留真实失败原因与提示词且不自动重试', async () => {
+    /** 模拟 SDK 已保存的渠道错误，检验任务详情不会退化为通用无图片提示。 */
+    const serviceError = '生图服务请求失败 (503)，请求 ID: request-503：No available compatible accounts'
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    harness.runHeadless = async (callbacks, extensions) => {
+      extensions.captureDesignImageCall?.({
+        designSummary: '保留已确认的画面需求。',
+        prompt: 'The confirmed image prompt.',
+      })
+      harness.sdkMessages = createSdkToolErrorMessages(serviceError)
+      callbacks.onComplete([])
+    }
+    /** 固定真实现场使用的 OpenAI 图片执行器，避免误归因到 ComfyUI。 */
+    const job = harness.manager.create({
+      ...createGenerateInput(),
+      imageModelProfileId: 'profile-gpt',
+    })
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed',
+      error: `图片生成失败：${serviceError}`,
+      designSummary: '保留已确认的画面需求。',
+      finalImagePrompt: 'The confirmed image prompt.',
+    })
+    expect(harness.manager.getTaskDetails('project-1', job.id, false).attempts).toEqual([
+      expect.objectContaining({ jobId: job.id, status: 'failed', error: `图片生成失败：${serviceError}` }),
+    ])
+    expect(harness.manager.list('project-1')).toHaveLength(1)
+    expect(harness.createdSessions).toHaveLength(1)
+    expect(document.nodes[0]).toMatchObject({ kind: 'job', jobId: job.id })
   })
 
   test('Given Pi 以 user tool_result 返回已验证图片 When 完成 Then 导入图片而不是误报无输出', async () => {

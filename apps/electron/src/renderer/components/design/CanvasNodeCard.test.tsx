@@ -134,6 +134,41 @@ describe('Canvas 通用折叠节点卡片', () => {
     expect(html).toContain('truncate')
   })
 
+  test.each<CanvasNodeKind>(['agent', 'image', 'audio', 'video', 'document', 'webview'])(
+    'Given %s 节点正在运行 When 折叠渲染 Then 显示统一加载动效',
+    (kind) => {
+      const html = renderCard(kind, { activityState: 'running' })
+
+      expect(html).toContain('data-canvas-node-loading-indicator')
+      expect(html).toContain('animate-spin')
+      expect(html).toContain('motion-reduce:animate-none')
+    },
+  )
+
+  test('Given 已有图片再次运行 When 折叠渲染 Then 保留缩略图并叠加加载反馈', () => {
+    const html = renderCard('image', {
+      activityState: 'running',
+      previewUrl: 'proma-file://thumbnail-token/adopted.webp',
+    })
+
+    expect(html).toContain('src="proma-file://thumbnail-token/adopted.webp"')
+    expect(html).toContain('data-canvas-node-loading-indicator')
+  })
+
+  test('Given Agent 运行文案与活动态同时存在 When 折叠渲染 Then 只保留一个可降级的加载图标', () => {
+    const html = renderCard('agent', { activityState: 'running', statusLabel: '运行中' })
+
+    expect(html.match(/animate-spin/g)).toHaveLength(1)
+    expect(html.match(/motion-reduce:animate-none/g)).toHaveLength(1)
+  })
+
+  test.each<CanvasNodeActivityState>(['idle', 'waiting-approval'])(
+    'Given 节点处于 %s 终止或等待态 When 折叠渲染 Then 不显示加载动效',
+    (activityState) => {
+      expect(renderCard('agent', { activityState })).not.toContain('data-canvas-node-loading-indicator')
+    },
+  )
+
   test('Given 节点允许创建下游 When 折叠渲染 Then 保留节点侧扩展入口和静态端口', () => {
     const html = renderCard('image')
 

@@ -11,11 +11,13 @@ import type {
   MediaInputValue,
   MediaRunSnapshot,
 } from '@proma/shared'
+import { parseCanvasMediaModuleConfig, parseSaveCanvasMediaModuleInput } from '@proma/shared'
 import type { StableDirectoryNativeRequest, StableDirectoryNativeResult } from '../stable-directory-native-host'
 import {
   CanvasMediaService,
   type CanvasMediaModuleState,
   type CanvasMediaModuleStore,
+  type CanvasMediaServiceDependencies,
 } from './canvas-media-service'
 import type { MediaRunOrigin } from '../media/media-run-service'
 import { MediaWorkflowValidationError } from '../media/media-workflow-error'
@@ -168,6 +170,8 @@ function createService(
     projectId: string,
     asset: CanvasMediaCandidate['outputs'][number]['asset'],
   ) => Promise<Uint8Array>,
+  /** 模拟只读与异步期间撤权，不绕过生产服务的权限检查。 */
+  authorizeTarget?: CanvasMediaServiceDependencies['authorizeTarget'],
 ): CanvasMediaService {
   return new CanvasMediaService({
     store,
@@ -250,12 +254,123 @@ function createService(
       }],
     })),
     onAdopted: onAdopted ?? (async () => undefined),
-    authorizeTarget: async () => undefined,
+    authorizeTarget: authorizeTarget ?? (async () => undefined),
     now: () => 10,
   })
 }
 
 describe('Canvas 通用媒体服务', () => {
+  test('Given 空视频已有多份候选 When 加载 Then 默认采用最早有效主视频并持久化默认来源', async () => {
+    /** 故意倒置候选数组，默认版本按完成时间确定。 */
+    const candidates: CanvasMediaCandidate[] = [20, 10].map((createdAt) => ({
+      id: `candidate-${createdAt}`, operationId: `operation-${createdAt}`, runId: `run-${createdAt}`,
+      sourceConfigRevision: 2, profile: { profileId: 'profile-1', profileRevision: 3 }, createdAt,
+      outputs: config().outputs.map((binding, index) => ({ ...binding, asset: run().outputs[index]!.asset })),
+    }))
+    const store = createStore({ candidates })
+    const service = createService(store, run())
+    const snapshot = await service.load(target)
+    expect(snapshot.config.adoptedOutputs).toMatchObject([
+      { key: 'video', candidateId: 'candidate-10', selectionOrigin: 'initial' },
+    ])
+    expect(parseCanvasMediaModuleConfig(snapshot.config)).toEqual(snapshot.config)
+    await service.load(target)
+    expect(store.current().config.revision).toBe(snapshot.config.revision)
+    /** 明确采用同一视频会去掉默认来源，允许原有工作流验收继续。 */
+    const confirmed = await service.adopt({ ...target, expectedConfigRevision: snapshot.config.revision,
+      candidateId: 'candidate-10', selectedKeys: ['video'] })
+    expect(confirmed.adoptedOutputs[0]).not.toHaveProperty('selectionOrigin')
+  })
+
+  test('Given 视频已采用或运行后用户修改配置 When 加载旧候选 Then 不覆盖已有选择或新配置', async () => {
+    /** 默认采用必须复验运行时配置版本。 */
+    const candidate: CanvasMediaCandidate = {
+      id: 'candidate-1', operationId: 'operation-1', runId: 'run-1', sourceConfigRevision: 2,
+      profile: { profileId: 'profile-1', profileRevision: 3 }, createdAt: 4,
+      outputs: config().outputs.map((binding, index) => ({ ...binding, asset: run().outputs[index]!.asset })),
+    }
+    const changed = createStore({ config: config(3), candidates: [candidate] })
+    await createService(changed, run()).load(target)
+    expect(changed.current().config.adoptedOutputs).toEqual([])
+    const selected = config()
+    selected.adoptedOutputs = [{ ...candidate.outputs[0]!, candidateId: 'user-choice', runId: 'user-run' }]
+    const adopted = createStore({ config: selected, candidates: [candidate] })
+    await createService(adopted, run()).load(target)
+    expect(adopted.current().config).toEqual(selected)
+  })
+
+  test('Given 视频和音轨属于同一 bundle When 并发加载空节点 Then 只默认采用一次完整组且传播可恢复', async () => {
+    const bundled = config()
+    bundled.outputs[0] = { ...bundled.outputs[0]!, bundle: 'av' }
+    bundled.outputs[1] = { ...bundled.outputs[1]!, bundle: 'av' }
+    const candidate: CanvasMediaCandidate = {
+      id: 'candidate-1', operationId: 'operation-1', runId: 'run-1', sourceConfigRevision: 2,
+      profile: { profileId: 'profile-1', profileRevision: 3 }, createdAt: 4,
+      outputs: bundled.outputs.map((binding, index) => ({ ...binding, asset: run().outputs[index]!.asset })),
+    }
+    const store = createStore({ config: bundled, candidates: [candidate] })
+    const service = createService(store, run())
+    await Promise.all([service.load(target), service.load(target)])
+    expect(store.current().config.adoptedOutputs.map((item) => item.key)).toEqual(['video', 'audio'])
+    expect(store.current().config.revision).toBe(3)
+    expect(store.current().pendingAdoptionProjection).toBeNull()
+  })
+
+  test('Given 默认视频已写入但传播失败 When 重建服务读取 Then 真实 Store 重放默认来源且不重复采用', async () => {
+    const fixture = createPersistentStore(createStore().current())
+    try {
+      const service = createService(fixture.store, run(), undefined, undefined, async () => { throw new Error('暂时无法传播') })
+      await expect(service.run({ ...target, expectedConfigRevision: 2, operationId: 'auto-persistent' }, origin))
+        .rejects.toThrow('CANVAS_MEDIA_ADOPTION_PROPAGATION_PENDING')
+      const pending = await fixture.store.load(target)
+      expect(pending.pendingAdoptionProjection?.outputs[0]).toMatchObject({ key: 'video', selectionOrigin: 'initial' })
+      const recovered = await createService(fixture.store, run()).load(target)
+      expect(recovered.config).toEqual(pending.config)
+      expect((await fixture.store.load(target)).pendingAdoptionProjection).toBeNull()
+    } finally { fixture.cleanup() }
+  })
+
+  test('Given 默认采用读取素材时用户已明确选择 When 旧提交 CAS 冲突 Then 保留用户版本', async () => {
+    const store = createStore()
+    /** 第一次完整性读取期间模拟用户在另一窗口采用同一候选。 */
+    let raced = false
+    const manual = createService(store, run())
+    const service = createService(store, run(), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async () => {
+        if (!raced) {
+          raced = true
+          await manual.adopt({ ...target, expectedConfigRevision: 2, candidateId: 'candidate:run-1', selectedKeys: ['video'] })
+        }
+        return new Uint8Array([1])
+      })
+    await service.run({ ...target, expectedConfigRevision: 2, operationId: 'auto-race' }, origin)
+    expect(store.current().config.revision).toBe(3)
+    expect(store.current().config.adoptedOutputs[0]).not.toHaveProperty('selectionOrigin')
+  })
+
+  test('Given 已生成视频所在项目只读 When 加载 Then 保留候选且不默认写入', async () => {
+    const source = createStore()
+    await createService(source, run()).run({ ...target, expectedConfigRevision: 2, operationId: 'source' }, origin)
+    const initial = source.current()
+    const store = createStore({ ...initial, config: config() })
+    const service = createService(store, run(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async (_target, operation) => { if (operation !== 'read') throw new Error('CANVAS_MEDIA_PROJECT_READ_ONLY') })
+    const snapshot = await service.load(target)
+    expect(snapshot.candidates).toHaveLength(1)
+    expect(snapshot.config.adoptedOutputs).toEqual([])
+    expect(store.current().revision).toBe(initial.revision)
+  })
+
+  test('Given 首次成功视频文件无法读取 When 默认采用 Then 抛出实际错误并保留未采用历史', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      async () => { throw new Error('MEDIA_ASSET_CONTENT_MISMATCH') })
+    await expect(service.run({ ...target, expectedConfigRevision: 2, operationId: 'bad-video' }, origin))
+      .rejects.toThrow('MEDIA_ASSET_CONTENT_MISMATCH')
+    expect(store.current().candidates).toHaveLength(1)
+    expect(store.current().config.adoptedOutputs).toEqual([])
+  })
+
   test('Given 固定 profile 和确切 operationId When 运行成功 Then 按 key/type/order CAS 挂候选', async () => {
     const store = createStore()
     const service = createService(store, run())
@@ -376,6 +491,35 @@ describe('Canvas 通用媒体服务', () => {
       origin,
     )).rejects.toThrow('CANVAS_MEDIA_INPUTS_NOT_READY')
     expect(store.current().operations).toEqual([])
+  })
+
+  test('Given 空视频卡片与完整输出绑定 When 保存工作流但暂缺素材 Then 真实 Store 往返保留草稿且没有运行', async () => {
+    /** 从空卡片开始，经过共享保存解析器、服务和严格 Store 的 CAS 读写。 */
+    const persistent = createPersistentStore({
+      schemaVersion: 1, revision: 0,
+      config: { ...config(0), profile: null, workflow: null, inputs: [], outputs: [] },
+      operations: [], candidates: [], pendingAdoptionProjection: null,
+    })
+    try {
+      /** 现场只有一个视频输出；角色和顺序显式填写，未知输入保持为空。 */
+      const input = parseSaveCanvasMediaModuleInput({
+        ...target, expectedConfigRevision: 0, profile: null,
+        workflow: { workflowId: 'minimax-ref-test', workflowRevision: 1, connectionId: 'gpu' },
+        inputs: [], outputs: [{ key: '92.video', mediaKind: 'video', role: 'primary', order: 0 }],
+      })
+      const service = createService(persistent.store, run('running'))
+      const saved = await service.save(input)
+      const reloaded = await service.load(target)
+      expect(reloaded.config).toEqual(saved)
+      expect(reloaded.config).toMatchObject({
+        revision: 1, profile: null, workflow: input.workflow, inputs: [], outputs: input.outputs,
+      })
+      expect(reloaded.runs).toEqual([])
+      expect(reloaded.candidates).toEqual([])
+      expect((await persistent.store.load(target)).operations).toEqual([])
+    } finally {
+      persistent.cleanup()
+    }
   })
 
   test('Given 工作流仍缺少必填输入 When 启动运行 Then 抛出可定位错误并持久化待配置状态', async () => {
@@ -563,7 +707,9 @@ describe('Canvas 通用媒体服务', () => {
     )).resolves.toMatchObject({ id: 'run-1', phase: 'succeeded' })
 
     expect(store.current().config.preparation).toBeNull()
-    expect(store.current().config.revision).toBe(2)
+    /** 准备诊断不推进版本；成功后的默认采用单独推进一次。 */
+    expect(store.current().config.revision).toBe(3)
+    expect(store.current().config.adoptedOutputs[0]).toMatchObject({ selectionOrigin: 'initial' })
     expect(store.current().operations[0]?.sourceConfigRevision).toBe(2)
   })
 
@@ -587,11 +733,14 @@ describe('Canvas 通用媒体服务', () => {
       const recoveredService = createService(fixture.store, run())
       await expect(recoveredService.run(input, origin)).resolves.toMatchObject({ id: 'run-1' })
       const recovered = await fixture.store.load(target)
-      expect(recovered.config.revision).toBe(input.expectedConfigRevision)
+      expect(recovered.config.revision).toBe(input.expectedConfigRevision + 1)
+      expect(recovered.config.adoptedOutputs[0]).toMatchObject({ selectionOrigin: 'initial' })
       expect(recovered.config.preparation).toBeNull()
       expect(recovered.operations).toMatchObject([
         { operationId: input.operationId, sourceConfigRevision: input.expectedConfigRevision },
       ])
+      await expect(recoveredService.run(input, origin)).resolves.toMatchObject({ id: 'run-1' })
+      expect((await fixture.store.load(target)).config.revision).toBe(recovered.config.revision)
     } finally {
       fixture.cleanup()
     }

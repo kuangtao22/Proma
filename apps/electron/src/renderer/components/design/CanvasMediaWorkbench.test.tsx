@@ -15,6 +15,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   CanvasMediaPreviewLeaseOwner,
+  CanvasMediaPreviewAutoloadGuard,
   CanvasMediaDraftLoadGuard,
   CanvasMediaWorkflowForm,
   CanvasMediaWorkbench,
@@ -29,6 +30,7 @@ import {
   getCanvasMediaErrorMessage,
   releaseCanvasMediaPreview,
   replaceCanvasMediaPreview,
+  resolveCanvasMediaDefaultPreview,
   resolveDelayedCanvasDefaultConnection,
   resolveCanvasMediaWorkflow,
   resolveCanvasMediaWorkflowConnection,
@@ -269,6 +271,14 @@ describe('CanvasMediaWorkbench', () => {
     expect(getCanvasMediaErrorMessage('unknown', '媒体模块加载失败。')).toBe('媒体模块加载失败。')
   })
 
+  test('Given 文件仍被其它操作占用 When 详情显示本地或 IPC 错误 Then 说明可重试原因并保留错误码', () => {
+    expect(getCanvasMediaErrorMessage(new Error('MEDIA_FILE_BUSY'), '加载失败。'))
+      .toBe('媒体数据正在被其他操作使用，请稍后重试。（MEDIA_FILE_BUSY）')
+    expect(getCanvasMediaErrorMessage(new Error("Error invoking remote method 'canvas-media:load': Error: MEDIA_FILE_BUSY"), '加载失败。'))
+      .toBe('媒体数据正在被其他操作使用，请稍后重试。（MEDIA_FILE_BUSY）')
+    expect(getCanvasMediaErrorMessage(new Error(''), '媒体模块加载失败。')).toBe('媒体模块加载失败。')
+  })
+
   test('Given 用户选择公共工作流 When 创建草稿 Then 标量从 prompt 初始化且媒体保持空选', () => {
     const draft = createCanvasMediaWorkflowSelectionDraft(
       target,
@@ -467,6 +477,66 @@ describe('CanvasMediaWorkbench', () => {
     expect(released).toEqual(['lease-a'])
     await owner.release()
     expect(released).toEqual(['lease-a', 'lease-b'])
+  })
+
+  test('Given 视频尚未显式采用 When 快照含多份主输出 Then 默认选择最早候选及最小输出顺序', () => {
+    const snapshot = createSnapshot()
+    snapshot.candidates = [
+      {
+        ...snapshot.candidates[0]!, id: 'candidate-later', createdAt: 8,
+        outputs: [
+          { ...snapshot.candidates[0]!.outputs[0]!, key: 'video-2', order: 2 },
+          { ...snapshot.candidates[0]!.outputs[0]!, key: 'video-1', order: 1 },
+        ],
+      },
+      {
+        ...snapshot.candidates[0]!, id: 'candidate-first', createdAt: 3,
+        outputs: [
+          { ...snapshot.candidates[0]!.outputs[0]!, key: 'video-b', order: 4 },
+          { ...snapshot.candidates[0]!.outputs[0]!, key: 'video-a', order: 0 },
+        ],
+      },
+      {
+        ...snapshot.candidates[0]!, id: 'candidate-same-time', createdAt: 3,
+        outputs: [{ ...snapshot.candidates[0]!.outputs[0]!, key: 'video-c', order: 0 }],
+      },
+    ]
+
+    expect(resolveCanvasMediaDefaultPreview(snapshot)).toEqual({
+      candidateId: 'candidate-first', outputKey: 'video-a', outputOrder: 0,
+    })
+  })
+
+  test('Given 视频已有正式主输出 When 解析默认预览 Then 已采用项优先于最早候选且音频不自动预览', () => {
+    const snapshot = createSnapshot()
+    const adoptedCandidate = {
+      ...snapshot.candidates[0]!, id: 'candidate-adopted', createdAt: 20,
+      outputs: [{ ...snapshot.candidates[0]!.outputs[0]!, key: 'final-video', order: 5 }],
+    }
+    snapshot.candidates.push(adoptedCandidate)
+    snapshot.config.adoptedOutputs = [{
+      ...adoptedCandidate.outputs[0]!, candidateId: adoptedCandidate.id, runId: adoptedCandidate.runId,
+    }]
+
+    expect(resolveCanvasMediaDefaultPreview(snapshot)).toEqual({
+      candidateId: 'candidate-adopted', outputKey: 'final-video', outputOrder: 5,
+    })
+    expect(resolveCanvasMediaDefaultPreview({ ...snapshot, target: { ...snapshot.target, mediaKind: 'audio' } })).toBeNull()
+  })
+
+  test('Given 默认预览读取失败或用户手动选中 When 普通快照刷新 Then 不重复读取也不抢回；目标切换后可重新初始化', () => {
+    const guard = new CanvasMediaPreviewAutoloadGuard()
+    const first = { candidateId: 'candidate-1', outputKey: 'video', outputOrder: 0 }
+    const adopted = { candidateId: 'candidate-2', outputKey: 'video', outputOrder: 0 }
+
+    expect(guard.claim('project-1/canvas-1/video-1', first)).toBeTrue()
+    expect(guard.claim('project-1/canvas-1/video-1', first)).toBeFalse()
+    guard.markManual('project-1/canvas-1/video-1')
+    expect(guard.claim('project-1/canvas-1/video-1', adopted)).toBeFalse()
+    expect(guard.claim('project-1/canvas-1/video-2', first)).toBeTrue()
+    guard.resetForTarget('project-1/canvas-1/video-empty')
+    guard.resetForTarget('project-1/canvas-1/video-1')
+    expect(guard.claim('project-1/canvas-1/video-1', first)).toBeTrue()
   })
 
   test('Given 预览仍在读取 When 工作台释放 owner Then 读取完成后自动释放新 lease', async () => {

@@ -1,9 +1,23 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createCanvasBoundEdge, createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasDocument, CanvasNode } from '@proma/shared'
+import type {
+  CanvasDocument,
+  CanvasImageCandidateBatch,
+  CanvasImageModuleConfig,
+  CanvasNode,
+  CanvasTarget,
+  CanvasWorkflowRunChangedEvent,
+} from '@proma/shared'
+import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
+import { createCanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
+import {
+  createCanvasImageCandidateBatchStore,
+  type CanvasImageCandidateAdoptionIntent,
+} from './canvas-image-candidate-batch-store'
 import { createCanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import { createCanvasWorkflowPlanSnapshot } from './canvas-workflow-planner'
 import { createCanvasWorkflowRunStore } from './canvas-workflow-run-store'
@@ -143,6 +157,243 @@ describe('Canvas Workflow Execution Persistence', () => {
     ])
     expect(imageStarts).toBe(1)
   })
+
+  for (const scenario of [
+    { name: '图与配置均匹配', graphMatches: true, configMatches: true, expectedStatus: 'completed' },
+    { name: '仅图匹配', graphMatches: true, configMatches: false, expectedStatus: 'waiting-review' },
+    { name: '仅配置匹配', graphMatches: false, configMatches: true, expectedStatus: 'waiting-review' },
+  ] as const) {
+    test(`Given 首次图片由真实候选服务自动选中且${scenario.name} When 重建服务后用户明确恢复 Then 仅双重匹配继续下游`, async () => {
+      const temporaryRoot = mkdtempSync(join(tmpdir(), 'proma-workflow-real-adoption-'))
+      temporaryRoots.push(temporaryRoot)
+      const transactionsDir = join(temporaryRoot, 'transactions')
+      mkdirSync(transactionsDir, { recursive: true })
+      const workflowRuns = createCanvasWorkflowRunStore({
+        pathResolver: { resolveCanvas: () => ({ transactionsDir }) as never },
+        runWorkspaceWrite: (_projectId, effect) => effect(),
+        now: (() => { let value = 100; return () => value += 1 })(),
+      })
+      const target: CanvasTarget = { projectId: 'project-1', canvasId: 'canvas-1' }
+      let document = createDocument()
+      let config: CanvasImageModuleConfig = {
+        schemaVersion: 2,
+        kind: 'image',
+        contentId: 'image-module',
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        prompt: '生成主视觉',
+        selectedModelProfileId: 'model-1',
+        aspectRatio: '1:1',
+        imageSize: 'auto',
+        contextMode: 'none',
+        adoptedAssetId: null,
+      }
+      /** Map 只替代文件 I/O，批次和采用 intent 仍经过生产 Store 的严格 parser。 */
+      const batches = new Map<string, CanvasImageCandidateBatch>()
+      const intents = new Map<string, CanvasImageCandidateAdoptionIntent>()
+      const candidateStore = createCanvasImageCandidateBatchStore({
+        scanBatches: async () => [...batches.values()].map((batch) => structuredClone(batch)),
+        writeBatch: async (batch) => {
+          batches.set(batch.batchId, structuredClone(batch))
+          return { commitVisible: true, durabilityUncertain: false }
+        },
+        scanAdoptionIntents: async () => [...intents.values()].map((intent) => structuredClone(intent)),
+        writeAdoptionIntent: async (intent) => {
+          intents.set(intent.operationId, structuredClone(intent))
+          return { commitVisible: true, durabilityUncertain: false }
+        },
+      })
+      const candidateService = createCanvasImageCandidateBatchService({
+        store: candidateStore,
+        dependencyState: createCanvasDependencyStateService(),
+        runExclusive: async (_canvasTarget, effect) => effect(),
+        loadConfig: async () => structuredClone(config),
+        adoptAsset: async (_imageTarget, expectedConfigRevision, assetId) => {
+          if (config.revision !== expectedConfigRevision) throw new Error('CANVAS_IMAGE_CONFIG_REVISION_CONFLICT')
+          config = {
+            ...config,
+            revision: config.revision + 1,
+            updatedAt: 40,
+            adoptedAssetId: assetId,
+          }
+          return structuredClone(config)
+        },
+        loadCanvas: async () => structuredClone(document),
+        applyCanvasProjection: async (_canvasTarget, expectedRevision, nodes) => {
+          if (document.revision !== expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+          const replacements = new Map(nodes.map((node) => [node.id, node]))
+          document = {
+            ...document,
+            revision: document.revision + 1,
+            nodes: document.nodes.map((node) => replacements.get(node.id) ?? node),
+            updatedAt: 40,
+          }
+          return structuredClone(document)
+        },
+        retryEntry: async () => { throw new Error('TEST_UNEXPECTED_RETRY') },
+        now: () => 40,
+      })
+      const agentStarts: string[] = []
+      let imageStarts = 0
+      const dependencies = {
+        load: () => structuredClone(document),
+        validateAccess: () => undefined,
+        isAgentBusy: () => false,
+        agentExecution: {
+          execute: async (request: { target: { nodeId: string } }) => {
+            agentStarts.push(request.target.nodeId)
+            const contentSha256 = request.target.nodeId === 'root' ? 'a'.repeat(64) : 'b'.repeat(64)
+            const pointer = {
+              messageUuid: request.target.nodeId === 'root'
+                ? '11111111-1111-4111-8111-111111111111'
+                : '22222222-2222-4222-8222-222222222222',
+              contentSha256,
+              completedAt: 20,
+            }
+            document = {
+              ...document,
+              revision: document.revision + 1,
+              nodes: document.nodes.map((node) => node.id === request.target.nodeId && node.kind === 'agent'
+                ? { ...node, outputPointer: pointer }
+                : node),
+            }
+            return {
+              status: 'completed' as const,
+              output: {
+                target: { ...target, nodeId: request.target.nodeId },
+                revision: document.revision,
+                pointer,
+                downstreamNodeIds: [],
+              },
+            }
+          },
+        },
+        imageRuns: {
+          run: async () => {
+            imageStarts += 1
+            await candidateService.createBatch({
+              ...target,
+              batchId: 'batch-real-1',
+              source: 'canvas-tool',
+              sourceSessionId: 'parent-session',
+              sourceToolCallId: 'tool-call-real-1',
+              entries: [{
+                nodeId: 'image',
+                imageModuleId: 'image-module',
+                initialAdoptedAssetId: null,
+                initialConfigRevision: config.revision,
+                jobId: 'task-real-1',
+              }],
+            })
+            return {
+              tasks: [{ nodeId: 'image', status: 'started' as const, taskId: 'task-real-1' }],
+              batch: {
+                batchId: 'batch-real-1', status: 'running' as const, totalCount: 1,
+                candidateCount: 0, failedCount: 0, runningCount: 1, requiresCanvasReview: true as const,
+              },
+            }
+          },
+          awaitBatch: async () => {
+            await candidateService.recordJobTerminal({
+              ...target,
+              candidateBatchId: 'batch-real-1',
+              jobId: 'task-real-1',
+              status: 'succeeded',
+              outputAssetId: 'asset-first-1',
+              error: null,
+            })
+            const batch = await candidateService.load({ ...target, batchId: 'batch-real-1' })
+            return {
+              batchId: batch.batchId,
+              status: 'ready' as const,
+              totalCount: 1,
+              candidateCount: 1,
+              failedCount: 0,
+              runningCount: 0,
+              requiresCanvasReview: true as const,
+              entries: [{ nodeId: 'image', taskId: 'task-real-1', status: 'candidate' as const }],
+            }
+          },
+          cancelTasks: async () => undefined,
+        },
+        workflowRuns,
+        isImageCandidateAdopted: async (input: CanvasTarget & {
+          nodeId: string
+          batchId: string
+          taskId: string
+        }) => {
+          const adoption = await candidateService.getCandidateAdoption({
+            ...input,
+            jobId: input.taskId,
+          })
+          return {
+            adopted: adoption !== null,
+            artifactHash: adoption
+              ? createHash('sha256').update(JSON.stringify(['image-asset', adoption.assetId])).digest('hex')
+              : null,
+            committedAt: adoption?.committedAt ?? null,
+          }
+        },
+        now: () => 50,
+        setDeadline: () => ({ cancel: () => undefined }),
+      }
+      const context = {
+        projectId: 'project-1', sessionId: 'parent-session', runStartedAt: 10,
+        explicitReferences: [], permissionCeiling: 'execute' as const,
+      }
+
+      const firstService = createCanvasWorkflowExecutionService(dependencies)
+      const first = await firstService.execute(context, {
+        canvasId: 'canvas-1', expectedRevision: 3, startNodeIds: ['root'],
+        goal: '完成主视觉', maxImageRuns: 1,
+      }, 'tool-call-real-1')
+      const waitingRun = (await firstService.listPage(context, 'canvas-1')).runs[0]!
+      expect(first.status).toBe('waiting-review')
+      expect(config.adoptedAssetId).toBe('asset-first-1')
+      expect(document.nodes.find((node) => node.id === 'image' && node.kind === 'image')?.adoptedAssetId)
+        .toBe('asset-first-1')
+      expect(agentStarts).toEqual(['root'])
+      const persistedReceipt = await candidateService.getCandidateAdoption({
+        ...target,
+        batchId: 'batch-real-1',
+        nodeId: 'image',
+        jobId: 'task-real-1',
+      })
+      expect(persistedReceipt).toEqual({ assetId: 'asset-first-1', committedAt: 40 })
+      /** 重新创建服务模拟重启；后台对账不能将真实首选 receipt 视为验收。 */
+      const automaticService = createCanvasWorkflowExecutionService(dependencies)
+      const automatic = await automaticService.resume(context, {
+        ...target, runId: waitingRun.id,
+      }, undefined, { automatic: true })
+      expect(automatic.status).toBe('waiting-review')
+      expect(agentStarts).toEqual(['root'])
+      expect(imageStarts).toBe(1)
+
+      /** 分别破坏图或配置的一侧，验证恢复不能把局部一致误判为正式采用。 */
+      if (!scenario.graphMatches) {
+        document = {
+          ...document,
+          nodes: document.nodes.map((node) => node.id === 'image' && node.kind === 'image'
+            ? { ...node, adoptedAssetId: undefined }
+            : node),
+        }
+      }
+      if (!scenario.configMatches) config = { ...config, adoptedAssetId: null }
+
+      const secondService = createCanvasWorkflowExecutionService(dependencies)
+      const resumed = await secondService.resume({ ...context, runStartedAt: 99 }, {
+        ...target,
+        runId: waitingRun.id,
+      })
+
+      expect(resumed.status).toBe(scenario.expectedStatus)
+      expect(imageStarts).toBe(1)
+      expect(agentStarts).toEqual(scenario.expectedStatus === 'completed'
+        ? ['root', 'finisher']
+        : ['root'])
+    })
+  }
 
   test('Given 音频 typed input 与本次输出 When 执行并采用 Then 固定输入哈希且恢复不重投媒体 run', async () => {
     const root = mkdtempSync(join(tmpdir(), 'proma-workflow-media-'))

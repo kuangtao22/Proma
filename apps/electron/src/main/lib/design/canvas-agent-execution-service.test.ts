@@ -263,6 +263,8 @@ describe('Canvas Agent 统一执行服务', () => {
         allowedToolNames: [knownTool.name, unknownTool.name],
         allowedToolNamesMode: 'extend',
         singleApprovalToolNames: [knownTool.name, unknownTool.name],
+        /** 未进入父编排白名单的工具不能继承上游自主授权。 */
+        toolApprovalPolicy: { getMode: () => 'automatic', subscribe: () => () => {} },
       },
       inspectHeadlessExtensions: (extensions) => {
         inspected = true
@@ -270,6 +272,8 @@ describe('Canvas Agent 统一执行服务', () => {
         expect(extensions?.allowedToolNames).not.toContain(unknownTool.name)
         expect(extensions?.piCustomTools?.map((tool) => tool.name)).toEqual([knownTool.name])
         expect(extensions?.singleApprovalToolNames).toEqual([knownTool.name])
+        expect(extensions?.toolApprovalPolicy?.getMode(knownTool.name)).toBe('automatic')
+        expect(extensions?.toolApprovalPolicy?.getMode(unknownTool.name)).toBe('ask')
       },
     })
 

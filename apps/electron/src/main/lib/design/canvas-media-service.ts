@@ -519,7 +519,10 @@ export class CanvasMediaService {
       options.signal?.throwIfAborted()
       run = this.dependencies.supervisor.start(input.projectId, run.id, run.revision)
     }
-    if (run.phase === 'succeeded') await this.attachCandidate(input, operation, run)
+    if (run.phase === 'succeeded') {
+      await this.attachCandidate(input, operation, run)
+      await this.adoptInitialVideo(input)
+    }
     return run
   }
 
@@ -835,6 +838,14 @@ export class CanvasMediaService {
 
   /** 按 selectedKeys 独立采用；显式 bundle 必须一次选择完整同组。 */
   async adopt(input: AdoptCanvasMediaCandidateInput): Promise<CanvasMediaModuleConfig> {
+    return this.commitAdoption(input)
+  }
+
+  /** 默认选择与明确采用共用资产校验、配置 CAS 和可恢复传播，来源只能由 Host 指定。 */
+  private async commitAdoption(
+    input: AdoptCanvasMediaCandidateInput,
+    selectionOrigin?: 'initial',
+  ): Promise<CanvasMediaModuleConfig> {
     await this.dependencies.authorizeTarget(input, 'write')
     const state = await this.dependencies.store.load(input)
     if (state.config.revision !== input.expectedConfigRevision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
@@ -863,6 +874,7 @@ export class CanvasMediaService {
     for (const output of candidate.outputs) {
       if (selected.has(output.key)) adoptedByKey.set(output.key, {
         ...output, candidateId: candidate.id, runId: candidate.runId, asset: { ...output.asset },
+        ...(selectionOrigin ? { selectionOrigin } : {}),
       })
     }
     const config: CanvasMediaModuleConfig = {
@@ -914,6 +926,45 @@ export class CanvasMediaService {
       if (run.phase === 'succeeded') await this.attachCandidate(target, operation, run)
     }
     await this.flushPendingAdoption(target)
+    /** 已有视频的普通刷新无需再读取模块或申请默认采用写权限。 */
+    if (!state.config.adoptedOutputs.some((output) => output.mediaKind === 'video')) await this.adoptInitialVideo(target)
+  }
+
+  /** 空视频从当前配置对应的最早有效候选初始化主输出；重跑和并发人工选择优先。 */
+  private async adoptInitialVideo(target: CanvasMediaTarget): Promise<void> {
+    if (target.mediaKind !== 'video') return
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      /** 只读项目仍能浏览历史，不通过 LOAD 绕过写权限。 */
+      try { await this.dependencies.authorizeTarget(target, 'write') } catch { return }
+      const state = await this.dependencies.store.load(target)
+      if (state.pendingAdoptionProjection || state.config.adoptedOutputs.some((output) => output.mediaKind === 'video')) return
+      /** 候选顺序来自完成时间，不依赖目录扫描或 UI 倒序展示。 */
+      const candidates = [...state.candidates].sort((left, right) => left.createdAt - right.createdAt)
+      /** 一次只选择主视频及其显式 bundle，未成组的音轨、海报保留原选择。 */
+      let selection: { candidateId: string; selectedKeys: string[] } | null = null
+      for (const candidate of candidates) {
+        if (candidate.sourceConfigRevision !== state.config.revision) continue
+        const primary = candidate.outputs.find((output) => output.mediaKind === 'video' && output.role === 'primary')
+        if (!primary) continue
+        const selectedOutputs = primary.bundle
+          ? candidate.outputs.filter((output) => output.bundle === primary.bundle)
+          : [primary]
+        if (selectedOutputs.some((output) => state.config.adoptedOutputs.some((adopted) => adopted.key === output.key)
+          || !state.config.outputs.some((binding) => binding.key === output.key && binding.mediaKind === output.mediaKind
+            && binding.order === output.order && binding.role === output.role && binding.bundle === output.bundle))) continue
+        selection = { candidateId: candidate.id, selectedKeys: selectedOutputs.map((output) => output.key) }
+        break
+      }
+      if (!selection) return
+      try {
+        await this.commitAdoption({ ...target, expectedConfigRevision: state.config.revision, ...selection }, 'initial')
+        return
+      } catch (error) {
+        /** 只有版本竞争可以重读；资产损坏、授权撤销和传播失败继续向调用方报错。 */
+        if (!(error instanceof Error) || !['CANVAS_MEDIA_STATE_CONFLICT', 'CANVAS_MEDIA_CONFIG_CONFLICT'].includes(error.message)) throw error
+      }
+    }
+    throw new Error('CANVAS_MEDIA_STATE_CONFLICT')
   }
 
   /** 重放已提交采用事实，Host 幂等成功后才清除持久 marker。 */

@@ -150,6 +150,39 @@ describe('Canvas 操作工具', () => {
       .rejects.toThrow('CANVAS_OPERATION_RESPONSE_TOO_LARGE')
   })
 
+  test('Given 图片任务查询带等待时间 When 校验输入 Then 只接受 0 到 30000 毫秒整数', async () => {
+    const received: unknown[] = []
+    const tools = createCanvasOperationTools(
+      { getTask: async (input) => { received.push(input); return { status: 'running' } } },
+      context,
+      { authorizeRead: () => undefined, requireLinkedCanvas: () => ({}) as never },
+      () => 'operation-1',
+    )
+
+    await executeOperation(tools, 'canvas_get_task', { ...createValidInputs().canvas_get_task!, waitMs: 30_000 })
+    expect(received).toEqual([{ ...createValidInputs().canvas_get_task!, waitMs: 30_000, projectId: 'project-1' }])
+    for (const waitMs of [-1, 30_001, 1.5]) {
+      await expect(executeOperation(tools, 'canvas_get_task', {
+        ...createValidInputs().canvas_get_task!, waitMs,
+      })).rejects.toThrow('CANVAS_OPERATION_INPUT_INVALID')
+    }
+  })
+
+  test('Given 重试和查询工具 When 读取描述 Then 明确要求沿 replacementJobId 等待真实终态', () => {
+    const tools = createCanvasOperationTools(
+      createAllHandlers(), context,
+      { authorizeRead: () => undefined, requireLinkedCanvas: () => ({}) as never },
+      () => 'operation-1',
+    )
+    const descriptions = Object.fromEntries(tools.map((tool) => [tool.name, tool.description]))
+
+    expect(descriptions.canvas_retry_task).toContain('replacementJobId')
+    expect(descriptions.canvas_retry_task).toContain('canvas_get_task')
+    expect(descriptions.canvas_get_task).toContain('waitMs')
+    expect(descriptions.canvas_get_task).toContain('同一 job')
+    expect(descriptions.canvas_get_task).toContain('失败')
+  })
+
   test('Given 异步读取期间收到取消或权限撤销 When 处理器完成 Then 响应前 fresh 校验并拒绝过期结果', async () => {
     const gate = Promise.withResolvers<void>()
     const entered = Promise.withResolvers<void>()

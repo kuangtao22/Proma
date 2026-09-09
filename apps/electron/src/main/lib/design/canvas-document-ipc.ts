@@ -129,6 +129,7 @@ import type {
 import { createCanvasToolRun } from './canvas-tool-provider'
 import { paginateCanvasOperationRecords, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import type { CanvasTaskOperationService } from './canvas-task-operation-service'
+import { waitForCanvasImageTaskTerminal } from './canvas-task-waiter'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasNodeReferenceResolver } from './canvas-node-reference-resolver'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
@@ -1174,7 +1175,8 @@ export function registerCanvasDocumentIpcHandlers(
   const imageArtifactAdapter = createCanvasImageArtifactAdapter({
     read: options.imageModules.load,
     update: options.imageModules.save,
-    listJobs: options.imageJobs.listCanvasImageJobs,
+    /** Manager 依赖实例索引，必须保留接收者，不能将方法作为裸函数传入。 */
+    listJobs: (target) => options.imageJobs.listCanvasImageJobs(target),
     listAssets: options.imageAssets.list,
     run: async (target) => {
       /** 统一 run 继续创建并启动现有 Design Job，不引入第二套执行器。 */
@@ -1841,15 +1843,44 @@ export function registerCanvasDocumentIpcHandlers(
   /** 新 Agent 操作调用既有生命周期；写守卫内再次核对本轮权限。 */
   const canvasOperationHandlers: CanvasOperationToolHandlers = {
     ...(options.taskOperations ? {
-      getTask: async (input, execution) => runArtifactReconciled(input, async () => {
+      getTask: async (input, execution) => {
+        /** 无等待查询保持原单次受控读取；等待查询先在锁内固定当前模块身份。 */
+        const readDetails = (expectedTarget?: CanvasImageTarget) => runArtifactReconciled(input, async () => {
+          execution.validateAccess()
+          const currentTarget = requireOperationImageTarget(input)
+          if (expectedTarget && currentTarget.imageModuleId !== expectedTarget.imageModuleId) {
+            throw new Error('CANVAS_TASK_IDENTITY_MISMATCH')
+          }
+          const details = await options.taskOperations!.getTaskLocked({ ...currentTarget, jobId: input.jobId,
+            ...(input.cursor ? { attemptCursor: input.cursor } : {}), ...(input.limit ? { attemptLimit: input.limit } : {}),
+            ...(input.logs ? { logs: input.logs } : {}) })
+          execution.validateAccess()
+          return { ...details }
+        })
+        if (input.waitMs === undefined || input.waitMs === 0) return readDetails()
+        const target = await runArtifactReconciled(input, async () => {
+          execution.validateAccess()
+          const currentTarget = requireOperationImageTarget(input)
+          const currentJob = options.imageJobs.getProjectJob(input.projectId, input.jobId)
+          if (!currentJob || currentJob.id !== input.jobId || !isOwnedImageJob(currentJob, currentTarget)) {
+            throw new Error('CANVAS_TASK_IDENTITY_MISMATCH')
+          }
+          return currentTarget
+        })
+        /** 等待阶段只订阅任务事件，不进入 Canvas/workspace 写锁；结束后再受控读取详情。 */
+        const waitResult = await waitForCanvasImageTaskTerminal({ ...target, jobId: input.jobId }, input.waitMs, {
+          readCurrent: () => options.imageJobs.getProjectJob(input.projectId, input.jobId),
+          subscribe: (listener) => options.imageJobs.onChanged(listener),
+          ...(execution.signal ? { signal: execution.signal } : {}),
+        })
         execution.validateAccess()
-        const target = requireOperationImageTarget(input)
-        const details = await options.taskOperations!.getTaskLocked({ ...target, jobId: input.jobId,
-          ...(input.cursor ? { attemptCursor: input.cursor } : {}), ...(input.limit ? { attemptLimit: input.limit } : {}),
-          ...(input.logs ? { logs: input.logs } : {}) })
-        execution.validateAccess()
-        return { ...details }
-      }),
+        const details = await readDetails(target)
+        const withWaitOutcome = { ...details, waitOutcome: waitResult }
+        /** 领域详情可能已接近 64KiB，等待标记不得挤掉真实错误或日志。 */
+        return Buffer.byteLength(JSON.stringify(withWaitOutcome), 'utf8') <= 64 * 1024
+          ? withWaitOutcome
+          : details
+      },
       cancelTask: async (input, execution) => runArtifactReconciled(input, async () => {
         execution.validateAccess()
         requireWritableProject(input.projectId, options)
@@ -1864,7 +1895,18 @@ export function registerCanvasDocumentIpcHandlers(
         const target = requireOperationImageTarget(input)
         await options.imageJobTarget.assertTarget(target.projectId, { kind: 'canvas-image', canvasId: target.canvasId, nodeId: target.nodeId, imageModuleId: target.imageModuleId })
         execution.validateAccess()
-        return { ...await options.taskOperations!.retryTaskLocked({ ...target, jobId: input.jobId, operationId: execution.operationId }) }
+        const result = await options.taskOperations!.retryTaskLocked({ ...target, jobId: input.jobId, operationId: execution.operationId })
+        return {
+          ...result,
+          nextAction: {
+            tool: 'canvas_get_task',
+            canvasId: input.canvasId,
+            nodeId: input.nodeId,
+            jobId: result.replacementJobId,
+            waitMs: 30_000,
+            reason: '重试已提交，必须继续查询同一 replacementJobId 直到终态。',
+          },
+        }
       }),
     } satisfies CanvasOperationToolHandlers : {}),
     ...(options.artifactExport ? {
@@ -2308,7 +2350,9 @@ export function registerCanvasDocumentIpcHandlers(
         let replayed = false
         if (validateAccess) {
           try {
-            replayed = (await options.imageCandidateBatches.load({ ...input, batchId })).status === 'adopted'
+            replayed = (await options.imageCandidateBatches.load({
+              projectId: input.projectId, canvasId: input.canvasId, batchId,
+            })).status === 'adopted'
           } catch (error) {
             if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
           }

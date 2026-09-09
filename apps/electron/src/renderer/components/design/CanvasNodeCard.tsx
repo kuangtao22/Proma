@@ -121,10 +121,10 @@ export function createCanvasNodeChildTypeSelectHandler(
   return () => onCreateChild(sourceNodeId, kind)
 }
 
-/** Agent 折叠态保留既有运行与故障图标，其他类型无需额外状态图标。 */
+/** Agent 折叠态只保留故障和空闲图标；运行图标统一由卡片标题栏提供。 */
 function CanvasNodeStatusIcon({ kind, statusLabel }: Pick<CanvasNodeCardProps, 'kind' | 'statusLabel'>): React.ReactElement | null {
   if (kind !== 'agent') return null
-  if (statusLabel === '运行中') return <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
+  if (statusLabel === '运行中') return null
   if (statusLabel === '会话不可用') return <CircleAlert className="size-3.5" aria-hidden="true" />
   return <Bot className="size-3.5" aria-hidden="true" />
 }
@@ -175,6 +175,13 @@ export function CanvasNodeCard({
   const accessibleMediaProgress = mediaProgress?.nodeProgressLabel
     ? `，${mediaProgress.nodeProgressLabel}`
     : ''
+  /** 排队与运行态统一显示加载反馈，CSS 动画不触发 React 逐帧更新。 */
+  const showLoadingIndicator = activityState === 'queued' || activityState === 'running'
+  /** 状态文案已表达活动态时不重复朗读同一句。 */
+  const accessibleActivityLabel = activityState !== 'idle'
+    && CANVAS_NODE_ACTIVITY_LABELS[activityState] !== visibleStatusLabel
+    ? `，${CANVAS_NODE_ACTIVITY_LABELS[activityState]}`
+    : ''
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <div
@@ -201,13 +208,22 @@ export function CanvasNodeCard({
             hasDynamicHeight ? 'h-full' : 'h-[144px]',
             selected ? 'border-primary ring-2 ring-primary/25' : 'border-border',
           )}
-          aria-label={`${label}：${title}，${visibleStatusLabel}${accessibleMediaProgress}${activityState === 'idle' ? '' : `，${CANVAS_NODE_ACTIVITY_LABELS[activityState]}`}`}
+          aria-label={`${label}：${title}，${visibleStatusLabel}${accessibleMediaProgress}${accessibleActivityLabel}`}
         >
           <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4">
             <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
               <Icon className="size-4" aria-hidden="true" />
             </span>
             <span className="min-w-0 flex-1 text-xs font-medium text-muted-foreground">{label}</span>
+            {showLoadingIndicator ? (
+              <span
+                data-canvas-node-loading-indicator
+                className="flex size-7 shrink-0 items-center justify-center text-primary"
+                aria-hidden="true"
+              >
+                <LoaderCircle className="size-4 animate-spin motion-reduce:animate-none" />
+              </span>
+            ) : null}
             {toolbar}
             {onReferenceNode ? (
               <Popover>

@@ -1795,6 +1795,7 @@ export function createNativeCanvasWorkspaceController(
           startAuthoritativeRecovery()
           return
         }
+        console.error('[NativeCanvasWorkspace] 画布保存失败:', error)
         activeSave = null
         dependencies.updateState((latest) => ({
           pendingMutations: [...batch, ...latest.pendingMutations],

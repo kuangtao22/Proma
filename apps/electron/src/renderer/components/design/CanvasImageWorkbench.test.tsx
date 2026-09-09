@@ -201,6 +201,26 @@ function renderWorkbench(
 }
 
 describe('Canvas 生图工作台', () => {
+  test('Given 当前目录包含供应商名称 When 展示已选模型 Then 显示供应商和模型名称', () => {
+    /** 展示必须来自当前模型目录，不使用历史任务快照。 */
+    const option = { ...createModelOption(), channelName: 'GPT-传贝' }
+    /** 使用真实工作台渲染验证已选标签。 */
+    const html = renderWorkbench(createState(), true, { imageModelOptions: [option] })
+
+    expect(html).toContain('GPT-传贝 · GPT Image 2')
+    expect(html).not.toContain('GPT Image 2 · gpt-image-2</span>')
+  })
+
+  test('Given 当前 API 模型的供应商已不存在 When 展示已选模型 Then 明确标注供应商不可用', () => {
+    /** 缺少供应商名称不能把模型名称冒充供应商。 */
+    const html = renderWorkbench(createState(), true, {
+      imageModelOptions: [{ ...createModelOption(), available: false, unavailableReason: '关联的模型配置已不存在' }],
+    })
+
+    expect(html).toContain('供应商不可用 · GPT Image 2')
+    expect(html).toContain('关联的模型配置已不存在')
+  })
+
   test('Given 新图片工作流有画布默认连接 When 初始化 Then 继承默认；已有连接始终优先', () => {
     expect(resolveCanvasImageWorkflowConnection(null, 'connection-default')).toBe('connection-default')
     expect(resolveCanvasImageWorkflowConnection({
@@ -463,11 +483,11 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('导入参考素材')
   })
 
-  test('Given 配置内容超过工作台高度 When 渲染 Then 主操作固定在底部且工作台保持可滚动', () => {
+  test('Given 配置内容超过工作台高度 When 渲染 Then 主操作位于配置滚动区之外', () => {
     const html = renderWorkbench(createState())
 
     expect(html).toContain('aria-label="生图主操作"')
-    expect(html).toMatch(/aria-label="生图主操作"[^>]*class="[^"]*sticky[^"]*bottom-0/u)
+    expect(html).toMatch(/<\/div><\/div><footer aria-label="生图主操作"/u)
     expect(html).toContain('aria-label="生图节点工作台内容"')
   })
 
@@ -485,7 +505,7 @@ describe('Canvas 生图工作台', () => {
     expect(html).not.toContain('Agent 正在')
   })
 
-  test('Given 最近任务失败 When 渲染 Then 显示清洗错误、重试和详情入口', () => {
+  test('Given 最近任务失败 When 渲染 Then 显示错误并允许按当前配置生成和查看详情', () => {
     const current = createState()
     const failed = { ...createJob('job-failed', 'failed'), error: '模型服务暂时不可用' }
     const html = renderWorkbench({
@@ -494,8 +514,21 @@ describe('Canvas 生图工作台', () => {
     })
 
     expect(html).toContain('模型服务暂时不可用')
-    expect(html).toContain('重试生成')
+    expect(html).toContain('按当前配置生成')
+    expect(html).not.toContain('重试生成')
     expect(html).toContain('查看任务详情')
+  })
+
+  test('Given 旧任务失败且当前模型不可用 When 渲染 Then 生成仍受当前配置校验约束', () => {
+    /** 旧失败不能绕过当前目录的模型可用性和生成按钮校验。 */
+    const current = createState()
+    const html = renderWorkbench({
+      ...current,
+      snapshot: current.snapshot ? { ...current.snapshot, jobs: [createJob('job-failed', 'failed')] } : null,
+    }, true, { imageModelOptions: [{ ...createModelOption(), available: false }] })
+
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*?<\/svg>按当前配置生成<\/button>/u)
+    expect(html).not.toContain('重试生成')
   })
 
   test('Given 历史版本被预览 When 渲染 Then 原图切换且采用入口只在历史项内', () => {

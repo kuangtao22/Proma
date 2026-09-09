@@ -174,7 +174,7 @@ export interface DesignJobManagerDependencies {
   assetService: Pick<DesignAssetService, 'resolveAssetPath' | 'importAuthorizedFiles'>
   /** Canvas 图片输出采用与节点投影修复边界；旧 Design 路径不依赖它。 */
   canvasImageTargetAdapter?: CanvasImageJobTargetAdapter
-  /** 新候选链路存在时，Canvas 图片成功输出只登记候选，不自动采用。 */
+  /** 新候选链路负责登记输出，并仅为仍无默认素材的首次成功结果完成采用。 */
   canvasImageCandidateBatches?: {
     recordJobTerminal: (event: {
       projectId: string
@@ -184,6 +184,8 @@ export interface DesignJobManagerDependencies {
       status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
       outputAssetId: string | null
       error: string | null
+      /** 启动时只恢复旧候选，不把历史重放当作新生成。 */
+      skipInitialAdoption?: boolean
       singleBatchRecovery?: {
         nodeId: string
         imageModuleId: string
@@ -675,6 +677,23 @@ export class DesignJobManager {
     this.ensureCanvasImageIndex(projectId)
     const job = this.jobs.get(jobId)
     return job?.projectId === projectId ? clonePublicDesignJob(job) : undefined
+  }
+
+  /**
+   * 证明自动首选正在消费本任务已进入提交阶段的输出，不公开 journal 恢复字段。
+   * @param projectId 已授权项目 ID。
+   * @param jobId 精确 Canvas 图片任务 ID。
+   * @param assetId 本次终态事件携带的素材 ID；调用方仍须复核 Asset 来源。
+   * @returns 当前运行的 pending 输出是否与请求完全一致。
+   */
+  isPendingCanvasImageOutput(projectId: string, jobId: string, assetId: string): boolean {
+    if (!isSafeDesignStableId(projectId) || !isSafeDesignStableId(jobId)) return false
+    this.ensureCanvasImageIndex(projectId)
+    /** 读取已建立的项目索引，不为逐个完成的任务重新扫描历史。 */
+    const job = this.jobs.get(jobId)
+    return job?.projectId === projectId && job.target.kind === 'canvas-image'
+      && job.status === 'running' && job.terminalState?.status === 'pending'
+      && job.terminalState.outputAssetId === assetId
   }
 
   /**
@@ -1170,6 +1189,7 @@ export class DesignJobManager {
               outputAssetId: job.outputAssetId,
               error: null,
               singleBatchRecovery,
+              skipInitialAdoption: true,
             })
           } catch (error) {
             this.warn(`[Canvas 图片候选] 成功任务 ${job.id} 的批次恢复失败: ${String(error)}`)
@@ -1800,7 +1820,7 @@ export class DesignJobManager {
             : {}),
         })
       } else {
-        /** 旧装配兼容分支；生产接入候选服务后不再自动采用。 */
+        /** 旧装配兼容分支；生产由候选服务负责区分首次采用和后续候选。 */
         await targetAdapter.adoptOutput(job.projectId, job.target, asset.id)
       }
       this.updateStatus(pending, 'succeeded', {

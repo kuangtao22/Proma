@@ -48,6 +48,8 @@ export interface CanvasImageCandidateJobTerminalEvent extends CanvasTarget {
   status: 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
   outputAssetId: string | null
   error: string | null
+  /** 启动补登记历史成功任务时不追溯修改用户原来的默认选择。 */
+  skipInitialAdoption?: boolean
   /** 仅旧版单节点批次文件丢失时使用的可信重建基线；多节点任务不得提供。 */
   singleBatchRecovery?: Omit<CreateCanvasImageCandidateBatchEntry, 'jobId'>
 }
@@ -92,10 +94,25 @@ export interface CanvasImageCandidateAdoptionReconciliation {
   error?: Error
 }
 
+/** 按原批次任务查询当前真实采用事实，不改变画布或工作流状态。 */
+export interface ReadCanvasImageCandidateAdoptionInput extends CanvasTarget {
+  batchId: string
+  nodeId: string
+  jobId: string
+  /** 自动推进为 false；只有明确继续才能接纳原先等待中的首选结果。 */
+  acceptInitialAdoption?: boolean
+}
+
+/** 已采用素材及不可变采用时间，供工作流恢复使用。 */
+export interface CanvasImageCandidateAdoptionFact {
+  assetId: string
+  committedAt: number
+}
+
 /** 候选批次业务服务依赖。 */
 export interface CanvasImageCandidateBatchServiceDependencies {
   store: CanvasImageCandidateBatchStore
-  /** 正式采用时复用的纯依赖提示投影；候选创建和终态登记不得调用。 */
+  /** 正式采用时复用的纯依赖提示投影；仅首次成功的空节点可在终态登记时采用。 */
   dependencyState: CanvasDependencyStateService
   runExclusive: <T>(target: CanvasTarget, effect: () => Promise<T>) => Promise<T>
   loadConfig: (target: CanvasImageTarget) => Promise<CanvasImageModuleConfig>
@@ -120,7 +137,13 @@ export interface CanvasImageCandidateBatchServiceDependencies {
   /** 定向重试前复核节点仍绑定目标图片模块，防止删除或换绑后的陈旧重试。 */
   assertRetryTarget?: (target: CanvasImageTarget) => Promise<void>
   /** 候选 Asset、Job 与血缘的额外权威验证。 */
-  validateCandidate?: (batch: CanvasImageCandidateBatch, entry: CanvasImageCandidateBatchEntry) => Promise<void>
+  validateCandidate?: (
+    batch: CanvasImageCandidateBatch,
+    entry: CanvasImageCandidateBatchEntry,
+    allowPendingOutput?: boolean,
+  ) => Promise<void>
+  /** 首次采用及其恢复事实只在 Canvas 串行锁释放后发布。 */
+  publishAdoption?: (publication: CanvasImageCandidateAdoptionPublication) => void
   now?: () => number
   randomUUID?: () => string
   /** 正式采用事务完成后的非阻塞通知，仅供原已授权工作流恢复。 */
@@ -136,6 +159,7 @@ export interface CanvasImageCandidateBatchService {
   recordJobTerminal(event: CanvasImageCandidateJobTerminalEvent): Promise<void>
   onChanged(listener: CanvasImageCandidateBatchChangedListener): () => void
   load(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
+  getCandidateAdoption(input: ReadCanvasImageCandidateAdoptionInput): Promise<CanvasImageCandidateAdoptionFact | null>
   continueBatch(input: CanvasTarget & { batchId: string }): Promise<CanvasImageCandidateBatch>
   retryJob(input: RetryCanvasImageCandidateJobInput): Promise<string>
   /** 调用方已持有同一 Canvas 串行权时定向重试，避免重复获取非重入锁。 */
@@ -215,7 +239,7 @@ function getInvalidatedDownstreamNodeIds(
 ): string[] {
   return dependencyState.consumeAndPropagate({
     document,
-    producerNodeIds: intent.entries.map((entry) => entry.nodeId),
+    producerNodeIds: intent.entries.filter((entry) => !entry.alreadyAdopted).map((entry) => entry.nodeId),
     changedAt: intent.createdAt,
   }).downstreamNodeIds
 }
@@ -231,26 +255,32 @@ function createAdoptionProjection(
   /** 统一纯服务同时消费 producer 自身提示并聚合直接下游。 */
   const dependencyProjection = dependencyState.consumeAndPropagate({
     document,
-    producerNodeIds: intent.entries.map((entry) => entry.nodeId),
+    producerNodeIds: intent.entries.filter((entry) => !entry.alreadyAdopted).map((entry) => entry.nodeId),
     changedAt: intent.createdAt,
   })
   /** 在同一节点投影内叠加正式采用素材，保证只发生一次图 mutation。 */
-  const nodes = dependencyProjection.nodes.map((node): CanvasNode => {
+  const projectedNodes = new Map(dependencyProjection.nodes.map((node) => [node.id, node]))
+  /** 保留已采用条目的当前节点，仅实际变化的 producer 消费和传播提示。 */
+  const nodes = document.nodes.flatMap((node): CanvasNode[] => {
     const entry = entryByNodeId.get(node.id)
-    if (!entry) return node
+    const projected = projectedNodes.get(node.id)
+    if (!entry) return projected ? [projected] : []
     if (node.kind !== 'image'
       || node.imageModuleId !== entry.imageModuleId
       || (node.adoptedAssetId ?? null) !== entry.oldAssetId) {
       throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
     }
-    return { ...node, adoptedAssetId: entry.candidateAssetId }
+    /** 投影必须保持原节点类型，才能叠加图片采用字段。 */
+    const imageNode = projected ?? node
+    if (imageNode.kind !== 'image') throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
+    return [{ ...imageNode, adoptedAssetId: entry.candidateAssetId }]
   })
   if (nodes.filter((node) => entryByNodeId.has(node.id)).length !== intent.entries.length) {
     throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
   }
   /** 用 reducer 等价的 upsert 结果计算崩溃后可证明的最终图哈希。 */
   const projectedByNodeId = new Map(nodes.map((node) => [node.id, node]))
-  const expectedDocument: CanvasDocument = {
+  const expectedDocument: CanvasDocument = intent.entries.every((entry) => entry.alreadyAdopted) ? document : {
     ...document,
     revision: document.revision + 1,
     nodes: document.nodes.map((node) => projectedByNodeId.get(node.id) ?? node),
@@ -274,6 +304,19 @@ export function createCanvasImageCandidateBatchService(
     const value = (dependencies.now ?? Date.now)()
     if (!Number.isSafeInteger(value) || value < 0) throw new Error('CANVAS_IMAGE_BATCH_TIME_INVALID')
     return value
+  }
+
+  /** 从稳定项目、节点和 Job 身份派生首次采用 receipt，供提交和恢复查询共用。 */
+  const initialAdoptionBatchId = (target: CanvasImageTarget, jobId: string): string => (
+    `agent-canvas-${createHash('sha256').update(JSON.stringify([
+      'initial-image-adoption', target.projectId, target.canvasId, target.nodeId, target.imageModuleId, jobId,
+    ])).digest('hex')}`
+  )
+
+  /** 从首次采用批次 ID 稳定派生原生 helper 支持的 UUID，重放沿用同一 intent。 */
+  const initialAdoptionOperationId = (batchId: string): string => {
+    const hash = createHash('sha256').update(batchId).digest('hex')
+    return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
   }
 
   /** 写入批次初始事实；调用方负责确保同 Canvas 串行。 */
@@ -360,7 +403,7 @@ export function createCanvasImageCandidateBatchService(
       }
       let config = await dependencies.loadConfig(imageTarget)
       if (entry.committedConfigRevision === null) {
-        if (config.revision === entry.expectedConfigRevision
+        if (!entry.alreadyAdopted && config.revision === entry.expectedConfigRevision
           && config.adoptedAssetId === entry.oldAssetId) {
           try {
             config = await dependencies.adoptAsset(
@@ -377,11 +420,11 @@ export function createCanvasImageCandidateBatchService(
             }
             config = reloaded
           }
-        } else if (config.revision !== entry.expectedConfigRevision + 1
+        } else if (config.revision !== entry.expectedConfigRevision + (entry.alreadyAdopted ? 0 : 1)
           || config.adoptedAssetId !== entry.candidateAssetId) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
         }
-        if (config.revision !== entry.expectedConfigRevision + 1
+        if (config.revision !== entry.expectedConfigRevision + (entry.alreadyAdopted ? 0 : 1)
           || config.adoptedAssetId !== entry.candidateAssetId) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
         }
@@ -402,9 +445,12 @@ export function createCanvasImageCandidateBatchService(
       }
     }
 
-    /** 图提交只允许从原基线推进一次，或由 revision+哈希精确证明已完成。 */
+    /** 全部已采用时只确认批次；有素材变化才推进一次图 revision。 */
+    const requiresGraphCommit = intent.entries.some((entry) => !entry.alreadyAdopted)
+    /** 精确预期版本同时用于普通提交和无图写入的崩溃恢复。 */
+    const expectedCanvasRevision = intent.baseCanvasRevision + (requiresGraphCommit ? 1 : 0)
     let document = await dependencies.loadCanvas(intent)
-    if (document.revision === intent.baseCanvasRevision) {
+    if (requiresGraphCommit && document.revision === intent.baseCanvasRevision) {
       const projection = createAdoptionProjection(document, intent, dependencies.dependencyState)
       try {
         document = await dependencies.applyCanvasProjection(
@@ -414,14 +460,14 @@ export function createCanvasImageCandidateBatchService(
         )
       } catch (error) {
         const reloaded = await dependencies.loadCanvas(intent)
-        if (reloaded.revision !== intent.baseCanvasRevision + 1
+        if (reloaded.revision !== expectedCanvasRevision
           || !matchesGraphSha256(reloaded, intent, dependencies.dependencyState)) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED', { cause: error })
         }
         document = reloaded
       }
     }
-    if (document.revision !== intent.baseCanvasRevision + 1
+    if (document.revision !== expectedCanvasRevision
       || !matchesGraphSha256(document, intent, dependencies.dependencyState)) {
       throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
     }
@@ -485,7 +531,14 @@ export function createCanvasImageCandidateBatchService(
         updatedAt: now(),
       })
     }
-    try { dependencies.onAdopted?.({ projectId: batch.projectId, canvasId: batch.canvasId }) }
+    /** 首选 receipt 只初始化默认素材；显式验收前不得唤醒父工作流。 */
+    const firstEntry = batch.entries[0]
+    const isInitialAdoption = batch.entries.length === 1 && firstEntry !== undefined
+      && batch.batchId === initialAdoptionBatchId({
+        projectId: batch.projectId, canvasId: batch.canvasId,
+        nodeId: firstEntry.nodeId, imageModuleId: firstEntry.imageModuleId,
+      }, firstEntry.jobId)
+    try { if (!isInitialAdoption) dependencies.onAdopted?.({ projectId: batch.projectId, canvasId: batch.canvasId }) }
     catch { reportCanvasImageDiagnostic('CANVAS_IMAGE_BATCH_LISTENER_FAILED') }
     return { batch, document }
   }
@@ -668,9 +721,11 @@ export function createCanvasImageCandidateBatchService(
   const adoptBatchLocked = async (
     input: AdoptCanvasImageCandidateBatchInput,
     execution?: CanvasCandidateAdoptionExecution,
+    /** 内部首选流程已完成对账；仅这个 Job 可验证尚未清除 pending 的输出。 */
+    initialJobId?: string,
   ): Promise<CanvasImageCandidateBatch> => {
     execution?.validateAccess()
-    await requireReconciledLocked(input)
+    if (!initialJobId) await requireReconciledLocked(input)
     const batch = await dependencies.store.load(input, input.batchId)
     execution?.validateAccess()
     if (execution?.expectedCandidateHash !== undefined
@@ -704,23 +759,33 @@ export function createCanvasImageCandidateBatchService(
       throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
     }
     /** 全量预检必须先于 prepared intent，保证普通基线冲突是零副作用。 */
-    for (const entry of candidates) {
+    for (let index = 0; index < candidates.length; index += 1) {
+      /** 自动首选已提交时，显式整批采用可沿当前同素材基线继续，仍拒绝后续配置编辑。 */
+      let entry = candidates[index]!
       const config = await dependencies.loadConfig({
         ...input,
         nodeId: entry.nodeId,
         imageModuleId: entry.imageModuleId,
       })
+      if (entry.initialAdoptedAssetId === null
+        && config.revision === entry.initialConfigRevision + 1
+        && config.adoptedAssetId === entry.candidateAssetId) {
+        entry = { ...entry, initialConfigRevision: config.revision, initialAdoptedAssetId: config.adoptedAssetId }
+        candidates[index] = entry
+      }
       if (config.revision !== entry.initialConfigRevision
         || config.adoptedAssetId !== entry.initialAdoptedAssetId) {
         throw new Error('CANVAS_IMAGE_BATCH_CONFLICT')
       }
-      await dependencies.validateCandidate?.(batch, entry)
+      await dependencies.validateCandidate?.(batch, entry, initialJobId === entry.jobId)
       execution?.validateAccess()
     }
     /** 图基线与目标节点身份同样在任何模块写入前固化。 */
     const document = await dependencies.loadCanvas(input)
     const timestamp = now()
-    const operationId = execution?.operationId ?? (dependencies.randomUUID ?? randomUUID)()
+    const operationId = execution?.operationId ?? (initialJobId
+      ? initialAdoptionOperationId(input.batchId)
+      : (dependencies.randomUUID ?? randomUUID)())
     /** 先构造不含真实哈希的草稿，以复用唯一投影算法。 */
     const draftIntent: CanvasImageCandidateAdoptionIntent = {
       schemaVersion: 1,
@@ -737,6 +802,7 @@ export function createCanvasImageCandidateBatchService(
         candidateAssetId: entry.candidateAssetId!,
         expectedConfigRevision: entry.initialConfigRevision,
         committedConfigRevision: null,
+        ...(entry.initialAdoptedAssetId === entry.candidateAssetId ? { alreadyAdopted: true as const } : {}),
       })),
       expectedGraphSha256: '0'.repeat(64),
       state: 'prepared',
@@ -756,8 +822,10 @@ export function createCanvasImageCandidateBatchService(
   /** 把历史素材登记为单条候选，再沿与新生成结果相同的采用事务提交。 */
   const adoptExistingAssetLocked = async (
     input: AdoptExistingCanvasImageAssetInput,
+    /** 仅内部首次采用传入，公开历史采用仍要求成功 Job。 */
+    initialJobId?: string,
   ): Promise<CanvasImageCandidateBatch> => {
-    await requireReconciledLocked(input)
+    if (!initialJobId) await requireReconciledLocked(input)
     /** 成功 receipt 必须先于当前配置 CAS 检查，保证重放不覆盖用户后续编辑。 */
     let existing: CanvasImageCandidateBatch | undefined
     try {
@@ -809,7 +877,60 @@ export function createCanvasImageCandidateBatchService(
       canvasId: input.canvasId,
       batchId: input.batchId,
       mode: 'all',
-    })
+    }, undefined, initialJobId)
+  }
+
+  /**
+   * 为仍保持任务初始空基线的节点采用首个成功素材，后续结果只保留候选。
+   * @param batch 已完成候选登记的原批次，不改写其它节点的任务或验收状态。
+   * @param event Job Manager 已验证并持久化的输出事实。
+   * @param publications 累积待锁外广播的恢复与新采用结果。
+   */
+  const adoptInitialOutputLocked = async (
+    batch: CanvasImageCandidateBatch,
+    event: CanvasImageCandidateJobTerminalEvent,
+    publications: CanvasImageCandidateAdoptionPublication[],
+  ): Promise<void> => {
+    /** 失败、放弃和已有正式版本的任务无需额外读图或扫描采用事务。 */
+    const entry = batch.entries.find((candidate) => candidate.jobId === event.jobId)
+    if (event.skipInitialAdoption || event.status !== 'succeeded' || !event.outputAssetId || !entry
+      || entry.initialAdoptedAssetId !== null || batch.status === 'abandoned' || batch.status === 'adopted') return
+    /** 先收敛未决采用，避免配置已提交、图未提交时误以为无需继续。 */
+    const reconciliation = await reconcileLocked(event)
+    publications.push(...reconciliation.publications)
+    if (reconciliation.error) throw reconciliation.error
+    /** 后来的人工选择和提示词修改优先于自动首选。 */
+    const target: CanvasImageTarget = {
+      projectId: batch.projectId, canvasId: batch.canvasId,
+      nodeId: entry.nodeId, imageModuleId: entry.imageModuleId,
+    }
+    /** 删除、换绑或图与模块不一致时不创建采用 intent，成功素材仍保留在历史中。 */
+    const document = await dependencies.loadCanvas(target)
+    /** 正式图与模块必须同时为空，不能只按配置推断首选资格。 */
+    const node = document.nodes.find((candidate) => candidate.id === entry.nodeId)
+    if (node?.kind !== 'image' || node.imageModuleId !== entry.imageModuleId || node.adoptedAssetId) return
+    /** 固化配置版本防止运行期间的新配置被旧结果自动采用。 */
+    const config = await dependencies.loadConfig(target)
+    if (config.adoptedAssetId !== null || config.revision !== entry.initialConfigRevision) return
+    /** 每个成功 Job 派生独立 receipt；多节点批次继续等待其它结果，重放使用同一事务。 */
+    const batchId = initialAdoptionBatchId(target, event.jobId)
+    try {
+      await adoptExistingAssetLocked({
+        ...target, jobId: event.jobId, assetId: event.outputAssetId,
+        currentAssetId: null, currentConfigRevision: config.revision, batchId,
+      }, event.jobId)
+    } finally {
+      try {
+        /** 图提交后 receipt 写入可能失败；仍发布可证明已提交的节点，原异常保持不变。 */
+        const latest = await dependencies.loadCanvas(target)
+        /** 只发布本次精确节点与素材，不把其它图变化当作采用成功。 */
+        const adopted = latest.nodes.find((candidate) => candidate.id === target.nodeId)
+        if (latest.revision === document.revision + 1 && adopted?.kind === 'image'
+          && adopted.imageModuleId === target.imageModuleId && adopted.adoptedAssetId === event.outputAssetId) {
+          publications.push({ document: latest, imageTargets: [target] })
+        }
+      } catch { reportCanvasImageDiagnostic('CANVAS_IMAGE_INITIAL_ADOPTION_READ_FAILED') }
+    }
   }
 
   return {
@@ -817,63 +938,79 @@ export function createCanvasImageCandidateBatchService(
     createBatchLocked,
     listActiveSummaries: async (input) => dependencies.store.listActiveSummaries(input),
     recordJobTerminal: async (event) => {
-      /** 先完成权威批次写入并释放同 Canvas 串行锁，再通知等待方重读。 */
-      const changed = await dependencies.runExclusive(event, async (): Promise<CanvasImageCandidateBatchChangedEvent> => {
-        let batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
-        if (!batch
-          && event.status === 'succeeded'
-          && event.candidateBatchId
-          && event.singleBatchRecovery) {
-          /** 成功 replacement 可修复仍指向旧 attempt 的单节点批次；失败旧任务无恢复资格。 */
-          try {
-            const existing = await dependencies.store.load(event, event.candidateBatchId)
-            const entry = assertRecoverableSingleBatch(existing, event.singleBatchRecovery)
-            batch = await dependencies.store.save({
-              ...existing,
-              status: 'running',
-              entries: [{
-                ...entry, jobId: event.jobId, candidateAssetId: null, status: 'queued', error: null,
-              }],
-              updatedAt: now(),
-            })
-          } catch (error) {
-            if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
-            batch = await createBatchLocked({
-              ...event,
-              batchId: event.candidateBatchId,
-              source: 'single',
-              sourceSessionId: null,
-              sourceToolCallId: null,
-              entries: [{ ...event.singleBatchRecovery, jobId: event.jobId }],
-            })
+      /** 即使后续步骤失败，已恢复的正式图事实也必须在锁外发布。 */
+      const publications: CanvasImageCandidateAdoptionPublication[] = []
+      /** 批次写入成功后用于锁外通知等待中的工作流。 */
+      let changed: CanvasImageCandidateBatchChangedEvent
+      try {
+        /** 先完成权威批次写入并释放同 Canvas 串行锁，再通知等待方重读。 */
+        changed = await dependencies.runExclusive(event, async (): Promise<CanvasImageCandidateBatchChangedEvent> => {
+          let batch = await dependencies.store.findByJobId(event, event.jobId, event.candidateBatchId)
+          if (!batch
+            && event.status === 'succeeded'
+            && event.candidateBatchId
+            && event.singleBatchRecovery) {
+            /** 成功 replacement 可修复仍指向旧 attempt 的单节点批次；失败旧任务无恢复资格。 */
+            try {
+              const existing = await dependencies.store.load(event, event.candidateBatchId)
+              const entry = assertRecoverableSingleBatch(existing, event.singleBatchRecovery)
+              batch = await dependencies.store.save({
+                ...existing,
+                status: 'running',
+                entries: [{
+                  ...entry, jobId: event.jobId, candidateAssetId: null, status: 'queued', error: null,
+                }],
+                updatedAt: now(),
+              })
+            } catch (error) {
+              if (!(error instanceof Error) || error.message !== 'CANVAS_IMAGE_BATCH_NOT_FOUND') throw error
+              batch = await createBatchLocked({
+                ...event,
+                batchId: event.candidateBatchId,
+                source: 'single',
+                sourceSessionId: null,
+                sourceToolCallId: null,
+                entries: [{ ...event.singleBatchRecovery, jobId: event.jobId }],
+              })
+            }
           }
-        }
-        if (!batch) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
-        const entries = batch.entries.map((entry): CanvasImageCandidateBatchEntry => {
-          if (entry.jobId !== event.jobId) return entry
-          if (event.status === 'succeeded') {
-            if (!event.outputAssetId) throw new Error('CANVAS_IMAGE_BATCH_OUTPUT_INVALID')
-            return { ...entry, candidateAssetId: event.outputAssetId, status: 'candidate', error: null }
+          if (!batch) throw new Error('CANVAS_IMAGE_BATCH_JOB_NOT_FOUND')
+          /** 已完成采用的原批次不得被迟到终态恢复成 candidate。 */
+          if (batch.status === 'adopted') {
+            return { projectId: batch.projectId, canvasId: batch.canvasId, batchId: batch.batchId, jobId: event.jobId }
           }
+          const entries = batch.entries.map((entry): CanvasImageCandidateBatchEntry => {
+            if (entry.jobId !== event.jobId) return entry
+            if (event.status === 'succeeded') {
+              if (!event.outputAssetId) throw new Error('CANVAS_IMAGE_BATCH_OUTPUT_INVALID')
+              return { ...entry, candidateAssetId: event.outputAssetId, status: 'candidate', error: null }
+            }
+            return {
+              ...entry, candidateAssetId: null, status: 'failed',
+              error: (event.error ?? `任务${event.status}`).slice(0, 1000),
+            }
+          })
+          /** abandoned 只追加历史候选事实，不恢复为待验收状态。 */
+          const saved = await dependencies.store.save({
+            ...batch,
+            entries,
+            status: batch.status === 'abandoned' ? 'abandoned' : deriveStatus(entries),
+            updatedAt: now(),
+          })
+          await adoptInitialOutputLocked(saved, event, publications)
           return {
-            ...entry, candidateAssetId: null, status: 'failed',
-            error: (event.error ?? `任务${event.status}`).slice(0, 1000),
+            projectId: saved.projectId,
+            canvasId: saved.canvasId,
+            batchId: saved.batchId,
+            jobId: event.jobId,
           }
         })
-        /** abandoned 只追加历史候选事实，不恢复为待验收状态。 */
-        const saved = await dependencies.store.save({
-          ...batch,
-          entries,
-          status: batch.status === 'abandoned' ? 'abandoned' : deriveStatus(entries),
-          updatedAt: now(),
-        })
-        return {
-          projectId: saved.projectId,
-          canvasId: saved.canvasId,
-          batchId: saved.batchId,
-          jobId: event.jobId,
+      } finally {
+        for (const publication of publications) {
+          try { dependencies.publishAdoption?.(publication) }
+          catch { reportCanvasImageDiagnostic('CANVAS_IMAGE_INITIAL_ADOPTION_PUBLISH_FAILED') }
         }
-      })
+      }
       for (const listener of listeners) {
         try {
           listener(changed)
@@ -890,6 +1027,38 @@ export function createCanvasImageCandidateBatchService(
     load: async (rawInput) => {
       const input = parseGetCanvasImageCandidateBatchInput(rawInput)
       return dependencies.store.load(input, input.batchId)
+    },
+    getCandidateAdoption: async (input) => {
+      /** 原批次负责证明任务身份；自动首选的提交时间来自独立采用 receipt。 */
+      const batch = await dependencies.store.load(input, input.batchId)
+      const entry = batch.entries.find((candidate) => candidate.nodeId === input.nodeId && candidate.jobId === input.jobId)
+      if (!entry?.candidateAssetId || (entry.status !== 'candidate' && entry.status !== 'adopted')) return null
+      if (entry.status === 'candidate' && input.acceptInitialAdoption === false) return null
+      /** 按原任务绑定重建完整目标，不能由当前节点推断其它模块的采用结果。 */
+      const target: CanvasImageTarget = {
+        projectId: input.projectId, canvasId: input.canvasId,
+        nodeId: input.nodeId, imageModuleId: entry.imageModuleId,
+      }
+      /** 显式整批采用使用原 receipt，自动首选使用稳定派生的独立 receipt。 */
+      let receipt = batch
+      if (entry.status === 'candidate') {
+        try { receipt = await dependencies.store.load(input, initialAdoptionBatchId(target, input.jobId)) }
+        catch (error) {
+          if (error instanceof Error && error.message === 'CANVAS_IMAGE_BATCH_NOT_FOUND') return null
+          throw error
+        }
+      }
+      /** 已采用批次必须精确包含本任务与素材，不能仅凭当前图片相同推断提交。 */
+      if (receipt.status !== 'adopted' || !receipt.adoption
+        || !receipt.entries.some((candidate) => candidate.nodeId === input.nodeId
+          && candidate.imageModuleId === entry.imageModuleId && candidate.jobId === input.jobId
+          && candidate.status === 'adopted' && candidate.candidateAssetId === entry.candidateAssetId)) return null
+      const document = await dependencies.loadCanvas(target)
+      const node = document.nodes.find((candidate) => candidate.id === target.nodeId)
+      if (node?.kind !== 'image' || node.imageModuleId !== target.imageModuleId || node.adoptedAssetId !== entry.candidateAssetId) return null
+      const config = await dependencies.loadConfig(target)
+      if (config.adoptedAssetId !== entry.candidateAssetId) return null
+      return { assetId: entry.candidateAssetId, committedAt: receipt.adoption.committedAt }
     },
     retryJob: async (input) => dependencies.runExclusive(input, () => retryJobLocked(input)),
     retryJobLocked,

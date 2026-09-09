@@ -470,7 +470,10 @@ async function invokeCanvasSafely<T>(
 ): Promise<CanvasInvokeResult<T>> {
   try {
     return await ipc.invoke(channel, input) as CanvasInvokeResult<T>
-  } catch {
+  } catch (error) {
+    if (channel === CANVAS_IPC_CHANNELS.SAVE_MUTATIONS) {
+      console.error('[DesignPreload] Canvas 保存 IPC 调用失败:', error)
+    }
     return { ok: false, error: { ...fallback } }
   }
 }

@@ -16,7 +16,7 @@ import type {
   MediaWorkflowVersion,
 } from '@proma/shared'
 import { validateMediaWorkflowFieldValue } from '@proma/shared'
-import { Check, Download, Eye, FileUp, LoaderCircle, Play, RefreshCw, Square } from 'lucide-react'
+import { AudioLines, Check, Download, Eye, FileUp, Film, History, LoaderCircle, Play, RefreshCw, Square } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -25,6 +25,7 @@ import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { getMediaProjectWatchLeaseRegistry, projectMediaRunProgress } from './use-media-run-progress'
+import { CanvasMediaImagePicker } from './CanvasMediaImagePicker'
 
 /** 媒体工作台只依赖公开 IPC，不读取本地路径。 */
 export type CanvasMediaWorkbenchAdapter = CanvasMediaPreloadApi
@@ -425,7 +426,11 @@ export class CanvasMediaDraftLoadGuard {
 
 /** 把未知异常收敛为工作台可展示文本。 */
 export function getCanvasMediaErrorMessage(cause: unknown, fallback: string): string {
-  return cause instanceof Error ? cause.message : fallback
+  if (!(cause instanceof Error) || !cause.message.trim()) return fallback
+  if (/^(?:Error invoking remote method '[^']+': Error: )?MEDIA_FILE_BUSY$/.test(cause.message)) {
+    return '媒体数据正在被其他操作使用，请稍后重试。（MEDIA_FILE_BUSY）'
+  }
+  return cause.message
 }
 
 /** 保存配置成功后才启动运行，避免运行消费未提交草稿。 */
@@ -449,6 +454,89 @@ export function getCanvasMediaAdoptionKeys(
   return output.bundle
     ? candidate.outputs.filter((item) => item.bundle === output.bundle).map((item) => item.key)
     : [output.key]
+}
+
+/** 候选预览的稳定身份；目标字段由工作台在调用 IPC 时补齐。 */
+export interface CanvasMediaPreviewIdentity {
+  candidateId: string
+  outputKey: string
+  outputOrder: number
+}
+
+/** 判断两个预览身份是否指向同一候选输出。 */
+function isSameCanvasMediaPreviewIdentity(
+  left: CanvasMediaPreviewIdentity,
+  right: CanvasMediaPreviewIdentity,
+): boolean {
+  return left.candidateId === right.candidateId
+    && left.outputKey === right.outputKey
+    && left.outputOrder === right.outputOrder
+}
+
+/**
+ * 解析视频工作台首次应展示的主输出。
+ * 已采用输出优先；尚未采用时按候选创建时间、原数组顺序及输出 order 选择第一份有效视频主输出。
+ */
+export function resolveCanvasMediaDefaultPreview(
+  snapshot: CanvasMediaModuleSnapshot,
+): CanvasMediaPreviewIdentity | null {
+  if (snapshot.target.mediaKind !== 'video') return null
+  for (const adopted of snapshot.config.adoptedOutputs) {
+    if (adopted.mediaKind !== 'video' || adopted.role !== 'primary') continue
+    const candidate = snapshot.candidates.find((item) => item.id === adopted.candidateId)
+    const output = candidate?.outputs.find((item) => (
+      item.key === adopted.key
+      && item.order === adopted.order
+      && item.mediaKind === 'video'
+      && item.role === 'primary'
+    ))
+    if (candidate && output) {
+      return { candidateId: candidate.id, outputKey: output.key, outputOrder: output.order }
+    }
+  }
+  const candidates = snapshot.candidates
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((left, right) => left.candidate.createdAt - right.candidate.createdAt || left.index - right.index)
+  for (const { candidate } of candidates) {
+    const output = candidate.outputs
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.mediaKind === 'video' && item.role === 'primary')
+      .sort((left, right) => left.item.order - right.item.order || left.index - right.index)[0]?.item
+    if (output) return { candidateId: candidate.id, outputKey: output.key, outputOrder: output.order }
+  }
+  return null
+}
+
+/** 记录默认预览的单次尝试与用户手动意图，避免刷新重试风暴或抢回选择。 */
+export class CanvasMediaPreviewAutoloadGuard {
+  /** 当前媒体目标的稳定身份。 */
+  private targetIdentity = ''
+  /** 用户手动预览或采用后，当前目标不再自动切换。 */
+  private manual = false
+  /** 最近一次自动尝试，失败后普通刷新也不会重复读取。 */
+  private attempted: CanvasMediaPreviewIdentity | null = null
+
+  /** 目标变化时清空上个节点的自动尝试和手动选择；同一目标普通刷新保持原记录。 */
+  resetForTarget(targetIdentity: string): void {
+    if (targetIdentity === this.targetIdentity) return
+    this.targetIdentity = targetIdentity
+    this.manual = false
+    this.attempted = null
+  }
+
+  /** 用户已明确选择当前目标的预览，后续快照刷新保持该选择。 */
+  markManual(targetIdentity: string): void {
+    this.resetForTarget(targetIdentity)
+    this.manual = true
+  }
+
+  /** 原子认领一次默认读取；相同目标和输出最多认领一次。 */
+  claim(targetIdentity: string, preview: CanvasMediaPreviewIdentity): boolean {
+    this.resetForTarget(targetIdentity)
+    if (this.manual || (this.attempted && isSameCanvasMediaPreviewIdentity(this.attempted, preview))) return false
+    this.attempted = preview
+    return true
+  }
 }
 
 /** 释放预览授权；null 表示当前没有活跃 lease。 */
@@ -579,21 +667,31 @@ export function CanvasMediaWorkflowForm({
         const update = (changes: Partial<CanvasMediaWorkflowInputDraft>): void => onInputChange(index, { ...input, ...changes })
         const mediaInput = input.kind === 'image' || input.kind === 'audio' || input.kind === 'video'
         return (
-          <div key={input.key} className="grid min-w-0 gap-2 border-b border-border pb-3 sm:grid-cols-[minmax(0,120px)_minmax(0,120px)_minmax(0,1fr)]">
-            <Label className="pt-2 text-xs">{input.label}{input.required ? ' *' : ''}<span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">节点 {input.bindingNodeId || '?'} · {input.bindingInput || input.key}</span></Label>
+          <div key={input.key} className="canvas-media-form-field grid min-w-0 gap-2 border-b border-border pb-3">
+            <Label className="min-w-0 break-words pt-2 text-xs">{input.label}{input.required ? ' *' : ''}<span className="mt-0.5 block break-all font-mono text-[10px] text-muted-foreground">节点 {input.bindingNodeId || '?'} · {input.bindingInput || input.key}</span></Label>
             {allowCanvasOutput && (mediaInput || input.kind === 'text') ? (
               <Select value={input.sourceType} disabled={!writable || busy} onValueChange={(value: 'literal' | 'canvas-output') => update({ sourceType: value })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectTrigger className="canvas-media-form-source h-8 w-28 text-xs"><SelectValue /></SelectTrigger>
                 <SelectContent><SelectItem value="literal">直接值</SelectItem><SelectItem value="canvas-output">Canvas 输出</SelectItem></SelectContent>
               </Select>
-            ) : <div className="hidden sm:block" />}
+            ) : <div className="canvas-media-form-source-empty" />}
+            <div className="canvas-media-form-value min-w-0">
             {input.sourceType === 'canvas-output' ? (
               <div className="grid grid-cols-2 gap-2">
                 <Input aria-label={`${input.label} 来源节点`} placeholder="节点 ID" value={input.sourceNodeId} disabled={!writable || busy} onChange={(event) => update({ sourceNodeId: event.target.value })} />
                 <Input aria-label={`${input.label} 输出 key`} placeholder="输出 key" value={input.outputKey} disabled={!writable || busy} onChange={(event) => update({ outputKey: event.target.value })} />
               </div>
             ) : mediaInput ? (
-              <div className="flex min-w-0 items-center gap-1"><Select value={input.value} disabled={!writable || busy || importingKey !== null} onValueChange={(value) => {
+              <div className="flex min-w-0 items-center gap-1">{input.kind === 'image' ? <CanvasMediaImagePicker
+                projectId={projectId}
+                assets={availableAssets}
+                value={input.value}
+                label={input.label}
+                disabled={!writable || busy || importingKey !== null}
+                onSelect={(asset) => update({ value: asset.id, asset: {
+                  assetId: asset.id, revision: asset.revision, hash: asset.hash, mediaKind: asset.mediaKind,
+                } })}
+              /> : <Select value={input.value} disabled={!writable || busy || importingKey !== null} onValueChange={(value) => {
                 const asset = availableAssets.find((candidate) => candidate.id === value && candidate.mediaKind === input.kind)
                 update({ value, asset: asset ? {
                   assetId: asset.id, revision: asset.revision, hash: asset.hash, mediaKind: asset.mediaKind,
@@ -601,7 +699,7 @@ export function CanvasMediaWorkflowForm({
               }}>
                 <SelectTrigger className="min-w-0 flex-1"><SelectValue placeholder="选择素材" /></SelectTrigger>
                 <SelectContent>{availableAssets.filter((asset) => asset.mediaKind === input.kind).map((asset) => <SelectItem key={asset.id} value={asset.id}>{asset.filename}</SelectItem>)}</SelectContent>
-              </Select>{projectId ? <Button type="button" variant="ghost" size="icon-sm" className="shrink-0" disabled={!writable || busy || importingKey !== null} aria-label={`导入${input.label}`} title={`导入${input.label}`} onClick={() => { void importAsset(index, input) }}>{importingKey === input.key ? <LoaderCircle className="animate-spin" /> : <FileUp />}</Button> : null}</div>
+              </Select>}{projectId ? <Button type="button" variant="ghost" size="icon-sm" className="shrink-0" disabled={!writable || busy || importingKey !== null} aria-label={`导入${input.label}`} title={`导入${input.label}`} onClick={() => { void importAsset(index, input) }}>{importingKey === input.key ? <LoaderCircle className="animate-spin" /> : <FileUp />}</Button> : null}</div>
             ) : input.kind === 'boolean' ? (
               <Switch aria-label={`${input.label} 值`} checked={input.value === 'true'} disabled={!writable || busy} onCheckedChange={(value) => update({ value: String(value) })} />
             ) : input.kind === 'text' ? (
@@ -619,7 +717,8 @@ export function CanvasMediaWorkflowForm({
                 onChange={(event) => update({ value: event.target.value })}
               />
             )}
-            {fieldErrors[input.key] ? <p className="sm:col-start-3 text-xs text-amber-600" role="status">{fieldErrors[input.key]}</p> : null}
+            </div>
+            {fieldErrors[input.key] ? <p className="canvas-media-form-error break-words text-xs text-amber-600" role="status">{fieldErrors[input.key]}</p> : null}
           </div>
         )
   }
@@ -631,7 +730,7 @@ export function CanvasMediaWorkflowForm({
   const basic = inputs.map((input, index) => ({ input, index })).filter(({ input }) => !advanced.some((item) => item.input.key === input.key))
   const advancedProblemCount = advanced.filter(({ input }) => fieldErrors[input.key]).length
   return (
-    <section className="space-y-3" aria-label="工作流输入">
+    <section className="canvas-media-form-container space-y-3" aria-label="工作流输入">
       <h3 className="text-sm font-medium">输入</h3>
       {importError ? <p role="alert" className="text-xs text-destructive">{importError}</p> : null}
       {inputs.length === 0 ? <p className="text-xs text-muted-foreground">当前工作流没有输入。</p> : basic.map(({ input, index }) => renderInput(input, index))}
@@ -683,6 +782,7 @@ export function CanvasMediaWorkbench({
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [preview, setPreview] = React.useState<CanvasMediaOutputPreview | null>(null)
+  const [previewError, setPreviewError] = React.useState<string | null>(null)
   /** LOAD 代次和 dirty 状态不参与渲染，使用单个稳定守卫保存。 */
   const loadGuardRef = React.useRef(new CanvasMediaDraftLoadGuard())
   /** 每个媒体目标拥有独立 lease owner，目标切换会清理旧 owner。 */
@@ -691,6 +791,18 @@ export function CanvasMediaWorkbench({
     stableTarget,
     setPreview,
   ), [adapter, stableTarget])
+  /** 视频默认预览仅尝试一次，并在用户手动选择后停止跟随快照。 */
+  const previewAutoloadGuardRef = React.useRef(new CanvasMediaPreviewAutoloadGuard())
+  /** 预览请求代次隔离快速切换、目标变化及迟到错误。 */
+  const previewRequestGenerationRef = React.useRef(0)
+  /** 目标身份不依赖对象引用，供预览守卫判断真实节点切换。 */
+  const previewTargetIdentity = React.useMemo(() => [
+    stableTarget.projectId,
+    stableTarget.canvasId,
+    stableTarget.nodeId,
+    stableTarget.mediaModuleId,
+    stableTarget.mediaKind,
+  ].join('\u0000'), [stableTarget])
   /** 展开工作台与折叠 AV 卡片共享同一项目 watch 引用计数。 */
   const mediaWatchRegistry = React.useMemo(
     () => getMediaProjectWatchLeaseRegistry(adapter),
@@ -784,7 +896,42 @@ export function CanvasMediaWorkbench({
       void mediaWatchRegistry.release(stableTarget.projectId)
     }
   }, [adapter, load, mediaWatchRegistry, stableTarget])
-  React.useEffect(() => () => { void previewLeaseOwner.release() }, [previewLeaseOwner])
+  React.useEffect(() => {
+    previewAutoloadGuardRef.current.resetForTarget(previewTargetIdentity)
+    setPreviewError(null)
+    return () => {
+      previewRequestGenerationRef.current += 1
+      void previewLeaseOwner.release()
+    }
+  }, [previewLeaseOwner])
+
+  /** 读取精确候选；手动读取允许重试，并阻止后续刷新改回默认项。 */
+  const openPreview = React.useCallback(async (
+    identity: CanvasMediaPreviewIdentity,
+    manual: boolean,
+  ): Promise<void> => {
+    if (manual) previewAutoloadGuardRef.current.markManual(previewTargetIdentity)
+    const requestGeneration = ++previewRequestGenerationRef.current
+    setPreviewError(null)
+    try {
+      await previewLeaseOwner.replace({ ...stableTarget, ...identity })
+    } catch (cause) {
+      if (requestGeneration === previewRequestGenerationRef.current) {
+        setPreviewError(getCanvasMediaErrorMessage(cause, '视频预览加载失败，请重试。'))
+      }
+    }
+  }, [previewLeaseOwner, previewTargetIdentity, stableTarget])
+
+  React.useEffect(() => {
+    if (!snapshot || snapshot.target.projectId !== stableTarget.projectId
+      || snapshot.target.canvasId !== stableTarget.canvasId
+      || snapshot.target.nodeId !== stableTarget.nodeId
+      || snapshot.target.mediaModuleId !== stableTarget.mediaModuleId
+      || snapshot.target.mediaKind !== stableTarget.mediaKind) return
+    const identity = resolveCanvasMediaDefaultPreview(snapshot)
+    if (!identity || !previewAutoloadGuardRef.current.claim(previewTargetIdentity, identity)) return
+    void openPreview(identity, false)
+  }, [openPreview, previewTargetIdentity, snapshot, stableTarget])
 
   const workflows = selectCanvasMediaWorkflowsForProject(
     settings?.workflows ?? [],
@@ -860,7 +1007,12 @@ export function CanvasMediaWorkbench({
   }, [])
 
   if (loading) return <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground" role="status"><LoaderCircle className="size-4 animate-spin" />加载媒体模块</div>
-  if (!snapshot || !settings) return <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground"><p>{error ?? '媒体模块不可用。'}</p><Button size="sm" variant="outline" onClick={() => void load()}><RefreshCw />重试</Button></div>
+  if (!snapshot || !settings) return (
+    <div className="flex h-full min-w-0 flex-col items-center justify-center gap-3 p-4 text-sm text-muted-foreground">
+      <p className="max-w-md break-words text-center [overflow-wrap:anywhere]" role="alert">{error ?? '媒体模块不可用。'}</p>
+      <Button size="sm" variant="outline" onClick={() => void load()}><RefreshCw />重试</Button>
+    </div>
+  )
 
   const activeRun = snapshot.runs.find(isActiveRun)
   const displayRun = getCanvasMediaDisplayRun(snapshot.runs)
@@ -880,80 +1032,135 @@ export function CanvasMediaWorkbench({
   const preparation = snapshot.config.preparation
   const runError = displayRun?.error?.trim() || null
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3">
-        <Select value={workflowSelection} disabled={!writable || busy} onValueChange={(value) => {
-          const workflow = resolveCanvasMediaWorkflow(workflows, value)
-          if (!workflow) { setError('工作流版本不可用。'); return }
-          try {
-            const draft = createCanvasMediaWorkflowSelectionDraft(stableTarget, workflow)
-            loadGuardRef.current.markDirty()
-            setWorkflowSelection(value); setInputs(draft.inputs); setOutputs(draft.outputs); setError(null)
-          } catch (cause) { setError(getCanvasMediaErrorMessage(cause, '工作流不可用。')) }
-        }}>
-          <SelectTrigger className="w-full min-w-0 sm:w-auto sm:min-w-52"><SelectValue placeholder="选择工作流" /></SelectTrigger>
-          <SelectContent>{workflows.map((workflow) => {
-            const current = workflow.id === snapshot.config.workflow?.workflowId
-              && workflow.revision === snapshot.config.workflow.workflowRevision
-            const latest = workflow.revision === latestWorkflowRevisions.get(workflow.id)
-            return <SelectItem key={createCanvasMediaWorkflowSelection(workflow)} value={createCanvasMediaWorkflowSelection(workflow)}>{workflow.name}{workflow.projectId === null ? '' : ' · 项目'} · v{workflow.revision}{latest ? ' · 最新' : ''}{current ? ' · 当前' : ''}</SelectItem>
-          })}</SelectContent>
-        </Select>
-        <Select value={connectionSelection} disabled={!writable || busy} onValueChange={(value) => {
-          loadGuardRef.current.markDirty(); setConnectionSelection(value); setError(null)
-        }}>
-          <SelectTrigger className="w-full min-w-0 sm:w-auto sm:min-w-44"><SelectValue placeholder="选择连接" /></SelectTrigger>
-          <SelectContent>{connections.map((connection) => <SelectItem key={connection.id} value={connection.id}>{connection.name}</SelectItem>)}</SelectContent>
-        </Select>
-        {canRunLegacyProfile ? <span className="text-xs text-muted-foreground">旧预设配置</span> : null}
-        <Button size="sm" variant="outline" disabled={!writable || busy || !canSaveWorkflow} onClick={() => void execute(save, { commitDraft: true })}><Check />保存</Button>
-        {activeRun ? (
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaCancel({ ...stableTarget, runId: activeRun.id }))}><Square />取消</Button>
-        ) : (
-          <Button size="sm" disabled={!writable || busy || (!canRunWorkflow && !canRunLegacyProfile)} title={!canRunLegacyProfile && workflowValidationError ? workflowValidationError : undefined} onClick={() => void execute(async () => {
-            if (canRunLegacyProfile) {
-              await adapter.canvasMediaRun({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, operationId: crypto.randomUUID() })
-            } else {
-              const workflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
-              const inputProblem = workflow ? validateCanvasMediaWorkflowDrafts(workflow, inputs) : '请选择工作流。'
-              if (inputProblem) { setError(inputProblem); return }
-              await saveAndRunCanvasMedia(stableTarget, crypto.randomUUID(), save, adapter.canvasMediaRun)
-            }
-          }, { commitDraft: true })}><Play />运行</Button>
-        )}
-        {runProgress ? <div className="w-full min-w-0 text-left text-xs sm:ml-auto sm:w-auto sm:text-right" role="status" aria-live="polite"><p className="font-medium text-foreground">{runProgress.phaseLabel}</p>{runProgress.nodeProgressLabel ? <p className="truncate text-muted-foreground sm:max-w-64" title={runProgress.nodeProgressLabel}>{runProgress.nodeProgressLabel}</p> : null}</div> : null}
-      </div>
-      {preparation ? <p className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700" role="status">待配置：{preparation.message}</p> : null}
-      {error ? <p className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive" role="alert">{error}</p> : null}
-      {!error && runError ? <p className="border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive" role="alert">运行失败：{runError}</p> : null}
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="space-y-5 p-4">
-          <CanvasMediaWorkflowForm
-            projectId={stableTarget.projectId}
-            inputs={inputs}
-            assets={snapshot.assets}
-            writable={writable}
-            busy={busy}
-            allowCanvasOutput
-            onInputChange={(index, input) => updateInput(index, () => input)}
-          />
-          {preview ? <section className="space-y-2" aria-label="候选预览"><h3 className="text-sm font-medium">预览</h3>{preview.asset.mediaKind === 'video' ? <video className="max-h-80 w-full bg-black" controls src={preview.mediaUrl} /> : preview.asset.mediaKind === 'audio' ? <audio className="w-full" controls src={preview.mediaUrl} /> : <img className="max-h-80 w-full object-contain" src={preview.mediaUrl} alt="候选输出预览" />}</section> : null}
-          <section className="space-y-3" aria-label="候选历史">
-            <h3 className="text-sm font-medium">候选历史</h3>
-            {snapshot.candidates.length === 0 ? <p className="text-xs text-muted-foreground">运行完成后，候选输出会显示在这里。</p> : [...snapshot.candidates].reverse().map((candidate) => (
-              <div key={candidate.id} className="space-y-2 border-b border-border pb-3">
-                <p className="text-xs text-muted-foreground">配置 v{candidate.sourceConfigRevision} · {new Date(candidate.createdAt).toLocaleString('zh-CN')}</p>
-                {candidate.outputs.map((output) => {
-                  const selectedKeys = getCanvasMediaAdoptionKeys(candidate, output.key)
-                  const adopted = snapshot.config.adoptedOutputs.some((item) => item.key === output.key && item.candidateId === candidate.id)
-                  const exact = { ...stableTarget, candidateId: candidate.id, outputKey: output.key, outputOrder: output.order }
-                  return <div key={output.key} className="flex flex-wrap items-center gap-2 text-xs"><span className="min-w-32">{output.key} · {output.mediaKind} · {output.role}</span><Button size="sm" variant="ghost" disabled={busy} onClick={() => void execute(() => previewLeaseOwner.replace(exact), { refresh: false })}><Eye />预览</Button><Button size="sm" variant="ghost" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaExportOutput(exact), { refresh: false })}><Download />导出</Button><Button size="sm" variant={adopted ? 'secondary' : 'outline'} disabled={!writable || busy || adopted} onClick={() => void execute(() => adapter.canvasMediaAdopt({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, candidateId: candidate.id, selectedKeys }))}><Check />{adopted ? '已采用' : output.bundle ? `采用 ${output.bundle} 组` : '采用'}</Button></div>
-                })}
+    <div className="canvas-media-workbench-container h-full min-h-0">
+      <div className="canvas-media-workbench-layout">
+        <section className="canvas-media-preview-pane flex min-h-0 min-w-0 flex-col border-b border-border" aria-label="媒体预览与版本">
+          <header className="flex min-w-0 shrink-0 items-center justify-between gap-3 px-4 py-3">
+            <h3 className="shrink-0 text-sm font-semibold">{stableTarget.mediaKind === 'video' ? '视频预览' : '音频预览'}</h3>
+            {runProgress ? <div className="flex min-w-0 items-center gap-1.5 text-xs" role="status" aria-live="polite">
+              {activeRun ? <LoaderCircle className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : null}
+              <span className="truncate">{runProgress.phaseLabel}</span>
+            </div> : null}
+          </header>
+          <ScrollArea className="canvas-media-preview-scroll min-h-0 flex-1">
+            <div className="space-y-4 px-4 pb-4">
+              <section aria-label="候选预览" className="flex aspect-video w-full min-w-0 items-center justify-center overflow-hidden rounded-sm border border-border bg-muted/40">
+                {preview?.asset.mediaKind === 'video' ? <video className="h-full w-full object-contain" controls preload="metadata" src={preview.mediaUrl} />
+                  : preview?.asset.mediaKind === 'audio' ? <div className="flex w-full min-w-0 flex-col items-center gap-6 px-4 py-6"><AudioLines className="size-10 text-muted-foreground" aria-hidden="true" /><audio className="w-full min-w-0" controls preload="metadata" src={preview.mediaUrl} /></div>
+                    : preview ? <img className="h-full w-full object-contain" src={preview.mediaUrl} alt="候选输出预览" />
+                      : <div className="flex flex-col items-center gap-2 px-3 py-6 text-xs text-muted-foreground">
+                        {stableTarget.mediaKind === 'video' ? <Film className="size-7" aria-hidden="true" /> : <AudioLines className="size-7" aria-hidden="true" />}
+                        <span>{snapshot.candidates.length > 0 ? '尚未选择预览' : stableTarget.mediaKind === 'video' ? '尚未生成视频' : '尚未生成音频'}</span>
+                      </div>}
+              </section>
+              {previewError ? <p className="break-words text-xs text-destructive" role="alert">预览加载失败：{previewError}</p> : null}
+              {runProgress?.nodeProgressLabel ? <p className="break-words text-xs text-muted-foreground" role="status">{runProgress.nodeProgressLabel}</p> : null}
+              {runError ? <p className="break-words text-xs text-destructive" role="alert">运行失败：{runError}</p> : null}
+              <section className="space-y-3" aria-label="候选历史">
+                <h3 className="flex items-center gap-1.5 text-xs font-medium"><History className="size-3.5" aria-hidden="true" />历史版本</h3>
+                {snapshot.candidates.length === 0 ? <p className="text-xs text-muted-foreground">暂无历史版本</p> : [...snapshot.candidates].reverse().map((candidate) => (
+                  <div key={candidate.id} className="space-y-3 border-b border-border pb-3">
+                    <p className="break-words text-[11px] text-muted-foreground">配置 v{candidate.sourceConfigRevision} · {new Date(candidate.createdAt).toLocaleString('zh-CN')}</p>
+                    {candidate.outputs.map((output) => {
+                      /** 预览、导出与采用沿用同一份精确候选身份，不因布局改动而改变执行对象。 */
+                      const selectedKeys = getCanvasMediaAdoptionKeys(candidate, output.key)
+                      const adoptedOutput = snapshot.config.adoptedOutputs.find((item) => item.key === output.key && item.candidateId === candidate.id)
+                      const adopted = adoptedOutput !== undefined
+                      const initiallySelected = adoptedOutput !== undefined
+                        && 'selectionOrigin' in adoptedOutput
+                        && adoptedOutput.selectionOrigin === 'initial'
+                      const exact = { ...stableTarget, candidateId: candidate.id, outputKey: output.key, outputOrder: output.order }
+                      const selected = preview?.candidateId === candidate.id && preview.outputKey === output.key && preview.outputOrder === output.order
+                      return <div key={output.key} className="space-y-1.5 text-xs">
+                        <p className="break-all text-muted-foreground">{output.key} · {output.mediaKind === 'video' ? '视频' : output.mediaKind === 'audio' ? '音频' : '图片'} · {output.role === 'primary' ? '主输出' : output.role === 'preview' ? '预览' : '辅助输出'}</p>
+                        <div className="flex flex-wrap items-center gap-1">
+                          <Button size="sm" variant={selected ? 'secondary' : 'ghost'} aria-pressed={selected} disabled={busy} onClick={() => void openPreview(exact, true)}><Eye />预览</Button>
+                          <Button size="sm" variant="ghost" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaExportOutput(exact), { refresh: false })}><Download />导出</Button>
+                          {initiallySelected ? <span className="text-muted-foreground">当前默认</span> : null}
+                          <Button size="sm" variant={adopted ? 'secondary' : 'outline'} className="h-auto min-h-8 max-w-full whitespace-normal break-all" disabled={!writable || busy || (adopted && !initiallySelected)} onClick={() => void execute(async () => {
+                            previewAutoloadGuardRef.current.markManual(previewTargetIdentity)
+                            await adapter.canvasMediaAdopt({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, candidateId: candidate.id, selectedKeys })
+                            await openPreview(exact, false)
+                          })}><Check />{initiallySelected ? '确认采用' : adopted ? '已采用' : output.bundle ? `采用 ${output.bundle} 组` : '采用'}</Button>
+                        </div>
+                      </div>
+                    })}
+                  </div>
+                ))}
+              </section>
+            </div>
+          </ScrollArea>
+        </section>
+
+        <section className="flex min-h-0 min-w-0 flex-col" aria-label="媒体生成配置">
+          <header className="shrink-0 px-4 py-3"><h3 className="text-sm font-semibold">生成配置</h3></header>
+          <ScrollArea className="canvas-media-config-scroll min-h-0 flex-1">
+            <div className="space-y-4 px-4 pb-4">
+              {!writable ? <p className="text-xs text-muted-foreground">当前画布为只读状态</p> : null}
+              {preparation ? <p className="break-words border-l-2 border-amber-500/40 pl-2 text-xs text-amber-700" role="status">待配置：{preparation.message}</p> : null}
+              <div className="min-w-0 space-y-1.5">
+                <Label className="text-xs" htmlFor="canvas-media-workflow">工作流</Label>
+                <Select value={workflowSelection} disabled={!writable || busy} onValueChange={(value) => {
+                  const workflow = resolveCanvasMediaWorkflow(workflows, value)
+                  if (!workflow) { setError('工作流版本不可用。'); return }
+                  try {
+                    const draft = createCanvasMediaWorkflowSelectionDraft(stableTarget, workflow)
+                    loadGuardRef.current.markDirty()
+                    setWorkflowSelection(value); setInputs(draft.inputs); setOutputs(draft.outputs); setError(null)
+                  } catch (cause) { setError(getCanvasMediaErrorMessage(cause, '工作流不可用。')) }
+                }}>
+                  <SelectTrigger id="canvas-media-workflow" className="h-8 w-full min-w-0 text-xs"><SelectValue placeholder="选择工作流" /></SelectTrigger>
+                  <SelectContent>{workflows.map((workflow) => {
+                    const current = workflow.id === snapshot.config.workflow?.workflowId
+                      && workflow.revision === snapshot.config.workflow.workflowRevision
+                    const latest = workflow.revision === latestWorkflowRevisions.get(workflow.id)
+                    return <SelectItem key={createCanvasMediaWorkflowSelection(workflow)} value={createCanvasMediaWorkflowSelection(workflow)}>{workflow.name}{workflow.projectId === null ? '' : ' · 项目'} · v{workflow.revision}{latest ? ' · 最新' : ''}{current ? ' · 当前' : ''}</SelectItem>
+                  })}</SelectContent>
+                </Select>
               </div>
-            ))}
-          </section>
-        </div>
-      </ScrollArea>
+              <div className="min-w-0 space-y-1.5">
+                <Label className="text-xs" htmlFor="canvas-media-connection">服务器</Label>
+                <Select value={connectionSelection} disabled={!writable || busy} onValueChange={(value) => {
+                  loadGuardRef.current.markDirty(); setConnectionSelection(value); setError(null)
+                }}>
+                  <SelectTrigger id="canvas-media-connection" className="h-8 w-full min-w-0 text-xs"><SelectValue placeholder="选择连接" /></SelectTrigger>
+                  <SelectContent>{connections.map((connection) => <SelectItem key={connection.id} value={connection.id}>{connection.name}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+              {canRunLegacyProfile ? <p className="text-xs text-muted-foreground">旧预设配置</p> : null}
+              <CanvasMediaWorkflowForm
+                projectId={stableTarget.projectId}
+                inputs={inputs}
+                assets={snapshot.assets}
+                writable={writable}
+                busy={busy}
+                allowCanvasOutput
+                onInputChange={(index, input) => updateInput(index, () => input)}
+              />
+            </div>
+          </ScrollArea>
+          <footer className="shrink-0 space-y-2 border-t border-border bg-background p-3" aria-label="媒体主操作">
+            {error ? <p className="max-h-12 overflow-y-auto break-words text-xs text-destructive" role="alert">{error}</p> : null}
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" disabled={!writable || busy || !canSaveWorkflow} onClick={() => void execute(save, { commitDraft: true })}><Check />保存</Button>
+              {activeRun ? (
+                <Button className="min-w-0 flex-1" size="sm" variant="outline" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaCancel({ ...stableTarget, runId: activeRun.id }))}><Square />取消</Button>
+              ) : (
+                <Button className="min-w-0 flex-1" size="sm" disabled={!writable || busy || (!canRunWorkflow && !canRunLegacyProfile)} title={!canRunLegacyProfile && workflowValidationError ? workflowValidationError : undefined} onClick={() => void execute(async () => {
+                  if (canRunLegacyProfile) {
+                    await adapter.canvasMediaRun({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, operationId: crypto.randomUUID() })
+                  } else {
+                    const workflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
+                    const inputProblem = workflow ? validateCanvasMediaWorkflowDrafts(workflow, inputs) : '请选择工作流。'
+                    if (inputProblem) { setError(inputProblem); return }
+                    await saveAndRunCanvasMedia(stableTarget, crypto.randomUUID(), save, adapter.canvasMediaRun)
+                  }
+                }, { commitDraft: true })}>{busy ? <LoaderCircle className="animate-spin motion-reduce:animate-none" /> : <Play />}运行</Button>
+              )}
+            </div>
+          </footer>
+        </section>
+      </div>
     </div>
   )
 }

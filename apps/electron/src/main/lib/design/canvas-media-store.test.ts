@@ -23,7 +23,9 @@ interface MediaStoreFixture {
   files: Map<string, string>
   modulePath: string
   store: ReturnType<typeof createCanvasMediaStore>
+  createStore(): ReturnType<typeof createCanvasMediaStore>
   changed: CanvasMediaModuleState[]
+  setDocument(document: CanvasDocument): void
   setMetaWriteFailure(enabled: boolean): void
   seed(state: CanvasMediaModuleState, meta?: CanvasNodeContentMeta): void
 }
@@ -36,27 +38,32 @@ afterEach(() => {
 })
 
 /** 创建真实锁、内存文件和权威 Canvas 归属的 Store。 */
-function createFixture(documentOverride?: CanvasDocument): MediaStoreFixture {
+function createFixture(
+  documentOverride?: CanvasDocument,
+  fixtureTarget: CanvasMediaTarget = target,
+  beforeRead?: (request: StableDirectoryNativeRequest) => Promise<void>,
+): MediaStoreFixture {
   const root = mkdtempSync(join(tmpdir(), 'proma-canvas-media-store-'))
   roots.push(root)
   const nodesPath = join(root, 'nodes')
-  const modulePath = join(nodesPath, target.mediaModuleId)
+  const modulePath = join(nodesPath, fixtureTarget.mediaModuleId)
   mkdirSync(modulePath, { recursive: true })
   const files = new Map<string, string>()
   const changed: CanvasMediaModuleState[] = []
   let failMetaWrite = false
-  const document: CanvasDocument = documentOverride ?? {
-    schemaVersion: 4, projectId: target.projectId, canvasId: target.canvasId, revision: 0,
+  let document: CanvasDocument = documentOverride ?? {
+    schemaVersion: 4, projectId: fixtureTarget.projectId, canvasId: fixtureTarget.canvasId, revision: 0,
     viewport: { x: 0, y: 0, zoom: 1 },
     nodes: [{
-      id: target.nodeId, kind: 'video', title: '短片', position: { x: 0, y: 0 },
-      mediaModuleId: target.mediaModuleId,
+      id: fixtureTarget.nodeId, kind: fixtureTarget.mediaKind, title: '短片', position: { x: 0, y: 0 },
+      mediaModuleId: fixtureTarget.mediaModuleId,
     }],
     edges: [], createdAt: 1, updatedAt: 1,
   }
   /** stable-directory helper 的内存实现保留每次原子提交结果。 */
   const runNative = async (request: StableDirectoryNativeRequest): Promise<StableDirectoryNativeResult> => {
     if (request.mode === 'canvas-content-read') {
+      await beforeRead?.(request)
       const content = files.get(request.fileName!)
       return {
         roots: [], entries: [],
@@ -97,18 +104,21 @@ function createFixture(documentOverride?: CanvasDocument): MediaStoreFixture {
       changed.push(structuredClone(state))
     },
   }
+  const createStore = (): ReturnType<typeof createCanvasMediaStore> => createCanvasMediaStore(dependencies)
   return {
     files,
     modulePath,
-    store: createCanvasMediaStore(dependencies),
+    store: createStore(),
+    createStore,
     changed,
+    setDocument: (nextDocument) => { document = nextDocument },
     setMetaWriteFailure: (enabled) => { failMetaWrite = enabled },
     seed: (state, meta) => {
       files.set('config.json', JSON.stringify(state))
       files.set('meta.json', JSON.stringify(meta ?? {
         schemaVersion: 1,
-        kind: target.mediaKind,
-        contentId: target.mediaModuleId,
+        kind: fixtureTarget.mediaKind,
+        contentId: fixtureTarget.mediaModuleId,
         revision: state.revision,
         createdAt: state.config.createdAt,
         updatedAt: state.config.updatedAt,
@@ -127,6 +137,139 @@ function nextState(current: CanvasMediaModuleState): CanvasMediaModuleState {
 }
 
 describe('CanvasMediaStore', () => {
+  test('Given 两个 Store 实例并发读取同一模块 When 首次读取持锁 Then 后续读取等待并全部成功', async () => {
+    let releaseRead = (): void => undefined
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let notifyStarted = (): void => undefined
+    const readStarted = new Promise<void>((resolve) => { notifyStarted = resolve })
+    let blockFirstRead = true
+    const fixture = createFixture(undefined, target, async () => {
+      if (!blockFirstRead) return
+      blockFirstRead = false
+      notifyStarted()
+      await readGate
+    })
+    fixture.seed(createInitialCanvasMediaModuleState(target, 10))
+
+    const first = fixture.store.load(target)
+    await readStarted
+    const second = fixture.createStore().load(target)
+    releaseRead()
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+  })
+
+  test('Given LOAD 与 CAS 并发访问同一模块 When LOAD 先持锁 Then CAS 等待后保持 revision 语义', async () => {
+    let releaseRead = (): void => undefined
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let notifyStarted = (): void => undefined
+    const readStarted = new Promise<void>((resolve) => { notifyStarted = resolve })
+    let blockFirstRead = true
+    const fixture = createFixture(undefined, target, async () => {
+      if (!blockFirstRead) return
+      blockFirstRead = false
+      notifyStarted()
+      await readGate
+    })
+    const initial = createInitialCanvasMediaModuleState(target, 10)
+    fixture.seed(initial)
+
+    const load = fixture.store.load(target)
+    await readStarted
+    const swap = fixture.store.compareAndSwap(target, 0, nextState(initial))
+    releaseRead()
+
+    await expect(load).resolves.toMatchObject({ revision: 0 })
+    await expect(swap).resolves.toMatchObject({ revision: 1 })
+  })
+
+  test('Given 不同媒体模块并发读取 When 一个模块暂停 Then 另一个模块仍立即完成', async () => {
+    let releaseRead = (): void => undefined
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let notifyStarted = (): void => undefined
+    const readStarted = new Promise<void>((resolve) => { notifyStarted = resolve })
+    let blockFirstRead = true
+    const first = createFixture(undefined, target, async () => {
+      if (!blockFirstRead) return
+      blockFirstRead = false
+      notifyStarted()
+      await readGate
+    })
+    const otherTarget: CanvasMediaTarget = {
+      ...target, nodeId: 'video-2', mediaModuleId: 'media-2',
+    }
+    const other = createFixture(undefined, otherTarget)
+    first.seed(createInitialCanvasMediaModuleState(target, 10))
+    other.seed(createInitialCanvasMediaModuleState(otherTarget, 10))
+
+    const blocked = first.store.load(target)
+    await readStarted
+    await expect(other.store.load(otherTarget)).resolves.toMatchObject({ revision: 0 })
+    releaseRead()
+    await blocked
+  })
+
+  test('Given 同模块前序读取失败 When 后续读取已排队 Then 队列继续执行成功', async () => {
+    let releaseRead = (): void => undefined
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let notifyStarted = (): void => undefined
+    const readStarted = new Promise<void>((resolve) => { notifyStarted = resolve })
+    let firstRead = true
+    const fixture = createFixture(undefined, target, async () => {
+      if (!firstRead) return
+      firstRead = false
+      notifyStarted()
+      await readGate
+      throw new Error('测试读取失败')
+    })
+    fixture.seed(createInitialCanvasMediaModuleState(target, 10))
+
+    const failed = fixture.store.load(target)
+    await readStarted
+    const next = fixture.createStore().load(target)
+    releaseRead()
+
+    await expect(failed).rejects.toThrow('测试读取失败')
+    await expect(next).resolves.toMatchObject({ revision: 0 })
+  })
+
+  test('Given 同模块后续读取等待期间节点归属变化 When 后续任务出队 Then 重新校验最新 Canvas 授权', async () => {
+    let releaseRead = (): void => undefined
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve })
+    let notifyStarted = (): void => undefined
+    const readStarted = new Promise<void>((resolve) => { notifyStarted = resolve })
+    let blockFirstRead = true
+    const fixture = createFixture(undefined, target, async () => {
+      if (!blockFirstRead) return
+      blockFirstRead = false
+      notifyStarted()
+      await readGate
+    })
+    fixture.seed(createInitialCanvasMediaModuleState(target, 10))
+
+    const first = fixture.store.load(target)
+    await readStarted
+    const queued = fixture.createStore().load(target)
+    fixture.setDocument({
+      schemaVersion: 4, projectId: target.projectId, canvasId: target.canvasId, revision: 1,
+      viewport: { x: 0, y: 0, zoom: 1 },
+      nodes: [{
+        id: target.nodeId, kind: 'video', title: '已替换短片', position: { x: 0, y: 0 },
+        mediaModuleId: 'media-replaced',
+      }],
+      edges: [], createdAt: 1, updatedAt: 2,
+    })
+    /** 立即收口后继结果，避免在首个断言完成前留下未处理拒绝。 */
+    const queuedOutcome = queued.then(
+      () => 'unexpected-success',
+      (error: unknown) => error instanceof Error ? error.message : String(error),
+    )
+    releaseRead()
+
+    await expect(first).resolves.toMatchObject({ revision: 0 })
+    expect(await queuedOutcome).toBe('CANVAS_MEDIA_TARGET_INVALID')
+  })
+
   test('Given Canvas 节点不拥有目标模块 When load Then 在任何文件读取前拒绝', async () => {
     const fixture = createFixture({
       schemaVersion: 4, projectId: target.projectId, canvasId: target.canvasId, revision: 0,

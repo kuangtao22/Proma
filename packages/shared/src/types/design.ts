@@ -202,6 +202,8 @@ export type ImageGenerationModelOption =
       unavailableReason?: string
     }
   | Extract<ImageGenerationModelSnapshot, { executor: 'openai-images' }> & {
+      /** 当前供应商的展示名称，仅用于目录选择，不进入历史任务快照。 */
+      channelName?: string
       available: boolean
       unavailableReason?: string
     }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import type { CanvasDocument, MediaRunSnapshot } from '@proma/shared'
-import { createCanvasWorkflowAgentRecovery, createCanvasWorkflowMediaAdapter } from './canvas-workflow-runtime-adapters'
+import type { CanvasDocument, CanvasMediaAdoptedOutput, MediaRunSnapshot } from '@proma/shared'
+import { createCanvasWorkflowAgentRecovery, createCanvasWorkflowMediaAdapter, findCanvasWorkflowConfirmedMediaOutput } from './canvas-workflow-runtime-adapters'
 import type { CanvasWorkflowMediaAdapterDependencies } from './canvas-workflow-runtime-adapters'
 import type { MediaRunOrigin } from '../media/media-run-service'
 
@@ -29,6 +29,17 @@ function mediaFixture(phase: MediaRunSnapshot['phase'] = 'prepared') {
 }
 
 describe('Canvas 工作流媒体运行适配', () => {
+  test('Given 默认首选或不同运行的输出 When 恢复等待采用的工作流 Then 只有原运行的明确采用可放行', () => {
+    const video: CanvasMediaAdoptedOutput = {
+      key: 'video', mediaKind: 'video', role: 'primary', order: 0, candidateId: 'candidate-1', runId: 'run-1',
+      asset: { assetId: 'video-1', mediaKind: 'video', revision: 1, hash: 'a'.repeat(64) },
+    }
+    expect(findCanvasWorkflowConfirmedMediaOutput([{ ...video, selectionOrigin: 'initial' }], 'run-1', 'video')).toBeNull()
+    expect(findCanvasWorkflowConfirmedMediaOutput([video], 'run-2', 'video')).toBeNull()
+    expect(findCanvasWorkflowConfirmedMediaOutput([video], 'run-1', 'audio')).toBeNull()
+    expect(findCanvasWorkflowConfirmedMediaOutput([video], 'run-1', 'video')).toEqual(video)
+  })
+
   test('Given 父 deadline 中止 When 恢复远端任务 Then 保留远端任务且不请求取消', async () => {
     const fixture = mediaFixture('running')
     const controller = new AbortController()

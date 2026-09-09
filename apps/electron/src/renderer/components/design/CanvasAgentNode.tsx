@@ -33,9 +33,12 @@ export const AGENT_STATUS_LABELS: Record<CanvasAgentStatus, string> = {
 export function CanvasAgentNode({ data, selected }: NodeProps<CanvasAgentFlowNode>): React.ReactElement {
   /** 故障 Agent 即使收到迟到回调也不得继续创建下游节点。 */
   const onCreateChild = data.status === 'unavailable' ? undefined : data.onCreateChild
+  /** 兼容只携带旧 status 的调用方，卡片仍只消费统一活动态。 */
+  const activityState = data.activityState ?? (data.status === 'running' ? 'running' : 'idle')
   return (
     <CanvasNodeCard
       {...data}
+      activityState={activityState}
       canCreateChild={data.status !== 'unavailable' && data.canCreateChild}
       onCreateChild={onCreateChild}
       selected={selected}

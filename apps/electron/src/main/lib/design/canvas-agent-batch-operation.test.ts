@@ -131,7 +131,10 @@ function createFixture(options: {
       }),
     } : {}),
     contentLifecycle: {
-      inspectBatchContent: async (_target, input) => ({ exists: contents.has(input.contentId) }),
+      inspectBatchContent: async (_target, input) => {
+        events.push(`inspect:${input.contentId}`)
+        return { exists: contents.has(input.contentId) }
+      },
       prepareBatchContent: async (_target, input) => {
         events.push(`prepare:${input.contentId}`)
         if (input.contentId === options.failContentId) throw new Error('PREPARE_FAILED')
@@ -142,6 +145,7 @@ function createFixture(options: {
       cleanupBatchContent: async (_target, input) => { contents.delete(input.contentId) },
       prepareBatchDeletions: async (_target, entries) => {
         for (const entry of entries) {
+          events.push(`trash:${entry.contentId}`)
           if (trash.has(entry.trashId)) continue
           if (contents.delete(entry.contentId)) trashMoveCalls += 1
           else if (![...trash.values()].some((candidate) => candidate.contentId === entry.contentId)) {
@@ -611,6 +615,61 @@ describe('CanvasAgentBatchOperationService', () => {
     expect(fixture.contents.has(contentId)).toBe(true)
     expect(fixture.trash.size).toBe(0)
     expect(fixture.getDocument().nodes.map((node) => node.id)).toEqual([next.id])
+  })
+
+  test('Given 旧内容节点已有入出边 When 同批创建并验证新节点后迁移关系再删除旧节点 Then 新拓扑保留且旧内容进入回收区', async () => {
+    /** 模拟审核发现中间内容错误，但上下游关系必须保持的既有画布。 */
+    const fixture = createFixture()
+    fixture.getDocument().nodes.push(
+      { id: 'review-source', kind: 'agent', title: '审核输入', position: { x: 0, y: 0 }, agentSessionId: 'review-source-session' },
+      { id: 'review-old', kind: 'document', title: '错误内容', position: { x: 100, y: 0 }, documentId: 'review-old-content', contentRevision: 3 },
+      { id: 'review-target', kind: 'agent', title: '审核下游', position: { x: 200, y: 0 }, agentSessionId: 'review-target-session' },
+    )
+    fixture.getDocument().edges.push(
+      { id: 'review-edge-in', sourceNodeId: 'review-source', sourcePort: 'output', targetNodeId: 'review-old', targetPort: 'input', relation: 'depends-on' },
+      { id: 'review-edge-out', sourceNodeId: 'review-old', sourcePort: 'output', targetNodeId: 'review-target', targetPort: 'input', relation: 'depends-on' },
+    )
+    fixture.contents.add('review-old-content')
+
+    /** 在单个受控事务中先准备替代内容，再改接关系并回收旧节点。 */
+    const result = await fixture.service.execute({
+      ...batch(),
+      operations: [
+        { type: 'upsert-nodes', nodes: [{
+          id: 'review-replacement', kind: 'document', title: '修正内容', position: { x: 100, y: 0 },
+          documentId: 'review-replacement-content', contentRevision: 0,
+        }] },
+        { type: 'upsert-edges', edges: [
+          { id: 'review-edge-in', sourceNodeId: 'review-source', sourcePort: 'output', targetNodeId: 'review-replacement', targetPort: 'input', relation: 'depends-on' },
+          { id: 'review-edge-out', sourceNodeId: 'review-replacement', sourcePort: 'output', targetNodeId: 'review-target', targetPort: 'input', relation: 'depends-on' },
+        ] },
+        { type: 'remove-nodes', nodeIds: ['review-old'] },
+      ],
+    })
+
+    expect(result.document.revision).toBe(8)
+    expect(result.document.nodes.map((node) => node.id)).toEqual([
+      'review-source', 'review-target', 'review-replacement',
+    ])
+    expect(result.document.edges).toEqual([
+      { id: 'review-edge-in', sourceNodeId: 'review-source', sourcePort: 'output', targetNodeId: 'review-replacement', targetPort: 'input', relation: 'depends-on' },
+      { id: 'review-edge-out', sourceNodeId: 'review-replacement', sourcePort: 'output', targetNodeId: 'review-target', targetPort: 'input', relation: 'depends-on' },
+    ])
+    expect(fixture.contents.has('review-replacement-content')).toBe(true)
+    expect(fixture.contents.has('review-old-content')).toBe(false)
+    expect([...fixture.trash.values()]).toEqual([
+      expect.objectContaining({ nodeId: 'review-old', contentId: 'review-old-content', contentRevision: 3 }),
+    ])
+    expect(fixture.events.filter((event) => (
+      event === 'inspect:review-replacement-content'
+      || event === 'prepare:review-replacement-content'
+      || event === 'trash:review-old-content'
+    ))).toEqual([
+      'inspect:review-replacement-content',
+      'prepare:review-replacement-content',
+      'trash:review-old-content',
+    ])
+    expect(fixture.getMutateCalls()).toBe(1)
   })
 
   test('Given Agent session 归属节点 A When 同批删除 A 并由 B 复用 Then intent 与 inspect 前拒绝', async () => {

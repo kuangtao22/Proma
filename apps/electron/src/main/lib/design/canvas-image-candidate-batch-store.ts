@@ -42,6 +42,8 @@ export interface CanvasImageCandidateAdoptionEntry {
   candidateAssetId: string
   expectedConfigRevision: number
   committedConfigRevision: number | null
+  /** 同一素材已由先前采用提交，本事务只核对版本、不重复写模块或传播下游。 */
+  alreadyAdopted?: true
 }
 
 /** 位于目标 Canvas transactions 目录的可恢复整批采用 intent。 */
@@ -76,6 +78,8 @@ export interface CanvasImageCandidateBatchStore {
 /** Store 测试注入点与生产目录能力。 */
 export interface CanvasImageCandidateBatchStoreDependencies {
   documents?: Pick<CanvasDocumentStore, 'loadWithDirectoryCapability'>
+  /** 原生协议注入点；生产沿用进程级资源预算，测试可使用真实 helper。 */
+  runStableDirectoryNative?: typeof runStableDirectoryNative
   scanBatches?: (target: CanvasTarget) => Promise<CanvasImageCandidateBatch[]>
   writeBatch?: (batch: CanvasImageCandidateBatch) => Promise<StableDirectoryNativeWriteOutcome>
   scanAdoptionIntents?: (target: CanvasTarget) => Promise<CanvasImageCandidateAdoptionIntent[]>
@@ -174,7 +178,9 @@ export function parseCanvasImageCandidateAdoptionIntent(
       'expectedConfigRevision', 'committedConfigRevision',
     ] as const
     if (!isRecord(rawEntry)
-      || !hasExactKeys(rawEntry, entryKeys)
+      || !hasExactKeys(rawEntry, Object.hasOwn(rawEntry, 'alreadyAdopted') ? [...entryKeys, 'alreadyAdopted'] : entryKeys)
+      || (Object.hasOwn(rawEntry, 'alreadyAdopted')
+        && (rawEntry.alreadyAdopted !== true || rawEntry.oldAssetId !== rawEntry.candidateAssetId))
       || typeof rawEntry.nodeId !== 'string' || !ADOPTION_ID.test(rawEntry.nodeId)
       || typeof rawEntry.imageModuleId !== 'string' || !ADOPTION_ID.test(rawEntry.imageModuleId)
       || !isNullableId(rawEntry.oldAssetId)
@@ -182,7 +188,7 @@ export function parseCanvasImageCandidateAdoptionIntent(
       || !isNonNegativeInteger(rawEntry.expectedConfigRevision)
       || (rawEntry.committedConfigRevision !== null
         && (!isNonNegativeInteger(rawEntry.committedConfigRevision)
-          || rawEntry.committedConfigRevision !== rawEntry.expectedConfigRevision + 1))
+          || rawEntry.committedConfigRevision !== rawEntry.expectedConfigRevision + (rawEntry.alreadyAdopted ? 0 : 1)))
       || nodeIds.has(rawEntry.nodeId)
       || moduleIds.has(rawEntry.imageModuleId)) {
       throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID')
@@ -196,6 +202,7 @@ export function parseCanvasImageCandidateAdoptionIntent(
       candidateAssetId: rawEntry.candidateAssetId,
       expectedConfigRevision: rawEntry.expectedConfigRevision,
       committedConfigRevision: rawEntry.committedConfigRevision,
+      ...(rawEntry.alreadyAdopted ? { alreadyAdopted: true as const } : {}),
     }
   })
   if (value.state === 'prepared' && entries.some((entry) => entry.committedConfigRevision !== null)) {
@@ -243,12 +250,33 @@ function summarize(batch: CanvasImageCandidateBatch): CanvasImageCandidateBatchS
 export function createCanvasImageCandidateBatchStore(
   dependencies: CanvasImageCandidateBatchStoreDependencies,
 ): CanvasImageCandidateBatchStore {
+  /** 所有活动区和归档读写共用同一原生 host 与资源预算。 */
+  const runNative = dependencies.runStableDirectoryNative ?? runStableDirectoryNative
   /** 从当前 Canvas capability 或测试注入取得精确归档访问。 */
   const archiveFor = (target: CanvasTarget): CanvasTransactionArchive | null => {
     if (dependencies.archive) return dependencies.archive
     if (!dependencies.documents) return null
     const loaded = dependencies.documents.loadWithDirectoryCapability(target)
-    return createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'))
+    return createNativeCanvasTransactionArchive(loaded.openSingleChildDirectory('transactions'), { run: runNative })
+  }
+
+  /** 按已校验文件名精确读取，只有 active 明确缺失才回退同一目录能力的归档。 */
+  const readTransaction = async (target: CanvasTarget, fileName: string): Promise<string | null> => {
+    if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
+    const directory = dependencies.documents.loadWithDirectoryCapability(target)
+      .openSingleChildDirectory('transactions')
+    directory.assertValid()
+    const result = await runNative({
+      mode: 'canvas-intent-read', roots: [directory.rootPath], childName: 'transactions', fileName,
+    }, directory.authorizeOpenedRoots)
+    directory.assertValid()
+    if (!result.readOutcome || result.readOutcome.status === 'corrupt') {
+      throw new Error(fileName.startsWith('image-candidate-adoption-')
+        ? 'CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID'
+        : 'CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    }
+    if (result.readOutcome.status === 'ok') return result.readOutcome.content
+    return (dependencies.archive ?? createNativeCanvasTransactionArchive(directory, { run: runNative })).load(fileName)
   }
 
   /** 扫描并严格解析目标 Canvas 的所有批次文件。 */
@@ -265,7 +293,7 @@ export function createCanvasImageCandidateBatchStore(
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(target)
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({
+    const result = await runNative({
       mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions',
       maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_SCAN_FILES, maxOutputBytes: 40 * 1024 * 1024,
     }, directory.authorizeOpenedRoots)
@@ -288,7 +316,7 @@ export function createCanvasImageCandidateBatchStore(
       archiveEntries.push({ name: entry.name, content: entry.content })
     }
     directory.assertValid()
-    await createNativeCanvasTransactionArchive(directory).archiveEntries(archiveEntries)
+    await createNativeCanvasTransactionArchive(directory, { run: runNative }).archiveEntries(archiveEntries)
     return batches
   }
 
@@ -309,7 +337,7 @@ export function createCanvasImageCandidateBatchStore(
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(target)
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({
+    const result = await runNative({
       mode: 'canvas-intent-scan', roots: [directory.rootPath], childName: 'transactions',
       maxDepth: 0, maxEntries: MAX_CANDIDATE_BATCH_SCAN_FILES, maxOutputBytes: 40 * 1024 * 1024,
     }, directory.authorizeOpenedRoots)
@@ -317,6 +345,16 @@ export function createCanvasImageCandidateBatchStore(
     const intents: CanvasImageCandidateAdoptionIntent[] = []
     const archiveEntries: CanvasTransactionEntry[] = []
     for (const entry of result.entries) {
+      /** 精确读取不再整理目录，因此沿既有恢复扫描同时归档本 Store 的终态批次。 */
+      const batchMatch = CANDIDATE_BATCH_FILE.exec(entry.name)
+      if (batchMatch) {
+        if (entry.isDirectory || typeof entry.content !== 'string') {
+          throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+        }
+        parseCandidateBatchForTarget(JSON.parse(entry.content) as unknown, target, batchMatch[1])
+        archiveEntries.push({ name: entry.name, content: entry.content })
+        continue
+      }
       const match = ADOPTION_INTENT_FILE.exec(entry.name)
       if (!match) continue
       if (entry.isDirectory || typeof entry.content !== 'string') {
@@ -332,7 +370,7 @@ export function createCanvasImageCandidateBatchStore(
       archiveEntries.push({ name: entry.name, content: entry.content })
     }
     directory.assertValid()
-    await createNativeCanvasTransactionArchive(directory).archiveEntries(archiveEntries)
+    await createNativeCanvasTransactionArchive(directory, { run: runNative }).archiveEntries(archiveEntries)
     return intents
   }
 
@@ -342,7 +380,7 @@ export function createCanvasImageCandidateBatchStore(
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(batch)
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({
+    const result = await runNative({
       mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions',
       fileName: `image-candidate-batch-${batch.batchId}.json`,
       content: `${JSON.stringify(batch, null, 2)}\n`, maxEntries: MAX_CANDIDATE_BATCH_FILES,
@@ -360,7 +398,7 @@ export function createCanvasImageCandidateBatchStore(
     if (!dependencies.documents) throw new Error('CANVAS_IMAGE_BATCH_DIRECTORY_CAPABILITY_MISSING')
     const loaded = dependencies.documents.loadWithDirectoryCapability(intent)
     const directory = loaded.openSingleChildDirectory('transactions')
-    const result = await runStableDirectoryNative({
+    const result = await runNative({
       mode: 'canvas-intent-write', roots: [directory.rootPath], childName: 'transactions',
       fileName: `image-candidate-adoption-${intent.operationId}.json`,
       content: `${JSON.stringify(intent, null, 2)}\n`, maxEntries: MAX_CANDIDATE_BATCH_FILES,
@@ -370,6 +408,39 @@ export function createCanvasImageCandidateBatchStore(
     return result.writeOutcome
   }
 
+  /** 精确读取候选批次；保留旧扫描注入合同供内存恢复测试使用。 */
+  const loadBatch = async (target: CanvasTarget, batchId: string): Promise<CanvasImageCandidateBatch | null> => {
+    if (!ADOPTION_ID.test(batchId)) throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
+    const fileName = `image-candidate-batch-${batchId}.json`
+    let content: string | null | undefined
+    if (dependencies.scanBatches) {
+      const batch = (await scan(target)).find((candidate) => candidate.batchId === batchId)
+      if (batch) return batch
+      content = await archiveFor(target)?.load(fileName)
+    } else {
+      content = await readTransaction(target, fileName)
+    }
+    return content == null ? null : parseCandidateBatchForTarget(JSON.parse(content) as unknown, target, batchId)
+  }
+
+  /** 精确读取采用凭据；文件身份和正文身份始终同时校验。 */
+  const loadIntent = async (
+    target: CanvasTarget,
+    operationId: string,
+  ): Promise<CanvasImageCandidateAdoptionIntent | null> => {
+    if (!ADOPTION_ID.test(operationId)) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID')
+    const fileName = `image-candidate-adoption-${operationId}.json`
+    let content: string | null | undefined
+    if (dependencies.scanAdoptionIntents) {
+      const intent = (await scanAdoptionIntents(target)).find((candidate) => candidate.operationId === operationId)
+      if (intent) return intent
+      content = await archiveFor(target)?.load(fileName)
+    } else {
+      content = await readTransaction(target, fileName)
+    }
+    return content == null ? null : parseCanvasImageCandidateAdoptionIntent(JSON.parse(content) as unknown, target, operationId)
+  }
+
   return {
     listActiveSummaries: async (target) => (await scan(target))
       .filter((batch) => batch.status === 'running' || batch.status === 'partial' || batch.status === 'ready')
@@ -377,19 +448,16 @@ export function createCanvasImageCandidateBatchStore(
       .sort((left, right) => right.updatedAt - left.updatedAt || left.batchId.localeCompare(right.batchId))
       .slice(0, CANVAS_IMAGE_CANDIDATE_BATCH_SUMMARY_LIMIT),
     load: async (target, batchId) => {
-      if (!ADOPTION_ID.test(batchId)) throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
-      const batch = (await scan(target)).find((candidate) => candidate.batchId === batchId)
-      if (batch) return batch
-      const archived = await archiveFor(target)?.load(`image-candidate-batch-${batchId}.json`)
-      if (!archived) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
-      return parseCandidateBatchForTarget(JSON.parse(archived) as unknown, target, batchId)
+      const batch = await loadBatch(target, batchId)
+      if (!batch) throw new Error('CANVAS_IMAGE_BATCH_NOT_FOUND')
+      return batch
     },
     save: async (rawBatch) => {
       const batch = parseCanvasImageCandidateBatch(rawBatch)
       const outcome = await write(batch)
       if (!outcome.commitVisible) throw new Error('CANVAS_IMAGE_BATCH_WRITE_FAILED')
       if (outcome.durabilityUncertain) {
-        const visible = (await scan(batch)).find((candidate) => candidate.batchId === batch.batchId)
+        const visible = await loadBatch(batch, batch.batchId)
         if (!visible || JSON.stringify(visible) !== JSON.stringify(batch)) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
         }
@@ -399,16 +467,7 @@ export function createCanvasImageCandidateBatchStore(
     findByJobId: async (target, jobId, candidateBatchId) => {
       /** 新 journal 直接指定批次；旧 journal 才兼容扫描定位。 */
       if (candidateBatchId) {
-        if (!ADOPTION_ID.test(candidateBatchId)) {
-          throw new Error('CANVAS_IMAGE_CANDIDATE_BATCH_INVALID')
-        }
-        let batch = (await scan(target)).find((value) => value.batchId === candidateBatchId)
-        if (!batch) {
-          const archived = await archiveFor(target)?.load(`image-candidate-batch-${candidateBatchId}.json`)
-          batch = archived
-            ? parseCandidateBatchForTarget(JSON.parse(archived) as unknown, target, candidateBatchId)
-            : undefined
-        }
+        const batch = await loadBatch(target, candidateBatchId)
         if (!batch || !batch.entries.some((entry) => entry.jobId === jobId)) return null
         return batch
       }
@@ -416,12 +475,9 @@ export function createCanvasImageCandidateBatchStore(
     },
     scanAdoptionIntents,
     loadAdoptionIntent: async (target, operationId) => {
-      if (!ADOPTION_ID.test(operationId)) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_INVALID')
-      const intent = (await scanAdoptionIntents(target)).find((candidate) => candidate.operationId === operationId)
-      if (intent) return intent
-      const archived = await archiveFor(target)?.load(`image-candidate-adoption-${operationId}.json`)
-      if (!archived) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_NOT_FOUND')
-      return parseCanvasImageCandidateAdoptionIntent(JSON.parse(archived) as unknown, target, operationId)
+      const intent = await loadIntent(target, operationId)
+      if (!intent) throw new Error('CANVAS_IMAGE_BATCH_ADOPTION_INTENT_NOT_FOUND')
+      return intent
     },
     saveAdoptionIntent: async (rawIntent) => {
       const intent = parseCanvasImageCandidateAdoptionIntent(
@@ -432,8 +488,7 @@ export function createCanvasImageCandidateBatchStore(
       const outcome = await writeAdoptionIntent(intent)
       if (!outcome.commitVisible) throw new Error('CANVAS_IMAGE_BATCH_WRITE_FAILED')
       if (outcome.durabilityUncertain) {
-        const visible = (await scanAdoptionIntents(intent))
-          .find((candidate) => candidate.operationId === intent.operationId)
+        const visible = await loadIntent(intent, intent.operationId)
         if (!visible || JSON.stringify(visible) !== JSON.stringify(intent)) {
           throw new Error('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
         }

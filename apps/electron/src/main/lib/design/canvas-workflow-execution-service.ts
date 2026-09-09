@@ -182,6 +182,8 @@ export interface CanvasWorkflowExecutionService {
       retryNodeIds?: string[]
     },
     signal?: AbortSignal,
+    /** 后台恢复只核对显式采用，不能把首选初始化当作用户验收。 */
+    options?: { automatic: boolean },
   ) => Promise<CanvasRunWorkflowResult>
   cancel: (
     context: CanvasToolRunContext,
@@ -726,6 +728,7 @@ export function createCanvasWorkflowExecutionService(
     context: CanvasToolRunContext,
     initialRun: CanvasWorkflowRun,
     parentSignal?: AbortSignal,
+    acceptInitialAdoption = false,
   ): Promise<CanvasWorkflowRun> => {
     if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
     if (initialRun.projectId !== context.projectId || initialRun.owner.sessionId !== context.sessionId) {
@@ -752,6 +755,11 @@ export function createCanvasWorkflowExecutionService(
     parentSignal?.addEventListener('abort', onParentAbort, { once: true })
     if (parentSignal?.aborted) controller.abort('cancel')
     let run = initialRun
+    /** 明确继续仅接纳进入本轮前已等待的任务，新生成的后继仍须停在评审边界。 */
+    const acceptedInitialTasks = new Set(acceptInitialAdoption ? initialRun.nodes.flatMap((node) => (
+      node.status === 'waiting-adoption' && node.execution?.kind === 'image' && node.execution.taskId
+        ? [node.execution.taskId] : []
+    )) : [])
     const target = initialTarget
     /** 权限始终复核当前调用者；外部执行身份固定为 journal 中的原始工作流 owner。 */
     const executionContext: CanvasToolRunContext = {
@@ -918,9 +926,9 @@ export function createCanvasWorkflowExecutionService(
         }
 
         const reconciled = await reconcileCanvasWorkflowRun(run, document, {
-          isImageCandidateAdopted: dependencies.isImageCandidateAdopted ?? (() => ({
-            adopted: false, artifactHash: null, committedAt: null,
-          })),
+          isImageCandidateAdopted: (query) => dependencies.isImageCandidateAdopted?.({
+            ...query, acceptInitialAdoption: acceptedInitialTasks.has(query.taskId),
+          }) ?? ({ adopted: false, artifactHash: null, committedAt: null }),
           isMediaOutputAdopted: dependencies.isMediaOutputAdopted,
         })
         /** 已完成上游使原正式下游变为待更新时，只重跑固定范围内该后继。 */
@@ -1660,7 +1668,7 @@ export function createCanvasWorkflowExecutionService(
         if (activeRuns.get(activeKey) === owner) activeRuns.delete(activeKey)
       }
     },
-    resume: async (context, input, signal) => {
+    resume: async (context, input, signal, options) => {
       if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
       if (input.projectId !== context.projectId) throw new Error('CANVAS_WORKFLOW_RUN_TARGET_INVALID')
       await dependencies.validateAccess(context, input.canvasId)
@@ -1713,7 +1721,7 @@ export function createCanvasWorkflowExecutionService(
           run = publishSavedRun(dependencies.workflowRuns.saveExecutionProgress(run, run.revision))
         }
       }
-      return projectDurableRunResult(await driveDurableRun(context, run, signal))
+      return projectDurableRunResult(await driveDurableRun(context, run, signal, options?.automatic !== true))
     },
     cancel: async (context, input) => {
       if (!dependencies.workflowRuns) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')

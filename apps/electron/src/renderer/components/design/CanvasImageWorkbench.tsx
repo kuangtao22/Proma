@@ -55,6 +55,13 @@ const EMPTY_MEDIA_WORKFLOWS: MediaWorkflowVersion[] = []
 const EMPTY_MEDIA_CONNECTIONS: MediaConnectionSummary[] = []
 const EMPTY_MEDIA_ASSETS: MediaAssetRecord[] = []
 
+/** 从当前目录选项生成供应商和模型标签；旧执行器保留原有名称与标识。 */
+function getImageModelLabel(option: ImageGenerationModelOption): string {
+  return option.executor === 'openai-images'
+    ? `${option.channelName || (option.available ? '未提供供应商' : '供应商不可用')} · ${option.name}`
+    : `${option.name} · ${option.modelId}`
+}
+
 /** Canvas 图片工作台只接收状态与命令，不直接调用 IPC。 */
 export interface CanvasImageWorkbenchProps {
   state: CanvasImageModuleViewState
@@ -496,13 +503,13 @@ export function CanvasImageWorkbench({
   const jobs = sortJobsByRecency(snapshot.jobs)
   /** 同模块至多一个排队或运行任务。 */
   const activeJob = jobs.find((job) => job.status === 'queued' || job.status === 'running')
-  /** 最近任务决定失败、取消和中断后的恢复主操作。 */
+  /** 最近任务决定状态展示和当前配置生成按钮的文案。 */
   const latestJob = jobs[0]
   /** 运行任务优先代表当前界面状态，避免较新的历史终态遮住正在执行的任务。 */
   const displayedJob = activeJob ?? latestJob
   /** 只有当前展示 Job 属于 Comfy 执行时才存在运行阶段投影。 */
   const mediaProgress = displayedJob ? mediaProgressByJobId?.get(displayedJob.id) : undefined
-  /** 只有可恢复终态任务显示重试。 */
+  /** 失败、取消和中断后，主操作仍按当前配置生成；原任务重试保留在详情。 */
   const retryableJob = latestJob && ['failed', 'cancelled', 'interrupted'].includes(latestJob.status)
     ? latestJob
     : undefined
@@ -553,359 +560,371 @@ export function CanvasImageWorkbench({
   const detailsState = detailsJob ? createTaskDetailsViewState(state.taskDetails.get(detailsJob.id)) : null
 
   return (
-    <ScrollArea className="h-full" aria-label="生图节点工作台内容">
-      <div className="grid min-h-full grid-cols-1 lg:grid-cols-[minmax(0,1.15fr)_minmax(18rem,0.85fr)]">
-        <section className="min-w-0 space-y-3 border-b border-border p-4 lg:border-b-0 lg:border-r" aria-label="图片预览与版本">
-          <div className="flex min-w-0 items-center justify-between gap-2">
-            <div className="min-w-0">
-              <h3 className="text-sm font-semibold">当前图片</h3>
-              <p className="mt-0.5 text-[11px] text-muted-foreground">
-                {previewingHistory ? '正在预览历史版本' : '跟随已采用版本'}
-              </p>
-            </div>
-            {displayedJob && <Badge variant="secondary" className="rounded-sm text-[10px]">{JOB_STATUS_LABELS[displayedJob.status]}</Badge>}
-          </div>
+    <div className="canvas-media-workbench-container h-full min-h-0" aria-label="生图节点工作台内容">
+      <div className="canvas-media-workbench-layout">
+        <section className="canvas-media-preview-pane flex min-h-0 min-w-0 flex-col border-b border-border" aria-label="图片预览与版本">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="space-y-3 p-4">
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold">当前图片</h3>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    {previewingHistory ? '正在预览历史版本' : '跟随已采用版本'}
+                  </p>
+                </div>
+                {displayedJob && <Badge variant="secondary" className="rounded-sm text-[10px]">{JOB_STATUS_LABELS[displayedJob.status]}</Badge>}
+              </div>
 
-          <ImagePreview
-            asset={visibleAsset}
-            assetBaseUrl={snapshot.assetBaseUrl}
-            aspectRatio={draft.aspectRatio}
-            activeJob={activeJob}
-          />
-
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            aria-label="导出当前图片"
-            disabled={!writable || !adoptedAsset || exportState === 'exporting'}
-            onClick={() => {
-              if (adoptedAsset) onExportAsset(adoptedAsset.id)
-            }}
-          >
-            {exportState === 'exporting'
-              ? <><LoaderCircle className="animate-spin" aria-hidden="true" />正在导出</>
-              : <><Download aria-hidden="true" />导出当前图片</>}
-          </Button>
-          {exportError && (
-            <p className="break-words text-xs text-destructive" role="alert">{exportError}</p>
-          )}
-
-          {displayedJob?.error && (
-            <p className="break-words text-xs text-destructive" role="alert">{displayedJob.error}</p>
-          )}
-          {displayedJob && JOB_STATUS_MESSAGES[displayedJob.status] && !displayedJob.error && (
-            <p className="text-xs text-muted-foreground">{JOB_STATUS_MESSAGES[displayedJob.status]}</p>
-          )}
-          {mediaProgress && (
-            <div className="space-y-0.5 border-l-2 border-primary/40 pl-2 text-xs text-muted-foreground" role="status">
-              <p className="font-medium text-foreground">{mediaProgress.phaseLabel}</p>
-              {mediaProgress.nodeProgressLabel ? <p className="break-words">{mediaProgress.nodeProgressLabel}</p> : null}
-            </div>
-          )}
-
-          <div className="space-y-2">
-            <div className="flex items-center gap-1.5">
-              <History className="size-3.5 text-muted-foreground" aria-hidden="true" />
-              <FieldHeader>历史版本</FieldHeader>
-            </div>
-            {versions.length > 0 ? (
-              <TooltipProvider delayDuration={200} disableHoverableContent>
-                <ul className="flex gap-2 overflow-x-auto pb-1" aria-label="历史版本">
-                  {versions.map(({ job, asset }) => {
-                    /** 当前权威采用版本使用明确状态，不与预览选择混淆。 */
-                    const adopted = asset.id === snapshot.config.adoptedAssetId
-                    /** 当前可见版本支持键盘和鼠标选择。 */
-                    const selected = asset.id === visibleAssetId
-                    /** 采用期间所有版本共享单一写通道，目标项显示明确进度。 */
-                    const adopting = asset.id === adoptingAssetId
-                    return (
-                      <li key={asset.id} className="relative size-16 shrink-0">
-                        <button
-                          type="button"
-                          className={cn(
-                            'size-16 overflow-hidden rounded-sm border bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                            selected ? 'border-primary' : 'border-border hover:border-foreground/40',
-                          )}
-                          aria-label={`预览第 ${job.attemptNumber} 次生成结果`}
-                          aria-pressed={selected}
-                          onClick={() => onPreviewAsset(asset.id)}
-                        >
-                          <img
-                            src={createMediaUrl(snapshot.thumbnailBaseUrl, asset.thumbnailRelativePath)}
-                            alt=""
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                          />
-                          {adopted && (
-                            <span className="absolute bottom-0 left-0 right-0 bg-background/90 py-0.5 text-center text-[9px] text-foreground">默认</span>
-                          )}
-                        </button>
-                        {!adopted && (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span className="absolute right-1 top-1 inline-flex" tabIndex={writable ? undefined : 0}>
-                                <Button
-                                  type="button"
-                                  size="icon"
-                                  variant="secondary"
-                                  className="size-6 rounded-sm bg-background/90 shadow-sm"
-                                  aria-label={adopting ? '正在设为默认' : '设为默认'}
-                                  disabled={!writable || adoptingAssetId !== null}
-                                  onClick={() => onAdoptAsset(asset.id)}
-                                >
-                                  {adopting
-                                    ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
-                                    : <Check className="size-3.5" aria-hidden="true" />}
-                                </Button>
-                              </span>
-                            </TooltipTrigger>
-                            <TooltipContent side="top">
-                              {writable ? '设为默认' : '当前画布为只读状态'}
-                            </TooltipContent>
-                          </Tooltip>
-                        )}
-                      </li>
-                    )
-                  })}
-                </ul>
-              </TooltipProvider>
-            ) : (
-              <p className="text-xs text-muted-foreground">生成成功后会在这里保留版本</p>
-            )}
-          </div>
-
-          {displayedJob && (
-            <Button type="button" variant="ghost" size="sm" className="px-1" onClick={() => setDetailsJobId(displayedJob.id)}>
-              查看任务详情
-            </Button>
-          )}
-
-          {detailsJob && detailsState && (
-            <div className="border-t border-border pt-1">
-              <DesignTaskDetailsView
-                job={detailsJob}
-                detailsState={detailsState}
-                onLoadDetails={() => onLoadTaskDetails(detailsJob.id, false)}
-                onLoadTrace={() => onLoadTaskDetails(detailsJob.id, true)}
-                onCopyPrompt={onCopyPrompt}
-                onRetry={detailsJob.status === 'failed' || detailsJob.status === 'cancelled' || detailsJob.status === 'interrupted'
-                  ? onRetry
-                  : undefined}
+              <ImagePreview
+                asset={visibleAsset}
+                assetBaseUrl={snapshot.assetBaseUrl}
+                aspectRatio={draft.aspectRatio}
+                activeJob={activeJob}
               />
-            </div>
-          )}
-        </section>
 
-        <section className="relative min-w-0 space-y-4 p-4" aria-label="图片生成配置">
-          {!writable && (
-            <p className="rounded-sm border border-border bg-muted/45 px-2.5 py-2 text-xs text-muted-foreground">
-              当前画布为只读状态
-            </p>
-          )}
-          {snapshot.config.preparation ? (
-            <p className="rounded-sm border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700" role="status">
-              待配置：{snapshot.config.preparation.message}
-            </p>
-          ) : null}
-
-          <div className="space-y-1.5">
-            <Label htmlFor="canvas-image-prompt" className="text-xs">提示词</Label>
-            <Textarea
-              id="canvas-image-prompt"
-              value={draft.prompt}
-              rows={6}
-              className="min-h-28 resize-y text-xs leading-5"
-              placeholder="描述要生成的画面、用途与重点"
-              disabled={!writable}
-              onChange={(event) => onDraftChange({ prompt: event.currentTarget.value })}
-            />
-          </div>
-
-          <div className="space-y-1.5">
-            <Label htmlFor="canvas-image-model" className="text-xs">生图模型</Label>
-            {imageModelLoadState === 'loading' || imageModelLoadState === 'idle' ? (
-              <div className="h-8 animate-pulse rounded-sm bg-muted" aria-label="正在加载生图模型" />
-            ) : (
-              <Select
-                value={mediaWorkflow ? '' : draft.selectedModelProfileId ?? ''}
-                disabled={!writable || imageModelLoadState !== 'ready' || imageModelOptions.length === 0}
-                onValueChange={(profileId) => {
-                  setWorkflowEditorGeneration((value) => value + 1)
-                  onMediaWorkflowChange?.(null)
-                  onDraftChange({ selectedModelProfileId: profileId })
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-label="导出当前图片"
+                disabled={!writable || !adoptedAsset || exportState === 'exporting'}
+                onClick={() => {
+                  if (adoptedAsset) onExportAsset(adoptedAsset.id)
                 }}
               >
-                <SelectTrigger id="canvas-image-model" className="h-8 rounded-sm px-2 text-xs">
-                  <SelectValue placeholder="未配置生图模型">
-                    {selectedModel ? `${selectedModel.name} · ${selectedModel.modelId}` : undefined}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectContent>
-                  {imageModelOptions.map((option) => (
-                    <SelectItem key={option.profileId} value={option.profileId} disabled={!option.available}>
-                      <span title={option.unavailableReason}>{option.name} · {option.modelId}</span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-            {(imageModelLoadState === 'failed' || !selectedModel?.available) && (
-              <div className="space-y-1.5">
-                <p className="break-words text-xs text-destructive">
-                  {imageModelError ?? selectedModel?.unavailableReason ?? '未配置可用的生图模型'}
-                </p>
-                <Button type="button" variant="outline" size="sm" className="w-full" onClick={onConfigureModels}>
-                  <Settings2 aria-hidden="true" />配置生图模型
-                </Button>
+                {exportState === 'exporting'
+                  ? <><LoaderCircle className="animate-spin" aria-hidden="true" />正在导出</>
+                  : <><Download aria-hidden="true" />导出当前图片</>}
+              </Button>
+              {exportError && (
+                <p className="break-words text-xs text-destructive" role="alert">{exportError}</p>
+              )}
+
+              {displayedJob?.error && (
+                <p className="break-words text-xs text-destructive" role="alert">{displayedJob.error}</p>
+              )}
+              {displayedJob && JOB_STATUS_MESSAGES[displayedJob.status] && !displayedJob.error && (
+                <p className="text-xs text-muted-foreground">{JOB_STATUS_MESSAGES[displayedJob.status]}</p>
+              )}
+              {mediaProgress && (
+                <div className="space-y-0.5 border-l-2 border-primary/40 pl-2 text-xs text-muted-foreground" role="status">
+                  <p className="font-medium text-foreground">{mediaProgress.phaseLabel}</p>
+                  {mediaProgress.nodeProgressLabel ? <p className="break-words">{mediaProgress.nodeProgressLabel}</p> : null}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <History className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                  <FieldHeader>历史版本</FieldHeader>
+                </div>
+                {versions.length > 0 ? (
+                  <TooltipProvider delayDuration={200} disableHoverableContent>
+                    <ul className="flex gap-2 overflow-x-auto pb-1" aria-label="历史版本">
+                      {versions.map(({ job, asset }) => {
+                        /** 当前权威采用版本使用明确状态，不与预览选择混淆。 */
+                        const adopted = asset.id === snapshot.config.adoptedAssetId
+                        /** 当前可见版本支持键盘和鼠标选择。 */
+                        const selected = asset.id === visibleAssetId
+                        /** 采用期间所有版本共享单一写通道，目标项显示明确进度。 */
+                        const adopting = asset.id === adoptingAssetId
+                        return (
+                          <li key={asset.id} className="relative size-16 shrink-0">
+                            <button
+                              type="button"
+                              className={cn(
+                                'size-16 overflow-hidden rounded-sm border bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                                selected ? 'border-primary' : 'border-border hover:border-foreground/40',
+                              )}
+                              aria-label={`预览第 ${job.attemptNumber} 次生成结果`}
+                              aria-pressed={selected}
+                              onClick={() => onPreviewAsset(asset.id)}
+                            >
+                              <img
+                                src={createMediaUrl(snapshot.thumbnailBaseUrl, asset.thumbnailRelativePath)}
+                                alt=""
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                              />
+                              {adopted && (
+                                <span className="absolute bottom-0 left-0 right-0 bg-background/90 py-0.5 text-center text-[9px] text-foreground">默认</span>
+                              )}
+                            </button>
+                            {!adopted && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="absolute right-1 top-1 inline-flex" tabIndex={writable ? undefined : 0}>
+                                    <Button
+                                      type="button"
+                                      size="icon"
+                                      variant="secondary"
+                                      className="size-6 rounded-sm bg-background/90 shadow-sm"
+                                      aria-label={adopting ? '正在设为默认' : '设为默认'}
+                                      disabled={!writable || adoptingAssetId !== null}
+                                      onClick={() => onAdoptAsset(asset.id)}
+                                    >
+                                      {adopting
+                                        ? <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />
+                                        : <Check className="size-3.5" aria-hidden="true" />}
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">
+                                  {writable ? '设为默认' : '当前画布为只读状态'}
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  </TooltipProvider>
+                ) : (
+                  <p className="text-xs text-muted-foreground">生成成功后会在这里保留版本</p>
+                )}
               </div>
-            )}
-          </div>
 
-          {onMediaWorkflowChange
-          && (selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId).length > 0 || mediaWorkflow) ? (
-            <CanvasImageWorkflowEditor
-              key={workflowEditorGeneration}
-              projectId={snapshot.target.projectId}
-              workflow={mediaWorkflow}
-              workflows={selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId)}
-              connections={mediaConnections}
-              assets={mediaAssets}
-              writable={writable}
-              busy={Boolean(activeJob) || state.saveState === 'saving'}
-              defaultComfyuiConnectionId={defaultComfyuiConnectionId}
-              onValidationChange={setWorkflowValidationError}
-              onChange={(next) => {
-                if (next && !mediaWorkflow) onDraftChange({ selectedModelProfileId: null })
-                onMediaWorkflowChange(next)
-              }}
-            />
-          ) : null}
-          {workflowValidationError ? (
-            <p className="break-words text-xs text-destructive" role="alert">{workflowValidationError}</p>
-          ) : null}
+              {displayedJob && (
+                <Button type="button" variant="ghost" size="sm" className="px-1" onClick={() => setDetailsJobId(displayedJob.id)}>
+                  查看任务详情
+                </Button>
+              )}
 
-          <div className="space-y-1.5">
-            <Label className="text-xs">项目上下文</Label>
-            <div role="radiogroup" aria-label="项目上下文" className="grid grid-cols-3 gap-1 rounded-sm bg-muted/50 p-1">
-              {CONTEXT_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={draft.contextMode === option.value}
-                  title={option.description}
-                  disabled={!writable}
-                  className={cn(
-                    'min-h-7 min-w-0 rounded-sm px-1.5 py-1 text-[11px] leading-4 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                    draft.contextMode === option.value && 'bg-background font-medium text-foreground shadow-sm',
-                  )}
-                  onClick={() => onDraftChange({ contextMode: option.value })}
-                >
-                  {option.label}
-                </button>
-              ))}
+              {detailsJob && detailsState && (
+                <div className="border-t border-border pt-1">
+                  <DesignTaskDetailsView
+                    job={detailsJob}
+                    detailsState={detailsState}
+                    onLoadDetails={() => onLoadTaskDetails(detailsJob.id, false)}
+                    onLoadTrace={() => onLoadTaskDetails(detailsJob.id, true)}
+                    onCopyPrompt={onCopyPrompt}
+                    onRetry={detailsJob.status === 'failed' || detailsJob.status === 'cancelled' || detailsJob.status === 'interrupted'
+                      ? onRetry
+                      : undefined}
+                  />
+                </div>
+              )}
             </div>
-          </div>
+          </ScrollArea>
+        </section>
 
-          <div className="space-y-1.5">
-            <Label className="text-xs">画面比例</Label>
-            <div role="radiogroup" aria-label="画面比例" className="grid grid-cols-5 gap-1">
-              {ASPECT_RATIO_OPTIONS.map((ratio) => (
-                <button
-                  key={ratio}
-                  type="button"
-                  role="radio"
-                  aria-checked={draft.aspectRatio === ratio}
+        <section className="flex min-h-0 min-w-0 flex-col" aria-label="图片生成配置">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="space-y-4 p-4">
+              {!writable && (
+                <p className="rounded-sm border border-border bg-muted/45 px-2.5 py-2 text-xs text-muted-foreground">
+                  当前画布为只读状态
+                </p>
+              )}
+              {snapshot.config.preparation ? (
+                <p className="rounded-sm border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700" role="status">
+                  待配置：{snapshot.config.preparation.message}
+                </p>
+              ) : null}
+
+              <div className="space-y-1.5">
+                <Label htmlFor="canvas-image-prompt" className="text-xs">提示词</Label>
+                <Textarea
+                  id="canvas-image-prompt"
+                  value={draft.prompt}
+                  rows={6}
+                  className="min-h-28 resize-y text-xs leading-5"
+                  placeholder="描述要生成的画面、用途与重点"
                   disabled={!writable}
-                  className={cn(
-                    'h-8 rounded-sm border border-border px-1 text-[11px] text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                    draft.aspectRatio === ratio && 'border-primary bg-primary/10 font-medium text-foreground',
-                  )}
-                  onClick={() => onDraftChange({ aspectRatio: ratio })}
-                >
-                  {ratio}
-                </button>
-              ))}
-            </div>
-          </div>
+                  onChange={(event) => onDraftChange({ prompt: event.currentTarget.value })}
+                />
+              </div>
 
-          <div className="space-y-1.5">
-            <Label htmlFor="canvas-image-size" className="text-xs">图片尺寸</Label>
-            <Select
-              value={draft.imageSize}
-              disabled={!writable}
-              onValueChange={(imageSize) => {
-                if (isCanvasImageSize(imageSize)) onDraftChange({ imageSize })
-              }}
-            >
-              <SelectTrigger id="canvas-image-size" className="h-8 rounded-sm px-2 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {IMAGE_SIZE_OPTIONS.map((option) => (
-                  <SelectItem
-                    key={option.value}
-                    value={option.value}
-                    disabled={selectedModel?.executor === 'comfyui' && option.value === 'auto'}
+              <div className="space-y-1.5">
+                <Label htmlFor="canvas-image-model" className="text-xs">生图模型</Label>
+                {imageModelLoadState === 'loading' || imageModelLoadState === 'idle' ? (
+                  <div className="h-8 animate-pulse rounded-sm bg-muted" aria-label="正在加载生图模型" />
+                ) : (
+                  <Select
+                    value={mediaWorkflow ? '' : draft.selectedModelProfileId ?? ''}
+                    disabled={!writable || imageModelLoadState !== 'ready' || imageModelOptions.length === 0}
+                    onValueChange={(profileId) => {
+                      setWorkflowEditorGeneration((value) => value + 1)
+                      onMediaWorkflowChange?.(null)
+                      onDraftChange({ selectedModelProfileId: profileId })
+                    }}
                   >
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {comfyAutoSizeUnsupported ? (
-              <p className="text-xs text-destructive">ComfyUI 工作流需要选择明确的图片尺寸</p>
-            ) : null}
-          </div>
+                    <SelectTrigger
+                      id="canvas-image-model"
+                      className="h-8 min-w-0 rounded-sm px-2 text-xs [&>span]:min-w-0 [&>svg]:shrink-0"
+                      title={selectedModel ? `${getImageModelLabel(selectedModel)} · ${selectedModel.modelId}` : undefined}
+                    >
+                      <SelectValue placeholder="未配置生图模型">
+                        {selectedModel ? getImageModelLabel(selectedModel) : undefined}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent className="max-w-[var(--radix-select-content-available-width)]">
+                      {imageModelOptions.map((option) => (
+                        <SelectItem key={option.profileId} value={option.profileId} disabled={!option.available} className="[&>span:last-child]:min-w-0">
+                          <span className="break-all" title={option.unavailableReason ?? `${getImageModelLabel(option)} · ${option.modelId}`}>
+                            {getImageModelLabel(option)}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+                {(imageModelLoadState === 'failed' || !selectedModel?.available) && (
+                  <div className="space-y-1.5">
+                    <p className="break-words text-xs text-destructive">
+                      {imageModelError ?? selectedModel?.unavailableReason ?? '未配置可用的生图模型'}
+                    </p>
+                    <Button type="button" variant="outline" size="sm" className="w-full" onClick={onConfigureModels}>
+                      <Settings2 aria-hidden="true" />配置生图模型
+                    </Button>
+                  </div>
+                )}
+              </div>
 
-          <div className="space-y-1.5">
-            <FieldHeader>直接上游已提交内容</FieldHeader>
-            {inputReferences.length > 0 ? (
-              <ul className="space-y-1.5">
-                {inputReferences.map((reference) => (
-                  <li key={`${reference.nodeId}-${reference.revision}`} className="border-l border-border pl-2 text-xs leading-5 text-muted-foreground">
-                    <span className="font-medium text-foreground">{reference.kind}</span>
-                    <span className="break-words"> · {reference.summary}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-xs text-muted-foreground">暂无已提交的直接上游内容</p>
-            )}
-          </div>
+              {onMediaWorkflowChange
+              && (selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId).length > 0 || mediaWorkflow) ? (
+                <CanvasImageWorkflowEditor
+                  key={workflowEditorGeneration}
+                  projectId={snapshot.target.projectId}
+                  workflow={mediaWorkflow}
+                  workflows={selectCanvasImageWorkflowsForProject(mediaWorkflows, snapshot.target.projectId)}
+                  connections={mediaConnections}
+                  assets={mediaAssets}
+                  writable={writable}
+                  busy={Boolean(activeJob) || state.saveState === 'saving'}
+                  defaultComfyuiConnectionId={defaultComfyuiConnectionId}
+                  onValidationChange={setWorkflowValidationError}
+                  onChange={(next) => {
+                    if (next && !mediaWorkflow) onDraftChange({ selectedModelProfileId: null })
+                    onMediaWorkflowChange(next)
+                  }}
+                />
+              ) : null}
+              {workflowValidationError ? (
+                <p className="break-words text-xs text-destructive" role="alert">{workflowValidationError}</p>
+              ) : null}
+
+              <div className="space-y-1.5">
+                <Label className="text-xs">项目上下文</Label>
+                <div role="radiogroup" aria-label="项目上下文" className="grid grid-cols-3 gap-1 rounded-sm bg-muted/50 p-1">
+                  {CONTEXT_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={draft.contextMode === option.value}
+                      title={option.description}
+                      disabled={!writable}
+                      className={cn(
+                        'min-h-7 min-w-0 rounded-sm px-1.5 py-1 text-[11px] leading-4 text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        draft.contextMode === option.value && 'bg-background font-medium text-foreground shadow-sm',
+                      )}
+                      onClick={() => onDraftChange({ contextMode: option.value })}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label className="text-xs">画面比例</Label>
+                <div role="radiogroup" aria-label="画面比例" className="grid grid-cols-5 gap-1">
+                  {ASPECT_RATIO_OPTIONS.map((ratio) => (
+                    <button
+                      key={ratio}
+                      type="button"
+                      role="radio"
+                      aria-checked={draft.aspectRatio === ratio}
+                      disabled={!writable}
+                      className={cn(
+                        'h-8 rounded-sm border border-border px-1 text-[11px] text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                        draft.aspectRatio === ratio && 'border-primary bg-primary/10 font-medium text-foreground',
+                      )}
+                      onClick={() => onDraftChange({ aspectRatio: ratio })}
+                    >
+                      {ratio}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="canvas-image-size" className="text-xs">图片尺寸</Label>
+                <Select
+                  value={draft.imageSize}
+                  disabled={!writable}
+                  onValueChange={(imageSize) => {
+                    if (isCanvasImageSize(imageSize)) onDraftChange({ imageSize })
+                  }}
+                >
+                  <SelectTrigger id="canvas-image-size" className="h-8 rounded-sm px-2 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {IMAGE_SIZE_OPTIONS.map((option) => (
+                      <SelectItem
+                        key={option.value}
+                        value={option.value}
+                        disabled={selectedModel?.executor === 'comfyui' && option.value === 'auto'}
+                      >
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {comfyAutoSizeUnsupported ? (
+                  <p className="text-xs text-destructive">ComfyUI 工作流需要选择明确的图片尺寸</p>
+                ) : null}
+              </div>
+
+              <div className="space-y-1.5">
+                <FieldHeader>直接上游已提交内容</FieldHeader>
+                {inputReferences.length > 0 ? (
+                  <ul className="space-y-1.5">
+                    {inputReferences.map((reference) => (
+                      <li key={`${reference.nodeId}-${reference.revision}`} className="border-l border-border pl-2 text-xs leading-5 text-muted-foreground">
+                        <span className="font-medium text-foreground">{reference.kind}</span>
+                        <span className="break-words"> · {reference.summary}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-xs text-muted-foreground">暂无已提交的直接上游内容</p>
+                )}
+              </div>
+            </div>
+          </ScrollArea>
 
           <footer
             aria-label="生图主操作"
-            className="sticky bottom-0 z-10 -mx-4 -mb-4 space-y-2 border-t border-border bg-background/95 p-3 backdrop-blur-sm"
+            className="shrink-0 space-y-2 border-t border-border bg-background px-4 py-3"
           >
             {state.saveState === 'saving' && <p className="text-xs text-muted-foreground">正在保存配置</p>}
             {state.saveState === 'dirty' && <p className="text-xs text-muted-foreground">配置尚未保存</p>}
             {operationError && (
-              <p className="break-words text-xs text-destructive" role="alert">{operationError}</p>
+              <p className="max-h-12 overflow-y-auto break-words text-xs text-destructive" role="alert">{operationError}</p>
             )}
-            {state.saveState === 'conflict' && (
-              <Button type="button" variant="outline" className="w-full" onClick={onRetryLoad}>
-                <RefreshCw aria-hidden="true" />重新加载配置
-              </Button>
-            )}
+            <div className="flex items-center gap-2">
+              {state.saveState === 'conflict' && (
+                <Button type="button" variant="outline" className="min-w-0 flex-1" onClick={onRetryLoad}>
+                  <RefreshCw aria-hidden="true" />重新加载配置
+                </Button>
+              )}
 
-            {activeJob ? (
-              <Button type="button" variant="outline" className="w-full" disabled={!writable} onClick={() => onCancel(activeJob.id)}>
-                <Square aria-hidden="true" />取消生成
-              </Button>
-            ) : retryableJob ? (
-              <Button type="button" className="w-full" disabled={!writable} onClick={() => onRetry(retryableJob.id)}>
-                <RefreshCw aria-hidden="true" />重试生成
-              </Button>
-            ) : (
-              <Button type="button" className="w-full" disabled={generationDisabled} onClick={onGenerate}>
-                <Play aria-hidden="true" />生成图片
-              </Button>
-            )}
+              {activeJob ? (
+                <Button type="button" variant="outline" className="min-w-0 flex-1" disabled={!writable} onClick={() => onCancel(activeJob.id)}>
+                  <Square aria-hidden="true" />取消生成
+                </Button>
+              ) : (
+                <Button type="button" className="min-w-0 flex-1" disabled={generationDisabled} onClick={onGenerate}>
+                  <Play aria-hidden="true" />{retryableJob ? '按当前配置生成' : '生成图片'}
+                </Button>
+              )}
+            </div>
           </footer>
         </section>
       </div>
-    </ScrollArea>
+    </div>
   )
 }

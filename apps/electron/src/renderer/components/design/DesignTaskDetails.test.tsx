@@ -65,6 +65,19 @@ function createJob(): DesignJobRecord {
 }
 
 describe('Design 任务详情', () => {
+  test('Given 失败任务 When 展示重试入口 Then 明确复用原配置', () => {
+    /** 详情中的历史重试与工作台按当前配置生成是两个独立命令。 */
+    const html = renderToStaticMarkup(<DesignTaskDetailsView
+      job={{ ...createJob(), status: 'failed' }}
+      detailsState={{ phase: 'idle', traceLoaded: false, traceLoading: false }}
+      onLoadDetails={() => undefined}
+      onLoadTrace={() => undefined}
+      onRetry={() => undefined}
+    />)
+
+    expect(html).toContain('按原配置重试')
+  })
+
   test('Given 轻量详情已加载 When 渲染 Then 展示原始要求、摘要、精确提示词和尝试历史', () => {
     const html = renderToStaticMarkup(
       <DesignTaskDetails

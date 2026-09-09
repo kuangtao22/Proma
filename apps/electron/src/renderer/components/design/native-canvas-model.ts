@@ -217,6 +217,51 @@ const DEFAULT_NATIVE_CANVAS_PROJECTION_OPTIONS: NativeCanvasProjectionOptions = 
   onWorkbenchNodeChange: () => undefined,
 }
 
+/** 媒体运行阶段到通用节点活动态的优先级，用于合并图片 Job 与 ComfyUI 运行事实。 */
+const NATIVE_CANVAS_PROJECTION_ACTIVITY_PRIORITY: Readonly<Record<CanvasNodeActivityState, number>> = {
+  idle: 0,
+  queued: 1,
+  'waiting-approval': 2,
+  running: 3,
+}
+
+/**
+ * 将媒体运行投影收敛为所有卡片共享的活动态。
+ * @param progress 当前媒体模块的最新运行阶段。
+ * @returns 等待阶段为 queued，处理中为 running，终态为 idle。
+ */
+function resolveMediaRunActivityState(
+  progress: MediaRunProgressProjection | undefined,
+): CanvasNodeActivityState {
+  if (!progress || progress.phase === 'succeeded' || progress.phase === 'failed' || progress.phase === 'cancelled') {
+    return 'idle'
+  }
+  if (progress.phase === 'pending' || progress.phase === 'prepared' || progress.phase === 'queued') {
+    return 'queued'
+  }
+  return 'running'
+}
+
+/**
+ * 合并 Workspace 活动态与媒体阶段，确保任一真实运行事实都能驱动卡片动效。
+ * @param state Workspace 已按节点聚合的状态。
+ * @param progress 当前媒体运行投影。
+ * @returns 优先级最高的通用节点活动态。
+ */
+function resolveProjectedCanvasNodeActivityState(
+  state: CanvasNodeActivityState | undefined,
+  progress: MediaRunProgressProjection | undefined,
+): CanvasNodeActivityState {
+  /** 未命中 Map 视为空闲，但不覆盖媒体模块提供的实时阶段。 */
+  const workspaceState = state ?? 'idle'
+  /** 媒体阶段只做常量时间判断，不读取模块或启动额外订阅。 */
+  const mediaState = resolveMediaRunActivityState(progress)
+  return NATIVE_CANVAS_PROJECTION_ACTIVITY_PRIORITY[workspaceState]
+    >= NATIVE_CANVAS_PROJECTION_ACTIVITY_PRIORITY[mediaState]
+    ? workspaceState
+    : mediaState
+}
+
 /** 非 Agent 折叠节点只附带稳定业务引用，不读取引用内容。 */
 export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   kind: 'image' | 'audio' | 'video' | 'document' | 'webview'
@@ -464,8 +509,13 @@ export function toNativeCanvasFlowNodes(
   return document.nodes.map((node): NativeCanvasFlowNode => {
     /** 投影尺寸复用预先计算结果，避免边和节点使用不同高度。 */
     const nodeSize = nodeSizeById.get(node.id) ?? resolveNativeCanvasNodeSize(node)
-    /** 活动映射按节点 ID 常量时间查询，未命中节点保持零动画的空闲态。 */
-    const activityState = options.nodeActivityStates?.get(node.id) ?? 'idle'
+    /** 活动映射与媒体阶段都按节点 ID 常量时间查询，终态保持零动画。 */
+    const mediaProgress = options.mediaProgressByNodeId?.get(node.id)
+    /** 合并两个现有内存投影，不增加轮询、网络请求或逐帧 React 更新。 */
+    const activityState = resolveProjectedCanvasNodeActivityState(
+      options.nodeActivityStates?.get(node.id),
+      mediaProgress,
+    )
     /** 四类节点共享稳定布局；无边节点继续显式空 handles 以支持可见区裁剪。 */
     const base = {
       id: node.id,
@@ -508,8 +558,6 @@ export function toNativeCanvasFlowNodes(
       /** 候选只改变状态文案，正式采用前不得注入缩略图或素材身份。 */
       const hasPendingCandidate = !node.adoptedAssetId
         && options.imageCandidateNodeIds?.has(node.id) === true
-      /** 当前图片节点的 Comfy 运行投影只读取一次，保持投影逻辑清晰。 */
-      const mediaProgress = options.mediaProgressByNodeId?.get(node.id)
       return {
         ...base,
         type: 'canvasImage',
@@ -556,7 +604,6 @@ export function toNativeCanvasFlowNodes(
       }
     }
     if (node.kind === 'audio' || node.kind === 'video') {
-      const mediaProgress = options.mediaProgressByNodeId?.get(node.id)
       return {
         ...base,
         type: 'canvasMedia',
@@ -566,8 +613,10 @@ export function toNativeCanvasFlowNodes(
           title: node.title,
           mediaModuleId: node.mediaModuleId,
           activityState,
-          statusLabel: '待创作',
-          summary: node.kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
+          statusLabel: mediaProgress?.phase === 'succeeded' ? '已有结果' : '待创作',
+          summary: mediaProgress?.phase === 'succeeded'
+            ? '已有生成结果'
+            : node.kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
           ...(mediaProgress ? { mediaProgress } : {}),
           canOpenWorkbench: true,
           onOpenWorkbench: options.onWorkbenchNodeChange,

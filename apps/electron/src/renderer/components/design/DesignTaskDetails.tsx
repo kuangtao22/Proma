@@ -451,7 +451,7 @@ export function DesignTaskDetailsView({
       <div className="flex flex-wrap gap-1.5">
         {retryable && onRetry && (
           <Button type="button" variant="outline" size="sm" onClick={() => onRetry(job.id)}>
-            <RotateCcw aria-hidden="true" />重试
+            <RotateCcw aria-hidden="true" />按原配置重试
           </Button>
         )}
         {job.status === 'succeeded' && job.outputAssetId && onContinueFromVersion && (

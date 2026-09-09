@@ -1,9 +1,19 @@
-import type { CanvasDocument, CanvasTarget, MediaRunSnapshot } from '@proma/shared'
+import type { CanvasDocument, CanvasMediaAdoptedOutput, CanvasTarget, MediaRunSnapshot } from '@proma/shared'
 import type { MediaRunService } from '../media/media-run-service'
 import type { MediaRunSupervisor } from '../media/media-run-supervisor'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
 import type { CanvasMediaService } from './canvas-media-service'
 import type { CanvasWorkflowExecutionServiceDependencies } from './canvas-workflow-execution-service'
+
+/** 只认可指定运行和输出的明确采用，默认首选不能替代工作流验收。 */
+export function findCanvasWorkflowConfirmedMediaOutput(
+  outputs: readonly CanvasMediaAdoptedOutput[],
+  runId: string,
+  outputKey: string,
+): CanvasMediaAdoptedOutput | null {
+  return outputs.find((output) => output.key === outputKey && output.runId === runId
+    && output.selectionOrigin !== 'initial') ?? null
+}
 
 /** 工作流只通过已有媒体服务提交，恢复时保持原 run 和调用主体。 */
 export interface CanvasWorkflowMediaAdapterDependencies {

@@ -8,7 +8,8 @@ import {
   type CanvasTarget,
 } from '@proma/shared'
 import { createCanvasImageCandidateBatchService, createCanvasImageCandidateHash } from './canvas-image-candidate-batch-service'
-import type { CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
+import type { CanvasImageCandidateAdoptionPublication } from './canvas-image-candidate-batch-service'
+import { parseCanvasImageCandidateAdoptionIntent, type CanvasImageCandidateAdoptionIntent } from './canvas-image-candidate-batch-store'
 import { createCanvasDependencyStateService } from './canvas-dependency-state-service'
 import { parseCanvasDocument } from './canvas-document-store'
 
@@ -30,7 +31,7 @@ test('Given Agent 明确整批采用 When 同 operation 重放或变更模式 Th
 })
 
 /** 创建 14 节点内存夹具；normalizeDocument 为 true 时复现主进程 Store 的读写重建。 */
-function createFixture(input: boolean | { validateCandidate?: () => Promise<void> } = false) {
+function createFixture(input: boolean | { validateCandidate?: () => Promise<void> } = false, initiallyEmpty = false) {
   /** 同时覆盖真实 Store 规范化与异步候选预检。 */
   const normalizeDocument = typeof input === 'boolean' ? input : false
   const options = typeof input === 'boolean' ? {} : input
@@ -39,8 +40,12 @@ function createFixture(input: boolean | { validateCandidate?: () => Promise<void
   const intents = new Map<string, CanvasImageCandidateAdoptionIntent>()
   const configs = new Map<string, CanvasImageModuleConfig>()
   const adopted: string[] = []
+  /** 记录显式采用恢复通知，首选初始化与其恢复均不能唤醒父流程。 */
+  const resumeNotifications: CanvasTarget[] = []
   const retried: string[] = []
   const started: string[] = []
+  /** 记录锁外发布的正式素材事实，验证关闭工作台后仍能刷新卡片。 */
+  const publications: CanvasImageCandidateAdoptionPublication[] = []
   /** 依赖投影调用数用于证明候选阶段不会提前传播。 */
   let dependencyProjectionCalls = 0
   /** 公开入口获取串行器的次数，用于证明 locked 恢复入口不会重入。 */
@@ -52,10 +57,10 @@ function createFixture(input: boolean | { validateCandidate?: () => Promise<void
     configs.set(nodeId, {
       schemaVersion: 2, kind: 'image', contentId: `module-${index}`, revision: 1,
       createdAt: 1, updatedAt: 1, prompt: '生成', selectedModelProfileId: 'model-1',
-      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none', adoptedAssetId: `old-${index}`,
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'none', adoptedAssetId: initiallyEmpty ? null : `old-${index}`,
     })
     return {
-      nodeId, imageModuleId: `module-${index}`, initialAdoptedAssetId: `old-${index}`,
+      nodeId, imageModuleId: `module-${index}`, initialAdoptedAssetId: initiallyEmpty ? null : `old-${index}`,
       initialConfigRevision: 1, jobId: `job-${index}`,
     }
   })
@@ -98,13 +103,17 @@ function createFixture(input: boolean | { validateCandidate?: () => Promise<void
       return structuredClone(value)
     },
     saveAdoptionIntent: async (intent: CanvasImageCandidateAdoptionIntent) => {
-      intents.set(intent.operationId, structuredClone(intent))
-      return structuredClone(intent)
+      /** 采用条目必须经过生产 parser，避免内存夹具接受磁盘合同拒绝的数据。 */
+      const parsed = parseCanvasImageCandidateAdoptionIntent(intent, target, intent.operationId)
+      intents.set(intent.operationId, structuredClone(parsed))
+      return structuredClone(parsed)
     },
   }
   const service = createCanvasImageCandidateBatchService({
     store,
     validateCandidate: options.validateCandidate,
+    onAdopted: (target) => { resumeNotifications.push(target) },
+    publishAdoption: (publication) => { publications.push(structuredClone(publication)) },
     dependencyState: {
       consumeAndPropagate: (input) => {
         dependencyProjectionCalls += 1
@@ -149,7 +158,7 @@ function createFixture(input: boolean | { validateCandidate?: () => Promise<void
     randomUUID: () => 'operation-1',
   })
   return {
-    target, entries, batches, intents, configs, adopted, retried, started, service,
+    target, entries, batches, intents, configs, adopted, retried, started, service, publications, store, resumeNotifications,
     get canvas() { return canvas },
     set canvas(value: CanvasDocument) { canvas = value },
     get dependencyProjectionCalls() { return dependencyProjectionCalls },
@@ -234,6 +243,249 @@ async function createLegacyRawHashRecoveryFixture() {
 }
 
 describe('Canvas 图片候选批次 Service', () => {
+  test('Given 首次生成且没有默认素材 When 第一张成功 Then 自动设为默认并发布图变化', async () => {
+    /** 使用真实 parser 重建，锁定正式图而不是单独的预览选中态。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-first', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-first', jobId: 'job-0',
+      status: 'succeeded', outputAssetId: 'first-image', error: null,
+    })
+
+    expect(fixture.configs.get('node-0')).toMatchObject({ adoptedAssetId: 'first-image', revision: 2 })
+    expect(fixture.canvas.nodes[0]).toMatchObject({ adoptedAssetId: 'first-image' })
+    expect(fixture.publications).toHaveLength(1)
+    expect(fixture.publications[0]?.document.revision).toBe(fixture.canvas.revision)
+    expect(fixture.started).toEqual([])
+    expect(fixture.resumeNotifications).toEqual([])
+    await fixture.service.adopt({ ...fixture.target, batchId: 'batch-first', mode: 'all' })
+    expect(fixture.resumeNotifications).toEqual([fixture.target])
+    /** 原生采用文件只接受 UUID，批次的 agent-canvas 哈希身份不能直接复用。 */
+    expect([...fixture.intents.values()][0]?.operationId)
+      .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/)
+  })
+
+  test('Given 首次批量生成 When 部分成功且部分失败 Then 只为成功的空节点选中素材', async () => {
+    /** 失败节点保留为空，不能因自动采用一个节点而关闭整个批次。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-first-many', source: 'canvas-tool',
+      sourceSessionId: 'session-1', sourceToolCallId: 'tool-1', entries: fixture.entries.slice(0, 3),
+    })
+    for (const index of [1, 0]) {
+      await fixture.service.recordJobTerminal({
+        ...fixture.target, candidateBatchId: 'batch-first-many', jobId: `job-${index}`,
+        status: 'succeeded', outputAssetId: `first-${index}`, error: null,
+      })
+    }
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-first-many', jobId: 'job-2',
+      status: 'failed', outputAssetId: null, error: '生成失败',
+    })
+    expect(fixture.configs.get('node-0')?.adoptedAssetId).toBe('first-0')
+    expect(fixture.configs.get('node-1')?.adoptedAssetId).toBe('first-1')
+    expect(fixture.configs.get('node-2')?.adoptedAssetId).toBeNull()
+    expect((await fixture.service.load({ ...fixture.target, batchId: 'batch-first-many' })).status).toBe('partial')
+    expect(fixture.publications).toHaveLength(2)
+  })
+
+  test('Given 首次素材已采用 When 重放终态且重新生成 Then 保留第一份默认并避免重复写图', async () => {
+    /** 同一空基线的迟到任务也不得覆盖先完成的默认素材。 */
+    const fixture = createFixture(true, true)
+    for (const [batchId, jobId] of [['batch-first', 'job-0'], ['batch-second', 'job-second']]) {
+      await fixture.service.createBatch({
+        ...fixture.target, batchId: batchId!, source: 'single', sourceSessionId: null, sourceToolCallId: null,
+        entries: [{ ...fixture.entries[0]!, jobId: jobId! }],
+      })
+    }
+    /** 重复成功回调必须幂等。 */
+    const event = {
+      ...fixture.target, candidateBatchId: 'batch-first', jobId: 'job-0',
+      status: 'succeeded' as const, outputAssetId: 'first-image', error: null,
+    }
+    await fixture.service.recordJobTerminal(event)
+    await fixture.service.recordJobTerminal(event)
+    await fixture.service.recordJobTerminal({
+      ...event, candidateBatchId: 'batch-second', jobId: 'job-second', outputAssetId: 'second-image',
+    })
+    expect(fixture.configs.get('node-0')).toMatchObject({ adoptedAssetId: 'first-image', revision: 2 })
+    expect(fixture.adopted).toEqual(['node-0'])
+    expect(fixture.publications).toHaveLength(1)
+  })
+
+  test('Given 空节点生成期间配置已修改或批次已放弃 When 结果到达 Then 只保存候选', async () => {
+    for (const changed of ['config', 'abandoned']) {
+      /** 修改配置意味着当前用户意图已不再等同任务固化的空节点基线。 */
+      const fixture = createFixture(true, true)
+      await fixture.service.createBatch({
+        ...fixture.target, batchId: 'batch-stale-first', source: 'single',
+        sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+      })
+      if (changed === 'config') {
+        fixture.configs.set('node-0', { ...fixture.configs.get('node-0')!, revision: 2, prompt: '新提示词' })
+      } else {
+        await fixture.service.abandon({ ...fixture.target, batchId: 'batch-stale-first' })
+      }
+      await fixture.service.recordJobTerminal({
+        ...fixture.target, candidateBatchId: 'batch-stale-first', jobId: 'job-0',
+        status: 'succeeded', outputAssetId: 'stale-image', error: null,
+      })
+      expect(fixture.configs.get('node-0')?.adoptedAssetId).toBeNull()
+      expect(fixture.adopted).toEqual([])
+      expect(fixture.publications).toEqual([])
+    }
+  })
+
+  test('Given 已自动首选且原批次还有其他新版本 When 显式整批采用 Then 原批次仍可完成', async () => {
+    /** 同批次混合首次生成与已存在素材，自动采用不提前关闭原批次。 */
+    const fixture = createFixture(true, true)
+    fixture.configs.set('node-1', { ...fixture.configs.get('node-1')!, adoptedAssetId: 'old-1' })
+    fixture.canvas = {
+      ...fixture.canvas,
+      nodes: fixture.canvas.nodes.map((node) => node.id === 'node-1' && node.kind === 'image'
+        ? { ...node, adoptedAssetId: 'old-1' } : node),
+    }
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-mixed', source: 'canvas-tool', sourceSessionId: 'session-1', sourceToolCallId: 'tool-1',
+      entries: [fixture.entries[0]!, { ...fixture.entries[1]!, initialAdoptedAssetId: 'old-1' }],
+    })
+    for (const index of [0, 1]) {
+      await fixture.service.recordJobTerminal({
+        ...fixture.target, candidateBatchId: 'batch-mixed', jobId: `job-${index}`,
+        status: 'succeeded', outputAssetId: `new-${index}`, error: null,
+      })
+    }
+    expect(fixture.configs.get('node-1')?.adoptedAssetId).toBe('old-1')
+    await expect(fixture.service.adopt({ ...fixture.target, batchId: 'batch-mixed', mode: 'all' }))
+      .resolves.toMatchObject({ status: 'adopted' })
+    expect(fixture.configs.get('node-1')?.adoptedAssetId).toBe('new-1')
+    expect(fixture.configs.get('node-0')?.revision).toBe(2)
+    expect(fixture.adopted).toEqual(['node-0', 'node-1'])
+  })
+
+  test('Given 首选已完成但原批次终态被重放 When 工作流查询采用事实 Then 保留真实采用时间', async () => {
+    /** 原批次事件时间可以变化，正式采用时间必须来自独立 receipt。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-stable-time', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-stable-time', jobId: 'job-0',
+      status: 'succeeded', outputAssetId: 'first-image', error: null,
+    })
+    /** 模拟恢复重新登记原候选，其更新时间不再等于首次采用时间。 */
+    fixture.batches.set('batch-stable-time', { ...fixture.batches.get('batch-stable-time')!, updatedAt: 999 })
+    expect(await fixture.service.getCandidateAdoption({
+      ...fixture.target, batchId: 'batch-stable-time', nodeId: 'node-0', jobId: 'job-0',
+    })).toEqual({ assetId: 'first-image', committedAt: 100 })
+    fixture.configs.set('node-0', { ...fixture.configs.get('node-0')!, adoptedAssetId: 'different-image' })
+    expect(await fixture.service.getCandidateAdoption({
+      ...fixture.target, batchId: 'batch-stable-time', nodeId: 'node-0', jobId: 'job-0',
+    })).toBeNull()
+  })
+
+  test('Given 全部候选已自动选中 When 整批采用及失败恢复 Then 不重复写入模块或画布', async () => {
+    for (const failReceipt of [false, true]) {
+      /** 全部候选均为首次成功，之后的验收只确认批次，不改变正式素材。 */
+      const fixture = createFixture(true, true)
+      await fixture.service.createBatch({
+        ...fixture.target, batchId: 'batch-already-selected', source: 'single',
+        sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+      })
+      await fixture.service.recordJobTerminal({
+        ...fixture.target, candidateBatchId: 'batch-already-selected', jobId: 'job-0',
+        status: 'succeeded', outputAssetId: 'first-image', error: null,
+      })
+      /** 完整图快照同时锁定 revision、内容和下游提示，防止无内容写入。 */
+      const selectedDocument = structuredClone(fixture.canvas)
+      const save = fixture.store.save
+      const failure = spyOn(fixture.store, 'save').mockImplementation(async (batch) => {
+        if (failReceipt && batch.status === 'adopted') throw new Error('BATCH_WRITE_FAILED')
+        return save(batch)
+      })
+      const adoption = fixture.service.adopt({ ...fixture.target, batchId: 'batch-already-selected', mode: 'all' })
+      if (failReceipt) {
+        await expect(adoption).rejects.toThrow('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+        failure.mockRestore()
+        expect((await fixture.service.reconcile(fixture.target)).error).toBeUndefined()
+      } else {
+        await expect(adoption).resolves.toMatchObject({ status: 'adopted' })
+        failure.mockRestore()
+      }
+      expect(fixture.canvas).toEqual(selectedDocument)
+      expect(fixture.configs.get('node-0')?.revision).toBe(2)
+      expect(fixture.adopted).toEqual(['node-0'])
+      expect((await fixture.service.load({ ...fixture.target, batchId: 'batch-already-selected' })).status).toBe('adopted')
+    }
+  })
+
+  test('Given 首次失败后重试成功 When replacement 返回素材 Then 自动选择首份成功素材', async () => {
+    /** 失败不占据默认版本；重试沿原批次空基线完成首次采用。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-retry-first', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-retry-first', jobId: 'job-0',
+      status: 'failed', outputAssetId: null, error: '失败',
+    })
+    await fixture.service.retryJob({ ...fixture.target, batchId: 'batch-retry-first', nodeId: 'node-0', imageModuleId: 'module-0', jobId: 'job-0' })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-retry-first', jobId: 'job-0-retry',
+      status: 'succeeded', outputAssetId: 'first-retry', error: null,
+    })
+    expect(fixture.configs.get('node-0')?.adoptedAssetId).toBe('first-retry')
+  })
+
+  test('Given 启动时补登记历史成功任务 When 历史从未手动采用 Then 保留旧选择并且不自动回填', async () => {
+    /** 启动恢复历史候选不等同本次首次生成，避免按磁盘枚举顺序选择旧素材。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-history-first', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    await fixture.service.recordJobTerminal({
+      ...fixture.target, candidateBatchId: 'batch-history-first', jobId: 'job-0',
+      status: 'succeeded', outputAssetId: 'history-image', error: null, skipInitialAdoption: true,
+    })
+    expect(fixture.configs.get('node-0')?.adoptedAssetId).toBeNull()
+    expect(fixture.adopted).toEqual([])
+    expect(fixture.publications).toEqual([])
+  })
+
+  test('Given 首次采用图已提交但批次终态写失败 When 重放终态 Then 先发布已提交图并幂等恢复', async () => {
+    /** 注入一次批次终态持久化故障，模拟图片已显示但 receipt 尚未收口的崩溃窗口。 */
+    const fixture = createFixture(true, true)
+    await fixture.service.createBatch({
+      ...fixture.target, batchId: 'batch-crash-first', source: 'single',
+      sourceSessionId: null, sourceToolCallId: null, entries: [fixture.entries[0]!],
+    })
+    /** 保留真实内存 Store 的写入语义，只在 adopted 批次落盘前拒绝。 */
+    const save = fixture.store.save
+    const failure = spyOn(fixture.store, 'save').mockImplementation(async (batch) => {
+      if (batch.status === 'adopted') throw new Error('BATCH_WRITE_FAILED')
+      return save(batch)
+    })
+    const event = {
+      ...fixture.target, candidateBatchId: 'batch-crash-first', jobId: 'job-0',
+      status: 'succeeded' as const, outputAssetId: 'first-image', error: null,
+    }
+    await expect(fixture.service.recordJobTerminal(event)).rejects.toThrow('CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED')
+    expect(fixture.canvas.nodes[0]).toMatchObject({ adoptedAssetId: 'first-image' })
+    expect(fixture.publications).toHaveLength(1)
+    failure.mockRestore()
+    await fixture.service.recordJobTerminal(event)
+    expect(fixture.configs.get('node-0')).toMatchObject({ adoptedAssetId: 'first-image', revision: 2 })
+    expect(fixture.adopted).toEqual(['node-0'])
+    expect([...fixture.intents.values()].every((intent) => intent.state === 'batch-committed')).toBe(true)
+    expect(fixture.resumeNotifications).toEqual([])
+  })
+
   test('Given 真实 Store 重建新增下游提示的字段顺序 When 采用后用户合法编辑并 LOAD reconcile Then 不再阻断', async () => {
     /** 开启读写规范化，覆盖原内存夹具未模拟的生产边界。 */
     const fixture = createFixture(true)
