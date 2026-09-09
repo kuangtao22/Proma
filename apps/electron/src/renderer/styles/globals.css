@@ -2842,28 +2842,37 @@
   outline-offset: -2px;
 }
 .live-markdown-table-editor .is-editing {
-  padding: 0.2rem 0.25rem;
   background: hsl(var(--muted) / 0.38);
 }
 .live-markdown-table-input {
+  display: block;
   box-sizing: border-box;
-  width: 100%;
+  width: calc(100% + 1.4rem);
   min-width: 0;
+  min-height: 2.35rem;
+  margin: -0.5rem -0.7rem;
+  resize: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   border: 0;
   border-radius: 0.25rem;
   background: hsl(var(--background));
   color: hsl(var(--foreground));
-  padding: 0.3rem 0.45rem;
+  padding: 0.5rem 0.7rem;
   font: inherit;
   line-height: inherit;
   outline: 2px solid hsl(var(--ring));
-  outline-offset: 0;
+  outline-offset: -2px;
 }
 .live-markdown-table-value {
   display: block;
   min-height: 1.35rem;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+.live-markdown-table-value strong {
+  font-weight: 700;
 }
 .live-markdown-table-math {
   display: inline-block;
