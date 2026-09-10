@@ -84,6 +84,7 @@ import { initShortcutRegistry, updateShortcutOverrides } from './lib/shortcut-re
 import { triggerLegacyScratchPadMigration } from './lib/legacy-scratch-pad-migration'
 import { initializePerformanceMonitor } from './lib/performance-monitor'
 import { createUpdateReminderScheduler, type UpdateReminderScheduler } from './lib/update-reminder-scheduler'
+import { PROMA_DOWNLOAD_URL } from '../shared/release-config'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
@@ -376,7 +377,7 @@ function UpdaterInitializer(): null {
             <button
               type="button"
               className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
-              onClick={() => { void window.electronAPI.openExternal('https://proma.cool/changelog') }}
+              onClick={() => { void window.electronAPI.openExternal(PROMA_DOWNLOAD_URL) }}
             >
               查看更新
               <ArrowUpRight size={13} />

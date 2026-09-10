@@ -2,7 +2,7 @@
  * AboutSettings - 关于页面
  *
  * 显示应用版本号等基本信息，以及版本检测状态。
- * 检测到新版本后引导用户去 GitHub Releases 手动下载。
+ * 检测到新版本后引导用户去 Proma 官方下载页手动下载。
  */
 
 import * as React from 'react'
@@ -22,7 +22,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { ReleaseNotesViewer } from './ReleaseNotesViewer'
 import { VersionHistory } from './VersionHistory'
-import { PROMA_RELEASE_REPOSITORY } from '../../../shared/release-config'
+import { PROMA_DOWNLOAD_URL, PROMA_RELEASE_REPOSITORY } from '../../../shared/release-config'
 import { createAppVersionDisplay } from '@/lib/app-version-display'
 
 /** 从 package.json 构建时由 Vite define 注入 */
@@ -31,9 +31,6 @@ declare const __APP_VERSION__: string
 const APP_VERSION = __APP_VERSION__
 /** 关于页分别展示官方基线与 Bone 构建号。 */
 const APP_VERSION_DISPLAY = createAppVersionDisplay(APP_VERSION)
-/** 手动下载更新时使用的 fork Release 页面。 */
-const GITHUB_RELEASES_URL = `${PROMA_RELEASE_REPOSITORY.webUrl}/releases`
-
 /** 更新状态卡片 */
 function UpdateCard(): React.ReactElement | null {
   const available = useAtomValue(updaterAvailableAtom)
@@ -56,8 +53,7 @@ function UpdateCard(): React.ReactElement | null {
   }
 
   const handleGoToDownload = (): void => {
-    const url = release?.html_url || GITHUB_RELEASES_URL
-    window.electronAPI.openExternal(url)
+    window.electronAPI.openExternal(PROMA_DOWNLOAD_URL)
   }
 
   const handleInstallWhenIdle = (): void => {
