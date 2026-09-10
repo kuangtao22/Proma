@@ -106,7 +106,7 @@ import {
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentCanvasBinding, AgentCanvasBindingChangeEvent, AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, CanvasChangeEvent, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock, AgentQueuedMessageSnapshot, AgentQueuedMessageStatus } from '@proma/shared'
+import type { AgentCanvasBinding, AgentCanvasBindingChangeEvent, AgentStreamEvent, AgentStreamCompletePayload, AgentStreamErrorPayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, CanvasChangeEvent, SDKAssistantMessage, SDKResultMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock, AgentQueuedMessageSnapshot, AgentQueuedMessageStatus } from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
 import {
   buildExternalAgentRunActivation,
@@ -482,8 +482,12 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
         }
       }
       // Usage（保留完整字段用于详细展示）
-      if (!aMsg.parent_tool_use_id && aMsg.message.usage) {
+      if (!aMsg.parent_tool_use_id && (aMsg.message.usage || aMsg.message.usageStatus)) {
         const u = aMsg.message.usage
+        if (!u) {
+          events.push({ type: 'usage_update', usage: { usageStatus: aMsg.message.usageStatus } })
+          return events
+        }
         const inputTokens = u.input_tokens + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0)
         // 流式过程中 SDK 不返回 contextWindow，按模型名推断一个默认值作为 fallback。
         // 注意：必须优先用 _channelModelId（用户在 UI 上选择的原始模型 ID），
@@ -494,6 +498,7 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
         events.push({
           type: 'usage_update',
           usage: {
+            ...(aMsg.message.usageStatus ? { usageStatus: aMsg.message.usageStatus } : {}),
             inputTokens,
             outputTokens: u.output_tokens,
             cacheReadTokens: u.cache_read_input_tokens,
@@ -527,15 +532,7 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
     }
 
     case 'result': {
-      const rMsg = msg as {
-        subtype: string
-        total_cost_usd?: number
-        modelUsage?: Record<string, { contextWindow?: number }>
-        usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
-        isSyntheticCompactionResult?: boolean
-        _channelModelId?: string
-        _channelProvider?: ProviderType
-      }
+      const rMsg = msg as SDKResultMessage
       if (rMsg.isSyntheticCompactionResult) {
         return [{
           type: 'complete',
@@ -570,7 +567,8 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
       return [{
         type: 'complete',
         stopReason: rMsg.subtype === 'success' ? 'end_turn' : 'error',
-        usage: (rMsg.total_cost_usd != null || contextWindow != null || u != null) ? {
+        usage: (rMsg.total_cost_usd != null || contextWindow != null || u != null || rMsg.usageStatus) ? {
+          ...(rMsg.usageStatus ? { usageStatus: rMsg.usageStatus } : {}),
           costUsd: rMsg.total_cost_usd,
           contextWindow,
           ...(inputTokens != null && { inputTokens }),
@@ -2406,10 +2404,11 @@ export function useGlobalAgentListeners(): void {
             store.set(agentSessionStreamingStateAtomFamily(data.sessionId), (state) => {
               if (!state || state.running || state.backgroundWaiting) return state
               // 上下文用量圆环需要 usage；其余运行态随本轮结束回收。
-              if (state.inputTokens !== undefined) {
+              if (state.inputTokens !== undefined || state.usageStatus !== undefined) {
                 return {
                   running: false,
                   inputTokens: state.inputTokens,
+                  usageStatus: state.usageStatus,
                   outputTokens: state.outputTokens,
                   cacheReadTokens: state.cacheReadTokens,
                   cacheCreationTokens: state.cacheCreationTokens,

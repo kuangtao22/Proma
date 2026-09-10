@@ -538,11 +538,18 @@ export function buildUsageTooltip(durationMs: number, usage?: AgentEventUsage): 
   lines.push(`耗时: ${formatDuration(durationMs)}`)
 
   if (usage) {
-    const pureInput = (usage.inputTokens ?? 0) - (usage.cacheReadTokens ?? 0) - (usage.cacheCreationTokens ?? 0)
-    if (pureInput > 0) lines.push(`输入: ${pureInput.toLocaleString()}`)
-    if (usage.outputTokens) lines.push(`输出: ${usage.outputTokens.toLocaleString()}`)
-    if (usage.cacheCreationTokens) lines.push(`缓存写入: ${usage.cacheCreationTokens.toLocaleString()}`)
-    if (usage.cacheReadTokens) lines.push(`缓存读取: ${usage.cacheReadTokens.toLocaleString()}`)
+    if (usage.usageStatus === 'unknown') {
+      lines.push('用量未知')
+    } else if (usage.usageStatus === 'partial') {
+      lines.push('部分统计')
+    }
+    if (usage.usageStatus !== 'unknown') {
+      const pureInput = (usage.inputTokens ?? 0) - (usage.cacheReadTokens ?? 0) - (usage.cacheCreationTokens ?? 0)
+      if (usage.inputTokens != null) lines.push(`输入: ${Math.max(0, pureInput).toLocaleString()}`)
+      if (usage.outputTokens != null) lines.push(`输出: ${usage.outputTokens.toLocaleString()}`)
+      if (usage.cacheCreationTokens != null) lines.push(`缓存写入: ${usage.cacheCreationTokens.toLocaleString()}`)
+      if (usage.cacheReadTokens != null) lines.push(`缓存读取: ${usage.cacheReadTokens.toLocaleString()}`)
+    }
   }
 
   return lines.join('\n')

@@ -463,12 +463,14 @@ export function reduce(state: RunState, payload: AgentStreamPayload): RunState {
     }
 
     if (msg.type === 'result') {
+      /** partial/unknown 仅是已知小计或完全未知，卡片不能把它显示成完整用量。 */
       const rm = msg as SDKResultMessage
+      const completeUsage = rm.usageStatus === undefined || rm.usageStatus === 'known' ? rm.usage : undefined
       const meta = {
         ...state.meta,
         durationMs: Date.now() - state.startedAt,
-        inputTokens: rm.usage?.input_tokens,
-        outputTokens: rm.usage?.output_tokens,
+        inputTokens: completeUsage?.input_tokens,
+        outputTokens: completeUsage?.output_tokens,
         costUsd: rm.total_cost_usd,
       }
       // result.subtype 以 'error' 开头视为错误（含 error / error_max_turns /

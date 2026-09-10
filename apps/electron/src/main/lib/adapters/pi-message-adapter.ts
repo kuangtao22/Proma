@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto'
 import type { AgentMessage } from '@earendil-works/pi-agent-core'
 import type { AssistantMessage, ToolResultMessage, UserMessage } from '@earendil-works/pi-ai/compat'
-import type { SDKAssistantMessage, SDKMessage } from '@proma/shared'
+import type { SDKAssistantMessage, SDKMessage, SDKResultMessage } from '@proma/shared'
 import type { RuntimeGuardResultOverride } from '../agent-runtime-guards'
 import { isMalformedResponseError, isTransientNetworkError } from '../error-patterns'
 import { sanitizeToolResultImageContent } from '../image-content-validation'
@@ -193,18 +193,35 @@ export function dropTrailingAbortedAssistant(messages: AgentMessage[]): AgentMes
   return lastMessage && isAbortedAssistantMessage(lastMessage) ? messages.slice(0, -1) : messages
 }
 
-function usageFromAssistant(message: AssistantMessage): {
-  input_tokens: number
-  output_tokens: number
-  cache_read_input_tokens?: number
-  cache_creation_input_tokens?: number
-} {
+/** 将完整有效的供应商统计映射为 SDK 用量；缺失统计返回 undefined，保留真实零值。 */
+function usageFromAssistant(message: AssistantMessage): SDKResultMessage['usage'] {
+  /** Pi 显式报告状态保留到 JSONL，避免把 SDK 占位零用于统计。 */
+  const usage = message.usage
+  if (!usage || usage.reported === false) return undefined
+  /** 不接受不完整主计数或非有限计数；缓存字段缺省按协议代表没有缓存。 */
+  const counts = [usage.input, usage.output, usage.cacheRead ?? 0, usage.cacheWrite ?? 0]
+  if (!counts.every((value) => Number.isSafeInteger(value) && value >= 0)) return undefined
+  // 旧 SDK 的失败消息用全零占位；没有明确报告证据时不可把它当作真实账单。
+  if (usage.reported !== true && (message.stopReason === 'error' || message.stopReason === 'aborted')
+    && counts.every((value) => value === 0)) return undefined
   return {
-    input_tokens: message.usage?.input ?? 0,
-    output_tokens: message.usage?.output ?? 0,
-    cache_read_input_tokens: message.usage?.cacheRead ?? 0,
-    cache_creation_input_tokens: message.usage?.cacheWrite ?? 0,
+    input_tokens: usage.input,
+    output_tokens: usage.output,
+    cache_read_input_tokens: usage.cacheRead ?? 0,
+    cache_creation_input_tokens: usage.cacheWrite ?? 0,
   }
+}
+
+/** 校验完成消息是否包含正文、思考或工具；流式 pending 不做空回复终态判断。 */
+function getAssistantTerminalError(message: AssistantMessage): string | undefined {
+  if (message.stopReason === 'error') return message.errorMessage || 'Provider returned an error stop reason'
+  if (message.stopReason !== 'stop' && message.stopReason !== 'toolUse') return undefined
+  /** 工具和非空思考同样属于有效输出；只有重放签名的空思考不代表用户收到了内容。 */
+  const hasContent = message.content.some((block) => block.type === 'toolCall'
+    ? Boolean(block.name?.trim() && block.id?.trim())
+    : block.type === 'text' ? Boolean(block.text?.trim())
+      : block.type === 'thinking' && Boolean(block.thinking?.trim()))
+  return hasContent ? undefined : 'Empty assistant response: provider returned no text, thinking or tool calls'
 }
 
 // 说明：本函数产出的消息 parent_tool_use_id 恒为 null。Pi 的事件模型（AgentEvent）不存在
@@ -235,10 +252,11 @@ export function convertPiMessage(
 
   if (message.role === 'assistant') {
     const assistant = message as AssistantMessage
-    // 只有 stopReason === 'error' 才把 errorMessage 提升为终态 error 字段；
-    // 其它终态即使带 errorMessage 也只记录日志，避免误报失败。
-    const isTerminalError = assistant.stopReason === 'error'
-    const errorType = assistant.errorMessage && isMalformedResponseError(assistant.errorMessage)
+    // 保留 SDK 错误，并保护旧记录/其它 provider 的空成功边界；任意附带 errorMessage 不等同于终态失败。
+    const terminalError = getAssistantTerminalError(assistant)
+    const isTerminalError = Boolean(terminalError)
+    const usage = usageFromAssistant(assistant)
+    const errorType = terminalError && isMalformedResponseError(terminalError)
       ? 'service_error'
       : assistant.errorMessage && isTransientNetworkError(assistant.errorMessage)
         ? 'network_error'
@@ -264,15 +282,16 @@ export function convertPiMessage(
           }
           return block as unknown as Record<string, unknown>
         }),
-        usage: usageFromAssistant(assistant),
+        ...(usage && { usage }),
+        usageStatus: usage ? 'known' : 'unknown',
         model: assistant.model,
-        stop_reason: assistant.stopReason,
+        stop_reason: isTerminalError ? 'error' : assistant.stopReason,
       },
       parent_tool_use_id: null,
       session_id: sessionId,
       uuid: options.uuid ?? randomUUID(),
-      ...(assistant.errorMessage && isTerminalError && {
-        error: { message: assistant.errorMessage, errorType },
+      ...(terminalError && {
+        error: { message: terminalError, errorType },
       }),
       ...(channelModelId && { _channelModelId: channelModelId }),
     } as unknown as SDKMessage
@@ -310,31 +329,42 @@ export function convertResultMessage(
   messages: AgentMessage[],
   sessionId: string,
   override?: RuntimeGuardResultOverride,
-): SDKMessage {
+): SDKResultMessage {
   const assistants = messages.filter((m): m is AssistantMessage =>
     !!m && typeof m === 'object' && 'role' in m && m.role === 'assistant')
+  /** 只累加有完整报告的调用；未知调用保留状态，不补零伪造完整统计。 */
+  const knownUsages = assistants.map(usageFromAssistant)
+    .filter((usage): usage is NonNullable<typeof usage> => usage !== undefined)
+  /** 汇总状态区分整轮完整统计、仅已知小计和完全未知。 */
+  const usageStatus = knownUsages.length === 0 ? 'unknown'
+    : knownUsages.length === assistants.length ? 'known' : 'partial'
   const costValues = assistants
     .map((msg) => msg.usage?.cost?.total)
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-  const usage = assistants.reduce(
-    (acc, msg) => ({
-      input_tokens: acc.input_tokens + (msg.usage?.input ?? 0),
-      output_tokens: acc.output_tokens + (msg.usage?.output ?? 0),
-      cache_read_input_tokens: acc.cache_read_input_tokens + (msg.usage?.cacheRead ?? 0),
-      cache_creation_input_tokens: acc.cache_creation_input_tokens + (msg.usage?.cacheWrite ?? 0),
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+  const usage = knownUsages.reduce(
+    (acc, current) => ({
+      input_tokens: acc.input_tokens + current.input_tokens,
+      output_tokens: acc.output_tokens + current.output_tokens,
+      cache_read_input_tokens: (acc.cache_read_input_tokens ?? 0) + (current.cache_read_input_tokens ?? 0),
+      cache_creation_input_tokens: (acc.cache_creation_input_tokens ?? 0) + (current.cache_creation_input_tokens ?? 0),
     }),
     { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
   )
   const lastAssistant = assistants[assistants.length - 1]
-  const assistantError = lastAssistant?.stopReason === 'error' ? lastAssistant.errorMessage : undefined
-  const terminalReason = override?.terminalReason ?? (lastAssistant?.stopReason === 'length' ? 'max_tokens' : 'completed')
+  const assistantError = lastAssistant ? getAssistantTerminalError(lastAssistant) : 'Empty assistant response: no assistant message'
+  /** 取消拥有独立终态，不能因没有 errorMessage 而落入成功。 */
+  const aborted = lastAssistant?.stopReason === 'aborted'
+  const terminalReason = override?.terminalReason ?? (aborted ? 'aborted' : assistantError ? 'error'
+    : lastAssistant?.stopReason === 'length' ? 'max_tokens' : 'completed')
   return {
     type: 'result',
-    subtype: override?.subtype ?? (assistantError ? 'error_during_execution' : terminalReason === 'max_tokens' ? 'max_tokens' : 'success'),
-    usage,
-    total_cost_usd: costValues.length > 0 ? costValues.reduce((sum, cost) => sum + cost, 0) : undefined,
+    subtype: override?.subtype ?? (assistantError || aborted ? 'error_during_execution' : terminalReason === 'max_tokens' ? 'max_tokens' : 'success'),
+    ...(usageStatus !== 'unknown' && { usage }),
+    usageStatus,
+    total_cost_usd: usageStatus === 'known' && costValues.length === assistants.length
+      ? costValues.reduce((sum, cost) => sum + cost, 0) : undefined,
     terminal_reason: terminalReason,
     errors: override?.errors ?? (assistantError ? [assistantError] : undefined),
     session_id: sessionId,
-  } as unknown as SDKMessage
+  }
 }

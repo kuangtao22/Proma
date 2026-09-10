@@ -66,10 +66,17 @@ export function getSessionContextUsageRatio(sessionId: string): number | undefin
       continue
     }
 
-    const msg = parsed as { type?: string }
+    /** JSONL 中的轻量消息头，用于在未可信 usage 时识别压缩边界。 */
+    const msg = parsed as { type?: string; subtype?: string }
+
+    // 压缩会重置上下文；绝不能把边界前的精确值套用到边界后的未知调用。
+    if (msg.type === 'system' && msg.subtype === 'compact_boundary') return undefined
 
     if (msg.type === 'result') {
+      /** result usage 是整轮累计值，新版消息不能替代最后 assistant 的上下文占用。 */
       const result = parsed as SDKResultMessage
+      if (result.isSyntheticCompactionResult) continue
+      if (result.usageStatus !== undefined) continue
       if (!result.usage) continue
       const usedTokens = sumUsedTokens(result.usage)
       const contextWindow = pickResultContextWindow(result)
@@ -77,7 +84,9 @@ export function getSessionContextUsageRatio(sessionId: string): number | undefin
     }
 
     if (msg.type === 'assistant') {
+      /** 只有完整 usage 能代表本次 assistant 响应结束时的上下文。 */
       const asst = parsed as SDKAssistantMessage
+      if (asst.message?.usageStatus === 'unknown' || asst.message?.usageStatus === 'partial') continue
       const usage = asst.message?.usage
       if (!usage) continue
       const usedTokens = sumUsedTokens(usage)

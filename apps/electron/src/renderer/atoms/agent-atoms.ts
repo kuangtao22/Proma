@@ -83,6 +83,8 @@ export interface AgentRetryState {
 /** Agent 会话的流式状态 */
 export interface AgentStreamState {
   running: boolean
+  /** 当前 token 数据的完整性状态；旧状态缺失时按历史 known 语义处理。 */
+  usageStatus?: 'known' | 'partial' | 'unknown'
   /**
    * 后台任务等待态（软空闲）：本轮主体已结束、UI 可输入，但 SDK 通道仍开着等后台任务唤醒。
    * 此状态下 running 为 false，但服务端 activeSessions 仍保留，新消息必须走注入通道而非新建 run。
@@ -353,6 +355,7 @@ export const agentStreamingStatesAtom = atom<Map<string, AgentStreamState>, [Map
 export type AgentViewStreamState = Pick<
   AgentStreamState,
   | 'running'
+  | 'usageStatus'
   | 'backgroundWaiting'
   | 'inputTokens'
   | 'outputTokens'
@@ -370,6 +373,7 @@ export function areAgentViewStreamStatesEqual(
   next: AgentViewStreamState,
 ): boolean {
   return previous.running === next.running
+    && previous.usageStatus === next.usageStatus
     && previous.backgroundWaiting === next.backgroundWaiting
     && previous.inputTokens === next.inputTokens
     && previous.outputTokens === next.outputTokens
@@ -1532,29 +1536,36 @@ export function applyAgentEvent(
       // 真实值只在 result 中返回。若完全不用 result.usage，这些渠道的 ContextUsageBadge
       // 永远停留在 inputTokens=0 不显示。
       //
-      // 折中：仅当「整个 query 期间从未收到流式 usage_update」（prev.inputTokens 为空/0）
-      // 才从 result.usage 兜底写入 token 字段；已有流式真实值时不动。
+      // 旧格式允许 result 兜底；新版 Pi 的 result 始终是累计值，只能从 assistant 取得上下文。
       // - contextWindow：取流式与 result 的较大值（result 未必更权威——多 entry 时
       //   子 Agent 的小窗口可能拉低值，Fix 1/2 已从源头取 max，此处作为安全网）。
-      // - costUsd：始终覆盖（本就该是整轮累计成本）
-      const needResultFallback = !prev.inputTokens || prev.inputTokens <= 0 || prev.contextUsageIsEstimated === true
+      // - costUsd：仅采用完整统计的整轮成本。
+      const needResultFallback = prev.contextUsageIsEstimated === true
+        || (prev.usageStatus !== 'known' && (prev.inputTokens == null || prev.inputTokens <= 0))
       const shouldUseResultUsage = needResultFallback
+        && event.usage?.usageStatus === undefined
         && event.usage?.inputTokens != null
         && (event.usage.inputTokens > 0 || prev.contextUsageIsEstimated !== true)
       return {
         ...prev,
         ...(event.usage ? {
-          ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
+          // unknown 表示本轮完全未取得统计；partial 保留最后 assistant 的上下文可信度。
+          ...(event.usage.usageStatus === 'unknown' && { usageStatus: 'unknown' as const }),
+          ...(event.usage.usageStatus === 'partial' && prev.usageStatus !== 'known'
+            && { usageStatus: prev.usageStatus ?? 'partial' as const }),
+          ...((event.usage.usageStatus === undefined || event.usage.usageStatus === 'known')
+            && event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
           ...(event.usage.contextWindow != null && {
             contextWindow: prev.contextWindow != null
               ? Math.max(prev.contextWindow, event.usage.contextWindow)
               : event.usage.contextWindow,
           }),
           ...(shouldUseResultUsage && {
-            inputTokens: event.usage.inputTokens,
-            outputTokens: event.usage.outputTokens,
-            cacheReadTokens: event.usage.cacheReadTokens,
-            cacheCreationTokens: event.usage.cacheCreationTokens,
+            usageStatus: 'known' as const,
+            ...(event.usage.inputTokens != null && { inputTokens: event.usage.inputTokens }),
+            ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
+            ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
+            ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
             contextUsageIsEstimated: false,
           }),
         } : {}),
@@ -1581,20 +1592,21 @@ export function applyAgentEvent(
       const resumed = clearFinishedCompactionForResumedWork(prev)
       return {
         ...resumed,
-        ...(event.usage.inputTokens != null && {
-          inputTokens: event.usage.inputTokens,
-          contextUsageIsEstimated: false,
-        }),
-        ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
-        ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
-        ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
-        ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-        // contextWindow 取 max：本分支同时承载「流式 assistant 消息按模型名推断的窗口」
-        // 与「后端从 SDK result 透传的真实窗口（context_window 事件）」两个来源。
-        // 模型窗口在同一会话内不会缩小，取更大值可兼顾两类端点——既不会让推断偏小的
-        // 端点（如 GLM 剥掉 [1m] 后缀）挡住真实的 1M，也不会让回报偏小的端点覆盖正确的 1M。
-        ...(event.usage.contextWindow && {
-          contextWindow: Math.max(resumed.contextWindow ?? 0, event.usage.contextWindow),
+        usageStatus: event.usage.usageStatus
+          ?? (event.usage.inputTokens != null || event.usage.outputTokens != null ? 'known' : resumed.usageStatus),
+        ...(event.usage.usageStatus === 'unknown' || event.usage.usageStatus === 'partial' ? {} : {
+          ...(event.usage.inputTokens != null && {
+            inputTokens: event.usage.inputTokens,
+            contextUsageIsEstimated: false,
+          }),
+          ...(event.usage.outputTokens != null && { outputTokens: event.usage.outputTokens }),
+          ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
+          ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
+          ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
+          // contextWindow 取 max，兼顾流式模型推断与后端 context_window 事件。
+          ...(event.usage.contextWindow && {
+            contextWindow: Math.max(resumed.contextWindow ?? 0, event.usage.contextWindow),
+          }),
         }),
       }
     }
@@ -1624,6 +1636,7 @@ export function applyAgentEvent(
         isCompacting: false,
         contextCompaction,
         inputTokens: event.estimatedTokensAfter,
+        usageStatus: undefined,
         outputTokens: undefined,
         cacheReadTokens: undefined,
         cacheCreationTokens: undefined,

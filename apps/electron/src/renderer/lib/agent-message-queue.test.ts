@@ -7,6 +7,7 @@ import {
   addCanvasNodeReferences,
   buildQueuedMessageSendPayload,
   createAgentQueuedMessage,
+  createQueuedAgentStreamState,
   getQueuedMessageDisplayParts,
   mergeAgentDraftWithRestoredMessage,
   parseQueuedMessageMentions,
@@ -14,6 +15,11 @@ import {
   restoreMissingCanvasNodeReferences,
   submitQueuedMessagePayload,
 } from './agent-message-queue'
+
+test('Given 最近上下文标记未知 When 队列启动下一轮 Then 保留数值及可信度', () => {
+  expect(createQueuedAgentStreamState({ inputTokens: 12_000, usageStatus: 'unknown' }, 1))
+    .toMatchObject({ inputTokens: 12_000, usageStatus: 'unknown', running: true })
+})
 
 /** 队列结构化引用测试使用的稳定节点快照。 */
 const canvasReferenceA: CanvasNodeReference = {

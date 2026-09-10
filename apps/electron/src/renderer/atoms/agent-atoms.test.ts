@@ -6,6 +6,7 @@ import {
   agentAckPendingMentionsAtom,
   agentPendingMentionsAtomFamily,
   agentSessionInputStreamStateAtomFamily,
+  agentSessionViewStreamStateAtomFamily,
   agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentStreamingStatesAtom,
@@ -154,6 +155,80 @@ function createStreamState(overrides: Partial<AgentStreamState> = {}): AgentStre
 }
 
 describe('Agent 上下文压缩状态', () => {
+  test('Given 部分小计事件 When 已有精确上下文 Then 不覆盖输入输出与费用', () => {
+    const result = applyAgentEvent(createStreamState({ costUsd: 0.5 }), {
+      type: 'usage_update',
+      usage: { usageStatus: 'partial', inputTokens: 999_999, outputTokens: 999, costUsd: 0 },
+    })
+    expect(result).toMatchObject({ inputTokens: 180_000, outputTokens: 2_000, costUsd: 0.5, usageStatus: 'partial' })
+  })
+
+  test('Given 最新 assistant 报告真实零 When 收到整轮累计 Then 保留零与 known', () => {
+    const known = applyAgentEvent(createStreamState(), {
+      type: 'usage_update', usage: { usageStatus: 'known', inputTokens: 0, outputTokens: 0 },
+    })
+    const result = applyAgentEvent(known, {
+      type: 'complete', usage: { usageStatus: 'known', inputTokens: 20_000, outputTokens: 500 },
+    })
+    expect(result).toMatchObject({ inputTokens: 0, outputTokens: 0, usageStatus: 'known' })
+  })
+
+  test('Given 本轮没有流式统计 When 收到新版累计结果 Then 不将累计值误用为上下文', () => {
+    const result = applyAgentEvent(createStreamState({ inputTokens: undefined, outputTokens: undefined }), {
+      type: 'complete', usage: { usageStatus: 'known', inputTokens: 20_000, outputTokens: 500 },
+    })
+    expect(result.inputTokens).toBeUndefined()
+  })
+
+  test('Given 只收到未知 result When 完成 Then 保留已有数值并更新可见状态', () => {
+    const result = applyAgentEvent(createStreamState({ usageStatus: 'known', costUsd: 0.5 }), {
+      type: 'complete', usage: { usageStatus: 'unknown', inputTokens: 0, costUsd: 0 },
+    })
+    expect(result).toMatchObject({ inputTokens: 180_000, costUsd: 0.5, usageStatus: 'unknown' })
+  })
+
+  test('Given 用量状态单独变化 When selector 订阅 Then 读取新状态', () => {
+    const store = createStore()
+    const stateAtom = agentSessionStreamingStateAtomFamily('usage-selector')
+    const viewAtom = agentSessionViewStreamStateAtomFamily('usage-selector')
+    store.set(stateAtom, createStreamState({ usageStatus: 'known' }))
+    expect(store.get(viewAtom).usageStatus).toBe('known')
+    store.set(stateAtom, applyAgentEvent(store.get(stateAtom)!, { type: 'usage_update', usage: { usageStatus: 'unknown' } }))
+    expect(store.get(viewAtom).usageStatus).toBe('unknown')
+    expect(store.get(viewAtom).inputTokens).toBe(180_000)
+  })
+
+  test('given known usage when unknown update arrives then preserve the last known values', () => {
+    const result = applyAgentEvent(createStreamState(), {
+      type: 'usage_update',
+      usage: { usageStatus: 'unknown' },
+    })
+
+    expect(result.inputTokens).toBe(180_000)
+    expect(result.outputTokens).toBe(2_000)
+    expect(result.contextWindow).toBe(200_000)
+  })
+
+  test('given no stream usage when partial result arrives then do not use it as exact fallback', () => {
+    const result = applyAgentEvent(createStreamState({ inputTokens: 0, outputTokens: undefined }), {
+      type: 'complete',
+      usage: { usageStatus: 'partial', inputTokens: 12_000, outputTokens: 300 },
+    })
+
+    expect(result.inputTokens).toBe(0)
+    expect(result.outputTokens).toBeUndefined()
+  })
+
+  test('given real zero usage from a legacy event then preserve zero as a real value', () => {
+    const result = applyAgentEvent(createStreamState(), {
+      type: 'usage_update',
+      usage: { inputTokens: 0, outputTokens: 0 },
+    })
+
+    expect(result.inputTokens).toBe(0)
+    expect(result.outputTokens).toBe(0)
+  })
+
   test('given Pi 手动压缩提供预估 token when 压缩完成 then 显示预估值并清除旧明细', () => {
     const result = applyAgentEvent(createStreamState(), {
       type: 'compact_complete',

@@ -1,11 +1,116 @@
+diff --git a/dist/api/openai-completions.js b/dist/api/openai-completions.js
+--- a/dist/api/openai-completions.js
++++ b/dist/api/openai-completions.js
+@@ -175,6 +175,8 @@
+             provider: model.provider,
+             model: model.id,
+             usage: {
++                // 未收到有效计数前，零只是 SDK 占位，不能当作供应商真实用量。
++                reported: false,
+                 input: 0,
+                 output: 0,
+                 cacheRead: 0,
+@@ -375,17 +377,14 @@
+                 if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
+                     output.responseModel ||= chunk.model;
+                 }
+-                if (chunk.usage) {
+-                    output.usage = parseChunkUsage(chunk.usage, model);
+-                }
+                 const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
++                // 完整有效快照才替换已有统计；空顶层 usage 仍允许使用 choice 后备值。
++                const reportedUsage = parseChunkUsage(chunk.usage, model) ?? parseChunkUsage(choice?.usage, model);
++                if (reportedUsage) {
++                    output.usage = reportedUsage;
++                }
+                 if (!choice)
+                     continue;
+-                // Fallback: some providers (e.g., Moonshot) return usage
+-                // in choice.usage instead of the standard chunk.usage
+-                if (!chunk.usage && choice.usage) {
+-                    output.usage = parseChunkUsage(choice.usage, model);
+-                }
+                 if (choice.finish_reason) {
+                     output.rawStopReason = choice.finish_reason;
+                     const finishReasonResult = mapStopReason(choice.finish_reason);
+@@ -499,6 +498,14 @@
+             }
+             if ((compat.supportsFinishReason && !hasFinishReason) || output.stopReason === "pending") {
+                 throw new Error("Stream ended without finish_reason");
++            }
++            // 仅拒绝成功终态的全空响应；保留工具、思考、长度截断和取消语义。
++            if ((output.stopReason === "stop" || output.stopReason === "toolUse") &&
++                !output.content.some((block) => block.type === "toolCall"
++                    ? Boolean(block.name?.trim() && block.id?.trim())
++                    : block.type === "text" ? Boolean(block.text?.trim())
++                    : block.type === "thinking" && Boolean(block.thinking?.trim()))) {
++                throw new Error("Empty assistant response: provider returned no text, thinking or tool calls");
+             }
+             stream.push({ type: "done", reason: output.stopReason, message: output });
+             stream.end();
+@@ -1175,10 +1182,22 @@
+         };
+     });
+ }
++// 校验供应商快照的完整性；返回 undefined 表示本帧不可用，调用方保留上次有效值。
+ function parseChunkUsage(rawUsage, model) {
+-    const promptTokens = rawUsage.prompt_tokens || 0;
++    // 必须实际报告输入和输出；不将缺字段、字符串、负值或无穷值补成零。
++    const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
++    if (!rawUsage || !validCount(rawUsage.prompt_tokens) || !validCount(rawUsage.completion_tokens)) {
++        return undefined;
++    }
++    const promptTokens = rawUsage.prompt_tokens;
+     const cacheReadTokens = rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? rawUsage.cached_tokens ?? 0;
+-    const cacheWriteTokens = rawUsage.prompt_tokens_details?.cache_write_tokens || 0;
++    const cacheWriteTokens = rawUsage.prompt_tokens_details?.cache_write_tokens ?? 0;
++    const reasoningTokens = rawUsage.completion_tokens_details?.reasoning_tokens ?? 0;
++    if (![cacheReadTokens, cacheWriteTokens, reasoningTokens].every(validCount) ||
++        cacheReadTokens + cacheWriteTokens > promptTokens || reasoningTokens > rawUsage.completion_tokens ||
++        (rawUsage.total_tokens != null && !validCount(rawUsage.total_tokens))) {
++        return undefined;
++    }
+     // Follow documented OpenAI/OpenRouter semantics: cached_tokens is cache-read
+     // tokens (hits). Providers disagree on placement: OpenAI/OpenRouter use
+     // prompt_tokens_details.cached_tokens, DeepSeek uses prompt_cache_hit_tokens,
+@@ -1192,13 +1211,14 @@
+     // https://github.com/antirez/ds4/pull/29
+     const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+     // OpenAI completion_tokens already includes reasoning_tokens.
+-    const outputTokens = rawUsage.completion_tokens || 0;
++    const outputTokens = rawUsage.completion_tokens;
+     const usage = {
++        reported: true,
+         input,
+         output: outputTokens,
+         cacheRead: cacheReadTokens,
+         cacheWrite: cacheWriteTokens,
+-        reasoning: rawUsage.completion_tokens_details?.reasoning_tokens || 0,
++        reasoning: reasoningTokens,
+         totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
+         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+     };
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -263,6 +263,8 @@
+     namespace?: string;
+ }
+ export interface Usage {
++    /** Proma: false 为未收到有效统计；true 包含供应商明确报告的零值。旧记录可省略。 */
++    reported?: boolean;
+     input: number;
+     output: number;
+     cacheRead: number;
 diff --git a/dist/utils/retry.js b/dist/utils/retry.js
-index 65c7c9efd7667445b711fcd43549062ee3eb5ecf..a68249412801369ac48f09235e79b1aa9ba0cddc 100644
 --- a/dist/utils/retry.js
 +++ b/dist/utils/retry.js
-@@ -61,9 +61,17 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+@@ -61,9 +61,19 @@
      // "stream ended without ..." and "Anthropic stream ended before message_stop"
      // (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
      "ended without",
++    // 成功结束但无任何内容的兼容网关响应，复用原生有界重试。
++    "empty assistant response",
 +    // Some OpenAI-compatible gateways omit "response" in this terminal-event error.
 +    "stream ended before (?:a )?terminal(?: response)? event",
      "stream ended before message_stop",

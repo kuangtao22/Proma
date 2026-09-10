@@ -220,6 +220,8 @@ export interface SDKAssistantMessage {
       cache_read_input_tokens?: number
       cache_creation_input_tokens?: number
     }
+    /** 供应商统计可用性；旧消息未标记时沿用既有数字语义。 */
+    usageStatus?: 'known' | 'partial' | 'unknown'
     model?: string
     stop_reason?: string
   }
@@ -279,12 +281,14 @@ export interface SkillActivation {
 export interface SDKResultMessage {
   type: 'result'
   subtype: 'success' | 'error' | 'error_max_turns' | 'error_max_budget_usd' | 'error_during_execution' | (string & {})
-  usage: {
+  usage?: {
     input_tokens: number
     output_tokens: number
     cache_read_input_tokens?: number
     cache_creation_input_tokens?: number
   }
+  /** partial 的数字仅是已知调用小计，unknown 不携带伪造的零用量。 */
+  usageStatus?: 'known' | 'partial' | 'unknown'
   total_cost_usd?: number
   modelUsage?: Record<string, { contextWindow?: number }>
   errors?: string[]
@@ -485,6 +489,8 @@ export interface TypedError {
 
 /** Agent 事件 Usage 信息 */
 export interface AgentEventUsage {
+  /** 未知或部分统计不能覆盖已有的精确上下文用量。 */
+  usageStatus?: 'known' | 'partial' | 'unknown'
   inputTokens?: number
   outputTokens?: number
   cacheReadTokens?: number

@@ -1251,12 +1251,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
             const map = new Map(prev)
             // 软空闲态（后台任务等待）：必须保留 backgroundWaiting 标志（否则 handleSend 误走新建 run）。
             // 实时文本只在 liveMessages 中，完成消息刷新时随其统一清理。
-            if (state.inputTokens !== undefined) {
+            if (state.inputTokens !== undefined || state.usageStatus !== undefined) {
               // 保留 usage 数据，仅清除本轮工具活动展示状态。
               map.set(sessionId, {
                 running: false,
                 backgroundWaiting: state.backgroundWaiting,
                 inputTokens: state.inputTokens,
+                usageStatus: state.usageStatus,
                 outputTokens: state.outputTokens,
                 cacheReadTokens: state.cacheReadTokens,
                 cacheCreationTokens: state.cacheCreationTokens,

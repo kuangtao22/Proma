@@ -61,7 +61,7 @@ describe('convertPiMessage', () => {
   test('only exposes terminal Pi errors', () => {
     const providerError = 'Connection error. Failed to fetch'
     const nonTerminal = convertPiMessage({
-      role: 'assistant', content: [], stopReason: 'stop', errorMessage: providerError,
+      role: 'assistant', content: [{ type: 'text', text: '正常正文' }], stopReason: 'stop', errorMessage: providerError,
     } as unknown as AssistantMessage, 'session-1') as { error?: unknown }
     const terminalError = convertPiMessage({
       role: 'assistant', content: [], stopReason: 'error', errorMessage: providerError,
@@ -126,7 +126,7 @@ describe('convertPiMessage', () => {
   test('only reports result errors for terminal Pi failures', () => {
     const providerError = 'stream ended before a terminal response event'
     const partialStop = convertResultMessage([{
-      role: 'assistant', content: [], stopReason: 'stop', errorMessage: providerError,
+      role: 'assistant', content: [{ type: 'text', text: '正常正文' }], stopReason: 'stop', errorMessage: providerError,
     } as unknown as AssistantMessage], 'session-1') as { subtype?: string; errors?: string[] }
     const terminalError = convertResultMessage([{
       role: 'assistant', content: [], stopReason: 'error', errorMessage: providerError,

@@ -191,6 +191,8 @@ export function ContextUsageBadge({
   const displayIsEstimated = sessionId
     ? sessionStreamState.contextUsageIsEstimated === true
     : isEstimated === true
+  /** 本次报告可信度与保留的最近数值分开，未知不等于零占用。 */
+  const displayUsageStatus = sessionId ? sessionStreamState.usageStatus : undefined
   const displayIsCompacting = sessionId
     ? sessionStreamState.isCompacting === true
     : isCompacting === true
@@ -211,7 +213,7 @@ export function ContextUsageBadge({
       lastSessionRef.current = sessionId
     }
   }, [sessionId])
-  if (displayInputTokens && displayInputTokens > 0) {
+  if (displayInputTokens != null && (displayInputTokens > 0 || displayUsageStatus === 'known')) {
     stableRef.current = {
       inputTokens: displayInputTokens,
       outputTokens: displayOutputTokens,
@@ -289,29 +291,35 @@ export function ContextUsageBadge({
 
   // 使用稳定值：优先当前数据，回退到上次有效数据
   const stable = stableRef.current
-  const hasCurrent = displayInputTokens != null && displayInputTokens > 0
+  const hasCurrent = displayInputTokens != null && (displayInputTokens > 0 || displayUsageStatus === 'known')
   const displayTokens = hasCurrent ? displayInputTokens : stable?.inputTokens
   const displayWindow = hasCurrent ? displayContextWindow : stable?.contextWindow
   const displayOutput = hasCurrent ? displayOutputTokens : stable?.outputTokens
   const displayCacheRead = hasCurrent ? displayCacheReadTokens : stable?.cacheReadTokens
   const displayCacheCreation = hasCurrent ? displayCacheCreationTokens : stable?.cacheCreationTokens
 
-  // 从未有过 usage 数据 → 不显示
-  if (!displayTokens || displayTokens <= 0) return null
+  /** 有明确的未知报告时显示问号入口；没有任何用量事件时保持隐藏。 */
+  const isUsageUnavailable = displayUsageStatus === 'unknown' || displayUsageStatus === 'partial'
+  if (displayTokens == null && !isUsageUnavailable) return null
 
   // 警告阈值：Pi 在自动压缩阈值的 80% 时预警。
   const compactThreshold = displayWindow
     ? calculatePiAutoCompactionThresholdTokens(displayWindow)
     : undefined
-  const isWarning = compactThreshold
+  const isWarning = compactThreshold && displayTokens != null
     ? displayTokens / compactThreshold >= WARNING_RATIO
     : false
 
-  const ratio = displayWindow ? displayTokens / displayWindow : 0
+  const ratio = displayWindow && displayTokens != null ? displayTokens / displayWindow : 0
 
-  const percent = displayWindow
+  const percent = displayWindow && displayTokens != null
     ? Math.round((displayTokens / displayWindow) * 100)
     : undefined
+
+  /** 屏幕阅读器和悬浮入口都明确说明数值是本次报告还是最近已知值。 */
+  const usageLabel = isUsageUnavailable
+    ? `${displayUsageStatus === 'partial' ? '用量仅部分统计' : '用量未知'}${displayTokens != null ? '，显示最近已知值' : ''}`
+    : `上下文用量 ${percent != null ? `${percent}%` : `${displayTokens} tokens`}`
 
   const shouldShowPlanQuota = quota != null && (
     quota.supported
@@ -326,6 +334,8 @@ export function ContextUsageBadge({
           type="button"
           variant="ghost"
           size="icon"
+          aria-label={usageLabel}
+          title={usageLabel}
           className={cn(
             inputToolbarButtonClass,
             isWarning ? 'text-amber-600 dark:text-amber-400' : 'text-foreground/60 hover:text-foreground',
@@ -336,7 +346,7 @@ export function ContextUsageBadge({
           }}
           onMouseLeave={scheduleClose}
         >
-          <UsageRing ratio={ratio} isWarning={isWarning} />
+          {displayTokens == null ? <span aria-hidden="true">?</span> : <UsageRing ratio={ratio} isWarning={isWarning} />}
         </Button>
       </PopoverTrigger>
       <PopoverContent
@@ -356,7 +366,8 @@ export function ContextUsageBadge({
         }}
       >
         <div className="flex flex-col gap-1.5">
-          {displayIsEstimated ? (
+          {isUsageUnavailable ? <DetailRow label="本次用量" value={usageLabel} /> : null}
+          {displayTokens == null ? null : displayIsEstimated ? (
             <DetailRow
               label="压缩后"
               value={`预估 ${formatTokens(displayTokens)} tokens${percent != null ? `（${percent}%）` : ''}`}

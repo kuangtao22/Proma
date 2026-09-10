@@ -177,7 +177,7 @@ export function createAgentQueuedMessage(
 }
 
 export function createQueuedAgentStreamState(
-  previous: Pick<AgentStreamState, 'model' | 'inputTokens' | 'contextWindow'> | undefined,
+  previous: Pick<AgentStreamState, 'model' | 'inputTokens' | 'contextWindow' | 'usageStatus'> | undefined,
   startedAt: number,
 ): AgentStreamState {
   return {
@@ -186,6 +186,7 @@ export function createQueuedAgentStreamState(
     model: previous?.model,
     startedAt,
     inputTokens: previous?.inputTokens,
+    usageStatus: previous?.usageStatus,
     contextWindow: previous?.contextWindow,
   }
 }
