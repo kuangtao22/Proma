@@ -1602,7 +1602,7 @@ export class AgentOrchestrator {
 
           case 'plan': {
             // Plan 模式：只允许只读工具 + Write/Edit 任意 .md 文件（计划文档）
-            if (PLAN_MODE_ALLOWED_TOOLS.has(toolName)) {
+            if (PLAN_MODE_ALLOWED_TOOLS.has(toolName) || extensions.readOnlyToolNames?.includes(toolName)) {
               return { behavior: 'allow' as const, updatedInput: input }
             }
             // 允许 Write/Edit 到任意 .md 文件（计划文档一定是 markdown；非 .md 仍被拒）
@@ -1851,6 +1851,7 @@ export class AgentOrchestrator {
           maxBudgetUsd: appSettings.agentMaxBudgetUsd,
         }),
         ...(piCustomTools.length > 0 && { customTools: piCustomTools as PiAgentQueryOptions['customTools'] }),
+        ...(extensions.evaluateCompletion ? { evaluateCompletion: extensions.evaluateCompletion } : {}),
         onSessionId: handleSessionId,
         onPiEntryBindings: (bindings) => {
           if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return

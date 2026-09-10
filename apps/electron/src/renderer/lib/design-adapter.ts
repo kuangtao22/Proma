@@ -778,6 +778,10 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     },
     onCanvasChanges: subscribeCanvasChanges,
     canvasMediaLoad: (input) => requireMethod(api, 'canvasMediaLoad')(input),
+    canvasMediaReadConfig: api.canvasMediaReadConfig ? (input) => api.canvasMediaReadConfig!(input) : undefined,
+    canvasMediaCheckPreparation: api.canvasMediaCheckPreparation
+      ? (input) => api.canvasMediaCheckPreparation!(input)
+      : undefined,
     canvasMediaSave: (input) => requireMethod(api, 'canvasMediaSave')(input),
     canvasMediaRun: (input) => requireMethod(api, 'canvasMediaRun')(input),
     canvasMediaCancel: (input) => requireMethod(api, 'canvasMediaCancel')(input),

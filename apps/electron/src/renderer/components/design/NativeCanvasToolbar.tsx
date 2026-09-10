@@ -67,15 +67,20 @@ export interface NativeCanvasToolbarProps {
   /** 只有当前权威选区至少两个节点时展示批量引用。 */
   canReferenceSelection?: boolean
   issueCount: number
+  /** 媒体草稿准备单独计数，不混入损坏节点问题。 */
+  mediaPreparationCount?: number
+  onFocusMediaPreparation?: () => void
   onToolChange: (tool: 'select' | 'pan') => void
   onAddNode: (kind: CanvasNodeKind) => void
   onDelete: () => void
   onReferenceSelection?: () => void
-  /** 三个显式整理范围分别展示实际节点数量。 */
+  /** 四个显式整理范围分别展示实际节点数量。 */
   arrangeSelectionCount?: number
+  arrangeRelatedCount?: number
   arrangeVisibleCount?: number
   arrangeAllCount?: number
   onArrangeSelection?: () => void
+  onArrangeRelated?: () => void
   onArrangeVisible?: () => void
   onArrangeAll?: () => void
   onFocusFirstIssue: () => void
@@ -139,14 +144,18 @@ export function NativeCanvasToolbar({
   canDelete,
   canReferenceSelection = false,
   issueCount,
+  mediaPreparationCount = 0,
+  onFocusMediaPreparation,
   onToolChange,
   onAddNode,
   onDelete,
   onReferenceSelection,
   arrangeSelectionCount = 0,
+  arrangeRelatedCount = 0,
   arrangeVisibleCount = 0,
   arrangeAllCount = 0,
   onArrangeSelection,
+  onArrangeRelated,
   onArrangeVisible,
   onArrangeAll,
   onFocusFirstIssue,
@@ -283,6 +292,18 @@ export function NativeCanvasToolbar({
                   type="button"
                   variant="ghost"
                   className="h-9 justify-start px-2"
+                  aria-label="整理相关节点"
+                  disabled={arrangeRelatedCount < 2 || !onArrangeRelated}
+                  onClick={onArrangeRelated}
+                >
+                  整理相关节点 <span className="ml-auto text-xs text-muted-foreground">{arrangeRelatedCount}</span>
+                </Button>
+              </PopoverClose>
+              <PopoverClose asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="h-9 justify-start px-2"
                   aria-label="整理当前可见节点"
                   disabled={arrangeVisibleCount < 2 || !onArrangeVisible}
                   onClick={onArrangeVisible}
@@ -336,6 +357,11 @@ export function NativeCanvasToolbar({
           <TooltipContent side="bottom">删除节点</TooltipContent>
         </Tooltip>
 
+        {mediaPreparationCount > 0 ? <Button type="button" size="sm" variant="outline"
+          className="h-8 gap-1.5 px-2 text-xs" onClick={onFocusMediaPreparation}
+          aria-label="查看媒体准备状态">
+          <Video aria-hidden="true" />{mediaPreparationCount} 个媒体待准备
+        </Button> : null}
         {issueCount > 0 ? (
           <>
             <Separator orientation="vertical" className="mx-0.5 h-5" />

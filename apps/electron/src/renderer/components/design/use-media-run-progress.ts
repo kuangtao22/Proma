@@ -1,5 +1,7 @@
 import * as React from 'react'
+import { createCanvasMediaInputConnectionInspector } from '@proma/shared'
 import type {
+  CanvasDocument,
   CanvasMediaModuleChangedEvent,
   CanvasMediaModuleSnapshot,
   CanvasMediaTarget,
@@ -15,6 +17,8 @@ export interface MediaRunProgressProjection {
   phaseLabel: string
   /** Comfy 只提供当前节点采样计数，不能解释为整体任务百分比。 */
   nodeProgressLabel?: string
+  /** 折叠卡片仅汇总本地配置与连接事实，不宣称已完成运行前校验。 */
+  preparation?: { workflowBound: boolean; inputsConnected: boolean; needsAttention: boolean }
 }
 
 /** 图片媒体进度只需要活动列表已有的轻量任务字段。 */
@@ -91,7 +95,7 @@ export interface CanvasMediaNodeProgressControllerDependencies {
 /** AV 节点进度控制器；初次有界加载后仅靠模块与运行事件刷新。 */
 export interface CanvasMediaNodeProgressController {
   start(): void
-  setTargets(targets: readonly CanvasMediaTarget[]): void
+  setTargets(targets: readonly CanvasMediaTarget[], document?: CanvasDocument): void
   whenIdle(): Promise<void>
   dispose(): void
 }
@@ -105,7 +109,11 @@ export function createCanvasMediaNodeProgressController(
   /** 每个节点保存完整公开运行列表，避免非最新运行事件被误归属。 */
   let runsByNodeId = new Map<string, MediaRunSnapshot[]>()
   /** 配置诊断独立于运行历史，即使尚未创建 run 也能在原卡片展示。 */
-  const configurationByNodeId = new Map<string, { configured: boolean; issue: CanvasMediaModuleSnapshot['config']['preparation'] }>()
+  const configurationByNodeId = new Map<string, CanvasMediaModuleSnapshot['config']>()
+  /** 图变化只重算连接事实，不重复读取模块或素材。 */
+  let currentDocument: CanvasDocument | undefined
+  /** 同一代图共享索引，模块或运行事件不重复扫描全部节点与边。 */
+  let inspectConnections: ReturnType<typeof createCanvasMediaInputConnectionInspector> | undefined
   /** 每个模块独立递增读取代次，拒绝乱序事件刷新。 */
   const requestGenerations = new Map<string, number>()
   /** 最近异步读取链供测试和卸载收口。 */
@@ -138,12 +146,28 @@ export function createCanvasMediaNodeProgressController(
       /** 配置摘要只来自已有模块 LOAD，不为卡片状态额外请求服务器。 */
       const configuration = configurationByNodeId.get(nodeId)
       if (run && isActiveMediaRun(run)) progress.set(nodeId, projectMediaRunProgress(run))
-      else if (configuration?.issue) progress.set(nodeId, {
+      else if (configuration?.preparation) progress.set(nodeId, {
         phase: 'pending', phaseLabel: '待配置',
-        nodeProgressLabel: `${configuration.issue.code} · ${configuration.issue.message}`,
+        nodeProgressLabel: `${configuration.preparation.code} · ${configuration.preparation.message}`,
       })
       else if (run) progress.set(nodeId, projectMediaRunProgress(run))
-      else progress.set(nodeId, { phase: 'pending', phaseLabel: configuration?.configured ? '参数待检查' : '待配置' })
+      else progress.set(nodeId, { phase: 'pending', phaseLabel: configuration?.profile || configuration?.workflow ? '参数待检查' : '待配置' })
+      if (configuration && inspectConnections) {
+        /** 只有精确目标仍属于当前图，才向顶部汇总可恢复准备状态。 */
+        const target = targetsByNodeId.get(nodeId)
+        const projection = progress.get(nodeId)
+        if (target && projection) {
+          try {
+            const connections = inspectConnections(target, configuration.inputs)
+            const workflowBound = Boolean(configuration.profile || configuration.workflow)
+            progress.set(nodeId, { ...projection,
+              ...(!run && !connections.connected ? { phaseLabel: '输入待接通', nodeProgressLabel: connections.bindings.find((binding) => binding.errorCode)?.message } : {}),
+              preparation: { workflowBound, inputsConnected: connections.connected,
+                needsAttention: !workflowBound || !connections.connected || Boolean(configuration.preparation) },
+            })
+          } catch { /* 图和模块切换窗口内不发布过期的准备计数。 */ }
+        }
+      }
     }
     dependencies.onChange(progress)
   }
@@ -169,10 +193,7 @@ export function createCanvasMediaNodeProgressController(
           || createCanvasMediaTargetKey(currentTarget) !== targetKey
           || createCanvasMediaTargetKey(snapshot.target) !== targetKey) return
         runsByNodeId.set(target.nodeId, snapshot.runs)
-        configurationByNodeId.set(target.nodeId, {
-          configured: Boolean(snapshot.config.profile || snapshot.config.workflow),
-          issue: snapshot.config.preparation,
-        })
+        configurationByNodeId.set(target.nodeId, snapshot.config)
         publish()
       } catch {
         /** 卡片进度属于增强信息；读取失败保留现有节点状态。 */
@@ -251,7 +272,9 @@ export function createCanvasMediaNodeProgressController(
       ensureProjectWatch()
       loadInitialTargets([...targetsByNodeId.values()])
     },
-    setTargets: (targets) => {
+    setTargets: (targets, document) => {
+      if (document !== currentDocument) inspectConnections = document ? createCanvasMediaInputConnectionInspector(document) : undefined
+      currentDocument = document
       const nextTargets = new Map(targets.map((target) => [target.nodeId, target]))
       /** 仅首次出现或模块身份变化的目标需要读取初始快照。 */
       const targetsToLoad: CanvasMediaTarget[] = []
@@ -306,6 +329,8 @@ export function useCanvasMediaNodeProgress(
   adapter: Pick<CanvasMediaNodeProgressControllerDependencies,
     'canvasMediaLoad' | 'onCanvasMediaChanged' | 'onMediaRunChanged'>
     & MediaProjectWatchApi | null,
+  /** 已经加载的当前图用于连接阶段的同步投影。 */
+  document?: CanvasDocument,
 ): ReadonlyMap<string, MediaRunProgressProjection> {
   /** 节点卡片只消费可展示的媒体运行事实。 */
   const [progress, setProgress] = React.useState<ReadonlyMap<string, MediaRunProgressProjection>>(() => new Map())
@@ -333,8 +358,8 @@ export function useCanvasMediaNodeProgress(
   }, [adapter, targets[0]?.projectId])
 
   React.useEffect(() => {
-    controllerRef.current?.setTargets(targets)
-  }, [targets])
+    controllerRef.current?.setTargets(targets, document)
+  }, [targets, document, adapter])
 
   return progress
 }

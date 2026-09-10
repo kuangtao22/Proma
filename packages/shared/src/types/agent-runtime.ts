@@ -82,6 +82,7 @@ export const AGENT_RUNTIME_METHODS = {
   CAPABILITY_CAN_USE_TOOL: 'agent.capability.canUseTool',
   CAPABILITY_CANCEL: 'agent.capability.cancel',
   CAPABILITY_CUSTOM_TOOL: 'agent.capability.customTool',
+  CAPABILITY_EVALUATE_COMPLETION: 'agent.capability.evaluateCompletion',
   CAPABILITY_CODEX_OAUTH_REFRESHED: 'agent.capability.codex_oauth_refreshed',
   CAPABILITY_XAI_OAUTH_REFRESHED: 'agent.capability.xai_oauth_refreshed',
   EVENT_STATE: 'runtime.state',

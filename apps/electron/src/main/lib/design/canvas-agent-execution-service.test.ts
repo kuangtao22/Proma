@@ -285,6 +285,42 @@ describe('Canvas Agent 统一执行服务', () => {
     expect(inspected).toBe(true)
   })
 
+  test('Given Provider 已开放父编排查询能力 When 执行服务二次复核 Then 保留任务与版本读取工具', async () => {
+    const queryToolNames = ['canvas_task', 'canvas_get_task', 'canvas_list_versions', 'canvas_read_version']
+    /** 完成检查必须原样进入最终 Headless 运行扩展，不能被二次筛选丢弃。 */
+    const evaluateCompletion: NonNullable<CanvasToolRun['evaluateCompletion']> = async () => ({ action: 'complete' })
+    /** 使用真实扩展过滤链验证 Provider 已开放的只读能力不会被第二层名单误删。 */
+    const queryTools = queryToolNames.map((name) => ({ name })) as unknown as CanvasToolRun['piCustomTools']
+    let inspected = false
+    const fixture = createFixture({
+      canvasRun: {
+        systemPromptAppend: 'tools-prompt',
+        piCustomTools: queryTools,
+        evaluateCompletion,
+        readOnlyToolNames: [...queryToolNames, 'canvas_future_unknown'],
+        allowedToolNames: queryToolNames,
+        allowedToolNamesMode: 'extend',
+        singleApprovalToolNames: [],
+      },
+      inspectHeadlessExtensions: (extensions) => {
+        inspected = true
+        expect(extensions?.allowedToolNames).toEqual(expect.arrayContaining(queryToolNames))
+        expect(extensions?.piCustomTools?.map((tool) => tool.name)).toEqual(queryToolNames)
+        expect(extensions?.evaluateCompletion).toBe(evaluateCompletion)
+        expect(extensions?.readOnlyToolNames).toEqual(queryToolNames)
+        expect(extensions?.allowedToolNames).toContain('WebSearch')
+        expect(extensions?.allowedToolNames).not.toContain('Bash')
+      },
+    })
+
+    await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '检查现有任务并继续处理', userMessageUuid: 'anchor-query-tools', startedAt: 62,
+    })
+
+    expect(inspected).toBe(true)
+  })
+
   test.each([
     ['停止', { stopped: true }],
     ['错误', { runError: '运行失败' }],

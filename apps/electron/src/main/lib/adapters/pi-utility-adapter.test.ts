@@ -29,6 +29,8 @@ interface FakeRuntimeState {
   stop: ReturnType<typeof createDeferred>
   /** 发往 runtime 的方法。 */
   calls: string[]
+  /** 发往 runtime 的请求参数，用于验证函数不会被序列化。 */
+  requestPayloads: unknown[]
   /** 底层 stop 实际调用次数。 */
   stopCalls: number
   /** query abort 的协议响应。 */
@@ -48,6 +50,7 @@ mock.module('../agent-runtime-client', () => ({
       this.state = {
         stop: createDeferred(),
         calls: [],
+        requestPayloads: [],
         stopCalls: 0,
         abortResponse: { accepted: true, completed: true },
       }
@@ -58,8 +61,9 @@ mock.module('../agent-runtime-client', () => ({
       this.state.eventListener = listener
       return () => undefined
     }
-    async call(method: string): Promise<unknown> {
+    async call(method: string, payload?: unknown): Promise<unknown> {
       this.state.calls.push(method)
+      this.state.requestPayloads.push(payload)
       if (method === AGENT_RUNTIME_METHODS.QUERY_ABORT) return this.state.abortResponse
       return undefined
     }
@@ -91,6 +95,74 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
 }
 
 describe('Pi utility 强制关闭合同', () => {
+  test('Given Host 提供完成检查 When 启动 utility query Then 只序列化能力标记并通过独立 RPC 调用', async () => {
+    const evaluations: AbortSignal[] = []
+    const input = {
+      ...createQueryInput('session-completion'),
+      evaluateCompletion: async (signal: AbortSignal) => {
+        evaluations.push(signal)
+        return { action: 'complete' as const }
+      },
+    } as PiAgentQueryOptions
+    const adapter = new PiUtilityAdapter()
+    const iterator = adapter.query(input, 'query-completion')[Symbol.asyncIterator]()
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+
+    const startPayload = runtimeStates[0]!.requestPayloads[0] as { input?: Record<string, unknown> }
+    expect(startPayload.input?.evaluateCompletion).toBeUndefined()
+    expect(startPayload.input?.completionEvaluationEnabled).toBe(true)
+    await expect(adapter.handleRuntimeRequest(createAgentRuntimeRequest(
+      'agent.capability.evaluateCompletion',
+      { queryId: 'query-completion', sessionId: 'session-completion' },
+      { queryId: 'query-completion', sessionId: 'session-completion' },
+    ))).resolves.toEqual({ action: 'complete' })
+    expect(evaluations).toHaveLength(1)
+
+    runtimeStates[0]!.stop.resolve()
+    runtimeStates[0]!.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-completion', sessionId: 'session-completion', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
+  test('Given utility 完成检查仍等待 When capability 取消 Then AbortSignal 终止检查', async () => {
+    let evaluationEntered = false
+    const input = {
+      ...createQueryInput('session-completion-cancel'),
+      evaluateCompletion: async (signal: AbortSignal) => new Promise((resolve) => {
+        evaluationEntered = true
+        signal.addEventListener('abort', () => resolve({ action: 'blocked' as const, message: '检查已取消' }), { once: true })
+      }),
+    } as PiAgentQueryOptions
+    const adapter = new PiUtilityAdapter()
+    const iterator = adapter.query(input, 'query-completion-cancel')[Symbol.asyncIterator]()
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    const request = createAgentRuntimeRequest(
+      'agent.capability.evaluateCompletion',
+      { queryId: 'query-completion-cancel', sessionId: 'session-completion-cancel' },
+      { queryId: 'query-completion-cancel', sessionId: 'session-completion-cancel' },
+    )
+    const evaluation = adapter.handleRuntimeRequest(request)
+    await waitUntil(() => evaluationEntered)
+
+    await adapter.handleRuntimeRequest(createAgentRuntimeRequest(
+      AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
+      { requestId: request.requestId },
+      { queryId: 'query-completion-cancel', sessionId: 'session-completion-cancel' },
+    ))
+    await expect(evaluation).resolves.toEqual({ action: 'blocked', message: '检查已取消' })
+
+    runtimeStates[0]!.stop.resolve()
+    runtimeStates[0]!.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-completion-cancel', sessionId: 'session-completion-cancel', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
   test('Given 主进程权限请求仍等待 When utility 取消对应 capability Then AbortSignal 终结审批且不影响 query', async () => {
     /** 权限回调是否已进入等待。 */
     let permissionEntered = false

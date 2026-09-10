@@ -22,9 +22,11 @@ function createToolbarProps(): React.ComponentProps<typeof NativeCanvasToolbar> 
     onDelete: () => undefined,
     onReferenceSelection: () => undefined,
     arrangeSelectionCount: 2,
+    arrangeRelatedCount: 3,
     arrangeVisibleCount: 4,
     arrangeAllCount: 6,
     onArrangeSelection: () => undefined,
+    onArrangeRelated: () => undefined,
     onArrangeVisible: () => undefined,
     onArrangeAll: () => undefined,
     onFocusFirstIssue: () => undefined,
@@ -170,12 +172,13 @@ describe('原生 Canvas 顶部工具栏', () => {
     expect(hasElementProperty(elementTree, 'data-canvas-node-picker-width', 'compact')).toBeTrue()
   })
 
-  test('Given 画布有多个节点 When 渲染工具栏 Then 提供三个明确整理范围', () => {
+  test('Given 画布有多个节点 When 渲染工具栏 Then 提供四个明确整理范围', () => {
     const html = renderToStaticMarkup(<NativeCanvasToolbar {...createToolbarProps()} />)
     const elementTree = NativeCanvasToolbar(createToolbarProps())
 
     expect(html).toContain('aria-label="整理布局"')
     expect(hasElementProperty(elementTree, 'aria-label', '整理选中节点')).toBeTrue()
+    expect(hasElementProperty(elementTree, 'aria-label', '整理相关节点')).toBeTrue()
     expect(hasElementProperty(elementTree, 'aria-label', '整理当前可见节点')).toBeTrue()
     expect(hasElementProperty(elementTree, 'aria-label', '整理整个画布')).toBeTrue()
   })
@@ -185,6 +188,15 @@ describe('原生 Canvas 顶部工具栏', () => {
       { ...createToolbarProps(), arrangeSelectionCount: 1 },
     )
     const path = findElementPathByProperty(elementTree, 'aria-label', '整理选中节点')
+
+    expect(path?.at(-1)?.props.disabled).toBeTrue()
+  })
+
+  test('Given 选中媒体节点没有足够直接依赖 When 渲染整理菜单 Then 相关节点整理保持禁用', () => {
+    const elementTree = NativeCanvasToolbar(
+      { ...createToolbarProps(), arrangeRelatedCount: 1 },
+    )
+    const path = findElementPathByProperty(elementTree, 'aria-label', '整理相关节点')
 
     expect(path?.at(-1)?.props.disabled).toBeTrue()
   })

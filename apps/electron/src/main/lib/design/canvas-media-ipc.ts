@@ -15,7 +15,7 @@ import type { CanvasMediaModuleChangedEvent, CanvasMediaTarget, MediaAssetRecord
 import type { CanvasMediaService, CanvasMediaServiceDependencies } from './canvas-media-service'
 
 /** IPC 只持有公开操作，不依赖服务的私有状态。 */
-type CanvasMediaIpcService = Pick<CanvasMediaService, 'load' | 'save' | 'run' | 'cancel' | 'adopt' | 'readPreview' | 'exportOutput'>
+type CanvasMediaIpcService = Pick<CanvasMediaService, 'load' | 'readConfig' | 'checkPreparation' | 'save' | 'run' | 'cancel' | 'adopt' | 'readPreview' | 'exportOutput'>
 
 /** 窗口只持有受管媒体的临时 URL，不能指定磁盘路径。 */
 export interface CanvasMediaIpcOptions {
@@ -148,6 +148,8 @@ export function registerCanvasMediaIpcHandlers(options: CanvasMediaIpcOptions): 
     track(event, input)
     return result
   })
+  handle(CANVAS_MEDIA_IPC_CHANNELS.CHECK_PREPARATION, parseCanvasMediaTarget, (service, input) => service.checkPreparation(input))
+  handle(CANVAS_MEDIA_IPC_CHANNELS.READ_CONFIG, parseCanvasMediaTarget, (service, input) => service.readConfig(input))
   handle(CANVAS_MEDIA_IPC_CHANNELS.SAVE, parseSaveCanvasMediaModuleInput, (service, input) => service.save(input))
   handle(CANVAS_MEDIA_IPC_CHANNELS.RUN, parseRunCanvasMediaModuleInput, (service, input) => (
     service.run(input, { canvasMedia: parseCanvasMediaTarget({

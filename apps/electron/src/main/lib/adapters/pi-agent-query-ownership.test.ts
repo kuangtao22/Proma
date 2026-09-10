@@ -13,14 +13,22 @@ function createDeferred(): { promise: Promise<void>; resolve: () => void } {
 /** 测试所需的最小 active query 形状。 */
 interface TestActiveQuery {
   session: {
+    isStreaming?: boolean
     abortCompaction: () => void
     abort: () => Promise<void>
   }
+  ready?: Promise<TestActiveQuery['session']>
   closed: Promise<void>
   forceClosePromise?: Promise<void>
   abortRequested: boolean
-  pendingInterruptPrompts: []
+  interrupting?: boolean
+  pendingInterruptPrompts: Array<{
+    content: string
+    resolveAccepted: () => void
+    rejectAccepted: (error: unknown) => void
+  }>
   readySettled: boolean
+  completionEvaluationAbortController?: AbortController
 }
 
 /** 暴露 adapter 内部 query 所有权表的测试视图。 */
@@ -30,6 +38,52 @@ interface TestPiAgentAdapterState {
 }
 
 describe('Pi in-process query 所有权', () => {
+  test('Given Host 正在完成检查且 Pi 已停止流式输出 When 用户中断 Then 立即取消旧验收并保留新消息接缝', async () => {
+    const adapter = new PiAgentAdapter()
+    const state = adapter as unknown as TestPiAgentAdapterState
+    const completionController = new AbortController()
+    let sessionAbortCalls = 0
+    const session = {
+      isStreaming: false,
+      abortCompaction: () => undefined,
+      abort: async () => { sessionAbortCalls += 1 },
+    }
+    const active: TestActiveQuery = {
+      session,
+      ready: Promise.resolve(session),
+      closed: Promise.resolve(),
+      abortRequested: false,
+      interrupting: false,
+      pendingInterruptPrompts: [],
+      readySettled: true,
+      completionEvaluationAbortController: completionController,
+    }
+    state.activeSessions.set('session-completion', active)
+
+    let accepted = false
+    const sending = adapter.sendQueuedMessage('session-completion', {
+      type: 'user',
+      message: { role: 'user', content: '改为处理新的目标' },
+      parent_tool_use_id: null,
+      session_id: 'session-completion',
+    }, {
+      interrupt: true,
+      onAccepted: () => { accepted = true },
+    })
+    await Bun.sleep(0)
+
+    expect(completionController.signal.aborted).toBe(true)
+    expect(active.interrupting).toBe(true)
+    expect(sessionAbortCalls).toBe(0)
+    expect(active.pendingInterruptPrompts).toHaveLength(1)
+    expect(active.pendingInterruptPrompts[0]?.content).toBe('改为处理新的目标')
+    expect(accepted).toBe(false)
+
+    active.pendingInterruptPrompts.shift()?.resolveAccepted()
+    await sending
+    expect(accepted).toBe(true)
+  })
+
   test('Given generation1 cleanup 延迟且 generation2 已成为当前 When force-close generation1 token Then 只中止 generation1', async () => {
     /** 被测 in-process adapter。 */
     const adapter = new PiAgentAdapter()

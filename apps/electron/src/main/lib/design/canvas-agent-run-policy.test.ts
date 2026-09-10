@@ -3,6 +3,7 @@ import { createEmptyCanvasDocument } from '@proma/shared'
 import type { AgentSessionMeta, CanvasDocument } from '@proma/shared'
 import {
   CANVAS_AGENT_ALLOWED_TOOL_NAMES,
+  resolveCanvasAgentBuiltinToolNames,
   buildCanvasAgentExecutionSystemPrompt,
   listCanvasAgentBoundInputReferences,
   requireCanvasAgentRunOwner,
@@ -69,14 +70,24 @@ describe('Canvas Agent 运行策略', () => {
     })).toThrow('Canvas Agent 归属无效')
   })
 
-  test('Given Canvas Agent 运行 When 构造工具策略 Then 只允许三个只读工具', () => {
-    expect(CANVAS_AGENT_ALLOWED_TOOL_NAMES).toEqual(['Read', 'Glob', 'Grep'])
+  test('Given Canvas Agent 运行 When 构造工具策略 Then 支持读取和搜索且父编排不获得工程写权限', () => {
+    expect(CANVAS_AGENT_ALLOWED_TOOL_NAMES).toEqual(['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'])
     for (const denied of [
       'Write', 'Edit', 'Bash', 'Shell', 'AskUserQuestion', 'EnterPlanMode',
       'mcp__browser__navigate', 'mcp__nano_banana__generate_image', 'Task',
     ]) {
       expect(CANVAS_AGENT_ALLOWED_TOOL_NAMES).not.toContain(denied)
     }
+  })
+
+  test('Given 交互式 Canvas Agent When 执行工程和预览 Then 沿用原权限工具且不隐式启用任意 MCP', () => {
+    /** 两种可信来源的实际内建工具范围。 */
+    const manual = resolveCanvasAgentBuiltinToolNames('renderer-manual')
+    const parent = resolveCanvasAgentBuiltinToolNames('parent-orchestrated')
+    expect(manual).toEqual(expect.arrayContaining(['Write', 'Edit', 'Bash', 'BrowserPreviewOpen', 'BrowserObserve', 'BrowserClick']))
+    expect(parent).not.toContain('Bash')
+    expect(parent).not.toContain('BrowserClick')
+    expect(manual).not.toContain('mcp__unknown__execute')
   })
 
   test('Given 入边同时包含 bound、关联和未确认边 When 提取直接输入 Then 只返回 bound 来源并稳定去重', () => {

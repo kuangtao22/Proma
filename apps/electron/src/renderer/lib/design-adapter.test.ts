@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
+import { CANVAS_MEDIA_IPC_CHANNELS, createEmptyCanvasDocument, createEmptyDesignDocument } from '@proma/shared'
+import { createCanvasMediaPreloadApi } from '../../preload/canvas-media-preload'
 import type {
   CanvasChangeEvent,
   CanvasImageCandidateBatch,
@@ -37,6 +38,26 @@ function createWorkflowRun(): CanvasWorkflowRun {
 }
 
 describe('Design renderer adapter', () => {
+  test('Given 新旧媒体 bridge When 经 renderer 读取来源与准备 Then 只走独立只读通道且不回退 LOAD', async () => {
+    /** 捕获实际 preload 通道，避免把可能默认采用的 LOAD 当作只读配置。 */
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const target = { projectId: 'project', canvasId: 'canvas', nodeId: 'video', mediaModuleId: 'module', mediaKind: 'video' as const }
+    const api = createCanvasMediaPreloadApi(async (channel, input) => {
+      calls.push({ channel, input })
+      return channel === CANVAS_MEDIA_IPC_CHANNELS.READ_CONFIG ? { contentId: 'module' } : { ready: false }
+    }, () => () => {})
+    const adapter = createDesignAdapter(api)
+    expect(await adapter.canvasMediaReadConfig!(target)).toMatchObject({ contentId: 'module' })
+    expect(await adapter.canvasMediaCheckPreparation!(target)).toMatchObject({ ready: false })
+    expect(calls).toEqual([
+      { channel: CANVAS_MEDIA_IPC_CHANNELS.READ_CONFIG, input: target },
+      { channel: CANVAS_MEDIA_IPC_CHANNELS.CHECK_PREPARATION, input: target },
+    ])
+    const legacy = createDesignAdapter({ canvasMediaLoad: api.canvasMediaLoad })
+    expect(legacy.canvasMediaReadConfig).toBeUndefined()
+    expect(legacy.canvasMediaCheckPreparation).toBeUndefined()
+    expect(calls).toHaveLength(2)
+  })
   test('Given 工作流 Preload 合同 When 调用与订阅 Then 严格重建并按 Canvas 过滤事件', async () => {
     const run = createWorkflowRun()
     const target = {

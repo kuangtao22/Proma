@@ -84,6 +84,7 @@ export * from './design'
 // 独立 Canvas 图文档相关类型
 export * from './canvas'
 export * from './canvas-media'
+export * from './canvas-media-connections'
 export * from './canvas-media-model-scope'
 export * from './canvas-workflow-run'
 export * from './media-workflow'

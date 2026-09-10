@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { resolveCanvasEdgeBinding } from '@proma/shared'
+import { getCanvasMediaInputEdgeError as validateBoundEdge, getCanvasMediaSourcePort as expectedSourcePort } from '@proma/shared'
 import type {
   CanvasAgentOutputPointer,
   CanvasDocument,
@@ -121,47 +121,6 @@ function validateAsset(
     throw new Error('CANVAS_MEDIA_ASSET_INVALID')
   }
   return structuredClone(asset)
-}
-
-/** 返回来源类型对应的唯一公开边端口。 */
-function expectedSourcePort(kind: CanvasNode['kind']): string {
-  switch (kind) {
-    case 'agent': return 'agent.text'
-    case 'image': return 'image.asset'
-    case 'audio': return 'audio.asset'
-    case 'video': return 'video.asset'
-    case 'document': return 'document.markdown'
-    case 'webview': return 'webview.html'
-  }
-}
-
-/** 验证 source binding 在当前图中仍由显式类型化直接边支撑。 */
-function validateBoundEdge(
-  document: CanvasDocument,
-  source: CanvasNode,
-  target: CanvasNode,
-  requiredKind: CanvasMediaInputBinding['kind'],
-  outputMediaKind?: MediaAssetRef['mediaKind'],
-): string | null {
-  const directEdges = document.edges.filter((edge) => (
-    edge.sourceNodeId === source.id
-    && edge.targetNodeId === target.id
-    && edge.relation !== 'association'
-  ))
-  if (directEdges.length === 0) return 'CANVAS_MEDIA_SOURCE_EDGE_MISSING'
-  /** AV 节点的 poster/audio 等多角色输出以 adopted asset 实际类型决定端口。 */
-  const sourceKind = outputMediaKind ?? source.kind
-  for (const edge of directEdges) {
-    const binding = resolveCanvasEdgeBinding(edge, sourceKind, target.kind)
-    if (binding.state !== 'bound' || binding.sourceCapability !== expectedSourcePort(sourceKind)) continue
-    if (requiredKind === 'text' && binding.targetSlot === 'context.text') return null
-    if (requiredKind === 'image' && binding.targetSlot === 'context.image') return null
-    if (requiredKind === 'audio'
-      && (binding.targetSlot === 'audio.reference' || binding.targetSlot === 'context.audio')) return null
-    if (requiredKind === 'video'
-      && (binding.targetSlot === 'video.reference' || binding.targetSlot === 'context.video')) return null
-  }
-  return 'CANVAS_MEDIA_SOURCE_EDGE_INVALID'
 }
 
 /** 判断异步读取后来源节点仍是同一业务身份。 */

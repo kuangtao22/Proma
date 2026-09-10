@@ -8,6 +8,7 @@ import type {
   CanvasMediaOutputBinding,
   CanvasMediaOutputPreview,
   CanvasMediaPreparationIssue,
+  CanvasMediaPreparationStatus,
   CanvasMediaTarget,
   ExportCanvasMediaOutputInput,
   ExportCanvasMediaOutputResult,
@@ -19,7 +20,7 @@ import type {
   RunCanvasMediaModuleInput,
   SaveCanvasMediaModuleInput,
 } from '@proma/shared'
-import { validateMediaWorkflowFieldValue } from '@proma/shared'
+import { getCanvasMediaInputErrorMessage, validateMediaWorkflowFieldValue } from '@proma/shared'
 import type { MediaRunOrigin } from '../media/media-run-service'
 import { MediaWorkflowValidationError } from '../media/media-workflow-error'
 
@@ -344,7 +345,15 @@ export class CanvasMediaService {
     this.now = dependencies.now ?? Date.now
   }
 
-  /** 加载公开快照；运行与资产只从统一服务读取。 */
+  /** 读取目标配置并在返回前复验权限，不刷新候选、默认采用或运行。 */
+  async readConfig(target: CanvasMediaTarget): Promise<CanvasMediaModuleConfig> {
+    await this.dependencies.authorizeTarget(target, 'read')
+    const state = await this.dependencies.store.load(target)
+    await this.dependencies.authorizeTarget(target, 'read')
+    return structuredClone(state.config)
+  }
+
+  /** 完整工作台加载会恢复已完成运行；来源目录应使用只读 readConfig。 */
   async load(target: CanvasMediaTarget): Promise<CanvasMediaModuleSnapshot> {
     await this.dependencies.authorizeTarget(target, 'read')
     await this.refreshCompleted(target)
@@ -357,6 +366,67 @@ export class CanvasMediaService {
       runs: state.operations.map((operation) => this.dependencies.runs.get(target.projectId, operation.runId)),
       assets: await this.dependencies.assets.list(target.projectId),
     }
+  }
+
+  /**
+   * 按需检查本地运行准备，既不刷新候选也不创建或提交运行。
+   * @param target 当前精确媒体目标。
+   * @returns 当前配置的工作流、输入与可运行状态；异步期间变化会拒绝旧结果。
+   */
+  async checkPreparation(target: CanvasMediaTarget): Promise<CanvasMediaPreparationStatus> {
+    await this.dependencies.authorizeTarget(target, 'read')
+    /** 检查基线独立于运行历史和候选投影，不触发 load 的默认采用行为。 */
+    const state = await this.dependencies.store.load(target)
+    const config = state.config
+    const issues: CanvasMediaPreparationIssue[] = []
+    let workflowBound = false
+    let inputsReady = false
+    /** 公开诊断只使用受控代码和字段说明，禁止泄漏外部异常的磁盘路径。 */
+    const report = (error: unknown): void => {
+      if (error instanceof CanvasMediaPreparationError) { issues.push({ ...error.issue }); return }
+      const code = error instanceof Error && /^CANVAS_MEDIA_[A-Z0-9_]+$/.test(error.message)
+        ? error.message : 'CANVAS_MEDIA_PREPARATION_INVALID'
+      issues.push({ code, message: code === 'CANVAS_MEDIA_SOURCE_REQUIRED'
+        ? '尚未绑定工作流，请选择工作流及连接。'
+        : '工作流或输入输出合同尚不可用，请检查固定版本、连接和字段配置。' })
+    }
+    try {
+      let workflow: MediaWorkflowDefinition
+      if (config.workflow) {
+        workflow = this.resolveAuthorizedWorkflow(config, {
+          kind: 'project-draft-revision', workflowId: config.workflow.workflowId,
+          workflowRevision: config.workflow.workflowRevision, connectionId: config.workflow.connectionId,
+          mediaKind: config.mediaKind,
+        }, target.projectId, false)
+      } else if (config.profile) {
+        const resolved = this.dependencies.configuration.resolveProfile(config.profile.profileId, config.profile.profileRevision, target.projectId)
+        if (resolved.profile.id !== config.profile.profileId || resolved.profile.revision !== config.profile.profileRevision
+          || resolved.profile.mediaKind !== config.mediaKind) throw new Error('CANVAS_MEDIA_PROFILE_MISMATCH')
+        workflow = resolved.workflow.definition
+      } else throw new Error('CANVAS_MEDIA_SOURCE_REQUIRED')
+      workflowBound = true
+      this.resolveOperationOutputs(config.outputs, workflow)
+      this.assertDraftWorkflowInputContract(config, workflow)
+    } catch (error) { report(error) }
+    try {
+      const resolved = await this.dependencies.resolveWorkflowInputs(target, config.revision)
+      /** 逐槽展示缺边或缺少正式产物；不把素材内容传回 Renderer。 */
+      for (const binding of resolved.bindings) {
+        if (binding.errorCode) issues.push({ code: binding.errorCode,
+          message: `输入“${binding.targetInputKey}”：${getCanvasMediaInputErrorMessage(binding.errorCode)}` })
+      }
+      if (resolved.ready) {
+        resolvedMediaInputs(config, resolved)
+        inputsReady = true
+      } else if (!resolved.bindings.some((binding) => binding.errorCode)) {
+        report(new Error('CANVAS_MEDIA_INPUTS_NOT_READY'))
+      }
+    } catch (error) { report(error) }
+    await this.dependencies.authorizeTarget(target, 'read')
+    const fresh = await this.dependencies.store.load(target)
+    if (fresh.config.revision !== config.revision) throw new Error('CANVAS_MEDIA_CONFIG_CONFLICT')
+    return { configRevision: config.revision, workflowBound, inputsReady,
+      ready: workflowBound && inputsReady && issues.length === 0, issues }
   }
 
   /** 保存配置时只推进独立 config revision，并保留仍匹配的正式输出。 */
@@ -531,6 +601,8 @@ export class CanvasMediaService {
     config: CanvasMediaModuleConfig,
     sourceRef: Extract<MediaRunSourceReference, { kind: 'project-draft-revision' }>,
     projectId: string,
+    /** 只读准备检查先确认绑定，再独立展示输入输出合同问题。 */
+    validateContract = true,
   ): MediaWorkflowDefinition {
     const selected = config.workflow
     if (!selected
@@ -548,6 +620,7 @@ export class CanvasMediaService {
       || (workflow.projectId !== null && workflow.projectId !== projectId)) throw new Error('CANVAS_MEDIA_WORKFLOW_MISMATCH')
     const connection = this.dependencies.configuration.resolveConnection(sourceRef.connectionId, projectId)
     if (connection.connection.id !== sourceRef.connectionId) throw new Error('CANVAS_MEDIA_CONNECTION_MISMATCH')
+    if (!validateContract) return workflow.definition
     if (config.outputs.length !== workflow.definition.outputs.length
       || config.outputs.some((output, index) => {
         const selector = workflow.definition.outputs[index]

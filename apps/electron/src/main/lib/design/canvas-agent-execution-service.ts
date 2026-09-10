@@ -16,14 +16,13 @@ import type {
   CanvasAgentOutputService,
 } from './canvas-agent-output-service'
 import {
-  CANVAS_AGENT_ALLOWED_TOOL_NAMES,
+  resolveCanvasAgentBuiltinToolNames,
   buildCanvasAgentExecutionSystemPrompt,
   listCanvasAgentBoundInputReferences,
   requireCanvasAgentRunOwner,
 } from './canvas-agent-run-policy'
 import type { CanvasToolRun, CanvasToolRunContext } from './canvas-tool-provider'
-import { MEDIA_TOOL_NAMES } from '../media/media-tool-provider'
-import { CANVAS_IMAGE_CANDIDATE_TOOL_NAMES } from './canvas-image-candidate-tools'
+import { filterCanvasAgentToolNamesForMode } from './canvas-agent-tool-policy'
 
 /** Renderer 手动运行只接受 IPC 已严格解析的消息身份。 */
 export interface CanvasRendererManualAgentExecutionRequest {
@@ -116,29 +115,6 @@ export interface CanvasAgentExecutionService {
   execute: (request: CanvasAgentExecutionRequest) => Promise<CanvasAgentExecutionResult>
 }
 
-/** parent 模式只开放当前节点生产所需能力；未来新增工具默认无权进入子 Agent。 */
-const PARENT_ALLOWED_CANVAS_TOOLS = new Set([
-  ...CANVAS_IMAGE_CANDIDATE_TOOL_NAMES,
-  ...MEDIA_TOOL_NAMES.filter((name) => !['media_execute_run', 'media_cancel_run', 'media_save_profile'].includes(name)),
-  'media_list_sources',
-  'media_import_assets',
-  'canvas_get_context',
-  'canvas_list_nodes',
-  'canvas_inspect_images',
-  'canvas_read',
-  'canvas_apply_changes',
-  'canvas_import_image',
-  'canvas_create_artifact',
-  'canvas_create_media',
-  'canvas_update_artifact',
-  'canvas_update_image_config',
-  'canvas_update_media_config',
-  'canvas_inspect_media',
-  'canvas_adopt_media_candidate',
-  'canvas_get_workflow_run',
-  'canvas_list_workflow_runs',
-])
-
 /** 将长期和本轮 Skill 名称解析为当前启用 Skill 的稳定 slug。 */
 function resolveSkillSlugs(
   selectedNames: readonly string[],
@@ -170,9 +146,8 @@ function buildRunExtensions(
   prompt: string,
   canvasRun: CanvasToolRun | undefined,
 ): AgentRunExtensions {
-  const canvasToolNames = (canvasRun?.allowedToolNames ?? []).filter((name) => (
-    mode === 'renderer-manual' || PARENT_ALLOWED_CANVAS_TOOLS.has(name)
-  ))
+  /** 即使 Provider 已按模式收缩，这里仍用同一权威策略做执行前二次复核。 */
+  const canvasToolNames = filterCanvasAgentToolNamesForMode(canvasRun?.allowedToolNames ?? [], mode)
   /** 三个工具入口共享同一正向集合，避免 schema、执行器和审批列表出现权限漂移。 */
   const canvasToolNameSet = new Set(canvasToolNames)
   return {
@@ -180,8 +155,10 @@ function buildRunExtensions(
       .filter((section): section is string => Boolean(section?.trim()))
       .join('\n\n'),
     ...(canvasRun ? { piCustomTools: canvasRun.piCustomTools.filter((tool) => canvasToolNameSet.has(tool.name)) } : {}),
-    allowedToolNames: [...CANVAS_AGENT_ALLOWED_TOOL_NAMES, ...canvasToolNames],
+    allowedToolNames: [...resolveCanvasAgentBuiltinToolNames(mode), ...canvasToolNames],
     allowedToolNamesMode: 'replace',
+    readOnlyToolNames: canvasRun?.readOnlyToolNames?.filter(name => canvasToolNameSet.has(name)),
+    ...(canvasRun?.evaluateCompletion ? { evaluateCompletion: canvasRun.evaluateCompletion } : {}),
     ...(canvasRun ? {
       singleApprovalToolNames: canvasRun.singleApprovalToolNames.filter((name) => canvasToolNameSet.has(name)),
       /** 只对当前 Agent 仍可调用的工具透传动态生成授权，父编排白名单不扩张。 */

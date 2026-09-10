@@ -93,7 +93,7 @@ export function createCanvasImageModuleKey(target: CanvasImageTarget): string {
 /** 共享 graph 的结构生命周期操作身份。 */
 export interface NativeCanvasStructuralOperation {
   id: string
-  kind: 'create' | 'delete' | 'restore' | 'rebuild' | 'arrange'
+  kind: 'create' | 'delete' | 'restore' | 'rebuild' | 'arrange' | 'connect'
 }
 
 /** 按项目与 Canvas 双重身份隔离的 Renderer 状态。 */

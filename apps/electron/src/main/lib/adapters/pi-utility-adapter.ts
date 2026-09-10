@@ -223,6 +223,17 @@ export class PiUtilityAdapter {
       }
     }
 
+    if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_EVALUATE_COMPLETION) {
+      if (!pending.input.evaluateCompletion) throw new Error(`No completion evaluation handler: ${pending.sessionId}`)
+      const controller = new AbortController()
+      this.capabilityAbortControllers.set(request.requestId, { controller, queryId: pending.queryId })
+      try {
+        return await pending.input.evaluateCompletion(controller.signal)
+      } finally {
+        this.capabilityAbortControllers.delete(request.requestId)
+      }
+    }
+
     if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_CODEX_OAUTH_REFRESHED) {
       await pending.input.onCodexOAuthCredentialsRefreshed?.(payload?.credentials as never)
       return { accepted: true }
@@ -362,6 +373,7 @@ function serializeQueryInput(input: PiAgentQueryOptions): Record<string, unknown
     onSkillActivated: _onSkillActivated,
     onCodexOAuthCredentialsRefreshed: _onCodexOAuthCredentialsRefreshed,
     onXaiOAuthCredentialsRefreshed: _onXaiOAuthCredentialsRefreshed,
+    evaluateCompletion,
     ...serializable
   } = input
   const serializedCustomTools = (customTools ?? []).map((tool) => {
@@ -370,6 +382,7 @@ function serializeQueryInput(input: PiAgentQueryOptions): Record<string, unknown
   })
   return {
     ...serializable,
+    ...(evaluateCompletion ? { completionEvaluationEnabled: true } : {}),
     ...(serializedCustomTools.length > 0 ? { customTools: serializedCustomTools } : {}),
   }
 }

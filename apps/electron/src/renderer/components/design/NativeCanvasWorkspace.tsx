@@ -148,8 +148,10 @@ import {
 } from './native-canvas-model'
 import {
   createNativeCanvasArrangeCommand,
+  createNativeCanvasRelatedArrangeNodeIds,
   getNativeCanvasArrangeErrorMessage,
 } from './native-canvas-arrange-command'
+import { connectCanvasMediaInputs } from './canvas-media-connect-command'
 import {
   useCanvasImageModule,
   type CanvasImageModuleAdapter,
@@ -260,6 +262,8 @@ export interface NativeCanvasAdapter {
   onCanvasImageModuleChanged?: DesignAdapter['onCanvasImageModuleChanged']
   /** 音视频工作台完整能力只在展开媒体节点时按需组合。 */
   canvasMediaLoad?: DesignAdapter['canvasMediaLoad']
+  canvasMediaReadConfig?: DesignAdapter['canvasMediaReadConfig']
+  canvasMediaCheckPreparation?: DesignAdapter['canvasMediaCheckPreparation']
   canvasMediaSave?: DesignAdapter['canvasMediaSave']
   canvasMediaRun?: DesignAdapter['canvasMediaRun']
   canvasMediaCancel?: DesignAdapter['canvasMediaCancel']
@@ -2054,6 +2058,8 @@ function createNativeCanvasMediaWorkbenchAdapter(
     || !adapter.onMediaRunChanged) return null
   return {
     canvasMediaLoad: adapter.canvasMediaLoad,
+    canvasMediaReadConfig: adapter.canvasMediaReadConfig,
+    canvasMediaCheckPreparation: adapter.canvasMediaCheckPreparation,
     canvasMediaSave: adapter.canvasMediaSave,
     canvasMediaRun: adapter.canvasMediaRun,
     canvasMediaCancel: adapter.canvasMediaCancel,
@@ -2458,6 +2464,8 @@ export function createNativeCanvasNodeActivityStates(
   document: CanvasDocument,
   runningSessionIds: ReadonlySet<string>,
   jobs: readonly NativeCanvasActivityJob[],
+  /** AV 排队/采集等非终态也须固定几何和输入，直到真实运行结束。 */
+  mediaProgress?: ReadonlyMap<string, MediaRunProgressProjection>,
 ): ReadonlyMap<string, CanvasNodeActivityState> {
   /** 权威节点索引同时阻止其他 Canvas 的 Job 污染当前画布。 */
   const nodesById = new Map(document.nodes.map((node) => [node.id, node]))
@@ -2481,6 +2489,13 @@ export function createNativeCanvasNodeActivityStates(
       || nodesById.get(job.target.nodeId)?.kind !== 'image') continue
     if (job.status === 'running') assign(job.target.nodeId, 'running')
     else if (job.status === 'queued') assign(job.target.nodeId, 'queued')
+  }
+  for (const [nodeId, progress] of mediaProgress ?? []) {
+    const kind = nodesById.get(nodeId)?.kind
+    if (kind !== 'audio' && kind !== 'video') continue
+    if (progress.phase === 'prepared') assign(nodeId, 'waiting-approval')
+    else if (progress.phase !== 'pending' && progress.phase !== 'succeeded'
+      && progress.phase !== 'failed' && progress.phase !== 'cancelled') assign(nodeId, 'running')
   }
   return states
 }
@@ -2890,7 +2905,11 @@ export function NativeCanvasWorkspace({
     )) ?? []
   ), [state.snapshot?.document.nodes, target.canvasId, target.projectId])
   /** AV 初次读取后由模块和运行事件增量更新，不轮询媒体服务。 */
-  const canvasMediaProgressByNodeId = useCanvasMediaNodeProgress(canvasMediaTargets, mediaWorkbenchAdapter)
+  const canvasMediaProgressByNodeId = useCanvasMediaNodeProgress(canvasMediaTargets, mediaWorkbenchAdapter, state.snapshot?.document)
+  /** 媒体准备与会话损坏问题分别计数，避免顶部隐藏尚未接通的多张媒体卡片。 */
+  const mediaPreparationNodeIds = React.useMemo(() => [...canvasMediaProgressByNodeId]
+    .filter(([, progress]) => progress.preparation?.needsAttention)
+    .map(([nodeId]) => nodeId), [canvasMediaProgressByNodeId])
   /** Graph 对图片与 AV 节点使用同一个只读进度合同。 */
   const mediaProgressByNodeId = React.useMemo(() => new Map([
     ...imageMediaProgressByNodeId,
@@ -2902,9 +2921,11 @@ export function NativeCanvasWorkspace({
         state.snapshot.document,
         runningSessionIds,
         projectCanvasJobs,
+        canvasMediaProgressByNodeId,
       )
     : new Map<string, CanvasNodeActivityState>(), [
       projectCanvasJobs,
+      canvasMediaProgressByNodeId,
       runningSessionIds,
       state.snapshot,
     ])
@@ -2928,6 +2949,10 @@ export function NativeCanvasWorkspace({
     const documentNodeIds = new Set(state.snapshot.document.nodes.map((node) => node.id))
     return viewState.selectedNodeIds.filter((nodeId) => documentNodeIds.has(nodeId))
   }, [state.snapshot, viewState.selectedNodeIds])
+  /** 只扩展所选媒体的直接来源，避免共享母版把其它镜头一起纳入整理。 */
+  const relatedArrangeNodeIds = React.useMemo(() => state.snapshot
+    ? createNativeCanvasRelatedArrangeNodeIds(state.snapshot.document, validSelectedNodeIds)
+    : [], [state.snapshot, validSelectedNodeIds])
   /** 完整选区节点用于批量删除摘要和运行态边界检查。 */
   const selectedNodes = React.useMemo(() => {
     if (!state.snapshot) return []
@@ -3930,6 +3955,34 @@ export function NativeCanvasWorkspace({
           }}
           writable={workspaceWritable}
           adapter={mediaWorkbenchAdapter}
+          canvasDocument={state.snapshot?.document}
+          imagePreviews={state.snapshot?.imagePreviews}
+          onConnectInputs={mediaWorkbenchAdapter.canvasMediaCheckPreparation ? async (config) => connectCanvasMediaInputs({
+            target: { ...target, nodeId: node.id, mediaModuleId: node.mediaModuleId, mediaKind: node.kind },
+            config,
+            createOperationId: () => window.crypto.randomUUID(),
+            getCurrentContext: () => {
+              const current = store.get(nativeCanvasStatesAtom).get(stateKey)
+              if (!current?.snapshot) return null
+              return {
+                workspaceKey: currentWorkspaceKeyRef.current,
+                document: current.snapshot.document,
+                permissionWritable: Boolean(current.snapshot.writable && current.authoritativeRecoveryState === 'idle' && current.saveState !== 'conflict'),
+                blockedNodeIds: new Set([...nodeActivityStatesRef.current]
+                  .filter(([, activity]) => activity === 'running' || activity === 'waiting-approval')
+                  .map(([nodeId]) => nodeId)),
+              }
+            },
+            beginOperation: (operationId) => beginStructuralOperation(operationId, 'connect'),
+            endOperation: endStructuralOperation,
+            checkPreparation: mediaWorkbenchAdapter.canvasMediaCheckPreparation!,
+            save: adapter.saveCanvas,
+            onSuccess: (document) => {
+              if (currentWorkspaceKeyRef.current !== viewStateKey) return
+              updateNativeCanvasState({ key: stateKey, update: (current) => current.snapshot && current.snapshot.document.revision <= document.revision
+                ? { snapshot: { ...current.snapshot, document }, saveState: 'saved', error: null } : {} })
+            },
+          }) : undefined}
           defaultComfyuiConnectionId={inheritableCanvasComfyUiConnectionId}
         />
       )
@@ -3986,6 +4039,9 @@ export function NativeCanvasWorkspace({
   }, [
     ConversationRenderer,
     acceptTextArtifactMutation,
+    adapter.saveCanvas,
+    beginStructuralOperation,
+    endStructuralOperation,
     canvasSurfaceSize,
     changeWebviewDevicePreset,
     closeWorkbench,
@@ -4001,8 +4057,10 @@ export function NativeCanvasWorkspace({
     rebuildState.error,
     rebuildState.loading,
     requestSelectedNodeDelete,
-    state.snapshot?.nodeIssues,
-    state.snapshot?.document.revision,
+    state.snapshot,
+    stateKey,
+    store,
+    updateNativeCanvasState,
     updateAgentCanvasViewState,
     target,
     updateWorkbenchDirty,
@@ -4104,10 +4162,21 @@ export function NativeCanvasWorkspace({
                 canDelete={canDeleteNode}
                 canReferenceSelection={validSelectedNodeIds.length > 1}
                 issueCount={state.snapshot.nodeIssues.length}
+                mediaPreparationCount={mediaPreparationNodeIds.length}
+                onFocusMediaPreparation={() => {
+                  const nodeId = mediaPreparationNodeIds[0]
+                  if (!nodeId) return
+                  updateAgentCanvasViewState({ key: viewStateKey, update: (current) => ({
+                    selectedNodeId: nodeId, selectedNodeIds: [nodeId],
+                    ...createAgentCanvasWorkbenchChangeUpdate(current, nodeId),
+                  }) })
+                }}
                 arrangeSelectionCount={validSelectedNodeIds.length}
+                arrangeRelatedCount={relatedArrangeNodeIds.length}
                 arrangeVisibleCount={visibleNodeIds.length}
                 arrangeAllCount={state.snapshot.document.nodes.length}
                 onArrangeSelection={() => arrangeCanvasNodes(validSelectedNodeIds)}
+                onArrangeRelated={() => arrangeCanvasNodes(relatedArrangeNodeIds)}
                 onArrangeVisible={() => arrangeCanvasNodes(visibleNodeIds)}
                 onArrangeAll={() => arrangeCanvasNodes(state.snapshot!.document.nodes.map((node) => node.id))}
                 onToolChange={(activeTool) => updateAgentCanvasViewState({

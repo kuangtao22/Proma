@@ -12,6 +12,8 @@ export type CanvasNodeCapability =
   | 'task-control'
   | 'versions'
   | 'adopt-version'
+  | 'adopt-candidate'
+  | 'attach-assets'
   | 'export'
   | 'rebuild'
 
@@ -30,71 +32,125 @@ export interface CanvasNodeCapabilityRegistry {
   assert: (node: CanvasNode, capability: CanvasNodeCapability) => void
 }
 
-/** 返回节点类别静态支持的能力，顺序同时作为公开展示顺序。 */
-function listSupportedCapabilities(node: CanvasNode): CanvasNodeCapability[] {
+/** Agent 可直接调用的一项节点动作及其本轮可用工具。 */
+export interface CanvasNodeAction {
+  capability: CanvasNodeCapability
+  toolNames: string[]
+}
+
+/** 节点能力及其兼容工具声明；空工具只用于表达非动作状态。 */
+interface CanvasNodeCapabilityDefinition {
+  capability: CanvasNodeCapability
+  toolNames: readonly string[]
+}
+
+/** 构造单项能力声明，保持类别映射紧凑且顺序明确。 */
+function defineCapability(
+  capability: CanvasNodeCapability,
+  ...toolNames: string[]
+): CanvasNodeCapabilityDefinition {
+  return { capability, toolNames }
+}
+
+/** 返回节点类别静态支持的能力与工具映射，顺序同时作为公开展示顺序。 */
+function listSupportedCapabilityDefinitions(node: CanvasNode): CanvasNodeCapabilityDefinition[] {
   switch (node.kind) {
-    case 'agent': return ['read', 'update-config', 'run', 'rebuild']
+    case 'agent': return [
+      defineCapability('read', 'canvas_read'),
+      defineCapability('update-config', 'canvas_update_agent_config'),
+      defineCapability('run', 'canvas_run_agent'),
+      defineCapability('rebuild', 'canvas_rebuild_agent'),
+    ]
     case 'image': return [
-      'read', 'preview', 'update-config', 'run', 'review-required',
-      'task-status', 'task-control', 'versions', 'adopt-version', 'export',
+      defineCapability('read', 'canvas_read'),
+      defineCapability('preview', 'canvas_inspect_images'),
+      defineCapability('update-config', 'canvas_update_image_config', 'canvas_update_artifact'),
+      defineCapability('run', 'canvas_run_nodes'),
+      defineCapability('review-required'),
+      defineCapability('task-status', 'canvas_get_task'),
+      defineCapability('task-control', 'canvas_cancel_task', 'canvas_retry_task'),
+      defineCapability('versions', 'canvas_list_versions', 'canvas_read_version'),
+      defineCapability('adopt-version', 'canvas_adopt_version', 'canvas_adopt_candidate_batch'),
+      defineCapability('export', 'canvas_export_artifact'),
     ]
     case 'audio':
-    case 'video': return ['read', 'update-config', 'run', 'review-required']
+    case 'video': return [
+      defineCapability('read', 'canvas_read'),
+      defineCapability('update-config', 'canvas_update_media_config'),
+      defineCapability('run', 'canvas_run_nodes'),
+      defineCapability('review-required'),
+      defineCapability('task-status', 'canvas_inspect_media'),
+      defineCapability('task-control', 'canvas_cancel_media_run'),
+      defineCapability('adopt-candidate', 'canvas_adopt_media_candidate'),
+      defineCapability('attach-assets', 'canvas_attach_media_assets'),
+    ]
     case 'document':
-    case 'webview': return ['read', 'update-content', 'versions', 'adopt-version', 'export']
+    case 'webview': return [
+      defineCapability('read', 'canvas_read'),
+      defineCapability('update-content', 'canvas_update_artifact'),
+      defineCapability('versions', 'canvas_list_versions', 'canvas_read_version'),
+      defineCapability('adopt-version', 'canvas_adopt_version'),
+      defineCapability('export', 'canvas_export_artifact'),
+    ]
   }
 }
 
 /** 会改变持久状态、外部文件或付费运行的能力在 plan 模式不应被发现。 */
 const MUTATING_CAPABILITIES = new Set<CanvasNodeCapability>([
-  'update-config', 'update-content', 'run', 'task-control', 'adopt-version', 'export', 'rebuild',
+  'update-config', 'update-content', 'run', 'task-control', 'adopt-version',
+  'adopt-candidate', 'attach-assets', 'export', 'rebuild',
 ])
 
-/** 判断能力是否由当前实际工具集合支持；同一能力可由兼容工具兜底。 */
-function hasCapabilityTool(
-  node: CanvasNode,
-  capability: CanvasNodeCapability,
-  availableToolNames: ReadonlySet<string>,
+/** 判断能力声明是否满足节点状态、权限上限和本轮工具集合。 */
+function isCapabilityDiscoverable(
+  definition: CanvasNodeCapabilityDefinition,
+  state: CanvasNodeCapabilityState,
 ): boolean {
-  switch (capability) {
-    case 'read': return availableToolNames.has('canvas_read')
-    case 'preview': return node.kind === 'audio' || node.kind === 'video'
-      ? availableToolNames.has('canvas_inspect_media')
-      : availableToolNames.has('canvas_inspect_images')
-    case 'review-required': return true
-    case 'run': return availableToolNames.has(node.kind === 'agent' ? 'canvas_run_agent' : 'canvas_run_nodes')
-    case 'update-config': return node.kind === 'agent'
-      ? availableToolNames.has('canvas_update_agent_config')
-      : node.kind === 'audio' || node.kind === 'video'
-        ? availableToolNames.has('canvas_update_media_config')
-        : availableToolNames.has('canvas_update_image_config') || availableToolNames.has('canvas_update_artifact')
-    case 'update-content': return availableToolNames.has('canvas_update_artifact')
-    case 'task-status': return availableToolNames.has('canvas_get_task')
-    case 'task-control': return availableToolNames.has('canvas_cancel_task')
-      || availableToolNames.has('canvas_retry_task')
-    case 'versions': return availableToolNames.has('canvas_list_versions')
-      || availableToolNames.has('canvas_read_version')
-    case 'adopt-version': return availableToolNames.has('canvas_adopt_version')
-      || (node.kind === 'image' && availableToolNames.has('canvas_adopt_candidate_batch'))
-    case 'export': return availableToolNames.has('canvas_export_artifact')
-    case 'rebuild': return availableToolNames.has('canvas_rebuild_agent')
-  }
+  if (state.availability !== 'available' && definition.capability === 'run') return false
+  if (state.permissionCeiling === 'plan' && MUTATING_CAPABILITIES.has(definition.capability)) return false
+  if (!state.availableToolNames || definition.toolNames.length === 0) return true
+  return definition.toolNames.some((toolName) => state.availableToolNames?.has(toolName))
+}
+
+/** 返回声明中当前实际可用的兼容工具；缺省工具集合时返回完整静态映射。 */
+function listAvailableToolNames(
+  definition: CanvasNodeCapabilityDefinition,
+  availableToolNames?: ReadonlySet<string>,
+): string[] {
+  return availableToolNames
+    ? definition.toolNames.filter((toolName) => availableToolNames.has(toolName))
+    : [...definition.toolNames]
+}
+
+/**
+ * 返回节点本轮可直接执行的结构化动作。
+ * @param node 权威 Canvas 节点。
+ * @param state 当前可用性、权限上限和实际工具集合。
+ * @returns 按稳定能力顺序排列的动作；不包含纯审核状态标记。
+ */
+export function listCanvasNodeActions(
+  node: CanvasNode,
+  state: CanvasNodeCapabilityState,
+): CanvasNodeAction[] {
+  return listSupportedCapabilityDefinitions(node)
+    .filter((definition) => definition.capability !== 'review-required')
+    .filter((definition) => isCapabilityDiscoverable(definition, state))
+    .map((definition) => ({
+      capability: definition.capability,
+      toolNames: listAvailableToolNames(definition, state.availableToolNames),
+    }))
 }
 
 /** Canvas 能力仅从权威节点和本轮运行态派生，不写回节点或磁盘。 */
 export const canvasNodeCapabilityRegistry: CanvasNodeCapabilityRegistry = {
   list: (node, state) => {
-    const capabilities = listSupportedCapabilities(node)
-    return capabilities.filter((capability) => {
-      if (state.availability !== 'available' && capability === 'run') return false
-      if (state.permissionCeiling === 'plan' && MUTATING_CAPABILITIES.has(capability)) return false
-      return state.availableToolNames
-        ? hasCapabilityTool(node, capability, state.availableToolNames)
-        : true
-    })
+    return listSupportedCapabilityDefinitions(node)
+      .filter((definition) => isCapabilityDiscoverable(definition, state))
+      .map((definition) => definition.capability)
   },
   assert: (node, capability) => {
-    if (!listSupportedCapabilities(node).includes(capability)) {
+    if (!listSupportedCapabilityDefinitions(node)
+      .some((definition) => definition.capability === capability)) {
       throw new Error('CANVAS_NODE_CAPABILITY_UNSUPPORTED')
     }
   },

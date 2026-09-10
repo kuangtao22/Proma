@@ -116,6 +116,40 @@ describe('Canvas Workflow Planner', () => {
     expect(audioPlan.nodes[0]?.status).toBe('ready')
   })
 
+  test('Given 空内容节点位于 Agent 链路中间 When 上游完成并对账 Then 文档与 WebView 均不释放下游', async () => {
+    const cases = ['document', 'webview'] as const
+
+    for (const kind of cases) {
+      const root = createNode(`${kind}-root`, 'agent')
+      const emptyContent = {
+        ...createNode(`${kind}-empty`, kind),
+        contentRevision: 0,
+      } as CanvasNode
+      const target = createNode(`${kind}-target`, 'agent')
+      const document = createDocument(
+        [root, emptyContent, target],
+        [[root, emptyContent], [emptyContent, target]],
+      )
+      const run = createRun(document, [root.id])
+      const rootState = run.nodes.find((node) => node.nodeId === root.id)!
+      rootState.status = 'completed'
+      rootState.execution = { kind: 'agent', operationId: `${kind}-root-operation` }
+      rootState.completedArtifactHash = 'c'.repeat(64)
+      rootState.completedAt = 20
+
+      const reconciled = await reconcileCanvasWorkflowRun(run, document, {
+        isImageCandidateAdopted: noAdoption,
+      })
+
+      expect(reconciled.readyNodeIds).toEqual([])
+      expect(reconciled.run.nodes.find((node) => node.nodeId === emptyContent.id)).toMatchObject({
+        status: 'blocked', errorCode: 'CANVAS_WORKFLOW_NODE_UNSUPPORTED',
+      })
+      expect(reconciled.run.nodes.find((node) => node.nodeId === target.id)?.status).toBe('ready')
+      expect(reconciled.run.status).toBe('partial')
+    }
+  })
+
   test('Given 恢复期间新增范围外后继 When 对账 Then 不扩大首次计划范围', async () => {
     const root = createNode('root', 'agent')
     const image = createNode('image', 'image')

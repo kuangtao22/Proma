@@ -101,7 +101,8 @@ test('Given 用户已给出具体目标后追问能否执行 When 构建系统�
     },
   })
 
-  expect(prompt).toContain('“能做吗”“可以吗”或“继续”')
-  expect(prompt).toContain('立即调用第一个必要的读取、查询或检查工具')
+  expect(prompt).toContain('依据任务目标与已有授权选择行动，不依赖特定措辞触发')
+  expect(prompt).toContain('使用当前可用工具取得事实、完成修改并验证结果')
+  expect(prompt).toContain('不为了工具调用而调用工具')
   expect(prompt).toContain('不要只回复能力说明、重复计划或等待用户再次催促')
 })

@@ -260,6 +260,51 @@ function createService(
 }
 
 describe('Canvas 通用媒体服务', () => {
+  test('Given 媒体来源有候选 When 只读配置目录 Then 不触发候选采用或运行刷新且返回隔离配置', async () => {
+    const store = createStore()
+    const before = store.current()
+    const value = await createService(store, run()).readConfig(target)
+    value.outputs[0]!.key = 'mutated'
+    expect(store.current()).toEqual(before)
+    expect(before.config.adoptedOutputs).toEqual([])
+  })
+  test('Given 已保存草稿缺工作流且来源缺边 When 只读准备检查 Then 分别报告且不改变配置', async () => {
+    /** 草稿可以独立保存输入，不必伪造工作流。 */
+    const store = createStore({ config: { ...config(), profile: null } })
+    const before = store.current()
+    const service = createService(store, run(), undefined, async () => ({ ready: false, bindings: [{
+      targetInputKey: 'prompt', requiredKind: 'text', sourceNodeId: 'doc', sourceOutputKey: 'document.markdown',
+      sourceArtifactHash: null, resolvedValue: null, errorCode: 'CANVAS_MEDIA_SOURCE_EDGE_MISSING',
+    }] }))
+    const result = await service.checkPreparation(target)
+    expect(result).toMatchObject({ configRevision: 2, workflowBound: false, inputsReady: false, ready: false })
+    expect(result.issues.map((issue) => issue.code)).toEqual(['CANVAS_MEDIA_SOURCE_REQUIRED', 'CANVAS_MEDIA_SOURCE_EDGE_MISSING'])
+    expect(store.current()).toEqual(before)
+  })
+  test('Given 固定工作流及正式输入均有效 When 只读准备检查 Then 返回可运行但不创建任务', async () => {
+    const store = createStore()
+    const before = store.current()
+    const result = await createService(store, run()).checkPreparation(target)
+    expect(result).toEqual({ configRevision: 2, workflowBound: true, inputsReady: true, ready: true, issues: [] })
+    expect(store.current()).toEqual(before)
+  })
+  test('Given 工作流必填项未配置 When 只读准备检查 Then 已绑定但不可运行', async () => {
+    const store = createStore({ config: { ...config(), inputs: [] } })
+    const result = await createService(store, run()).checkPreparation(target)
+    expect(result.workflowBound).toBe(true)
+    expect(result.ready).toBe(false)
+    expect(result.issues.some((issue) => issue.code === 'CANVAS_MEDIA_INPUT_REQUIRED')).toBe(true)
+  })
+  test('Given 检查期间配置被修改 When 异步输入返回 Then 拒绝把旧结果标成就绪', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      const current = store.current()
+      await store.compareAndSwap(target, current.revision, { ...current, revision: current.revision + 1,
+        config: { ...current.config, revision: current.config.revision + 1 } })
+      return { ready: true, bindings: [] }
+    })
+    await expect(service.checkPreparation(target)).rejects.toThrow('CANVAS_MEDIA_CONFIG_CONFLICT')
+  })
   test('Given 空视频已有多份候选 When 加载 Then 默认采用最早有效主视频并持久化默认来源', async () => {
     /** 故意倒置候选数组，默认版本按完成时间确定。 */
     const candidates: CanvasMediaCandidate[] = [20, 10].map((createdAt) => ({

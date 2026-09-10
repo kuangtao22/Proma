@@ -203,6 +203,13 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
       /** 用户保存的媒体授权策略随同工具进入运行，避免普通 Agent 丢失自主权限。 */
       ...(canvasRun.toolApprovalPolicy ? { toolApprovalPolicy: canvasRun.toolApprovalPolicy } : {}),
       allowedToolNamesMode: canvasRun.allowedToolNamesMode,
+      readOnlyToolNames: [...(prepared.extensions.readOnlyToolNames ?? []), ...(canvasRun.readOnlyToolNames ?? [])],
+      ...(canvasRun.evaluateCompletion ? { evaluateCompletion: async (signal: AbortSignal) => {
+        /** 保留原运行已有的完成守卫，画布检查只能追加约束。 */
+        const previous = await prepared.extensions.evaluateCompletion?.(signal)
+        if (previous && previous.action !== 'complete') return previous
+        return canvasRun.evaluateCompletion!(signal)
+      } } : {}),
     },
   }
 }

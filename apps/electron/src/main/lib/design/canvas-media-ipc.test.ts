@@ -32,6 +32,13 @@ function fixture(afterOpen?: () => void) {
     createMediaAccess: () => ({ assetBaseUrl: 'proma-file://grant/', release: () => { releases += 1 } }),
     exportAsset: async () => ({ cancelled: true }),
     createService: (files) => ({
+      readConfig: async () => {
+        calls += 1
+        afterOpen?.()
+        return { schemaVersion: 1, contentId: 'module', mediaKind: 'video', revision: 0,
+          createdAt: 1, updatedAt: 1, profile: null, inputs: [], outputs: [], adoptedOutputs: [] }
+      },
+      checkPreparation: async () => { calls += 1; afterOpen?.(); return { configRevision: 0, workflowBound: false, inputsReady: true, ready: false, issues: [{ code: 'CANVAS_MEDIA_SOURCE_REQUIRED', message: '尚未绑定工作流。' }] } },
       load: async () => { calls += 1; return { target, config: { schemaVersion: 1, contentId: 'module', mediaKind: 'video', revision: 0,
         createdAt: 1, updatedAt: 1, profile: null, inputs: [], outputs: [], adoptedOutputs: [] }, candidates: [], runs: [], assets: [] } },
       save: async (input) => {
@@ -58,6 +65,37 @@ function fixture(afterOpen?: () => void) {
 }
 
 describe('Canvas 媒体 IPC', () => {
+  test('Given 已授权来源 When 只读配置 Then 返回配置且不创建预览或保存', async () => {
+    const f = fixture()
+    expect(await f.invoke(f.first, CHANNELS.READ_CONFIG, target)).toMatchObject({ contentId: 'module', revision: 0 })
+    expect(f.calls()).toBe(1)
+    expect(f.savedInputs).toEqual([])
+    expect(f.releases()).toBe(0)
+    f.registration.dispose()
+  })
+  test('Given 来源配置读取期间撤权 When 返回 Then 拒绝迟到配置', async () => {
+    const f = fixture(() => { f.authorized.delete(1) })
+    await expect(f.invoke(f.first, CHANNELS.READ_CONFIG, target)).rejects.toThrow('DENIED')
+    expect(f.calls()).toBe(1)
+    f.registration.dispose()
+  })
+  test('Given 合法窗口 When 按需检查准备状态 Then 返回分阶段事实且不保存或创建预览', async () => {
+    const f = fixture()
+    expect(await f.invoke(f.first, CHANNELS.CHECK_PREPARATION, target)).toMatchObject({ workflowBound: false, inputsReady: true, ready: false })
+    expect(f.savedInputs).toEqual([])
+    expect(f.releases()).toBe(0)
+    f.registration.dispose()
+  })
+  test('Given 检查前无权限或响应前窗口销毁 When 准备检查 Then 拒绝访问和迟到结果', async () => {
+    const f = fixture(() => { f.first.destroyed = true })
+    f.authorized.delete(1)
+    await expect(f.invoke(f.first, CHANNELS.CHECK_PREPARATION, target)).rejects.toThrow('DENIED')
+    expect(f.calls()).toBe(0)
+    f.authorized.add(1)
+    await expect(f.invoke(f.first, CHANNELS.CHECK_PREPARATION, { ...target, path: '/private' })).rejects.toThrow('CANVAS_MEDIA_TARGET_INVALID')
+    await expect(f.invoke(f.first, CHANNELS.CHECK_PREPARATION, target)).rejects.toThrow('CANVAS_MEDIA_ACCESS_DENIED')
+    f.registration.dispose()
+  })
   test('Given 公共 workflow 保存 payload When IPC 解析 Then 精确保留版本与连接引用', async () => {
     const f = fixture()
     await f.invoke(f.first, CHANNELS.SAVE, {

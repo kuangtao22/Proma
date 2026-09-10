@@ -3,6 +3,7 @@ import type {
   CanvasMediaModuleChangedEvent,
   CanvasMediaModuleSnapshot,
   CanvasMediaTarget,
+  CanvasDocument,
   DesignJobRecord,
   MediaRunEvent,
   MediaRunSnapshot,
@@ -181,6 +182,31 @@ describe('媒体运行进度控制器', () => {
 })
 
 describe('Canvas AV 节点进度控制器', () => {
+  test('Given 已保存媒体缺边 When 仅图连线变化 Then 阶段随图更新且不再次读取模块', async () => {
+    /** 媒体配置固定，只有图从缺边变成接通。 */
+    const target = mediaTarget()
+    const snapshot = mediaSnapshot(target, [])
+    snapshot.config.inputs = [{ key: 'image', kind: 'image', source: { type: 'canvas-output', nodeId: 'image', outputKey: 'image.asset' } }]
+    const document: CanvasDocument = { schemaVersion: 4, projectId: target.projectId, canvasId: target.canvasId, revision: 1,
+      viewport: { x: 0, y: 0, zoom: 1 }, createdAt: 1, updatedAt: 1, edges: [], nodes: [
+        { id: 'image', kind: 'image', imageModuleId: 'image-module', title: '首帧', position: { x: 0, y: 0 } },
+        { id: target.nodeId, kind: 'video', mediaModuleId: target.mediaModuleId, title: '视频', position: { x: 400, y: 0 } },
+      ] }
+    let reads = 0
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({ projectId: target.projectId,
+      canvasMediaLoad: async () => { reads += 1; return snapshot }, onCanvasMediaChanged: () => () => undefined,
+      onMediaRunChanged: () => () => undefined, acquireProjectWatch: async () => undefined,
+      releaseProjectWatch: async () => undefined, onChange: (value) => projections.push(value) })
+    controller.setTargets([target], document)
+    controller.start()
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.preparation).toMatchObject({ workflowBound: false, inputsConnected: false, needsAttention: true })
+    controller.setTargets([target], { ...document, revision: 2, edges: [{ id: 'edge', sourceNodeId: 'image', sourcePort: 'image.asset', targetNodeId: target.nodeId, targetPort: 'context.image', relation: 'depends-on' }] })
+    expect(projections.at(-1)?.get(target.nodeId)?.preparation).toMatchObject({ workflowBound: false, inputsConnected: true, needsAttention: true })
+    expect(reads).toBe(1)
+    controller.dispose()
+  })
   test('Given 空媒体卡片或分析失败 When 加载和收到配置更新 Then 原卡片显示待配置及诊断且修复后清除', async () => {
     /** 以模块事件模拟错误保存和修复，不额外发起远端任务或轮询。 */
     const target = mediaTarget()

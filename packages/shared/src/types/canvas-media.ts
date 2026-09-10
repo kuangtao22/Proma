@@ -4,6 +4,8 @@ import type { CanvasTarget } from './canvas'
 /** Canvas 通用音视频模块的固定 IPC 通道。 */
 export const CANVAS_MEDIA_IPC_CHANNELS = {
   LOAD: 'canvas-media:load',
+  CHECK_PREPARATION: 'canvas-media:check-preparation',
+  READ_CONFIG: 'canvas-media:read-config',
   SAVE: 'canvas-media:save',
   RUN: 'canvas-media:run',
   CANCEL: 'canvas-media:cancel',
@@ -41,6 +43,15 @@ export interface CanvasMediaWorkflowReference {
 export interface CanvasMediaPreparationIssue {
   code: string
   message: string
+}
+
+/** 只读检查的当前准备事实，不代表远端服务已接受生成任务。 */
+export interface CanvasMediaPreparationStatus {
+  configRevision: number
+  workflowBound: boolean
+  inputsReady: boolean
+  ready: boolean
+  issues: CanvasMediaPreparationIssue[]
 }
 
 /** 标量与媒体输入通过判别联合保持工作流绑定类型。 */
@@ -204,6 +215,10 @@ export interface CanvasMediaModuleChangedEvent {
 /** Renderer 只通过类型安全 preload 调用通用音视频模块。 */
 export interface CanvasMediaPreloadApi {
   canvasMediaLoad(input: CanvasMediaTarget): Promise<CanvasMediaModuleSnapshot>
+  /** 来源选择只读配置，不触发 LOAD 的候选刷新或默认采用。 */
+  canvasMediaReadConfig?(input: CanvasMediaTarget): Promise<CanvasMediaModuleConfig>
+  /** 新工作台按需检查；旧 Adapter 可缺省，界面保持“尚未检查”。 */
+  canvasMediaCheckPreparation?(input: CanvasMediaTarget): Promise<CanvasMediaPreparationStatus>
   canvasMediaSave(input: SaveCanvasMediaModuleInput): Promise<CanvasMediaModuleConfig>
   canvasMediaRun(input: RunCanvasMediaModuleInput): Promise<MediaRunSnapshot>
   canvasMediaCancel(input: ControlCanvasMediaRunInput): Promise<MediaRunSnapshot>

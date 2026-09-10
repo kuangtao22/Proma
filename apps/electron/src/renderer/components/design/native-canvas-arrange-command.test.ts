@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
 import type { CanvasDocument, CanvasMutation } from '@proma/shared'
 import {
+  createNativeCanvasRelatedArrangeNodeIds,
   createNativeCanvasArrangeCommand,
   getNativeCanvasArrangeErrorMessage,
 } from './native-canvas-arrange-command'
@@ -79,6 +80,43 @@ function createHarness() {
 }
 
 describe('Native Canvas 异步整理命令', () => {
+  test('Given 选中视频节点有多类真实输入 When 解析相关整理范围 Then 只纳入一跳非关联来源并保持文档顺序', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      { id: 'master', kind: 'image', title: '共享母版', imageModuleId: 'image-master', position: { x: 0, y: 0 } },
+      { id: 'frame', kind: 'image', title: '首帧', imageModuleId: 'image-frame', position: { x: 0, y: 0 } },
+      { id: 'prompt', kind: 'document', title: '动态提示词', documentId: 'document-1', contentRevision: 1, position: { x: 0, y: 0 } },
+      { id: 'video', kind: 'video', title: '镜头视频', mediaModuleId: 'video-1', position: { x: 0, y: 0 } },
+      { id: 'downstream', kind: 'audio', title: '配音', mediaModuleId: 'audio-1', position: { x: 0, y: 0 } },
+    ]
+    document.edges = [
+      { id: 'master-frame', sourceNodeId: 'master', sourcePort: 'image.asset', targetNodeId: 'frame', targetPort: 'image.reference', relation: 'depends-on' },
+      { id: 'frame-video', sourceNodeId: 'frame', sourcePort: 'image.asset', targetNodeId: 'video', targetPort: 'context.image', relation: 'depends-on' },
+      { id: 'prompt-video', sourceNodeId: 'prompt', sourcePort: 'document.markdown', targetNodeId: 'video', targetPort: 'context.text', relation: 'reference' },
+      { id: 'master-video-association', sourceNodeId: 'master', sourcePort: 'unbound', targetNodeId: 'video', targetPort: 'unbound', relation: 'association' },
+      { id: 'video-downstream', sourceNodeId: 'video', sourcePort: 'video.asset', targetNodeId: 'downstream', targetPort: 'context.video', relation: 'derives' },
+    ]
+
+    expect(createNativeCanvasRelatedArrangeNodeIds(document, ['video', 'video', 'missing']))
+      .toEqual(['frame', 'prompt', 'video'])
+  })
+
+  test('Given 选中普通节点和图片媒体节点 When 解析相关整理范围 Then 保留选区且只扩展媒体节点直接来源', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [
+      { id: 'agent', kind: 'agent', title: 'Agent', agentSessionId: 'session-1', position: { x: 0, y: 0 } },
+      { id: 'source', kind: 'document', title: '文案', documentId: 'document-1', contentRevision: 1, position: { x: 0, y: 0 } },
+      { id: 'image', kind: 'image', title: '成图', imageModuleId: 'image-1', position: { x: 0, y: 0 } },
+    ]
+    document.edges = [
+      { id: 'source-agent', sourceNodeId: 'source', sourcePort: 'document.markdown', targetNodeId: 'agent', targetPort: 'context.text', relation: 'depends-on' },
+      { id: 'source-image', sourceNodeId: 'source', sourcePort: 'document.markdown', targetNodeId: 'image', targetPort: 'context.text', relation: 'depends-on' },
+    ]
+
+    expect(createNativeCanvasRelatedArrangeNodeIds(document, ['agent', 'image']))
+      .toEqual(['agent', 'source', 'image'])
+  })
+
   test.each([
     [new Error('CANVAS_LAYOUT_TOO_LARGE'), '节点过多，请选择部分节点分批整理。'],
     [Object.assign(new Error('Canvas 智能整理超时'), { name: 'TimeoutError' }), '智能整理超过 8 秒，请缩小选区后重试。'],

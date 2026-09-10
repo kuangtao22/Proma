@@ -7,6 +7,10 @@ import type {
   CanvasMediaOutputPreview,
   CanvasMediaPreloadApi,
   CanvasMediaTarget,
+  CanvasDocument,
+  CanvasImagePreview,
+  CanvasMediaInputConnections,
+  CanvasMediaPreparationStatus,
   MediaAssetRecord,
   MediaAssetRef,
   MediaInputValue,
@@ -15,7 +19,7 @@ import type {
   MediaSettingsSnapshot,
   MediaWorkflowVersion,
 } from '@proma/shared'
-import { validateMediaWorkflowFieldValue } from '@proma/shared'
+import { inspectCanvasMediaInputConnections, validateMediaWorkflowFieldValue } from '@proma/shared'
 import { AudioLines, Check, Download, Eye, FileUp, Film, History, LoaderCircle, Play, RefreshCw, Square } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -26,6 +30,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { getMediaProjectWatchLeaseRegistry, projectMediaRunProgress } from './use-media-run-progress'
 import { CanvasMediaImagePicker } from './CanvasMediaImagePicker'
+import { CanvasMediaSourcePicker } from './CanvasMediaSourcePicker'
 
 /** 媒体工作台只依赖公开 IPC，不读取本地路径。 */
 export type CanvasMediaWorkbenchAdapter = CanvasMediaPreloadApi
@@ -100,6 +105,26 @@ function defaultOutputKey(kind: CanvasMediaInputBinding['kind']): string {
   if (kind === 'audio') return 'audio.asset'
   if (kind === 'video') return 'video.asset'
   return ''
+}
+
+/** 将未绑定工作流的已完成草稿转换为 typed 输入，保留直接值且不猜测模板字段。 */
+export function buildCanvasMediaUnboundInputs(drafts: readonly CanvasMediaWorkflowInputDraft[]): CanvasMediaInputBinding[] {
+  return drafts.flatMap((draft): CanvasMediaInputBinding[] => {
+    if (draft.sourceType === 'canvas-output') {
+      if (!draft.sourceNodeId || !draft.outputKey || draft.kind === 'number' || draft.kind === 'boolean') return []
+      return [{ key: draft.key, kind: draft.kind, source: { type: 'canvas-output', nodeId: draft.sourceNodeId, outputKey: draft.outputKey } }]
+    }
+    if (draft.kind === 'image' || draft.kind === 'audio' || draft.kind === 'video') {
+      return draft.asset?.mediaKind === draft.kind
+        ? [{ key: draft.key, kind: draft.kind, source: { type: 'literal', value: { ...draft.asset } } }] : []
+    }
+    if (draft.kind === 'text') return [{ key: draft.key, kind: 'text', source: { type: 'literal', value: draft.value } }]
+    if (draft.kind === 'boolean') return [{ key: draft.key, kind: 'boolean', source: { type: 'literal', value: draft.value === 'true' } }]
+    /** 空数值保留为未完成槽位，不能转换成意外的零。 */
+    const value = Number(draft.value)
+    return draft.value.trim() !== '' && Number.isFinite(value)
+      ? [{ key: draft.key, kind: 'number', source: { type: 'literal', value } }] : []
+  })
 }
 
 /** 把工作流版本转换为节点配置；缺少媒体素材时由 Canvas 输出草稿承接。 */
@@ -424,13 +449,25 @@ export class CanvasMediaDraftLoadGuard {
   }
 }
 
-/** 把未知异常收敛为工作台可展示文本。 */
+/** 可恢复错误只匹配完整错误码，保留未知错误的原始证据。 */
+const CANVAS_MEDIA_RECOVERY_MESSAGES: Readonly<Record<string, string>> = {
+  MEDIA_FILE_BUSY: '媒体数据正在被其他操作使用，请稍后重试。',
+  CANVAS_MEDIA_CONNECT_UNAVAILABLE: '当前画布不可编辑，请恢复写权限后重试。',
+  CANVAS_MEDIA_CONNECT_BUSY: '画布正在保存或整理，请完成后重试。',
+  CANVAS_MEDIA_CONNECT_BLOCKED: '请等待相关节点运行或审批结束，再补齐输入连线。',
+  CANVAS_MEDIA_CONNECT_STALE: '画布已变化，请重新打开详情后补齐输入连线。',
+  CANVAS_MEDIA_CONFIG_CONFLICT: '输入配置已变化，请重新打开详情核对来源后重试。',
+  CANVAS_REVISION_CONFLICT: '画布已被其他操作更新，请重新打开详情后重试。',
+  CANVAS_MEDIA_TARGET_INVALID: '媒体节点已变化，请重新打开该节点的详情。',
+}
+
+/** 把未知异常收敛为工作台可展示文本；入参为本地或 IPC 异常，返回恢复说明。 */
 export function getCanvasMediaErrorMessage(cause: unknown, fallback: string): string {
   if (!(cause instanceof Error) || !cause.message.trim()) return fallback
-  if (/^(?:Error invoking remote method '[^']+': Error: )?MEDIA_FILE_BUSY$/.test(cause.message)) {
-    return '媒体数据正在被其他操作使用，请稍后重试。（MEDIA_FILE_BUSY）'
-  }
-  return cause.message
+  /** Electron 包装只影响传输前缀，不改变业务错误码。 */
+  const code = cause.message.replace(/^Error invoking remote method '[^']+': Error: /, '')
+  const recovery = CANVAS_MEDIA_RECOVERY_MESSAGES[code]
+  return recovery ? `${recovery}（${code}）` : cause.message
 }
 
 /** 保存配置成功后才启动运行，避免运行消费未提交草稿。 */
@@ -610,6 +647,13 @@ export function CanvasMediaWorkflowForm({
   allowCanvasOutput = false,
   onInputChange,
   projectId,
+  canvasDocument,
+  imagePreviews,
+  onConnectInputs,
+  canvasTarget,
+  canvasMediaReadConfig,
+  dirty = false,
+  connectionState,
 }: {
   inputs: readonly CanvasMediaWorkflowInputDraft[]
   assets: readonly MediaAssetRecord[]
@@ -619,6 +663,13 @@ export function CanvasMediaWorkflowForm({
   onInputChange(index: number, input: CanvasMediaWorkflowInputDraft): void
   /** 素材导入必须落入当前项目，未提供项目的只读预览不显示导入动作。 */
   projectId?: string
+  canvasDocument?: CanvasDocument
+  imagePreviews?: readonly CanvasImagePreview[]
+  onConnectInputs?: () => Promise<void>
+  canvasTarget?: CanvasMediaTarget
+  canvasMediaReadConfig?: CanvasMediaWorkbenchAdapter['canvasMediaReadConfig']
+  dirty?: boolean
+  connectionState?: CanvasMediaInputConnections | null
 }): React.ReactElement {
   /** 新导入素材在父目录刷新前保留短期投影，不改变工作流模板。 */
   const [importedAssets, setImportedAssets] = React.useState<MediaAssetRecord[]>([])
@@ -668,7 +719,7 @@ export function CanvasMediaWorkflowForm({
         const mediaInput = input.kind === 'image' || input.kind === 'audio' || input.kind === 'video'
         return (
           <div key={input.key} className="canvas-media-form-field grid min-w-0 gap-2 border-b border-border pb-3">
-            <Label className="min-w-0 break-words pt-2 text-xs">{input.label}{input.required ? ' *' : ''}<span className="mt-0.5 block break-all font-mono text-[10px] text-muted-foreground">节点 {input.bindingNodeId || '?'} · {input.bindingInput || input.key}</span></Label>
+            <Label className="min-w-0 break-words pt-2 text-xs">{input.label}{input.required ? ' *' : ''}<span className="mt-0.5 block break-all text-[10px] text-muted-foreground">{input.bindingNodeId ? `节点 ${input.bindingNodeId} · ${input.bindingInput || input.key}` : '待工作流绑定'}</span></Label>
             {allowCanvasOutput && (mediaInput || input.kind === 'text') ? (
               <Select value={input.sourceType} disabled={!writable || busy} onValueChange={(value: 'literal' | 'canvas-output') => update({ sourceType: value })}>
                 <SelectTrigger className="canvas-media-form-source h-8 w-28 text-xs"><SelectValue /></SelectTrigger>
@@ -677,10 +728,20 @@ export function CanvasMediaWorkflowForm({
             ) : <div className="canvas-media-form-source-empty" />}
             <div className="canvas-media-form-value min-w-0">
             {input.sourceType === 'canvas-output' ? (
-              <div className="grid grid-cols-2 gap-2">
-                <Input aria-label={`${input.label} 来源节点`} placeholder="节点 ID" value={input.sourceNodeId} disabled={!writable || busy} onChange={(event) => update({ sourceNodeId: event.target.value })} />
-                <Input aria-label={`${input.label} 输出 key`} placeholder="输出 key" value={input.outputKey} disabled={!writable || busy} onChange={(event) => update({ outputKey: event.target.value })} />
-              </div>
+              canvasDocument ? <CanvasMediaSourcePicker
+                document={canvasDocument}
+                imagePreviews={imagePreviews}
+                inputKind={input.kind}
+                label={input.label}
+                targetNodeId={canvasTarget?.nodeId}
+                value={input.sourceNodeId ? { nodeId: input.sourceNodeId, outputKey: input.outputKey } : null}
+                disabled={!writable || busy}
+                loadMediaConfig={canvasMediaReadConfig && canvasTarget ? async (node) => {
+                  const loaded = await canvasMediaReadConfig({ ...canvasTarget, nodeId: node.id, mediaModuleId: node.mediaModuleId, mediaKind: node.kind })
+                  return loaded.outputs
+                } : undefined}
+                onChange={(value) => update({ sourceNodeId: value.nodeId, outputKey: value.outputKey })}
+              /> : <p className="text-xs text-muted-foreground">等待 Canvas 节点来源。</p>
             ) : mediaInput ? (
               <div className="flex min-w-0 items-center gap-1">{input.kind === 'image' ? <CanvasMediaImagePicker
                 projectId={projectId}
@@ -734,6 +795,11 @@ export function CanvasMediaWorkflowForm({
       <h3 className="text-sm font-medium">输入</h3>
       {importError ? <p role="alert" className="text-xs text-destructive">{importError}</p> : null}
       {inputs.length === 0 ? <p className="text-xs text-muted-foreground">当前工作流没有输入。</p> : basic.map(({ input, index }) => renderInput(input, index))}
+      {connectionState && !connectionState.connected ? <div role="status" className="space-y-1 text-xs text-amber-600">
+        <p>{connectionState.bindings.filter((item) => item.errorCode).length} 项输入待接通。</p>
+        {connectionState.bindings.filter((item) => item.errorCode).map((item) => <p key={item.inputKey}>{inputs.find((input) => input.key === item.inputKey)?.label ?? item.inputKey}：{item.message}</p>)}
+      </div> : null}
+      {onConnectInputs && connectionState?.missingEdges.length ? <Button type="button" variant="outline" size="sm" disabled={!writable || busy || dirty} onClick={() => { void onConnectInputs() }}>补齐输入连线</Button> : null}
       {advanced.length > 0 ? <details className="rounded-sm border border-border px-3 py-2">
         <summary className="cursor-pointer text-xs font-medium text-muted-foreground">高级参数{advancedProblemCount > 0 ? ` · ${advancedProblemCount} 项待配置` : ''}</summary>
         <div className="space-y-3 pt-3">{advanced.map(({ input, index }) => renderInput(input, index))}</div>
@@ -748,12 +814,18 @@ export function CanvasMediaWorkbench({
   writable,
   adapter,
   defaultComfyuiConnectionId = null,
+  canvasDocument,
+  imagePreviews,
+  onConnectInputs,
 }: {
   target: CanvasMediaTarget
   writable: boolean
   adapter: CanvasMediaWorkbenchAdapter
   /** 新工作流草稿继承的画布默认连接。 */
   defaultComfyuiConnectionId?: string | null
+  canvasDocument?: CanvasDocument
+  imagePreviews?: readonly CanvasImagePreview[]
+  onConnectInputs?: (config: CanvasMediaModuleConfig) => Promise<void>
 }): React.ReactElement {
   /** 默认连接只供尚未保存连接的干净草稿读取，切换默认不会直接重置当前编辑。 */
   const defaultConnectionRef = React.useRef(defaultComfyuiConnectionId)
@@ -772,6 +844,9 @@ export function CanvasMediaWorkbench({
     target.nodeId,
     target.projectId,
   ])
+  /** 命令可在后台完成，但旧目标回调不得清除新草稿或重新加载旧详情。 */
+  const activeTargetRef = React.useRef<CanvasMediaTarget | null>(stableTarget)
+  activeTargetRef.current = stableTarget
   const [snapshot, setSnapshot] = React.useState<CanvasMediaModuleSnapshot | null>(null)
   const [settings, setSettings] = React.useState<MediaSettingsSnapshot | null>(null)
   const [inputs, setInputs] = React.useState<CanvasMediaWorkflowInputDraft[]>([])
@@ -783,6 +858,10 @@ export function CanvasMediaWorkbench({
   const [error, setError] = React.useState<string | null>(null)
   const [preview, setPreview] = React.useState<CanvasMediaOutputPreview | null>(null)
   const [previewError, setPreviewError] = React.useState<string | null>(null)
+  /** 准备检查仅属于当前已保存配置，不替代运行时复验。 */
+  const [preparationStatus, setPreparationStatus] = React.useState<CanvasMediaPreparationStatus | null>(null)
+  /** 当前请求错误不混入持久化工作流诊断。 */
+  const [preparationError, setPreparationError] = React.useState<string | null>(null)
   /** LOAD 代次和 dirty 状态不参与渲染，使用单个稳定守卫保存。 */
   const loadGuardRef = React.useRef(new CanvasMediaDraftLoadGuard())
   /** 每个媒体目标拥有独立 lease owner，目标切换会清理旧 owner。 */
@@ -854,6 +933,7 @@ export function CanvasMediaWorkbench({
   }, [adapter, stableTarget])
 
   React.useEffect(() => {
+    activeTargetRef.current = stableTarget
     loadGuardRef.current.markClean()
     setSnapshot(null)
     setSettings(null)
@@ -862,9 +942,13 @@ export function CanvasMediaWorkbench({
     setWorkflowSelection('')
     setConnectionSelection('')
     setLoading(true)
+    setBusy(false)
     setError(null)
     void load()
-    return () => loadGuardRef.current.invalidate()
+    return () => {
+      loadGuardRef.current.invalidate()
+      if (activeTargetRef.current === stableTarget) activeTargetRef.current = null
+    }
   }, [load])
   React.useEffect(() => {
     /** cleanup 后忽略迟到 watch 失败，避免旧目标覆盖当前错误。 */
@@ -904,6 +988,23 @@ export function CanvasMediaWorkbench({
       void previewLeaseOwner.release()
     }
   }, [previewLeaseOwner])
+
+  React.useEffect(() => {
+    /** 清除上一图/配置的结果；effect 清理阻断卸载和后续请求的迟到响应。 */
+    let active = true
+    setPreparationStatus(null)
+    setPreparationError(null)
+    if (!adapter.canvasMediaCheckPreparation || !snapshot || loadGuardRef.current.isDirty()) {
+      return
+    }
+    const expectedRevision = snapshot.config.revision
+    void adapter.canvasMediaCheckPreparation(stableTarget).then((status) => {
+      if (!active || loadGuardRef.current.isDirty()) return
+      if (status.configRevision !== expectedRevision) { setPreparationError('配置已变化，请刷新后重新检查。'); return }
+      setPreparationStatus(status)
+    }).catch(() => { if (active) setPreparationError('准备状态检查失败，请刷新后重试。') })
+    return () => { active = false }
+  }, [adapter, canvasDocument?.revision, snapshot?.config.revision, stableTarget])
 
   /** 读取精确候选；手动读取允许重试，并阻止后续刷新改回默认项。 */
   const openPreview = React.useCallback(async (
@@ -961,20 +1062,20 @@ export function CanvasMediaWorkbench({
   const save = React.useCallback(async (): Promise<CanvasMediaModuleConfig> => {
     if (!snapshot || !settings) throw new Error('媒体模块尚未加载。')
     const workflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
-    if (!workflow) throw new Error('请选择工作流。')
+    if (workflowSelection && !workflow) throw new Error('所选工作流版本不可用，请重新选择。')
     const connection = connections.find((item) => item.id === connectionSelection)
-    if (!connection) throw new Error('请选择已启用的连接。')
+    if (workflow && !connection) throw new Error('请选择已启用的连接。')
     const config = await adapter.canvasMediaSave({
       ...stableTarget,
       expectedConfigRevision: snapshot.config.revision,
-      profile: null,
-      workflow: { workflowId: workflow.id, workflowRevision: workflow.revision, connectionId: connection.id },
+      profile: workflow ? null : snapshot.config.profile,
+      workflow: workflow ? { workflowId: workflow.id, workflowRevision: workflow.revision, connectionId: connection!.id } : null,
       preparation: null,
-      inputs: buildPartialInputs(workflow, inputs),
+      inputs: workflow ? buildPartialInputs(workflow, inputs) : buildCanvasMediaUnboundInputs(inputs),
       outputs,
     })
     /** 配置已经持久化；即使随后启动运行失败，也不能继续把相同草稿标成未保存。 */
-    loadGuardRef.current.markClean()
+    if (activeTargetRef.current === stableTarget) loadGuardRef.current.markClean()
     return config
   }, [adapter, connectionSelection, connections, inputs, outputs, settings, snapshot, stableTarget, workflowSelection, workflows])
 
@@ -988,14 +1089,17 @@ export function CanvasMediaWorkbench({
     setError(null)
     try {
       await command()
+      if (activeTargetRef.current !== stableTarget) return
       if (options.commitDraft) loadGuardRef.current.markClean()
       if (options.refresh !== false) {
         await load({ preserveDirtyDraft: !options.commitDraft, showLoading: false })
       }
     } catch (cause) {
-      setError(getCanvasMediaErrorMessage(cause, '媒体操作失败。'))
-    } finally { setBusy(false) }
-  }, [busy, load])
+      if (activeTargetRef.current === stableTarget) setError(getCanvasMediaErrorMessage(cause, '媒体操作失败。'))
+    } finally {
+      if (activeTargetRef.current === stableTarget) setBusy(false)
+    }
+  }, [busy, load, stableTarget])
 
   /** 更新单个输入草稿并统一标记未保存状态。 */
   const updateInput = React.useCallback((
@@ -1005,6 +1109,13 @@ export function CanvasMediaWorkbench({
     loadGuardRef.current.markDirty()
     setInputs((current) => current.map((item, itemIndex) => itemIndex === index ? update(item) : item))
   }, [])
+
+  /** 连接只由已保存输入和图决定，编辑文本时复用结果；切换中的过期目标暂不展示。 */
+  const connectionState = React.useMemo<CanvasMediaInputConnections | null>(() => {
+    if (!canvasDocument || !snapshot) return null
+    try { return inspectCanvasMediaInputConnections(canvasDocument, stableTarget, snapshot.config.inputs) }
+    catch { return null }
+  }, [canvasDocument, snapshot?.config.inputs, stableTarget])
 
   if (loading) return <div className="flex h-full items-center justify-center gap-2 text-xs text-muted-foreground" role="status"><LoaderCircle className="size-4 animate-spin" />加载媒体模块</div>
   if (!snapshot || !settings) return (
@@ -1022,7 +1133,7 @@ export function CanvasMediaWorkbench({
   for (const workflow of workflows) {
     latestWorkflowRevisions.set(workflow.id, Math.max(latestWorkflowRevisions.get(workflow.id) ?? 0, workflow.revision))
   }
-  const canSaveWorkflow = Boolean(workflowSelection && connectionSelection)
+  const canSaveWorkflow = !workflowSelection || Boolean(connectionSelection)
   const canRunLegacyProfile = Boolean(snapshot.config.profile && !snapshot.config.workflow && !workflowSelection)
   const selectedWorkflow = resolveCanvasMediaWorkflow(workflows, workflowSelection)
   const workflowValidationError = selectedWorkflow
@@ -1098,6 +1209,18 @@ export function CanvasMediaWorkbench({
             <div className="space-y-4 px-4 pb-4">
               {!writable ? <p className="text-xs text-muted-foreground">当前画布为只读状态</p> : null}
               {preparation ? <p className="break-words border-l-2 border-amber-500/40 pl-2 text-xs text-amber-700" role="status">待配置：{preparation.message}</p> : null}
+              <section aria-label="媒体准备阶段" className="space-y-2 rounded-md border border-border p-3 text-xs">
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+                  <span>已建卡</span>
+                  <span>{connectionState?.connected ? '输入已接通' : '输入待接通'}</span>
+                  <span>{preparationStatus ? preparationStatus.workflowBound ? '工作流已绑定' : '工作流待绑定' : '工作流待检查'}</span>
+                  <span>{loadGuardRef.current.isDirty() ? '配置待保存' : preparationStatus?.ready && connectionState?.connected ? '可运行' : '运行条件待满足'}</span>
+                </div>
+                {loadGuardRef.current.isDirty() ? <p className="text-amber-600" role="status">有未保存配置，准备状态将在保存后更新。</p>
+                  : preparationError ? <p className="text-amber-600" role="status">{preparationError}</p>
+                  : preparationStatus ? preparationStatus.issues.map((issue, index) => <p key={`${issue.code}:${index}`} className="text-amber-600" role="status">{issue.message}</p>)
+                  : <p className="text-muted-foreground" role="status">运行准备尚未检查。</p>}
+              </section>
               <div className="min-w-0 space-y-1.5">
                 <Label className="text-xs" htmlFor="canvas-media-workflow">工作流</Label>
                 <Select value={workflowSelection} disabled={!writable || busy} onValueChange={(value) => {
@@ -1135,6 +1258,16 @@ export function CanvasMediaWorkbench({
                 writable={writable}
                 busy={busy}
                 allowCanvasOutput
+                canvasDocument={canvasDocument}
+                imagePreviews={imagePreviews}
+                canvasTarget={stableTarget}
+                canvasMediaReadConfig={adapter.canvasMediaReadConfig}
+                dirty={loadGuardRef.current.isDirty()}
+                connectionState={connectionState}
+                onConnectInputs={onConnectInputs ? async () => {
+                  if (loadGuardRef.current.isDirty()) { setError('请先保存当前输入。'); return }
+                  await execute(() => onConnectInputs(snapshot.config))
+                } : undefined}
                 onInputChange={(index, input) => updateInput(index, () => input)}
               />
             </div>

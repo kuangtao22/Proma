@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import type { CanvasNode } from '@proma/shared'
-import { canvasNodeCapabilityRegistry } from './canvas-node-capability-registry'
+import {
+  canvasNodeCapabilityRegistry,
+  listCanvasNodeActions,
+} from './canvas-node-capability-registry'
 
 /** 构造覆盖全部节点类别的最小权威节点。 */
 function createNode(kind: CanvasNode['kind']): CanvasNode {
@@ -23,6 +26,16 @@ describe('Canvas 节点能力注册表', () => {
       .toEqual([
         'read', 'preview', 'update-config', 'run', 'review-required',
         'task-status', 'task-control', 'versions', 'adopt-version', 'export',
+      ])
+    expect(canvasNodeCapabilityRegistry.list(createNode('audio'), { availability: 'available' }))
+      .toEqual([
+        'read', 'update-config', 'run', 'review-required', 'task-status', 'task-control',
+        'adopt-candidate', 'attach-assets',
+      ])
+    expect(canvasNodeCapabilityRegistry.list(createNode('video'), { availability: 'available' }))
+      .toEqual([
+        'read', 'update-config', 'run', 'review-required', 'task-status', 'task-control',
+        'adopt-candidate', 'attach-assets',
       ])
     expect(canvasNodeCapabilityRegistry.list(createNode('document'), { availability: 'available' }))
       .toEqual(['read', 'update-content', 'versions', 'adopt-version', 'export'])
@@ -74,5 +87,58 @@ describe('Canvas 节点能力注册表', () => {
     expect(canvasNodeCapabilityRegistry.list(createNode('document'), {
       availability: 'available', availableToolNames: batchOnlyTools, permissionCeiling: 'execute',
     })).not.toContain('adopt-version')
+  })
+
+  test('Given 音视频媒体工具 When 枚举运行态能力 Then 精确映射操作且元数据检查不冒充内容预览', () => {
+    const mediaTools = new Set([
+      'canvas_read', 'canvas_update_media_config', 'canvas_run_nodes', 'canvas_inspect_media',
+      'canvas_cancel_media_run', 'canvas_adopt_media_candidate', 'canvas_attach_media_assets',
+    ])
+
+    for (const kind of ['audio', 'video'] as const) {
+      expect(canvasNodeCapabilityRegistry.list(createNode(kind), {
+        availability: 'available', availableToolNames: mediaTools, permissionCeiling: 'execute',
+      })).toEqual([
+        'read', 'update-config', 'run', 'review-required', 'task-status', 'task-control',
+        'adopt-candidate', 'attach-assets',
+      ])
+      expect(canvasNodeCapabilityRegistry.list(createNode(kind), {
+        availability: 'available', availableToolNames: mediaTools, permissionCeiling: 'execute',
+      })).not.toContain('preview')
+    }
+  })
+
+  test('Given 节点与当前工具集合 When 读取可执行动作 Then 能力和工具来自同一映射且排除纯审核标记', () => {
+    const mediaTools = new Set([
+      'canvas_read', 'canvas_update_media_config', 'canvas_run_nodes', 'canvas_inspect_media',
+      'canvas_cancel_media_run', 'canvas_adopt_media_candidate', 'canvas_attach_media_assets',
+    ])
+    const state = {
+      availability: 'available' as const,
+      availableToolNames: mediaTools,
+      permissionCeiling: 'execute' as const,
+    }
+
+    const actions = listCanvasNodeActions(createNode('video'), state)
+
+    expect(actions).toEqual([
+      { capability: 'read', toolNames: ['canvas_read'] },
+      { capability: 'update-config', toolNames: ['canvas_update_media_config'] },
+      { capability: 'run', toolNames: ['canvas_run_nodes'] },
+      { capability: 'task-status', toolNames: ['canvas_inspect_media'] },
+      { capability: 'task-control', toolNames: ['canvas_cancel_media_run'] },
+      { capability: 'adopt-candidate', toolNames: ['canvas_adopt_media_candidate'] },
+      { capability: 'attach-assets', toolNames: ['canvas_attach_media_assets'] },
+    ])
+    expect(actions.map((action) => action.capability)).toEqual(
+      canvasNodeCapabilityRegistry.list(createNode('video'), state)
+        .filter((capability) => capability !== 'review-required'),
+    )
+    expect(listCanvasNodeActions(createNode('video'), {
+      ...state, permissionCeiling: 'plan',
+    })).toEqual([
+      { capability: 'read', toolNames: ['canvas_read'] },
+      { capability: 'task-status', toolNames: ['canvas_inspect_media'] },
+    ])
   })
 })

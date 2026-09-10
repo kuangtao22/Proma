@@ -56,6 +56,33 @@ export interface NativeCanvasArrangeCommand {
   dispose: () => void
 }
 
+/**
+ * 从当前选区派生媒体节点的局部整理范围，只扩展真实图中的一跳输入来源。
+ * @param document 当前权威 Canvas 文档；不读取媒体配置或节点标题推断关系。
+ * @param selectedNodeIds 当前已校验或待过滤的选区节点身份。
+ * @returns 按文档节点顺序去重后的选区与直接输入来源。
+ */
+export function createNativeCanvasRelatedArrangeNodeIds(
+  document: CanvasDocument,
+  selectedNodeIds: readonly string[],
+): string[] {
+  /** 原始选区保留普通节点，并让重复身份以集合语义参与计算。 */
+  const selectedNodeIdSet = new Set(selectedNodeIds)
+  /** 只有媒体节点扩展输入来源，避免普通 Agent 选区意外吸入整条业务链。 */
+  const selectedMediaNodeIds = new Set(document.nodes
+    .filter((node) => selectedNodeIdSet.has(node.id)
+      && (node.kind === 'image' || node.kind === 'audio' || node.kind === 'video'))
+    .map((node) => node.id))
+  /** 结果仅增加直接入边来源；不递归经过共享母版继续扩张。 */
+  const relatedNodeIds = new Set(selectedNodeIdSet)
+  for (const edge of document.edges) {
+    if (edge.relation !== 'association' && selectedMediaNodeIds.has(edge.targetNodeId)) {
+      relatedNodeIds.add(edge.sourceNodeId)
+    }
+  }
+  return document.nodes.filter((node) => relatedNodeIds.has(node.id)).map((node) => node.id)
+}
+
 /** 将布局边界错误转换为用户可执行的重试建议。 */
 export function getNativeCanvasArrangeErrorMessage(error: unknown): string {
   if (!(error instanceof Error)) return '整理布局失败，原位置已保留。'

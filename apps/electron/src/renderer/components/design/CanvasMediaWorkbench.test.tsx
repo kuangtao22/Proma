@@ -19,6 +19,7 @@ import {
   CanvasMediaDraftLoadGuard,
   CanvasMediaWorkflowForm,
   CanvasMediaWorkbench,
+  buildCanvasMediaUnboundInputs,
   buildPartialInputs,
   buildCanvasMediaWorkflowValues,
   createInputDrafts,
@@ -217,6 +218,20 @@ function createAdapter(snapshot = createSnapshot()): CanvasMediaWorkbenchAdapter
 }
 
 describe('CanvasMediaWorkbench', () => {
+  test('Given 未绑定工作流的草稿同时包含直接值和节点来源 When 保存输入 Then 保留类型化直接值且不伪造工作流字段', () => {
+    /** 无模板也必须保留已填文本、数字、布尔和媒体引用。 */
+    const config = createSnapshot().config
+    config.workflow = null
+    config.profile = null
+    config.inputs = [
+      { key: 'prompt', kind: 'text', source: { type: 'literal', value: '动态词' } },
+      { key: 'seed', kind: 'number', source: { type: 'literal', value: 42 } },
+      { key: 'flag', kind: 'boolean', source: { type: 'literal', value: false } },
+      { key: 'frame', kind: 'image', source: { type: 'literal', value: { assetId: 'frame', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image' } } },
+      { key: 'end', kind: 'image', source: { type: 'canvas-output', nodeId: 'tail', outputKey: 'image.asset' } },
+    ]
+    expect(buildCanvasMediaUnboundInputs(createInputDrafts(config, undefined))).toEqual(config.inputs)
+  })
   test('Given 新音视频配置有画布默认连接 When 建立草稿 Then 继承默认且不覆盖已保存连接', () => {
     expect(resolveCanvasMediaWorkflowConnection(null, 'connection-default')).toBe('connection-default')
     expect(resolveCanvasMediaWorkflowConnection('connection-saved', 'connection-default')).toBe('connection-saved')
@@ -277,6 +292,15 @@ describe('CanvasMediaWorkbench', () => {
     expect(getCanvasMediaErrorMessage(new Error("Error invoking remote method 'canvas-media:load': Error: MEDIA_FILE_BUSY"), '加载失败。'))
       .toBe('媒体数据正在被其他操作使用，请稍后重试。（MEDIA_FILE_BUSY）')
     expect(getCanvasMediaErrorMessage(new Error(''), '媒体模块加载失败。')).toBe('媒体模块加载失败。')
+  })
+
+  test('Given 补线遇到并发或运行态阻挡 When 展示错误 Then 提供具体恢复动作', () => {
+    expect(getCanvasMediaErrorMessage(new Error('CANVAS_MEDIA_CONNECT_BLOCKED'), '失败'))
+      .toContain('等待相关节点运行或审批结束')
+    expect(getCanvasMediaErrorMessage(new Error("Error invoking remote method 'canvas:save': Error: CANVAS_REVISION_CONFLICT"), '失败'))
+      .toContain('重新打开详情')
+    expect(getCanvasMediaErrorMessage(new Error('CANVAS_MEDIA_CONFIG_CONFLICT'), '失败'))
+      .toContain('输入配置已变化')
   })
 
   test('Given 用户选择公共工作流 When 创建草稿 Then 标量从 prompt 初始化且媒体保持空选', () => {

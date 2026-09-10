@@ -286,6 +286,36 @@ describe('Canvas Workflow Graph', () => {
     ])
   })
 
+  test('Given 文档或 WebView 尚无正式版本 When 作为根或中间节点规划 Then 不得满足工作流依赖', () => {
+    const root = createNode('root', 'agent')
+    const target = createNode('target', 'agent')
+    const emptyNodes = [
+      { ...createNode('empty-document', 'document'), contentRevision: 0 } as CanvasNode,
+      { ...createNode('empty-webview', 'webview'), contentRevision: 0 } as CanvasNode,
+    ]
+
+    for (const emptyNode of emptyNodes) {
+      expect(() => createCanvasWorkflowGraphPlan({
+        document: createDocument([emptyNode]),
+        startNodeIds: [emptyNode.id],
+        maxImageRuns: 0,
+        allowedStartNodeKinds: [emptyNode.kind],
+      })).toThrow('CANVAS_WORKFLOW_START_NODE_INVALID')
+
+      const plan = createCanvasWorkflowGraphPlan({
+        document: createDocument([root, emptyNode, target], [
+          connect(root, emptyNode, `edge-root-${emptyNode.id}`),
+          connect(emptyNode, target, `edge-${emptyNode.id}-target`),
+        ]),
+        startNodeIds: [root.id],
+        maxImageRuns: 0,
+      })
+
+      expect(plan.initialStates.get(emptyNode.id)).toBe('blocked')
+      expect(plan.dependenciesByNodeId.get(target.id)).toEqual([emptyNode.id])
+    }
+  })
+
   test('Given 范围外存在坏边 When 规划合法根 Then 无关分支不污染当前执行图', () => {
     const root = createNode('root', 'agent')
     const outsideSource = createNode('outside-source', 'document')

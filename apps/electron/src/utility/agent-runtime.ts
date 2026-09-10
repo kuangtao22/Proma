@@ -192,6 +192,13 @@ function handleQueryStart(request: RuntimeRequest): void {
       AGENT_RUNTIME_METHODS.CAPABILITY_XAI_OAUTH_REFRESHED,
       { queryId, sessionId, credentials },
     ),
+    ...(queryInput.completionEvaluationEnabled === true ? {
+      evaluateCompletion: (signal: AbortSignal) => requestParent(
+        AGENT_RUNTIME_METHODS.CAPABILITY_EVALUATE_COMPLETION,
+        { queryId, sessionId },
+        signal,
+      ),
+    } : {}),
   }
   ;(utilityInput as Record<string, unknown>).customTools = createProxyCustomTools(active, queryInput.customTools)
   void pumpQuery(active, utilityInput as unknown as PiAgentQueryOptions)

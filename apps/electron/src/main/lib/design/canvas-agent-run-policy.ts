@@ -8,8 +8,23 @@ import type {
 import { resolveCanvasEdgeBinding } from '@proma/shared'
 import { hasValidCanvasAgentOwnership } from '../agent-session-visibility'
 
-/** Canvas 对话单次运行唯一允许的只读 Pi 工具。 */
-export const CANVAS_AGENT_ALLOWED_TOOL_NAMES = ['Read', 'Glob', 'Grep'] as const
+/** 所有 Canvas Agent 共用的读取与调研工具，仍经过原权限检查。 */
+export const CANVAS_AGENT_ALLOWED_TOOL_NAMES = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'] as const
+
+/** 前台交互式 Canvas Agent 的工程与预览工具；不隐式继承任意 MCP 或后台任务能力。 */
+const CANVAS_INTERACTIVE_TOOL_NAMES = [
+  ...CANVAS_AGENT_ALLOWED_TOOL_NAMES, 'Write', 'Edit', 'Bash',
+  'BrowserObserve', 'BrowserNavigate', 'BrowserWaitFor', 'BrowserFind',
+  'BrowserClick', 'BrowserAct', 'BrowserFill', 'BrowserDomAction', 'BrowserExecuteJavaScript',
+  'BrowserPress', 'BrowserHover', 'BrowserDrag', 'BrowserScroll', 'BrowserExtract',
+  'BrowserSelectOption', 'BrowserScreenshot', 'BrowserPreviewOpen', 'BrowserListTabs',
+  'BrowserNewTab', 'BrowserSelectTab', 'BrowserCloseTab', 'BrowserClose',
+] as const
+
+/** 按 Host 可信来源返回能力上限，工具执行仍沿用当前权限、目录和浏览器会话边界。 */
+export function resolveCanvasAgentBuiltinToolNames(mode: 'renderer-manual' | 'parent-orchestrated'): readonly string[] {
+  return mode === 'renderer-manual' ? CANVAS_INTERACTIVE_TOOL_NAMES : CANVAS_AGENT_ALLOWED_TOOL_NAMES
+}
 
 /** Canvas Agent 提示词中允许的数据块最大 UTF-8 字节数。 */
 const MAX_CANVAS_AGENT_PROMPT_DATA_BYTES = 16 * 1024

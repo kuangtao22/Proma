@@ -2,7 +2,7 @@
 name: canvas-production
 description: Proma 画布生产与 Agent 编排 Skill。用户希望创建或迭代网页原型、图片设计稿、文档、产品套图、整套交互视觉稿、漫剧分镜、程序规划或其他需要多个可关联产物的任务时使用。负责判断是否进入画布、规划节点与关系、按需读取和局部更新产物，并通过 Proma 内置 canvas_* 工具执行；普通代码修改、一次性文本回答或不需要长期产物图的任务不要强行转入画布。
 group: proma
-version: "1.0.19"
+version: "1.0.20"
 ---
 
 # 画布生产
@@ -47,6 +47,19 @@ version: "1.0.19"
 普通 Agent 先用 `canvas_read` 读取 Canvas Agent 的 `artifact.config` 与 `artifact.configRevision`，再用 `canvas_update_agent_config` 局部更新长期职责、模型和已安装的专业 Skill；`expectedGraphRevision` 使用读取结果的顶层 `revision`，`expectedConfigRevision` 使用 `artifact.configRevision`。配置因响应预算被省略而返回 `configOmitted` 时，缩小到单个节点重新读取，不猜测旧配置或版本。需要专业分工时，优先复用用户已启用且与任务匹配的 Skill；Skill 负责方法和领域质量，节点关系、运行权限与正式产物仍由 Host 合同控制。
 
 Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入节点，再用 `canvas_read` 读取真实内容和关系。不得把连线只当作视觉装饰，也不得仅凭节点标题猜测正文。任务要求生成脚本、首尾帧配置、文档或原型时，由当前 Canvas Agent 直接创建或更新下游产物，并建立准确关系；不得只输出一份“建议用户之后创建”的清单。
+
+明确执行画布任务时，在修改或创建前调用 `canvas_task(action=start)` 登记交付要求。根据完整任务语义填写每项 `id`、`description`、`validation`，不按关键词或模型名称选择行为：
+
+- 文本本身就是交付时使用 `response`，完成时提交实际正文；不能拿计划说明代替用户要求的产物。
+- 节点交付还需填写 `nodeKind` 与 `change`。检查现有目标用 `existing`，修改用 `updated`，均指定 `nodeId`；新增用 `created`，不能将原输入作为新产物。
+- `content` 证明正式正文存在；`configuration` 证明配置保存；`adopted` 证明正式素材采用；`inspection` 证明真实图片已送达模型。配置不代表生成完成，默认采用不代表质量合格。
+- `canvas_read` 为完整读取的正文、配置和音视频采用事实返回 `evidence`；图片须用 `canvas_inspect_images` 获取 `evidenceId`，正式采用图片还返回独立的 `adoptedEvidenceId`。一份证据只能满足一项要求，截断或读取失败时缩小范围重读。
+- 按声明目标检查质量，引用证据后调用 `canvas_task(action=complete)`。Host 会重新核验精确节点、产物与版本；旧证据失效时沿原任务修复，不降低要求或重复创建运行。
+- 缺少必要输入、授权或验收能力时，使用 `canvas_task(action=block, blockedStatus=needs-input|blocked, reason=...)` 报告具体阻碍。音视频元数据与 WebView 源码不能冒充试听、观看或交互验收。
+
+父编排的执行节点在完成前必须登记交付；合法纯文本任务仍可使用 `response`。已登记但未交付的任务会在原 Pi 会话与预算内有界续行，最多三次，仍未完成则以受阻结束。普通问答不必登记。重启或新一轮恢复时先查询既有工作流、原节点与原任务记录，重新核对本轮合同，不重放已提交生成。
+
+`canvas_read.availableActions` 将当前节点能力映射到本轮真实工具；它受运行来源和计划模式约束，不是额外授权。所有 Canvas Agent 可使用当前可用的读取、搜索工具。交互式 Canvas Agent 还可沿原权限使用文件、Shell 和受管浏览器完成工程与预览；正式画布内容仍通过 `canvas_*` 写入。父工作流的子 Agent 不获得 Shell、任意 MCP 或浏览器写交互权限，需要这些能力时向父任务报告明确阻碍。
 
 不得把普通 Agent、协作会话或当前会话伪装绑定为 Canvas Agent 节点。不得要求用户在主会话与 Canvas Agent 之间反复复制任务；系统已提供的直接输入节点就是本轮生产入口。Canvas Agent 不能使用 `canvas_manage` 创建、关联或切换其它画布。
 
@@ -200,9 +213,9 @@ WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存
 工具可用范围以本轮实际 schema 和 `canvas_read.capabilities` 为准：
 
 - 普通 Agent 可使用当前已装配的全部任务、版本、导出、回收、重建和工作流操作。
-- 手动运行的 Canvas Agent 只可在固定画布内查询、停止或重试图片任务，读取或采用单个版本，导出产物，以及查看或恢复回收项；不能采用候选批次，不能重建自身，也不能控制父工作流。
-- 父编排的 Canvas Agent 只可读取任务状态、版本列表和历史正文；不能停止、重试、采用、导出、恢复、重建或继续工作流。
-- `plan` 模式只发现并执行只读操作：`canvas_get_task`、`canvas_list_versions`、`canvas_read_version`、`canvas_list_trash`、`canvas_list_workflows`、`canvas_get_workflow`。其它操作即使来自旧上下文也必须由 Host 拒绝。
+- 交互式 Canvas Agent 固定在当前画布内工作，按 `availableActions` 发现查询、配置、运行、版本和媒体操作；没有 schema 的动作不能由 Skill 自行补充。
+- 父编排的 Canvas Agent 负责分支内容与配置准备，支持任务及版本查询；媒体启动、预算与父工作流控制继续由父层负责，其余操作以本轮实际工具清单为准。
+- `plan` 模式的画布查询与内存任务登记可直接执行，写入、生成和采用仍由 Host 拒绝；不得通过旧上下文或工具别名绕过。
 
 ## 节点关系语义
 

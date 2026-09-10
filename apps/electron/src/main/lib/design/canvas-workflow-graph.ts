@@ -141,7 +141,9 @@ function hasCommittedArtifact(node: CanvasNode): boolean {
     case 'audio':
     case 'video': return false
     case 'document':
-    case 'webview': return Number.isSafeInteger(node.contentRevision) && node.contentRevision >= 0
+    case 'webview':
+      /** revision 0 是内容节点创建后的空占位；正式版本存储从 revision 1 开始。 */
+      return Number.isSafeInteger(node.contentRevision) && node.contentRevision >= 1
   }
 }
 

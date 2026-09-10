@@ -331,6 +331,19 @@ describe('Agent Canvas 共享图与独立视图', () => {
       ['image-2', 'running'],
     ])
   })
+  test('Given 音视频仍在准备排队或执行 When 聚合布局锁 Then 固定这些节点且不锁已结束或其它画布节点', () => {
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = ['prepared', 'queued', 'running', 'succeeded'].map((phase) => ({
+      id: phase, kind: 'video', mediaModuleId: `module-${phase}`, title: phase, position: { x: 0, y: 0 },
+    }))
+    expect([...createNativeCanvasNodeActivityStates(document, new Set(), [], new Map([
+      ['prepared', { phase: 'prepared', phaseLabel: '等待执行' }],
+      ['queued', { phase: 'queued', phaseLabel: '排队中' }],
+      ['running', { phase: 'running', phaseLabel: '运行中' }],
+      ['succeeded', { phase: 'succeeded', phaseLabel: '完成' }],
+      ['other', { phase: 'running', phaseLabel: '运行中' }],
+    ]))]).toEqual([['prepared', 'waiting-approval'], ['queued', 'running'], ['running', 'running']])
+  })
 
   test('Given 其他 Canvas 的图片任务 When 聚合节点活动态 Then 不污染同名节点', () => {
     const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
@@ -3022,7 +3035,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       </Provider>,
     )
 
-    expect(html).toContain('此节点关联的 Agent 会话不可用。')
+    expect(html).toContain('此节点关联的 Agent 会话或模型配置不可用。')
     expect(html).toContain('重建会话')
     expect(conversationRenderCount).toBe(0)
   })

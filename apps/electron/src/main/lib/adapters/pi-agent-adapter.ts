@@ -27,6 +27,10 @@ import type {
   SkillActivation,
 } from '@proma/shared'
 import {
+  applyAgentCompletionPolicy,
+  type AgentCompletionEvaluation,
+} from '../agent-completion-policy'
+import {
   calculatePiAutoCompactionReserveTokens,
   inferReasoningTransport,
   isCodexFastModeSupportedModel,
@@ -112,6 +116,71 @@ export function shouldMarkCompactionAfterCompletedTurn(
     && !requiresOriginalTaskContinuation
 }
 
+/** 通过隐藏的 custom message 在原 transcript 中续行，不创建新的用户消息锚点。 */
+export async function sendPiTaskContinuation(
+  session: Pick<AgentSession, 'sendCustomMessage'>,
+  message: string,
+): Promise<void> {
+  await session.sendCustomMessage({
+    customType: 'proma-task-continuation',
+    content: message,
+    display: false,
+  }, { triggerTurn: true })
+}
+
+/** Pi turn 完成后的 Host 验收循环依赖。 */
+export interface FinalizePiAgentCompletionTurnsInput {
+  continuationCount: number
+  prepareTerminalResult: () => Promise<void>
+  takeTerminalResult: () => SDKMessage | undefined
+  emitTerminalResult: (result: SDKMessage) => void
+  isStopped: () => boolean
+  canContinue: () => boolean
+  createEvaluationController: () => AbortController
+  releaseEvaluationController?: (controller: AbortController) => void
+  evaluateCompletion?: (signal: AbortSignal) => Promise<AgentCompletionEvaluation>
+  continueTask: (message: string) => Promise<void>
+}
+
+/** 处理真实 Pi turn 的可选完成检查，只上送最终可提交终态。 */
+export async function finalizePiAgentCompletionTurns(
+  input: FinalizePiAgentCompletionTurnsInput,
+): Promise<number> {
+  let continuationCount = input.continuationCount
+  while (true) {
+    await input.prepareTerminalResult()
+    if (input.isStopped()) {
+      input.takeTerminalResult()
+      return continuationCount
+    }
+    const terminalResult = input.takeTerminalResult()
+    if (!terminalResult) return continuationCount
+    if (!input.evaluateCompletion) {
+      input.emitTerminalResult(terminalResult)
+      return continuationCount
+    }
+
+    const controller = input.createEvaluationController()
+    try {
+      const outcome = await applyAgentCompletionPolicy({
+        terminalResult,
+        continuationCount,
+        signal: controller.signal,
+        canContinue: input.canContinue(),
+        stopped: input.isStopped(),
+        evaluateCompletion: input.evaluateCompletion,
+        continueTask: input.continueTask,
+      })
+      continuationCount = outcome.continuationCount
+      if (outcome.continued) continue
+      if (outcome.terminalResult && !input.isStopped()) input.emitTerminalResult(outcome.terminalResult)
+      return continuationCount
+    } finally {
+      input.releaseEvaluationController?.(controller)
+    }
+  }
+}
+
 /** Pi SDK 查询选项（扩展通用 AgentQueryInput） */
 export interface PiAgentQueryOptions extends AgentQueryInput {
   apiKey: string
@@ -185,6 +254,8 @@ export interface PiAgentQueryOptions extends AgentQueryInput {
   onXaiOAuthCredentialsRefreshed?: (credentials: XaiOAuthCredentials) => void | Promise<void>
   /** 会话级 OpenAI（Codex OAuth / Responses API）思考深度。 */
   openAIThinkingLevel?: AgentThinkingLevel
+  /** 可选 Host 完成检查；仅内部任务显式启用。 */
+  evaluateCompletion?: (signal: AbortSignal) => Promise<AgentCompletionEvaluation>
 }
 
 interface ActivePiSession {
@@ -206,6 +277,8 @@ interface ActivePiSession {
   skillWorkspaceSlug?: string
   pendingSkillActivations: PendingPromptSkillActivationTracker
   onSkillActivated?: (activations: SkillActivation[], userMessageUuid: string) => void
+  /** 当前 Host 完成检查的取消边界，只在显式启用时存在。 */
+  completionEvaluationAbortController?: AbortController
 }
 
 interface PendingInterruptPrompt {
@@ -1438,6 +1511,8 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         unsubscribe = undefined
         if (!active.disposed) {
           active.disposed = true
+          active.completionEvaluationAbortController?.abort()
+          active.completionEvaluationAbortController = undefined
           rejectPendingInterruptPrompts(active, createAbortError())
           active.pendingSkillActivations.clear()
           active.session?.dispose()
@@ -1484,6 +1559,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       let compactContextRequested = false
       let pendingCompactionContinuation: string | undefined
       let automaticCompactionContinuations = 0
+      let completionContinuations = 0
       let pendingTerminalResult: SDKMessage | undefined
       /** 当前压缩是否紧随一个成功完成的主 Agent turn。 */
       let completedAgentTurnPendingCompaction = false
@@ -1938,6 +2014,67 @@ export class PiAgentAdapter implements AgentProviderAdapter {
             userMessageUuid: input.initialUserMessageUuid,
           }
           let nextInterrupt: PendingInterruptPrompt | undefined
+          /** 完成一次模型 turn 后处理压缩、Host 验收和必要的同 transcript 续行。 */
+          const finalizeCompletedTurn = async (): Promise<void> => {
+            completionContinuations = await finalizePiAgentCompletionTurns({
+              continuationCount: completionContinuations,
+              prepareTerminalResult: async () => {
+                persistPiEntryBindings()
+                if (compactContextRequested) {
+                  try {
+                    await compactCurrentSessionAfterTurn(session, (message) => queue.push(message))
+                  } catch (error) {
+                    // 用户在压缩期间停止时，Pi 会取消 summarization；这是正常中止而不是运行错误。
+                    if (active.abortRequested) return
+                    throw error
+                  }
+                  compactContextRequested = false
+                  const continuation = planPiCompactionContinuation({
+                    continuationCount: automaticCompactionContinuations,
+                    abortRequested: active.abortRequested,
+                    runtimeLimitReached: runtimeGuard.shouldStopBeforeNextTurn(),
+                  })
+                  if (continuation.shouldContinue) {
+                    automaticCompactionContinuations += 1
+                    pendingCompactionContinuation = appendOutputFormatInstruction(continuation.prompt, input.outputFormat)
+                    // 当前终态仅表示为执行压缩而结束的内部 loop，不应让上层把原任务视为完成。
+                    pendingTerminalResult = undefined
+                  } else if (continuation.reason === 'continuation_limit') {
+                    pendingTerminalResult = createCompactionContinuationLimitResult(session.sessionId)
+                  }
+                }
+                if (active.abortRequested || active.interrupting) {
+                  // Cancellation can arrive while Pi is compacting, after its first agent_end.
+                  // Do not render that stale terminal result before the next interrupt prompt starts.
+                  retryTerminalGate.settle(true)
+                  pendingNativeOverflowRecovery = false
+                  pendingTerminalResult = undefined
+                }
+              },
+              takeTerminalResult: () => {
+                const result = pendingTerminalResult
+                pendingTerminalResult = undefined
+                return result
+              },
+              emitTerminalResult: (result) => queue.push(result),
+              isStopped: () => active.abortRequested || active.interrupting,
+              canContinue: () => !active.abortRequested
+                && !active.interrupting
+                && !runtimeGuard.shouldStopBeforeNextTurn(),
+              createEvaluationController: () => {
+                const controller = new AbortController()
+                active.completionEvaluationAbortController = controller
+                return controller
+              },
+              releaseEvaluationController: (controller) => {
+                if (active.completionEvaluationAbortController === controller) {
+                  active.completionEvaluationAbortController = undefined
+                }
+              },
+              evaluateCompletion: input.evaluateCompletion,
+              continueTask: (message) => sendPiTaskContinuation(session, message),
+            })
+          }
           while (nextPrompt !== undefined) {
             const currentInterrupt = nextInterrupt
             nextInterrupt = undefined
@@ -1978,40 +2115,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
               }
               currentInterrupt?.resolveAccepted()
               await session.prompt(prompt, { source: 'rpc' })
-              persistPiEntryBindings()
-              if (compactContextRequested) {
-                try {
-                  await compactCurrentSessionAfterTurn(session, (message) => queue.push(message))
-                } catch (error) {
-                  // 用户在压缩期间停止时，Pi 会取消 summarization；这是正常中止而不是运行错误。
-                  if (active.abortRequested) return
-                  throw error
-                }
-                compactContextRequested = false
-                const continuation = planPiCompactionContinuation({
-                  continuationCount: automaticCompactionContinuations,
-                  abortRequested: active.abortRequested,
-                  runtimeLimitReached: runtimeGuard.shouldStopBeforeNextTurn(),
-                })
-                if (continuation.shouldContinue) {
-                  automaticCompactionContinuations += 1
-                  pendingCompactionContinuation = appendOutputFormatInstruction(continuation.prompt, input.outputFormat)
-                  // 当前终态仅表示为执行压缩而结束的内部 loop，不应让上层把原任务视为完成。
-                  pendingTerminalResult = undefined
-                } else if (continuation.reason === 'continuation_limit') {
-                  pendingTerminalResult = createCompactionContinuationLimitResult(session.sessionId)
-                }
-              }
-              if (active.abortRequested || active.interrupting) {
-                // Cancellation can arrive while Pi is compacting, after its first agent_end.
-                // Do not render that stale terminal result before the next interrupt prompt starts.
-                retryTerminalGate.settle(true)
-                pendingNativeOverflowRecovery = false
-                pendingTerminalResult = undefined
-              } else if (pendingTerminalResult) {
-                queue.push(pendingTerminalResult)
-                pendingTerminalResult = undefined
-              }
+              await finalizeCompletedTurn()
             } finally {
               if (active.interrupting) {
                 session.agent.state.messages = dropTrailingAbortedAssistant(session.agent.state.messages)
@@ -2067,6 +2171,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
   /** 中止指定 query 对象，不重新按 session 查询，避免旧 generation 误停当前请求。 */
   private abortActiveQuery(active: ActivePiSession, logIdentity: string): void {
     active.abortRequested = true
+    active.completionEvaluationAbortController?.abort()
     rejectPendingInterruptPrompts(active, createAbortError())
     if (!active.session) rejectActiveReady(active, createAbortError())
     try {
@@ -2139,6 +2244,12 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         })
       })
       accepted.catch(() => {})
+      if (active.completionEvaluationAbortController) {
+        // Host 验收发生在 Pi 已停止 streaming 之后；新指令仍应立即终止旧任务收尾，
+        // 再由既有 pending interrupt 队列在同一 transcript 启动新一轮。
+        active.interrupting = true
+        active.completionEvaluationAbortController.abort()
+      }
       if (session.isStreaming) {
         // Pi 没有单独的 interrupt()；公开取消 API 是 abort()。
         // 这里把 abort 产生的内部 aborted 终态压住，再由 query 的 prompt chain 发送新消息。

@@ -8,6 +8,8 @@ export function createCanvasMediaPreloadApi(
 ): CanvasMediaPreloadApi {
   return {
     canvasMediaLoad: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.LOAD, input) as ReturnType<CanvasMediaPreloadApi['canvasMediaLoad']>,
+    canvasMediaReadConfig: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.READ_CONFIG, input) as ReturnType<NonNullable<CanvasMediaPreloadApi['canvasMediaReadConfig']>>,
+    canvasMediaCheckPreparation: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.CHECK_PREPARATION, input) as ReturnType<NonNullable<CanvasMediaPreloadApi['canvasMediaCheckPreparation']>>,
     canvasMediaSave: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.SAVE, input) as ReturnType<CanvasMediaPreloadApi['canvasMediaSave']>,
     canvasMediaRun: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.RUN, input) as ReturnType<CanvasMediaPreloadApi['canvasMediaRun']>,
     canvasMediaCancel: (input) => invoke(CANVAS_MEDIA_IPC_CHANNELS.CANCEL, input) as ReturnType<CanvasMediaPreloadApi['canvasMediaCancel']>,
