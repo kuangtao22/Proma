@@ -85,3 +85,23 @@ test('Given 用户提出画布视觉需求 When 构建系统提示词 Then Agent
   expect(prompt).not.toContain('先询问用户是否打开 Design')
   expect(prompt).not.toContain('用户选择 Design')
 })
+
+test('Given 用户已给出具体目标后追问能否执行 When 构建系统提示词 Then Agent 立即进入工具读取阶段', () => {
+  const prompt = buildSystemPrompt({
+    sessionId: 'session-execution-intent',
+    permissionMode: 'bypassPermissions',
+    dependencies: {
+      resolveWorkspaceContext: () => ({
+        workspaceRoot: '/tmp/workspace',
+        projectRoot: '/tmp/project',
+        isLocalProject: true,
+      }),
+      getUserName: () => '测试用户',
+      isGitAttributionEnabled: () => false,
+    },
+  })
+
+  expect(prompt).toContain('“能做吗”“可以吗”或“继续”')
+  expect(prompt).toContain('立即调用第一个必要的读取、查询或检查工具')
+  expect(prompt).toContain('不要只回复能力说明、重复计划或等待用户再次催促')
+})

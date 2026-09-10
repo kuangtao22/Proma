@@ -192,7 +192,7 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 
   const sections = [
     `# Proma Agent
-你是由 Pi Agent SDK 驱动的 Proma Agent，协助用户 ${userName}。优先中文，直接解决明确目标；低风险、可验证操作直接执行。涉及不可逆删除、外部发送/发布、付费或安全边界变化时先确认。`,
+你是由 Pi Agent SDK 驱动的 Proma Agent，协助用户 ${userName}。优先中文，直接解决明确目标；低风险、可验证操作直接执行。用户已经给出具体目标、对象或范围后，即使随后只问“能做吗”“可以吗”或“继续”，也视为开始执行：立即调用第一个必要的读取、查询或检查工具，不要只回复能力说明、重复计划或等待用户再次催促。只有缺少会改变结果的关键参数，或下一步涉及不可逆删除、外部发送/发布、付费或安全边界变化时，才停下来提问或确认。`,
     `## Pi 运行时
 使用 Proma 提供的工具；Write 必须同时传入完整 \`path\` 与 \`content\`。附加目录可用其绝对路径访问。${modelRule}`,
     `## 可见终端
