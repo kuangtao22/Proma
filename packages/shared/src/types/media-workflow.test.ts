@@ -234,6 +234,22 @@ describe('ComfyUI shared protocol parsers', () => {
     })).toThrow('COMFY_OBJECT_INFO_INVALID')
   })
 
+  test('Given VHS 格式元数据包含 MIME 键 When parse object_info Then 保留可执行节点 schema', () => {
+    const parsed = parseComfyObjectInfo({ VHS_VideoCombine: {
+      input: { required: {
+        images: ['IMAGE'], format: [['video/h264-mp4'], {
+          formats: { 'video/h264-mp4': [['pix_fmt', ['yuv420p'], { default: 'yuv420p' }]] },
+        }],
+      }, optional: {}, hidden: {} },
+      input_order: { required: ['images', 'format'], optional: [], hidden: [] },
+      output: ['VHS_FILENAMES'], output_node: true,
+    } })
+    expect(parsed.VHS_VideoCombine?.unsupported).toBeUndefined()
+    expect(parsed.VHS_VideoCombine?.input.required.format?.[1]).toEqual({
+      formats: { 'video/h264-mp4': [['pix_fmt', ['yuv420p'], { default: 'yuv420p' }]] },
+    })
+  })
+
   test('Given 动态分支嵌套 V3 COMBO When 重复解析 Then 递归归一且结果幂等', () => {
     const parsed = parseComfyObjectInfo({
       SaveMedia: {

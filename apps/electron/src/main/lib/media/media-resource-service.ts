@@ -248,8 +248,9 @@ export class MediaResourceService {
       source = 'object-info'
       items = Object.entries(nodes.schema).map(([id, schema]) => {
         const supported = schema.unsupported !== true && Object.hasOwn(COMFY_CORE_NODE_CONTRACTS, id)
+        const support = schema.unsupported === true ? 'unsupported' : supported ? 'supported' : 'unknown'
         return { id, name: schema.display_name ?? id, category: schema.category ?? '', supported,
-          support: supported ? 'supported' : 'unsupported', source, schema }
+          support, source, schema }
       })
     } else if (input.kind === 'models') {
       const models = await this.loadModels(context, input.refresh === true)

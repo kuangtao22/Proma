@@ -919,6 +919,18 @@ describe('媒体 Agent 工具提供器', () => {
     expect(JSON.stringify(response.details)).not.toContain('private-input.png')
   })
 
+  test('Given LTX 节点 schema 已解析但没有本地执行合同 When Agent 读取节点摘要 Then 区分已发现与可执行', async () => {
+    const f = fixture()
+    f.dependencies.resources.getSchema = async () => ({
+      LTXVPreprocess: { input: { required: { image: ['IMAGE'], img_compression: ['INT'] } }, output: ['IMAGE'] },
+    })
+    const run = createMediaToolRun(f.dependencies, context)
+    const response = await executeTool(run.piCustomTools, 'media_get_node_schema', { connectionId: 'gpu', classTypes: ['LTXVPreprocess'] })
+    expect(response.details).toEqual({ nodes: [{ classType: 'LTXVPreprocess', category: '', inputs: [
+      { name: 'image', required: true, type: 'IMAGE' }, { name: 'img_compression', required: true, type: 'INT' },
+    ], outputs: ['IMAGE'], supported: false, support: 'unknown', schemaAvailable: true }] })
+  })
+
   test('Given 核心节点已安装但 schema 无法验证 When Agent 读取节点摘要 Then 明确标记为不支持', async () => {
     const f = fixture()
     f.dependencies.resources.getSchema = async () => ({

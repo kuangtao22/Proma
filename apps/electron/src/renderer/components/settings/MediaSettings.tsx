@@ -1156,7 +1156,7 @@ function ResourceBrowser({
                         setSelectedId((current) => state.kind === 'workflows' ? item.id : current === item.id ? null : item.id)
                       }}>
                         <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{item.name}</span><span className="block truncate text-xs text-muted-foreground">{item.category || '未分类'}</span></span>
-                        <span className={cn('text-[11px]', item.supported ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground')}>{item.supported ? '已支持' : '只读'}</span>
+                        <span className={cn('text-[11px]', item.supported ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground')}>{item.supported ? '已支持' : item.support === 'unknown' ? '已发现' : '只读'}</span>
                       </button>
                       {state.kind !== 'workflows' && selected?.id === item.id && (
                         <div className="border-t border-border/60 bg-muted/20">

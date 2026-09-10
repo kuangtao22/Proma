@@ -97,6 +97,17 @@ describe('ComfyUI 资源目录', () => {
     expect(page.items.find((item) => item.id === 'Custom / Node')).toMatchObject({ support: 'unsupported' })
   })
 
+  test('Given 已解析的第三方节点没有本地执行合同 When 查询目录 Then 标记为已发现而非接口不支持', async () => {
+    const service = new MediaResourceService({
+      resolveConnection: () => ({ connection: { id: 'gpu', instanceGeneration: 'v1', baseUrl: 'http://localhost/' }, headers: {} }),
+      createClient: () => ({ ...defaultClient, objectInfo: async () => ({
+        LTXVPreprocess: { input: { required: { image: ['IMAGE'], img_compression: ['INT'] } }, output: ['IMAGE'] },
+      }) }),
+    })
+    const page = await service.list({ connectionId: 'gpu', kind: 'nodes' })
+    expect(page.items[0]).toMatchObject({ id: 'LTXVPreprocess', supported: false, support: 'unknown' })
+  })
+
   test('Given 多个 Agent 同时查询 When 使用同一实例 Then 单飞读取且目录不暴露素材枚举', async () => {
     let reads = 0
     const service = new MediaResourceService({

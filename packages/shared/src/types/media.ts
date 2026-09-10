@@ -295,7 +295,7 @@ export interface MediaRemoteWorkflowOutputSummary {
   classType: string
   title?: string
   mediaType: MediaKind
-  historyKey: 'images' | 'audio'
+  historyKey: 'images' | 'audio' | 'gifs'
 }
 
 /** Renderer 与 Agent 共用的工作流转换和校验结果。 */

@@ -96,7 +96,7 @@ export interface CompiledComfyWorkflow {
 /** 运行时从 history 收集输出时使用的精确媒体合同。 */
 export interface ComfyHistoryOutputContract {
   mediaType: 'image' | 'audio' | 'video'
-  historyKey: 'images' | 'audio'
+  historyKey: 'images' | 'audio' | 'gifs'
 }
 
 /** loader 资源输入合同。 */
@@ -130,6 +130,7 @@ export const COMFY_CORE_NODE_CONTRACTS: Readonly<Record<string, ComfyCoreNodeCon
   PreviewAudio: { outputNode: true, historyOutput: { mediaType: 'audio', historyKey: 'audio' } },
   SaveWEBM: { outputNode: true, historyOutput: { mediaType: 'video', historyKey: 'images' }, safeOutputPrefixInput: 'filename_prefix' },
   SaveVideo: { outputNode: true, historyOutput: { mediaType: 'video', historyKey: 'images' }, safeOutputPrefixInput: 'filename_prefix' },
+  VHS_VideoCombine: { outputNode: true, historyOutput: { mediaType: 'video', historyKey: 'gifs' }, safeOutputPrefixInput: 'filename_prefix' },
   CreateVideo: {},
   CheckpointLoaderSimple: { modelInputs: ['ckpt_name'] },
   CLIPLoader: { modelInputs: ['clip_name'] },

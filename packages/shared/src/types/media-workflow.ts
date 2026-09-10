@@ -161,6 +161,30 @@ function parseJsonValue(value: unknown, depth = 0): JsonValue {
   throw new Error('COMFY_JSON_INVALID')
 }
 
+/** 解析 object_info 输入元数据；允许 MIME/格式键，但仍拒绝危险键和控制字符。 */
+function parseSchemaOptionsValue(value: unknown, depth = 0): JsonValue {
+  if (depth > MAX_JSON_DEPTH) throw new Error('COMFY_JSON_DEPTH_EXCEEDED')
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.length <= MAX_STRING_LENGTH) return value
+  if (Array.isArray(value)) {
+    if (value.length > MAX_NODE_INPUTS || !Array.from({ length: value.length }, (_, index) => Object.hasOwn(value, index)).every(Boolean)) {
+      throw new Error('COMFY_JSON_INVALID')
+    }
+    return value.map((item) => parseSchemaOptionsValue(item, depth + 1))
+  }
+  if (isRecord(value) && Object.keys(value).length <= MAX_NODE_INPUTS) {
+    /** 复制输入元数据，保留格式名中的斜杠并阻断原对象后续变更。 */
+    const parsed: JsonObject = {}
+    for (const [key, item] of Object.entries(value)) {
+      if (!key || key.length > MAX_STRING_LENGTH || /[\u0000-\u001F\u007F]/.test(key) || DANGEROUS_KEYS.has(key)) throw new Error('COMFY_JSON_INVALID')
+      parsed[key] = parseSchemaOptionsValue(item, depth + 1)
+    }
+    return parsed
+  }
+  throw new Error('COMFY_JSON_INVALID')
+}
+
 /**
  * 严格解析 ComfyUI API 格式工作流。
  * @param value 来自文件或 IPC 的未知值。
@@ -249,7 +273,7 @@ function parseInputSchema(value: unknown, dynamicDepth = 0): ComfyNodeInputSchem
   /** 转换后的输入选项，解析错误统一归属 object_info 协议。 */
   let options: JsonValue | undefined
   try {
-    options = rawOptions === undefined ? undefined : parseJsonValue(rawOptions)
+    options = rawOptions === undefined ? undefined : parseSchemaOptionsValue(rawOptions)
   } catch {
     throw new Error('COMFY_OBJECT_INFO_INVALID')
   }

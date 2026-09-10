@@ -68,7 +68,7 @@ export interface RemoteWorkflowOutputSummary {
   classType: string
   title?: string
   mediaType: 'image' | 'audio' | 'video'
-  historyKey: 'images' | 'audio'
+  historyKey: 'images' | 'audio' | 'gifs'
 }
 
 /** 远端工作流的结构、兼容性与可保存定义。 */

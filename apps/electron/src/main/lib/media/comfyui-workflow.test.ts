@@ -607,6 +607,29 @@ describe('ComfyUI static workflow', () => {
     expect(COMFY_CORE_NODE_CONTRACTS.SaveVideo?.historyOutput).toEqual({ mediaType: 'video', historyKey: 'images' })
   })
 
+  test('Given LTX 前处理连接 VHS 输出 When 静态校验 Then 允许已解析节点并使用 gifs 历史合同', () => {
+    const info: ComfyObjectInfo = {
+      ImageSource: { input: { required: {} }, output: ['IMAGE'] },
+      LTXVPreprocess: { input: { required: { image: ['IMAGE'], img_compression: ['INT'] } }, output: ['IMAGE'] },
+      VHS_VideoCombine: { input: { required: {
+        images: ['IMAGE'], frame_rate: ['FLOAT'], loop_count: ['INT'], filename_prefix: ['STRING'],
+        format: [['video/h264-mp4']], pingpong: ['BOOLEAN'], save_output: ['BOOLEAN'],
+      }, optional: {} }, output: ['VHS_FILENAMES'], output_node: true },
+    }
+    const result = validateComfyWorkflow({
+      schemaVersion: 1,
+      prompt: {
+        '1': { class_type: 'ImageSource', inputs: {} },
+        '2': { class_type: 'LTXVPreprocess', inputs: { image: ['1', 0], img_compression: 35 } },
+        '3': { class_type: 'VHS_VideoCombine', inputs: { images: ['2', 0], frame_rate: 25, loop_count: 0, filename_prefix: 'Proma', format: 'video/h264-mp4', pingpong: false, save_output: true } },
+      },
+      bindings: [],
+      outputs: [{ key: 'video', nodeId: '3', outputIndex: 0, mediaType: 'video' }],
+    }, info)
+    expect(result).toEqual({ valid: true, issues: [], truncated: false })
+    expect(COMFY_CORE_NODE_CONTRACTS.VHS_VideoCombine?.historyOutput).toEqual({ mediaType: 'video', historyKey: 'gifs' })
+  })
+
   test('Given SaveAudioAdvanced 动态格式分支 When 使用扁平 prompt 字段 Then 只接受选中分支', () => {
     const info: ComfyObjectInfo = {
       SaveAudioAdvanced: {

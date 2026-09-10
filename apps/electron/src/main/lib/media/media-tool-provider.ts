@@ -287,6 +287,8 @@ function summarizeSchema(schema: Awaited<ReturnType<MediaResourceService['getSch
         inputs,
         outputs: node.output,
         supported: node.unsupported !== true && Object.hasOwn(COMFY_CORE_NODE_CONTRACTS, classType),
+        ...(node.unsupported !== true && !Object.hasOwn(COMFY_CORE_NODE_CONTRACTS, classType)
+          ? { support: 'unknown', schemaAvailable: true } : {}),
         ...(node.unsupported === true ? { unsupported: true } : {}),
       }
     }),
