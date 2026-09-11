@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { JsonObject } from '@proma/shared'
 import { MediaResourceService } from './media-resource-service'
+import { MediaResourceSnapshotStore } from './media-resource-snapshot-store'
 import { ComfyUIError } from './comfyui-client'
 
 /** 资源目录中的实际 schema fixture，图片枚举包含不得作为模型公开的远端用户文件。 */
@@ -27,6 +31,41 @@ function client(overrides: Partial<typeof defaultClient> = {}): typeof defaultCl
 }
 
 describe('ComfyUI 资源目录', () => {
+  test('Given 2104 项真实形状节点目录 When 持久化并重启 Then 从磁盘严格重读且不再联网', async () => {
+    /** 模拟当前真实 object_info 的规模与常用字段，避免测试依赖在线服务。 */
+    const largeSchema = Object.fromEntries(Array.from({ length: 2_104 }, (_, index) => [`Node-${index}`, {
+      input: { required: { image: ['IMAGE'] }, optional: { strength: ['FLOAT', { default: 1, min: 0, max: 1 }] } },
+      input_order: { required: ['image'], optional: ['strength'] },
+      output: ['IMAGE'],
+      output_name: ['IMAGE'],
+      output_is_list: [false],
+      category: 'image/process',
+      display_name: `Node ${index}`,
+    }]))
+    const directory = mkdtempSync(join(tmpdir(), 'proma-media-resource-large-catalog-'))
+    let reads = 0
+    /** 每次重建服务均复用真实磁盘快照存储，以覆盖进程重启后的严格解析路径。 */
+    const create = () => new MediaResourceService({
+      resolveConnection: () => ({ connection: { id: 'gpu', instanceGeneration: 'v1', baseUrl: 'http://localhost/' }, headers: {} }),
+      createClient: () => ({ ...defaultClient, objectInfo: async () => { reads += 1; return largeSchema } }),
+      snapshots: new MediaResourceSnapshotStore(directory),
+    })
+
+    try {
+      const remote = await create().list({ connectionId: 'gpu', kind: 'nodes' })
+      expect(remote.total).toBe(2_104)
+      expect(remote.snapshotOrigin).toBe('remote')
+      expect(reads).toBe(1)
+
+      const local = await create().list({ connectionId: 'gpu', kind: 'nodes' })
+      expect(local.total).toBe(2_104)
+      expect(local.snapshotOrigin).toBe('local')
+      expect(reads).toBe(1)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('Given 旧节点 schema 快照 When 首次迁移失败 Then 保留旧内容且同实例不重复请求', async () => {
     let reads = 0
     const stored = new Map<string, unknown>([['legacy-key', {

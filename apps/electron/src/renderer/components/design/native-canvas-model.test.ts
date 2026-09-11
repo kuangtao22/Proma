@@ -161,8 +161,8 @@ describe('原生 Canvas 纯投影', () => {
   )
 
   test.each([
-    ['pending', 'queued'],
-    ['prepared', 'queued'],
+    ['pending', 'idle'],
+    ['prepared', 'idle'],
     ['queued', 'queued'],
     ['uploading', 'running'],
     ['compiling', 'running'],

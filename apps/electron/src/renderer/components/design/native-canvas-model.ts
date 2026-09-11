@@ -228,7 +228,7 @@ const NATIVE_CANVAS_PROJECTION_ACTIVITY_PRIORITY: Readonly<Record<CanvasNodeActi
 /**
  * 将媒体运行投影收敛为所有卡片共享的活动态。
  * @param progress 当前媒体模块的最新运行阶段。
- * @returns 等待阶段为 queued，处理中为 running，终态为 idle。
+ * @returns 真实排队阶段为 queued，处理中为 running，待执行/终态为 idle。
  */
 function resolveMediaRunActivityState(
   progress: MediaRunProgressProjection | undefined,
@@ -236,7 +236,9 @@ function resolveMediaRunActivityState(
   if (!progress || progress.phase === 'succeeded' || progress.phase === 'failed' || progress.phase === 'cancelled') {
     return 'idle'
   }
-  if (progress.phase === 'pending' || progress.phase === 'prepared' || progress.phase === 'queued') {
+  // pending/prepared 只代表本地模块状态，尚未提交执行，不能触发卡片加载动画。
+  if (progress.phase === 'pending' || progress.phase === 'prepared') return 'idle'
+  if (progress.phase === 'queued') {
     return 'queued'
   }
   return 'running'

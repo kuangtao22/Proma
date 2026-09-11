@@ -28,6 +28,7 @@ import { applyDesignMutations } from './design-store'
 import type { DesignStore } from './design-store'
 import { createWorkspaceOperationRegistry } from '../workspace-operation-lock'
 import type { AgentRunExtensions } from '../agent-run-extensions'
+import type { HeadlessAgentRunCallbacks } from '../agent-headless-runner-registry'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
@@ -1355,6 +1356,152 @@ describe('Design Job Manager', () => {
     })
   })
 
+  test('Given 规划模型只通过 completion 报告超时 When 收敛 Then 保存真实错误且不自动重试', async () => {
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([], {
+        status: 'errored', stoppedByUser: false, startedAt: 1,
+        resultSubtype: 'error_during_execution', resultErrors: ['Request timed out.'],
+      })
+    }
+    /** 本轮没有图片工具调用，不能误报图片服务已经完成。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed', error: '设计任务执行失败：模型请求超时。Request timed out.',
+    })
+    expect(harness.manager.list('project-1')).toHaveLength(1)
+    expect(harness.createdSessions).toHaveLength(1)
+    expect(harness.manager.get(job.id)?.outputAssetId).toBeUndefined()
+  })
+
+  test('Given 旧 headless 回调没有终态参数 When SDK result 报告失败 Then 从持久化消息恢复错误', async () => {
+    harness.sdkMessages = [{
+      type: 'result', subtype: 'error_during_execution',
+      errors: ['HTTP 503: No available compatible accounts'],
+    }]
+    /** 只在持久化结果中出现的供应商错误也必须可见。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed', error: '设计任务执行失败：HTTP 503: No available compatible accounts',
+    })
+  })
+
+  test.each(['onError', 'throw'] as const)(
+    'Given 上游经 %s 返回含凭据的长错误 When 任务落盘 Then 错误有界脱敏且保留原因',
+    async (failurePath) => {
+      /** 两条既有异常入口与新增 completion 错误必须共享同一持久化边界。 */
+      const rawError = 'HTTP 503: unavailable Authorization: Bearer secret-token '
+        + 'apiKey="secret-key" /Users/example/request.json https://user:password@example.test/api '
+        + 'x'.repeat(10_000)
+      harness.runHeadless = async (callbacks) => {
+        if (failurePath === 'throw') throw new Error(rawError)
+        callbacks.onError(rawError)
+        callbacks.onComplete([])
+      }
+      /** 只运行本地 fixture，验证真实 journal 写入而非仅 UI 展示。 */
+      const job = harness.manager.create(createGenerateInput())
+
+      await harness.manager.run(job.id)
+
+      /** 磁盘记录不应残留未经脱敏的原始异常。 */
+      const journal = readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8')
+      expect(journal).toContain('HTTP 503: unavailable')
+      expect(journal).not.toContain('secret')
+      expect(journal).not.toContain('/Users/example')
+      expect(journal).not.toContain('password')
+      expect(harness.manager.get(job.id)?.error?.length).toBeLessThanOrEqual(500)
+    },
+  )
+
+  test('Given 失败终态没有详情但存在图片附件 When 收敛 Then 不误采用失败回合产物', async () => {
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([createToolMessage('session-1/output.png')], {
+        status: 'errored', stoppedByUser: false, startedAt: 1,
+        resultSubtype: 'error_max_turns',
+      })
+    }
+    /** 附件归属正确也不能越过运行终态校验。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({
+      status: 'failed', error: '设计任务执行失败：error_max_turns',
+    })
+    expect(harness.manager.get(job.id)?.outputAssetId).toBeUndefined()
+  })
+
+  test('Given Pi 在 result 前以 TypedError 结束 When headless 只返回空 metadata Then 从 assistant.error 恢复原因', async () => {
+    harness.sdkMessages = [{
+      type: 'assistant', parent_tool_use_id: null,
+      message: { content: [{ type: 'text', text: '不能把自然语言正文当作错误详情' }] },
+      error: { message: 'Request timed out.', errorType: 'network_error' },
+    }]
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([], { status: 'errored', stoppedByUser: false, startedAt: 1 })
+    }
+    /** 复现 Orchestrator 提前终止迭代、未消费 SDK result 的旧链路。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)?.error).toBe('设计任务执行失败：模型请求超时。Request timed out.')
+  })
+
+  test('Given headless 返回取消 When 收敛 Then 保持取消而非缺图失败', async () => {
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([], {
+        status: 'cancelled', stoppedByUser: true, startedAt: 1,
+        resultSubtype: 'error_during_execution',
+      })
+    }
+    /** 运行时主动终止也使用明确取消状态。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)?.status).toBe('cancelled')
+  })
+
+  test('Given 早期错误后本轮明确成功 When headless 返回成功和图片 Then 不被旧 assistant 错误覆盖', async () => {
+    harness.sdkMessages = [{
+      type: 'assistant', parent_tool_use_id: null, message: { content: [] },
+      error: { message: 'earlier request failed', errorType: 'network_error' },
+    }]
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([createToolMessage('session-1/output.png')], {
+        status: 'completed', stoppedByUser: false, startedAt: 1, resultSubtype: 'success',
+      })
+    }
+    /** 只以当前终态判定是否成功，不把恢复前的错误当作最终失败。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-output' })
+  })
+
+  test('Given 图片工具明确失败且 Agent 也返回失败终态 When 收敛 Then 优先保留图片工具原因', async () => {
+    harness.sdkMessages = createSdkToolErrorMessages('生图服务请求失败 (503)')
+    harness.runHeadless = async (callbacks) => {
+      callbacks.onComplete([], {
+        status: 'errored', stoppedByUser: false, startedAt: 1,
+        resultSubtype: 'error_during_execution', resultErrors: ['Agent stopped after tool failure'],
+      })
+    }
+    /** 工具边界的失败原因比 Agent 泛化终态更具体。 */
+    const job = harness.manager.create(createGenerateInput())
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)?.error).toBe('图片生成失败：生图服务请求失败 (503)')
+  })
+
   test('Given GPT 图片渠道返回 503 When 收敛任务 Then 保留真实失败原因与提示词且不自动重试', async () => {
     /** 模拟 SDK 已保存的渠道错误，检验任务详情不会退化为通用无图片提示。 */
     const serviceError = '生图服务请求失败 (503)，请求 ID: request-503：No available compatible accounts'
@@ -2275,10 +2422,8 @@ describe('Design Job Manager', () => {
     const state: {
       settings: { agentChannelId?: string; agentModelId?: string }
       messages: AgentMessage[]
-      runHeadless: undefined | ((callbacks: {
-        onError: (error: string) => void
-        onComplete: (messages?: AgentMessage[]) => void
-      }, extensions: AgentRunExtensions) => Promise<void>)
+      runHeadless: undefined | ((callbacks: Pick<HeadlessAgentRunCallbacks, 'onError' | 'onComplete'>,
+        extensions: AgentRunExtensions) => Promise<void>)
       createSessionError?: Error
       importError?: Error
       mutateError?: Error

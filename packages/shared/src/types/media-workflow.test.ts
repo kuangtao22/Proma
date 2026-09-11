@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  COMFY_OBJECT_INFO_MAX_CLASSES,
   parseComfyObjectCatalog,
   parseComfyObjectInfo,
   parseComfyPrompt,
@@ -49,6 +50,26 @@ test('Given 真实 V3 节点的空输出模板和隐藏输入顺序 When 解析 
 })
 
 describe('ComfyUI shared protocol parsers', () => {
+  test('Given 节点目录达到统一容量边界 When 目录与严格解析 Then 接受边界并对超限返回专用错误', () => {
+    /** 构造真实 object_info 的最小节点形状，隔离验证目录条目容量合同。 */
+    const createObjectInfo = (count: number) => Object.fromEntries(
+      Array.from({ length: count }, (_, index) => [`Node-${index}`, {
+        input: { required: { image: ['IMAGE'] } },
+        output: ['IMAGE'],
+        output_name: ['IMAGE'],
+        category: 'image/process',
+      }]),
+    )
+    const boundary = createObjectInfo(COMFY_OBJECT_INFO_MAX_CLASSES)
+
+    expect(Object.keys(parseComfyObjectCatalog(boundary))).toHaveLength(COMFY_OBJECT_INFO_MAX_CLASSES)
+    expect(Object.keys(parseComfyObjectInfo(boundary))).toHaveLength(COMFY_OBJECT_INFO_MAX_CLASSES)
+
+    const oversized = createObjectInfo(COMFY_OBJECT_INFO_MAX_CLASSES + 1)
+    expect(() => parseComfyObjectCatalog(oversized)).toThrow('COMFY_OBJECT_INFO_SIZE_LIMIT')
+    expect(() => parseComfyObjectInfo(oversized)).toThrow('COMFY_OBJECT_INFO_SIZE_LIMIT')
+  })
+
   test('Given 合法 API 图 When 解析 Then 保留节点链接与元数据', () => {
     expect(parseComfyPrompt({
       '3': { class_type: 'KSampler', inputs: { seed: 1, model: ['4', 0] }, _meta: { title: '采样器' } },
@@ -338,8 +359,8 @@ describe('ComfyUI shared protocol parsers', () => {
     expect(() => parseComfyObjectCatalog({ 'Unsafe\nNode': { input: {}, output: [] } })).toThrow('COMFY_OBJECT_INFO_INVALID')
     expect(() => parseComfyObjectCatalog({ Node: null })).toThrow('COMFY_OBJECT_INFO_INVALID')
     expect(() => parseComfyObjectCatalog(Object.fromEntries(
-      Array.from({ length: 2_049 }, (_, index) => [`Node-${index}`, { input: {}, output: [] }]),
-    ))).toThrow('COMFY_OBJECT_INFO_INVALID')
+      Array.from({ length: COMFY_OBJECT_INFO_MAX_CLASSES + 1 }, (_, index) => [`Node-${index}`, { input: {}, output: [] }]),
+    ))).toThrow('COMFY_OBJECT_INFO_SIZE_LIMIT')
   })
 
   test('Given 动态输入含原型键或路径式字段 When 解析 Then 继续拒绝不安全 schema', () => {

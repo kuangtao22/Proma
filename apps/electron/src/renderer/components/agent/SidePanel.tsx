@@ -1241,16 +1241,18 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       const current = sanitizeAgentCanvasWorkspaceState(previous[sessionId])
       const nextState = update(current)
       const unchanged = current.activeTab === nextState.activeTab
+        && current.canvasLauncherOpen === nextState.canvasLauncherOpen
         && current.openTabs.length === nextState.openTabs.length
         && current.openTabs.every((tab, index) => tab === nextState.openTabs[index])
       const stored = previous[sessionId]
       const storedIsCanonical = stored !== undefined
         && stored.activeTab === current.activeTab
+        && stored.canvasLauncherOpen === current.canvasLauncherOpen
         && stored.openTabs.length === current.openTabs.length
         && stored.openTabs.every((tab, index) => tab === current.openTabs[index])
-      if (unchanged && (storedIsCanonical || (!stored && nextState.openTabs.length === 0))) return previous
+      if (unchanged && (storedIsCanonical || (!stored && nextState.openTabs.length === 0 && !nextState.canvasLauncherOpen))) return previous
       const next = { ...previous }
-      if (nextState.openTabs.length === 0) delete next[sessionId]
+      if (nextState.openTabs.length === 0 && !nextState.canvasLauncherOpen) delete next[sessionId]
       else next[sessionId] = nextState
       return next
     })
@@ -1301,7 +1303,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
 
   /** 登记用户明确打开的 Canvas 标签；具体画布会替换仅用于选取画布的 launcher。 */
   const rememberOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab, makeActive: boolean): void => {
-    if (!parseCanvasWorkspaceTab(tab)) return
     updateCanvasWorkspaceState((current) => rememberAgentCanvasWorkspaceTab(current, tab, makeActive))
   }, [updateCanvasWorkspaceState])
 
@@ -1379,7 +1380,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       const activeTab = current.activeTab && openTabs.includes(current.activeTab)
         ? current.activeTab
         : null
-      return { openTabs, activeTab }
+      return { openTabs, activeTab, canvasLauncherOpen: current.canvasLauncherOpen }
     })
 
     const restore = canvasWorkspaceRestoreRef.current
@@ -1400,7 +1401,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       restore.pendingTab = targetTab
       onTabChange(targetTab)
     }
-  }, [availableCanvasWorkspaceTabs, canvasRegistry.bindingReady, canvasRegistry.metadataReady, canvasWorkspaceState.activeTab, effectiveActiveTab, isOpen, onTabChange, updateCanvasWorkspaceState])
+  }, [availableCanvasWorkspaceTabs, canvasRegistry.bindingReady, canvasRegistry.metadataReady, canvasWorkspaceState.activeTab, canvasWorkspaceState.canvasLauncherOpen, effectiveActiveTab, isOpen, onTabChange, updateCanvasWorkspaceState])
 
   React.useEffect(() => {
     const restore = canvasWorkspaceRestoreRef.current
@@ -1734,13 +1735,13 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       canvasRegistry.binding,
       canvasRegistry.sessions,
       canvasRegistry.bindingReady,
-      effectiveActiveTab === 'canvas',
+      effectiveActiveTab === 'canvas' || canvasWorkspaceState.canvasLauncherOpen,
     )
       ? [{ id: 'canvas', label: '画布', icon: <Workflow className="size-3.5" />, closable: true } as const]
       : []),
     ...canvasWorkspaceTabs.map((canvas) => ({
       id: canvas.id,
-      label: canvas.title,
+      label: '画布',
       icon: <Workflow className="size-3.5" />,
       closable: true,
       activity: isAgentCanvasActivityUnread(canvas),
@@ -1792,7 +1793,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: showBrowserActivity && activeBrowserTabId !== tab.tabId && browserState.activeTabId === tab.tabId,
     })) ?? []),
-  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceTabs, currentWorkspaceId, effectiveActiveTab, previewFiles, selectedDelegationSession, selectedDelegationStatus, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
+  ], [activeBrowserTabId, browserState, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.sessions, canvasWorkspaceState.canvasLauncherOpen, canvasWorkspaceTabs, currentWorkspaceId, effectiveActiveTab, previewFiles, selectedDelegationSession, selectedDelegationStatus, sessions, sessionId, showBrowserActivity, sideChatConversationId, sideTemporaryAgents, terminalTabs, workspaceComponentTabs])
   workspaceTabsRef.current = workspaceTabs
 
   React.useEffect(() => {

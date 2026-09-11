@@ -2,15 +2,18 @@ import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } fr
 import { dirname, join } from 'node:path'
 import type {
   DesignJobTraceSummary,
+  DesignJobRecord,
   DesignTraceEntry,
   SDKAssistantMessage,
   SDKMessage,
+  SDKResultMessage,
   SDKToolResultBlock,
   SDKToolUseBlock,
   SDKUserMessage,
 } from '@proma/shared'
 import { ensureDirectoryDurable, removeFileAtomic, writeJsonLinesFileAtomic } from '../safe-file'
 import { isSafeDesignStableId, type DesignPathResolver } from './design-paths'
+import { formatDesignExecutionError, summarizeDesignExecutionError } from './design-execution-error'
 
 /** Design 内部 Agent 当前唯一可信的图片工具入口。 */
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
@@ -115,9 +118,15 @@ export class DesignTraceStore {
    * @param projectId 已登记 Design 项目 ID。
    * @param jobId 当前单次执行 ID。
    * @param messages 当前内部会话的持久化 SDK 消息。
+   * @param terminal 已提交的任务终态；SDK 未留下消息时仍保留真实业务结论。
    * @returns 可放入 Job 记录的轻量摘要和 trace 条数。
    */
-  writeFromMessages(projectId: string, jobId: string, messages: SDKMessage[]): DesignTraceWriteResult {
+  writeFromMessages(
+    projectId: string,
+    jobId: string,
+    messages: SDKMessage[],
+    terminal?: Pick<DesignJobRecord, 'status' | 'error' | 'completedAt'>,
+  ): DesignTraceWriteResult {
     /** 仅包含公开白名单字段的 trace 记录。 */
     const entries: DesignTraceEntry[] = []
     /** 用于把 user/tool_result 与此前真实 tool_use 精确关联。 */
@@ -131,8 +140,29 @@ export class DesignTraceStore {
 
     for (const message of messages) {
       const timestamp = resolveTimestamp(message, this.now)
+      if (message.type === 'result' && !message.isSyntheticCompactionResult) {
+        /** result 可能是失败回合唯一留下的结构化消息，必须先于会话回收转存。 */
+        const result = message as SDKResultMessage
+        /** SDKMessage 兼容扩展消息，先收窄为 result 合同再读取错误字段。 */
+        const failed = result.subtype !== 'success'
+        entries.push({
+          timestamp, type: failed ? 'error' : 'status',
+          title: failed ? 'Agent 执行失败' : 'Agent 执行完成',
+          ...(failed ? { content: formatDesignExecutionError(result.errors, result.subtype) } : {}),
+          isError: failed,
+        })
+        continue
+      }
       if (message.type === 'assistant') {
-        const content = (message as SDKAssistantMessage).message?.content
+        /** TypedError 可能没有后续 result；只读取 error 字段，不把正文误当失败详情。 */
+        const assistant = message as SDKAssistantMessage
+        if (assistant.error) {
+          entries.push({
+            timestamp, type: 'error', title: 'Agent 执行失败', isError: true,
+            content: formatDesignExecutionError([assistant.error.message], assistant.error.errorType),
+          })
+        }
+        const content = assistant.message?.content
         if (!Array.isArray(content)) continue
         for (const block of content) {
           if (block.type === 'thinking') {
@@ -168,6 +198,19 @@ export class DesignTraceStore {
           isError: result.is_error === true,
         })
       }
+    }
+
+    if (terminal) {
+      /** 与 Agent result 分开标记业务结论：Agent 成功结束也可能没有有效图片。 */
+      const failed = terminal.status === 'failed'
+      entries.push({
+        timestamp: terminal.completedAt ?? this.now(),
+        type: failed ? 'error' : 'status',
+        title: failed ? '设计任务失败' : terminal.status === 'succeeded' ? '设计任务完成'
+          : terminal.status === 'cancelled' ? '设计任务已取消' : '设计任务已中断',
+        ...(terminal.error ? { content: summarizeDesignExecutionError(terminal.error) } : {}),
+        isError: failed,
+      })
     }
 
     /** 当前任务的受信任 trace 路径，兼容尚未创建 traces 子目录的旧项目。 */

@@ -98,7 +98,8 @@ export interface MediaWorkflowDefinition {
 const MAX_PROMPT_NODES = 512
 const MAX_NODE_INPUTS = 128
 const MAX_PROMPT_INPUTS = 2_048
-const MAX_OBJECT_INFO_CLASSES = 2_048
+/** 单份 ComfyUI object_info 允许的节点类型上限，目录与严格快照解析共用。 */
+export const COMFY_OBJECT_INFO_MAX_CLASSES = 16_384
 const MAX_STRING_LENGTH = 16_384
 const MAX_JSON_DEPTH = 32
 const SAFE_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/
@@ -336,7 +337,8 @@ function parseInputMap(value: unknown): Record<string, ComfyNodeInputSchema> {
  * @returns 有界的节点 schema 映射。
  */
 export function parseComfyObjectInfo(value: unknown): ComfyObjectInfo {
-  if (!isRecord(value) || Object.keys(value).length > MAX_OBJECT_INFO_CLASSES) throw new Error('COMFY_OBJECT_INFO_INVALID')
+  if (!isRecord(value)) throw new Error('COMFY_OBJECT_INFO_INVALID')
+  if (Object.keys(value).length > COMFY_OBJECT_INFO_MAX_CLASSES) throw new Error('COMFY_OBJECT_INFO_SIZE_LIMIT')
   /** 解析后的 class schema。 */
   const result: ComfyObjectInfo = {}
   for (const [classType, rawSchema] of Object.entries(value)) {
@@ -454,7 +456,8 @@ function parseCatalogText(value: unknown): string | undefined {
  * @returns 包含受支持 schema 与不可执行目录占位的有界节点映射。
  */
 export function parseComfyObjectCatalog(value: unknown): ComfyObjectInfo {
-  if (!isRecord(value) || Object.keys(value).length > MAX_OBJECT_INFO_CLASSES) throw new Error('COMFY_OBJECT_INFO_INVALID')
+  if (!isRecord(value)) throw new Error('COMFY_OBJECT_INFO_INVALID')
+  if (Object.keys(value).length > COMFY_OBJECT_INFO_MAX_CLASSES) throw new Error('COMFY_OBJECT_INFO_SIZE_LIMIT')
   /** 兼容目录中的节点条目。 */
   const catalog: ComfyObjectInfo = {}
   for (const [classType, rawSchema] of Object.entries(value)) {

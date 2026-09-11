@@ -707,6 +707,8 @@ export async function runAgentHeadless(
     startedAt?: number
     runGeneration?: number
     resultSubtype?: string
+    /** 完成回调中的错误详情必须随终态一起传到业务执行器。 */
+    resultErrors?: string[]
   }): HeadlessAgentRunTerminalOptions => {
     /** 优先使用 completion 自带的权威代次，早期异常回退已捕获的启动代次。 */
     const terminalRunGeneration = options?.runGeneration ?? runGeneration
@@ -720,6 +722,7 @@ export async function runAgentHeadless(
       startedAt: options?.startedAt ?? activeStartedAt,
       ...(terminalRunGeneration !== undefined ? { runGeneration: terminalRunGeneration } : {}),
       ...(options?.resultSubtype !== undefined ? { resultSubtype: options.resultSubtype } : {}),
+      ...(options?.resultErrors?.length ? { resultErrors: [...options.resultErrors] } : {}),
     }
   }
   /** 仅在 headless 运行准入后绑定 renderer route。 */

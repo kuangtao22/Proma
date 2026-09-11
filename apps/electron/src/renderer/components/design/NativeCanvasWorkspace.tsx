@@ -127,6 +127,8 @@ import type {
   NativeCanvasWorkflowRunState,
 } from './NativeCanvasWorkflowRunDialog'
 import { NativeCanvasToolbar } from './NativeCanvasToolbar'
+import { NativeCanvasNodeNavigator } from './NativeCanvasNodeNavigator'
+import { createNativeCanvasNodeFocusUpdate } from './native-canvas-navigation'
 import { CanvasMediaModelPicker } from './CanvasMediaModelPicker'
 import { useCanvasMediaNodeProgress, useMediaRunProgress } from './use-media-run-progress'
 import type { MediaRunProgressProjection } from './use-media-run-progress'
@@ -145,6 +147,7 @@ import {
   isNativeCanvasPositionMutation,
   replayNativeCanvasPositionMutations,
   resolveNativeCanvasNodeSize,
+  resolveNativeCanvasImageNodeHeight,
 } from './native-canvas-model'
 import {
   createNativeCanvasArrangeCommand,
@@ -3739,6 +3742,25 @@ export function NativeCanvasWorkspace({
     setWorkbenchSwitchError(null)
   }, [state.authoritativeRecoveryState, updateAgentCanvasViewState, viewStateKey])
 
+  /** 浏览节点时读取最新快照与会话视口，避免菜单打开后移动或删除导致过期定位。 */
+  const navigateToCanvasNode = React.useCallback((nodeId: string): void => {
+    /** 导航只读当前共享图，不调用保存、运行或工作台切换。 */
+    const snapshot = store.get(nativeCanvasStatesAtom).get(stateKey)?.snapshot
+    const node = snapshot?.document.nodes.find((item) => item.id === nodeId)
+    if (!snapshot || !node) return
+    /** 复用图片预览与设备预设的真实几何，且只计算目标节点。 */
+    const size = resolveNativeCanvasNodeSize(node)
+    if (node.kind === 'image') {
+      size.height = resolveNativeCanvasImageNodeHeight(node.adoptedAssetId
+        ? snapshot.imagePreviews?.find((preview) => preview.assetId === node.adoptedAssetId)
+        : undefined)
+    }
+    /** 直接测量覆盖展开、缩放窗口后的最新边界；未挂载时保留现有视口。 */
+    const surface = canvasSurfaceRef.current?.getBoundingClientRect() ?? { width: 0, height: 0 }
+    updateAgentCanvasViewState({ key: viewStateKey,
+      update: (current) => createNativeCanvasNodeFocusUpdate(node, size, current.viewport, surface) })
+  }, [stateKey, store, updateAgentCanvasViewState, viewStateKey])
+
   /** 聚焦第一个问题节点并打开局部恢复面板。 */
   const focusFirstIssue = React.useCallback((): void => {
     const issue = state.snapshot?.nodeIssues[0]
@@ -4138,6 +4160,12 @@ export function NativeCanvasWorkspace({
               className="relative h-full min-w-0"
             >
               <NativeCanvasToolbar
+                nodeNavigator={<NativeCanvasNodeNavigator
+                  nodes={state.snapshot.document.nodes}
+                  edges={state.snapshot.document.edges}
+                  selectedNodeIds={validSelectedNodeIds}
+                  onNavigate={navigateToCanvasNode}
+                />}
                 mediaModelPicker={adapter.getImageModelSelection || adapter.mediaGetSettings ? <CanvasMediaModelPicker
                     key={`${target.projectId}:${target.canvasId}`}
                     projectId={target.projectId}

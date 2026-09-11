@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import type { CanvasNodeKind } from '@proma/shared'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { Tooltip } from '@/components/ui/tooltip'
+import { NativeCanvasNodeNavigator } from './NativeCanvasNodeNavigator'
 import {
   NATIVE_CANVAS_NODE_TYPE_OPTIONS,
   NativeCanvasToolbar,
@@ -66,6 +67,16 @@ function findElementPathByProperty(
 }
 
 describe('原生 Canvas 顶部工具栏', () => {
+  test('Given 只读画布 When 渲染工具栏 Then 节点查看入口可用且关闭时不挂载列表', () => {
+    /** 只读权限限制编辑，不限制浏览、搜索与会话内定位。 */
+    const html = renderToStaticMarkup(<NativeCanvasToolbar {...createToolbarProps()} writable={false}
+      nodeNavigator={<NativeCanvasNodeNavigator nodes={[]} edges={[]} selectedNodeIds={[]} onNavigate={() => undefined} />} />)
+    expect(html).toContain('aria-label="查看节点"')
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*aria-label="查看节点"/u)
+    expect(html).not.toMatch(/<button[^>]*aria-label="查看节点"[^>]*disabled=""/u)
+    expect(html).not.toContain('搜索画布节点')
+  })
+
   test('Given 可写 Canvas When 渲染工具栏 Then 添加入口公开悬浮菜单语义并保留既有命令', () => {
     const html = renderToStaticMarkup(<NativeCanvasToolbar {...createToolbarProps()} />)
 

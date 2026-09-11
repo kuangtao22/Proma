@@ -298,6 +298,7 @@ export class MediaRunService {
       this.dependencies.authorize(input.projectId, 'prepare', origin)
       const client = this.client(resolved.connection.baseUrl, resolved.headers)
       const schema = await this.selectedSchema(client, resolved.workflow.definition)
+      this.dependencies.authorize(input.projectId, 'prepare', origin)
       this.assertValid(resolved.workflow.definition, schema)
       const bindingKeys = new Set(resolved.workflow.definition.bindings.map((binding) => binding.key))
       if (Object.keys(inputs).some((key) => !bindingKeys.has(key))) throw new Error('MEDIA_INPUT_UNEXPECTED')
@@ -402,6 +403,7 @@ export class MediaRunService {
       this.dependencies.authorize(projectId, 'execute', manifest.origin)
       const client = this.resolveClient(manifest)
       const schema = await this.selectedSchema(client, manifest.workflow)
+      this.dependencies.authorize(projectId, 'execute', manifest.origin)
       if (stableHash(schema) !== manifest.schemaHash) throw new Error('MEDIA_SCHEMA_CHANGED')
       this.assertValid(manifest.workflow, schema)
       try {
@@ -716,11 +718,57 @@ export class MediaRunService {
     return this.client(resolved.connection.baseUrl, resolved.headers)
   }
 
-  /** 只固定当前图使用的节点 schema，避免无关节点安装使准备失效。 */
+  /**
+   * 仅查询当前图使用的节点接口；并发、总时长和累计 schema 体积均有界。
+   * @param client 固定到本次连接身份的客户端。
+   * @param workflow 已解析的工作流；同类节点只查询一次。
+   * @returns 完整相关 schema，任一请求失败则取消并等待所有在途读取结束。
+   */
   private async selectedSchema(client: MediaRunClient, workflow: MediaWorkflowDefinition): Promise<ComfyObjectInfo> {
-    const all = await client.objectInfo()
-    return Object.fromEntries([...new Set(Object.values(workflow.prompt).map((node) => node.class_type))].filter((name) => all[name]).map((name) => {
-      const schema = structuredClone(all[name]!)
+    /** 按图中出现顺序去重，保持历史 schema 序列稳定。 */
+    const names = [...new Set(Object.values(workflow.prompt).map((node) => node.class_type))]
+    /** 各读取协程仅写入自身 class 对应的结果。 */
+    const selected: ComfyObjectInfo = {}
+    /** 任一失败和整体截止时间共用取消信号。 */
+    const controller = new AbortController()
+    /** 下一个待查询 class；同步递增不会重复分配。 */
+    let nextIndex = 0
+    /** 累计保留的 schema 不超过原完整 JSON 响应的默认体积。 */
+    let schemaBytes = 0
+    /** 保留首个业务异常，避免后续取消掩盖认证或接口错误。 */
+    let failure: { error: unknown } | undefined
+    /** 多类查询整体沿用原单次目录读取的三十秒预算。 */
+    const deadline = setTimeout(() => controller.abort(new ComfyUIError('timeout', 'ComfyUI 节点接口读取超时')), 30_000)
+    /** 单个协程顺序领取节点类型，失败后不再发起后继请求。 */
+    const readNext = async (): Promise<void> => {
+      try {
+        while (!controller.signal.aborted) {
+          /** 本协程当前领取的 class。 */
+          const name = names[nextIndex++]
+          if (name === undefined) return
+          /** 请求路径由生产客户端编码，保留代理前缀、认证与响应体限制。 */
+          const response = await client.objectInfo(name, { signal: controller.signal })
+          controller.signal.throwIfAborted()
+          if (!Object.hasOwn(response, name)) continue
+          /** 缺失类交由工作流校验生成具体节点诊断；已有类必须完整保留。 */
+          const schema = structuredClone(response[name]!)
+          schemaBytes += Buffer.byteLength(JSON.stringify(schema), 'utf8')
+          if (schemaBytes > 8 * 1024 * 1024) throw new ComfyUIError('size-limit', '工作流节点接口总大小超出限制')
+          selected[name] = schema
+        }
+      } catch (error) {
+        failure ??= { error }
+        controller.abort(error)
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(4, names.length) }, () => readNext()))
+      if (failure) throw failure.error
+      controller.signal.throwIfAborted()
+    } finally { clearTimeout(deadline) }
+    return Object.fromEntries(names.filter((name) => Object.hasOwn(selected, name)).map((name) => {
+      /** 仅擦除动态上传目录值，其他 schema 继续参与准备/执行一致性检查。 */
+      const schema = selected[name]!
       const input = COMFY_CORE_NODE_CONTRACTS[name]?.resourceInput?.input
       if (input) {
         // 已上传文件目录是动态资源事实，不能把别的上传误判为 Loader schema 升级。

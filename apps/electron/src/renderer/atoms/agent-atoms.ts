@@ -934,11 +934,13 @@ export interface PersistedAgentCanvasWorkspaceState {
   openTabs: AgentCanvasWorkspaceTab[]
   /** 退出时位于前台的具体 Canvas；查看其它右侧标签时为 null。 */
   activeTab: AgentCanvasWorkspaceTab | null
+  /** 用户打开但尚未绑定具体 Canvas 时，保留“画布”入口的打开状态。 */
+  canvasLauncherOpen: boolean
 }
 
 /** 空 Canvas 工作区偏好，每次清洗均返回独立数组避免共享可变引用。 */
 function createEmptyAgentCanvasWorkspaceState(): PersistedAgentCanvasWorkspaceState {
-  return { openTabs: [], activeTab: null }
+  return { openTabs: [], activeTab: null, canvasLauncherOpen: false }
 }
 
 /** 将未知持久化值降级为严格、去重且内部一致的 Canvas 工作区偏好。 */
@@ -946,8 +948,8 @@ export function sanitizeAgentCanvasWorkspaceState(value: unknown): PersistedAgen
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return createEmptyAgentCanvasWorkspaceState()
   }
-  /** 未验证的本地存储对象只读取允许的两个字段。 */
-  const candidate = value as { openTabs?: unknown; activeTab?: unknown }
+  /** 未验证的本地存储对象只读取允许的标签、焦点与入口字段。 */
+  const candidate = value as { openTabs?: unknown; activeTab?: unknown; canvasLauncherOpen?: unknown }
   /** 按原始打开顺序收集合法具体 Canvas 标签。 */
   const openTabs: AgentCanvasWorkspaceTab[] = []
   /** 去重集合避免损坏值重复挂载同一 Canvas。 */
@@ -968,7 +970,7 @@ export function sanitizeAgentCanvasWorkspaceState(value: unknown): PersistedAgen
     && seenTabs.has(candidate.activeTab as AgentCanvasWorkspaceTab)
     ? candidate.activeTab as AgentCanvasWorkspaceTab
     : null
-  return { openTabs, activeTab }
+  return { openTabs, activeTab, canvasLauncherOpen: candidate.canvasLauncherOpen === true }
 }
 
 /** 将未知顶层本地存储值清洗为按普通 Agent 会话隔离的 Canvas 工作区状态。 */
@@ -976,15 +978,15 @@ export function sanitizeAgentCanvasWorkspaceStateMap(
   value: unknown,
 ): Record<string, PersistedAgentCanvasWorkspaceState> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  /** 只保存非空会话键和至少一张具体 Canvas，损坏条目独立降级。 */
+  /** 只保存非空会话键和已打开的具体画布或空入口，损坏条目独立降级。 */
   const entries = Object.entries(value)
     .filter(([sessionId]) => sessionId.length > 0)
     .map(([sessionId, state]) => [sessionId, sanitizeAgentCanvasWorkspaceState(state)] as const)
-    .filter(([, state]) => state.openTabs.length > 0)
+    .filter(([, state]) => state.openTabs.length > 0 || state.canvasLauncherOpen)
   return Object.fromEntries(entries)
 }
 
-/** 登记具体 Canvas 标签，并按调用方意图决定是否同时设为前台。 */
+/** 登记画布入口或具体 Canvas 标签；具体画布按调用方意图记录前台。 */
 export function rememberAgentCanvasWorkspaceTab(
   state: unknown,
   tab: AgentSidePanelTab | string,
@@ -992,6 +994,7 @@ export function rememberAgentCanvasWorkspaceTab(
 ): PersistedAgentCanvasWorkspaceState {
   /** 所有更新均从严格清洗后的状态开始，防止损坏 localStorage 扩散。 */
   const current = sanitizeAgentCanvasWorkspaceState(state)
+  if (tab === 'canvas') return { ...current, canvasLauncherOpen: true, activeTab: makeActive ? null : current.activeTab }
   if (!parseCanvasWorkspaceTab(tab)) return current
   /** parse 已证明该字符串符合具体 Canvas 标签合同。 */
   const canvasTab = tab as AgentCanvasWorkspaceTab
@@ -1001,6 +1004,8 @@ export function rememberAgentCanvasWorkspaceTab(
   return {
     openTabs,
     activeTab: makeActive ? canvasTab : current.activeTab,
+    // 具体 Canvas 已打开后，空 launcher 不再作为可恢复 Tab 残留。
+    canvasLauncherOpen: false,
   }
 }
 
@@ -1009,6 +1014,7 @@ export function setActiveAgentCanvasWorkspaceTab(
   state: unknown,
   tab: AgentSidePanelTab | string | null,
 ): PersistedAgentCanvasWorkspaceState {
+  if (tab === 'canvas') return rememberAgentCanvasWorkspaceTab(state, tab, true)
   /** 非 Canvas 标签表示用户当前正在查看其它右侧能力。 */
   if (!tab || !parseCanvasWorkspaceTab(tab)) {
     const current = sanitizeAgentCanvasWorkspaceState(state)
@@ -1024,12 +1030,14 @@ export function forgetAgentCanvasWorkspaceTab(
 ): PersistedAgentCanvasWorkspaceState {
   /** 所有更新均从严格清洗后的状态开始。 */
   const current = sanitizeAgentCanvasWorkspaceState(state)
+  if (tab === 'canvas') return { ...current, canvasLauncherOpen: false }
   if (!parseCanvasWorkspaceTab(tab)) return current
   /** parse 已证明该字符串符合具体 Canvas 标签合同。 */
   const canvasTab = tab as AgentCanvasWorkspaceTab
   return {
     openTabs: current.openTabs.filter((item) => item !== canvasTab),
     activeTab: current.activeTab === canvasTab ? null : current.activeTab,
+    canvasLauncherOpen: current.canvasLauncherOpen,
   }
 }
 
@@ -1056,11 +1064,11 @@ export function pruneAgentCanvasWorkspaceStates(
     }
     retainedIds.add(activeSessionId)
   }
-  /** 只保留仍有具体 Canvas 的严格状态，空状态没有持久化价值。 */
+  /** 保留已打开的具体画布或空入口，完全关闭的状态不占历史名额。 */
   const entries = Object.entries(states)
     .filter(([sessionId]) => retainedIds.has(sessionId))
     .map(([sessionId, state]) => [sessionId, sanitizeAgentCanvasWorkspaceState(state)] as const)
-    .filter(([, state]) => state.openTabs.length > 0)
+    .filter(([, state]) => state.openTabs.length > 0 || state.canvasLauncherOpen)
   return Object.fromEntries(entries)
 }
 

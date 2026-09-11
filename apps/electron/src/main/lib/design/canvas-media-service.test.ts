@@ -21,6 +21,7 @@ import {
 } from './canvas-media-service'
 import type { MediaRunOrigin } from '../media/media-run-service'
 import { MediaWorkflowValidationError } from '../media/media-workflow-error'
+import { ComfyUIError, type ComfyUIErrorKind } from '../media/comfyui-client'
 import { createCanvasMediaStore } from './canvas-media-store'
 
 const target: CanvasMediaTarget = {
@@ -701,7 +702,60 @@ describe('Canvas 通用媒体服务', () => {
     expect(JSON.stringify(store.current().config.preparation)).not.toContain('Bearer secret')
   })
 
-  test('Given 未知准备异常包含敏感正文 When 运行失败 Then 仅持久化稳定中文错误并继续抛出原异常', async () => {
+  test.each([
+    ['COMFY_OBJECT_INFO_SIZE_LIMIT', 'ComfyUI 节点目录超过安全处理上限，请更新应用；若仍失败，请精简服务端自定义节点。'],
+    ['COMFY_OBJECT_INFO_INVALID', '节点接口响应失效，请刷新 ComfyUI 节点目录后重试。'],
+  ])('Given ComfyUI 节点目录错误 %s When 准备失败 Then 持久化并抛出确定性中文诊断', async (code, message) => {
+    const fixture = createPersistentStore(createStore().current())
+    try {
+      const service = createService(fixture.store, run(), undefined, async () => {
+        throw new Error(`${code}: /private/path token=secret-value`)
+      })
+      const input = { ...target, expectedConfigRevision: 2, operationId: `catalog-${code}` }
+
+      await expect(service.run(input, origin)).rejects.toThrow(`${code}: ${message}`)
+
+      const failed = await fixture.store.load(target)
+      expect(failed.config.revision).toBe(input.expectedConfigRevision)
+      expect(failed.config.preparation).toEqual({ code, message })
+      expect(JSON.stringify(failed.config.preparation)).not.toContain('/private/path')
+      expect(JSON.stringify(failed.config.preparation)).not.toContain('secret-value')
+    } finally {
+      fixture.cleanup()
+    }
+  })
+
+  test.each([
+    ['timeout', 'COMFYUI_REQUEST_TIMEOUT', '连接 ComfyUI 超时，请检查服务状态后重试。'],
+    ['size-limit', 'COMFYUI_RESPONSE_SIZE_LIMIT', 'ComfyUI 响应超过安全大小上限，请更新应用；若仍失败，请精简服务端自定义节点。'],
+    ['authentication', 'COMFYUI_AUTHENTICATION_REQUIRED', 'ComfyUI 认证失败，请检查连接凭据和访问权限。'],
+    ['network', 'COMFYUI_NETWORK_UNAVAILABLE', '无法连接 ComfyUI，请检查服务地址和网络状态后重试。'],
+  ])('Given ComfyUI %s 错误含敏感正文 When 准备失败 Then 按稳定类别持久化并抛出固定诊断', async (kind, code, message) => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      throw new ComfyUIError(kind as ComfyUIErrorKind, '/private/path token=secret-value')
+    })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: `comfy-${kind}` }, origin,
+    )).rejects.toThrow(`${code}: ${message}`)
+    expect(store.current().config.preparation).toEqual({ code, message })
+    expect(JSON.stringify(store.current().config.preparation)).not.toContain('/private/path')
+    expect(JSON.stringify(store.current().config.preparation)).not.toContain('secret-value')
+  })
+
+  test('Given 已有稳定媒体文件占用码 When 准备失败 Then 保留原码供 Renderer 提示恢复动作', async () => {
+    const store = createStore()
+    const service = createService(store, run(), undefined, async () => {
+      throw new Error('MEDIA_FILE_BUSY')
+    })
+
+    await expect(service.run(
+      { ...target, expectedConfigRevision: 2, operationId: 'media-file-busy' }, origin,
+    )).rejects.toThrow('MEDIA_FILE_BUSY')
+  })
+
+  test('Given 未知准备异常包含敏感正文 When 运行失败 Then 持久化并抛出同一稳定中文错误', async () => {
     const store = createStore()
     const service = createService(store, run(), undefined, async () => {
       throw new Error('token=secret-value')
@@ -709,7 +763,7 @@ describe('Canvas 通用媒体服务', () => {
 
     await expect(service.run(
       { ...target, expectedConfigRevision: 2, operationId: 'unknown-error' }, origin,
-    )).rejects.toThrow('token=secret-value')
+    )).rejects.toThrow('CANVAS_MEDIA_PREPARATION_FAILED: 媒体工作流准备失败，请检查工作流、连接和输入配置。')
 
     expect(store.current().config.preparation).toEqual({
       code: 'CANVAS_MEDIA_PREPARATION_FAILED',
@@ -732,7 +786,7 @@ describe('Canvas 通用媒体服务', () => {
 
     await expect(service.run(
       { ...target, expectedConfigRevision: 2, operationId: 'late-error' }, origin,
-    )).rejects.toThrow('迟到失败')
+    )).rejects.toThrow('CANVAS_MEDIA_PREPARATION_FAILED: 媒体工作流准备失败，请检查工作流、连接和输入配置。')
 
     expect(store.current().config.revision).toBe(3)
     expect(store.current().config).not.toHaveProperty('preparation')

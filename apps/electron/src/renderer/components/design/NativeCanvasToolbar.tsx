@@ -86,6 +86,8 @@ export interface NativeCanvasToolbarProps {
   onFocusFirstIssue: () => void
   /** 由画布文档保存的媒体模型候选范围控件。 */
   mediaModelPicker?: React.ReactNode
+  /** 节点浏览只更新会话视图，不受画布编辑权限限制。 */
+  nodeNavigator?: React.ReactNode
 }
 
 /** 根据节点类型返回稳定图标，避免菜单标签承担全部识别负担。 */
@@ -160,6 +162,7 @@ export function NativeCanvasToolbar({
   onArrangeAll,
   onFocusFirstIssue,
   mediaModelPicker,
+  nodeNavigator,
 }: NativeCanvasToolbarProps): React.ReactElement {
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
@@ -169,6 +172,7 @@ export function NativeCanvasToolbar({
         onPointerDown={(event) => event.stopPropagation()}
       >
         {mediaModelPicker}
+        {nodeNavigator}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button

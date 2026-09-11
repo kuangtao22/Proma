@@ -346,9 +346,15 @@ export function expandComfyNodeInputs(
           }
         }
       }
-      /** 当前 schema 应写入的必填或可选映射。 */
-      const targetMap = target === 'required' ? required : optional
+      /** V3 嵌套动态选择器仅在提供扁平键时激活；普通分支参数和顶层入口仍按声明必填。
+       * 对齐 _io.py DynamicCombo 的 live_inputs 语义，同时避免将缺少 execute 实参误当可运行。
+       */
+      const executionRequired = target === 'required'
+        && (!prefix || inputSchema[0] !== 'COMFY_DYNAMICCOMBO_V3' || Object.hasOwn(values, fullName))
+      /** 保留未激活选择器的合法字段身份，避免影响绑定识别。 */
+      const targetMap = executionRequired ? required : optional
       targetMap[fullName] = inputSchema
+      // UI 导入按声明顺序逐个读取控件，仍需保留尚未读到值的 required 动态控件。
       ordered.push({ name: fullName, schema: inputSchema, required: target === 'required' })
       /** 当前动态分支选择值。 */
       const selected = values[fullName]

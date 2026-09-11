@@ -21,6 +21,7 @@ import type {
   ImageGenerationModelSnapshot,
   SDKAssistantMessage,
   SDKMessage,
+  SDKResultMessage,
   SDKToolResultBlock,
   SDKToolUseBlock,
   SDKUserMessage,
@@ -36,6 +37,7 @@ import {
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
+import type { HeadlessAgentRunTerminalOptions } from '../agent-headless-runner-registry'
 import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
 import { runSafeImageModelOperation } from '../image-generation-model-error'
 import { resolveProjectInstructions } from '../project-instruction-resolver'
@@ -47,7 +49,8 @@ import type {
 import type { DesignContextOrchestrator } from './design-context-orchestrator'
 import { isSafeDesignStableId } from './design-paths'
 import type { DesignStore } from './design-store'
-import type { DesignTraceWriteResult } from './design-trace-store'
+import type { DesignTraceStore } from './design-trace-store'
+import { formatDesignExecutionError, summarizeDesignExecutionError } from './design-execution-error'
 import type {
   CanvasImageJobTarget,
   CanvasImageJobTargetAdapter,
@@ -162,7 +165,7 @@ const LEGACY_STORED_JOB_FIELDS = new Set([
 /** Headless Agent 回调的窄接口。 */
 interface DesignHeadlessCallbacks {
   onError: (error: string) => void
-  onComplete: (messages?: AgentMessage[]) => void
+  onComplete: (messages?: AgentMessage[], options?: HeadlessAgentRunTerminalOptions) => void
   onTitleUpdated: (title: string) => void
   source: 'design'
 }
@@ -226,7 +229,7 @@ export interface DesignJobManagerDependencies {
   stopAgent: (sessionId: string) => void | Promise<void>
   /** 保存并按需读取 Design trace，不向 Manager 暴露实际文件路径。 */
   traceStore: {
-    writeFromMessages: (projectId: string, jobId: string, messages: SDKMessage[]) => DesignTraceWriteResult
+    writeFromMessages: DesignTraceStore['writeFromMessages']
     read: (projectId: string, jobId: string) => NonNullable<DesignTaskDetails['trace']>
     delete: (projectId: string, jobId: string) => void
   }
@@ -889,6 +892,8 @@ export class DesignJobManager {
       start.accept()
       let runError: string | undefined
       let messages: AgentMessage[] = []
+      /** 失败可能只出现在完成回调中，不能以 onError 是否调用作为成功依据。 */
+      let terminalOptions: HeadlessAgentRunTerminalOptions | undefined
       try {
         await this.dependencies.runHeadless({
           sessionId: session.id,
@@ -902,7 +907,10 @@ export class DesignJobManager {
         }, {
           source: 'design',
           onError: (error) => { runError ??= error },
-          onComplete: (completedMessages) => { messages = completedMessages ?? [] },
+          onComplete: (completedMessages, options) => {
+            messages = completedMessages ?? []
+            terminalOptions = options
+          },
           onTitleUpdated: () => undefined,
         }, {
           piCustomTools: contextRun.tools,
@@ -937,16 +945,43 @@ export class DesignJobManager {
       }
       const latest = this.requireJob(jobId)
       if (latest.status === 'cancelled' || latest.status === 'interrupted') return
+      /** 本轮 SDK 消息只读取一次，并兼容尚未提供终态参数的 headless 调用方。 */
+      const sdkMessages = this.dependencies.getSessionMessages(session.id)
+      /** 合成压缩结果不代表本轮 Agent 执行终态。 */
+      const result = sdkMessages.findLast((message): message is SDKResultMessage =>
+        message.type === 'result' && !message.isSyntheticCompactionResult)
+      /** 旧 Orchestrator 可能在 result 前退出，只留下结构化 assistant.error。 */
+      const assistantFailure = sdkMessages.findLast((message): message is SDKAssistantMessage =>
+        message.type === 'assistant' && Boolean((message as SDKAssistantMessage).error))?.error
+      if (terminalOptions?.status === 'cancelled' || result?.terminal_reason === 'aborted') {
+        this.updateStatus(latest, 'cancelled', { error: undefined })
+        return
+      }
       if (runError) {
         this.updateStatus(latest, 'failed', { error: runError })
         return
       }
+      if (terminalOptions?.status === 'errored' || (result && result.subtype !== 'success')
+        || (!terminalOptions && !result && assistantFailure)) {
+        /** 图片工具失败详情优先；否则保留规划模型或运行时的真实失败原因。 */
+        const imageToolError = this.findImageToolError(sdkMessages) ?? this.findImageToolError(messages)
+        this.updateStatus(latest, 'failed', {
+          error: imageToolError ?? formatDesignExecutionError(
+            terminalOptions?.resultErrors?.some((error) => error.trim())
+              ? terminalOptions.resultErrors
+              : result?.errors?.some((error) => error.trim()) ? result.errors
+                : assistantFailure ? [assistantFailure.message] : undefined,
+            terminalOptions?.resultSubtype ?? result?.subtype ?? assistantFailure?.errorType,
+          ),
+        })
+        return
+      }
       /** 完成回调兼容旧消息；当前 Pi 的结构化附件以持久化 SDK 消息为权威事实。 */
       const outputPath = this.findOwnedOutputPath(messages, session.id)
-        ?? this.findOwnedOutputPath(this.dependencies.getSessionMessages(session.id), session.id)
+        ?? this.findOwnedOutputPath(sdkMessages, session.id)
       if (!outputPath) {
         /** SDK 持久化消息最接近真实工具边界，优先于兼容 AgentMessage。 */
-        const imageToolError = this.findImageToolError(this.dependencies.getSessionMessages(session.id))
+        const imageToolError = this.findImageToolError(sdkMessages)
           ?? this.findImageToolError(messages)
         this.updateStatus(latest, 'failed', { error: imageToolError ?? DESIGN_JOB_OUTPUT_ERROR })
         return
@@ -1586,7 +1621,9 @@ export class DesignJobManager {
     if (job.traceState !== 'ready') {
       try {
         const messages = this.dependencies.getSessionMessages(sessionId)
-        const written = this.dependencies.traceStore.writeFromMessages(job.projectId, job.id, messages)
+        const written = this.dependencies.traceStore.writeFromMessages(job.projectId, job.id, messages, {
+          status: job.status, error: job.error, completedAt: job.completedAt,
+        })
         job = this.updateStatus(job, job.status, {
           ...written.summary,
           contextReferences: job.contextReferences ?? written.summary.contextReferences,
@@ -2137,6 +2174,8 @@ export class DesignJobManager {
     const next: StoredDesignJob = {
       ...job,
       ...updates,
+      /** 所有失败入口在写 journal/发事件前统一脱敏；不改写旧记录或未更新的字段。 */
+      ...(typeof updates.error === 'string' ? { error: summarizeDesignExecutionError(updates.error) } : {}),
       status,
       ...(status === 'running' && job.startedAt === undefined ? { startedAt: now } : {}),
       ...(TERMINAL_JOB_STATUSES.has(status) && job.completedAt === undefined ? { completedAt: now } : {}),

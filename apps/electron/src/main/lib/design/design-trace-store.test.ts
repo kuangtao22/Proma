@@ -100,6 +100,61 @@ describe('DesignTraceStore', () => {
     expect(existsSync(join(paths.tracesDir, 'job-1.jsonl'))).toBe(true)
   })
 
+  test('Given Pi 只有错误 result When 转存 trace Then 保留失败原因而不是写空文件', () => {
+    /** 复现没有图片工具调用的规划模型失败。 */
+    const result = store.writeFromMessages('project-1', 'job-1', [{
+      type: 'result', subtype: 'error_during_execution', errors: ['Request timed out.'],
+    }])
+
+    expect(result.entryCount).toBe(1)
+    expect(store.read('project-1', 'job-1')).toEqual([{
+      timestamp: 100, type: 'error', title: 'Agent 执行失败',
+      content: '设计任务执行失败：模型请求超时。Request timed out.', isError: true,
+    }])
+  })
+
+  test('Given 上游错误包含凭据路径和长正文 When 转存 trace Then 有界脱敏并保留 HTTP 原因', () => {
+    store.writeFromMessages('project-1', 'job-1', [{
+      type: 'result', subtype: 'error_during_execution', errors: [
+        'HTTP 503: unavailable Authorization: Bearer secret-token apiKey="secret-key" '
+        + '/Users/example/request.json https://user:password@example.test/api?key=secret '
+        + 'x'.repeat(10_000),
+      ],
+    }])
+    /** 直接检查落盘内容，不能依赖详情接口再次脱敏。 */
+    const persisted = readFileSync(join(paths.tracesDir, 'job-1.jsonl'), 'utf8')
+
+    expect(persisted).toContain('HTTP 503: unavailable')
+    expect(persisted).not.toContain('secret')
+    expect(persisted).not.toContain('/Users/example')
+    expect(persisted).not.toContain('password')
+    expect(persisted.length).toBeLessThan(1024)
+  })
+
+  test('Given Pi 只保存 TypedError 消息 When 转存 trace Then 使用结构化错误而非自然语言正文', () => {
+    store.writeFromMessages('project-1', 'job-1', [{
+      type: 'assistant', parent_tool_use_id: null,
+      message: { content: [{ type: 'text', text: '未执行的图片生成计划' }] },
+      error: { message: 'Request timed out.', errorType: 'network_error' },
+    }])
+
+    expect(store.read('project-1', 'job-1')).toEqual([{
+      timestamp: 100, type: 'error', title: 'Agent 执行失败',
+      content: '设计任务执行失败：模型请求超时。Request timed out.', isError: true,
+    }])
+  })
+
+  test('Given 异常早于 SDK result When 保存任务终态 Then 留下可读失败证据供清理后查看', () => {
+    store.writeFromMessages('project-1', 'job-1', [], {
+      status: 'failed', error: '设计任务执行失败：模型请求超时。Request timed out.', completedAt: 123,
+    })
+
+    expect(store.read('project-1', 'job-1')).toEqual([{
+      timestamp: 123, type: 'error', title: '设计任务失败',
+      content: '设计任务执行失败：模型请求超时。Request timed out.', isError: true,
+    }])
+  })
+
   test('Given 工具详情含敏感和大字段 When 写入 trace Then 只保存白名单事实', () => {
     const result = store.writeFromMessages('project-1', 'job-1', createSdkMessages())
 

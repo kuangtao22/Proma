@@ -10,6 +10,7 @@ import {
   agentSessionPendingMentionsAtom,
   agentSessionStreamingStateAtomFamily,
   agentStreamingStatesAtom,
+  agentCanvasWorkspaceStateMapAtom,
   applyAgentEvent,
   clearAgentStreamError,
   forgetAgentCanvasWorkspaceTab,
@@ -37,9 +38,9 @@ describe('Agent 右侧画布标签', () => {
     expect(sanitizeAgentCanvasWorkspaceState({
       openTabs: ['canvas', 'files', 'canvas:valid', 'canvas:valid', 'canvas:'],
       activeTab: 'canvas:missing',
-    })).toEqual({ openTabs: ['canvas:valid'], activeTab: null })
+    })).toEqual({ openTabs: ['canvas:valid'], activeTab: null, canvasLauncherOpen: false })
 
-    expect(sanitizeAgentCanvasWorkspaceState(null)).toEqual({ openTabs: [], activeTab: null })
+    expect(sanitizeAgentCanvasWorkspaceState(null)).toEqual({ openTabs: [], activeTab: null, canvasLauncherOpen: false })
   })
 
   test('Given 顶层 localStorage 不是合法 Record When 清洗 Then 坏值降级且不影响其它会话', () => {
@@ -48,7 +49,7 @@ describe('Agent 右侧画布标签', () => {
       'session-a': { openTabs: ['canvas:a'], activeTab: 'canvas:a' },
       'session-empty': { openTabs: 'broken', activeTab: 42 },
     })).toEqual({
-      'session-a': { openTabs: ['canvas:a'], activeTab: 'canvas:a' },
+      'session-a': { openTabs: ['canvas:a'], activeTab: 'canvas:a', canvasLauncherOpen: false },
     })
   })
 
@@ -67,11 +68,50 @@ describe('Agent 右侧画布标签', () => {
       'canvas:b',
     )
 
-    expect(opened).toEqual({ openTabs: ['canvas:a'], activeTab: null })
-    expect(activated).toEqual({ openTabs: ['canvas:a', 'canvas:b'], activeTab: 'canvas:b' })
-    expect(backgrounded).toEqual({ openTabs: ['canvas:a', 'canvas:b'], activeTab: null })
-    expect(closedBackground).toEqual({ openTabs: ['canvas:b'], activeTab: null })
-    expect(closedActive).toEqual({ openTabs: [], activeTab: null })
+    expect(opened).toMatchObject({ openTabs: ['canvas:a'], activeTab: null, canvasLauncherOpen: false })
+    expect(activated).toMatchObject({ openTabs: ['canvas:a', 'canvas:b'], activeTab: 'canvas:b', canvasLauncherOpen: false })
+    expect(backgrounded).toMatchObject({ openTabs: ['canvas:a', 'canvas:b'], activeTab: null, canvasLauncherOpen: false })
+    expect(closedBackground).toMatchObject({ openTabs: ['canvas:b'], activeTab: null, canvasLauncherOpen: false })
+    expect(closedActive).toMatchObject({ openTabs: [], activeTab: null, canvasLauncherOpen: false })
+  })
+
+  test('Given 未绑定 Canvas 的画布入口 When 打开、切换会话和关闭 Then 只记住当前会话入口', () => {
+    const opened = rememberAgentCanvasWorkspaceTab(undefined, 'canvas', true)
+    expect(opened).toEqual({ openTabs: [], activeTab: null, canvasLauncherOpen: true })
+    expect(sanitizeAgentCanvasWorkspaceState({ canvasLauncherOpen: true })).toEqual(opened)
+    expect(forgetAgentCanvasWorkspaceTab(opened, 'canvas')).toEqual({ openTabs: [], activeTab: null, canvasLauncherOpen: false })
+  })
+
+  test('Given launcher-only 状态写入按会话 Map When 清洗往返 Then 保留入口且不串会话', () => {
+    /** 使用真实读写 atom，再经过序列化和历史裁剪模拟重启路径。 */
+    const store = createStore()
+    store.set(agentCanvasWorkspaceStateMapAtom, {
+      'session-a': { openTabs: [], activeTab: null, canvasLauncherOpen: true },
+      'session-b': { openTabs: ['canvas:bound'], activeTab: 'canvas:bound', canvasLauncherOpen: false },
+    })
+    const stored = pruneAgentCanvasWorkspaceStates(sanitizeAgentCanvasWorkspaceStateMap(
+      JSON.parse(JSON.stringify(store.get(agentCanvasWorkspaceStateMapAtom)))), [], 'session-a')
+    expect(stored).toEqual({
+      'session-a': { openTabs: [], activeTab: null, canvasLauncherOpen: true },
+      'session-b': { openTabs: ['canvas:bound'], activeTab: 'canvas:bound', canvasLauncherOpen: false },
+    })
+    store.set(agentCanvasWorkspaceStateMapAtom, { ...stored,
+      'session-a': forgetAgentCanvasWorkspaceTab(stored['session-a'], 'canvas') })
+    expect(store.get(agentCanvasWorkspaceStateMapAtom)).toEqual({ 'session-b': stored['session-b']! })
+  })
+
+  test('Given 从空入口打开具体画布 When 关闭具体画布 Then 不恢复已替换的空入口', () => {
+    const opened = rememberAgentCanvasWorkspaceTab(undefined, 'canvas', true)
+    const bound = rememberAgentCanvasWorkspaceTab(opened, 'canvas:a', true)
+    expect(bound.canvasLauncherOpen).toBe(false)
+    expect(sanitizeAgentCanvasWorkspaceStateMap({ session: forgetAgentCanvasWorkspaceTab(bound, 'canvas:a') })).toEqual({})
+  })
+
+  test('Given 画布入口已打开 When 查看其它模块 Then 保留入口且清除具体画布焦点', () => {
+    const previous = rememberAgentCanvasWorkspaceTab(undefined, 'canvas:a', true)
+    const launcher = setActiveAgentCanvasWorkspaceTab(previous, 'canvas')
+    expect(launcher.activeTab).toBeNull()
+    expect(setActiveAgentCanvasWorkspaceTab(launcher, 'mcp').canvasLauncherOpen).toBe(true)
   })
 
   test('Given 超过上限的历史会话 When 裁剪 Then 保留最近 50 个并始终保留当前会话', () => {
@@ -85,7 +125,7 @@ describe('Agent 右侧画布标签', () => {
       sessions.map((session) => {
         /** 模板字符串在测试边界显式收紧为具体 Canvas 标签。 */
         const canvasTab = `canvas:${session.id}` as AgentCanvasWorkspaceTab
-        return [session.id, { openTabs: [canvasTab], activeTab: canvasTab }]
+        return [session.id, { openTabs: [canvasTab], activeTab: canvasTab, canvasLauncherOpen: false }]
       }),
     )
 

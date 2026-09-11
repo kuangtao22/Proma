@@ -449,7 +449,7 @@ export class CanvasMediaDraftLoadGuard {
   }
 }
 
-/** 可恢复错误只匹配完整错误码，保留未知错误的原始证据。 */
+/** 可恢复错误只匹配完整错误码，所有展示文本均由 Renderer 本地确定。 */
 const CANVAS_MEDIA_RECOVERY_MESSAGES: Readonly<Record<string, string>> = {
   MEDIA_FILE_BUSY: '媒体数据正在被其他操作使用，请稍后重试。',
   CANVAS_MEDIA_CONNECT_UNAVAILABLE: '当前画布不可编辑，请恢复写权限后重试。',
@@ -459,15 +459,91 @@ const CANVAS_MEDIA_RECOVERY_MESSAGES: Readonly<Record<string, string>> = {
   CANVAS_MEDIA_CONFIG_CONFLICT: '输入配置已变化，请重新打开详情核对来源后重试。',
   CANVAS_REVISION_CONFLICT: '画布已被其他操作更新，请重新打开详情后重试。',
   CANVAS_MEDIA_TARGET_INVALID: '媒体节点已变化，请重新打开该节点的详情。',
+  COMFY_OBJECT_INFO_SIZE_LIMIT: 'ComfyUI 节点目录超过安全处理上限，请更新应用；若仍失败，请精简服务端自定义节点。',
+  COMFY_OBJECT_INFO_INVALID: '节点接口响应失效，请刷新 ComfyUI 节点目录后重试。',
+  COMFYUI_REQUEST_TIMEOUT: '连接 ComfyUI 超时，请检查服务状态后重试。',
+  COMFYUI_RESPONSE_SIZE_LIMIT: 'ComfyUI 响应超过安全大小上限，请更新应用；若仍失败，请精简服务端自定义节点。',
+  COMFYUI_AUTHENTICATION_REQUIRED: 'ComfyUI 认证失败，请检查连接凭据和访问权限。',
+  COMFYUI_NETWORK_UNAVAILABLE: '无法连接 ComfyUI，请检查服务地址和网络状态后重试。',
+}
+
+/** 工作流错误码对应的本地文案；绝不采用 IPC 携带的原因文本。 */
+const CANVAS_MEDIA_WORKFLOW_ISSUE_MESSAGES: Readonly<Record<string, string>> = {
+  NODE_CLASS_UNKNOWN: '服务器未安装该节点',
+  NODE_CLASS_UNSAFE: '节点没有安全执行合同',
+  NODE_INTERFACE_UNSUPPORTED: '服务器未提供可验证的节点接口',
+  INPUT_REQUIRED: '缺少必填输入',
+  INPUT_UNKNOWN: '输入不在节点接口中',
+  INPUT_HIDDEN: '输入不可由工作流提交',
+  INPUT_ENUM_INVALID: '输入不在服务器允许选项中',
+  INPUT_TYPE_INVALID: '输入类型与服务器要求不匹配',
+  INPUT_RANGE_INVALID: '数值超出服务器允许范围',
+  LINK_NODE_UNKNOWN: '连接来源节点不存在',
+  LINK_TYPE_INVALID: '连接两端类型不兼容',
+  LINK_LIST_UNSUPPORTED: '当前不支持列表连接',
+  OUTPUT_INDEX_INVALID: '连接引用了不存在的输出',
+  WORKFLOW_CYCLE: '工作流包含循环依赖',
+  OUTPUT_REQUIRED: '缺少可收集的输出节点',
+  OUTPUT_SELECTOR_INVALID: '输出选择器无效',
+  OUTPUT_MEDIA_UNSUPPORTED: '输出媒体类型未适配',
+  OUTPUT_DECLARATION_REQUIRED: '输出节点缺少可收集声明',
+  OUTPUT_PREFIX_INVALID: '输出目录前缀不安全',
+  BINDING_TARGET_INVALID: '媒体绑定目标无效',
+  RESOURCE_BINDING_REQUIRED: '资源输入必须使用受管素材绑定',
+  RESOURCE_CONSTANT_FORBIDDEN: '资源输入不能直接写入远端路径',
+  RESOURCE_ENUM_REQUIRED: '资源输入缺少服务器文件枚举合同',
+  RESOURCE_CONTRACT_REQUIRED: '资源输入缺少安全上传合同',
+}
+
+/** 从可信工作流错误合同重建最多四项中文诊断，并保留安全节点和字段定位。 */
+function formatCanvasMediaWorkflowValidationError(message: string): string | null {
+  if (!message.startsWith('MEDIA_WORKFLOW_INVALID:')) return null
+  /** 主进程错误类最多公开四项，Renderer 再次限长以防伪造的 IPC 文本扩大展示。 */
+  const descriptions = message.slice('MEDIA_WORKFLOW_INVALID:'.length).split('|').slice(0, 4).flatMap((item) => {
+    /** 原因正文不可信，只读取稳定 code 与受限定位符。 */
+    const match = /^([A-Z0-9_]{1,96})(?:@([A-Za-z0-9_.:-]{1,513}))?:/.exec(item)
+    if (!match) return []
+    const code = match[1]!
+    const location = match[2]
+    const reason = CANVAS_MEDIA_WORKFLOW_ISSUE_MESSAGES[code] ?? '工作流结构不满足安全执行要求'
+    if (!location) return [`${reason}。（${code}）`]
+    /** 旧 wire 用点拼接两个均可含点的字段，无法无歧义拆分，因此完整保留中性定位。 */
+    return [`位置 ${location}：${reason}。（${code}）`]
+  })
+  return descriptions.length > 0 ? `工作流校验失败：${descriptions.join('；')}` : null
+}
+
+/** 从 Canvas 准备错误的安全 key/nodeId/input 三元组重建输入诊断。 */
+function formatCanvasMediaInputPreparationError(message: string): string | null {
+  /** 仅支持已有准备错误类产生的三种输入码，拒绝任意错误正文。 */
+  const match = /^(CANVAS_MEDIA_INPUT_REQUIRED|CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH|CANVAS_MEDIA_INPUT_INVALID):[\s\S]*（key=([A-Za-z0-9_.:-]{1,256})，nodeId=([A-Za-z0-9_.:-]{1,256})，input=([A-Za-z0-9_.:-]{1,256})）。?$/.exec(message)
+  if (!match) return null
+  const code = match[1]!
+  const key = match[2]!
+  const nodeId = match[3]!
+  const input = match[4]!
+  const description = code === 'CANVAS_MEDIA_INPUT_REQUIRED'
+    ? `输入 ${key} 未配置`
+    : code === 'CANVAS_MEDIA_INPUT_CONTRACT_MISMATCH'
+      ? `输入 ${key} 与工作流字段类型不匹配`
+      : `输入 ${key} 的值不符合字段约束`
+  return `${description}（节点 ${nodeId} 的字段 ${input}）。（${code}）`
 }
 
 /** 把未知异常收敛为工作台可展示文本；入参为本地或 IPC 异常，返回恢复说明。 */
 export function getCanvasMediaErrorMessage(cause: unknown, fallback: string): string {
   if (!(cause instanceof Error) || !cause.message.trim()) return fallback
   /** Electron 包装只影响传输前缀，不改变业务错误码。 */
-  const code = cause.message.replace(/^Error invoking remote method '[^']+': Error: /, '')
+  const message = cause.message.replace(/^Error invoking remote method '[^']+': Error: /, '')
+  const workflowMessage = formatCanvasMediaWorkflowValidationError(message)
+  if (workflowMessage) return workflowMessage
+  const inputMessage = formatCanvasMediaInputPreparationError(message)
+  if (inputMessage) return inputMessage
+  /** 普通业务错误只读取首个稳定 code；其余正文可能含路径、凭据或堆栈。 */
+  const code = /^([A-Z0-9_]{1,96})(?::|$)/.exec(message)?.[1]
+  if (!code) return fallback
   const recovery = CANVAS_MEDIA_RECOVERY_MESSAGES[code]
-  return recovery ? `${recovery}（${code}）` : cause.message
+  return recovery ? `${recovery}（${code}）` : fallback
 }
 
 /** 保存配置成功后才启动运行，避免运行消费未提交草稿。 */

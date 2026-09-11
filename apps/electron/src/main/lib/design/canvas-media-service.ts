@@ -22,6 +22,7 @@ import type {
 } from '@proma/shared'
 import { getCanvasMediaInputErrorMessage, validateMediaWorkflowFieldValue } from '@proma/shared'
 import type { MediaRunOrigin } from '../media/media-run-service'
+import { ComfyUIError, type ComfyUIErrorKind } from '../media/comfyui-client'
 import { MediaWorkflowValidationError } from '../media/media-workflow-error'
 
 /** 可安全持久化并向调用方抛出的工作流准备错误。 */
@@ -35,6 +36,66 @@ export class CanvasMediaPreparationError extends Error {
     this.name = 'CanvasMediaPreparationError'
     this.issue = boundedIssue
   }
+}
+
+/** ComfyUI 节点目录错误只映射为固定文案，避免底层响应、路径或凭据进入持久状态和 IPC。 */
+const COMFY_OBJECT_INFO_PREPARATION_ISSUES: Readonly<Record<string, CanvasMediaPreparationIssue>> = {
+  COMFY_OBJECT_INFO_SIZE_LIMIT: {
+    code: 'COMFY_OBJECT_INFO_SIZE_LIMIT',
+    message: 'ComfyUI 节点目录超过安全处理上限，请更新应用；若仍失败，请精简服务端自定义节点。',
+  },
+  COMFY_OBJECT_INFO_INVALID: {
+    code: 'COMFY_OBJECT_INFO_INVALID',
+    message: '节点接口响应失效，请刷新 ComfyUI 节点目录后重试。',
+  },
+}
+
+/** ComfyUI 传输错误按稳定 kind 映射，禁止使用可能含地址、路径或凭据的 message。 */
+const COMFYUI_PREPARATION_ISSUES: Readonly<Partial<Record<ComfyUIErrorKind, CanvasMediaPreparationIssue>>> = {
+  timeout: {
+    code: 'COMFYUI_REQUEST_TIMEOUT',
+    message: '连接 ComfyUI 超时，请检查服务状态后重试。',
+  },
+  'size-limit': {
+    code: 'COMFYUI_RESPONSE_SIZE_LIMIT',
+    message: 'ComfyUI 响应超过安全大小上限，请更新应用；若仍失败，请精简服务端自定义节点。',
+  },
+  authentication: {
+    code: 'COMFYUI_AUTHENTICATION_REQUIRED',
+    message: 'ComfyUI 认证失败，请检查连接凭据和访问权限。',
+  },
+  network: {
+    code: 'COMFYUI_NETWORK_UNAVAILABLE',
+    message: '无法连接 ComfyUI，请检查服务地址和网络状态后重试。',
+  },
+}
+
+/** 将准备阶段异常收敛为既有可信错误类，供持久化与 IPC 使用同一诊断。 */
+function normalizeCanvasMediaPreparationError(
+  error: unknown,
+): Error {
+  if (error instanceof CanvasMediaPreparationError || error instanceof MediaWorkflowValidationError) return error
+  if (error instanceof ComfyUIError) {
+    /** 未单独公开的 ComfyUI kind 继续使用通用脱敏诊断。 */
+    const comfyIssue = COMFYUI_PREPARATION_ISSUES[error.kind]
+    if (comfyIssue) return new CanvasMediaPreparationError({ ...comfyIssue })
+  }
+  /** 既有内部控制流错误码仍由调用方判定；它们不携带自由文本。 */
+  if (error instanceof Error && (/^CANVAS_MEDIA_[A-Z0-9_]+$/.test(error.message)
+    || error.message === 'CANVAS_REVISION_CONFLICT'
+    || error.message === 'MEDIA_FILE_BUSY')) return error
+  /** 只读取首个稳定错误码，不转发冒号后的外部错误正文。 */
+  const errorCode = error instanceof Error
+    ? /^([A-Z0-9_]{1,96})(?::|$)/.exec(error.message)?.[1]
+    : undefined
+  /** 目录类错误使用固定副本，避免调用方修改共享常量。 */
+  const catalogIssue = errorCode ? COMFY_OBJECT_INFO_PREPARATION_ISSUES[errorCode] : undefined
+  return new CanvasMediaPreparationError(catalogIssue
+    ? { ...catalogIssue }
+    : {
+        code: 'CANVAS_MEDIA_PREPARATION_FAILED',
+        message: '媒体工作流准备失败，请检查工作流、连接和输入配置。',
+      })
 }
 
 /** operation 固化工作流 selector；outputIndex 是节点 history 数组索引，不是 UI 顺序。 */
@@ -580,8 +641,10 @@ export class CanvasMediaService {
         }
         state = await this.appendOperation(input, state, operation)
       } catch (error) {
-        await this.persistPreparationIssue(input, state, error)
-        throw error
+        /** 持久状态与调用方必须看到同一份安全诊断，避免原始异常绕过脱敏。 */
+        const preparationError = normalizeCanvasMediaPreparationError(error)
+        await this.persistPreparationIssue(input, state, preparationError)
+        throw preparationError
       }
     }
     if (!isTerminal(run)) {

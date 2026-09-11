@@ -330,8 +330,10 @@ describe('Agent sendMessage 准入顺序合同', () => {
     /** 正常完成实际调用。 */
     const finalCompletionBody = source.slice(finalCompletionStart, finalCompletionEnd)
 
-    expect(typedErrorBody).toContain('completeRun(getAgentSessionMessages(sessionId), { startedAt: streamStartedAt })')
-    expect(typedErrorBody).not.toContain('resultSubtype:')
+    expect(typedErrorBody).toContain('completeRun(getAgentSessionMessages(sessionId), {')
+    expect(typedErrorBody).toContain("resultSubtype: 'error_during_execution'")
+    expect(typedErrorBody).toContain('resultErrors: [errorContent]')
+    expect(typedErrorBody).not.toContain("resultSubtype: 'success'")
     expect(resultBody).toContain('capturedResultSubtype = (msg as { subtype?: string }).subtype')
     expect(finalCompletionBody).toContain('resultSubtype: capturedResultSubtype')
   })

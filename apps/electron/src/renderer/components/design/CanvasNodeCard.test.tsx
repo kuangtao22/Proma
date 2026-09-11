@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import type { CanvasNodeActivityState, CanvasNodeKind } from '@proma/shared'
+import { createEmptyCanvasDocument } from '@proma/shared'
 import { ReactFlowProvider } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { CanvasNodeCard, createCanvasNodeChildTypeSelectHandler } from './CanvasNodeCard'
+import { toNativeCanvasFlowNodes } from './native-canvas-model'
 import type { CanvasNodeCardProps } from './CanvasNodeCard'
 
 /** 创建不含任何重内容读取能力的折叠卡片输入。 */
@@ -58,6 +60,27 @@ const propsWithLoadMessages: CanvasNodeCardProps = { ...createProps('agent'), lo
 const propsWithHtml: CanvasNodeCardProps = { ...createProps('webview'), html: '<main />' }
 
 describe('Canvas 通用折叠节点卡片', () => {
+  test.each([
+    ['pending', false], ['pending', true], ['prepared', false], ['prepared', true],
+  ] as const)('Given 视频模块 %s 未提交且其它 Agent 活跃=%s When 从投影渲染卡片 Then 保持静止', (phase, agentRunning) => {
+    /** 保留一个无关 Agent 会话，验证全局活跃状态不会污染视频卡片。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.nodes = [{ id: 'video-1', kind: 'video', title: '视频', mediaModuleId: 'module-1', position: { x: 0, y: 0 } }]
+    /** 通过真实 Canvas 投影消费待执行状态。 */
+    const [flowNode] = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [], runningSessionIds: new Set(agentRunning ? ['unrelated-session'] : []), canCreateChild: false,
+      onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+      mediaProgressByNodeId: new Map([['video-1', { phase, phaseLabel: phase }]]),
+    })
+    if (!flowNode) throw new Error('视频节点投影缺失')
+    /** 静态渲染同时检查外框和加载图标，不只断言内部状态枚举。 */
+    const html = renderCard('video', { activityState: flowNode.data.activityState })
+    expect(html).not.toContain('data-canvas-activity-outline')
+    expect(html).not.toContain('data-canvas-node-loading-indicator')
+    expect(html).not.toContain('canvas-queued-dash')
+    expect(html).not.toContain('canvas-running-dash')
+  })
+
   test.each([
     ['idle', false, null],
     ['queued', true, 'canvas-queued-dash'],

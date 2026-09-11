@@ -282,8 +282,64 @@ describe('CanvasMediaWorkbench', () => {
       <CanvasMediaWorkbench target={target} writable adapter={createAdapter()} />,
     )
     expect(html).toContain('加载媒体模块')
-    expect(getCanvasMediaErrorMessage(new Error('模块损坏'), '媒体模块加载失败。')).toBe('模块损坏')
+    expect(getCanvasMediaErrorMessage(new Error('模块损坏 /Users/test token=secret'), '媒体模块加载失败。')).toBe('媒体模块加载失败。')
     expect(getCanvasMediaErrorMessage('unknown', '媒体模块加载失败。')).toBe('媒体模块加载失败。')
+  })
+
+  test('Given 节点目录异常经过 Electron IPC 包装 When 展示运行错误 Then 使用确定性中文诊断且不回显底层正文', () => {
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: COMFY_OBJECT_INFO_SIZE_LIMIT: /private/catalog token=secret"),
+      '媒体操作失败。',
+    )).toBe('ComfyUI 节点目录超过安全处理上限，请更新应用；若仍失败，请精简服务端自定义节点。（COMFY_OBJECT_INFO_SIZE_LIMIT）')
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: COMFY_OBJECT_INFO_INVALID: malformed schema /private/catalog"),
+      '媒体操作失败。',
+    )).toBe('节点接口响应失效，请刷新 ComfyUI 节点目录后重试。（COMFY_OBJECT_INFO_INVALID）')
+  })
+
+  test('Given 可信工作流字段错误经过 Electron IPC 包装 When 展示运行错误 Then 保留节点字段定位并丢弃原始正文', () => {
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: MEDIA_WORKFLOW_INVALID:INPUT_REQUIRED@12.image:Bearer secret"),
+      '媒体操作失败。',
+    )).toBe('工作流校验失败：位置 12.image：缺少必填输入。（INPUT_REQUIRED）')
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: MEDIA_WORKFLOW_INVALID:INPUT_RANGE_INVALID@92.format.codec:/Users/test"),
+      '媒体操作失败。',
+    )).toBe('工作流校验失败：位置 92.format.codec：数值超出服务器允许范围。（INPUT_RANGE_INVALID）')
+  })
+
+  test('Given 工作流定位分别达到节点和字段上限 When 展示错误 Then 保留完整定位且不退化为 fallback', () => {
+    const location = `${'n'.repeat(256)}.${'i'.repeat(256)}`
+    const result = getCanvasMediaErrorMessage(
+      new Error(`MEDIA_WORKFLOW_INVALID:INPUT_UNKNOWN@${location}:不可信正文`),
+      '媒体操作失败。',
+    )
+    expect(result).toContain(`位置 ${location}`)
+    expect(result).toContain('输入不在节点接口中。（INPUT_UNKNOWN）')
+    expect(result).not.toBe('媒体操作失败。')
+  })
+
+  test.each([
+    ['COMFYUI_REQUEST_TIMEOUT', '连接 ComfyUI 超时，请检查服务状态后重试。'],
+    ['COMFYUI_RESPONSE_SIZE_LIMIT', 'ComfyUI 响应超过安全大小上限，请更新应用；若仍失败，请精简服务端自定义节点。'],
+    ['COMFYUI_AUTHENTICATION_REQUIRED', 'ComfyUI 认证失败，请检查连接凭据和访问权限。'],
+    ['COMFYUI_NETWORK_UNAVAILABLE', '无法连接 ComfyUI，请检查服务地址和网络状态后重试。'],
+  ])('Given ComfyUI 稳定错误 %s 经过 IPC 包装 When 展示 Then 使用固定中文且不回显正文', (code, message) => {
+    expect(getCanvasMediaErrorMessage(
+      new Error(`Error invoking remote method 'canvas-media:run': Error: ${code}: /private/path token=secret`),
+      '媒体操作失败。',
+    )).toBe(`${message}（${code}）`)
+  })
+
+  test('Given Canvas 输入准备错误经过 Electron IPC 包装 When 展示运行错误 Then 从安全定位符重建字段诊断', () => {
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: CANVAS_MEDIA_INPUT_REQUIRED: 待配置输入“密钥 /private/path”（key=prompt，nodeId=12，input=text）。"),
+      '媒体操作失败。',
+    )).toBe('输入 prompt 未配置（节点 12 的字段 text）。（CANVAS_MEDIA_INPUT_REQUIRED）')
+    expect(getCanvasMediaErrorMessage(
+      new Error("Error invoking remote method 'canvas-media:run': Error: CANVAS_MEDIA_INPUT_INVALID: 输入 采样步数 不能大于 50。（key=steps，nodeId=8，input=steps）"),
+      '媒体操作失败。',
+    )).toBe('输入 steps 的值不符合字段约束（节点 8 的字段 steps）。（CANVAS_MEDIA_INPUT_INVALID）')
   })
 
   test('Given 文件仍被其它操作占用 When 详情显示本地或 IPC 错误 Then 说明可重试原因并保留错误码', () => {

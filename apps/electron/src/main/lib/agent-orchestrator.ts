@@ -2131,7 +2131,12 @@ export class AgentOrchestrator {
                 // 透传归一化后的错误消息到前端，避免 SDK 原始 API Error 直接暴露给用户。
                 this.eventBus.emit(sessionId, { kind: 'sdk_message', message: errorSDKMsg })
                 try { updateAgentSessionMeta(sessionId, {}) } catch { /* 忽略 */ }
-                completeRun(getAgentSessionMessages(sessionId), { startedAt: streamStartedAt })
+                // 此处会提前结束迭代，必须直接传递错误终态，不能等未消费的 SDK result 补齐。
+                completeRun(getAgentSessionMessages(sessionId), {
+                  startedAt: streamStartedAt,
+                  resultSubtype: 'error_during_execution',
+                  resultErrors: [errorContent],
+                })
                 return
               }
             }
