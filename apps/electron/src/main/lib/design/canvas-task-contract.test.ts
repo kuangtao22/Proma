@@ -9,6 +9,26 @@ const existingRequirement = {
 }
 
 describe('Canvas 任务交付合同', () => {
+  test('Given 新导入的图片节点 When 检查真实图片 Then created不强制额外付费生成', async () => {
+    const task = createCanvasTaskContract({ required: true, verify: async () => true })
+    task.start('canvas', [{ id: 'import', description: '导入并检查图片', nodeKind: 'image', change: 'created', validation: 'inspection' }], {
+      nodeIds: ['doc'], evidence: [],
+    })
+    const proof = task.record({ canvasId: 'canvas', nodeId: 'imported', nodeKind: 'image', validation: 'inspection', identity: 'imported-image' })
+    expect((await task.complete([{ id: 'import', evidenceId: proof.evidenceId }], new AbortController().signal)).phase).toBe('completed')
+  })
+
+  test('Given 多批生成超过来源容量 When 提交旧来源 Then 有界淘汰且最近来源仍可核验', async () => {
+    const task = createCanvasTaskContract({ required: true, verify: async () => true })
+    task.start('canvas', [{ id: 'image', description: '生成并检查', nodeId: 'image', nodeKind: 'image', change: 'updated', validation: 'inspection' }], {
+      nodeIds: ['image'], evidence: [{ canvasId: 'canvas', nodeId: 'image', nodeKind: 'image', validation: 'inspection', absent: true }],
+    })
+    for (let index = 0; index < 257; index += 1) task.recordGeneratedJobs('canvas', [{ nodeId: 'image', jobId: `job-${index}` }])
+    const old = task.record({ canvasId: 'canvas', nodeId: 'image', nodeKind: 'image', validation: 'inspection', identity: 'first', jobId: 'job-0' })
+    await expect(task.complete([{ id: 'image', evidenceId: old.evidenceId }], new AbortController().signal)).rejects.toThrow('CANVAS_TASK_CANDIDATE_NOT_GENERATED')
+    const latest = task.record({ canvasId: 'canvas', nodeId: 'image', nodeKind: 'image', validation: 'inspection', identity: 'latest', jobId: 'job-256' })
+    expect((await task.complete([{ id: 'image', evidenceId: latest.evidenceId }], new AbortController().signal)).phase).toBe('completed')
+  })
   test('Given 普通问答未登记任务 When 模型结束 Then 无需工具或续行', async () => {
     const task = createCanvasTaskContract({ required: false, verify: async () => true })
     expect(await task.evaluate(new AbortController().signal)).toEqual({ action: 'complete' })
@@ -75,7 +95,29 @@ describe('Canvas 任务交付合同', () => {
       nodeIds: ['image-1'], evidence: [{ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', absent: true }],
     })
     const proof = task.record({ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', identity: 'old-picture', jobId: 'old-job' })
-    await expect(task.complete([{ id: 'image', evidenceId: proof.evidenceId }], new AbortController().signal)).rejects.toThrow('CANVAS_TASK_EVIDENCE_MISMATCH')
+    await expect(task.complete([{ id: 'image', evidenceId: proof.evidenceId }], new AbortController().signal)).rejects.toThrow('CANVAS_TASK_CANDIDATE_NOT_GENERATED')
+  })
+
+  test('Given 更新图片任务登记本轮生成回执 When 检查新候选且拒绝采用 Then 合同允许完成', async () => {
+    const task = createCanvasTaskContract({ required: true, verify: async () => true })
+    task.start('canvas', [{ id: 'image', description: '生成并检查新候选', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', change: 'updated' }], {
+      nodeIds: ['image-1'], evidence: [{ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', identity: 'adopted' }],
+    })
+    task.recordGeneratedJobs('canvas', [{ nodeId: 'image-1', jobId: 'new-job' }])
+    const proof = task.record({ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', identity: 'candidate', jobId: 'new-job' })
+    await expect(task.complete([{ id: 'image', evidenceId: proof.evidenceId }], new AbortController().signal)).resolves.toMatchObject({ phase: 'completed' })
+  })
+
+  test('Given 更新图片任务未登记或跨节点候选 When 完成 Then 拒绝冒充本轮生成', async () => {
+    const task = createCanvasTaskContract({ required: true, verify: async () => true })
+    task.start('canvas', [{ id: 'image', description: '生成新候选', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', change: 'updated' }], {
+      nodeIds: ['image-1'], evidence: [{ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', identity: 'adopted' }],
+    })
+    const proof = task.record({ canvasId: 'canvas', nodeId: 'image-1', nodeKind: 'image', validation: 'inspection', identity: 'candidate', jobId: 'other-job' })
+    await expect(task.complete([{ id: 'image', evidenceId: proof.evidenceId }], new AbortController().signal)).rejects.toThrow('CANVAS_TASK_CANDIDATE_NOT_GENERATED')
+    expect(() => task.recordGeneratedJobs('canvas', [{ nodeId: 'other-node', jobId: 'new-job' }])).not.toThrow()
+    const crossNode = task.record({ canvasId: 'canvas', nodeKind: 'image', validation: 'inspection', jobId: 'new-job', nodeId: 'other-node', identity: 'cross-node' })
+    await expect(task.complete([{ id: 'image', evidenceId: crossNode.evidenceId }], new AbortController().signal)).rejects.toThrow('CANVAS_TASK_EVIDENCE_MISMATCH')
   })
 
   test('Given 缺少必要输入或用户停止 When 检查完成 Then 不假装成功也不继续', async () => {

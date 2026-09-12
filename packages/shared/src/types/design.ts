@@ -460,10 +460,14 @@ export interface DesignJobRecord extends DesignJobTraceSummary {
   status: DesignJobStatus
   prompt: string
   originalRequest: string
+  /** 新版 Canvas 原生图片任务冻结节点配置原文，旧任务缺省时保持历史执行语义。 */
+  imagePromptContract?: 'frozen-config-v1'
   contextMode: DesignContextMode
   generationConstraints?: DesignGenerationConstraints
   canvasInputReferences?: CanvasImageInputReference[]
   canvasImageConfigRevision?: number
+  /** 创建时目标节点自身的采用基线；与实际编辑底图独立，缺省兼容旧任务。 */
+  canvasImageInitialAdoptedAssetId?: string | null
   /** Canvas 图片任务所属候选批次，用于终态 O(1) 定位验收记录。 */
   candidateBatchId?: string
   sourceAgentMessageId?: string
@@ -521,6 +525,8 @@ export interface RelinkDesignAssetInput {
 }
 
 export interface CreateDesignJobInput {
+  /** 已保存的底图节点选择，仅由主进程在创建时解析，重试沿用原素材快照。 */
+  editSourceNodeId?: string | null
   projectId: string
   action: DesignJobAction
   prompt: string
@@ -534,6 +540,8 @@ export interface CreateDesignJobInput {
   generationConstraints?: DesignGenerationConstraints
   canvasInputReferences?: CanvasImageInputReference[]
   canvasImageConfigRevision?: number
+  /** 创建时目标节点自身的采用基线；与实际编辑底图独立，缺省兼容旧任务。 */
+  canvasImageInitialAdoptedAssetId?: string | null
   /** Canvas 图片调用方在创建 journal 前已经固化的候选批次身份。 */
   candidateBatchId?: string
   sourceSessionId?: string

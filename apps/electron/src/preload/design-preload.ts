@@ -6,6 +6,7 @@ import {
   parseAgentCanvasBindingChangeEvent,
   parseCanvasChangeEvent,
   parseCanvasImageCandidateBatch,
+  parseCanvasImageModuleChangedEvent,
   parseCanvasImageModuleSnapshot,
   parseCanvasRunWorkflowResult,
   parseCanvasWorkflowRun,
@@ -24,6 +25,7 @@ import type {
   CanvasImageJobControlInput,
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
+  CanvasImageModuleChangedEvent,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
   GetCanvasImageCandidateBatchInput,
@@ -162,7 +164,7 @@ export interface DesignPreloadApi {
   /** 释放当前窗口为指定图片模块持有的媒体授权。 */
   releaseCanvasImageMedia: (input: ReleaseCanvasImageMediaInput) => Promise<CanvasInvokeResult<void>>
   /** 订阅全部图片模块变化，只公开完整目标身份。 */
-  onCanvasImageModuleChanged: (listener: (target: CanvasImageTarget) => void) => () => void
+  onCanvasImageModuleChanged: (listener: (event: CanvasImageModuleChangedEvent) => void) => () => void
   /** 加载项目中指定原生 Canvas 的公开工作区快照。 */
   loadCanvasWorkspace: (input: LoadCanvasInput) => Promise<CanvasInvokeResult<CanvasWorkspaceSnapshot>>
   /** 加载单个 WebView 节点的受管 HTML 快照。 */
@@ -428,15 +430,21 @@ function selectCanvasWebviewPreviewTarget(
  * @param value Electron 事件携带的未知值。
  * @returns 字段完整时的公开目标，否则返回 null。
  */
-function mapCanvasImageChange(value: unknown): CanvasImageTarget | null {
-  /** 事件候选只读取公开字段，不向 Renderer 传递原对象。 */
-  const candidate = value as Partial<CanvasImageTarget> | null
-  if (!candidate
-    || typeof candidate.projectId !== 'string'
-    || typeof candidate.canvasId !== 'string'
-    || typeof candidate.nodeId !== 'string'
-    || typeof candidate.imageModuleId !== 'string') return null
-  return selectCanvasImageTarget(candidate as CanvasImageTarget)
+function mapCanvasImageChange(value: unknown): CanvasImageModuleChangedEvent | null {
+  try {
+    /** 旧事件沿用既有字段裁剪，新增事件则由共享解析器拒绝任何多余任务正文。 */
+    if (value !== null && typeof value === 'object' && !Object.hasOwn(value, 'cause')) {
+      const candidate = value as Partial<CanvasImageTarget>
+      if (typeof candidate.projectId !== 'string'
+        || typeof candidate.canvasId !== 'string'
+        || typeof candidate.nodeId !== 'string'
+        || typeof candidate.imageModuleId !== 'string') return null
+      return parseCanvasImageModuleChangedEvent(selectCanvasImageTarget(candidate as CanvasImageTarget))
+    }
+    return parseCanvasImageModuleChangedEvent(value)
+  } catch {
+    return null
+  }
 }
 
 /**

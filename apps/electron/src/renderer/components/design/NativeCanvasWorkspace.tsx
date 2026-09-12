@@ -6,6 +6,7 @@ import type {
   CanvasChangeEvent,
   CanvasDocument,
   CanvasImageModuleConfig,
+  CanvasImagePreview,
   CanvasLayoutRect,
   CanvasMediaTarget,
   CanvasNodeLifecycleResult,
@@ -2127,6 +2128,8 @@ interface CanvasImageNodeWorkbenchProps {
   onRegisterDraftCommitter: RegisterNativeCanvasWorkbenchDraftCommitter
   mediaProgressByJobId: ReadonlyMap<string, MediaRunProgressProjection>
   defaultComfyuiConnectionId?: string | null
+  canvasDocument?: CanvasDocument
+  imagePreviews?: CanvasImagePreview[]
 }
 
 /** 只在图片节点展开时挂载模块状态、模型目录和媒体授权。 */
@@ -2140,6 +2143,8 @@ function CanvasImageNodeWorkbench({
   onRegisterDraftCommitter,
   mediaProgressByJobId,
   defaultComfyuiConnectionId,
+  canvasDocument,
+  imagePreviews,
 }: CanvasImageNodeWorkbenchProps): React.ReactElement {
   /** 图片节点的四元业务身份。 */
   const imageTarget = React.useMemo(() => ({
@@ -2310,6 +2315,8 @@ function CanvasImageNodeWorkbench({
       mediaWorkflows={mediaCatalog.workflows}
       mediaConnections={mediaCatalog.connections}
       mediaAssets={mediaCatalog.assets}
+      canvasDocument={canvasDocument}
+      imagePreviews={imagePreviews}
       defaultComfyuiConnectionId={defaultComfyuiConnectionId}
       onMediaWorkflowChange={(workflow) => imageModule.updateDraft({ mediaWorkflow: workflow })}
       onDraftChange={imageModule.updateDraft}
@@ -3963,6 +3970,8 @@ export function NativeCanvasWorkspace({
           onRegisterDraftCommitter={registerWorkbenchDraftCommitter}
           mediaProgressByJobId={mediaProgressByJobId}
           defaultComfyuiConnectionId={inheritableCanvasComfyUiConnectionId}
+          canvasDocument={activeCanvasDocument}
+          imagePreviews={state.snapshot?.imagePreviews}
         />
       )
     } else if ((node.kind === 'audio' || node.kind === 'video') && mediaWorkbenchAdapter) {

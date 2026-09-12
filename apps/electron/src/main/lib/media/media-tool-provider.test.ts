@@ -205,12 +205,25 @@ describe('媒体 Agent 工具提供器', () => {
     expect(run.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
     authorizationMode = 'automatic'
     for (const name of ['media_execute_run', 'media_cancel_run', 'canvas_run_nodes', 'canvas_run_workflow', 'canvas_resume_workflow', 'canvas_retry_task']) {
-      expect(run.toolApprovalPolicy?.getMode(name)).toBe('automatic')
+      expect(run.toolApprovalPolicy?.getMode(name, {})).toBe('automatic')
     }
     expect(run.toolApprovalPolicy?.getMode('server_exec')).toBe('ask')
     expect(createMediaToolRun(f.dependencies, { ...context, permissionCeiling: 'plan' }).toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
     authorizationMode = 'ask'
     expect(run.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+  })
+
+  test('Given 自动媒体策略 When 恢复请求扩额或预算参数不明 Then 保持逐次确认且正常恢复可自动', () => {
+    const f = fixture()
+    const read = f.dependencies.configuration.read
+    f.dependencies.configuration.read = () => ({ ...read(), authorizationMode: 'automatic' })
+    const policy = createMediaToolRun(f.dependencies, context).toolApprovalPolicy!
+    for (const input of [undefined, { addMediaRuns: 1 }, { addDurationMs: 1 },
+      { addMediaRuns: '1' }, { addMediaRuns: -1 }, { addMediaRuns: 0.5 }, { addDurationMs: null }]) {
+      expect(policy.getMode('canvas_resume_workflow', input)).toBe('ask')
+    }
+    expect(policy.getMode('canvas_resume_workflow', { runId: 'run-1' })).toBe('automatic')
+    expect(policy.getMode('canvas_resume_workflow', { addMediaRuns: 0, addDurationMs: 0 })).toBe('automatic')
   })
 
   test('Given 自主模式且远端完整目录无匹配 When 发现结束 Then 允许根据真实资源新建而不再要求对话确认', async () => {

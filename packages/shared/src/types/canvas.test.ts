@@ -12,6 +12,7 @@ import {
   parseCanvasImageJobControlInput,
   parseListCanvasImageActivityInput,
   parseCanvasImageJobActivities,
+  parseCanvasImageModuleChangedEvent,
   parseCanvasWebviewTarget,
   parseCanvasImageModuleConfig,
   parseCanvasImageMediaWorkflow,
@@ -946,6 +947,59 @@ describe('Canvas 图共享合同', () => {
     })
   })
 
+  test('Given 新旧图片模块变化事件 When 严格解析 Then 旧事件转完整对账且运行进度只接受轻量任务', () => {
+    /** 旧主进程事件缺少 cause 时必须继续触发完整对账。 */
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', imageModuleId: 'module-1',
+    }
+    expect(parseCanvasImageModuleChangedEvent(target)).toEqual({ ...target, cause: 'reconcile' })
+
+    /** 高频进度只允许 queued/running，终态必须由完整模块对账接管素材。 */
+    const progress = {
+      ...target,
+      cause: 'job-progress',
+      job: {
+        id: 'job-1', projectId: target.projectId,
+        target: { kind: 'canvas-image', canvasId: target.canvasId, nodeId: target.nodeId, imageModuleId: target.imageModuleId },
+        status: 'running', createdAt: 1, updatedAt: 2,
+      },
+    } as const
+    expect(parseCanvasImageModuleChangedEvent(progress)).toEqual(progress)
+    expect(() => parseCanvasImageModuleChangedEvent({
+      ...progress, job: { ...progress.job, status: 'succeeded', outputAssetId: 'asset-1' },
+    })).toThrow('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+    expect(() => parseCanvasImageModuleChangedEvent({
+      ...progress, job: { ...progress.job, target: { ...progress.job.target, nodeId: 'node-other' } },
+    })).toThrow('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+  })
+
+  test('Given 图片配置显式指定或清除编辑底图 When 严格解析 Then 保留节点身份并拒绝非法值', () => {
+    /** 合法基线用于只改变编辑底图字段。 */
+    const config = {
+      schemaVersion: 2, kind: 'image', contentId: 'module-1', revision: 3,
+      createdAt: 10, updatedAt: 20, prompt: '修改母版', selectedModelProfileId: 'profile-1',
+      aspectRatio: '16:9', imageSize: '2K', contextMode: 'project', adoptedAssetId: 'asset-1',
+    } as const
+
+    expect(parseCanvasImageModuleConfig({ ...config, editSourceNodeId: 'master-image' }).editSourceNodeId)
+      .toBe('master-image')
+    expect(parseCanvasImageModuleConfig({ ...config, editSourceNodeId: null }).editSourceNodeId).toBeNull()
+    expect(parseCanvasImageModuleConfig(config)).not.toHaveProperty('editSourceNodeId')
+    expect(() => parseCanvasImageModuleConfig({ ...config, editSourceNodeId: '../asset-1' }))
+      .toThrow('CANVAS_IMAGE_CONFIG_INVALID')
+
+    /** 保存输入的缺省、显式选择和显式清除必须保持三态。 */
+    const save = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1', imageModuleId: 'module-1',
+      expectedConfigRevision: 3, prompt: '修改母版', selectedModelProfileId: 'profile-1',
+      aspectRatio: '16:9', imageSize: '2K', contextMode: 'project',
+    } as const
+    expect(parseSaveCanvasImageModuleInput({ ...save, editSourceNodeId: 'master-image' }).editSourceNodeId)
+      .toBe('master-image')
+    expect(parseSaveCanvasImageModuleInput({ ...save, editSourceNodeId: null }).editSourceNodeId).toBeNull()
+    expect(parseSaveCanvasImageModuleInput(save)).not.toHaveProperty('editSourceNodeId')
+  })
+
   test('Given 图片配置与任务使用固定版本 Comfy 预设 When 严格解析 Then 保留 media 命名空间和快照', () => {
     const input = createCanvasImageSnapshotFixture()
     input.config.selectedModelProfileId = 'media:preset-1:3'
@@ -1062,6 +1116,35 @@ describe('Canvas 图共享合同', () => {
     expect(parsed.jobs[0]).not.toBe(input.jobs[0])
     expect(parsed.assets[0]).not.toBe(input.assets[0])
     expect(parsed.imageVersions[0]).not.toBe(input.imageVersions[0])
+  })
+
+  test('Given 新旧图片任务的初始采用基线 When 严格解析 Then 接受缺省、null 与稳定素材 ID', () => {
+    const legacy = createCanvasImageSnapshotFixture()
+    expect(parseCanvasImageModuleSnapshot(legacy).jobs[0]).not.toHaveProperty('canvasImageInitialAdoptedAssetId')
+
+    const emptyBaseline = createCanvasImageSnapshotFixture()
+    emptyBaseline.jobs[0]!.canvasImageInitialAdoptedAssetId = null
+    expect(parseCanvasImageModuleSnapshot(emptyBaseline).jobs[0]?.canvasImageInitialAdoptedAssetId).toBeNull()
+
+    const adoptedBaseline = createCanvasImageSnapshotFixture()
+    adoptedBaseline.jobs[0]!.canvasImageInitialAdoptedAssetId = 'asset-1'
+    expect(parseCanvasImageModuleSnapshot(adoptedBaseline).jobs[0]?.canvasImageInitialAdoptedAssetId).toBe('asset-1')
+
+    const invalid = createCanvasImageSnapshotFixture()
+    invalid.jobs[0]!.canvasImageInitialAdoptedAssetId = '../asset-1'
+    expect(() => parseCanvasImageModuleSnapshot(invalid)).toThrow('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  })
+
+  test('Given 新版原生图片任务冻结配置原文 When 严格解析公开快照 Then 保留合同并拒绝未知版本', () => {
+    const current = createCanvasImageSnapshotFixture()
+    current.jobs[0]!.imagePromptContract = 'frozen-config-v1'
+
+    expect(parseCanvasImageModuleSnapshot(current).jobs[0]?.imagePromptContract).toBe('frozen-config-v1')
+
+    const invalid = createCanvasImageSnapshotFixture()
+    /** 未识别版本不能在 Renderer 与主进程之间被静默降级。 */
+    invalid.jobs[0]!.imagePromptContract = 'untrusted-v2' as 'frozen-config-v1'
+    expect(() => parseCanvasImageModuleSnapshot(invalid)).toThrow('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   })
 
   test('Given 新旧图片任务引用 When 严格解析 Then 新端口成对保留且旧引用继续兼容', () => {

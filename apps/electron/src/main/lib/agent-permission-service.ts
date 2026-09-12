@@ -332,7 +332,7 @@ export class AgentPermissionService {
       const approveIfAutomatic = (): void => {
         let mode: 'ask' | 'automatic'
         try {
-          mode = dynamic?.policy.getMode(toolName) ?? 'ask'
+          mode = dynamic?.policy.getMode(toolName, input) ?? 'ask'
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           const settled = this.settlePending(request.requestId, {

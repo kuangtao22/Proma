@@ -92,6 +92,20 @@ describe('DesignTraceStore', () => {
     }))
   })
 
+  test('Given 执行器已准备真实请求 When 转存 trace Then 保留素材顺序且不声称服务接收', () => {
+    store.writeFromMessages('project-1', 'job-1', [], undefined, {
+      executor: 'openai-images', modelId: 'gpt-image-2', promptSha256: 'c'.repeat(64), preparedAt: 50,
+      referenceImages: [{ assetId: 'asset-master', sha256: 'a'.repeat(64), byteSize: 20 },
+        { assetId: 'asset-character', sha256: 'b'.repeat(64), byteSize: 30 }],
+    })
+    const entries = store.read('project-1', 'job-1')
+    expect(entries).toContainEqual(expect.objectContaining({ title: '图片请求已准备', timestamp: 50 }))
+    const content = entries[0]!.content!
+    expect(content.indexOf('asset-master')).toBeLessThan(content.indexOf('asset-character'))
+    expect(content).toContain('2')
+    expect(content).toContain('不代表服务商已接收')
+  })
+
   test('Given 旧项目尚未创建 traces 目录 When 转存 trace Then 自动补齐目录并完成写入', () => {
     rmSync(paths.tracesDir, { recursive: true, force: true })
 

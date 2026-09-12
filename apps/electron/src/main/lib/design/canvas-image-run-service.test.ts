@@ -25,6 +25,37 @@ const context: CanvasToolRunContext = {
   permissionCeiling: 'execute',
 }
 
+test('Given 本轮生成合同 When 新建批次并重放调用 Then 只对首次真实新建回传来源且早于启动', async () => {
+  /** 接收器只保存任务身份，图片字节不进入合同。 */
+  const received: Array<{ nodeId: string; jobId: string }> = []
+  const fixture = createHarness({ start: async (jobId) => {
+    expect(received.some(receipt => receipt.jobId === jobId)).toBe(true)
+  } })
+  const executionContext: CanvasToolRunContext = { ...context, onImageJobsCreated: (canvasId, jobs) => {
+    expect(canvasId).toBe(target.canvasId)
+    expect(fixture.batches.size).toBe(1)
+    received.push(...jobs)
+  } }
+  const nodes = [createImageNode('image-1')]
+  const first = await fixture.service.run(executionContext, target, nodes, 'generated-once')
+  await fixture.service.run(executionContext, target, nodes, 'generated-once')
+  expect(received).toEqual([{ nodeId: 'image-1', jobId: first.tasks[0]!.taskId! }])
+})
+
+test('Given 预检或建批失败 When journal被回滚 Then 不签发本轮生成来源', async () => {
+  for (const options of [
+    { preflight: async () => { throw new Error('PREFLIGHT_FAILED') } },
+    { createBatch: async () => { throw new Error('BATCH_FAILED') } },
+  ]) {
+    const fixture = createHarness(options)
+    const received: string[] = []
+    await fixture.service.run({ ...context, onImageJobsCreated: (_canvasId, jobs) => {
+      received.push(...jobs.map(job => job.jobId))
+    } }, target, [createImageNode('image-1')], 'failed-creation')
+    expect(received).toEqual([])
+  }
+})
+
 /** 创建图片节点，测试只改变稳定业务身份。 */
 function createImageNode(id: string): Extract<CanvasNode, { kind: 'image' }> {
   return {
@@ -347,6 +378,27 @@ describe('Canvas 图片统一运行服务', () => {
       { nodeId: first.id, status: 'blocked', error: 'CANVAS_BATCH_PREFLIGHT_BLOCKED' },
       { nodeId: second.id, status: 'failed', error: 'PREFLIGHT_FAILED' },
     ])
+  })
+
+  test('Given 空节点选择母版 When Agent 批量运行 Then 预检和创建沿用选择且采用基线仍为空', async () => {
+    /** 捕获实际传入 manager 的创建合同。 */
+    const inputs: CreateDesignJobInput[] = []
+    const node = createImageNode('image-a')
+    const harness = createHarness({
+      loadConfig: (value) => ({ ...createConfig(value), editSourceNodeId: 'master-node' }),
+      preflight: async (input) => { inputs.push(input) },
+      createOnce: async (input, jobId, jobs) => {
+        inputs.push(input)
+        const job = createJob(input, jobId)
+        jobs.set(jobId, job)
+        return { job, created: true }
+      },
+    })
+    const result = await harness.service.run(context, target, [node], 'tool-master')
+    expect(result.tasks[0]?.status).toBe('started')
+    expect(inputs).toHaveLength(2)
+    for (const input of inputs) expect(input).toMatchObject({ action: 'edit',
+      editSourceNodeId: 'master-node', canvasImageInitialAdoptedAssetId: null })
   })
 
   test('Given 相同父运行与工具调用 When 重放 Then 批次和任务 ID 稳定且不重复启动', async () => {

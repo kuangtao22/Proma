@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, describe, expect, mock, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, realpathSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
@@ -70,6 +71,19 @@ function createReferenceImageFixture(): { root: string; imagePath: string } {
   const imagePath = join(root, 'reference.png')
   writeFileSync(imagePath, PNG_BYTES)
   return { root, imagePath }
+}
+
+/** 创建按内容可区分的多张授权 PNG，用于验证 multipart 顺序与审计摘要。 */
+function createReferenceImageFixtures(count: number): { root: string; imagePaths: string[]; bytes: Buffer[] } {
+  const root = mkdtempSync(join(tmpdir(), 'proma-openai-images-'))
+  temporaryRoots.push(root)
+  const bytes = Array.from({ length: count }, (_, index) => Buffer.concat([PNG_BYTES, Buffer.from([index + 1])]))
+  const imagePaths = bytes.map((content, index) => {
+    const imagePath = join(root, `reference-${index + 1}.png`)
+    writeFileSync(imagePath, content)
+    return imagePath
+  })
+  return { root, imagePaths, bytes }
 }
 
 /** 创建捕获请求且不产生真实附件副作用的执行器依赖。 */
@@ -146,6 +160,118 @@ describe('OpenAI Images executor', () => {
     expect(requests[0]?.body).toBeInstanceOf(FormData)
     expect((requests[0]?.body as FormData).get('model')).toBe('gpt-image-2')
     expect((requests[0]?.body as FormData).get('image')).toBeInstanceOf(Blob)
+  })
+
+  test('Given 三张授权参考图 When 调用 Then 按序发送全部 image[] 并捕获真实字节审计', async () => {
+    const fixture = createReferenceImageFixtures(3)
+    const requests: CapturedRequest[] = []
+    const captured: Array<{
+      executor: string
+      modelId: string
+      prompt: string
+      referenceImages: Array<{ path: string; sha256: string; byteSize: number }>
+    }> = []
+
+    await executor.executeOpenAIImages({
+      route: createResolvedOpenAIRoute(),
+      sessionId: 'session-multi-reference',
+      prompt: 'Compose all references',
+      referenceImagePaths: fixture.imagePaths,
+      cwd: fixture.root,
+      captureRequest: (request) => { captured.push(request) },
+    }, createExecutorDependencies(requests, { data: [{ b64_json: PNG_BASE64 }] }))
+
+    const form = requests[0]?.body as FormData
+    const sentImages = form.getAll('image[]')
+    expect(form.get('image')).toBeNull()
+    expect(sentImages).toHaveLength(3)
+    expect(await Promise.all(sentImages.map(async (entry) => Buffer.from(await (entry as Blob).arrayBuffer()).toString('hex'))))
+      .toEqual(fixture.bytes.map((content) => content.toString('hex')))
+    expect(captured).toEqual([{
+      executor: 'openai-images',
+      modelId: 'gpt-image-2',
+      prompt: 'Compose all references',
+      referenceImages: fixture.imagePaths.map((path, index) => ({
+        path: realpathSync(path),
+        sha256: createHash('sha256').update(fixture.bytes[index]!).digest('hex'),
+        byteSize: fixture.bytes[index]!.length,
+      })),
+    }])
+  })
+
+  test('Given 请求审计回调抛错 When 执行 Then 在 fetch 前原样拒绝', async () => {
+    const fixture = createReferenceImageFixture()
+    let fetched = false
+
+    await expect(executor.executeOpenAIImages({
+      route: createResolvedOpenAIRoute(),
+      sessionId: 'session-audit-rejected',
+      prompt: 'Edit safely',
+      referenceImagePaths: [fixture.imagePath],
+      cwd: fixture.root,
+      captureRequest: () => { throw new Error('审计存储失败') },
+    }, createExecutorDependencies([], {}, () => { fetched = true }))).rejects.toThrow('审计存储失败')
+
+    expect(fetched).toBe(false)
+  })
+
+  test('Given 三图 edits 返回失败 When 执行 Then 只发送一次完整多图请求且不降级', async () => {
+    const fixture = createReferenceImageFixtures(3)
+    const requests: CapturedRequest[] = []
+    const dependencies = createExecutorDependencies(requests, {})
+    dependencies.fetch = async (input, init) => {
+      requests.push({
+        url: String(input),
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+        body: init?.body,
+      })
+      return new Response(JSON.stringify({ error: { message: 'multi image rejected' } }), {
+        status: 503,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+
+    await expect(executor.executeOpenAIImages({
+      route: createResolvedOpenAIRoute(),
+      sessionId: 'session-multi-failed',
+      prompt: 'Compose all references',
+      referenceImagePaths: fixture.imagePaths,
+      cwd: fixture.root,
+    }, dependencies)).rejects.toThrow('multi image rejected')
+
+    expect(requests).toHaveLength(1)
+    expect((requests[0]?.body as FormData).getAll('image[]')).toHaveLength(3)
+  })
+
+  test('Given 超过十六张参考图 When 调用 Then 在 fetch 前拒绝本地资源超限', async () => {
+    const fixture = createReferenceImageFixtures(17)
+    let fetched = false
+
+    await expect(executor.executeOpenAIImages({
+      route: createResolvedOpenAIRoute(),
+      sessionId: 'session-reference-count-limit',
+      prompt: 'Compose references',
+      referenceImagePaths: fixture.imagePaths,
+      cwd: fixture.root,
+    }, createExecutorDependencies([], {}, () => { fetched = true }))).rejects.toThrow('参考图数量不能超过 16 张')
+
+    expect(fetched).toBe(false)
+  })
+
+  test('Given 参考图总大小超过 100 MiB When 调用 Then 在读取正文和 fetch 前拒绝', async () => {
+    const fixture = createReferenceImageFixtures(2)
+    for (const path of fixture.imagePaths) truncateSync(path, 60 * 1024 * 1024)
+    let fetched = false
+
+    await expect(executor.executeOpenAIImages({
+      route: createResolvedOpenAIRoute(),
+      sessionId: 'session-reference-byte-limit',
+      prompt: 'Compose references',
+      referenceImagePaths: fixture.imagePaths,
+      cwd: fixture.root,
+    }, createExecutorDependencies([], {}, () => { fetched = true }))).rejects.toThrow('参考图总大小不能超过 100 MiB')
+
+    expect(fetched).toBe(false)
   })
 
   test('Given 越界参考图 When 调用 Then 在 fetch 前拒绝', async () => {

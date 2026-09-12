@@ -1,6 +1,8 @@
 import type { DesignJobRecord, DesignJobStatus, DesignTraceEntry } from '@proma/shared'
 import { isDeepStrictEqual } from 'node:util'
 import type { CanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
+import { createImageJobId } from './canvas-image-run-service'
+import type { CanvasWorkflowRunStore } from './canvas-workflow-run-store'
 import type { DesignJobManager } from './design-job-manager'
 import type { DesignTracePage, DesignTraceStore } from './design-trace-store'
 
@@ -85,6 +87,8 @@ export interface CanvasTaskRetryResult {
   operationId: string
   originalJobId: string
   replacementJobId: string
+  /** 仅本次实际创建 replacement 时为 true，重放不得再次登记工作流回执。 */
+  created: boolean
 }
 
 /** 任务领域服务只依赖现有权威 Job、候选批次和 trace 边界。 */
@@ -93,6 +97,8 @@ export interface CanvasTaskOperationServiceDependencies {
     'getProjectJob' | 'listCanvasImageJobs' | 'cancel' | 'retry' | 'run'>
   candidateBatches: Pick<CanvasImageCandidateBatchService, 'retryJobLocked'>
   traceStore: Pick<DesignTraceStore, 'readPage'>
+  /** 低频独立重试检查持久工作流归属，禁止绕过其已消费的媒体预算。 */
+  workflowRuns?: Pick<CanvasWorkflowRunStore, 'list'>
   /** 旧任务后台执行失败时写主进程诊断，不把内部错误透传给调用方。 */
   onBackgroundError?: (message: string, error: unknown) => void
 }
@@ -197,10 +203,12 @@ function hasSameRetrySnapshot(original: DesignJobRecord, replacement: DesignJobR
     action: replacement.action,
     prompt: replacement.prompt,
     originalRequest: replacement.originalRequest,
+    imagePromptContract: replacement.imagePromptContract,
     contextMode: replacement.contextMode,
     generationConstraints: replacement.generationConstraints,
     canvasInputReferences: replacement.canvasInputReferences,
     canvasImageConfigRevision: replacement.canvasImageConfigRevision,
+    canvasImageInitialAdoptedAssetId: replacement.canvasImageInitialAdoptedAssetId,
     candidateBatchId: replacement.candidateBatchId,
     sourceAgentMessageId: replacement.sourceAgentMessageId,
     sourceSessionId: replacement.sourceSessionId,
@@ -210,16 +218,51 @@ function hasSameRetrySnapshot(original: DesignJobRecord, replacement: DesignJobR
     action: original.action,
     prompt: original.prompt,
     originalRequest: original.originalRequest,
+    imagePromptContract: original.imagePromptContract,
     contextMode: original.contextMode,
     generationConstraints: original.generationConstraints,
     canvasInputReferences: original.canvasInputReferences,
     canvasImageConfigRevision: original.canvasImageConfigRevision,
+    canvasImageInitialAdoptedAssetId: original.canvasImageInitialAdoptedAssetId,
     candidateBatchId: original.candidateBatchId,
     sourceAgentMessageId: original.sourceAgentMessageId,
     sourceSessionId: original.sourceSessionId,
     sourceAssetId: original.sourceAssetId,
     imageModelSnapshot: original.imageModelSnapshot,
   })
+}
+
+/** 判断工作流执行身份是否已拥有当前图片任务或其完整创作 attempt 链。 */
+function isWorkflowOwnedImageRetry(
+  job: DesignJobRecord,
+  targetJobs: readonly DesignJobRecord[],
+  input: CanvasTaskReference,
+  workflowRuns: Pick<CanvasWorkflowRunStore, 'list'> | undefined,
+): boolean {
+  if (!workflowRuns) return false
+  /** 同创作链任务只需构建一次集合，避免每个 workflow execution 重复扫描目标任务。 */
+  const creativeTaskJobIds = new Set(targetJobs
+    .filter((candidate) => candidate.creativeTaskId === job.creativeTaskId)
+    .map((candidate) => candidate.id))
+  return workflowRuns.list({ projectId: input.projectId, canvasId: input.canvasId }).some((run) => (
+    run.nodes.some((node) => {
+      if (node.kind !== 'image' || node.nodeId !== input.nodeId) return false
+      const executions = [node.execution, ...(node.executionHistory ?? [])]
+      return executions.some((execution) => {
+        if (!execution || execution.kind !== 'image') return false
+        /** 提交回应丢失时仍可由原 owner 和 operation 精确复原预留 Job ID。 */
+        const ownedJobId = execution.taskId ?? createImageJobId(
+          run.owner,
+          execution.operationId,
+          run.canvasId,
+          node.nodeId,
+        )
+        if (ownedJobId === job.id) return true
+        /** 重试 replacement 改变 Job ID，但不得脱离原 workflow 的 creativeTask 链。 */
+        return creativeTaskJobIds.has(ownedJobId)
+      })
+    })
+  ))
 }
 
 /** 创建 UI 与 Agent 共用的纯主进程任务领域服务。 */
@@ -315,6 +358,9 @@ export function createCanvasTaskOperationService(
     retryTaskLocked: async (input) => {
       assertOperationId(input.operationId)
       const { job, targetJobs } = requireExactJob(input)
+      if (isWorkflowOwnedImageRetry(job, targetJobs, input, dependencies.workflowRuns)) {
+        throw new Error('CANVAS_WORKFLOW_TASK_RETRY_REQUIRES_RESUME')
+      }
       if (!job.imageModelSnapshot) throw new Error('CANVAS_TASK_RETRY_SNAPSHOT_UNAVAILABLE')
       /** 原 job journal 的 replacedBy 事实会表现为同创作任务的下一 attempt，先查它可恢复响应丢失。 */
       const existingReplacement = targetJobs
@@ -333,6 +379,7 @@ export function createCanvasTaskOperationService(
           operationId: input.operationId,
           originalJobId: job.id,
           replacementJobId: existingReplacement.id,
+          created: false,
         }
       }
 
@@ -344,7 +391,8 @@ export function createCanvasTaskOperationService(
           ? {
               nodeId: input.nodeId,
               imageModuleId: input.imageModuleId,
-              initialAdoptedAssetId: job.sourceAssetId ?? null,
+              initialAdoptedAssetId: job.canvasImageInitialAdoptedAssetId !== undefined
+                ? job.canvasImageInitialAdoptedAssetId : job.sourceAssetId ?? null,
               initialConfigRevision: job.canvasImageConfigRevision,
             }
           : undefined
@@ -373,7 +421,12 @@ export function createCanvasTaskOperationService(
           dependencies.onBackgroundError?.('[Canvas 任务] 旧任务重试后台执行失败', error)
         })
       }
-      return { operationId: input.operationId, originalJobId: job.id, replacementJobId }
+      return {
+        operationId: input.operationId,
+        originalJobId: job.id,
+        replacementJobId,
+        created: existingReplacement === undefined,
+      }
     },
   }
 }

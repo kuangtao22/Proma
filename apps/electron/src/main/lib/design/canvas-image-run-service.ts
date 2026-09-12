@@ -93,8 +93,8 @@ function isOwnedImageJob(job: DesignJobRecord, target: CanvasImageTarget): boole
 }
 
 /** 从父运行、工具调用和节点身份派生可重放任务 ID。 */
-function createImageJobId(
-  context: CanvasToolRunContext,
+export function createImageJobId(
+  context: Pick<CanvasToolRunContext, 'sessionId' | 'runStartedAt'>,
   operationId: string,
   canvasId: string,
   nodeId: string,
@@ -387,7 +387,7 @@ export function createCanvasImageRunService(
                 nodeId: node.id,
                 imageModuleId: node.imageModuleId,
               },
-              action: config.adoptedAssetId ? 'edit' : 'generate',
+              action: config.editSourceNodeId || config.adoptedAssetId ? 'edit' : 'generate',
               prompt: config.prompt,
               contextMode: config.contextMode,
               ...(config.mediaWorkflow
@@ -395,6 +395,8 @@ export function createCanvasImageRunService(
                 : { imageModelProfileId: config.selectedModelProfileId! }),
               generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
               canvasImageConfigRevision: config.revision,
+              editSourceNodeId: config.editSourceNodeId,
+              canvasImageInitialAdoptedAssetId: config.adoptedAssetId,
               candidateBatchId,
               ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
             }
@@ -532,6 +534,9 @@ export function createCanvasImageRunService(
       await awaitRunBoundary(Promise.resolve(), options)
       /** 只有本轮新建 journal 才需要锁外启动，既有 journal 不产生重复费用。 */
       const createdJobs = creationOutcome.jobs.filter((entry) => entry.created)
+      /** 建批事务已成功后才签发本轮来源；重放或旧 pending 不产生新回执。 */
+      if (createdJobs.length > 0) context.onImageJobsCreated?.(target.canvasId,
+        createdJobs.map(entry => ({ nodeId: entry.node.id, jobId: entry.job.id })))
       /** Manager 的 start 只等待 running ack，完整生成由 Manager 自己持有并收口。 */
       const runResults = await awaitRunBoundary(Promise.allSettled(
         createdJobs.map((entry) => dependencies.imageJobs.start(entry.job.id)),

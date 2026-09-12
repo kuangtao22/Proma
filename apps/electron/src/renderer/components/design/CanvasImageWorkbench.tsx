@@ -1,7 +1,9 @@
 import * as React from 'react'
 import type {
+  CanvasDocument,
   CanvasImageAspectRatio,
   CanvasImageMediaWorkflow,
+  CanvasImagePreview,
   CanvasImageSize,
   DesignAsset,
   DesignContextMode,
@@ -21,6 +23,7 @@ import {
   RefreshCw,
   Settings2,
   Square,
+  ZoomIn,
 } from 'lucide-react'
 import type {
   CanvasImageModuleDraft,
@@ -35,6 +38,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { ImageLightbox } from '@/components/ui/image-lightbox'
 import { cn } from '@/lib/utils'
 import { DesignTaskDetailsView } from './DesignTaskDetails'
 import {
@@ -54,6 +58,32 @@ export type CanvasImageModelLoadState = 'idle' | 'loading' | 'ready' | 'failed'
 const EMPTY_MEDIA_WORKFLOWS: MediaWorkflowVersion[] = []
 const EMPTY_MEDIA_CONNECTIONS: MediaConnectionSummary[] = []
 const EMPTY_MEDIA_ASSETS: MediaAssetRecord[] = []
+
+/** 编辑底图选择器使用的内部默认项，不会进入持久化节点 ID。 */
+const CURRENT_IMAGE_EDIT_SOURCE_VALUE = '__current-image__'
+
+/**
+ * 从权威画布中解析目标图片节点可选择的编辑底图来源。
+ * @param document 当前画布权威文档。
+ * @param targetNodeId 需要配置编辑底图的图片节点 ID。
+ * @returns 通过 image.asset -> image.reference 非 association 边绑定的其它图片节点。
+ */
+export function getCanvasImageEditSourceNodes(
+  document: CanvasDocument,
+  targetNodeId: string,
+): Array<Extract<CanvasDocument['nodes'][number], { kind: 'image' }>> {
+  /** Set 同时去重多条语义等价边，并保持文档节点顺序稳定。 */
+  const sourceNodeIds = new Set(document.edges
+    .filter((edge) => edge.sourceNodeId !== targetNodeId
+      && edge.sourcePort === 'image.asset'
+      && edge.targetNodeId === targetNodeId
+      && edge.targetPort === 'image.reference'
+      && edge.relation !== 'association')
+    .map((edge) => edge.sourceNodeId))
+  return document.nodes.filter((node): node is Extract<CanvasDocument['nodes'][number], { kind: 'image' }> => (
+    node.kind === 'image' && sourceNodeIds.has(node.id)
+  ))
+}
 
 /** 从当前目录选项生成供应商和模型标签；旧执行器保留原有名称与标识。 */
 function getImageModelLabel(option: ImageGenerationModelOption): string {
@@ -75,6 +105,10 @@ export interface CanvasImageWorkbenchProps {
   mediaConnections?: MediaConnectionSummary[]
   /** 当前项目已经授权并登记的媒体素材。 */
   mediaAssets?: MediaAssetRecord[]
+  /** 当前权威画布用于限定编辑底图只能来自已绑定图片节点。 */
+  canvasDocument?: CanvasDocument
+  /** 当前画布已采用图片的安全缩略图投影。 */
+  imagePreviews?: CanvasImagePreview[]
   /** 独立保存的工作流选择；null 表示使用旧模型 profile。 */
   mediaWorkflow?: CanvasImageMediaWorkflow | null
   /** 新工作流在首次建立本地草稿时继承的画布默认连接。 */
@@ -364,6 +398,90 @@ function createMediaUrl(baseUrl: string, relativePath: string): string {
   return `${baseUrl.replace(/\/+$/, '')}/${encodeURIComponent(filename)}`
 }
 
+/** 主预览实际加载的图片层级。 */
+export interface CanvasImagePreviewSource {
+  src: string
+  quality: 'thumbnail' | 'original-fallback'
+}
+
+/**
+ * 解析主面板图片地址，默认使用 512px 缩略图，仅在缩略图不可用时回退原图。
+ * @param asset 当前可见素材。
+ * @param assetBaseUrl 原图授权根。
+ * @param thumbnailBaseUrl 缩略图授权根。
+ * @param failedThumbnailAssetId 已确认缩略图加载失败的素材 ID。
+ * @returns 当前应加载的地址及清晰度标识。
+ */
+export function resolveCanvasImagePreviewSource(
+  asset: DesignAsset,
+  assetBaseUrl: string,
+  thumbnailBaseUrl: string,
+  failedThumbnailAssetId: string | null,
+): CanvasImagePreviewSource {
+  /** 有效且未失败的缩略图始终是主面板首选。 */
+  const useThumbnail = Boolean(asset.thumbnailRelativePath)
+    && failedThumbnailAssetId !== asset.id
+  return useThumbnail
+    ? { src: createMediaUrl(thumbnailBaseUrl, asset.thumbnailRelativePath), quality: 'thumbnail' }
+    : { src: createMediaUrl(assetBaseUrl, asset.relativePath), quality: 'original-fallback' }
+}
+
+/**
+ * 将原图查看身份限制为当前素材，避免版本切换时短暂显示上一张原图。
+ * @param requestedAssetId 用户明确请求查看原图的素材 ID。
+ * @param visibleAsset 当前主预览素材。
+ * @returns 身份一致时返回当前素材，否则不挂载 Lightbox。
+ */
+export function resolveCanvasImageFullResolutionAsset(
+  requestedAssetId: string | null,
+  visibleAsset: DesignAsset | undefined,
+): DesignAsset | undefined {
+  return requestedAssetId && visibleAsset?.id === requestedAssetId ? visibleAsset : undefined
+}
+
+/** 主预览交互状态与命令，按当前素材身份隔离。 */
+export interface CanvasImagePreviewController {
+  originalPreviewAssetId: string | null
+  failedThumbnailAssetId: string | null
+  failedOriginalAssetId: string | null
+  openOriginal: () => void
+  closeOriginal: () => void
+  reportThumbnailFailure: () => void
+  reportOriginalFailure: () => void
+}
+
+/**
+ * 管理主预览的按需原图和失败回退状态。
+ * @param assetId 当前可见素材 ID。
+ * @returns 只作用于当前素材的状态与幂等命令。
+ */
+export function useCanvasImagePreviewController(assetId: string): CanvasImagePreviewController {
+  /** 缩略图失败身份决定是否加载原图回退。 */
+  const [failedThumbnailAssetId, setFailedThumbnailAssetId] = React.useState<string | null>(null)
+  /** 原图回退失败身份决定是否展示不可用空态。 */
+  const [failedOriginalAssetId, setFailedOriginalAssetId] = React.useState<string | null>(null)
+  /** 仅用户明确激活时保存原图查看身份。 */
+  const [originalPreviewAssetId, setOriginalPreviewAssetId] = React.useState<string | null>(null)
+  /** 素材切换必须同步清空上一张的请求和失败状态。 */
+  React.useEffect(() => {
+    setFailedThumbnailAssetId(null)
+    setFailedOriginalAssetId(null)
+    setOriginalPreviewAssetId(null)
+  }, [assetId])
+  /** 打开当前素材原图。 */
+  const openOriginal = React.useCallback((): void => setOriginalPreviewAssetId(assetId), [assetId])
+  /** 关闭原图并释放 Lightbox。 */
+  const closeOriginal = React.useCallback((): void => setOriginalPreviewAssetId(null), [])
+  /** 记录当前素材缩略图失败。 */
+  const reportThumbnailFailure = React.useCallback((): void => setFailedThumbnailAssetId(assetId), [assetId])
+  /** 记录当前素材原图回退失败。 */
+  const reportOriginalFailure = React.useCallback((): void => setFailedOriginalAssetId(assetId), [assetId])
+  return {
+    originalPreviewAssetId, failedThumbnailAssetId, failedOriginalAssetId,
+    openOriginal, closeOriginal, reportThumbnailFailure, reportOriginalFailure,
+  }
+}
+
 /** 按更新时间从新到旧复制任务列表，避免改写权威快照数组。 */
 function sortJobsByRecency(jobs: DesignJobRecord[]): DesignJobRecord[] {
   return [...jobs].sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt)
@@ -401,39 +519,86 @@ function FieldHeader({ children }: { children: React.ReactNode }): React.ReactEl
 function ImagePreview({
   asset,
   assetBaseUrl,
+  thumbnailBaseUrl,
   aspectRatio,
   activeJob,
 }: {
   asset: DesignAsset | undefined
   assetBaseUrl: string
+  thumbnailBaseUrl: string
   aspectRatio: CanvasImageAspectRatio
   activeJob: DesignJobRecord | undefined
 }): React.ReactElement {
   /** 比例字符串可直接供 CSS aspect-ratio 使用。 */
   const cssAspectRatio = aspectRatio.replace(':', ' / ')
+  /** 无素材时使用稳定空身份；组件 key 会在素材出现时重建。 */
+  const previewController = useCanvasImagePreviewController(asset?.id ?? 'empty')
+  /** 当前素材的轻量或回退地址。 */
+  const previewSource = asset
+    ? resolveCanvasImagePreviewSource(asset, assetBaseUrl, thumbnailBaseUrl, previewController.failedThumbnailAssetId)
+    : undefined
+  /** 只有当前素材身份仍一致时才挂载原图 Lightbox。 */
+  const fullResolutionAsset = resolveCanvasImageFullResolutionAsset(previewController.originalPreviewAssetId, asset)
+  /** 原图回退失败状态同样按素材隔离。 */
+  const originalUnavailable = asset?.id === previewController.failedOriginalAssetId
   return (
-    <div
-      className="relative flex min-h-56 w-full items-center justify-center overflow-hidden rounded-md border border-border bg-muted/35"
-      style={{ aspectRatio: cssAspectRatio }}
-    >
-      {asset ? (
-        <img
-          src={createMediaUrl(assetBaseUrl, asset.relativePath)}
-          alt="当前生成结果"
-          className="absolute inset-0 h-full w-full object-contain"
+    <>
+      <div
+        className="relative flex min-h-56 w-full items-center justify-center overflow-hidden rounded-md border border-border bg-muted/35"
+        style={{ aspectRatio: cssAspectRatio }}
+      >
+        {asset && previewSource && !originalUnavailable ? (
+          <button
+            type="button"
+            className="group absolute inset-0 size-full cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            aria-label={`查看原图：${asset.filename}`}
+            onClick={previewController.openOriginal}
+          >
+            <img
+              src={previewSource.src}
+              alt="当前生成结果"
+              className="size-full object-contain"
+              onError={() => {
+                if (previewSource.quality === 'thumbnail') previewController.reportThumbnailFailure()
+                else previewController.reportOriginalFailure()
+              }}
+            />
+            <span
+              className="absolute bottom-2 right-2 flex items-center gap-1 rounded-sm bg-background/85 px-1.5 py-1 text-[10px] text-foreground shadow-sm backdrop-blur-sm"
+              data-image-preview-quality={previewSource.quality}
+            >
+              <ZoomIn className="size-3" aria-hidden="true" />
+              {previewSource.quality === 'thumbnail' ? '预览图 · 点击查看原图' : '原图'}
+            </span>
+          </button>
+        ) : asset ? (
+          <div className="flex flex-col items-center gap-2 px-6 text-center text-xs text-muted-foreground" role="status">
+            <ImageOff className="size-5" aria-hidden="true" />
+            <span>图片暂时无法显示</span>
+          </div>
+        ) : activeJob ? (
+          <div className="flex flex-col items-center gap-2 px-6 text-center text-xs text-muted-foreground" role="status">
+            <LoaderCircle className="size-5 animate-spin" aria-hidden="true" />
+            <span>{JOB_STATUS_MESSAGES[activeJob.status] ?? JOB_STATUS_LABELS[activeJob.status]}</span>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-2 px-6 text-center text-xs text-muted-foreground">
+            <ImageOff className="size-5" aria-hidden="true" />
+            <span>还没有生成结果</span>
+          </div>
+        )}
+      </div>
+      {fullResolutionAsset ? (
+        <ImageLightbox
+          src={createMediaUrl(assetBaseUrl, fullResolutionAsset.relativePath)}
+          alt={fullResolutionAsset.filename}
+          open
+          onOpenChange={(open) => {
+            if (!open) previewController.closeOriginal()
+          }}
         />
-      ) : activeJob ? (
-        <div className="flex flex-col items-center gap-2 px-6 text-center text-xs text-muted-foreground" role="status">
-          <LoaderCircle className="size-5 animate-spin" aria-hidden="true" />
-          <span>{JOB_STATUS_MESSAGES[activeJob.status] ?? JOB_STATUS_LABELS[activeJob.status]}</span>
-        </div>
-      ) : (
-        <div className="flex flex-col items-center gap-2 px-6 text-center text-xs text-muted-foreground">
-          <ImageOff className="size-5" aria-hidden="true" />
-          <span>还没有生成结果</span>
-        </div>
-      )}
-    </div>
+      ) : null}
+    </>
   )
 }
 
@@ -447,6 +612,8 @@ export function CanvasImageWorkbench({
   mediaWorkflows = EMPTY_MEDIA_WORKFLOWS,
   mediaConnections = EMPTY_MEDIA_CONNECTIONS,
   mediaAssets = EMPTY_MEDIA_ASSETS,
+  canvasDocument,
+  imagePreviews = [],
   mediaWorkflow = null,
   defaultComfyuiConnectionId = null,
   onMediaWorkflowChange,
@@ -558,6 +725,24 @@ export function CanvasImageWorkbench({
   const detailsJob = detailsJobId ? jobs.find((job) => job.id === detailsJobId) : undefined
   /** 详情视图按 job 独立读取，不复用旧 Inspector Map。 */
   const detailsState = detailsJob ? createTaskDetailsViewState(state.taskDetails.get(detailsJob.id)) : null
+  /** 非 Comfy 图片编辑只列当前权威关系允许的来源节点。 */
+  const editSourceNodes = canvasDocument
+    ? getCanvasImageEditSourceNodes(canvasDocument, snapshot.target.nodeId)
+    : []
+  /** 缩略图只按已采用素材 ID 匹配，不读取本地路径。 */
+  const editSourcePreviewByAssetId = new Map(imagePreviews.map((preview) => [preview.assetId, preview]))
+  /** 升级前内存草稿缺字段时按 null 处理，避免切到 Comfy 后误显示清理告警。 */
+  const editSourceNodeId = draft.editSourceNodeId ?? null
+  /** 已保存来源在图上失效时仍保留其 ID，避免静默改写用户配置。 */
+  const editSourceSelectionInvalid = editSourceNodeId !== null
+    && !editSourceNodes.some((node) => node.id === editSourceNodeId)
+  /** Select 触发器显式显示当前来源，服务端渲染和失效选项都不会丢失身份。 */
+  const selectedEditSourceNode = editSourceNodes.find((node) => node.id === editSourceNodeId)
+  const editSourceLabel = editSourceNodeId === null
+    ? '当前节点默认图片'
+    : selectedEditSourceNode?.title ?? `失效来源 · ${editSourceNodeId}`
+  /** Comfy 的参考图由工作流控制；仅在遗留独立选择需要清除时显示该设置。 */
+  const comfyControlsEditSource = Boolean(mediaWorkflow) || selectedModel?.executor === 'comfyui'
 
   return (
     <div className="canvas-media-workbench-container h-full min-h-0" aria-label="生图节点工作台内容">
@@ -576,8 +761,10 @@ export function CanvasImageWorkbench({
               </div>
 
               <ImagePreview
+                key={visibleAsset?.id ?? 'empty'}
                 asset={visibleAsset}
                 assetBaseUrl={snapshot.assetBaseUrl}
+                thumbnailBaseUrl={snapshot.thumbnailBaseUrl}
                 aspectRatio={draft.aspectRatio}
                 activeJob={activeJob}
               />
@@ -802,6 +989,55 @@ export function CanvasImageWorkbench({
               ) : null}
               {workflowValidationError ? (
                 <p className="break-words text-xs text-destructive" role="alert">{workflowValidationError}</p>
+              ) : null}
+
+              {!comfyControlsEditSource || editSourceNodeId !== null ? (
+                <div className="space-y-1.5">
+                  <Label htmlFor="canvas-image-edit-source" className="text-xs">编辑底图</Label>
+                  <Select
+                    value={editSourceNodeId ?? CURRENT_IMAGE_EDIT_SOURCE_VALUE}
+                    disabled={!writable}
+                    onValueChange={(nodeId) => onDraftChange({
+                      editSourceNodeId: nodeId === CURRENT_IMAGE_EDIT_SOURCE_VALUE ? null : nodeId,
+                    })}
+                  >
+                    <SelectTrigger id="canvas-image-edit-source" className="h-8 min-w-0 rounded-sm px-2 text-xs">
+                      <SelectValue>{editSourceLabel}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={CURRENT_IMAGE_EDIT_SOURCE_VALUE}>当前节点默认图片</SelectItem>
+                      {editSourceSelectionInvalid ? (
+                        <SelectItem value={editSourceNodeId!}>
+                          <span className="break-all">失效来源 · {editSourceNodeId}</span>
+                        </SelectItem>
+                      ) : null}
+                      {editSourceNodes.map((sourceNode) => {
+                        /** 只有来源节点已经采用素材时才展示其安全缩略图。 */
+                        const preview = sourceNode.adoptedAssetId
+                          ? editSourcePreviewByAssetId.get(sourceNode.adoptedAssetId)
+                          : undefined
+                        return (
+                          <SelectItem key={sourceNode.id} value={sourceNode.id}>
+                            <span className="flex min-w-0 items-center gap-2">
+                              {preview ? <img src={preview.previewUrl} alt="" className="size-5 shrink-0 rounded-sm object-cover" /> : null}
+                              <span className="truncate">{sourceNode.title}</span>
+                            </span>
+                          </SelectItem>
+                        )
+                      })}
+                    </SelectContent>
+                  </Select>
+                  {editSourceSelectionInvalid ? (
+                    <p className="break-words text-xs text-destructive" role="alert">
+                      原编辑底图已失效，请重新选择或改用当前节点默认图片。
+                    </p>
+                  ) : null}
+                  {comfyControlsEditSource && editSourceNodeId !== null ? (
+                    <p className="break-words text-xs text-destructive" role="alert">
+                      此模型的参考图由工作流输入决定，请清除独立底图选择。
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
 
               <div className="space-y-1.5">

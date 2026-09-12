@@ -223,6 +223,47 @@ describe('Design Job Manager', () => {
     expect(document.nodes).toEqual(before)
   })
 
+  test('Given 原生 Canvas 图片配置含首尾空白 When 创建任务 Then 冻结原文且保留既有展示提示词', async () => {
+    const originalRequest = '  精确保留 204x76 和 144x56 两个尺寸，不能概括。  '
+    const job = await harness.manager.createCanvasImage({
+      ...createCanvasImageInput('frozen-prompt'),
+      prompt: originalRequest,
+    })
+
+    expect(job).toMatchObject({
+      prompt: originalRequest.trim(),
+      originalRequest,
+      imagePromptContract: 'frozen-config-v1',
+    })
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))).toMatchObject({
+      originalRequest,
+      imagePromptContract: 'frozen-config-v1',
+    })
+  })
+
+  test('Given 原生 Canvas 图片合同 When 隐藏规划尝试改写配置 Then Host 扩展仅提供冻结原文和参数', async () => {
+    const originalRequest = '精确保留 204x76 和 144x56，不接受约七成宽度。'
+    harness.runHeadless = async (callbacks, extensions) => {
+      expect(extensions.trustedImagePrompt).toBe(originalRequest)
+      expect(extensions.trustedImageParameters).toEqual({
+        aspectRatio: '16:9', imageSize: '2K', numberOfImages: 1,
+      })
+      extensions.captureDesignImageCall?.({
+        designSummary: '保留已确认的尺寸与信息层级。',
+        prompt: extensions.trustedImagePrompt!,
+      })
+      callbacks.onComplete([])
+    }
+    const job = await harness.manager.createCanvasImage({
+      ...createCanvasImageInput('host-prompt'),
+      prompt: originalRequest,
+    })
+
+    await harness.manager.run(job.id)
+
+    expect(harness.manager.get(job.id)).toMatchObject({ finalImagePrompt: originalRequest })
+  })
+
   test('Given Canvas 图片执行仍在运行 When 并发 start Then running 后立即确认且只启动一次', async () => {
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
@@ -259,6 +300,7 @@ describe('Design Job Manager', () => {
     expect(mediaHarness.createdSessions).toEqual([])
     expect(mediaHarness.runInputs).toEqual([])
     expect(mediaHarness.importSources).toEqual([])
+    expect(job).not.toHaveProperty('imagePromptContract')
     expect(mediaHarness.manager.get(job.id)).toMatchObject({ status: 'succeeded', outputAssetId: 'asset-media' })
     expect(mediaHarness.candidateTerminalEvents).toEqual([{
       jobId: job.id,
@@ -617,6 +659,128 @@ describe('Design Job Manager', () => {
     })
     await harness.manager.run(job.id)
     expect(harness.runInputs[0]?.userMessage).toContain('referenceImagePaths: ["/trusted/asset-reference.png"]')
+  })
+
+  test('Given 显式选择母版 When 创建并重试 Then 固化母版且保留目标旧采用基线', async () => {
+    document.assets.push(createAsset('asset-master'))
+    harness.canvasInputReferences = [createImageReference('master-node', 'asset-master')]
+    /** 以母版编辑时，旧帧只作为采用基线。 */
+    const job = await harness.manager.createCanvasImage({
+      ...createCanvasImageEditInput(), editSourceNodeId: 'master-node',
+      canvasImageInitialAdoptedAssetId: 'asset-source',
+    })
+    expect(job).toMatchObject({ sourceAssetId: 'asset-master', parentAssetId: 'asset-master',
+      canvasImageInitialAdoptedAssetId: 'asset-source' })
+    await harness.manager.run(job.id)
+    harness.canvasInputReferences = []
+    /** 重试固定原始素材，不重新读取已变动的连线。 */
+    const retry = harness.manager.retry('project-1', job.id)
+    expect(retry).toMatchObject({ sourceAssetId: 'asset-master',
+      canvasImageInitialAdoptedAssetId: 'asset-source', canvasInputReferences: job.canvasInputReferences })
+  })
+
+  test('Given 编辑来源没有有效图片参考绑定 When 预检 Then 拒绝且不创建任务', async () => {
+    harness.canvasInputReferences = [{ ...createImageReference('master-node', 'asset-source'), targetPort: 'context.text' }]
+    await expect(harness.manager.createCanvasImage({
+      ...createCanvasImageEditInput(), editSourceNodeId: 'master-node',
+    })).rejects.toThrow('CANVAS_IMAGE_EDIT_SOURCE_INVALID')
+    expect(harness.createdIdCount).toBe(0)
+    expect(harness.createdSessions).toHaveLength(0)
+  })
+
+  test('Given 空节点选择母版 When 候选终态恢复 Then 仍以空采用基线恢复', async () => {
+    /** UUID 表示可独立恢复的单节点候选批次。 */
+    const candidateHarness = createHarness({ withCandidateBatches: true })
+    candidateHarness.canvasInputReferences = [createImageReference('master-node', 'asset-source')]
+    candidateHarness.messages = [createToolMessage('session-1/output.png')]
+    const job = await candidateHarness.manager.createCanvasImage({
+      ...createCanvasImageInput('a'), action: 'edit', editSourceNodeId: 'master-node',
+      canvasImageInitialAdoptedAssetId: null, candidateBatchId: '12345678-1234-4234-9234-123456789abc',
+    })
+    await candidateHarness.manager.run(job.id)
+    expect(candidateHarness.candidateTerminalEvents).toContainEqual(expect.objectContaining({
+      singleBatchRecovery: expect.objectContaining({ initialAdoptedAssetId: null }),
+    }))
+  })
+
+  test('Given 旧 Design 编辑任务 When 请求图片 Then 同样固定原图并记录真实输入', async () => {
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    /** 验证旧入口也经过 Host 控制，且广播不携带内部审计。 */
+    let captured = false
+    const events: DesignJobRecord[] = []
+    harness.manager.onChanged((event) => { events.push(event.job) })
+    harness.runHeadless = async (callbacks, extensions) => {
+      expect(extensions.trustedReferenceImagePaths).toEqual(['/trusted/asset-source.png'])
+      extensions.captureDesignImageRequest!({ executor: 'openai-images', modelId: 'gpt-image-2',
+        prompt: 'Edit original', referenceImages: [{ path: '/trusted/asset-source.png', sha256: 'a'.repeat(64), byteSize: 20 }] })
+      captured = true
+      callbacks.onComplete([])
+    }
+    const job = harness.manager.create(createEditInput())
+    await harness.manager.run(job.id)
+    expect(captured).toBe(true)
+    for (const event of events) {
+      expect(event).not.toHaveProperty('imageRequestAudit')
+      expect(event).not.toHaveProperty('placementState')
+    }
+  })
+
+  test('Given 工具请求省略固定参考 When 准备外发 Then 审计拒绝且任务失败', async () => {
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    harness.canvasInputReferences = [createImageReference('master-node', 'asset-source')]
+    /** 模拟执行器捕获遗漏参考的真实请求，不进入任何网络。 */
+    harness.runHeadless = async (_callbacks, extensions) => {
+      extensions.captureDesignImageRequest!({ executor: 'openai-images', modelId: 'gpt-image-2',
+        prompt: 'Actual prompt', referenceImages: [] })
+    }
+    const job = await harness.manager.createCanvasImage(createCanvasImageEditInput())
+    await harness.manager.run(job.id)
+    expect(harness.manager.getProjectJob('project-1', job.id)).toMatchObject({ status: 'failed',
+      error: expect.stringContaining('图片请求与任务快照不一致') })
+    expect(harness.importSources).toHaveLength(0)
+  })
+
+  test('Given ComfyUI 模型保存了独立底图 When 预检 Then 明确拒绝静默忽略', async () => {
+    harness.resolveAvailableSnapshot = () => createComfySnapshot()
+    await expect(harness.manager.createCanvasImage({ ...createCanvasImageEditInput(),
+      editSourceNodeId: 'master-node' })).rejects.toThrow('工作流输入')
+    expect(harness.createdIdCount).toBe(0)
+  })
+
+  test('Given 母版及角色参考 When 运行图片任务 Then Host 固定顺序并在请求前保存真实输入审计', async () => {
+    harness.resolveAvailableSnapshot = () => createOpenAISnapshot()
+    harness.canvasInputReferences = [createImageReference('character-node', 'asset-character'),
+      createImageReference('master-node', 'asset-source')]
+    /** 在回调中读 journal，证明发送前即已持久化。 */
+    let captured = false
+    harness.runHeadless = async (callbacks, extensions) => {
+      expect(extensions.trustedReferenceImagePaths).toEqual(['/trusted/asset-source.png', '/trusted/asset-character.png'])
+      expect(extensions.captureDesignImageRequest).toBeFunction()
+      extensions.captureDesignImageRequest!({ executor: 'openai-images', modelId: 'gpt-image-2', prompt: 'Actual prompt',
+        referenceImages: [
+          { path: '/trusted/asset-source.png', sha256: 'a'.repeat(64), byteSize: 20 },
+          { path: '/trusted/asset-character.png', sha256: 'b'.repeat(64), byteSize: 30 },
+        ] })
+      const journal = JSON.parse(readFileSync(join(cacheRoot, 'jobs', 'job-1.json'), 'utf8'))
+      expect(journal.imageRequestAudit).toMatchObject({ executor: 'openai-images', modelId: 'gpt-image-2',
+        referenceImages: [{ assetId: 'asset-source', sha256: 'a'.repeat(64), byteSize: 20 },
+          { assetId: 'asset-character', sha256: 'b'.repeat(64), byteSize: 30 }] })
+      expect(JSON.stringify(journal.imageRequestAudit)).not.toContain('/trusted/')
+      expect(journal.finalImagePrompt).toBe('Actual prompt')
+      captured = true
+      callbacks.onComplete([])
+    }
+    const job = await harness.manager.createCanvasImage(createCanvasImageEditInput())
+    await harness.manager.run(job.id)
+    expect(captured).toBe(true)
+    expect(harness.manager.getProjectJob('project-1', job.id)).not.toHaveProperty('imageRequestAudit')
+    expect(harness.manager.get(job.id)).not.toHaveProperty('imageRequestAudit')
+    expect(harness.manager.list('project-1')[0]).not.toHaveProperty('imageRequestAudit')
+    expect(await harness.manager.cancel('project-1', job.id)).not.toHaveProperty('imageRequestAudit')
+    expect(createHarness().manager.getProjectJob('project-1', job.id)).toMatchObject({ id: job.id, finalImagePrompt: 'Actual prompt' })
+    const retry = harness.manager.retry('project-1', job.id)
+    const retryJournal = JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${retry.id}.json`), 'utf8'))
+    expect(retryJournal).not.toHaveProperty('imageRequestAudit')
   })
 
   test('Given Canvas 图片参考已绑定 When 运行生成 Then 隐藏 Agent 收到真实参考图路径', async () => {
@@ -1026,7 +1190,7 @@ describe('Design Job Manager', () => {
 
     await harness.manager.run(job.id)
 
-    expect(harness.manager.get(job.id)).toMatchObject({
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))).toMatchObject({
       status: 'running',
       terminalState: { status: 'pending', outputAssetId: 'asset-output' },
     })
@@ -1065,7 +1229,7 @@ describe('Design Job Manager', () => {
 
     await expect(harness.manager.cancel('project-1', job.id))
       .rejects.toThrow('任务已进入结果提交阶段，无法取消')
-    expect(harness.manager.get(job.id)).toMatchObject({
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))).toMatchObject({
       status: 'running', terminalState: { status: 'pending', outputAssetId: 'asset-output' },
     })
     expect(harness.stoppedSessions).toEqual([])
@@ -1099,7 +1263,7 @@ describe('Design Job Manager', () => {
       .resolves.toMatchObject({ status: 'queued', target: { imageModuleId: 'image-module-b' } })
   })
 
-  test('Given Canvas 失败任务 When 重试 Then 复用任务身份和全部固化快照', async () => {
+  test('Given Canvas 失败任务 When 重试 Then 复用任务身份、提示词合同和全部固化快照', async () => {
     harness.canvasInputReferences = [{
       nodeId: 'document-1', kind: 'document', revision: 2,
       summary: '已提交首页文档', summaryHash: 'a'.repeat(64),
@@ -1118,12 +1282,27 @@ describe('Design Job Manager', () => {
       target: original.target,
       prompt: original.prompt,
       originalRequest: original.originalRequest,
+      imagePromptContract: original.imagePromptContract,
       contextMode: 'none',
       imageModelSnapshot: original.imageModelSnapshot,
       generationConstraints: original.generationConstraints,
       canvasImageConfigRevision: original.canvasImageConfigRevision,
       canvasInputReferences: original.canvasInputReferences,
     })
+  })
+
+  test('Given 原生 Canvas 配置原文超过执行上限 When 预检或创建任务 Then 拒绝且没有 journal 或 Agent 会话', async () => {
+    const input = {
+      ...createCanvasImageInput('too-long'),
+      prompt: 'x'.repeat(16_001),
+    }
+
+    await expect(harness.manager.preflightCanvasImage(input)).rejects.toThrow('CANVAS_IMAGE_PROMPT_TOO_LONG')
+    await expect(harness.manager.createCanvasImage(input)).rejects.toThrow('CANVAS_IMAGE_PROMPT_TOO_LONG')
+
+    expect(harness.createdIdCount).toBe(0)
+    expect(harness.createdSessions).toEqual([])
+    expect(existsSync(join(cacheRoot, 'jobs'))).toBe(false)
   })
 
   test('Given 旧 Canvas 任务失败且同模块已有新 active When 重试旧任务 Then 拒绝绕过模块互斥', async () => {
@@ -2008,10 +2187,8 @@ describe('Design Job Manager', () => {
 
     await harness.manager.run(job.id)
 
-    expect(harness.manager.get(job.id)).toMatchObject({
-      status: 'running',
-      terminalState: { status: 'pending', outputAssetId: 'asset-output' },
-    })
+    expect(harness.manager.get(job.id)).toMatchObject({ status: 'running' })
+    expect(harness.manager.get(job.id)).not.toHaveProperty('terminalState')
     expect(harness.batchCommits).toBe(0)
     expect(harness.batchRollbacks).toBe(0)
     expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', `${job.id}.json`), 'utf8'))).toMatchObject({
@@ -2069,7 +2246,7 @@ describe('Design Job Manager', () => {
     const firstRecovery = (await harness.manager.recover('project-1'))[0]
     expect(firstRecovery).toMatchObject({ status: 'running' })
     expect(firstRecovery).not.toHaveProperty('terminalState')
-    expect(harness.manager.get('job-pending')).toMatchObject({
+    expect(JSON.parse(readFileSync(join(cacheRoot, 'jobs', 'job-pending.json'), 'utf8'))).toMatchObject({
       status: 'running', terminalState: { status: 'pending' },
     })
 
@@ -3080,4 +3257,10 @@ function createSdkToolErrorMessages(error: string): SDKMessage[] {
       is_error: true,
     }] },
   }] as SDKMessage[]
+}
+
+/** 构造可信解析器返回的正式图片参考快照。 */
+function createImageReference(nodeId: string, assetId: string): CanvasImageInputReference {
+  return { nodeId, kind: 'image', revision: 1, summary: '已采用参考图', summaryHash: 'a'.repeat(64),
+    assetId, sourcePort: 'image.asset', targetPort: 'image.reference' }
 }

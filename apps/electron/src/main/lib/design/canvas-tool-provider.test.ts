@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { Value } from 'typebox/value'
 import { validateToolArguments } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
@@ -12,9 +13,230 @@ import {
   type CanvasToolRunContext,
 } from './canvas-tool-provider'
 import type { CanvasOperationToolHandlers } from './canvas-operation-tools'
+import { createCanvasAgentReviewTracker, resolveCanvasAgentReviewContext } from './canvas-agent-review'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
+
+test('Given 专业节点执行失败 When 父编排接收回执 Then 包含实际节点诊断和只读恢复动作', async () => {
+  const fixture = createFixture()
+  fixture.dependencies.agentExecution.execute = async () => ({ status: 'errored', failure: {
+    code: 'CANVAS_AGENT_RUN_FAILED', stage: 'execution', reasonCode: 'connection', message: '连接中断', recovery: 'inspect-node',
+  } })
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const result = await executeTool(run.piCustomTools, 'canvas_run_agent', {
+    canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '检查本任务',
+  })
+  expect(result.details).toMatchObject({ nodeId: 'agent-1', nodeTitle: expect.any(String), status: 'errored',
+    failure: { code: 'CANVAS_AGENT_RUN_FAILED', stage: 'execution', recovery: 'inspect-node' },
+    nextAction: { tool: 'canvas_read', canvasId: 'canvas-1', nodeIds: ['agent-1'] },
+  })
+  expect(fixture.runInputs).toEqual([])
+})
+
+test('Given 专业节点模型不可用 When 准备运行 Then 返回原节点配置诊断并保留撤权硬边界', async () => {
+  const fixture = createFixture()
+  fixture.dependencies.agentExecution.execute = async () => { throw new Error('CANVAS_AGENT_MODEL_UNAVAILABLE: 当前模型不可用') }
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const input = { canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '检查' }
+  expect((await executeTool(run.piCustomTools, 'canvas_run_agent', input)).details).toMatchObject({
+    nodeId: 'agent-1', status: 'errored', failure: { stage: 'preparation', reasonCode: 'model-unavailable', recovery: 'inspect-model' },
+    nextAction: { tool: 'canvas_read', nodeIds: ['agent-1'] },
+  })
+  fixture.dependencies.agentExecution.execute = async () => { throw new Error('CANVAS_ACCESS_DENIED') }
+  await expect(executeTool(run.piCustomTools, 'canvas_run_agent', input)).rejects.toThrow('CANVAS_ACCESS_DENIED')
+  expect(fixture.runInputs).toEqual([])
+})
+
+for (const entry of ['nodes', 'workflow', 'resume'] as const) {
+  test(`Given 新候选检查合同 When 经${entry}真实创建并检查 Then 可交付而无需采用`, async () => {
+    /** 三种执行入口共用同一 Host 身份登记边界。 */
+    const fixture = createFixture()
+    const jobId = 'new-candidate'
+    fixture.dependencies.images.listVersions = async () => [{ jobId, assetId: 'new-asset', createdAt: 5 }]
+    const originalRun = fixture.dependencies.imageRuns.run
+    fixture.dependencies.imageRuns.run = async (context, ...args) => {
+      context.onImageJobsCreated?.('canvas-1', [{ nodeId: 'image-1', jobId }])
+      return originalRun(context, ...args)
+    }
+    const originalWorkflow = fixture.dependencies.workflowExecution.execute
+    fixture.dependencies.workflowExecution.execute = async (context, ...args) => {
+      context.onImageJobsCreated?.('canvas-1', [{ nodeId: 'image-1', jobId }])
+      return originalWorkflow(context, ...args)
+    }
+    fixture.dependencies.operations = { resumeWorkflow: async (_input, execution) => {
+      execution.context.onImageJobsCreated?.('canvas-1', [{ nodeId: 'image-1', jobId }])
+      return { status: 'waiting-review' }
+    } }
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+      { id: 'candidate', description: '生成并检查，不要求采用', nodeKind: 'image', nodeId: 'image-1', change: 'updated', validation: 'inspection' },
+    ] })
+    if (entry === 'nodes') await executeTool(run.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] })
+    else if (entry === 'workflow') await executeTool(run.piCustomTools, 'canvas_run_workflow', {
+      canvasId: 'canvas-1', expectedRevision: 3, startNodeIds: ['agent-1'], goal: '生成候选', maxImageRuns: 1,
+    })
+    else await executeTool(run.piCustomTools, 'canvas_resume_workflow', { canvasId: 'canvas-1', runId: 'workflow-1', intent: 'explicit' })
+    const inspected = await executeTool(run.piCustomTools, 'canvas_inspect_images', {
+      canvasId: 'canvas-1', nodeIds: ['image-1'], versions: [{ nodeId: 'image-1', jobId }], expectedRevision: 3,
+    })
+    const proof = (inspected.details as { inspections: Array<{ evidenceId: string }> }).inspections[0]!
+    expect((await executeTool(run.piCustomTools, 'canvas_task', {
+      action: 'complete', submissions: [{ id: 'candidate', evidenceId: proof.evidenceId }],
+    })).details).toMatchObject({ phase: 'completed' })
+    expect(fixture.imageSaveInputs).toEqual([])
+    expect(await run.evaluateCompletion?.(new AbortController().signal)).toEqual({ action: 'complete' })
+  })
+}
+
+test('Given 合同之前启动的图片延迟创建 When 后来登记合同并检查 Then 不能追认旧调用或历史候选', async () => {
+  const fixture = createFixture()
+  let releaseCreation = (): void => undefined
+  const pendingCreation = new Promise<void>(resolve => { releaseCreation = resolve })
+  const originalRun = fixture.dependencies.imageRuns.run
+  fixture.dependencies.imageRuns.run = async (context, ...args) => {
+    await pendingCreation
+    context.onImageJobsCreated?.('canvas-1', [{ nodeId: 'image-1', jobId: 'old-pending' }])
+    return originalRun(context, ...args)
+  }
+  fixture.dependencies.images.listVersions = async () => [{ jobId: 'old-pending', assetId: 'old-asset', createdAt: 10 }]
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const generating = executeTool(run.piCustomTools, 'canvas_run_nodes', { canvasId: 'canvas-1', nodeIds: ['image-1'] })
+  await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+    { id: 'candidate', description: '本轮新生成并检查', nodeKind: 'image', nodeId: 'image-1', change: 'updated', validation: 'inspection' },
+  ] })
+  releaseCreation()
+  await generating
+  const inspected = await executeTool(run.piCustomTools, 'canvas_inspect_images', {
+    canvasId: 'canvas-1', nodeIds: ['image-1'], versions: [{ nodeId: 'image-1', jobId: 'old-pending' }], expectedRevision: 3,
+  })
+  const proof = (inspected.details as { inspections: Array<{ evidenceId: string }> }).inspections[0]!
+  await expect(executeTool(run.piCustomTools, 'canvas_task', {
+    action: 'complete', submissions: [{ id: 'candidate', evidenceId: proof.evidenceId }],
+  })).rejects.toThrow('CANVAS_TASK_CANDIDATE_NOT_GENERATED')
+})
+
+test('Given 导演明确审核范围 When 读取上下文和实际节点 Then 只在真实读取后登记覆盖且不启动媒体', async () => {
+  /** 复用真实Provider读取链，枚举或获取上下文本身不得增加覆盖。 */
+  const fixture = createFixture({ documentContent: '脚本' })
+  const document = fixture.dependencies.documents.load(target).document
+  const reviewContext = resolveCanvasAgentReviewContext(document, 'agent-1', { mode: 'nodes', nodeIds: ['doc-1'] })
+  const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context,
+    canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated', reviewContext,
+  })
+  expect((await executeTool(run.piCustomTools, 'canvas_get_context', {})).details).toMatchObject({
+    review: { mode: 'nodes', nodeIds: ['doc-1'], coverage: { readNodes: 0, unreadNodes: 1 } },
+  })
+  await executeTool(run.piCustomTools, 'canvas_list_nodes', { canvasId: 'canvas-1', expectedRevision: 3 })
+  expect(run.getReviewCoverage?.()).toMatchObject({ readNodes: 0 })
+  await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['doc-1'], expectedRevision: 3, includeNeighbors: true })
+  expect(run.getReviewCoverage?.()).toMatchObject({ readNodes: 1, unreadNodes: 0, qualityVerdict: 'not-assessed' })
+  expect(fixture.runInputs).toEqual([])
+})
+
+test('Given 导演审核有提示词的图片 When 真实读取完整正文及截断正文 Then 覆盖按实际送达内容更新', async () => {
+  /** Provider 在最终预算分配后将图片提示词回填配置，正文不重复携带同一字符串。 */
+  const fixture = createFixture()
+  /** 可变化的真实模块输入，用于验证完整读取之后仍识别新的正文裁剪。 */
+  let prompt = '首帧保留空卡槽，卡片与卡槽的长边至少保留20%总余量。'
+  /** 保留原模块合同，仅更换本次读取的提示词。 */
+  const loadImage = fixture.dependencies.images.load
+  fixture.dependencies.images.load = async (...args) => {
+    const snapshot = await loadImage(...args)
+    return { ...snapshot, config: { ...snapshot.config, prompt } }
+  }
+  /** 只审核目标图片，邻接节点用于补齐真实关系。 */
+  const reviewContext = resolveCanvasAgentReviewContext(fixture.dependencies.documents.load(target).document,
+    'agent-1', { mode: 'nodes', nodeIds: ['image-1'] })
+  const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context,
+    canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated', reviewContext,
+  })
+  const input = { canvasId: 'canvas-1', nodeIds: ['image-1'], expectedRevision: 3, includeNeighbors: true }
+  const result = await executeTool(run.piCustomTools, 'canvas_read', input)
+  expect(result.details).toMatchObject({ nodes: expect.arrayContaining([
+    expect.objectContaining({ node: expect.objectContaining({ id: 'image-1' }), content: '',
+      contentLength: prompt.length, artifact: expect.objectContaining({ config: expect.objectContaining({ prompt }) }) }),
+  ]) })
+  expect(run.getReviewCoverage?.()).toMatchObject({ readNodes: 1, incompleteNodes: 0, complete: true, qualityVerdict: 'not-assessed' })
+  prompt = '精确约束'.repeat(20_000)
+  await executeTool(run.piCustomTools, 'canvas_read', input)
+  expect(run.getReviewCoverage?.()).toMatchObject({ readNodes: 0, incompleteNodes: 1, complete: false })
+  expect(fixture.runInputs).toEqual([])
+})
+
+test('Given 导演读到被预算截断的正文 When 返回结果 Then 覆盖仍显示不完整', async () => {
+  /** 单节点超预算正文不能仅凭节点ID算作已检查。 */
+  const fixture = createFixture({ documentContent: 'A'.repeat(50_000) })
+  const reviewContext = resolveCanvasAgentReviewContext(fixture.dependencies.documents.load(target).document,
+    'agent-1', { mode: 'nodes', nodeIds: ['doc-1'] })
+  const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context,
+    canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated', reviewContext,
+  })
+  await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['doc-1'], expectedRevision: 3 })
+  expect(run.getReviewCoverage?.()).toMatchObject({ readNodes: 0, incompleteNodes: 1, complete: false })
+})
+
+test('Given 父Agent选择导演范围和前置布局 When 运行 Then 只移动导演并传递更新后的版本及覆盖', async () => {
+  /** 调用前验证公开schema，防止新增字段仅实现于内部却不可用。 */
+  const fixture = createFixture()
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const tool = run.piCustomTools.find(item => item.name === 'canvas_run_agent')!
+  const args = { canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '完整检查视频方案',
+    reviewScope: { mode: 'canvas' }, positionBeforeNodeIds: ['image-1'] }
+  expect(() => validateToolArguments(tool, { type: 'toolCall', id: 'review-1', name: tool.name, arguments: args })).not.toThrow()
+  const coverage = createCanvasAgentReviewTracker(resolveCanvasAgentReviewContext(fixture.dependencies.documents.load(target).document,
+    'agent-1', { mode: 'canvas' })).status()
+  const execute = fixture.dependencies.agentExecution.execute
+  fixture.dependencies.agentExecution.execute = async input => ({ ...await execute(input), reviewCoverage: coverage })
+  const result = await executeTool(run.piCustomTools, 'canvas_run_agent', args)
+  expect(fixture.batchInputs).toHaveLength(1)
+  expect(fixture.batchInputs[0]!.operations).toEqual([{ type: 'move-nodes', positions: [{ nodeId: 'agent-1', position: expect.any(Object) }] }])
+  expect(fixture.agentExecutionInputs[0]).toMatchObject({ expectedGraphRevision: 4, reviewScope: { mode: 'canvas' } })
+  expect(result.details).toMatchObject({ reviewCoverage: coverage })
+  expect(fixture.runInputs).toEqual([])
+})
+
+test('Given 导演布局发生版本竞争 When 运行 Then 不自动换基线重试或启动导演', async () => {
+  /** 位置写入同样遵守原CAS边界，避免覆盖用户刚调整的布局。 */
+  const fixture = createFixture({ conflictAlways: true })
+  await expect(executeTool(createCanvasToolRun(fixture.dependencies, fixture.context).piCustomTools, 'canvas_run_agent', {
+    canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '检查',
+    reviewScope: { mode: 'canvas' }, positionBeforeNodeIds: ['image-1'],
+  })).rejects.toThrow('CANVAS_REVISION_CONFLICT')
+  expect(fixture.batchInputs).toHaveLength(1)
+  expect(fixture.agentExecutionInputs).toEqual([])
+})
+
+test('Given 非法审核范围 When 同时请求前置布局 Then 写入和运行之前拒绝', async () => {
+  /** 布局不能先成功，再发现审核目标根本不存在。 */
+  const fixture = createFixture()
+  await expect(executeTool(createCanvasToolRun(fixture.dependencies, fixture.context).piCustomTools, 'canvas_run_agent', {
+    canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: 3, instruction: '检查',
+    reviewScope: { mode: 'nodes', nodeIds: ['missing'] }, positionBeforeNodeIds: ['image-1'],
+  })).rejects.toThrow('CANVAS_REVIEW_NODE_NOT_FOUND')
+  expect(fixture.batchInputs).toEqual([])
+  expect(fixture.agentExecutionInputs).toEqual([])
+})
+
+test('Given 未加载专业 Skill 的画布运行 When 创建工具上下文 Then 仍提供用途判断与评审边界且不自动执行', () => {
+  /** 直接检查实际注入结果，兼顾主编排和固定分支，避免默认 Skill 成为唯一入口。 */
+  const fixture = createFixture()
+  const load = spyOn(fixture.dependencies.documents, 'load')
+  for (const context of [fixture.context, { ...fixture.context, permissionCeiling: 'plan' as const }, { ...fixture.context,
+    canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated' as const,
+  }]) {
+    /** 创建工具只装配有界指引；用途判断本身不应触发扫图或启动 Agent。 */
+    const run = createCanvasToolRun(fixture.dependencies, context)
+    for (const rule of ['制作模式', '生成模式', '导演', '阻塞问题', '改进建议',
+      '只读', 'canvas_run_agent', '实际末帧', '评审通过不等于生成授权']) {
+      expect(run.systemPromptAppend).toContain(rule)
+    }
+    expect(run.systemPromptAppend).toContain('只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演')
+    expect(run.systemPromptAppend).toContain('单项任务无需额外创建规划和评审文档')
+    expect(run.systemPromptAppend).toContain('创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议')
+  }
+  expect(load).not.toHaveBeenCalled()
+})
 
 test('Given Canvas 正文交付 When 只声明完成未读取 Then 拒绝，读取真实版本后可完成', async () => {
   /** 真实 Provider 与可观察存储夹具。 */
@@ -238,6 +460,8 @@ function createAllOperationHandlers(): CanvasOperationToolHandlers {
 
 /** 构造可观察写入、执行与全项目扫描的窄依赖。 */
 function createFixture(options: {
+  /** 自定义真实正文用于审核裁剪边界回归。 */
+  documentContent?: string
   /** 用于验证空草稿和已有正式内容的不同启动基线。 */
   initialContentRevision?: number
   conflictOnce?: boolean
@@ -247,13 +471,21 @@ function createFixture(options: {
   runBatch?: CanvasRunNodesBatchSummary
   agentOutput?: string
   agentOutputAtPointer?: string
+  /** 模拟刚创建、尚未首次产生正式输出的节点。 */
+  agentWithoutOutput?: boolean
   unlinkBeforeWrite?: boolean
   unlinkBeforeAgentConfigValidation?: boolean
 } = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1), revision: 3,
     nodes: [
-      { id: 'agent-1', kind: 'agent', title: '策划', position: { x: -50, y: 0 }, agentSessionId: 'canvas-agent-session-1' },
+      { id: 'agent-1', kind: 'agent', title: '策划', position: { x: -50, y: 0 }, agentSessionId: 'canvas-agent-session-1',
+        ...(options.agentWithoutOutput ? {} : { outputPointer: {
+          messageUuid: '33333333-3333-4333-8333-333333333333',
+          contentSha256: createHash('sha256').update(options.agentOutput ?? 'Agent 正式输出').digest('hex'),
+          completedAt: 1,
+        } }),
+      },
       { id: 'doc-1', kind: 'document', title: '需求', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: options.initialContentRevision ?? 2 },
       { id: 'web-1', kind: 'webview', title: '原型', position: { x: 50, y: 0 }, prototypeId: 'prototype-1', contentRevision: 1, devicePreset: 'desktop' },
       { id: 'image-1', kind: 'image', title: '主视觉', position: { x: 100, y: 0 }, imageModuleId: 'image-content-1', adoptedAssetId: 'asset-1' },
@@ -373,7 +605,11 @@ function createFixture(options: {
       },
     },
     agentOutputs: {
-      read: async () => options.agentOutput ?? 'Agent 正式输出',
+      read: async () => {
+        /** 正式输出服务在没有指针时会拒绝，测试替身不能伪造首次输出掩盖生命周期错误。 */
+        if (options.agentWithoutOutput) throw new Error('CANVAS_AGENT_OUTPUT_INVALID')
+        return options.agentOutput ?? 'Agent 正式输出'
+      },
       readAtPointer: async (_target, pointer) => {
         agentOutputReadPointers.push(structuredClone(pointer))
         return options.agentOutputAtPointer ?? options.agentOutput ?? 'Agent 正式输出'
@@ -485,7 +721,7 @@ function createFixture(options: {
           parentRevision: input.contentRevision - 1, contentHash: 'a'.repeat(64),
           createdBy: { type: 'user' as const }, createdAt: 1,
         },
-        content: input.kind === 'document' ? '# 需求正文' : '<main>旧版</main>',
+        content: input.kind === 'document' ? (options.documentContent ?? '# 需求正文') : '<main>旧版</main>',
       }),
       listVersions: async (input) => [1, 2].map((revision) => ({
         kind: input.kind, contentId: input.contentId, revision, parentRevision: revision - 1,
@@ -1540,6 +1776,58 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(fixture.runInputs).toHaveLength(0)
   })
 
+  test('Given Agent 显式选择已绑定图片参考 When 更新图片配置 Then 保存节点身份且不切换正式采用', async () => {
+    const fixture = createFixture()
+    const document = fixture.dependencies.documents.load(target).document
+    document.nodes.push({
+      id: 'master-image', kind: 'image', title: '母版', position: { x: 0, y: 100 },
+      imageModuleId: 'master-content', adoptedAssetId: 'master-asset',
+    })
+    document.edges.push({
+      id: 'master-reference', sourceNodeId: 'master-image', sourcePort: 'image.asset',
+      targetNodeId: 'image-1', targetPort: 'image.reference', relation: 'reference',
+    })
+    fixture.dependencies.documents.load = () => ({
+      document: structuredClone(document), writable: true, nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3,
+      expectedConfigRevision: 4, editSourceNodeId: 'master-image',
+    }, 'tool-image-edit-source')
+
+    expect(fixture.imageSaveInputs[0]).toMatchObject({
+      editSourceNodeId: 'master-image',
+    })
+    expect(fixture.imageSaveInputs[0]).not.toHaveProperty('adoptedAssetId')
+    expect(document.nodes.find((node) => node.id === 'image-1')).toMatchObject({ adoptedAssetId: 'asset-1' })
+    expect(fixture.runInputs).toHaveLength(0)
+  })
+
+  test('Given Agent 指定未绑定或关联关系图片 When 更新编辑底图 Then 在保存前拒绝', async () => {
+    const fixture = createFixture()
+    const document = fixture.dependencies.documents.load(target).document
+    document.nodes.push({
+      id: 'master-image', kind: 'image', title: '母版', position: { x: 0, y: 100 },
+      imageModuleId: 'master-content',
+    })
+    document.edges.push({
+      id: 'master-association', sourceNodeId: 'master-image', sourcePort: 'image.asset',
+      targetNodeId: 'image-1', targetPort: 'image.reference', relation: 'association',
+    })
+    fixture.dependencies.documents.load = () => ({
+      document: structuredClone(document), writable: true, nodeIssues: [],
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    await expect(executeTool(run.piCustomTools, 'canvas_update_image_config', {
+      canvasId: 'canvas-1', nodeId: 'image-1', baseRevision: 3,
+      expectedConfigRevision: 4, editSourceNodeId: 'master-image',
+    }, 'tool-image-edit-source-invalid')).rejects.toThrow('CANVAS_IMAGE_EDIT_SOURCE_INVALID')
+    expect(fixture.imageSaveInputs).toHaveLength(0)
+  })
+
   test('Given 普通 Agent 未提供图片配置变更 When 更新图片配置 Then 在保存前明确拒绝', async () => {
     const fixture = createFixture()
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
@@ -1651,7 +1939,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     }, 'tool-agent-run-1', controller.signal)
 
     expect(Object.keys(result.details as Record<string, unknown>).sort()).toEqual([
-      'downstreamNodeIds', 'nodeId', 'outputPointer', 'outputSummary', 'status',
+      'downstreamNodeIds', 'nodeId', 'nodeTitle', 'outputPointer', 'outputSummary', 'status',
     ])
     expect(result.details).toMatchObject({
       nodeId: 'agent-1', status: 'completed',
@@ -1668,8 +1956,9 @@ describe('普通 Agent Canvas Tool Provider', () => {
     }])
     expect(fixture.runInputs).toHaveLength(0)
     expect(fixture.batchInputs).toHaveLength(0)
-    expect(fixture.getAuthorizeReadCalls()).toBe(1)
-    expect(fixture.getRequireLinkedCanvasCalls()).toBe(1)
+    /** 异步运行结束后再次复验，避免返回已撤权的正文和审核信息。 */
+    expect(fixture.getAuthorizeReadCalls()).toBe(2)
+    expect(fixture.getRequireLinkedCanvasCalls()).toBe(2)
   })
 
   test('Given 本次执行返回旧指针后下一轮已提交 When 生成响应摘要 Then 只读取本次精确指针正文', async () => {
@@ -2355,7 +2644,79 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(parent.allowedToolNames).not.toContain('canvas_attach_media_assets')
   })
 
-  test('Given Agent 节点已有权威正式输出 When canvas_read Then 返回验证正文且统一受 32 KiB 预算约束', async () => {
+  test('Given 新建 Agent 尚无输出 When 读取并配置后首次运行 Then 返回配置版本与执行能力且不伪造正文', async () => {
+    /** 首次输出尚不存在，配置仍是可独立读取与更新的正式事实。 */
+    const fixture = createFixture({ agentWithoutOutput: true })
+    const readOutput = spyOn(fixture.dependencies.agentOutputs, 'read')
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['agent-1'] })
+    const details = result.details as { revision: number; nodes: Array<{
+      content: string; capabilities: string[]; readError?: unknown
+      artifact: { configRevision: number }
+      availableActions: Array<{ toolNames: string[] }>
+      evidence: Array<{ validation: string }>
+    }> }
+    const entry = details.nodes[0]!
+    expect(entry.readError).toBeUndefined()
+    expect(entry.content).toBe('')
+    expect(entry.artifact.configRevision).toBe(4)
+    expect(entry.evidence.map(proof => proof.validation)).toEqual(['configuration'])
+    expect(entry.availableActions.flatMap(action => action.toolNames)).toEqual(expect.arrayContaining([
+      'canvas_update_agent_config', 'canvas_run_agent',
+    ]))
+    expect(readOutput).not.toHaveBeenCalled()
+    await executeTool(run.piCustomTools, 'canvas_update_agent_config', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', expectedGraphRevision: details.revision,
+      expectedConfigRevision: entry.artifact.configRevision, patch: { instruction: '完成导演方案，先不生成媒体' },
+    })
+    await executeTool(run.piCustomTools, 'canvas_run_agent', {
+      canvasId: 'canvas-1', nodeId: 'agent-1', expectedRevision: details.revision,
+      instruction: '读取简报并交付导演方案',
+    })
+    expect(fixture.agentConfigUpdateInputs).toHaveLength(1)
+    expect(fixture.agentExecutionInputs).toHaveLength(1)
+    expect(fixture.runInputs).toHaveLength(0)
+  })
+
+  test('Given Agent 已有正式指针但正文损坏 When 读取 Then 保留 agent-output 故障且不冒充空草稿', async () => {
+    /** 已发布但失效的输出必须继续沿严格校验路径处理。 */
+    const fixture = createFixture()
+    fixture.dependencies.agentOutputs.read = async () => { throw new Error('CANVAS_AGENT_OUTPUT_INVALID') }
+    const readConfig = spyOn(fixture.dependencies.agentConfigs, 'load')
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['agent-1'] })
+    expect(result.details).toMatchObject({ complete: false, nodes: [{
+      content: '', capabilities: ['read'],
+      readError: { code: 'CANVAS_NODE_READ_FAILED', stage: 'agent-output', contentVerdict: 'unknown' },
+    }] })
+    expect(readConfig).not.toHaveBeenCalled()
+    expect((result.details as { nodes: Array<{ evidence?: unknown }> }).nodes[0]?.evidence).toBeUndefined()
+  })
+
+  test('Given 未运行 Agent 配置读取失败 When 读取 Then 精确报告 agent-config 阶段', async () => {
+    /** 空输出不阻挡配置读取，但真实配置故障仍须报告。 */
+    const fixture = createFixture({ agentWithoutOutput: true })
+    fixture.dependencies.agentConfigs.load = async () => { throw new Error('CANVAS_AGENT_CONFIG_INVALID') }
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const result = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['agent-1'] })
+    expect(result.details).toMatchObject({ complete: false, nodes: [{
+      capabilities: ['read'], readError: { stage: 'agent-config', contentVerdict: 'unknown' },
+    }] })
+  })
+
+  test('Given plan 上限下的新建 Agent When 读取空输出节点 Then 可读配置但不提供执行动作', async () => {
+    /** 恢复正常读取不改变本轮权限上限。 */
+    const fixture = createFixture({ agentWithoutOutput: true })
+    const run = createCanvasToolRun(fixture.dependencies, { ...fixture.context, permissionCeiling: 'plan' })
+    const result = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['agent-1'] })
+    const entry = (result.details as { nodes: Array<{ readError?: unknown; artifact: { configRevision: number }; availableActions: Array<{ toolNames: string[] }> }> }).nodes[0]!
+    expect(entry.readError).toBeUndefined()
+    expect(entry.artifact.configRevision).toBe(4)
+    expect(entry.availableActions.flatMap(action => action.toolNames)).not.toContain('canvas_run_agent')
+    expect(entry.availableActions.flatMap(action => action.toolNames)).not.toContain('canvas_update_agent_config')
+  })
+
+  test('Given Agent 节点已有权威正式输出 When canvas_read Then 返回验证正文且统一受32768字符预算约束', async () => {
     const fixture = createFixture({ agentOutput: '中'.repeat(40_000) })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
 

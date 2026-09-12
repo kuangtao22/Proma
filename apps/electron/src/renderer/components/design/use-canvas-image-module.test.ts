@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
+  CanvasImageModuleChangedEvent,
   CanvasImageTarget,
   ReleaseCanvasImageMediaInput,
   DesignJobRecord,
@@ -116,7 +117,7 @@ function createFixture() {
   const saveCalls: Parameters<DesignAdapter['saveCanvasImageModule']>[0][] = []
   const createCalls: Parameters<DesignAdapter['createCanvasImageJob']>[0][] = []
   const releaseCalls: ReleaseCanvasImageMediaInput[] = []
-  const listeners = new Map<string, Set<(event: CanvasImageTarget) => void>>()
+  const listeners = new Map<string, Set<(event: CanvasImageModuleChangedEvent) => void>>()
   const loadQueue: Array<ReturnType<typeof deferred<CanvasImageModuleSnapshot>>> = []
   const saveQueue: Array<ReturnType<typeof deferred<CanvasImageModuleConfig>>> = []
   const jobQueue: Array<ReturnType<typeof deferred<DesignJobRecord>>> = []
@@ -197,14 +198,202 @@ function createFixture() {
   return {
     states, state, controller, loadCalls, saveCalls, createCalls, releaseCalls,
     loadQueue, saveQueue, jobQueue, detailQueue, traceQueue,
-    emit: (moduleTarget: CanvasImageTarget) => {
-      for (const listener of listeners.get(createCanvasImageModuleKey(moduleTarget)) ?? []) listener(moduleTarget)
+    emit: (event: CanvasImageModuleChangedEvent | CanvasImageTarget) => {
+      /** 测试夹具模拟 Preload 将旧四元事件规范化为完整对账事件。 */
+      const moduleTarget = {
+        projectId: event.projectId, canvasId: event.canvasId,
+        nodeId: event.nodeId, imageModuleId: event.imageModuleId,
+      }
+      const normalized = 'cause' in event ? event : { ...moduleTarget, cause: 'reconcile' as const }
+      for (const listener of listeners.get(createCanvasImageModuleKey(moduleTarget)) ?? []) listener(normalized)
     },
     runMicrotasks: () => { for (const task of microtasks.splice(0)) task() },
   }
 }
 
 describe('Canvas 生图模块 controller', () => {
+  test('Given 已加载运行任务 When 连续收到进度事件 Then 原位 patch 状态且不重读或更换媒体 URL', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('incremental-progress')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    const initial = snapshot(moduleTarget, 1)
+    initial.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'queued', updatedAt: 1 }]
+    fixture.loadQueue[0]?.resolve(initial)
+    await flush()
+
+    for (let revision = 2; revision <= 100; revision += 1) {
+      fixture.emit({
+        ...moduleTarget, cause: 'job-progress',
+        job: {
+          id: initial.jobs[0]!.id, projectId: moduleTarget.projectId,
+          target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+            nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+          status: 'running', createdAt: 1, updatedAt: revision,
+        },
+      })
+    }
+
+    expect(fixture.loadCalls).toHaveLength(1)
+    expect(fixture.state(moduleTarget).snapshot).toMatchObject({
+      mediaLeaseId: initial.mediaLeaseId,
+      assetBaseUrl: initial.assetBaseUrl,
+      jobs: [{ id: initial.jobs[0]!.id, status: 'running', updatedAt: 100 }],
+    })
+    expect(fixture.releaseCalls).toEqual([])
+  })
+
+  test('Given 未知任务进度或终态事件 When 工作台接收 Then 保守执行完整对账', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('incremental-fallback')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(snapshot(moduleTarget, 1))
+    await flush()
+
+    fixture.emit({
+      ...moduleTarget, cause: 'job-progress',
+      job: {
+        id: 'job-unknown', projectId: moduleTarget.projectId,
+        target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+          nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+        status: 'running', createdAt: 1, updatedAt: 2,
+      },
+    })
+    expect(fixture.loadCalls).toHaveLength(2)
+    fixture.loadQueue[1]?.resolve(snapshot(moduleTarget, 2))
+    await flush()
+
+    fixture.emit({ ...moduleTarget, cause: 'reconcile' })
+    expect(fixture.loadCalls).toHaveLength(3)
+  })
+
+  test('Given LOAD 已有较新运行状态 When 首次收到更旧或同刻 queued 事件 Then 不倒退任务', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('stale-first-progress')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    const initial = snapshot(moduleTarget, 1)
+    initial.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'running', updatedAt: 10 }]
+    fixture.loadQueue[0]?.resolve(initial)
+    await flush()
+
+    for (const updatedAt of [9, 10]) {
+      fixture.emit({
+        ...moduleTarget, cause: 'job-progress',
+        job: {
+          id: 'job-progress', projectId: moduleTarget.projectId,
+          target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+            nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+          status: 'queued', createdAt: 1, updatedAt,
+        },
+      })
+    }
+
+    expect(fixture.state(moduleTarget).snapshot?.jobs[0]).toMatchObject({
+      status: 'running', updatedAt: 10,
+    })
+    expect(fixture.loadCalls).toHaveLength(1)
+  })
+
+  test('Given 完整 LOAD 在途 When 同毫秒进度后到达 Then LOAD 不覆盖较新的轻量字段', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('load-progress-race')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    const initial = snapshot(moduleTarget, 1)
+    initial.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'running', updatedAt: 10,
+      outputAssetId: 'asset-old' }]
+    fixture.loadQueue[0]?.resolve(initial)
+    await flush()
+
+    fixture.emit({ ...moduleTarget, cause: 'reconcile' })
+    fixture.emit({
+      ...moduleTarget, cause: 'job-progress',
+      job: {
+        id: 'job-progress', projectId: moduleTarget.projectId,
+        target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+          nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+        status: 'running', createdAt: 1, updatedAt: 10, outputAssetId: 'asset-new',
+      },
+    })
+    const stale = snapshot(moduleTarget, 2)
+    stale.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'running', updatedAt: 10,
+      outputAssetId: 'asset-old', prompt: 'LOAD 返回的新提示词' }]
+    fixture.loadQueue[1]?.resolve(stale)
+    await flush()
+
+    expect(fixture.state(moduleTarget).snapshot?.jobs[0]).toMatchObject({
+      status: 'running', updatedAt: 10, outputAssetId: 'asset-new', prompt: 'LOAD 返回的新提示词',
+    })
+  })
+
+  test('Given LOAD 在途收到较早进度 When LOAD 返回更晚任务 Then 采用 LOAD 权威运行态和元数据', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('load-newer-than-progress')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    /** 初始任务用于让后续轻量事件命中已知 Job。 */
+    const initial = snapshot(moduleTarget, 1)
+    initial.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'queued', updatedAt: 10 }]
+    fixture.loadQueue[0]?.resolve(initial)
+    await flush()
+
+    fixture.emit({ ...moduleTarget, cause: 'reconcile' })
+    fixture.emit({
+      ...moduleTarget, cause: 'job-progress',
+      job: {
+        id: 'job-progress', projectId: moduleTarget.projectId,
+        target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+          nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+        status: 'running', createdAt: 1, updatedAt: 12,
+      },
+    })
+    /** LOAD 在读取链路稍后捕获到更晚的任务记录。 */
+    const newer = snapshot(moduleTarget, 2)
+    newer.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'running', updatedAt: 13,
+      prompt: 'LOAD 更晚的提示词' }]
+    fixture.loadQueue[1]?.resolve(newer)
+    await flush()
+
+    expect(fixture.state(moduleTarget).snapshot?.jobs[0]).toMatchObject({
+      status: 'running', updatedAt: 13, prompt: 'LOAD 更晚的提示词',
+    })
+  })
+
+  test('Given LOAD 在途收到同刻 queued When LOAD 返回 running Then running 单调状态优先', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('load-running-priority')
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    /** 初始任务用于让后续轻量事件命中已知 Job。 */
+    const initial = snapshot(moduleTarget, 1)
+    initial.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'queued', updatedAt: 10 }]
+    fixture.loadQueue[0]?.resolve(initial)
+    await flush()
+
+    fixture.emit({ ...moduleTarget, cause: 'reconcile' })
+    fixture.emit({
+      ...moduleTarget, cause: 'job-progress',
+      job: {
+        id: 'job-progress', projectId: moduleTarget.projectId,
+        target: { kind: 'canvas-image', canvasId: moduleTarget.canvasId,
+          nodeId: moduleTarget.nodeId, imageModuleId: moduleTarget.imageModuleId },
+        status: 'queued', createdAt: 1, updatedAt: 12,
+      },
+    })
+    /** 同毫秒的 running 比 queued 更接近终态。 */
+    const running = snapshot(moduleTarget, 2)
+    running.jobs = [{ ...jobRecord(moduleTarget, 'job-progress'), status: 'running', updatedAt: 12,
+      prompt: 'LOAD running 元数据' }]
+    fixture.loadQueue[1]?.resolve(running)
+    await flush()
+
+    expect(fixture.state(moduleTarget).snapshot?.jobs[0]).toMatchObject({
+      status: 'running', updatedAt: 12, prompt: 'LOAD running 元数据',
+    })
+  })
+
   test('Given 已显示图片且刷新尚未返回 When 连续收到百条任务事件 Then 保留工作台且只串行补读一次', async () => {
     /** 初次加载完成后再模拟后台任务事件，避免混淆首屏加载。 */
     const fixture = createFixture()
@@ -383,6 +572,32 @@ describe('Canvas 生图模块 controller', () => {
     expect(fixture.state(moduleTarget)).toMatchObject({ saveState: 'saved', error: null })
     expect(fixture.state(moduleTarget).snapshot?.config).toEqual(config(moduleTarget, 8, '服务端规范提示词'))
     expect(fixture.state(moduleTarget).draft).toMatchObject({ prompt: '服务端规范提示词', dirty: false })
+  })
+
+  test('Given 权威配置选择编辑底图 When 只改提示词并保存 Then 草稿与请求保留来源节点', async () => {
+    const fixture = createFixture()
+    const moduleTarget = target('edit-source-save')
+    const authoritative = snapshot(moduleTarget, 7)
+    authoritative.config.editSourceNodeId = 'master-image'
+    const controller = fixture.controller(moduleTarget)
+    controller.start()
+    fixture.loadQueue[0]?.resolve(authoritative)
+    await flush()
+
+    expect(fixture.state(moduleTarget).draft?.editSourceNodeId).toBe('master-image')
+    controller.updateDraft({ prompt: '只修改提示词' })
+    const pendingCommit = controller.commitDraft()
+    expect(fixture.saveCalls[0]).toMatchObject({
+      prompt: '只修改提示词', editSourceNodeId: 'master-image',
+    })
+    const saved = config(moduleTarget, 8, '只修改提示词')
+    saved.editSourceNodeId = 'master-image'
+    fixture.saveQueue[0]?.resolve(saved)
+    await pendingCommit
+
+    expect(fixture.state(moduleTarget).draft).toMatchObject({
+      prompt: '只修改提示词', editSourceNodeId: 'master-image', dirty: false,
+    })
   })
 
   test('Given 权威配置选择公共工作流 When 编辑并保存 Then 深拷贝完整输入且保持 profile 为空', async () => {

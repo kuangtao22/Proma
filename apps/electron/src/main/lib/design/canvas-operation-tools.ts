@@ -3,7 +3,8 @@ import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import type { Static, TSchema } from 'typebox'
 import { Value } from 'typebox/value'
-import { parseAdoptCanvasImageCandidateBatchInput } from '@proma/shared'
+import { CANVAS_WORKFLOW_MAX_DURATION_EXTENSION_MS, CANVAS_WORKFLOW_MAX_MEDIA_RUN_EXTENSION,
+  CANVAS_WORKFLOW_RUN_NODE_LIMIT, parseAdoptCanvasImageCandidateBatchInput } from '@proma/shared'
 import type { AdoptCanvasImageCandidateBatchInput } from '@proma/shared'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
@@ -87,6 +88,17 @@ const rebuildSchema = Type.Object({ ...nodeTarget, expectedRevision: Type.Intege
 const workflowReadSchema = Type.Object({ canvasId: stableId, runId: stableId }, { additionalProperties: false })
 /** 继续与取消均要求明确命令，运行代次由持久 Store 复核。 */
 const workflowWriteSchema = Type.Object({ canvasId: stableId, runId: stableId, ...explicitIntent }, { additionalProperties: false })
+/** 恢复沿用持久工作流的完整合同，扩额和定向重试须绑定原 revision 与幂等操作身份。 */
+const workflowResumeSchema = Type.Object({
+  canvasId: stableId, runId: stableId, ...explicitIntent,
+  expectedRunRevision: Type.Optional(Type.Integer({ minimum: 0 })),
+  resumeOperationId: Type.Optional(Type.String({ minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_-]+$' })),
+  addDurationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: CANVAS_WORKFLOW_MAX_DURATION_EXTENSION_MS })),
+  addMediaRuns: Type.Optional(Type.Integer({ minimum: 0, maximum: CANVAS_WORKFLOW_MAX_MEDIA_RUN_EXTENSION })),
+  retryNodeIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 160 }), {
+    maxItems: CANVAS_WORKFLOW_RUN_NODE_LIMIT, uniqueItems: true,
+  })),
+}, { additionalProperties: false })
 
 /** 业务处理器必须在实际进入写锁及每个副作用前调用权限复核。 */
 export interface CanvasOperationExecution {
@@ -123,7 +135,7 @@ export interface CanvasOperationToolHandlers {
   rebuildAgent?: CanvasOperationHandler<Static<typeof rebuildSchema>>
   listWorkflows?: CanvasOperationHandler<Static<typeof trashSchema>>
   getWorkflow?: CanvasOperationHandler<Static<typeof workflowReadSchema>>
-  resumeWorkflow?: CanvasOperationHandler<Static<typeof workflowWriteSchema>>
+  resumeWorkflow?: CanvasOperationHandler<Static<typeof workflowResumeSchema>>
   cancelWorkflow?: CanvasOperationHandler<Static<typeof workflowWriteSchema>>
 }
 
@@ -171,6 +183,8 @@ export function createCanvasOperationTools(
   context: CanvasToolRunContext,
   access: Pick<CanvasToolAccessFacade, 'authorizeRead' | 'requireLinkedCanvas'>,
   createOperationId: (toolCallId: string) => string,
+  /** 调用开始时捕获 Host 创建回执，不能在异步执行后追认任务范围。 */
+  getExecutionContext: () => CanvasToolRunContext = () => context,
 ): ToolDefinition[] {
   /** 将一项已装配处理器转成 Pi 工具，保留 TypeBox 参数推断。 */
   const define = <Schema extends TSchema>(
@@ -196,13 +210,19 @@ export function createCanvasOperationTools(
           access.requireLinkedCanvas(context, params.canvasId)
         }
         validateAccess()
+        const executionContext = getExecutionContext()
         try {
           const details = await handler({ ...params, projectId: context.projectId }, {
-            context, operationId: createOperationId(toolCallId), validateAccess,
+            context: executionContext, operationId: createOperationId(toolCallId), validateAccess,
             ...(signal ? { signal } : {}),
           })
           /** 异步读取期间可能收到取消或解绑；响应前再次验证，避免发布过期权限下的结果。 */
           validateAccess()
+          /** 只有领域层确认新建的 replacement 才属于本轮，重放旧重试不签发创建来源。 */
+          if (name === 'canvas_retry_task' && details.created === true && typeof details.replacementJobId === 'string'
+            && typeof params.nodeId === 'string') {
+            executionContext.onImageJobsCreated?.(params.canvasId, [{ nodeId: params.nodeId, jobId: details.replacementJobId }])
+          }
           /** 响应总预算是最后一道防线；各业务服务应在读取时限制正文和日志。 */
           const text = JSON.stringify(details)
           if (Buffer.byteLength(text, 'utf8') > 64 * 1024) throw new Error('CANVAS_OPERATION_RESPONSE_TOO_LARGE')
@@ -244,7 +264,7 @@ export function createCanvasOperationTools(
     ...define('canvas_rebuild_agent', '重建异常 Agent', '对已诊断异常且当前空闲的 Agent 节点重建会话，禁止直接指定或修改会话身份。', rebuildSchema, handlers.rebuildAgent, true),
     ...define('canvas_list_workflows', '查看画布工作流', '分页查询当前画布持久工作流，包含等待采用和可以继续的运行。', trashSchema, handlers.listWorkflows, false),
     ...define('canvas_get_workflow', '查看工作流状态', '查看指定原运行的节点状态与剩余预算，不启动执行。', workflowReadSchema, handlers.getWorkflow, false),
-    ...define('canvas_resume_workflow', '继续原工作流', '在原授权范围和剩余预算内继续已有运行，仅推进输入有效且未完成的下游；可能产生模型费用。', workflowWriteSchema, handlers.resumeWorkflow, true),
+    ...define('canvas_resume_workflow', '继续原工作流', '在原授权和剩余预算内继续已有运行。定向重试或扩额需 expectedRunRevision 与稳定 resumeOperationId，同次恢复重用身份；正数扩额需确认。未知提交先查询原任务，不重复生成。', workflowResumeSchema, handlers.resumeWorkflow, true),
     ...define('canvas_cancel_workflow', '停止工作流', '停止指定原运行，保留已生成产物并阻止迟到采用事件重新启动。', workflowWriteSchema, handlers.cancelWorkflow, true),
   ]
 }

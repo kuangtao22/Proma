@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type {
+  CanvasDocument,
   CanvasImageModuleSnapshot,
+  CanvasImagePreview,
   DesignAsset,
   DesignJobRecord,
   ImageGenerationModelOption,
@@ -8,14 +10,22 @@ import type {
   MediaConnectionSummary,
   MediaWorkflowVersion,
 } from '@proma/shared'
+import * as React from 'react'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { CanvasImageModuleViewState } from '@/atoms/native-canvas-atoms'
 import {
   buildCanvasImageMediaWorkflowChange,
   CanvasImageWorkbench,
   createCanvasImageWorkflowBaseline,
+  getCanvasImageEditSourceNodes,
+  resolveCanvasImageFullResolutionAsset,
+  resolveCanvasImagePreviewSource,
   resolveCanvasImageWorkflowConnection,
   selectCanvasImageWorkflowsForProject,
+  useCanvasImagePreviewController,
+  type CanvasImagePreviewController,
 } from './CanvasImageWorkbench'
 import { createCanvasMediaWorkflowDraft, resolveDelayedCanvasDefaultConnection } from './CanvasMediaWorkbench'
 
@@ -141,6 +151,7 @@ function createState(overrides: Partial<CanvasImageModuleViewState> = {}): Canva
     draft: {
       prompt: snapshot.config.prompt,
       selectedModelProfileId: snapshot.config.selectedModelProfileId,
+      editSourceNodeId: null,
       aspectRatio: snapshot.config.aspectRatio,
       imageSize: snapshot.config.imageSize,
       contextMode: snapshot.config.contextMode,
@@ -169,6 +180,8 @@ function renderWorkbench(
     mediaWorkflows?: MediaWorkflowVersion[]
     mediaConnections?: MediaConnectionSummary[]
     mediaAssets?: MediaAssetRecord[]
+    canvasDocument?: CanvasDocument
+    imagePreviews?: CanvasImagePreview[]
   } = {},
 ): string {
   return renderToStaticMarkup(
@@ -181,6 +194,8 @@ function renderWorkbench(
       mediaWorkflows={options.mediaWorkflows}
       mediaConnections={options.mediaConnections}
       mediaAssets={options.mediaAssets}
+      canvasDocument={options.canvasDocument}
+      imagePreviews={options.imagePreviews}
       onMediaWorkflowChange={() => undefined}
       onDraftChange={() => undefined}
       onGenerate={() => undefined}
@@ -198,6 +213,64 @@ function renderWorkbench(
       mediaProgressByJobId={options.mediaProgressByJobId}
     />,
   )
+}
+
+interface MinimalEventTarget {
+  addEventListener: () => void
+  removeEventListener: () => void
+}
+
+/** 创建只运行预览状态 Hook 的最小 React 宿主。 */
+function createHookRoot(): {
+  render: (node: React.ReactElement) => void
+  unmount: () => void
+  restore: () => void
+} {
+  /** React DOM 初始化需要的最小事件目标。 */
+  const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
+  class FakeHtmlIFrameElement {}
+  /** Probe 不生成 DOM，只提供 Hook 生命周期所需宿主字段。 */
+  const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement }
+  const fakeDocument = {
+    ...eventTarget, nodeType: 9, defaultView: fakeWindow, activeElement: null, body: null,
+    documentElement: { namespaceURI: 'http://www.w3.org/1999/xhtml' },
+  }
+  const container = {
+    ...eventTarget, nodeType: 1, tagName: 'DIV', namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: fakeDocument,
+  }
+  /** 保存测试前全局对象，卸载后完整恢复。 */
+  const globals = globalThis as unknown as { window?: unknown; document?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean }
+  const previousWindow = globals.window
+  const previousDocument = globals.document
+  const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT
+  globals.window = fakeWindow
+  globals.document = fakeDocument
+  globals.IS_REACT_ACT_ENVIRONMENT = true
+  /** 当前测试使用的 React 根。 */
+  const root = createRoot(container as unknown as Element)
+  return {
+    render: (node) => { root.render(node) },
+    unmount: () => { root.unmount() },
+    restore: () => {
+      globals.window = previousWindow
+      globals.document = previousDocument
+      globals.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment
+    },
+  }
+}
+
+/** 暴露主预览真实 Hook 状态，验证打开、关闭与素材切换生命周期。 */
+function ImagePreviewControllerProbe({
+  assetId,
+  onController,
+}: {
+  assetId: string
+  onController: (controller: CanvasImagePreviewController) => void
+}): null {
+  /** 与生产预览共用同一状态控制器。 */
+  const controller = useCanvasImagePreviewController(assetId)
+  React.useEffect(() => onController(controller), [controller, onController])
+  return null
 }
 
 describe('Canvas 生图工作台', () => {
@@ -219,6 +292,70 @@ describe('Canvas 生图工作台', () => {
 
     expect(html).toContain('供应商不可用 · GPT Image 2')
     expect(html).toContain('关联的模型配置已不存在')
+  })
+
+  test('Given 当前图片有多类入边 When 选择编辑底图 Then 只列已绑定 image.reference 的图片节点', () => {
+    const document: CanvasDocument = {
+      schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 2,
+      viewport: { x: 0, y: 0, zoom: 1 }, createdAt: 1, updatedAt: 2,
+      nodes: [
+        { id: 'node-1', kind: 'image', title: '结果', position: { x: 0, y: 0 }, imageModuleId: 'module-1' },
+        { id: 'master', kind: 'image', title: '母版', position: { x: 10, y: 0 }, imageModuleId: 'module-master', adoptedAssetId: 'asset-master' },
+        { id: 'other', kind: 'image', title: '未绑定', position: { x: 20, y: 0 }, imageModuleId: 'module-other' },
+      ],
+      edges: [
+        { id: 'bound', sourceNodeId: 'master', sourcePort: 'image.asset', targetNodeId: 'node-1', targetPort: 'image.reference', relation: 'reference' },
+        { id: 'associated', sourceNodeId: 'other', sourcePort: 'image.asset', targetNodeId: 'node-1', targetPort: 'image.reference', relation: 'association' },
+      ],
+    }
+
+    expect(getCanvasImageEditSourceNodes(document, 'node-1').map((node) => node.id)).toEqual(['master'])
+  })
+
+  test('Given 非 Comfy 图片配置选择失效底图 When 渲染 Then 保留失效选择提示且不自动替换', () => {
+    const current = createState()
+    const state: CanvasImageModuleViewState = {
+      ...current,
+      draft: current.draft ? { ...current.draft, editSourceNodeId: 'missing-master' } : null,
+    }
+    const document: CanvasDocument = {
+      schemaVersion: 4, projectId: 'project-1', canvasId: 'canvas-1', revision: 2,
+      viewport: { x: 0, y: 0, zoom: 1 }, nodes: [
+        { id: 'node-1', kind: 'image', title: '结果', position: { x: 0, y: 0 }, imageModuleId: 'module-1' },
+      ], edges: [], createdAt: 1, updatedAt: 2,
+    }
+    const html = renderWorkbench(state, true, { canvasDocument: document })
+
+    expect(html).toContain('编辑底图')
+    expect(html).toContain('missing-master')
+    expect(html).toContain('原编辑底图已失效，请重新选择或改用当前节点默认图片。')
+  })
+
+  test('Given 图片使用 Comfy 工作流 When 渲染 Then 底图仍由工作流输入控制', () => {
+    const current = createState()
+    const html = renderWorkbench(current, true, {
+      mediaWorkflow: {
+        workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'connection-1', inputs: {},
+      },
+    })
+
+    expect(html).not.toContain('编辑底图')
+  })
+
+  test('Given Comfy 工作流仍有旧编辑底图 When 渲染 Then 保留清除入口并说明工作流输入优先', () => {
+    const current = createState()
+    const html = renderWorkbench({
+      ...current,
+      draft: current.draft ? { ...current.draft, editSourceNodeId: 'master-image' } : null,
+    }, true, {
+      mediaWorkflow: {
+        workflowId: 'workflow-1', workflowRevision: 1, connectionId: 'connection-1', inputs: {},
+      },
+    })
+
+    expect(html).toContain('编辑底图')
+    expect(html).toContain('此模型的参考图由工作流输入决定，请清除独立底图选择。')
+    expect(html).toContain('当前节点默认图片')
   })
 
   test('Given 新图片工作流有画布默认连接 When 初始化 Then 继承默认；已有连接始终优先', () => {
@@ -428,8 +565,8 @@ describe('Canvas 生图工作台', () => {
     expect(html).toContain('当前图片')
     expect(html).toContain('GPT Image 2 · gpt-image-2')
     expect(html).toContain('首页面向内容创作者，主操作是创建项目。')
-    expect(html).toContain('proma-file://asset-token/asset-2.png')
     expect(html).toContain('proma-file://thumbnail-token/asset-2.webp')
+    expect(html).not.toContain('proma-file://asset-token/asset-2.png')
     expect(html).not.toContain('/assets/asset-2.png')
     expect(html).not.toContain('/thumbnails/asset-2.webp')
   })
@@ -531,15 +668,81 @@ describe('Canvas 生图工作台', () => {
     expect(html).not.toContain('重试生成')
   })
 
-  test('Given 历史版本被预览 When 渲染 Then 原图切换且采用入口只在历史项内', () => {
+  test('Given 历史版本被预览 When 渲染 Then 缩略图切换且采用入口只在历史项内', () => {
     const html = renderWorkbench(createState({ previewAssetId: 'asset-1' }))
 
-    expect(html).toContain('proma-file://asset-token/asset-1.png')
+    expect(html).toContain('proma-file://thumbnail-token/asset-1.webp')
+    expect(html).not.toContain('proma-file://asset-token/asset-1.png')
+    expect(html).toContain('aria-label="查看原图：asset-1.png"')
+    expect(html).toContain('data-image-preview-quality="thumbnail"')
+    expect(html).toContain('预览图 · 点击查看原图')
     expect(html).toContain('正在预览历史版本')
     expect(html).not.toContain('设为当前')
     expect(html).toContain('aria-label="设为默认"')
     expect(html).toContain('>默认</span>')
     expect(html).toContain('历史版本')
+  })
+
+  test('Given 当前素材有缩略图 When 初次渲染主预览 Then 不加载原图且提供键盘可激活按钮', () => {
+    const html = renderWorkbench(createState())
+
+    expect(html).toContain('src="proma-file://thumbnail-token/asset-2.webp"')
+    expect(html).not.toContain('proma-file://asset-token/asset-2.png')
+    expect(html).toMatch(/<button(?=[^>]*type="button")(?=[^>]*aria-label="查看原图：asset-2.png")[^>]*>/u)
+  })
+
+  test('Given 缩略图缺失或加载失败 When 解析主预览 Then 只为当前素材回退原图', () => {
+    const asset = createAsset('asset-2', 'job-2')
+    expect(resolveCanvasImagePreviewSource(asset, 'asset-root', 'thumbnail-root', null)).toEqual({
+      src: 'thumbnail-root/asset-2.webp',
+      quality: 'thumbnail',
+    })
+    expect(resolveCanvasImagePreviewSource(
+      { ...asset, thumbnailRelativePath: '' }, 'asset-root', 'thumbnail-root', null,
+    )).toEqual({ src: 'asset-root/asset-2.png', quality: 'original-fallback' })
+    expect(resolveCanvasImagePreviewSource(asset, 'asset-root', 'thumbnail-root', asset.id)).toEqual({
+      src: 'asset-root/asset-2.png',
+      quality: 'original-fallback',
+    })
+  })
+
+  test('Given 原图查看期间切换素材 When 解析 Lightbox 身份 Then 旧素材立即失效且关闭后释放', () => {
+    const first = createAsset('asset-1', 'job-1')
+    const second = createAsset('asset-2', 'job-2')
+
+    expect(resolveCanvasImageFullResolutionAsset('asset-1', first)).toBe(first)
+    expect(resolveCanvasImageFullResolutionAsset('asset-1', second)).toBeUndefined()
+    expect(resolveCanvasImageFullResolutionAsset(null, first)).toBeUndefined()
+  })
+
+  test('Given 用户打开原图并发生缩略图失败 When 关闭或切换素材 Then 真实组件状态立即释放且不串图', async () => {
+    const hookRoot = createHookRoot()
+    let controller: CanvasImagePreviewController | undefined
+    /** 每次 effect 都保存生产 Hook 的最新状态与命令。 */
+    const receiveController = (next: CanvasImagePreviewController): void => { controller = next }
+    try {
+      await act(async () => {
+        hookRoot.render(<ImagePreviewControllerProbe assetId="asset-1" onController={receiveController} />)
+      })
+      await act(async () => { controller?.openOriginal() })
+      expect(controller?.originalPreviewAssetId).toBe('asset-1')
+
+      await act(async () => { controller?.reportThumbnailFailure() })
+      expect(controller?.failedThumbnailAssetId).toBe('asset-1')
+
+      await act(async () => { controller?.closeOriginal() })
+      expect(controller?.originalPreviewAssetId).toBeNull()
+
+      await act(async () => {
+        hookRoot.render(<ImagePreviewControllerProbe assetId="asset-2" onController={receiveController} />)
+      })
+      expect(controller?.originalPreviewAssetId).toBeNull()
+      expect(controller?.failedThumbnailAssetId).toBeNull()
+      expect(controller?.failedOriginalAssetId).toBeNull()
+      await act(async () => { hookRoot.unmount() })
+    } finally {
+      hookRoot.restore()
+    }
   })
 
   test('Given Canvas 只读 When 渲染非默认历史版本 Then 采用按钮保持可见但不可写', () => {
@@ -570,7 +773,8 @@ describe('Canvas 生图工作台', () => {
     })
 
     expect(html).toContain('proma-file://thumbnail-token/asset-1.webp')
-    expect(html).not.toContain('proma-file://thumbnail-token/asset-2.webp')
+    /** asset-2 只允许作为当前主预览出现一次，不能重新混入历史版本列表。 */
+    expect(html.match(/proma-file:\/\/thumbnail-token\/asset-2\.webp/gu) ?? []).toHaveLength(1)
   })
 
   test('Given 模块加载失败或只读 When 渲染 Then 保留局部恢复入口并禁用编辑', () => {

@@ -67,6 +67,12 @@ export interface CanvasTaskBaseline {
   evidence: Array<CanvasTaskEvidence | CanvasTaskAbsentArtifact>
 }
 
+/** Host 在图片任务成功建立批次后登记的本轮候选身份，不接受模型自行声明。 */
+export interface CanvasTaskGeneratedJob {
+  nodeId: string
+  jobId: string
+}
+
 /** 返回节点类别支持的交付验证维度。 */
 function supportsValidation(
   nodeKind: CanvasNode['kind'],
@@ -102,6 +108,8 @@ export function createCanvasTaskContract(options: CanvasTaskContractOptions) {
   let baseline: CanvasTaskBaseline | undefined
   /** 固定上限控制长任务的内存；旧证据被淘汰时必须重新读取。 */
   const proofs = new Map<string, CanvasTaskEvidence>()
+  /** 本合同启动后由 Host 登记的候选任务，最多保留 256 个稳定身份。 */
+  const generatedJobs = new Set<string>()
 
   /** 返回可供模型读取的任务阶段，不暴露内部证明值。 */
   const status = () => ({
@@ -145,9 +153,11 @@ export function createCanvasTaskContract(options: CanvasTaskContractOptions) {
           && candidate.validation === proof.validation
         ))
         if (!original) throw new Error('CANVAS_TASK_BASELINE_REQUIRED')
-        /** 更新检查绑定原检查对象；改看历史候选不能冒充修改当前产物。 */
-        if (proof.validation === 'inspection' && proof.jobId !== original.jobId) throw new Error('CANVAS_TASK_EVIDENCE_MISMATCH')
         if (!('absent' in original) && original.identity === proof.identity) throw new Error('CANVAS_TASK_EVIDENCE_UNCHANGED')
+      }
+      if (change === 'updated' && proof.validation === 'inspection') {
+        if (!proof.jobId) throw new Error('CANVAS_TASK_CANDIDATE_ID_REQUIRED')
+        if (!generatedJobs.has(JSON.stringify([proof.nodeId, proof.jobId]))) throw new Error('CANVAS_TASK_CANDIDATE_NOT_GENERATED')
       }
       verifiedProofs.push(proof)
     }
@@ -214,9 +224,24 @@ export function createCanvasTaskContract(options: CanvasTaskContractOptions) {
       canvasId = targetCanvasId
       requirements = structuredClone(expected)
       baseline = initialBaseline ? structuredClone(initialBaseline) : undefined
+      generatedJobs.clear()
       phase = 'working'
       blockingReason = undefined
       return status()
+    },
+    /** 仅由 Host 生产回执调用，登记本合同启动后的目标图片任务。 */
+    recordGeneratedJobs(targetCanvasId: string, jobs: readonly CanvasTaskGeneratedJob[]) {
+      if (phase !== 'working' || canvasId !== targetCanvasId) throw new Error('CANVAS_TASK_NOT_STARTED')
+      if (jobs.length > 256 || jobs.some(job => !job.nodeId.trim() || !job.jobId.trim())) {
+        throw new Error('CANVAS_TASK_GENERATED_JOB_INVALID')
+      }
+      for (const job of jobs) {
+        /** 全轮最多256份来源，不能通过多次小批调用无限积累。 */
+        const key = JSON.stringify([job.nodeId, job.jobId])
+        generatedJobs.delete(key)
+        generatedJobs.add(key)
+        if (generatedJobs.size > 256) generatedJobs.delete(generatedJobs.values().next().value!)
+      }
     },
     /** 只有 Provider 真实读取成功后才能签发证据；token 不构成执行授权。 */
     record(evidence: CanvasTaskEvidence) {

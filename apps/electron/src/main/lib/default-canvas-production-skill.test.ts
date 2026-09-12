@@ -14,17 +14,50 @@ function readCanvasProductionSkill(): string {
     : ''
 }
 
+test('Given 导演首次接管或局部复核 When 读取规范 Then 显式审核范围与位置及生成依赖分别定义', () => {
+  /** 默认入口和详细合同均须说明新增工具字段，避免只有代码支持而模型不会调用。 */
+  const skill = readCanvasProductionSkill()
+  const review = readFileSync(join(canvasProductionSkillPath, '../references/production-review.md'), 'utf8')
+  for (const rule of ['reviewScope', 'positionBeforeNodeIds', 'reviewCoverage', '孤立节点', '逐节点', '局部复核']) {
+    expect(skill).toContain(rule)
+    expect(review).toContain(rule)
+  }
+  expect(review).toContain('scopeRevision')
+  expect(review).toContain('配置版本可能独立于图版本变化')
+  expect(review).toContain('先完成读取，再写方案')
+  expect(review).toContain('不为审核添加执行依赖')
+})
+
 test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数据包含 Proma 分组与明确触发边界', () => {
   const skill = readCanvasProductionSkill()
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.19"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.27"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
   expect(skill).toContain('普通代码')
   expect(skill).toContain('不要强行转入画布')
+})
+
+test('Given 按用途编排与视频评审 When 读取默认 Skill Then 运行前入口可达且详细合同随 Skill 分发', () => {
+  /** 主入口与按需参考必须一起发布，避免仅新增一个 Agent 永远不会读取的文件。 */
+  const skill = readCanvasProductionSkill()
+  const reviewPath = join(canvasProductionSkillPath, '../references/production-review.md')
+  expect(skill).toContain('references/production-review.md')
+  expect(skill).toContain('只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演')
+  expect(skill).toContain('创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议')
+  expect(skill.indexOf('### 2.3 按用途选择模式并评审')).toBeGreaterThan(0)
+  expect(skill.indexOf('### 2.3 按用途选择模式并评审')).toBeLessThan(skill.indexOf('### 3. 规划产物图'))
+  expect(existsSync(reviewPath)).toBe(true)
+  /** 文档合同验证可达性与关键边界，不声称静态测试已经验证模型的导演能力。 */
+  const review = readFileSync(reviewPath, 'utf-8')
+  for (const rule of ['制作模式', '生成模式', '阻塞问题', '改进建议', '实际末帧',
+    'canvas_run_agent', 'canvas_task', 'metadataOnly', '只读', '主 Agent', '版本']) {
+    expect(review).toContain(rule)
+  }
+  expect(review).toContain('只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演')
 })
 
 test('Given 多产物画布任务 When 读取 canvas-production Then 定义节点拆分、关系语义与完整工具循环', () => {
@@ -110,6 +143,32 @@ test('Given 图片异步生成或重试已提交 When 读取 Skill Then 继续�
   }
 })
 
+test('Given 图片迭代与成对帧生产 When 读取 Skill Then 锁定真实图源、请求证据、重试边界与母版验收', () => {
+  const skill = readCanvasProductionSkill()
+
+  for (const rule of [
+    'editSourceNodeId',
+    '`image.asset` → `image.reference`',
+    '`null` 表示采用当前图片',
+    '“母版”不代表已经切换底图',
+    '原快照重试',
+    '“图片请求已准备”',
+    'assetId',
+    'hash',
+    '数量',
+    '它不代表远端服务已经收到',
+    '无 `mask` 的编辑不能保证局部锁定',
+    '适配',
+    '道具',
+    '机位',
+    '构图',
+    '手位',
+    '母版不合格时先不扩散',
+  ]) {
+    expect(skill).toContain(rule)
+  }
+})
+
 test('Given Canvas Skill 负责语义编排 When 校验执行边界 Then 权限、破坏性操作和付费运行仍由工具层控制', () => {
   const skill = readCanvasProductionSkill()
 
@@ -184,10 +243,11 @@ test('Given 四类 Agent 运行范围 When 读取 canvas-production Then 十五�
   const skill = readCanvasProductionSkill()
 
   expect(skill).toContain('普通 Agent 可使用当前已装配的全部任务')
-  expect(skill).toContain('手动运行的 Canvas Agent')
-  expect(skill).toContain('不能重建自身，也不能控制父工作流')
-  expect(skill).toContain('父编排的 Canvas Agent 只可读取任务状态、版本列表和历史正文')
-  expect(skill).toContain('`plan` 模式只发现并执行只读操作')
+  expect(skill).toContain('交互式 Canvas Agent 固定在当前画布内工作')
+  expect(skill).toContain('没有 schema 的动作不能由 Skill 自行补充')
+  expect(skill).toContain('父编排的 Canvas Agent 负责分支内容与配置准备')
+  expect(skill).toContain('媒体启动、预算与父工作流控制继续由父层负责')
+  expect(skill).toContain('`plan` 模式的画布查询与内存任务登记可直接执行')
   expect(skill).toContain('CANVAS_OPERATION_CURSOR_INVALID')
   expect(skill).toContain('等待采用、可继续、完成和取消状态')
   expect(skill).toContain('批量导出最多十六项')

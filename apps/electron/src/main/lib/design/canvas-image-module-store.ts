@@ -255,6 +255,8 @@ export function createCanvasImageModuleStore(
     const configKeys = [
       'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
       'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode', 'adoptedAssetId',
+      ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'editSourceNodeId')
+        ? ['editSourceNodeId'] : []),
       ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'mediaWorkflow')
         ? ['mediaWorkflow'] : []),
       ...(rawConfig !== null && typeof rawConfig === 'object' && Object.hasOwn(rawConfig, 'preparation')
@@ -323,6 +325,7 @@ export function createCanvasImageModuleStore(
         updatedAt: timestamp,
         prompt: input.prompt,
         selectedModelProfileId: input.selectedModelProfileId,
+        ...(Object.hasOwn(input, 'editSourceNodeId') ? { editSourceNodeId: input.editSourceNodeId } : {}),
         ...(input.mediaWorkflow ? { mediaWorkflow: structuredClone(input.mediaWorkflow) } : {}),
         preparation: input.preparation ?? null,
         aspectRatio: input.aspectRatio,

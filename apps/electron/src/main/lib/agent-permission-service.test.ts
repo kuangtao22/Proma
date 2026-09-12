@@ -32,6 +32,30 @@ function approvalPolicy(initialMode: 'ask' | 'automatic' = 'ask'): AgentToolAppr
   }
 }
 
+test('Given 扩额审批正在等待 When 切换自动模式 Then 仍按原工具参数等待确认', async () => {
+  const service = new AgentPermissionService()
+  const policy = approvalPolicy()
+  const getMode = policy.getMode
+  /** 参数必须沿首次检查及动态订阅透传，不能丢失后自动批准。 */
+  const input = { runId: 'workflow-1', addMediaRuns: 2 }
+  const seen: unknown[] = []
+  policy.getMode = (name, params) => {
+    seen.push(params)
+    return params?.addMediaRuns === 2 ? 'ask' : getMode(name, params)
+  }
+  const requests: Array<{ requestId: string }> = []
+  const pending = service.requestSingleApproval('session-1', 'canvas_resume_workflow', input,
+    permissionOptions(new AbortController().signal, 'budget-request'), request => { requests.push(request) },
+    { policy, onResolved: () => undefined })
+  policy.setMode('automatic')
+  expect(seen.length).toBeGreaterThan(0)
+  expect(seen.every(value => value === input)).toBe(true)
+  expect(service.getPendingRequestOwner(requests[0]!.requestId)).not.toBeNull()
+  service.respondToPermission(requests[0]!.requestId, 'deny', false)
+  expect((await pending).behavior).toBe('deny')
+  expect(policy.listenerCount()).toBe(0)
+})
+
 describe('服务器远程命令权限', () => {
   test.each(['server_docker_action', 'server_files_mutate'])(
     'Given %s 被批准并伪造 alwaysAllow When 再次调用 Then 仍需逐次审批', async (toolName) => {

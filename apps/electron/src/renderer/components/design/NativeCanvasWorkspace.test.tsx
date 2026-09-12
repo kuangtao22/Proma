@@ -725,11 +725,11 @@ describe('Canvas 生图工作台接入', () => {
     })
 
     controller.schedule({
-      prompt: '首页第一版', selectedModelProfileId: 'profile-1', aspectRatio: '16:9',
+      prompt: '首页第一版', selectedModelProfileId: 'profile-1', editSourceNodeId: null, aspectRatio: '16:9',
       imageSize: '2K', contextMode: 'project', dirty: true,
     }, 'dirty')
     controller.schedule({
-      prompt: '首页第二版', selectedModelProfileId: 'profile-1', aspectRatio: '16:9',
+      prompt: '首页第二版', selectedModelProfileId: 'profile-1', editSourceNodeId: null, aspectRatio: '16:9',
       imageSize: '2K', contextMode: 'project', dirty: true,
     }, 'dirty')
 
@@ -828,6 +828,7 @@ describe('Canvas 生图工作台接入', () => {
       draft: {
         prompt: imageSnapshot.config.prompt,
         selectedModelProfileId: imageSnapshot.config.selectedModelProfileId,
+        editSourceNodeId: null,
         aspectRatio: imageSnapshot.config.aspectRatio,
         imageSize: imageSnapshot.config.imageSize,
         contextMode: imageSnapshot.config.contextMode,

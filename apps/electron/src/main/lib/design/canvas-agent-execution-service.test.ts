@@ -8,6 +8,7 @@ import {
   createCanvasAgentExecutionService,
   type CanvasAgentExecutionServiceDependencies,
 } from './canvas-agent-execution-service'
+import type { CanvasAgentReviewCoverage } from './canvas-agent-review'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1' }
 
@@ -15,6 +16,10 @@ const target = { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1'
 function createFixture(options: {
   reserveError?: Error
   runError?: string
+  /** 模拟没有经过 onError 回调的基础设施拒绝。 */
+  headlessThrow?: Error
+  /** 模拟缺失或错代的终态，不能以有正文作为成功依据。 */
+  invalidTerminal?: 'missing' | 'stale'
   stopped?: boolean
   skills?: SkillMeta[]
   config?: Partial<CanvasAgentConfig>
@@ -126,16 +131,17 @@ function createFixture(options: {
     },
     runHeadless: async (input, callbacks, extensions) => {
       calls.push(`headless:${callbacks.source}:${callbacks.originSessionId}:${input.triggeredBy}`)
+      if (options.headlessThrow) throw options.headlessThrow
       options.inspectRunOutsidePrepare?.(prepareHeld)
       activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
       options.inspectHeadlessExtensions?.(extensions)
       expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
       if (options.runError) callbacks.onError(options.runError)
       await options.runGate
-      callbacks.onComplete(undefined, {
+      callbacks.onComplete(undefined, options.invalidTerminal === 'missing' ? undefined : {
         status: options.stopped ? 'cancelled' : options.runError || options.headlessResultSubtype !== undefined ? 'errored' : 'completed',
         stoppedByUser: options.stopped === true,
-        startedAt: input.startedAt!,
+        startedAt: input.startedAt! + (options.invalidTerminal === 'stale' ? 1 : 0),
         runGeneration: 3,
         ...(options.headlessResultSubtype !== undefined ? { resultSubtype: options.headlessResultSubtype } : {}),
       })
@@ -191,7 +197,7 @@ describe('Canvas Agent 统一执行服务', () => {
     await expect(fixture.service.execute({
       mode: 'renderer-manual', target, sender: { id: 1 } as unknown as import('electron').WebContents, message: '重新生成',
       userMessageUuid: 'anchor-with-old-assistant', startedAt: 51,
-    })).resolves.toEqual({ status: 'errored' })
+    })).resolves.toMatchObject({ status: 'errored', failure: { code: 'CANVAS_AGENT_RUN_FAILED', stage: 'execution', recovery: 'inspect-node' } })
 
     expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
   })
@@ -210,6 +216,151 @@ describe('Canvas Agent 统一执行服务', () => {
     expect(capturedContext?.parentWorkflow).toEqual({ runId: 'workflow-1', parentSessionId: 'parent-1' })
     expect(fixture.calls.filter((call) => call.startsWith('commit:'))).toEqual(['commit:completed:1'])
     expect(fixture.runContexts[0]?.dialogOwnerWebContentsId).toBeUndefined()
+  })
+
+  test('Given 全画布审核范围 When 最终启动 Then 注入完整范围且不扩展输入引用', async () => {
+    let reviewContext: unknown
+    const fixture = createFixture({ inspectCanvasRunContext: (context) => {
+      reviewContext = (context as unknown as { reviewContext?: unknown }).reviewContext
+    } })
+    await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核导演方案', userMessageUuid: 'anchor-review-canvas', startedAt: 60,
+      reviewScope: { mode: 'canvas' },
+    })
+
+    expect(reviewContext).toMatchObject({ canvasId: target.canvasId, revision: 7, mode: 'canvas' })
+    expect((reviewContext as { nodeIds: string[] }).nodeIds).toEqual(['input-1', 'ignored-1'])
+    expect(fixture.calls).toContain('tools:parent-orchestrated:input-1')
+    expect(fixture.calls).not.toContain('tools:parent-orchestrated:input-1,ignored-1')
+  })
+
+  test('Given 节点审核范围 When 最终启动 Then 只注入指定节点且排除执行者自身', async () => {
+    let reviewContext: unknown
+    const fixture = createFixture({ inspectCanvasRunContext: (context) => {
+      reviewContext = (context as unknown as { reviewContext?: unknown }).reviewContext
+    } })
+    await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '复核输入节点', userMessageUuid: 'anchor-review-nodes', startedAt: 60,
+      reviewScope: { mode: 'nodes', nodeIds: ['input-1', target.nodeId] },
+    })
+
+    expect(reviewContext).toMatchObject({ canvasId: target.canvasId, revision: 7, mode: 'nodes', nodeIds: ['input-1'] })
+  })
+
+  test('Given 审核范围包含不存在节点 When 最终启动 Then 在 reserve 前拒绝', async () => {
+    const fixture = createFixture()
+    await expect(fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核', userMessageUuid: 'anchor-review-invalid', startedAt: 60,
+      reviewScope: { mode: 'nodes', nodeIds: ['missing-node'] },
+    })).rejects.toThrow()
+    expect(fixture.calls).not.toContain('reserve')
+    expect(fixture.calls.some((call) => call.startsWith('headless:'))).toBe(false)
+  })
+
+  test('Given 未提供审核范围 When 最终启动 Then 保持旧运行上下文且不返回覆盖结果', async () => {
+    let reviewContext: unknown = 'unset'
+    const fixture = createFixture({ inspectCanvasRunContext: (context) => {
+      reviewContext = (context as unknown as { reviewContext?: unknown }).reviewContext
+    } })
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '执行', userMessageUuid: 'anchor-review-none', startedAt: 60,
+    })
+
+    expect(reviewContext).toBeUndefined()
+    expect(result).not.toHaveProperty('reviewCoverage')
+  })
+
+  test('Given 审核运行已产生覆盖结果 When 子 Agent 完成 Then 返回同一覆盖结果', async () => {
+    /** 使用真实覆盖合同，避免测试字段与运行时协议漂移。 */
+    const reviewCoverage: CanvasAgentReviewCoverage = {
+      canvasId: target.canvasId, scopeRevision: 7, totalNodes: 2, readNodes: 2, unreadNodes: 0,
+      failedNodes: 0, incompleteNodes: 0, unreadNodeIds: [], failedNodeIds: [], incompleteNodeIds: [],
+      totalEdges: 0, readEdges: 0, missingEdges: 0, missingEdgeSamples: [], complete: true,
+      qualityVerdict: 'not-assessed',
+    }
+    const fixture = createFixture({ canvasRun: {
+      systemPromptAppend: 'tools-prompt', piCustomTools: [], allowedToolNames: ['canvas_read'],
+      allowedToolNamesMode: 'extend', singleApprovalToolNames: [],
+      getReviewCoverage: () => reviewCoverage,
+    } })
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核并完成', userMessageUuid: 'anchor-review-result', startedAt: 60,
+      reviewScope: { mode: 'canvas' },
+    })
+
+    expect(result.reviewCoverage).toEqual(reviewCoverage)
+  })
+
+  test('Given 审核覆盖可读取 When 正式输出提交 Then 只在 commit 前读取一次覆盖', async () => {
+    /** 记录覆盖读取时序，防止提交后重新读取导致审核事实漂移。 */
+    const reviewCoverage: CanvasAgentReviewCoverage = {
+      canvasId: target.canvasId, scopeRevision: 7, totalNodes: 0, readNodes: 0, unreadNodes: 0,
+      failedNodes: 0, incompleteNodes: 0, unreadNodeIds: [], failedNodeIds: [], incompleteNodeIds: [],
+      totalEdges: 0, readEdges: 0, missingEdges: 0, missingEdgeSamples: [], complete: true,
+      qualityVerdict: 'not-assessed',
+    }
+    const fixture = createFixture({ canvasRun: {
+      systemPromptAppend: 'tools-prompt', piCustomTools: [], allowedToolNames: ['canvas_read'],
+      allowedToolNamesMode: 'extend', singleApprovalToolNames: [],
+      getReviewCoverage: () => { fixture.calls.push('coverage'); return reviewCoverage },
+    } })
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核', userMessageUuid: 'anchor-review-order', startedAt: 60,
+      reviewScope: { mode: 'canvas' },
+    })
+    expect(result.reviewCoverage).toEqual(reviewCoverage)
+    expect(fixture.calls.filter(call => call === 'coverage')).toHaveLength(1)
+    expect(fixture.calls.indexOf('coverage')).toBeLessThan(fixture.calls.findIndex(call => call.startsWith('commit:')))
+  })
+
+  test('Given 审核运行错误终止 When 子 Agent 结束 Then 仍返回终态覆盖结果', async () => {
+    /** 错误终态也要保留已送达覆盖，便于父 Agent 精确补读。 */
+    const reviewCoverage: CanvasAgentReviewCoverage = {
+      canvasId: target.canvasId, scopeRevision: 7, totalNodes: 1, readNodes: 0, unreadNodes: 1,
+      failedNodes: 0, incompleteNodes: 0, unreadNodeIds: [ 'input-1' ], failedNodeIds: [], incompleteNodeIds: [],
+      totalEdges: 0, readEdges: 0, missingEdges: 0, missingEdgeSamples: [], complete: false,
+      qualityVerdict: 'not-assessed',
+    }
+    const fixture = createFixture({ runError: 'failed', canvasRun: {
+      systemPromptAppend: 'tools-prompt', piCustomTools: [], allowedToolNames: ['canvas_read'],
+      allowedToolNamesMode: 'extend', singleApprovalToolNames: [], getReviewCoverage: () => reviewCoverage,
+    } })
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核', userMessageUuid: 'anchor-review-error', startedAt: 60,
+      reviewScope: { mode: 'canvas' },
+    })
+    expect(result.status).toBe('errored')
+    expect(result.reviewCoverage).toEqual(reviewCoverage)
+  })
+
+  test('Given 审核运行在启动前取消 When 子 Agent 未运行 Then 返回取消终态覆盖结果', async () => {
+    /** 启动前取消也不应丢失已构造的审核范围回执。 */
+    const reviewCoverage: CanvasAgentReviewCoverage = {
+      canvasId: target.canvasId, scopeRevision: 7, totalNodes: 2, readNodes: 0, unreadNodes: 2,
+      failedNodes: 0, incompleteNodes: 0, unreadNodeIds: ['input-1', 'ignored-1'], failedNodeIds: [], incompleteNodeIds: [],
+      totalEdges: 1, readEdges: 0, missingEdges: 1, missingEdgeSamples: [{ id: 'edge-1', sourceNodeId: 'input-1', targetNodeId: target.nodeId }], complete: false,
+      qualityVerdict: 'not-assessed',
+    }
+    const fixture = createFixture({ canvasRun: {
+      systemPromptAppend: 'tools-prompt', piCustomTools: [], allowedToolNames: ['canvas_read'],
+      allowedToolNamesMode: 'extend', singleApprovalToolNames: [], getReviewCoverage: () => reviewCoverage,
+    } })
+    const controller = new AbortController()
+    controller.abort()
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '审核', userMessageUuid: 'anchor-review-cancelled', startedAt: 60, signal: controller.signal,
+      reviewScope: { mode: 'canvas' },
+    })
+    expect(result.status).toBe('cancelled')
+    expect(result.reviewCoverage).toEqual(reviewCoverage)
   })
 
   test('Given 父 Agent 初检后图 revision 已变化 When 最终启动 Then 在 reserve 前拒绝且不运行模型', async () => {
@@ -341,7 +492,7 @@ describe('Canvas Agent 统一执行服务', () => {
     await expect(fixture.service.execute({
       mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行',
       userMessageUuid: 'anchor-partial', startedAt: 71,
-    })).resolves.toEqual({ status: 'errored' })
+    })).resolves.toMatchObject({ status: 'errored', failure: { code: 'CANVAS_AGENT_RUN_FAILED', stage: 'execution', recovery: 'inspect-node' } })
     expect(fixture.calls.some((call) => call.startsWith('commit:'))).toBe(false)
   })
 
@@ -393,8 +544,61 @@ describe('Canvas Agent 统一执行服务', () => {
       userMessageUuid: 'anchor-empty', startedAt: 92,
     })
 
-    expect(result).toEqual({ status: 'errored' })
+    expect(result).toMatchObject({ status: 'errored', failure: { code: 'CANVAS_AGENT_OUTPUT_MISSING', stage: 'output', recovery: 'inspect-output' } })
     expect(fixture.calls).toContain('release-generation:child-1:1')
+  })
+
+  test.each(['missing', 'stale'] as const)('Given %s终态 When 子运行结束 Then 返回终态诊断且不提交已有正文', async (invalidTerminal) => {
+    const fixture = createFixture({ invalidTerminal })
+    const result = await fixture.service.execute({ mode: 'parent-orchestrated', target,
+      parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行', userMessageUuid: 'terminal-check', startedAt: 93 })
+    expect(result).toMatchObject({ status: 'errored', failure: { code: 'CANVAS_AGENT_TERMINAL_INVALID', stage: 'terminal' } })
+    expect(fixture.calls.some(call => call.startsWith('commit:'))).toBe(false)
+    expect(fixture.calls).toContain('unlisten')
+  })
+
+  test('Given 基础设施直接拒绝运行 When 没有错误回调 Then 返回诊断且释放启动代次', async () => {
+    const fixture = createFixture({ headlessThrow: new Error('连接中断 Bearer hidden-token') })
+    const result = await fixture.service.execute({ mode: 'parent-orchestrated', target,
+      parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行', userMessageUuid: 'throw-check', startedAt: 94 })
+    expect(result).toMatchObject({ status: 'errored', failure: { code: 'CANVAS_AGENT_RUN_FAILED', stage: 'execution' } })
+    expect(result.failure?.message).toContain('连接中断')
+    expect(result.failure?.message).not.toContain('hidden-token')
+    expect(fixture.calls.some(call => call.startsWith('commit:'))).toBe(false)
+    expect(fixture.calls).toContain('release-generation:child-1:1')
+  })
+
+  test.each([
+    ['CANVAS_AGENT_MODEL_UNAVAILABLE', 'model-unavailable', 'inspect-model'],
+    ['CANVAS_WORKFLOW_BUDGET_EXHAUSTED', 'budget', 'inspect-workflow'],
+    ['invalid_credentials', 'permission', 'inspect-permissions'],
+    ['Connection error.', 'connection', 'inspect-node'],
+    ['CANVAS_AGENT_SKILL_UNAVAILABLE: video', 'tool-unavailable', 'inspect-node'],
+    ['MEDIA_WORKFLOW_INVALID', 'workflow-incompatible', 'inspect-workflow'],
+    ['CANVAS_IMAGE_JOB_FAILED', 'media', 'inspect-node'],
+    ['某个未知问题', 'unknown', 'inspect-node'],
+  ])('Given 上游明确错误%s When 返回诊断 Then 分类为%s并保留只读恢复起点', async (runError, reasonCode, recovery) => {
+    const fixture = createFixture({ runError })
+    const result = await fixture.service.execute({ mode: 'parent-orchestrated', target,
+      parentSessionId: 'parent-1', expectedGraphRevision: 7, instruction: '执行', userMessageUuid: 'reason-check', startedAt: 95 })
+    expect(result).toMatchObject({ status: 'errored', failure: { reasonCode, recovery, message: runError } })
+  })
+
+  test('Given child 错误包含路径凭据和远端地址 When 返回失败诊断 Then 只保留有界脱敏消息', async () => {
+    const fixture = createFixture({ runError: 'https://secret.example/x?token=abc /Users/test/private.txt bearer=secret-value Bearer space-secret /private/tmp/a.txt /tmp/b.txt "api_key":"quoted-secret" ' + '错误'.repeat(400) })
+    const result = await fixture.service.execute({
+      mode: 'parent-orchestrated', target, parentSessionId: 'parent-1', expectedGraphRevision: 7,
+      instruction: '执行', userMessageUuid: 'anchor-failure-redaction', startedAt: 93,
+    })
+    expect(result.failure?.message).not.toContain('https://')
+    expect(result.failure?.message).not.toContain('/Users/test')
+    expect(result.failure?.message).not.toContain('secret-value')
+    expect(result.failure?.message).not.toContain('space-secret')
+    expect(result.failure?.message).not.toContain('quoted-secret')
+    expect(result.failure?.message).not.toContain('/private/tmp')
+    expect(result.failure?.message).not.toContain('/tmp/b')
+    expect(Buffer.byteLength(result.failure?.message ?? '', 'utf8')).toBeLessThanOrEqual(512)
+    expect(result.failure?.message).not.toContain('\uFFFD')
   })
 
   test('Given 父运行只拥有当前 child When 取消后 child 迟到完成 Then 精确停止且不提交指针', async () => {

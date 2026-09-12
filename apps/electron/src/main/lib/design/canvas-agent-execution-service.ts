@@ -23,6 +23,8 @@ import {
 } from './canvas-agent-run-policy'
 import type { CanvasToolRun, CanvasToolRunContext } from './canvas-tool-provider'
 import { filterCanvasAgentToolNamesForMode } from './canvas-agent-tool-policy'
+import type { CanvasAgentReviewCoverage, CanvasAgentReviewScope, CanvasAgentReviewContext } from './canvas-agent-review'
+import { resolveCanvasAgentReviewContext } from './canvas-agent-review'
 
 /** Renderer 手动运行只接受 IPC 已严格解析的消息身份。 */
 export interface CanvasRendererManualAgentExecutionRequest {
@@ -48,6 +50,8 @@ export interface CanvasParentOrchestratedAgentExecutionRequest {
   userMessageUuid: string
   startedAt: number
   signal?: AbortSignal
+  /** 父编排本轮审核范围；仅作为运行上下文，不改变画布关系或输入引用。 */
+  reviewScope?: CanvasAgentReviewScope
 }
 
 export type CanvasAgentExecutionRequest =
@@ -58,6 +62,74 @@ export type CanvasAgentExecutionRequest =
 export interface CanvasAgentExecutionResult {
   status: 'completed' | 'errored' | 'cancelled'
   output?: CanvasAgentOutputCommitResult
+  /** 本轮读取覆盖与正式方案输出分别返回，覆盖不代表内容合格。 */
+  reviewCoverage?: CanvasAgentReviewCoverage
+  /** 错误终态的有界诊断，不能作为重新生成或扩大权限的授权。 */
+  failure?: CanvasAgentExecutionFailure
+}
+
+/** Canvas Agent 失败的可执行诊断；不携带路径、凭据或远端请求身份。 */
+export interface CanvasAgentExecutionFailure {
+  code: 'CANVAS_AGENT_PREPARATION_FAILED' | 'CANVAS_AGENT_RUN_FAILED' | 'CANVAS_AGENT_TERMINAL_INVALID' | 'CANVAS_AGENT_OUTPUT_MISSING'
+  stage: 'preparation' | 'execution' | 'terminal' | 'output'
+  /** 只按明确错误码或明确连接错误分类；unknown不能被理解为允许重试。 */
+  reasonCode: 'model-unavailable' | 'permission' | 'budget' | 'connection' | 'tool-unavailable' | 'workflow-incompatible' | 'media' | 'unknown'
+  message: string
+  recovery: 'inspect-node' | 'inspect-output' | 'inspect-model' | 'inspect-permissions' | 'inspect-workflow'
+}
+
+/** 根据上游明确错误标识选择只读诊断方向，不根据自然语言推断远端执行/收费状态。 */
+function classifyAgentFailure(value: unknown): Pick<CanvasAgentExecutionFailure, 'reasonCode' | 'recovery'> {
+  const raw = typeof value === 'string' ? value : value instanceof Error ? value.message : ''
+  const code = raw.split(':', 1)[0]!.trim()
+  if (['CANVAS_AGENT_MODEL_UNAVAILABLE', 'AGENT_MODEL_DISABLED', 'agent_model_unavailable', 'invalid_model', 'channel_not_found', 'channel_disabled'].includes(code)) {
+    return { reasonCode: 'model-unavailable', recovery: 'inspect-model' }
+  }
+  if (['CANVAS_ACCESS_DENIED', 'CANVAS_NOT_LINKED', 'invalid_api_key', 'invalid_credentials', 'expired_oauth_token', 'mcp_auth_required'].includes(code)) {
+    return { reasonCode: 'permission', recovery: 'inspect-permissions' }
+  }
+  if (code === 'CANVAS_WORKFLOW_BUDGET_EXHAUSTED') return { reasonCode: 'budget', recovery: 'inspect-workflow' }
+  if (['network_error', 'mcp_unreachable', 'Connection error', 'Connection error.', 'fetch failed', 'ECONNRESET', 'ETIMEDOUT'].includes(code)) {
+    return { reasonCode: 'connection', recovery: 'inspect-node' }
+  }
+  if (['CANVAS_AGENT_SKILL_UNAVAILABLE', 'model_no_tool_support', 'agent_runtime_not_found'].includes(code)) {
+    return { reasonCode: 'tool-unavailable', recovery: 'inspect-node' }
+  }
+  if (['MEDIA_WORKFLOW_INVALID', 'CANVAS_MEDIA_WORKFLOW_REQUIRED'].includes(code)) {
+    return { reasonCode: 'workflow-incompatible', recovery: 'inspect-workflow' }
+  }
+  if (['CANVAS_IMAGE_JOB_FAILED', 'MEDIA_RUN_FAILED'].includes(code)) return { reasonCode: 'media', recovery: 'inspect-node' }
+  return { reasonCode: 'unknown', recovery: 'inspect-node' }
+}
+
+/** 仅模型/Skill不可用可转换为准备诊断；授权撤销、身份与版本竞争继续按原边界拒绝。 */
+export function describeCanvasAgentPreparationFailure(error: unknown): CanvasAgentExecutionFailure | undefined {
+  if (!(error instanceof Error) || !/^CANVAS_AGENT_(MODEL|SKILL)_UNAVAILABLE(?::|$)/.test(error.message)) return undefined
+  return createAgentExecutionFailure('CANVAS_AGENT_PREPARATION_FAILED', 'preparation', error, 'inspect-node')
+}
+
+/** 将 child 错误压缩为有界脱敏诊断，不能据此推断服务商是否执行。 */
+function sanitizeAgentFailureMessage(value: unknown): string {
+  /** 上游错误仅提取可读正文，不序列化可能包含凭据的异常对象。 */
+  const raw = typeof value === 'string' ? value : value instanceof Error ? value.message : ''
+  /** 脱敏后再按UTF-8预算裁剪，保留多字节字符完整性。 */
+  const sanitized = raw
+    .replace(/https?:\/\/[^\s]+/gi, '[远端地址已隐藏]')
+    .replace(/\b(Bearer|Basic)\s+[^\s"']+/gi, '$1 [已隐藏]')
+    .replace(/\b(authorization|bearer|credentials?|access[-_]?token|token|api[-_]?key|password|secret)["']?\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1=[已隐藏]')
+    .replace(/(?:\/(?:Users|home|private|tmp|var)\/|[A-Z]:\\)[^\s"']+/gi, '[本地路径已隐藏]')
+    .trim()
+  return Buffer.from(sanitized, 'utf8').subarray(0, 512).toString('utf8').replace(/\uFFFD$/, '') || 'Canvas Agent 执行失败。'
+}
+
+/** 输入失败阶段与原始原因，返回父编排可消费的安全诊断和只读恢复起点。 */
+function createAgentExecutionFailure(
+  code: CanvasAgentExecutionFailure['code'], stage: CanvasAgentExecutionFailure['stage'],
+  message: unknown, recovery: CanvasAgentExecutionFailure['recovery'],
+): CanvasAgentExecutionFailure {
+  const classified = classifyAgentFailure(message)
+  return { code, stage, message: sanitizeAgentFailureMessage(message), reasonCode: classified.reasonCode,
+    recovery: stage === 'output' ? recovery : classified.recovery }
 }
 
 /** Renderer 运行由 Agent service 返回的主进程权威终态身份。 */
@@ -163,8 +235,8 @@ function buildRunExtensions(
       singleApprovalToolNames: canvasRun.singleApprovalToolNames.filter((name) => canvasToolNameSet.has(name)),
       /** 只对当前 Agent 仍可调用的工具透传动态生成授权，父编排白名单不扩张。 */
       ...(canvasRun.toolApprovalPolicy ? { toolApprovalPolicy: {
-        getMode: (toolName: string) => canvasToolNameSet.has(toolName)
-          ? canvasRun.toolApprovalPolicy!.getMode(toolName) : 'ask' as const,
+        getMode: (toolName: string, input?: Readonly<Record<string, unknown>>) => canvasToolNameSet.has(toolName)
+          ? canvasRun.toolApprovalPolicy!.getMode(toolName, input) : 'ask' as const,
         subscribe: canvasRun.toolApprovalPolicy.subscribe,
       } } : {}),
     } : {}),
@@ -232,15 +304,19 @@ export function createCanvasAgentExecutionService(
         try {
           dependencies.assertModelAvailable(channelId, modelId)
         } catch (error) {
-          /** 历史 session 可能绑定已停用模型；提示用户通过节点恢复面板换绑当前模型。 */
+          /** 模型失效应在原节点修正配置，不能把模型问题误报成需要重建会话。 */
           throw new Error(
-            'CANVAS_AGENT_MODEL_UNAVAILABLE: 当前 Canvas Agent 绑定的模型已失效，请打开节点并点击“重建会话”使用当前启用的模型。',
+            'CANVAS_AGENT_MODEL_UNAVAILABLE: 当前 Canvas Agent 绑定的模型不可用，请在原节点配置中选择已启用模型后继续。',
             { cause: error },
           )
         }
         const previous = generations.get(key)
         const runGeneration = previous?.sessionId === currentOwner.session.id ? previous.generation + 1 : 1
         const inputReferences = listCanvasAgentBoundInputReferences(currentSnapshot.document, currentOwner.node.id)
+        /** 在最终权威图解析审核范围，保留直接输入的原有语义。 */
+        const reviewContext: CanvasAgentReviewContext | undefined = request.mode === 'parent-orchestrated' && request.reviewScope
+          ? resolveCanvasAgentReviewContext(currentSnapshot.document, currentOwner.node.id, request.reviewScope)
+          : undefined
         const canvasRun = dependencies.createCanvasRun({
           projectId: request.target.projectId,
           sessionId: currentOwner.session.id,
@@ -252,6 +328,7 @@ export function createCanvasAgentExecutionService(
             : {}),
           canvasAgentTarget: request.target,
           canvasAgentMode: request.mode,
+          ...(reviewContext ? { reviewContext } : {}),
           ...(request.mode === 'parent-orchestrated' && request.parentWorkflow
             ? { parentWorkflow: request.parentWorkflow }
             : {}),
@@ -279,10 +356,12 @@ export function createCanvasAgentExecutionService(
         /** reserve 与最终 owner 校验同处一个同步临界区；成功后图删除/重建由 busy 门禁阻断。 */
         const releaseStart = dependencies.reserveStart(currentOwner.session.id, request.startedAt)
         generations.set(key, { sessionId: currentOwner.session.id, generation: runGeneration })
-        return { currentOwner, runGeneration, input, extensions, releaseStart }
+        return { currentOwner, runGeneration, input, extensions, releaseStart, canvasRun }
       })
-      const { currentOwner, runGeneration, input, extensions, releaseStart } = prepared
+      const { currentOwner, runGeneration, input, extensions, releaseStart, canvasRun } = prepared
       let terminalStatus: CanvasAgentExecutionResult['status'] | undefined
+      /** child 执行失败的脱敏诊断，取消终态不复用该字段。 */
+      let runFailure: CanvasAgentExecutionFailure | undefined
       let unsubscribeStopped = (): void => undefined
       /** 终态 callback 到达即撤销父取消所有权，不能延长到正式输出提交。 */
       let ownsLiveChild = false
@@ -303,7 +382,9 @@ export function createCanvasAgentExecutionService(
         if (request.mode === 'parent-orchestrated') request.signal?.addEventListener('abort', onAbort, { once: true })
         if (request.mode === 'parent-orchestrated' && request.signal?.aborted) {
           terminalStatus = 'cancelled'
-          return { status: 'cancelled' }
+          /** 取消回执只保留本轮已取得的内存覆盖，不发起额外读取。 */
+          const reviewCoverage = canvasRun?.getReviewCoverage?.()
+          return { status: 'cancelled', ...(reviewCoverage ? { reviewCoverage } : {}) }
         }
         if (request.mode === 'renderer-manual') {
           await dependencies.runRenderer(input, request.sender, extensions, (observation) => {
@@ -315,20 +396,41 @@ export function createCanvasAgentExecutionService(
           await dependencies.runHeadless(input, {
             source: 'design',
             originSessionId: request.parentSessionId,
-            onError: () => { setTerminalStatus('errored') },
+            onError: (error) => {
+              runFailure = createAgentExecutionFailure('CANVAS_AGENT_RUN_FAILED', 'execution', error, 'inspect-node')
+              setTerminalStatus('errored')
+            },
             onComplete: (_messages, terminal) => {
               /** 缺失或错代终态一律按错误处理，只有当前 run 明确成功才允许提交。 */
               if (!terminal || terminal.startedAt !== request.startedAt) {
+                runFailure = createAgentExecutionFailure('CANVAS_AGENT_TERMINAL_INVALID', 'terminal', '子 Agent 未返回匹配的终态。', 'inspect-node')
                 setTerminalStatus('errored')
                 return
+              }
+              if (terminal.status === 'errored') {
+                runFailure ??= createAgentExecutionFailure('CANVAS_AGENT_RUN_FAILED', 'execution', terminal.resultErrors?.join('; ') || terminal.resultSubtype, 'inspect-node')
               }
               setTerminalStatus(terminal.status)
             },
             onTitleUpdated: () => undefined,
-          }, extensions)
+          }, extensions).catch((error: unknown) => {
+            /** 基础设施直接拒绝也返回诊断；用户取消仍优先，不把未知失败自动重试。 */
+            if (terminalStatus !== 'cancelled') terminalStatus = request.signal?.aborted ? 'cancelled' : 'errored'
+            runFailure ??= createAgentExecutionFailure('CANVAS_AGENT_RUN_FAILED', 'execution', error, 'inspect-node')
+          })
           ownsLiveChild = false
         }
-        if (terminalStatus !== 'completed') return { status: terminalStatus ?? 'errored' }
+        /** 正式输出提交会改变图版本，覆盖必须在commit前捕获一次。 */
+        const reviewCoverage = canvasRun?.getReviewCoverage?.()
+        if (terminalStatus !== 'completed') return {
+          status: terminalStatus ?? 'errored',
+          ...(reviewCoverage ? { reviewCoverage } : {}),
+          ...(terminalStatus === 'cancelled' ? {} : {
+            failure: runFailure ?? (terminalStatus === 'errored'
+              ? createAgentExecutionFailure('CANVAS_AGENT_RUN_FAILED', 'execution', 'Canvas Agent 执行失败，请先读取原节点。', 'inspect-node')
+              : createAgentExecutionFailure('CANVAS_AGENT_TERMINAL_INVALID', 'terminal', 'Canvas Agent 未返回合法终态，请先读取原节点。', 'inspect-node')),
+          }),
+        }
         try {
           const output = await dependencies.outputs.commit({
             target: request.target,
@@ -338,10 +440,10 @@ export function createCanvasAgentExecutionService(
             completedAt: now(),
             terminalStatus: 'completed',
           })
-          return { status: 'completed', output }
+          return { status: 'completed', output, ...(reviewCoverage ? { reviewCoverage } : {}) }
         } catch (error) {
           if (error instanceof Error && error.message === 'CANVAS_AGENT_OUTPUT_MISSING') {
-            return { status: 'errored' }
+            return { status: 'errored', ...(reviewCoverage ? { reviewCoverage } : {}), failure: createAgentExecutionFailure('CANVAS_AGENT_OUTPUT_MISSING', 'output', error, 'inspect-output') }
           }
           throw error
         }

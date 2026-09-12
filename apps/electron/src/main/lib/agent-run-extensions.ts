@@ -1,14 +1,22 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import type { ImageGenerationModelSnapshot } from '@proma/shared'
+import type { DesignJobRecord, ImageGenerationModelSnapshot } from '@proma/shared'
 import type { ResolveImageGenerationRoute } from './image-generation-runtime'
 import type { AgentCompletionEvaluation } from './agent-completion-policy'
+import type { ImageRequestAudit } from './chat-tools/image-request-context'
 
 /** 高影响工具的动态审批策略，只能作用于本轮显式列入逐次审批名单的工具。 */
 export interface AgentToolApprovalPolicy {
   /** 返回指定工具当前应逐次询问，还是由 Agent 自动执行。 */
-  getMode(toolName: string): 'ask' | 'automatic'
+  getMode(toolName: string, input?: Readonly<Record<string, unknown>>): 'ask' | 'automatic'
   /** 订阅策略变化；返回值用于在工具审批结束时释放监听。 */
   subscribe(listener: () => void): () => void
+}
+
+/** Canvas 冻结合同在本轮执行中由 Host 独占的图片参数，不持久化到 Agent 会话。 */
+export interface TrustedImageParameters {
+  aspectRatio: NonNullable<DesignJobRecord['generationConstraints']>['aspectRatio']
+  imageSize: NonNullable<DesignJobRecord['generationConstraints']>['imageSize']
+  numberOfImages: 1
 }
 
 /**
@@ -42,6 +50,14 @@ export interface AgentRunExtensions {
   beforeToolCall?: (toolName: string, input: Readonly<Record<string, unknown>>) => void
   /** Design 可信图片工具在执行前回传的真实摘要和精确提示词。 */
   captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
+  /** Canvas 原生图片任务冻结的配置原文；存在时图片工具忽略 Agent 提交的 prompt。 */
+  trustedImagePrompt?: string
+  /** Canvas 原生图片冻结的结构化参数；存在时图片工具忽略 Agent 提交的比例、尺寸和数量。 */
+  trustedImageParameters?: TrustedImageParameters
+  /** Design Job 固化的可信参考图顺序；字段存在时模型参数不能覆盖。 */
+  trustedReferenceImagePaths?: readonly string[]
+  /** OpenAI Images 请求外发前回传不含凭据和图片正文的可信审计信息。 */
+  captureDesignImageRequest?: (request: ImageRequestAudit) => void
   /** 可选 Host 完成检查；缺失时普通 Agent 沿用模型原始终态。 */
   evaluateCompletion?: (signal: AbortSignal) => Promise<AgentCompletionEvaluation>
 }

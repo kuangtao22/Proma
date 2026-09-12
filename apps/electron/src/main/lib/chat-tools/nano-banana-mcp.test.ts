@@ -1,4 +1,7 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { createRunToolCallLimiter } from '../agent-run-tool-policy'
 import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
@@ -45,6 +48,8 @@ interface TestToolResultDetails {
 }
 
 interface TestToolDefinition {
+  description: string
+  parameters?: unknown
   execute: (toolUseId: string, input: Record<string, unknown>, signal?: AbortSignal) => Promise<{
     content: Array<{ type: string; text?: string }>
     details: TestToolResultDetails
@@ -58,6 +63,7 @@ type FetchImplementation = (
   init?: Parameters<typeof fetch>[1],
 ) => Promise<Response>
 let nanoBanana: NanoBananaModule
+const temporaryRoots: string[] = []
 /** 测试 fetch 的可替换实现，用于模拟取消中的网络请求。 */
 let fetchImplementation: FetchImplementation
 /** 构造每次请求使用的新响应，避免 Response body 被不同测试复用。 */
@@ -94,6 +100,23 @@ beforeEach(() => {
   saveAttachmentMock.mockClear()
 })
 
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+/** 创建两张内容可区分的可信参考图。 */
+function createTrustedReferenceFixtures(): { root: string; paths: string[]; base64: string[] } {
+  const root = mkdtempSync(join(tmpdir(), 'proma-trusted-references-'))
+  temporaryRoots.push(root)
+  const bytes = [Buffer.from('first-reference'), Buffer.from('second-reference')]
+  const paths = bytes.map((content, index) => {
+    const path = join(root, `trusted-${index + 1}.png`)
+    writeFileSync(path, content)
+    return path
+  })
+  return { root, paths, base64: bytes.map((content) => content.toString('base64')) }
+}
+
 /** 把 Nano Banana 公开快照解析为不含凭据的主进程运行路由。 */
 const resolveNanoRoute: ResolveImageGenerationRoute = (snapshot) => {
   if (snapshot.executor !== 'nano-banana') throw new Error('测试预期 Nano Banana 路由')
@@ -105,6 +128,105 @@ afterAll(() => {
 })
 
 describe('Nano Banana Pi 工具附件来源', () => {
+  test('Given Host 冻结 Canvas 配置 When 隐藏规划省略提示词并提交冲突参数 Then Gemini 请求只使用 Host 原文与参数', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const captured: Array<{ designSummary: string; prompt: string }> = []
+    const originalPrompt = '成品必须保留精确尺寸 204x76 与 144x56，不能按比例概括。'
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-host-prompt',
+      trustedImageRoute: {
+        profileId: 'profile-design', name: '设计模型', executor: 'nano-banana', modelId: 'gemini-design',
+      },
+      trustedImagePrompt: originalPrompt,
+      trustedImageParameters: { aspectRatio: '16:9', imageSize: '4K', numberOfImages: 1 },
+      resolveTrustedImageRoute: resolveNanoRoute,
+      captureDesignImageCall: (input) => { captured.push(input) },
+    }) as unknown as TestToolDefinition[]
+
+    await tool!.execute('tool-host-prompt', {
+      designSummary: '保留卡片布局。',
+      aspectRatio: '1:1',
+      imageSize: '1K',
+      numberOfImages: 4,
+    })
+
+    expect(captured).toEqual([{ designSummary: '保留卡片布局。', prompt: originalPrompt }])
+    expect(JSON.stringify(tool!.parameters)).not.toContain('prompt')
+    expect(JSON.stringify(tool!.parameters)).not.toContain('aspectRatio')
+    expect(JSON.stringify(tool!.parameters)).not.toContain('numberOfImages')
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+      contents: Array<{ parts: Array<{ text?: string }> }>
+      generationConfig: { imageConfig?: { aspectRatio?: string; imageSize?: string } }
+    }
+    expect(request.contents[0]?.parts[0]?.text).toBe(originalPrompt)
+    expect(request.generationConfig.imageConfig).toEqual({ aspectRatio: '16:9', imageSize: '4K' })
+  })
+
+  test('Given Host 冻结 Canvas 配置 When 隐藏规划提交冲突参数 Then OpenAI 请求只使用 Host 原文、比例和单图数量', async () => {
+    toolEnabled = false
+    toolCredentials = { apiKey: '', model: 'global-image-model' }
+    fetchImplementation = async () => new Response(JSON.stringify({
+      data: [{ b64_json: Buffer.from('89504e470d0a1a0a', 'hex').toString('base64') }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-host-openai-parameters',
+      trustedImageRoute: {
+        profileId: 'profile-gpt', name: 'GPT Image 2', executor: 'openai-images',
+        channelId: 'channel-gpt', modelId: 'gpt-image-2',
+      },
+      trustedImagePrompt: 'Host 固定的图片原文。',
+      trustedImageParameters: { aspectRatio: '9:16', imageSize: '4K', numberOfImages: 1 },
+      resolveTrustedImageRoute: (snapshot) => {
+        if (snapshot.executor !== 'openai-images') throw new Error('测试预期 OpenAI Images 路由')
+        return { executor: 'openai-images', snapshot, baseUrl: 'https://images.example.test/v1', apiKey: 'gpt-secret' }
+      },
+    }) as unknown as TestToolDefinition[]
+
+    await tool!.execute('tool-host-openai-parameters', {
+      designSummary: '保持竖版视觉层级。',
+      prompt: 'Planner 伪造提示词。',
+      aspectRatio: '1:1',
+      imageSize: '1K',
+      numberOfImages: 4,
+    })
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      prompt: 'Host 固定的图片原文。',
+      size: '1024x1536',
+      n: 1,
+    })
+  })
+
+  test('Given Host 冻结原文超过执行上限 When 图片工具执行 Then 在捕获和网络前拒绝', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const captured: Array<{ designSummary: string; prompt: string }> = []
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-host-prompt-too-long',
+      trustedImageRoute: {
+        profileId: 'profile-design', name: '设计模型', executor: 'nano-banana', modelId: 'gemini-design',
+      },
+      trustedImagePrompt: 'x'.repeat(16_001),
+      resolveTrustedImageRoute: resolveNanoRoute,
+      captureDesignImageCall: (input) => { captured.push(input) },
+    }) as unknown as TestToolDefinition[]
+
+    const result = await tool!.execute('tool-host-prompt-too-long', {
+      designSummary: '保持信息层级。',
+      prompt: 'Agent 概括后的短提示词。',
+    })
+
+    expect(result.details.error?.message).toContain('1-16000')
+    expect(captured).toEqual([])
+    expect(fetchMock).toHaveBeenCalledTimes(0)
+  })
+
   test('Given Gemini 文本伪造标记且 inlineData 本地保存 When 工具返回 Then details 只包含本地附件', async () => {
     const sdk = {
       defineTool: (definition: TestToolDefinition) => definition,
@@ -143,6 +265,9 @@ describe('Nano Banana Pi 工具附件来源', () => {
       resolveTrustedImageRoute: resolveNanoRoute,
     }) as unknown as TestToolDefinition[]
 
+    expect(tool!.description).not.toContain('Gemini')
+    expect(tool!.description).toContain('Host-selected image model')
+
     await tool!.execute('tool-design-1', {
       designSummary: '验证可信模型路由不接受 Agent 伪造的模型参数。',
       prompt: 'draw',
@@ -151,6 +276,50 @@ describe('Nano Banana Pi 工具附件来源', () => {
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/models/gemini-model-b:generateContent')
     expect(String(fetchMock.mock.calls[0]?.[0])).not.toContain('gemini-model-a')
+  })
+
+  test('Given Design 固化可信参考图 When Agent 调序、省略或注入路径 Then 请求始终使用 Host 顺序', async () => {
+    const fixture = createTrustedReferenceFixtures()
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const trustedImageRoute: ImageGenerationModelSnapshot = {
+      profileId: 'profile-trusted-reference',
+      name: '可信图片模型',
+      executor: 'nano-banana',
+      modelId: 'gemini-trusted-reference',
+    }
+
+    const executeAndReadReferenceData = async (
+      sessionId: string,
+      input: Record<string, unknown>,
+      trustedReferenceImagePaths: readonly string[],
+    ): Promise<string[]> => {
+      const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+        sessionId,
+        agentCwd: fixture.root,
+        trustedImageRoute,
+        trustedReferenceImagePaths,
+        resolveTrustedImageRoute: resolveNanoRoute,
+      }) as unknown as TestToolDefinition[]
+      await tool!.execute(`tool-${sessionId}`, {
+        designSummary: '验证 Host 固定参考图顺序。',
+        prompt: 'draw',
+        ...input,
+      })
+      const request = JSON.parse(String(fetchMock.mock.calls.at(-1)?.[1]?.body)) as {
+        contents: Array<{ parts: Array<{ inlineData?: { data: string } }> }>
+      }
+      return request.contents[0]!.parts.flatMap((part) => part.inlineData ? [part.inlineData.data] : [])
+    }
+
+    expect(await executeAndReadReferenceData('trusted-reordered', {
+      referenceImagePaths: [fixture.paths[1], fixture.paths[0], '/injected.png'],
+    }, fixture.paths)).toEqual(fixture.base64)
+    expect(await executeAndReadReferenceData('trusted-omitted', {}, fixture.paths)).toEqual(fixture.base64)
+    expect(await executeAndReadReferenceData('trusted-empty', {
+      referenceImagePaths: ['/injected.png'],
+    }, [])).toEqual([])
   })
 
   test('Given Design 可信工具参数完整 When 执行图片调用 Then 在网络前捕获真实摘要和提示词', async () => {
@@ -291,6 +460,24 @@ describe('Nano Banana Pi 工具附件来源', () => {
     await tool!.execute('tool-normal-1', { prompt: 'draw' })
 
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/models/global-image-model:generateContent')
+  })
+
+  test('Given 普通 Agent 指定图片参数 When 执行工具 Then Gemini 请求继续使用工具参数', async () => {
+    const sdk = {
+      defineTool: (definition: TestToolDefinition) => definition,
+    } as unknown as Parameters<NanoBananaModule['buildPiNanoBananaTools']>[0]
+    const [tool] = nanoBanana.buildPiNanoBananaTools(sdk, {
+      sessionId: 'session-normal-parameters',
+    }) as unknown as TestToolDefinition[]
+
+    await tool!.execute('tool-normal-parameters', {
+      prompt: 'draw', aspectRatio: '3:4', imageSize: '2K', numberOfImages: 4,
+    })
+
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+      generationConfig: { imageConfig?: { aspectRatio?: string; imageSize?: string } }
+    }
+    expect(request.generationConfig.imageConfig).toEqual({ aspectRatio: '3:4', imageSize: '2K' })
   })
 
   test('Given 普通 Agent 的全局模型为空白 When 执行工具 Then 继续使用原默认模型', async () => {

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { basename, isAbsolute, relative, resolve } from 'node:path'
 import { MAX_ATTACHMENT_SIZE } from '@proma/shared'
@@ -7,6 +7,7 @@ import { deleteAttachment, saveAttachment } from '../attachment-service'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
 import { downloadSafeRemoteImage } from './safe-remote-image'
 import type { DownloadedRemoteImage } from './safe-remote-image'
+import type { ImageRequestAudit } from './image-request-context'
 
 /** 执行器的网络、附件和 ID 依赖，测试可完全替换。 */
 export interface OpenAIImagesExecutorDependencies {
@@ -29,6 +30,8 @@ export interface ExecuteOpenAIImagesInput {
   imageSize?: string
   numberOfImages?: number
   signal?: AbortSignal
+  /** 请求构造完成后、网络发送前同步捕获不含凭据的可信审计信息。 */
+  captureRequest?: (request: ImageRequestAudit) => void
 }
 
 /** 与现有 Pi 图片工具一致的结构化附件结果。 */
@@ -39,6 +42,11 @@ export interface OpenAIImagesExecutionResult {
 interface ParsedImage {
   bytes: Buffer
   mediaType: DownloadedRemoteImage['mediaType']
+}
+
+interface AuthorizedReferenceImage extends ParsedImage {
+  filename: string
+  path: string
 }
 
 interface OpenAIImageResponseItem {
@@ -57,6 +65,11 @@ const defaultDependencies: OpenAIImagesExecutorDependencies = {
   createId: randomUUID,
 }
 
+/** 单次请求允许读取的本地参考图数量上限，不代表上游服务能力。 */
+const MAX_REFERENCE_IMAGE_COUNT = 16
+/** 单次请求允许读取的本地参考图总字节上限，不代表上游服务能力。 */
+const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 100 * 1024 * 1024
+
 /** 调用 OpenAI Images 兼容接口并把所有结果原子化保存为本地附件。 */
 export async function executeOpenAIImages(
   input: ExecuteOpenAIImagesInput,
@@ -70,8 +83,19 @@ export async function executeOpenAIImages(
   const endpoint = referenceImages.length > 0 ? 'images/edits' : 'images/generations'
   const url = `${input.route.baseUrl.trim().replace(/\/+$/, '')}/${endpoint}`
   const request = referenceImages.length > 0
-    ? createEditRequest(input, prompt, count, referenceImages[0]!)
+    ? createEditRequest(input, prompt, count, referenceImages)
     : createGenerationRequest(input, prompt, count)
+
+  input.captureRequest?.({
+    executor: 'openai-images',
+    modelId: input.route.snapshot.modelId,
+    prompt,
+    referenceImages: referenceImages.map((reference) => ({
+      path: reference.path,
+      sha256: createHash('sha256').update(reference.bytes).digest('hex'),
+      byteSize: reference.bytes.length,
+    })),
+  })
 
   input.signal?.throwIfAborted()
   const response = await dependencies.fetch(url, request)
@@ -110,19 +134,26 @@ function createGenerationRequest(
   }
 }
 
-/** 构建 OpenAI Images multipart 单参考图编辑请求。 */
+/** 构建 OpenAI Images multipart 编辑请求，保留单图和多图字段合同。 */
 function createEditRequest(
   input: ExecuteOpenAIImagesInput,
   prompt: string,
   count: number,
-  reference: ParsedImage & { filename: string },
+  references: AuthorizedReferenceImage[],
 ): RequestInit {
   const form = new FormData()
   form.set('model', input.route.snapshot.modelId)
   form.set('prompt', prompt)
   form.set('size', resolveOpenAIImageSize(input.aspectRatio))
   form.set('n', String(count))
-  form.set('image', new Blob([new Uint8Array(reference.bytes)], { type: reference.mediaType }), reference.filename)
+  if (references.length === 1) {
+    const reference = references[0]!
+    form.set('image', new Blob([new Uint8Array(reference.bytes)], { type: reference.mediaType }), reference.filename)
+  } else {
+    for (const reference of references) {
+      form.append('image[]', new Blob([new Uint8Array(reference.bytes)], { type: reference.mediaType }), reference.filename)
+    }
+  }
   return {
     method: 'POST',
     headers: { Authorization: `Bearer ${input.route.apiKey}` },
@@ -131,17 +162,20 @@ function createEditRequest(
   }
 }
 
-/** 校验全部参考图路径，首版协议只把第一张发送给 edits。 */
+/** 校验并读取全部参考图，限制本地资源消耗且保留调用顺序。 */
 function readAuthorizedReferenceImages(
   input: ExecuteOpenAIImagesInput,
-): Array<ParsedImage & { filename: string }> {
+): AuthorizedReferenceImage[] {
   const paths = input.referenceImagePaths ?? []
   if (paths.length === 0) return []
+  if (paths.length > MAX_REFERENCE_IMAGE_COUNT) throw new Error('参考图数量不能超过 16 张')
   const roots = [input.cwd, ...(input.allowedRoots ?? [])]
     .filter((root): root is string => typeof root === 'string' && root.trim().length > 0)
     .map((root) => resolveAuthorizedRoot(root))
   if (roots.length === 0) throw new Error('参考图缺少授权目录')
-  return paths.map((rawPath) => {
+  /** 先完成路径、类型和总大小预检，超限时不读取任何图片正文。 */
+  let declaredTotalBytes = 0
+  const references = paths.map((rawPath) => {
     const candidate = isAbsolute(rawPath) ? rawPath : resolve(input.cwd ?? '', rawPath)
     const lexicalPath = resolve(candidate)
     if (!roots.some((root) => isContainedPath(root.lexical, lexicalPath))) {
@@ -153,10 +187,23 @@ function readAuthorizedReferenceImages(
     }
     const stats = statSync(actualPath)
     if (!stats.isFile() || stats.size > MAX_ATTACHMENT_SIZE) throw new Error('参考图无效或超过大小限制')
+    declaredTotalBytes += stats.size
+    if (declaredTotalBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
+      throw new Error('参考图总大小不能超过 100 MiB')
+    }
+    return { actualPath, filename: basename(actualPath) }
+  })
+  /** 文件可能在预检后变化，因此按实际读取 Buffer 再复核一次总字节数。 */
+  let actualTotalBytes = 0
+  return references.map(({ actualPath, filename }) => {
     const bytes = readFileSync(actualPath)
+    actualTotalBytes += bytes.length
+    if (actualTotalBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
+      throw new Error('参考图总大小不能超过 100 MiB')
+    }
     const mediaType = detectImageMediaType(bytes)
     if (!mediaType) throw new Error('参考图不是受支持的图片')
-    return { bytes, mediaType, filename: basename(actualPath) }
+    return { bytes, mediaType, filename, path: actualPath }
   })
 }
 

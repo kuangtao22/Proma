@@ -18,6 +18,7 @@ import {
   canvasAgentRunGenerationsAtom,
   canvasAgentAuthoritativeRunningSessionIdsAtom,
   createCanvasImageModuleKey,
+  createCanvasImageModuleStateAtom,
   createInitialCanvasImageModuleState,
   createInitialNativeCanvasState,
   createNativeCanvasKey,
@@ -85,6 +86,25 @@ describe('原生 Canvas 状态隔离', () => {
     expect(Object.keys(createInitialCanvasImageModuleState()).sort()).toEqual([
       'draft', 'error', 'phase', 'previewAssetId', 'saveState', 'snapshot', 'taskDetails',
     ])
+  })
+
+  test('Given A 工作台订阅 key 级状态 When 只更新 B Then A 订阅不重跑', () => {
+    const store = createStore()
+    const keyA = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-a', imageModuleId: 'module-a',
+    })
+    const keyB = createCanvasImageModuleKey({
+      projectId: 'project-a', canvasId: 'canvas-a', nodeId: 'node-b', imageModuleId: 'module-b',
+    })
+    const stateAtomA = createCanvasImageModuleStateAtom(keyA)
+    let notifications = 0
+    const unsubscribe = store.sub(stateAtomA, () => { notifications += 1 })
+
+    store.set(updateCanvasImageModuleStateAtom, { key: keyB, update: { phase: 'loading' } })
+    expect(notifications).toBe(0)
+    store.set(updateCanvasImageModuleStateAtom, { key: keyA, update: { phase: 'ready' } })
+    expect(notifications).toBe(1)
+    unsubscribe()
   })
 
   test.each([

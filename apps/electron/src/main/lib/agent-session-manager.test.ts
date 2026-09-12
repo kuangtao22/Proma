@@ -167,6 +167,38 @@ afterAll(() => {
 })
 
 describe('Agent 会话 JSONL 读取', () => {
+  test('Given 历史内嵌图片与损坏行 When 加载展示历史 Then 返回轻量消息且原始历史可完整恢复', async () => {
+    /** 模拟旧版本已写入的 Pi 图片，不触碰真实会话文件。 */
+    const original = { type: 'user', uuid: 'image-history', parent_tool_use_id: null, message: { content: [{
+      type: 'tool_result', tool_use_id: 'read-image', content: [
+        { type: 'text', text: '保留检查结果' },
+        { type: 'image', data: 'A'.repeat(400_000), mimeType: 'image/png' },
+      ],
+    }] } }
+    writeAgentSessionJsonl('display-image-history', [JSON.stringify(original), '{invalid', JSON.stringify({
+      type: 'assistant', uuid: 'after-image', parent_tool_use_id: null,
+      message: { content: [{ type: 'text', text: '仍能读取后续消息' }] },
+    })])
+    expect(typeof manager.getAgentSessionSDKMessagesForDisplay).toBe('function')
+    /** 展示路径逐行投影，不把整份 base64 历史返回给界面。 */
+    const display = await manager.getAgentSessionSDKMessagesForDisplay('display-image-history')
+    expect(display).toHaveLength(2)
+    expect(JSON.stringify(display).length).toBeLessThan(2_000)
+    expect(JSON.stringify(display)).toContain('保留检查结果')
+    expect(manager.getAgentSessionSDKMessages('display-image-history')[0]).toEqual(original)
+  })
+
+  test('Given 展示历史路径不可读取 When 加载 Then 拒绝请求而不是返回成功的空历史', async () => {
+    /** 目录占据文件路径可确定性触发 I/O 错误，不依赖平台权限位。 */
+    const directory = join(tempHome, '.proma', 'agent-sessions', 'display-unreadable.jsonl')
+    mkdirSync(directory, { recursive: true })
+    await expect(manager.getAgentSessionSDKMessagesForDisplay('display-unreadable')).rejects.toThrow()
+  })
+
+  test('Given 新会话尚未创建历史 When 加载展示 Then 返回空消息', async () => {
+    await expect(manager.getAgentSessionSDKMessagesForDisplay('display-missing')).resolves.toEqual([])
+  })
+
   test('Given Nano Banana 工具结果标记 When 解析落盘附件 Then 只接受完整图片字段', () => {
     const content = [
       '完成',

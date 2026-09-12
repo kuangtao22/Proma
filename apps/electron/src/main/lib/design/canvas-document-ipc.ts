@@ -34,6 +34,7 @@ import type {
   CanvasImageModuleConfig,
   CanvasImageCandidateBatch,
   CanvasImageModuleSnapshot,
+  CanvasImageJobActivity,
   CanvasImageTarget,
   CanvasMutation,
   CanvasBatchOperationEnvelope,
@@ -256,7 +257,7 @@ export interface CanvasDocumentIpcOptions {
   agent: {
     listActiveRuns: () => CanvasAgentActiveRunSnapshot
     getSession: (sessionId: string) => AgentSessionMeta | undefined
-    getMessages: (sessionId: string) => SDKMessage[]
+    getMessages: (sessionId: string) => SDKMessage[] | Promise<SDKMessage[]>
     execution: Pick<CanvasAgentExecutionService, 'execute'>
     configs: Pick<CanvasAgentConfigStore, 'load' | 'update'>
     stop: (sessionId: string) => void
@@ -1189,7 +1190,7 @@ export function registerCanvasDocumentIpcHandlers(
           kind: 'canvas-image', canvasId: target.canvasId,
           nodeId: target.nodeId, imageModuleId: target.imageModuleId,
         },
-        action: config.adoptedAssetId ? 'edit' : 'generate',
+        action: config.editSourceNodeId || config.adoptedAssetId ? 'edit' : 'generate',
         prompt: config.prompt,
         contextMode: config.contextMode,
         ...(config.mediaWorkflow
@@ -1197,6 +1198,8 @@ export function registerCanvasDocumentIpcHandlers(
           : { imageModelProfileId: config.selectedModelProfileId! }),
         generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
         canvasImageConfigRevision: config.revision,
+        editSourceNodeId: config.editSourceNodeId,
+        canvasImageInitialAdoptedAssetId: config.adoptedAssetId,
         ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
       })
       if (!isOwnedImageJob(job, target)) throw new Error('CANVAS_IMAGE_JOB_TARGET_CONFLICT')
@@ -1422,8 +1425,11 @@ export function registerCanvasDocumentIpcHandlers(
     previous.release()
   }
 
-  /** 广播图片模块需重新加载，只携带完整公开目标身份。 */
-  const broadcastImageModuleChanged = (target: CanvasImageTarget): void => {
+  /** 广播图片模块变化，缺省旧四元事件仍表示完整对账。 */
+  const broadcastImageModuleChanged = (
+    target: CanvasImageTarget,
+    change?: { cause: 'reconcile' } | { cause: 'job-progress'; job: CanvasImageJobActivity },
+  ): void => {
     /** 严格裁剪采用命令里的 jobId 等字段，只公开图片模块目标身份。 */
     const publicTarget: CanvasImageTarget = {
       projectId: target.projectId,
@@ -1434,7 +1440,7 @@ export function registerCanvasDocumentIpcHandlers(
     for (const contents of options.listAuthorizedWebContents()) {
       if (contents.isDestroyed()) continue
       try {
-        contents.send(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, publicTarget)
+        contents.send(CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED, change ? { ...publicTarget, ...change } : publicTarget)
       } catch (error) {
         console.error('[CanvasDocumentIPC] 图片模块变化广播失败:', error)
       }
@@ -1451,12 +1457,28 @@ export function registerCanvasDocumentIpcHandlers(
   /** Job Manager 后台变化驱动对应图片模块刷新。 */
   const unsubscribeImageJobs = options.imageJobs.onChanged(({ job }) => {
     if (job.target?.kind !== 'canvas-image') return
-    broadcastImageModuleChanged({
+    /** 任务 journal 的可信目标收窄为公开图片模块身份。 */
+    const target = {
       projectId: job.projectId,
       canvasId: job.target.canvasId,
       nodeId: job.target.nodeId,
       imageModuleId: job.target.imageModuleId,
-    })
+    }
+    if (job.status !== 'queued' && job.status !== 'running') {
+      broadcastImageModuleChanged(target, { cause: 'reconcile' })
+      return
+    }
+    /** 运行事件禁止携带提示词、模型、错误或文件身份，减少高频 IPC 与泄露面。 */
+    const activity: CanvasImageJobActivity = {
+      id: job.id,
+      projectId: job.projectId,
+      target: { ...job.target },
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      ...(job.outputAssetId ? { outputAssetId: job.outputAssetId } : {}),
+    }
+    broadcastImageModuleChanged(target, { cause: 'job-progress', job: activity })
   })
   /** 在指定项目与 Canvas 的键控队列中执行一次完整 IPC 写操作。 */
   const runCanvasExclusive = async <T>(
@@ -2215,7 +2237,7 @@ export function registerCanvasDocumentIpcHandlers(
             kind: 'canvas-image', canvasId: input.canvasId,
             nodeId: input.nodeId, imageModuleId: input.imageModuleId,
           },
-          action: config.adoptedAssetId ? 'edit' : 'generate',
+          action: config.editSourceNodeId || config.adoptedAssetId ? 'edit' : 'generate',
           prompt: config.prompt,
           contextMode: config.contextMode,
           ...(config.mediaWorkflow
@@ -2223,6 +2245,8 @@ export function registerCanvasDocumentIpcHandlers(
             : { imageModelProfileId: config.selectedModelProfileId! }),
           generationConstraints: { aspectRatio: config.aspectRatio, imageSize: config.imageSize },
           canvasImageConfigRevision: config.revision,
+          editSourceNodeId: config.editSourceNodeId,
+          canvasImageInitialAdoptedAssetId: config.adoptedAssetId,
           ...(config.adoptedAssetId ? { sourceAssetId: config.adoptedAssetId } : {}),
         }
         await options.imageJobs.preflightCanvasImage(jobInput)
@@ -2312,7 +2336,8 @@ export function registerCanvasDocumentIpcHandlers(
           ? {
               nodeId: input.nodeId,
               imageModuleId: input.imageModuleId,
-              initialAdoptedAssetId: previous.sourceAssetId ?? null,
+              initialAdoptedAssetId: previous.canvasImageInitialAdoptedAssetId !== undefined
+                ? previous.canvasImageInitialAdoptedAssetId : previous.sourceAssetId ?? null,
               initialConfigRevision: previous.canvasImageConfigRevision,
             }
           : undefined
@@ -2507,10 +2532,16 @@ export function registerCanvasDocumentIpcHandlers(
       const input = parseAgentTarget(value)
       /** 归属解析先消费 nodeIssues，再允许读取消息 JSONL。 */
       const owner = await resolveAgentOwner(input, 'messages')
+      /** UI 历史读取可能访问文件，必须等待后再复验窗口和当前节点归属。 */
+      const messages = await options.agent.getMessages(owner.session.id)
+      assertAuthorizedSender(event, options)
+      const currentOwner = await resolveAgentOwner(input, 'messages')
+      assertAuthorizedSender(event, options)
+      if (currentOwner.session.id !== owner.session.id) throw new Error('CANVAS_AGENT_SESSION_CHANGED')
       return {
-        sessionId: owner.session.id,
-        owner: { ...input, title: owner.node.title },
-        messages: options.agent.getMessages(owner.session.id),
+        sessionId: currentOwner.session.id,
+        owner: { ...input, title: currentOwner.node.title },
+        messages,
       }
     })
   ))

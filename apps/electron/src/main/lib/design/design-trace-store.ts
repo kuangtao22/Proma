@@ -1,3 +1,4 @@
+import type { DesignImageRequestAudit } from './design-image-request-audit'
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type {
@@ -126,6 +127,7 @@ export class DesignTraceStore {
     jobId: string,
     messages: SDKMessage[],
     terminal?: Pick<DesignJobRecord, 'status' | 'error' | 'completedAt'>,
+    imageRequestAudit?: DesignImageRequestAudit,
   ): DesignTraceWriteResult {
     /** 仅包含公开白名单字段的 trace 记录。 */
     const entries: DesignTraceEntry[] = []
@@ -198,6 +200,19 @@ export class DesignTraceStore {
           isError: result.is_error === true,
         })
       }
+    }
+
+    if (imageRequestAudit) {
+      /** 这是外发前的本地证据，不能据此声称服务商已经接收或遵循参考。 */
+      entries.push({ timestamp: imageRequestAudit.preparedAt, type: 'status', title: '图片请求已准备',
+        content: [
+          `执行器：${imageRequestAudit.executor}；模型：${imageRequestAudit.modelId}`,
+          `实际参考图数量：${imageRequestAudit.referenceImages.length}；提示词 SHA-256：${imageRequestAudit.promptSha256}`,
+          ...imageRequestAudit.referenceImages.map((reference, index) =>
+            `${index + 1}. 素材 ${reference.assetId}；SHA-256：${reference.sha256}；字节数：${reference.byteSize}`),
+          '以上为请求构造完成时的本地记录，不代表服务商已接收或保证输出符合要求。',
+        ].join('\n'),
+      })
     }
 
     if (terminal) {

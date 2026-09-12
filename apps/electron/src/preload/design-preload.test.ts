@@ -228,8 +228,8 @@ describe('Design preload', () => {
     const publicPayload = {
       projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
     }
-    expect(receivedA).toEqual([publicPayload])
-    expect(receivedB).toEqual([publicPayload])
+    expect(receivedA).toEqual([{ ...publicPayload, cause: 'reconcile' }])
+    expect(receivedB).toEqual([{ ...publicPayload, cause: 'reconcile' }])
     expect(recorded.added.map(({ channel }) => channel)).toEqual([
       CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
       CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
@@ -243,6 +243,29 @@ describe('Design preload', () => {
       addedA,
       addedB,
     ])
+  })
+
+  test('Given 图片任务运行进度事件 When Preload 接收 Then 只透传共享合同允许的轻量字段', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const received: unknown[] = []
+    api.onCanvasImageModuleChanged((event) => received.push(event))
+    const progress = {
+      projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1',
+      cause: 'job-progress',
+      job: {
+        id: 'job-1', projectId: 'p1',
+        target: { kind: 'canvas-image', canvasId: 'canvas-1', nodeId: 'node-image', imageModuleId: 'image-module-1' },
+        status: 'running', createdAt: 1, updatedAt: 2,
+      },
+    }
+
+    recorded.added[0]?.listener({} as IpcRendererEvent, progress)
+    recorded.added[0]?.listener({} as IpcRendererEvent, {
+      ...progress, job: { ...progress.job, prompt: '不应跨边界的完整提示词' },
+    })
+
+    expect(received).toEqual([progress])
   })
 
   test('Given 固定 API When 逐一调用 Then 只透传对应 Design 通道和结构化参数', async () => {

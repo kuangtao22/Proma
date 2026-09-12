@@ -277,4 +277,27 @@ describe('Canvas 图片模块 Store', () => {
     expect(saved.preparation).toBeNull()
     expect((await fixture.store.load(target)).preparation).toBeNull()
   })
+
+  test('Given 已选择参考节点 When 旧客户端保存或显式清除 Then 分别保留或清除编辑底图', async () => {
+    const fixture = createFixture()
+    fixture.seed({
+      schemaVersion: 2, kind: 'image', contentId: target.imageModuleId, revision: 0,
+      createdAt: 100, updatedAt: 100, prompt: '母版', selectedModelProfileId: 'profile-1',
+      editSourceNodeId: 'master-image', aspectRatio: '1:1', imageSize: 'auto',
+      contextMode: 'auto', adoptedAssetId: null,
+    })
+
+    /** 旧调用方没有该字段时，不得把已保存选择当成 null。 */
+    const preserved = await fixture.store.save({
+      ...target, expectedConfigRevision: 0, prompt: '只改提示词', selectedModelProfileId: 'profile-1',
+      aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto',
+    })
+    expect(preserved.editSourceNodeId).toBe('master-image')
+
+    const cleared = await fixture.store.save({
+      ...target, expectedConfigRevision: 1, prompt: '只改提示词', selectedModelProfileId: 'profile-1',
+      editSourceNodeId: null, aspectRatio: '1:1', imageSize: 'auto', contextMode: 'auto',
+    })
+    expect(cleared.editSourceNodeId).toBeNull()
+  })
 })

@@ -6,6 +6,7 @@ import type {
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
   CanvasImageModuleSnapshot,
+  CanvasImageModuleChangedEvent,
   CanvasWorkflowRun,
   DesignJobRecord,
   SaveDesignMutationsInput,
@@ -518,7 +519,7 @@ describe('Design renderer adapter', () => {
 
   test('Given 完整目标的图片变化 When adapter 订阅 Then 只传目标一致事件且取消保持幂等', () => {
     /** 捕获每个 preload 图片事件监听器。 */
-    const sourceListeners: Array<(event: typeof target) => void> = []
+    const sourceListeners: Array<(event: CanvasImageModuleChangedEvent) => void> = []
     /** preload 层释放调用次数。 */
     let releaseCalls = 0
     const target = {
@@ -536,11 +537,11 @@ describe('Design renderer adapter', () => {
     const releaseA = adapter.onCanvasImageModuleChanged(target, (event) => receivedA.push(event))
     const releaseB = adapter.onCanvasImageModuleChanged(target, (event) => receivedB.push(event))
     const events = [
-      { ...target, projectId: 'project-2' },
-      { ...target, canvasId: 'canvas-2' },
-      { ...target, nodeId: 'node-other' },
-      { ...target, imageModuleId: 'image-module-2' },
-      target,
+      { ...target, projectId: 'project-2', cause: 'reconcile' as const },
+      { ...target, canvasId: 'canvas-2', cause: 'reconcile' as const },
+      { ...target, nodeId: 'node-other', cause: 'reconcile' as const },
+      { ...target, imageModuleId: 'image-module-2', cause: 'reconcile' as const },
+      { ...target, cause: 'reconcile' as const },
     ]
     for (const event of events) {
       sourceListeners[0]?.(event)
@@ -550,8 +551,8 @@ describe('Design renderer adapter', () => {
     releaseA()
     releaseB()
 
-    expect(receivedA).toEqual([target])
-    expect(receivedB).toEqual([target])
+    expect(receivedA).toEqual([{ ...target, cause: 'reconcile' }])
+    expect(receivedB).toEqual([{ ...target, cause: 'reconcile' }])
     expect(releaseCalls).toBe(2)
   })
 

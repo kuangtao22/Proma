@@ -16,6 +16,35 @@ const context: CanvasToolRunContext = {
   permissionCeiling: 'execute',
 }
 
+test('Given 持久工作流需要定向修复 When 使用生产恢复工具 Then 完整透传原revision预算与幂等身份', async () => {
+  const received: unknown[] = []
+  const input = { canvasId: 'canvas-1', runId: 'workflow-1', intent: 'explicit', expectedRunRevision: 4,
+    resumeOperationId: 'repair_1', retryNodeIds: ['image-1'], addMediaRuns: 2, addDurationMs: 5000 }
+  const tools = createCanvasOperationTools({ resumeWorkflow: async (value) => {
+    received.push(value)
+    return { status: 'waiting-review' }
+  } }, context, { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never) }, () => 'operation-1')
+  await executeOperation(tools, 'canvas_resume_workflow', input)
+  expect(received).toEqual([{ ...input, projectId: 'project-1' }])
+  for (const invalid of [{ addMediaRuns: -1 }, { retryNodeIds: ['image-1', 'image-1'] }, { addDurationMs: 0.1 }]) {
+    await expect(executeOperation(tools, 'canvas_resume_workflow', { ...input, ...invalid })).rejects.toThrow('CANVAS_OPERATION_INPUT_INVALID')
+  }
+  expect(received).toHaveLength(1)
+})
+
+test('Given 单任务重试新建或重放 When 返回可信回执 Then 只有新建replacement登记为当前合同生成', async () => {
+  const received: unknown[] = []
+  let created = true
+  const tools = createCanvasOperationTools({ retryTask: async () => ({ created, replacementJobId: 'replacement-1' }) },
+    context, { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never) }, () => 'operation-1',
+    () => ({ ...context, onImageJobsCreated: (canvasId, jobs) => { received.push({ canvasId, jobs }) } }))
+  const input = { canvasId: 'canvas-1', nodeId: 'image-1', jobId: 'failed-job', intent: 'explicit' }
+  await executeOperation(tools, 'canvas_retry_task', input)
+  created = false
+  await executeOperation(tools, 'canvas_retry_task', input)
+  expect(received).toEqual([{ canvasId: 'canvas-1', jobs: [{ nodeId: 'image-1', jobId: 'replacement-1' }] }])
+})
+
 /** 调用指定操作工具并保留真实取消信号。 */
 async function executeOperation(
   tools: ToolDefinition[],

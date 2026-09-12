@@ -57,6 +57,7 @@ import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
 import { isAgentSessionsIndex } from './owned-path-rebaser-schema'
 import { hasValidCanvasAgentOwnership, isAgentSessionUserVisible } from './agent-session-visibility'
+import { projectSDKMessageForDisplay } from './agent-message-display'
 
 /**
  * 会话索引文件格式
@@ -837,6 +838,42 @@ export function getAgentSessionSDKMessages(id: string): SDKMessage[] {
   } catch (error) {
     console.error(`[Agent 会话] 读取 SDKMessage 失败 (${id}):`, error)
     return []
+  }
+}
+
+/**
+ * 逐行加载展示消息，避免整份 base64 历史在主进程与 Renderer 同时驻留。
+ * @param id 由调用方已验证访问权的会话 ID。
+ * @returns 不含内嵌图片字节的展示消息；原始文件和运行时读取路径保持完整。
+ */
+export async function getAgentSessionSDKMessagesForDisplay(id: string): Promise<SDKMessage[]> {
+  /** 路径仍通过原有会话路径校验，不接受任意文件位置。 */
+  const filePath = getAgentSessionMessagesPath(id)
+  if (!existsSync(filePath)) return []
+  /** readline 只保留当前行，处理后的数组不再引用整份原始文件字符串。 */
+  const input = createReadStream(filePath, { encoding: 'utf-8' })
+  const lines = createInterface({ input, crlfDelay: Infinity })
+  const messages: SDKMessage[] = []
+  let lineNumber = 0
+  try {
+    for await (const line of lines) {
+      lineNumber += 1
+      if (!line.trim()) continue
+      try {
+        /** 在下一行读入前丢弃原始图片，只保留轻量投影。 */
+        const message = normalizePersistedSDKMessage(JSON.parse(line))
+        messages.push(projectSDKMessageForDisplay(message))
+      } catch {
+        console.warn(`[Agent 会话] 读取展示消息 (${id}) — JSONL 第 ${lineNumber} 行解析失败，已跳过`)
+      }
+    }
+    return messages
+  } catch (error) {
+    console.error(`[Agent 会话] 读取展示消息失败 (${id}):`, error)
+    throw new Error('读取会话消息失败')
+  } finally {
+    lines.close()
+    input.destroy()
   }
 }
 

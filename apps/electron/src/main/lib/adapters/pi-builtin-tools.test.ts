@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, mock, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { ServerOpsAgentFacade } from '../server-ops/server-ops-agent-facade'
 
@@ -105,5 +107,17 @@ describe('Pi Server Ops 工具合同', () => {
     const registeredNames = result.tools.map((tool) => tool.name)
     expect(registeredNames.includes('server_list')).toBe(expected)
     expect(registeredNames.includes('server_exec')).toBe(expected)
+  })
+})
+
+describe('Pi 图片工具运行上下文', () => {
+  test('Given Host 固化参考图和请求审计 When 构建 Nano 工具 Then 适配层完整透传两个字段', () => {
+    const source = readFileSync(join(import.meta.dir, 'pi-builtin-tools.ts'), 'utf8')
+    const start = source.indexOf("  if (ctx.trustedImageRoute || isBuiltinMcpUserEnabled('nano-banana'))")
+    const body = source.slice(start, source.indexOf('\n  const cloudTools', start))
+
+    expect(body).toContain('trustedReferenceImagePaths: ctx.trustedReferenceImagePaths')
+    expect(body).toContain('trustedImageParameters: ctx.trustedImageParameters')
+    expect(body).toContain('captureDesignImageRequest: ctx.captureDesignImageRequest')
   })
 })

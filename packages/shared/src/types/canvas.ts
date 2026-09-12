@@ -192,6 +192,8 @@ const CANVAS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 const CANVAS_EDGE_OUTPUT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/
 /** 图片提示词上限，避免配置、IPC 与任务 journal 被无界文本放大。 */
 export const CANVAS_IMAGE_PROMPT_MAX_LENGTH = 100_000
+/** 原生图片工具单次实际请求允许的最大提示词长度，超限必须在外发前拒绝。 */
+export const CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH = 16_000
 /** Canvas 可恢复命令使用的 UUID，避免 operationId 与稳定内容 ID 混用。 */
 const CANVAS_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 /** Canvas Agent 正式输出消息使用的标准 UUID。 */
@@ -1074,6 +1076,20 @@ export interface CanvasImageTarget extends CanvasTarget {
   imageModuleId: string
 }
 
+/** 图片配置、素材或任务终态变化后要求 Renderer 完整对账。 */
+export interface CanvasImageModuleReconcileEvent extends CanvasImageTarget {
+  cause: 'reconcile'
+}
+
+/** 运行中任务只携带卡片状态所需的轻量字段，禁止提示词或路径进入高频事件。 */
+export interface CanvasImageJobProgressEvent extends CanvasImageTarget {
+  cause: 'job-progress'
+  job: CanvasImageJobActivity
+}
+
+/** 图片模块变化事件；旧四元目标由解析器规范化为完整对账。 */
+export type CanvasImageModuleChangedEvent = CanvasImageModuleReconcileEvent | CanvasImageJobProgressEvent
+
 /** 释放图片模块媒体授权时绑定具体授权代次的输入。 */
 export interface ReleaseCanvasImageMediaInput extends CanvasImageTarget {
   mediaLeaseId: string
@@ -1103,6 +1119,8 @@ export interface CanvasImageModuleConfig {
   updatedAt: number
   prompt: string
   selectedModelProfileId: string | null
+  /** 普通图片模型编辑时使用的绑定图片节点；null 表示改用当前节点自身采用图。 */
+  editSourceNodeId?: string | null
   mediaWorkflow?: CanvasImageMediaWorkflow
   /** 缺省兼容旧配置；null 表示已显式清除历史待配置错误。 */
   preparation?: CanvasMediaPreparationIssue | null
@@ -1117,6 +1135,8 @@ export interface SaveCanvasImageModuleInput extends CanvasImageTarget {
   expectedConfigRevision: number
   prompt: string
   selectedModelProfileId: string | null
+  /** 缺省保留旧值，null 显式清除，非空值由权威画布关系校验。 */
+  editSourceNodeId?: string | null
   mediaWorkflow?: CanvasImageMediaWorkflow
   /** null 表示清除历史待配置错误；缺省由普通保存同样清除。 */
   preparation?: CanvasMediaPreparationIssue | null
@@ -2321,6 +2341,47 @@ export function parseCanvasImageTarget(value: unknown): CanvasImageTarget {
 }
 
 /**
+ * 严格解析图片模块变化事件，并兼容旧版仅携带四元目标的广播。
+ * @param value 主进程发送到 Preload 的未知事件值。
+ * @returns 规范化后的完整对账或轻量任务进度事件。
+ */
+export function parseCanvasImageModuleChangedEvent(value: unknown): CanvasImageModuleChangedEvent {
+  try {
+    if (!isCanvasRecord(value)) throw new Error('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+    /** 旧事件没有 cause，只允许四元公开身份并规范化为完整对账。 */
+    if (!Object.hasOwn(value, 'cause')) {
+      return { ...parseCanvasImageTarget(value), cause: 'reconcile' }
+    }
+    const target = parseCanvasImageTarget({
+      projectId: value.projectId,
+      canvasId: value.canvasId,
+      nodeId: value.nodeId,
+      imageModuleId: value.imageModuleId,
+    })
+    if (value.cause === 'reconcile') {
+      if (!hasExactCanvasKeys(value, ['projectId', 'canvasId', 'nodeId', 'imageModuleId', 'cause'])) {
+        throw new Error('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+      }
+      return { ...target, cause: 'reconcile' }
+    }
+    if (value.cause !== 'job-progress'
+      || !hasExactCanvasKeys(value, ['projectId', 'canvasId', 'nodeId', 'imageModuleId', 'cause', 'job'])) {
+      throw new Error('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+    }
+    const job = parseCanvasImageJobActivities([value.job], target)[0]
+    if (!job
+      || (job.status !== 'queued' && job.status !== 'running')
+      || job.target.nodeId !== target.nodeId
+      || job.target.imageModuleId !== target.imageModuleId) {
+      throw new Error('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+    }
+    return { ...target, cause: 'job-progress', job }
+  } catch {
+    throw new Error('CANVAS_IMAGE_MODULE_CHANGED_INVALID')
+  }
+}
+
+/**
  * 严格解析图片模块媒体授权释放输入。
  * @param value 待解析的 Renderer 输入。
  * @returns 完整图片身份与不可复用的媒体授权身份。
@@ -2355,11 +2416,14 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
   const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
   /** 待配置错误允许旧数据缺省，但存在时必须符合共享安全边界。 */
   const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
+  /** 编辑底图三态字段允许旧配置缺省。 */
+  const hasEditSourceNodeId = value !== null && typeof value === 'object' && Object.hasOwn(value, 'editSourceNodeId')
   /** v2 图片配置允许的完整字段集合。 */
   const keys = [
     'schemaVersion', 'kind', 'contentId', 'revision', 'createdAt', 'updatedAt',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
     'adoptedAssetId', ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
+    ...(hasEditSourceNodeId ? ['editSourceNodeId'] : []),
     ...(hasPreparation ? ['preparation'] : []),
   ] as const
   if (!hasExactCanvasKeys(value, keys)
@@ -2371,6 +2435,7 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     || !isCanvasNonNegativeInteger(value.updatedAt)
     || !isCanvasImagePrompt(value.prompt)
     || !isOptionalCanvasImageModelProfileId(value.selectedModelProfileId)
+    || (hasEditSourceNodeId && !isOptionalCanvasImageId(value.editSourceNodeId))
     || (hasMediaWorkflow && value.selectedModelProfileId !== null)
     || !isCanvasImageAspectRatio(value.aspectRatio)
     || !isCanvasImageSize(value.imageSize)
@@ -2387,6 +2452,7 @@ export function parseCanvasImageModuleConfig(value: unknown): CanvasImageModuleC
     updatedAt: value.updatedAt,
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
+    ...(hasEditSourceNodeId ? { editSourceNodeId: value.editSourceNodeId as string | null } : {}),
     ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
     ...(hasPreparation ? { preparation: parseCanvasMediaPreparationIssue(value.preparation) } : {}),
     aspectRatio: value.aspectRatio,
@@ -2636,8 +2702,8 @@ function parseCanvasImageSnapshotInputReference(value: unknown): CanvasImageInpu
 /** 严格重建单个 Canvas 图片任务公开记录。 */
 function parseCanvasImageSnapshotJob(value: unknown, target: CanvasImageTarget): DesignJobRecord {
   const optionalKeys = [
-    'sessionId', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision',
-    'candidateBatchId',
+    'sessionId', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision', 'imagePromptContract',
+    'candidateBatchId', 'canvasImageInitialAdoptedAssetId',
     'sourceAgentMessageId', 'imageModelSnapshot', 'sourceSessionId', 'sourceAssetId',
     'parentAssetId', 'outputAssetId', 'error', 'traceState', 'executionSessionCleanupState',
     'startedAt', 'completedAt', 'contextReferences', 'designSummary', 'finalImagePrompt',
@@ -2675,6 +2741,10 @@ function parseCanvasImageSnapshotJob(value: unknown, target: CanvasImageTarget):
       throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
     }
   }
+  if (Object.hasOwn(value, 'canvasImageInitialAdoptedAssetId')
+    && !isOptionalCanvasImageId(value.canvasImageInitialAdoptedAssetId)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
   if (Object.hasOwn(value, 'generationConstraints')
     && (!hasExactCanvasKeys(value.generationConstraints, ['aspectRatio', 'imageSize'])
       || !isCanvasImageAspectRatio(value.generationConstraints.aspectRatio)
@@ -2691,6 +2761,10 @@ function parseCanvasImageSnapshotJob(value: unknown, target: CanvasImageTarget):
     : undefined
   if (Object.hasOwn(value, 'canvasImageConfigRevision')
     && !isCanvasNonNegativeInteger(value.canvasImageConfigRevision)) {
+    throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
+  }
+  if (Object.hasOwn(value, 'imagePromptContract')
+    && value.imagePromptContract !== 'frozen-config-v1') {
     throw new Error('CANVAS_IMAGE_MODULE_SNAPSHOT_INVALID')
   }
   /** 固化模型只在字段存在时解析。 */
@@ -2736,7 +2810,11 @@ function parseCanvasImageSnapshotJob(value: unknown, target: CanvasImageTarget):
     } } : {}),
     ...(canvasInputReferences === undefined ? {} : { canvasInputReferences }),
     ...(Object.hasOwn(value, 'canvasImageConfigRevision') ? { canvasImageConfigRevision: value.canvasImageConfigRevision as number } : {}),
+    ...(Object.hasOwn(value, 'imagePromptContract') ? { imagePromptContract: 'frozen-config-v1' as const } : {}),
     ...(Object.hasOwn(value, 'candidateBatchId') ? { candidateBatchId: value.candidateBatchId as string } : {}),
+    ...(Object.hasOwn(value, 'canvasImageInitialAdoptedAssetId')
+      ? { canvasImageInitialAdoptedAssetId: value.canvasImageInitialAdoptedAssetId as string | null }
+      : {}),
     ...(Object.hasOwn(value, 'sourceAgentMessageId') ? { sourceAgentMessageId: value.sourceAgentMessageId as string } : {}),
     ...(imageModelSnapshot === undefined ? {} : { imageModelSnapshot }),
     ...(Object.hasOwn(value, 'sourceSessionId') ? { sourceSessionId: value.sourceSessionId as string } : {}),
@@ -2901,10 +2979,13 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
   const hasMediaWorkflow = value !== null && typeof value === 'object' && Object.hasOwn(value, 'mediaWorkflow')
   /** 显式 preparation 允许只保存安全诊断或清除旧诊断。 */
   const hasPreparation = value !== null && typeof value === 'object' && Object.hasOwn(value, 'preparation')
+  /** 编辑底图三态字段按调用方是否显式提供参与保存合同。 */
+  const hasEditSourceNodeId = value !== null && typeof value === 'object' && Object.hasOwn(value, 'editSourceNodeId')
   /** 图片保存命令允许的完整字段集合。 */
   const keys = [
     'projectId', 'canvasId', 'nodeId', 'imageModuleId', 'expectedConfigRevision',
     'prompt', 'selectedModelProfileId', 'aspectRatio', 'imageSize', 'contextMode',
+    ...(hasEditSourceNodeId ? ['editSourceNodeId'] : []),
     ...(hasMediaWorkflow ? ['mediaWorkflow'] : []),
     ...(hasPreparation ? ['preparation'] : []),
   ] as const
@@ -2916,6 +2997,7 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
     || !isCanvasNonNegativeInteger(value.expectedConfigRevision)
     || !isCanvasImagePrompt(value.prompt)
     || !isOptionalCanvasImageModelProfileId(value.selectedModelProfileId)
+    || (hasEditSourceNodeId && !isOptionalCanvasImageId(value.editSourceNodeId))
     || (hasMediaWorkflow && value.selectedModelProfileId !== null)
     || !isCanvasImageAspectRatio(value.aspectRatio)
     || !isCanvasImageSize(value.imageSize)
@@ -2930,6 +3012,7 @@ export function parseSaveCanvasImageModuleInput(value: unknown): SaveCanvasImage
     expectedConfigRevision: value.expectedConfigRevision,
     prompt: value.prompt,
     selectedModelProfileId: value.selectedModelProfileId,
+    ...(hasEditSourceNodeId ? { editSourceNodeId: value.editSourceNodeId as string | null } : {}),
     ...(hasMediaWorkflow ? { mediaWorkflow: parseCanvasImageMediaWorkflow(value.mediaWorkflow) } : {}),
     ...(hasPreparation ? { preparation: parseCanvasMediaPreparationIssue(value.preparation) } : {}),
     aspectRatio: value.aspectRatio,

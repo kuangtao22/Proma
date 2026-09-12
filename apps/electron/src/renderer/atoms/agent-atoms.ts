@@ -12,6 +12,7 @@ import { atomFamily } from 'jotai-family'
 import type { AgentSessionMeta, AgentEvent, AgentWorkspace, AgentPendingFile, RetryAttempt, PromaPermissionMode, PermissionRequest, AskUserRequest, ExitPlanModeRequest, ThinkingConfig, AgentEffort, SDKMessage, UnstagedChangesResult, CanvasNodeReference } from '@proma/shared'
 import { PROMA_DEFAULT_PERMISSION_MODE } from '@proma/shared'
 import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-count'
+import { setBoundedSDKMessageCache } from '@/lib/agent-message-cache-budget'
 import type { AgentQueuedMessage } from '@/lib/agent-message-queue'
 import type { SessionFileChange } from '@/lib/session-file-changes'
 import type { FilePanelDragItem } from '@/lib/file-panel-drag'
@@ -1850,31 +1851,29 @@ export const agentMessageRefreshAtom = atom<Map<string, number>>(new Map())
  * 命中缓存可立即填充消息区，IPC 返回后再覆盖为最新数据。
  *
  * 内存安全：缓存条目随会话数增长会无限膨胀（长会话的消息数组很大），
- * 因此通过 setSessionMessagesCache 做 LRU 淘汰，仅保留最近访问的
- * AGENT_MSG_CACHE_MAX 个会话；会话删除时也需主动剔除对应条目。
+ * 因此通过 setSessionMessagesCache 做 LRU 与估算字节淘汰，仅保留最近访问的
+ * AGENT_MSG_CACHE_MAX 个会话及最多 AGENT_MSG_CACHE_MAX_ESTIMATED_BYTES 的历史；
+ * 会话删除时也需主动剔除对应条目。
  */
 export const AGENT_MSG_CACHE_MAX = 20
+/** 全局历史缓存的近似内存预算，单个超限会话仍由当前视图正常显示。 */
+export const AGENT_MSG_CACHE_MAX_ESTIMATED_BYTES = 64 * 1024 * 1024
 export const agentSDKMessagesCacheAtom = atom<Map<string, SDKMessage[]>>(new Map())
 
 /**
- * 写入会话消息缓存并执行 LRU 淘汰。
+ * 写入会话消息缓存并执行 LRU 与估算字节淘汰。
  * 利用 JS Map 的插入顺序：删除已存在的 key 再重新 set，使其移到「最新」位置；
- * 超出上限时从头部（最旧）删除，直到回到上限内。返回新的 Map（不可变更新）。
+ * 超出数量或字节预算时从头部（最旧）删除；单会话超预算不写入缓存。返回新的 Map（不可变更新）。
  */
 export function setSessionMessagesCache(
   prev: Map<string, SDKMessage[]>,
   sessionId: string,
   messages: SDKMessage[],
 ): Map<string, SDKMessage[]> {
-  const next = new Map(prev)
-  next.delete(sessionId)
-  next.set(sessionId, messages)
-  while (next.size > AGENT_MSG_CACHE_MAX) {
-    const oldest = next.keys().next().value
-    if (oldest === undefined) break
-    next.delete(oldest)
-  }
-  return next
+  return setBoundedSDKMessageCache(prev, sessionId, messages, {
+    maxEntries: AGENT_MSG_CACHE_MAX,
+    maxEstimatedBytes: AGENT_MSG_CACHE_MAX_ESTIMATED_BYTES,
+  })
 }
 
 /** 当前 Agent 会话的错误消息（派生只读原子） */

@@ -1,6 +1,8 @@
 import * as React from 'react'
 import type {
   CanvasImageModuleConfig,
+  CanvasImageModuleChangedEvent,
+  CanvasImageJobProgressEvent,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
   DesignJobRecord,
@@ -10,6 +12,7 @@ import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import {
   canvasImageModuleStatesAtom,
   createCanvasImageModuleKey,
+  createCanvasImageModuleStateAtom,
   createInitialCanvasImageModuleState,
   removeCanvasImageModuleStateAtom,
   updateCanvasImageModuleStateAtom,
@@ -190,6 +193,7 @@ function createDraftFromConfig(config: CanvasImageModuleConfig): CanvasImageModu
   return {
     prompt: config.prompt,
     selectedModelProfileId: config.selectedModelProfileId,
+    editSourceNodeId: config.editSourceNodeId ?? null,
     mediaWorkflow: config.mediaWorkflow ? structuredClone(config.mediaWorkflow) : null,
     aspectRatio: config.aspectRatio,
     imageSize: config.imageSize,
@@ -217,6 +221,7 @@ function isSameCanvasImageDraft(
   return current?.dirty === true
     && current.prompt === submitted.prompt
     && current.selectedModelProfileId === submitted.selectedModelProfileId
+    && current.editSourceNodeId === submitted.editSourceNodeId
     && JSON.stringify(current.mediaWorkflow) === JSON.stringify(submitted.mediaWorkflow)
     && current.aspectRatio === submitted.aspectRatio
     && current.imageSize === submitted.imageSize
@@ -237,6 +242,10 @@ export function createCanvasImageModuleController(
   let instanceEpoch = 0
   /** 只有新 LOAD 会淘汰旧 LOAD。 */
   let loadGeneration = 0
+  /** 当前 controller 已接收轻量事件的本地单调代次。 */
+  let nextJobEventEpoch = 0
+  /** 每个任务最近事件的本地到达代次；Canvas revision 不代表 Job 事件序号。 */
+  const jobEventEpochs = new Map<string, number>()
   /** 后台任务事件只允许一个模块读取在途，避免重复创建媒体 lease。 */
   let loadInFlight = false
   /** 在途读取期间的任意多个事件合并为一次后续权威读取。 */
@@ -339,7 +348,10 @@ export function createCanvasImageModuleController(
   }
 
   /** 以当前权威配置和草稿 dirty 状态接管一次模块快照。 */
-  const applySnapshot = (snapshot: Awaited<ReturnType<CanvasImageModuleAdapter['loadCanvasImageModule']>>): void => {
+  const applySnapshot = (
+    snapshot: Awaited<ReturnType<CanvasImageModuleAdapter['loadCanvasImageModule']>>,
+    loadStartedJobEventEpoch: number,
+  ): void => {
     if (createCanvasImageModuleKey(snapshot.target) !== key
       || snapshot.config.contentId !== dependencies.target.imageModuleId) return
     dependencies.updateState(key, (current) => {
@@ -348,12 +360,42 @@ export function createCanvasImageModuleController(
         && current.snapshot.config.revision > snapshot.config.revision
         ? current.snapshot.config
         : snapshot.config
+      /** 保留比本轮 LOAD 更新的运行态；终态对账始终接管并清除增量标记。 */
+      const currentJobById = new Map(current.snapshot?.jobs.map((job) => [job.id, job]) ?? [])
+      const jobs = snapshot.jobs.map((job) => {
+        if (job.status !== 'queued' && job.status !== 'running') {
+          jobEventEpochs.delete(job.id)
+          return job
+        }
+        const currentJob = currentJobById.get(job.id)
+        const eventEpoch = jobEventEpochs.get(job.id)
+        /** 仅保留 LOAD 启动后到达且时间不早于快照的增量；同刻 running 不得被 queued 回退。 */
+        const shouldPreserveProgress = currentJob
+          && eventEpoch !== undefined
+          && eventEpoch > loadStartedJobEventEpoch
+          && currentJob.updatedAt >= job.updatedAt
+          && !(currentJob.updatedAt === job.updatedAt
+            && currentJob.status === 'queued' && job.status === 'running')
+        if (shouldPreserveProgress) {
+          /** 以 LOAD 任务为基底，只覆盖事件合同携带的轻量运行字段。 */
+          return {
+            ...job,
+            status: currentJob.status,
+            updatedAt: currentJob.updatedAt,
+            ...(currentJob.outputAssetId ? { outputAssetId: currentJob.outputAssetId } : {}),
+          }
+        }
+        return job
+      })
       /** LOAD 的 jobs 是详情缓存存在性的权威集合。 */
-      const validJobIds = new Set(snapshot.jobs.map((job) => job.id))
+      const validJobIds = new Set(jobs.map((job) => job.id))
+      for (const jobId of jobEventEpochs.keys()) {
+        if (!validJobIds.has(jobId)) jobEventEpochs.delete(jobId)
+      }
       const taskDetails = new Map(current.taskDetails)
       pruneTaskDetails(taskDetails, validJobIds)
       return {
-        snapshot: { ...snapshot, config: authoritativeConfig },
+        snapshot: { ...snapshot, config: authoritativeConfig, jobs },
         draft: current.draft?.dirty ? current.draft : createDraftFromConfig(authoritativeConfig),
         phase: 'ready',
         saveState: current.draft?.dirty ? current.saveState : 'saved',
@@ -375,6 +417,8 @@ export function createCanvasImageModuleController(
     /** 当前 LOAD 同时捕获实例代次和 LOAD 通道代次。 */
     const epoch = instanceEpoch
     const generation = ++loadGeneration
+    /** 捕获 LOAD 发起时已接收的最后事件，识别响应在途期间的新进度。 */
+    const loadStartedJobEventEpoch = nextJobEventEpoch
     const owner: CanvasImageModuleErrorOwner = { epoch, channel: 'load', generation }
     beginErrorOperation(owner)
     /** 后台刷新保留已展示的图片与控件，避免整个工作台反复卸载。 */
@@ -385,7 +429,7 @@ export function createCanvasImageModuleController(
         return
       }
       clearOwnedError(owner)
-      applySnapshot(snapshot)
+      applySnapshot(snapshot, loadStartedJobEventEpoch)
     }).catch((error: unknown) => {
       if (!isCurrentInstance(epoch) || generation !== loadGeneration) return
       setOwnedError(owner, getCanvasImageModuleErrorMessage(error))
@@ -395,6 +439,46 @@ export function createCanvasImageModuleController(
       loadInFlight = false
       if (isCurrentInstance(epoch) && reloadRequested) load()
     })
+  }
+
+  /**
+   * 原位应用已存在任务的轻量运行状态。
+   * @param event 已由 Preload 严格重建的 queued/running 事件。
+   * @returns 已处理或安全忽略返回 true；缺少目标任务时返回 false 以触发完整对账。
+   */
+  const applyJobProgress = (event: CanvasImageJobProgressEvent): boolean => {
+    if (disposed || lifecycleLease?.isCurrent() !== true) return true
+    /** 当前模块快照决定进度事件能否安全增量合并。 */
+    const current = dependencies.getState(key)
+    const snapshot = current?.snapshot
+    if (!snapshot) return false
+    const jobIndex = snapshot.jobs.findIndex((job) => job.id === event.job.id)
+    if (jobIndex < 0) return false
+    const currentJob = snapshot.jobs[jobIndex]!
+    /** 已被完整对账确认终态的任务拒绝迟到运行事件。 */
+    if (currentJob.status !== 'queued' && currentJob.status !== 'running') return true
+    /** 首次增量事件也不能按旧时间或同刻 queued 倒退已加载的 running 状态。 */
+    if (event.job.updatedAt < currentJob.updatedAt
+      || (event.job.updatedAt === currentJob.updatedAt
+        && currentJob.status === 'running' && event.job.status === 'queued')) return true
+    nextJobEventEpoch += 1
+    jobEventEpochs.set(event.job.id, nextJobEventEpoch)
+    /** 仅复制任务数组和命中任务，媒体 URL、素材与配置保持原引用。 */
+    const jobs = [...snapshot.jobs]
+    jobs[jobIndex] = {
+      ...currentJob,
+      status: event.job.status,
+      updatedAt: event.job.updatedAt,
+      ...(event.job.outputAssetId ? { outputAssetId: event.job.outputAssetId } : {}),
+    }
+    dependencies.updateState(key, { snapshot: { ...snapshot, jobs } })
+    return true
+  }
+
+  /** 图片模块事件按原因选择轻量 patch 或完整模块对账。 */
+  const handleModuleChanged = (event: CanvasImageModuleChangedEvent): void => {
+    if (event.cause === 'job-progress' && applyJobProgress(event)) return
+    load()
   }
 
   /** 执行任务控制操作，并在成功后按权威 LOAD 对账任务与素材。 */
@@ -432,7 +516,7 @@ export function createCanvasImageModuleController(
         dependencies.removeState(key)
         if (snapshot) releaseSnapshotMedia(snapshot)
       })
-      unsubscribe = dependencies.adapter.onCanvasImageModuleChanged(dependencies.target, load)
+      unsubscribe = dependencies.adapter.onCanvasImageModuleChanged(dependencies.target, handleModuleChanged)
       load()
     },
     retryLoad: load,
@@ -470,6 +554,7 @@ export function createCanvasImageModuleController(
           expectedConfigRevision: current.snapshot.config.revision,
           prompt: draft.prompt,
           selectedModelProfileId: draft.selectedModelProfileId,
+          editSourceNodeId: draft.editSourceNodeId,
           ...(draft.mediaWorkflow ? { mediaWorkflow: structuredClone(draft.mediaWorkflow) } : {}),
           /** 用户提交修订后清除上一版分析诊断，完整参数仍由运行预检验证。 */
           preparation: null,
@@ -651,8 +736,10 @@ export function useCanvasImageModule(
 ): UseCanvasImageModuleResult {
   /** 完整 key 同时作为 effect 生命周期和 Jotai Map 查询身份。 */
   const key = createCanvasImageModuleKey(target)
-  /** 当前图片模块 Map 状态。 */
-  const states = useAtomValue(canvasImageModuleStatesAtom)
+  /** key 级派生 atom 保证其它图片节点更新不触发当前工作台重渲染。 */
+  const stateAtom = React.useMemo(() => createCanvasImageModuleStateAtom(key), [key])
+  /** 当前图片模块的独立状态。 */
+  const selectedState = useAtomValue(stateAtom)
   /** controller 写前通过 store 获取最新 Map，避免捕获旧 render 快照。 */
   const store = useStore()
   /** Jotai 图片模块原子更新入口。 */
@@ -683,7 +770,7 @@ export function useCanvasImageModule(
   }, [key, adapter, store, updateState, removeState])
 
   /** 当前 key 尚未加载时使用新的只读初始状态。 */
-  const state = states.get(key) ?? createInitialCanvasImageModuleState()
+  const state = selectedState ?? createInitialCanvasImageModuleState()
   return React.useMemo(() => ({
     state,
     start: () => controllerRef.current?.start(),

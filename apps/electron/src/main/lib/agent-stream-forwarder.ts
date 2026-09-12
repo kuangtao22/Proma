@@ -1,4 +1,5 @@
 import type { AgentStreamEvent, AgentStreamPayload, SDKMessage } from '@proma/shared'
+import { projectSDKMessageForDisplay } from './agent-message-display'
 
 export const FOREGROUND_PARTIAL_INTERVAL_MS = 50
 export const BACKGROUND_PARTIAL_INTERVAL_MS = 250
@@ -47,6 +48,11 @@ export class AgentStreamForwarder {
     send: (event: AgentStreamEvent) => void,
     foreground: boolean,
   ): void {
+    /** 仅投影发送给 Renderer 的副本，事件总线中的原始图片仍可落盘与恢复。 */
+    if (event.payload.kind === 'sdk_message') {
+      const message = projectSDKMessageForDisplay(event.payload.message)
+      if (message !== event.payload.message) event = { ...event, payload: { ...event.payload, message } }
+    }
     const { sessionId, payload } = event
     if (!isPartialAssistantPayload(payload)) {
       // 保持 Delta 与紧随其后的终态/状态事件顺序，避免 permission 或 result 抢掉待发送 Delta。

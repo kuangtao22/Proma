@@ -300,6 +300,8 @@ function createContext(options: {
   operationSerializer?: import('./canvas-document-ipc').CanvasOperationSerializer
   /** 注入真实形状的任务事件源，观察等待监听器的注册与释放。 */
   imageJobOnChanged?: (listener: (event: DesignJobChangedEvent) => void) => () => void
+  /** 允许异步历史读取测试在完成前修改权威节点归属。 */
+  agentGetMessages?: (sessionId: string) => SDKMessage[] | Promise<SDKMessage[]>
   /** 测试新任务入口是否调用唯一领域服务。 */
   taskOperations?: CanvasTaskOperationService
   /** 精确单项与批量导出使用同一实例。 */
@@ -839,7 +841,8 @@ function createContext(options: {
       getSession: (sessionId) => sessionId === agentSession.id ? agentSession : undefined,
       getMessages: (sessionId) => {
         agentCalls.push({ type: 'messages', value: sessionId })
-        return [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }] as SDKMessage[]
+        return options.agentGetMessages?.(sessionId)
+          ?? [{ type: 'user', message: { content: [{ type: 'text', text: '已有消息' }] } }] as SDKMessage[]
       },
       execution: { execute: async (request) => {
         agentCalls.push({ type: 'execute', value: request })
@@ -1453,6 +1456,40 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.imageCalls.filter((call) => call.type === 'retry' || call.type === 'run')).toEqual([])
   })
 
+  test.each([undefined, null, 'asset-before'])(
+    'Given 单图批次恢复基线为 %s When IPC 重试 Then 只对旧任务回退来源素材', async (baseline) => {
+      /** 当前帧基线与真正用来编辑的母版是不同事实。 */
+      const original = { ...createImageJob(imageTargetA, 'job-failed'), status: 'failed' as const,
+        candidateBatchId: '11111111-1111-4111-8111-111111111111', canvasImageConfigRevision: 4,
+        sourceAssetId: 'asset-master',
+        ...(baseline !== undefined ? { canvasImageInitialAdoptedAssetId: baseline } : {}),
+      }
+      const replacement = { ...original, id: 'job-retry', attemptNumber: 2 }
+      const context = createContext({ imageJobs: [original, replacement], imageCandidateRetry: async () => replacement.id })
+      const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.RETRY_IMAGE_JOB, context.sender,
+        { ...imageTargetA, jobId: original.id })
+      expect(result).toMatchObject({ ok: true })
+      expect(context.imageCalls).toContainEqual({ type: 'candidate-retry', value: expect.objectContaining({
+        singleBatchRecovery: expect.objectContaining({ initialAdoptedAssetId: baseline === undefined ? 'asset-master' : baseline }),
+      }) })
+    },
+  )
+
+  test('Given 用户为空节点选择母版 When 手动创建任务 Then 传递来源选择并保留空采用基线', async () => {
+    const context = createContext({ imageConfig: { ...createImageConfig(imageTargetA, 4),
+      adoptedAssetId: null, editSourceNodeId: 'master-node' } })
+    const result = await invoke(context.handlers, CANVAS_IPC_CHANNELS.CREATE_IMAGE_JOB, context.sender, {
+      ...imageTargetA, expectedConfigRevision: 4,
+    })
+    expect(result).toMatchObject({ ok: true })
+    expect(context.imageCalls).toContainEqual({ type: 'preflight', value: expect.objectContaining({
+      action: 'edit', editSourceNodeId: 'master-node', canvasImageInitialAdoptedAssetId: null,
+    }) })
+    expect(context.imageCalls).toContainEqual({ type: 'create-once', value: expect.objectContaining({
+      input: expect.objectContaining({ editSourceNodeId: 'master-node', canvasImageInitialAdoptedAssetId: null }),
+    }) })
+  })
+
   test('Given revision 身份或 asset 归属错误 When 写操作 Then fail closed 且无业务副作用', async () => {
     const jobA = createImageJob(imageTargetA, 'job-a')
     const context = createContext({
@@ -1542,6 +1579,39 @@ describe('原生 Canvas 文档 IPC', () => {
       error: { code: 'CANVAS_IMAGE_BATCH_RECOVERY_REQUIRED' },
     })
     expect(context.imageCalls.filter((call) => call.type === 'adopt')).toEqual([])
+  })
+
+  test('Given 图片任务运行与终态变化 When 广播模块事件 Then 运行态携带轻量 patch 且终态要求完整对账', () => {
+    /** 捕获 registrar 注册的唯一 Job Manager 事件监听器。 */
+    let listener: ((event: DesignJobChangedEvent) => void) | undefined
+    const context = createContext({
+      imageJobOnChanged: (registered) => {
+        listener = registered
+        return () => undefined
+      },
+    })
+    const baseJob = createImageJob(imageTargetA, 'job-progress')
+    const running = { ...baseJob, status: 'running' as const, updatedAt: 3 }
+    delete running.outputAssetId
+    listener?.({ job: running, revision: 11 })
+    listener?.({ job: { ...running, status: 'succeeded', outputAssetId: 'asset-new', updatedAt: 4 }, revision: 12 })
+
+    expect(context.sender.sent).toEqual([
+      {
+        channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
+        value: {
+          ...imageTargetA, cause: 'job-progress',
+          job: {
+            id: running.id, projectId: running.projectId, target: running.target,
+            status: 'running', createdAt: running.createdAt, updatedAt: 3,
+          },
+        },
+      },
+      {
+        channel: CANVAS_IPC_CHANNELS.IMAGE_MODULE_CHANGED,
+        value: { ...imageTargetA, cause: 'reconcile' },
+      },
+    ])
   })
 
   test('Given 手动生图存在待确认输入 When 创建任务 Then 返回稳定中文错误且不泄露内部身份', async () => {
@@ -2821,6 +2891,75 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(context.agentCalls).toEqual([])
   })
 
+  test.each(['sender-destroyed', 'owner-rebound'] as const)(
+    'Given 历史消息异步读取中发生 %s When 迟到正文返回 Then 重新校验并拒绝跨归属内容',
+    async (change) => {
+      const document = createDocument(4)
+      document.nodes = [{
+        id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+        agentSessionId: '22222222-2222-4222-8222-222222222222',
+      }]
+      const readStarted = createDeferred<void>()
+      const messages = createDeferred<SDKMessage[]>()
+      const context = createContext({
+        loadResult: { document, writable: true, nodeIssues: [] },
+        agentGetMessages: () => {
+          readStarted.resolve()
+          return messages.promise
+        },
+      })
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+      const pending = invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, {
+        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+      })
+      await readStarted.promise
+
+      if (change === 'sender-destroyed') context.sender.destroyForTest()
+      else if (document.nodes[0]?.kind === 'agent') document.nodes[0].agentSessionId = 'session-rebound'
+      messages.resolve([{ type: 'user', message: { content: [{ type: 'text', text: '迟到私有正文' }] } }] as SDKMessage[])
+
+      expect(await pending).toEqual({
+        ok: false,
+        error: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
+      })
+      errorSpy.mockRestore()
+    },
+  )
+
+  test('Given 消息已读且第二次 owner 对账仍在等待 When sender 销毁 Then 返回前再次拒绝正文', async () => {
+    const document = createDocument(4)
+    document.nodes = [{
+      id: 'node-1', kind: 'agent', title: '首页 Agent', position: { x: 0, y: 0 },
+      agentSessionId: '22222222-2222-4222-8222-222222222222',
+    }]
+    let reconciliationCount = 0
+    const secondReconciliationStarted = createDeferred<void>()
+    const secondReconciliationGate = createDeferred<void>()
+    const context = createContext({
+      loadResult: { document, writable: true, nodeIssues: [] },
+      batchReconcile: async () => {
+        reconciliationCount += 1
+        if (reconciliationCount !== 2) return
+        secondReconciliationStarted.resolve()
+        await secondReconciliationGate.promise
+      },
+      agentGetMessages: async () => [],
+    })
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => undefined)
+    const pending = invoke(context.handlers, CANVAS_IPC_CHANNELS.GET_AGENT_MESSAGES, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1',
+    })
+    await secondReconciliationStarted.promise
+    context.sender.destroyForTest()
+    secondReconciliationGate.resolve()
+
+    expect(await pending).toEqual({
+      ok: false,
+      error: { code: 'CANVAS_AGENT_MESSAGES_FAILED', message: '会话消息暂时无法加载。' },
+    })
+    errorSpy.mockRestore()
+  })
+
   test('Given 坏节点旧会话仍在运行 When REBUILD Then 拒绝且不创建替代会话', async () => {
     const document = createDocument(4)
     document.nodes = [{
@@ -2970,8 +3109,8 @@ describe('原生 Canvas 文档 IPC', () => {
     })
     expect(sent).toEqual({ ok: true, value: { ok: true } })
     expect(stopped).toEqual({ ok: true, value: undefined })
-    expect(context.calls.filter((call) => call === 'batch:reconcile')).toHaveLength(2)
-    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(2)
+    expect(context.calls.filter((call) => call === 'batch:reconcile')).toHaveLength(3)
+    expect(context.calls.filter((call) => call === 'creation:reconcile')).toHaveLength(3)
     expect(context.agentCalls).toEqual([
       { type: 'messages', value: '22222222-2222-4222-8222-222222222222' },
       { type: 'execute', value: {
@@ -4166,7 +4305,12 @@ describe('原生 Canvas 文档 IPC', () => {
     const taskOperations: CanvasTaskOperationService = {
       getTaskLocked: async () => { throw new Error('测试不应查询') },
       cancelTaskLocked: async () => { throw new Error('测试不应取消') },
-      retryTaskLocked: async (input) => ({ operationId: input.operationId, originalJobId: input.jobId, replacementJobId: 'job-retry' }),
+      retryTaskLocked: async (input) => ({
+        operationId: input.operationId,
+        originalJobId: input.jobId,
+        replacementJobId: 'job-retry',
+        created: true,
+      }),
     }
     const context = createContext({ enableToolProviderRuntime: true, taskOperations, loadResult: { document, writable: true, nodeIssues: [] } })
     try {
@@ -4643,6 +4787,8 @@ describe('原生 Canvas 文档 IPC', () => {
     document.nodes = [{
       id: 'agent-1', kind: 'agent', title: '研究 Agent', position: { x: 0, y: 0 },
       agentSessionId: 'session-1',
+      /** 该测试检验已有正式输出的注册隔离，空节点不应调用输出服务。 */
+      outputPointer: { messageUuid: '33333333-3333-4333-8333-333333333333', contentSha256: 'a'.repeat(64), completedAt: 1 },
     }]
     /** 记录实际被调用的 registration 输出服务。 */
     const outputReads: string[] = []

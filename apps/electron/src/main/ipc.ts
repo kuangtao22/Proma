@@ -421,6 +421,7 @@ import {
   getAgentSessionMeta,
   getAgentSessionMessages,
   getAgentSessionSDKMessages,
+  getAgentSessionSDKMessagesForDisplay,
   resolveAgentCwd,
   updateAgentSessionMeta,
   deleteAgentSession,
@@ -3445,6 +3446,7 @@ export function registerIpcHandlers(): void {
   /** 图片任务详情、停止与重试在界面和 Agent 间共享同一服务。 */
   const canvasTaskOperations = createCanvasTaskOperationService({
     jobs: designJobManager,
+    workflowRuns: canvasWorkflowRuns,
     candidateBatches: canvasImageCandidateBatchService,
     traceStore: designTraceStore,
     onBackgroundError: (message, error) => console.error(message, error),
@@ -3599,7 +3601,7 @@ export function registerIpcHandlers(): void {
     agent: {
       listActiveRuns: listActiveCanvasAgentRuns,
       getSession: getAgentSessionMeta,
-      getMessages: getAgentSessionSDKMessages,
+      getMessages: getAgentSessionSDKMessagesForDisplay,
       execution: canvasAgentExecutionService,
       configs: canvasAgentConfigStore,
       stop: stopAgent,
@@ -4969,7 +4971,10 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.GET_SDK_MESSAGES,
     async (_, id: string): Promise<SDKMessage[]> => {
       requireVisibleSession(id)
-      return getAgentSessionSDKMessages(id)
+      /** 异步读取后复核会话可见性，删除或归属变化不能返回迟到的正文。 */
+      const messages = await getAgentSessionSDKMessagesForDisplay(id)
+      requireVisibleSession(id)
+      return messages
     }
   )
 

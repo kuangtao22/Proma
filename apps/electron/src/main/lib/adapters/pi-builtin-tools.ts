@@ -19,6 +19,8 @@ import type {
   ImageGenerationModelSnapshot,
 } from '@proma/shared'
 import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
+import type { ImageRequestAudit } from '../chat-tools/image-request-context'
+import type { TrustedImageParameters } from '../agent-run-extensions'
 import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
@@ -128,6 +130,14 @@ export interface PiBuiltinToolsContext {
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
   /** Design 可信图片工具执行前捕获真实设计摘要和精确提示词。 */
   captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
+  /** Canvas 原生图片任务冻结的配置原文；存在时图片工具忽略 Agent 提交的 prompt。 */
+  trustedImagePrompt?: string
+  /** Canvas 原生图片冻结的结构化参数；存在时图片工具忽略 Agent 提交的比例、尺寸和数量。 */
+  trustedImageParameters?: TrustedImageParameters
+  /** Host 固化的参考图顺序；字段存在时模型工具参数不能覆盖。 */
+  trustedReferenceImagePaths?: readonly string[]
+  /** OpenAI Images 请求外发前捕获不含凭据和正文的可信审计信息。 */
+  captureDesignImageRequest?: (request: ImageRequestAudit) => void
   /** 已由 Orchestrator 绑定真实会话与运行来源的服务器运维 Facade。 */
   serverOpsFacade?: ServerOpsAgentFacade
 }
@@ -1772,6 +1782,10 @@ export async function buildPiBuiltinTools(
         trustedImageRoute: ctx.trustedImageRoute,
         resolveTrustedImageRoute: ctx.resolveTrustedImageRoute,
         captureDesignImageCall: ctx.captureDesignImageCall,
+        trustedImagePrompt: ctx.trustedImagePrompt,
+        trustedImageParameters: ctx.trustedImageParameters,
+        trustedReferenceImagePaths: ctx.trustedReferenceImagePaths,
+        captureDesignImageRequest: ctx.captureDesignImageRequest,
       }))
     } catch (error) {
       console.error('[Pi 桥接] 注入 nano-banana 工具失败:', error)

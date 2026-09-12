@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import type {
@@ -27,6 +27,7 @@ import type {
   SDKUserMessage,
 } from '@proma/shared'
 import {
+  CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_ID_MAX_LENGTH,
   IMAGE_GENERATION_MODEL_NAME_MAX_LENGTH,
   isCanvasArtifactInputSlot,
@@ -61,6 +62,9 @@ import {
   CANVAS_IMAGE_INPUT_MAX_TEXT,
 } from './canvas-image-input-resolver'
 import type { CanvasImageInputResolver } from './canvas-image-input-resolver'
+import { isDesignImageRequestAudit } from './design-image-request-audit'
+import type { DesignImageRequestAudit } from './design-image-request-audit'
+import type { ImageRequestAudit } from '../chat-tools/image-request-context'
 
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 const DESIGN_JOB_MODEL_ERROR = '未配置可用的 Agent 渠道和模型'
@@ -83,6 +87,8 @@ interface DesignJobSettings {
 interface StoredDesignJob extends Omit<DesignJobRecord, 'target'> {
   target: DesignJobTarget
   maskAnnotationId?: string
+  /** 实际请求构造完成时原子保存，终态转存 trace 后仍可恢复核验。 */
+  imageRequestAudit?: DesignImageRequestAudit
   /** queued journal 与占位节点两步提交的恢复标记。 */
   placementState?: 'pending' | 'ready'
   /** Store 终态提交结果不确定时保留的跨进程对账证据。 */
@@ -109,7 +115,8 @@ function createSingleBatchRecovery(job: StoredDesignJob): {
   return {
     nodeId: job.target.nodeId,
     imageModuleId: job.target.imageModuleId,
-    initialAdoptedAssetId: job.sourceAssetId ?? null,
+    initialAdoptedAssetId: job.canvasImageInitialAdoptedAssetId !== undefined
+      ? job.canvasImageInitialAdoptedAssetId : job.sourceAssetId ?? null,
     initialConfigRevision: job.canvasImageConfigRevision,
   }
 }
@@ -122,8 +129,14 @@ interface CanvasImageInFlightCreation {
 
 /** Canvas 图片创建前可重复执行且不写入的权威预检结果。 */
 interface CanvasImagePreflightResult {
+  /** 权威解析后的真实编辑来源，不复用目标节点的采用基线。 */
+  sourceAssetId?: string
   target: CanvasImageJobTarget
   prompt: string
+  /** 冻结前的节点配置原文，不让隐藏规划重新表述后成为实际生图输入。 */
+  originalRequest: string
+  /** 原生路由的版本化 Host 提示词合同；Comfy 工作流保持既有 typed 输入语义。 */
+  imagePromptContract?: 'frozen-config-v1'
   authoritativeRevision: number
   generationConstraints: NonNullable<CreateDesignJobInput['generationConstraints']>
   imageModelSnapshot: ImageGenerationModelSnapshot
@@ -136,13 +149,13 @@ type InternalCreateDesignJobInput = Omit<CreateDesignJobInput, 'imageModelProfil
 /** journal 允许出现的完整字段集合，未知字段一律拒绝。 */
 const STORED_JOB_FIELDS = new Set([
   'id', 'creativeTaskId', 'attemptNumber', 'projectId', 'sessionId', 'action', 'status',
-  'prompt', 'originalRequest', 'contextMode', 'sourceAgentMessageId', 'sourceSessionId',
+  'prompt', 'originalRequest', 'imagePromptContract', 'contextMode', 'sourceAgentMessageId', 'sourceSessionId',
   'sourceAssetId', 'parentAssetId', 'outputAssetId', 'error', 'createdAt', 'updatedAt',
   'traceState', 'executionSessionCleanupState', 'contextReferences', 'designSummary',
   'finalImagePrompt', 'rawThinkingAvailable', 'contextWarning', 'startedAt', 'completedAt',
   'imageModelSnapshot',
   'target', 'generationConstraints', 'canvasInputReferences', 'canvasImageConfigRevision',
-  'candidateBatchId',
+  'candidateBatchId', 'canvasImageInitialAdoptedAssetId', 'imageRequestAudit',
   'maskAnnotationId', 'placementState', 'terminalState',
   'replacedByJobId', 'retryState', 'deletionState',
 ])
@@ -378,12 +391,12 @@ export class DesignJobManager {
     const imageModelSnapshot = this.runImageModelValidation(
       () => this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId!, input.projectId),
     )
-    return this.createInternal(input, imageModelSnapshot)
+    return clonePublicDesignJob(this.createInternal(input, imageModelSnapshot))
   }
 
   /** 创建只归属 Canvas 图片模块的 queued journal，不修改旧 Design 节点。 */
   async createCanvasImage(input: CreateDesignJobInput): Promise<DesignJobRecord> {
-    return this.createCanvasImageInternal(input)
+    return clonePublicDesignJob(await this.createCanvasImageInternal(input))
   }
 
   /**
@@ -499,15 +512,18 @@ export class DesignJobManager {
         action: input.action,
         status: 'queued',
         prompt: preflight.prompt,
-        originalRequest: preflight.prompt,
+        originalRequest: preflight.originalRequest,
+        ...(preflight.imagePromptContract ? { imagePromptContract: preflight.imagePromptContract } : {}),
         contextMode: input.contextMode,
         generationConstraints: { ...preflight.generationConstraints },
         canvasInputReferences: preflight.canvasInputReferences.map((reference) => ({ ...reference })),
         canvasImageConfigRevision: input.canvasImageConfigRevision,
+        ...(input.canvasImageInitialAdoptedAssetId !== undefined
+          ? { canvasImageInitialAdoptedAssetId: input.canvasImageInitialAdoptedAssetId } : {}),
         ...(input.candidateBatchId ? { candidateBatchId: input.candidateBatchId } : {}),
         imageModelSnapshot: structuredClone(preflight.imageModelSnapshot),
-        ...(input.sourceAssetId
-          ? { sourceAssetId: input.sourceAssetId, parentAssetId: input.sourceAssetId }
+        ...(preflight.sourceAssetId
+          ? { sourceAssetId: preflight.sourceAssetId, parentAssetId: preflight.sourceAssetId }
           : {}),
         traceState: 'pending',
         executionSessionCleanupState: 'pending',
@@ -526,12 +542,14 @@ export class DesignJobManager {
   private async resolveCanvasImagePreflight(input: CreateDesignJobInput): Promise<CanvasImagePreflightResult> {
     if (input.target?.kind !== 'canvas-image') throw new Error('Canvas 图片任务目标无效')
     /** action 与来源素材的不变量必须先于模型、输入、ID 和持久化副作用。 */
-    if (input.action === 'generate' && input.sourceAssetId !== undefined) {
+    if (input.action === 'generate' && (input.sourceAssetId !== undefined || input.editSourceNodeId)) {
       throw new Error('生成任务不得包含来源素材')
     }
-    if (input.action === 'edit' && !input.sourceAssetId) throw new Error('编辑任务缺少来源素材')
+    if (input.action === 'edit' && !input.sourceAssetId && !input.editSourceNodeId) throw new Error('编辑任务缺少来源素材')
     /** 空提示词和缺失生成约束不能进入付费任务。 */
-    const prompt = input.prompt.trim()
+    /** 原始配置文本是新版原生图片任务的权威执行 prompt，trim 后文本仅保留既有显示语义。 */
+    const originalRequest = input.prompt
+    const prompt = originalRequest.trim()
     if (!prompt) throw new Error('设计任务提示词不能为空')
     if (!input.generationConstraints || input.canvasImageConfigRevision === undefined) {
       throw new Error('Canvas 图片任务缺少生成快照')
@@ -543,7 +561,7 @@ export class DesignJobManager {
     await targetAdapter.assertTarget(input.projectId, input.target)
     /** 来源素材必须先由当前项目权威 Store 证明，禁止跨项目或陈旧 ID 进入 journal。 */
     const current = this.dependencies.store.requireStableAuthoritativeDocument(input.projectId)
-    if (input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
+    if (!input.editSourceNodeId && input.sourceAssetId && !current.assets.some((asset) => asset.id === input.sourceAssetId)) {
       throw new Error(`素材不存在: ${input.sourceAssetId}`)
     }
     /** 可信模型校验必须早于 ID、journal 和事件副作用。 */
@@ -554,6 +572,15 @@ export class DesignJobManager {
       ? this.dependencies.imageModels.resolveAvailableWorkflowSnapshot?.(input.mediaWorkflow, input.projectId)
         ?? (() => { throw new Error('媒体工作流执行器未初始化') })()
       : this.dependencies.imageModels.resolveAvailableSnapshot(input.imageModelProfileId!, input.projectId))
+    if (imageModelSnapshot.executor === 'comfyui' && input.editSourceNodeId) {
+      throw new Error('此模型的参考图由工作流输入决定，请清除独立底图选择')
+    }
+    /** Comfy 只消费已冻结的工作流输入，不能猜测哪个自由文本字段承载图片提示词。 */
+    const imagePromptContract = imageModelSnapshot.executor === 'comfyui'
+      ? undefined : 'frozen-config-v1' as const
+    if (imagePromptContract && originalRequest.length > CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH) {
+      throw new Error('CANVAS_IMAGE_PROMPT_TOO_LONG')
+    }
     /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
     if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
       this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
@@ -561,6 +588,19 @@ export class DesignJobManager {
     const canvasInputReferences = await inputResolver.resolve(
       toCanvasImageTarget(input.projectId, input.target),
     )
+    /** 仅已解析的直接图片绑定可成为底图，失效选择不能静默回退旧图。 */
+    let sourceAssetId = input.sourceAssetId
+    if (input.editSourceNodeId) {
+      /** 回调内保留已验证目标身份，禁止引用自身。 */
+      const targetNodeId = input.target.nodeId
+      /** 绑定解析器已排除关联线；这里继续证明节点类型、槽位和正式素材。 */
+      const reference = canvasInputReferences.find((item) => item.nodeId === input.editSourceNodeId
+        && item.nodeId !== targetNodeId && item.kind === 'image'
+        && item.sourcePort === 'image.asset' && item.targetPort === 'image.reference' && item.assetId)
+      if (!reference?.assetId) throw new Error('CANVAS_IMAGE_EDIT_SOURCE_INVALID')
+      sourceAssetId = reference.assetId
+      if (!current.assets.some((asset) => asset.id === sourceAssetId)) throw new Error(`素材不存在: ${sourceAssetId}`)
+    }
     // 素材解析可能等待磁盘；提交前再次读取范围，避免期间撤选被旧快照绕过。
     if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
       this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
@@ -568,10 +608,13 @@ export class DesignJobManager {
     return {
       target: input.target,
       prompt,
+      originalRequest,
+      ...(imagePromptContract ? { imagePromptContract } : {}),
       authoritativeRevision: current.revision,
       generationConstraints: { ...input.generationConstraints },
       imageModelSnapshot,
       canvasInputReferences,
+      sourceAssetId,
     }
   }
 
@@ -600,7 +643,9 @@ export class DesignJobManager {
 
   /** 查询已加载或磁盘可发现的任务。 */
   get(jobId: string): DesignJobRecord | undefined {
-    return this.findStoredJob(jobId)
+    /** 对外查询不暴露 journal 内部恢复或请求审计字段。 */
+    const job = this.findStoredJob(jobId)
+    return job ? clonePublicDesignJob(job) : undefined
   }
 
   /** 列出项目全部任务，并把磁盘 journal 载入内存索引。 */
@@ -609,6 +654,7 @@ export class DesignJobManager {
     this.rebuildCanvasImageIndex(projectId, jobs)
     return jobs
       .sort((left, right) => left.createdAt - right.createdAt)
+      .map(clonePublicDesignJob)
   }
 
   /** 按完整 Canvas 图片目标查询，首次惰性扫描后只访问该目标任务集合。 */
@@ -877,7 +923,17 @@ export class DesignJobManager {
         hasTrustedInputContext: queued.target.kind === 'canvas-image'
           && (queued.canvasInputReferences?.length ?? 0) > 0,
       })
-      const userMessage = this.buildPrompt(queued)
+      /** 同一份 Host 参考快照同时进入提示词、工具请求和审计映射。 */
+      const trustedReferences = queued.target.kind === 'canvas-image' || queued.action === 'edit'
+        ? this.resolveImageReferences(queued) : undefined
+      const userMessage = this.buildPrompt(queued, trustedReferences?.map((reference) => reference.path))
+      /** 冻结合同必须同时具有已校验的结构化快照，避免损坏 journal 降级为 Agent 参数。 */
+      const trustedImageParameters = queued.imagePromptContract === 'frozen-config-v1'
+        ? (() => {
+            if (!queued.generationConstraints) throw new Error('Canvas 冻结图片任务缺少生成快照')
+            return { ...queued.generationConstraints, numberOfImages: 1 as const }
+          })()
+        : undefined
       /** 图片工具执行前捕获的真实结构化参数，不从自然语言或 trace 反推。 */
       let imageCall: { designSummary: string; prompt: string } | undefined
       const session = this.dependencies.createSession({
@@ -921,7 +977,17 @@ export class DesignJobManager {
             if (toolName === DESIGN_IMAGE_TOOL) contextRun.assertReadyForImageCall()
           },
           captureDesignImageCall: (value) => { imageCall = { ...value } },
+          ...(trustedImageParameters ? {
+            trustedImagePrompt: running.originalRequest,
+            trustedImageParameters,
+          } : {}),
           trustedImageRoute: running.imageModelSnapshot,
+          ...(trustedReferences ? {
+            trustedReferenceImagePaths: trustedReferences.map((reference) => reference.path),
+            captureDesignImageRequest: (request: ImageRequestAudit) => {
+              this.captureImageRequest(running.id, trustedReferences, request)
+            },
+          } : {}),
           resolveTrustedImageRoute: (route) => {
             try {
               return this.runImageModelValidation(
@@ -940,7 +1006,7 @@ export class DesignJobManager {
           contextReferences: contextRun.getReferences(),
           contextWarning: contextRun.getWarnings().join('\n') || undefined,
           designSummary: imageCall?.designSummary,
-          finalImagePrompt: imageCall?.prompt,
+          finalImagePrompt: latest.imageRequestAudit ? latest.finalImagePrompt : imageCall?.prompt,
         })
       }
       const latest = this.requireJob(jobId)
@@ -1030,7 +1096,7 @@ export class DesignJobManager {
   async cancel(projectId: string, jobId: string): Promise<DesignJobRecord> {
     const job = this.requireProjectJob(projectId, jobId)
     if (job.terminalState?.status === 'pending') throw new Error('任务已进入结果提交阶段，无法取消')
-    if (job.status !== 'queued' && job.status !== 'running') return job
+    if (job.status !== 'queued' && job.status !== 'running') return clonePublicDesignJob(job)
     if (job.imageModelSnapshot?.executor === 'comfyui') {
       const mediaExecution = this.dependencies.mediaExecution
       if (!mediaExecution) throw new Error('ComfyUI 图片执行边界未初始化')
@@ -1041,14 +1107,14 @@ export class DesignJobManager {
     const latest = this.requireProjectJob(projectId, jobId)
     /** stopAgent 等待期间也可能跨过输出提交点，必须再次以最新 journal 判定。 */
     if (latest.terminalState?.status === 'pending') throw new Error('任务已进入结果提交阶段，无法取消')
-    if (latest.status !== 'queued' && latest.status !== 'running') return latest
+    if (latest.status !== 'queued' && latest.status !== 'running') return clonePublicDesignJob(latest)
     const cancelled = this.updateStatus(latest, 'cancelled', { error: undefined })
     await this.finalizeExecution(cancelled.id)
     /** runHeadless 可能不响应 stop；取消终态必须主动释放当前及后续 run 等待。 */
     const execution = this.activeExecutions.get(cancelled.id)
     execution?.resolveCompletion()
     if (this.activeExecutions.get(cancelled.id) === execution) this.activeExecutions.delete(cancelled.id)
-    return this.requireProjectJob(projectId, cancelled.id)
+    return clonePublicDesignJob(this.requireProjectJob(projectId, cancelled.id))
   }
 
   /** 为失败、取消或中断任务创建新 journal，并让原占位节点指向新任务。 */
@@ -1057,7 +1123,7 @@ export class DesignJobManager {
       let previous = this.requireProjectJob(projectId, jobId)
       if (!previous.imageModelSnapshot) throw new Error('旧任务未记录生图模型，请重新提交')
       if (previous.replacedByJobId) {
-        return this.completeRetryIntent(previous)
+        return clonePublicDesignJob(this.completeRetryIntent(previous))
       }
       if (!['failed', 'cancelled', 'interrupted'].includes(previous.status)) {
         throw new Error('当前设计任务不可重试')
@@ -1095,7 +1161,7 @@ export class DesignJobManager {
             || durableIntent.retryState?.status !== 'pending') throw error
           previous = durableIntent
         }
-        return this.completeRetryIntent(previous, true)
+        return clonePublicDesignJob(this.completeRetryIntent(previous, true))
       } finally {
         releaseReservation?.()
       }
@@ -1421,7 +1487,7 @@ export class DesignJobManager {
   }
 
   /** 构建按任务选择上下文、且只允许单次可信图片调用的通用视觉提示。 */
-  private buildPrompt(job: StoredDesignJob): string {
+  private buildPrompt(job: StoredDesignJob, trustedReferencePaths?: string[]): string {
     /** 项目指令只从当前任务显式授权的项目根解析，不使用 Agent cwd 或祖先目录。 */
     const projectRoot = this.dependencies.pathResolver.resolve(job.projectId).projectRoot
     const instructionManifest = resolveProjectInstructions({ projectRoot })
@@ -1435,7 +1501,9 @@ export class DesignJobManager {
     const commonInstructions = [
       '你正在执行一个 Design 视觉任务。先理解视觉目标，再决定需要哪些信息。',
       '按当前任务从品牌、产品、代码、角色、故事、场景、连续性或参考资料中选择必要上下文；只读取完成任务所需的最少内容。',
-      '调用图片工具时，designSummary 必须使用中文说明视觉判断，prompt 必须是图片模型可直接执行的精确提示词。',
+      job.imagePromptContract === 'frozen-config-v1'
+        ? '调用图片工具时，designSummary 必须使用中文说明视觉判断；配置原文、画面比例、尺寸请求和图片数量由 Host 固定，不得改写或重述。实际像素尺寸受执行器支持限制，OpenAI Images 当前按画幅映射，不支持通过 imageSize 选择 2K/4K；不得仅凭配置承诺输出分辨率。'
+        : '调用图片工具时，designSummary 必须使用中文说明视觉判断，prompt 必须是图片模型可直接执行的精确提示词。',
       `只调用一次 ${DESIGN_IMAGE_TOOL}，并返回图片工具结果。`,
       `上下文模式：${job.contextMode}`,
       `项目指令（仅来自显式项目根）：\n${projectInstructions}`,
@@ -1445,13 +1513,13 @@ export class DesignJobManager {
       commonInstructions.push(
         `结构化画面比例：${job.generationConstraints?.aspectRatio ?? '1:1'}`,
         `结构化输出尺寸：${job.generationConstraints?.imageSize ?? 'auto'}`,
+        ...(job.imagePromptContract === 'frozen-config-v1'
+          ? ['Host 固定本次只生成 1 张图片；不要提交或改写 prompt、比例、尺寸或数量。']
+          : []),
         `Canvas 直接入边已提交快照：${JSON.stringify(job.canvasInputReferences ?? [])}`,
-        `referenceImagePaths: ${JSON.stringify([
-          ...(job.action === 'edit'
-            ? [this.dependencies.assetService.resolveAssetPath(job.projectId, job.sourceAssetId!)]
-            : []),
-          ...this.resolveCanvasReferenceImagePaths(job),
-        ].filter((path, index, paths) => paths.indexOf(path) === index))}`,
+        `referenceImagePaths: ${JSON.stringify(trustedReferencePaths ?? this.resolveImageReferences(job).map((reference) => reference.path))}`,
+        '参考图片由 Host 按上述顺序固定传递，不得删除或重排；编辑任务第一张是实际编辑底图，其余用于补充约束。',
+        '先明确本轮允许修改的内容和必须保留的内容。文字要求最小编辑不等于已提供蒙版，也不能保证其它区域像素锁定。',
       )
     }
     if (job.action === 'generate') {
@@ -1474,18 +1542,42 @@ export class DesignJobManager {
     ].join('\n')
   }
 
-  /** 将 Canvas journal 中的正式媒体身份按运行时授权解析为真实路径。 */
-  private resolveCanvasReferenceImagePaths(job: StoredDesignJob): string[] {
-    if (job.target.kind !== 'canvas-image') return []
-    /** 只有明确进入图片参考槽且带 adopted Asset 的输入属于媒体。 */
-    const assetIds = (job.canvasInputReferences ?? []).flatMap((reference) => (
-      reference.targetPort === 'image.reference' && reference.assetId
-        ? [reference.assetId]
-        : []
-    ))
-    return [...new Set(assetIds)].map((assetId) => (
-      this.dependencies.assetService.resolveAssetPath(job.projectId, assetId)
-    ))
+  /** 按底图优先、直接入边其次的顺序解析素材，去重但不改变其它参考顺序。 */
+  private resolveImageReferences(job: StoredDesignJob): Array<{ assetId: string; path: string }> {
+    /** 旧采用图只有被选为底图或显式连接时才加入本轮请求。 */
+    const assetIds = [
+      ...(job.action === 'edit' && job.sourceAssetId ? [job.sourceAssetId] : []),
+      ...(job.canvasInputReferences ?? []).flatMap((reference) => (
+        reference.targetPort === 'image.reference' && reference.assetId ? [reference.assetId] : []
+      )),
+    ]
+    return [...new Set(assetIds)].map((assetId) => ({ assetId,
+      path: this.dependencies.assetService.resolveAssetPath(job.projectId, assetId),
+    }))
+  }
+
+  /** 将执行器实际读取的图片映射至固定素材，原子写入完成后才允许请求外发。 */
+  private captureImageRequest(jobId: string, references: Array<{ assetId: string; path: string }>, request: ImageRequestAudit): void {
+    /** 以最新 journal 状态阻断取消后的外发和重复请求。 */
+    const job = this.requireJob(jobId)
+    if (job.status !== 'running' || job.imageRequestAudit
+      || request.executor !== job.imageModelSnapshot?.executor || request.modelId !== job.imageModelSnapshot.modelId
+      || request.referenceImages.length !== references.length) throw new Error('图片请求与任务快照不一致')
+    /** 持久化白名单不保留执行器提供的本地路径或提示词正文副本。 */
+    const audit: DesignImageRequestAudit = {
+      executor: request.executor, modelId: request.modelId,
+      promptSha256: createHash('sha256').update(request.prompt).digest('hex'), preparedAt: this.now(),
+      referenceImages: request.referenceImages.map((image, index) => {
+        /** 有序匹配 Host 素材身份；符号链接由真实路径再次核对。 */
+        const reference = references[index]!
+        if (image.path !== reference.path && image.path !== realpathSync(reference.path)) {
+          throw new Error('图片请求参考顺序与任务快照不一致')
+        }
+        return { assetId: reference.assetId, sha256: image.sha256, byteSize: image.byteSize }
+      }),
+    }
+    if (!isDesignImageRequestAudit(audit)) throw new Error('图片请求审计无效')
+    this.updateStatus(job, job.status, { imageRequestAudit: audit, finalImagePrompt: request.prompt })
   }
 
   /** 从本轮消息中选择第一张成功且属于当前会话的 Nano Banana 图片。 */
@@ -1623,7 +1715,7 @@ export class DesignJobManager {
         const messages = this.dependencies.getSessionMessages(sessionId)
         const written = this.dependencies.traceStore.writeFromMessages(job.projectId, job.id, messages, {
           status: job.status, error: job.error, completedAt: job.completedAt,
-        })
+        }, job.imageRequestAudit)
         job = this.updateStatus(job, job.status, {
           ...written.summary,
           contextReferences: job.contextReferences ?? written.summary.contextReferences,
@@ -2106,6 +2198,7 @@ export class DesignJobManager {
       contextWarning: undefined,
       designSummary: undefined,
       finalImagePrompt: undefined,
+      imageRequestAudit: undefined,
       rawThinkingAvailable: undefined,
       startedAt: undefined,
       completedAt: undefined,
@@ -2405,7 +2498,7 @@ export class DesignJobManager {
       ?? this.projectRevisions.get(job.projectId)
       ?? this.dependencies.store.requireStableAuthoritativeDocument(job.projectId).revision
     this.projectRevisions.set(job.projectId, authoritativeRevision)
-    for (const listener of this.listeners) listener({ job, revision: authoritativeRevision })
+    for (const listener of this.listeners) listener({ job: clonePublicDesignJob(job), revision: authoritativeRevision })
   }
 
   /** 解析并复核 journal 最终路径始终位于当前项目 jobsDir 单层内。 */
@@ -2567,6 +2660,7 @@ function clonePublicDesignJob(job: StoredDesignJob): DesignJobRecord {
   delete publicJob.replacedByJobId
   delete publicJob.retryState
   delete publicJob.deletionState
+  delete publicJob.imageRequestAudit
   return JSON.parse(JSON.stringify(publicJob)) as DesignJobRecord
 }
 
@@ -2663,6 +2757,7 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
     if (value[field] !== undefined && typeof value[field] !== 'string') return false
   }
   if (value.rawThinkingAvailable !== undefined && typeof value.rawThinkingAvailable !== 'boolean') return false
+  if (value.imagePromptContract !== undefined && value.imagePromptContract !== 'frozen-config-v1') return false
   if (value.startedAt !== undefined && (typeof value.startedAt !== 'number' || !Number.isFinite(value.startedAt))) return false
   if (value.completedAt !== undefined && (typeof value.completedAt !== 'number' || !Number.isFinite(value.completedAt))) return false
   if (value.contextReferences !== undefined && !Array.isArray(value.contextReferences)) return false
@@ -2691,6 +2786,8 @@ function isStoredDesignJob(value: unknown): value is StoredDesignJob {
     && (!Number.isSafeInteger(value.canvasImageConfigRevision)
       || (value.canvasImageConfigRevision as number) < 0)) return false
   if (!isOptionalStableId(value.candidateBatchId)) return false
+  if (value.canvasImageInitialAdoptedAssetId !== null && !isOptionalStableId(value.canvasImageInitialAdoptedAssetId)) return false
+  if (value.imageRequestAudit !== undefined && !isDesignImageRequestAudit(value.imageRequestAudit)) return false
   if (value.canvasInputReferences !== undefined) {
     if (!Array.isArray(value.canvasInputReferences)
       || value.canvasInputReferences.length > CANVAS_IMAGE_INPUT_MAX_REFERENCES

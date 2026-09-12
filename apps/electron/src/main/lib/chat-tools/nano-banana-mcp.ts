@@ -13,10 +13,13 @@ import { getToolState, getToolCredentials } from '../chat-tool-config'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
+import { CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH } from '@proma/shared'
 import type { AgentToolResultImage, ImageGenerationModelSnapshot } from '@proma/shared'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
 import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
+import type { TrustedImageParameters } from '../agent-run-extensions'
 import { executeOpenAIImages } from './openai-images-executor'
+import type { ImageRequestAudit } from './image-request-context'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
 
@@ -386,6 +389,14 @@ export interface PiNanoBananaToolsContext {
   resolveTrustedImageRoute?: ResolveImageGenerationRoute
   /** Design 可信图片工具在任何文件或网络副作用前回传真实结构化参数。 */
   captureDesignImageCall?: (input: { designSummary: string; prompt: string }) => void
+  /** Canvas 原生图片任务冻结的配置原文；存在时拒绝隐藏规划改写实际外发文本。 */
+  trustedImagePrompt?: string
+  /** Canvas 原生图片任务冻结的结构化参数；存在时拒绝隐藏规划改写实际请求配置。 */
+  trustedImageParameters?: TrustedImageParameters
+  /** Host 固化的参考图顺序；字段存在时完全替代模型工具参数，包括空数组。 */
+  trustedReferenceImagePaths?: readonly string[]
+  /** OpenAI Images 请求外发前捕获可信模型、提示词和参考图摘要。 */
+  captureDesignImageRequest?: (request: ImageRequestAudit) => void
 }
 
 function toPiToolResult(result: McpToolResult, toolUseId: string): AgentToolResult<NanoBananaToolResultDetails> {
@@ -420,11 +431,16 @@ export function buildPiNanoBananaTools(
     if (!toolState.enabled || !credentials.apiKey) return []
   }
 
-  /** 可信 Design 路由额外要求中文设计摘要；普通 Agent 继续沿用原参数合同。 */
-  const parameters = ctx.trustedImageRoute
+  /** 冻结 Canvas 合同只向规划器公开视觉摘要，图片请求的全部配置由 Host 提供。 */
+  const parameters = ctx.trustedImageRoute && ctx.trustedImageParameters
     ? Type.Object({
         designSummary: Type.String({ minLength: 1, maxLength: 4000, description: '用中文概括本次视觉判断和关键设计决策。' }),
-        prompt: Type.String({ minLength: 1, maxLength: 16000, description: '图片模型可直接执行的精确提示词。' }),
+      })
+    /** 旧 Design 任务仍保留原工具合同，避免历史任务和普通隐藏规划行为变化。 */
+    : ctx.trustedImageRoute
+      ? Type.Object({
+        designSummary: Type.String({ minLength: 1, maxLength: 4000, description: '用中文概括本次视觉判断和关键设计决策。' }),
+        prompt: Type.String({ minLength: 1, maxLength: CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH, description: '图片模型可直接执行的精确提示词。' }),
         referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
         aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
         imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
@@ -438,10 +454,15 @@ export function buildPiNanoBananaTools(
         numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
       })
 
+  /** 可信工具描述只声明 Host 选择的模型，避免把 OpenAI 路由误写成 Gemini。 */
+  const description = ctx.trustedImageRoute
+    ? 'Generate or edit images using the Host-selected image model and trusted reference images.'
+    : 'Generate or edit images using Gemini Image Generation. Supports text-to-image, reference image editing, and iterative multi-turn editing. Use English prompts for best results. Previous generations are automatically used as context. When the user uploads images (listed in <attached_files>) or mentions image files via @file:{path}, pass their paths through referenceImagePaths.'
+
   return [sdk.defineTool({
     name: 'mcp__nano_banana__generate_image',
     label: '生成或编辑图片',
-    description: 'Generate or edit images using Gemini Image Generation. Supports text-to-image, reference image editing, and iterative multi-turn editing. Use English prompts for best results. Previous generations are automatically used as context. When the user uploads images (listed in <attached_files>) or mentions image files via @file:{path}, pass their paths through referenceImagePaths.',
+    description,
     promptSnippet: 'Nano Banana: generate or edit images. Pass user-authorized reference image paths when editing an existing image.',
     parameters,
     async execute(toolCallId, args, signal) {
@@ -452,7 +473,28 @@ export function buildPiNanoBananaTools(
           : undefined
         if (ctx.trustedImageRoute && !resolvedRoute) throw new Error(MISSING_TRUSTED_ROUTE_RESOLVER_ERROR)
         /** 直调 execute 的测试和适配层也必须经过可信参数运行时校验。 */
-        const prompt = typeof args.prompt === 'string' ? args.prompt : ''
+        /** 冻结 Canvas 合同只接受 Host 原文和 Host 参数，旧路由沿用既有 Agent 参数。 */
+        const trustedParameters = ctx.trustedImageParameters
+        const trustedPrompt = ctx.trustedImagePrompt
+        /** 将联合 schema 的普通工具参数逐项收窄，冻结合同不会读取这些字段。 */
+        const requestedPrompt = 'prompt' in args && typeof args.prompt === 'string' ? args.prompt : ''
+        const requestedReferenceImagePaths = 'referenceImagePaths' in args
+          && Array.isArray(args.referenceImagePaths)
+          ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
+          : undefined
+        const requestedAspectRatio = 'aspectRatio' in args && typeof args.aspectRatio === 'string'
+          ? args.aspectRatio : undefined
+        const requestedImageSize = 'imageSize' in args && typeof args.imageSize === 'string'
+          ? args.imageSize : undefined
+        const requestedNumberOfImages = 'numberOfImages' in args && typeof args.numberOfImages === 'number'
+          ? args.numberOfImages : undefined
+        let prompt: string
+        if (trustedParameters) {
+          if (trustedPrompt === undefined) throw new Error('Canvas 冻结图片任务缺少配置原文')
+          prompt = trustedPrompt
+        } else {
+          prompt = trustedPrompt ?? requestedPrompt
+        }
         if (ctx.trustedImageRoute) {
           const designSummary = 'designSummary' in args && typeof args.designSummary === 'string'
             ? args.designSummary
@@ -460,19 +502,18 @@ export function buildPiNanoBananaTools(
           if (!designSummary.trim() || designSummary.length > 4000) {
             throw new Error('Design 图片工具参数 designSummary 必须为 1-4000 字符')
           }
-          if (!prompt.trim() || prompt.length > 16000) {
-            throw new Error('Design 图片工具参数 prompt 必须为 1-16000 字符')
+          if (!prompt.trim() || prompt.length > CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH) {
+            throw new Error(`Design 图片工具参数 prompt 必须为 1-${CANVAS_IMAGE_EXECUTION_PROMPT_MAX_LENGTH} 字符`)
           }
           ctx.captureDesignImageCall?.({ designSummary, prompt })
         }
-        const referenceImagePaths = Array.isArray(args.referenceImagePaths)
-          ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
-          : undefined
+        /** 可信路径字段存在时由 Host 独占输入，模型无法省略、调序或注入路径。 */
+        const referenceImagePaths = ctx.trustedReferenceImagePaths !== undefined
+          ? [...ctx.trustedReferenceImagePaths]
+          : requestedReferenceImagePaths
         const result: McpToolResult = resolvedRoute?.executor === 'openai-images'
           ? {
-              content: [{ type: 'text', text: referenceImagePaths && referenceImagePaths.length > 1
-                ? '图片已生成。当前协议使用第一张参考图。'
-                : '图片已生成。' }],
+              content: [{ type: 'text', text: '图片已生成。' }],
               imageAttachments: (await executeOpenAIImages({
                 route: resolvedRoute,
                 sessionId: ctx.sessionId,
@@ -480,19 +521,26 @@ export function buildPiNanoBananaTools(
                 referenceImagePaths,
                 cwd: ctx.agentCwd,
                 allowedRoots: ctx.allowedRoots,
-                aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
-                imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
-                numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+                aspectRatio: trustedParameters?.aspectRatio
+                  ?? requestedAspectRatio,
+                imageSize: trustedParameters?.imageSize
+                  ?? requestedImageSize,
+                numberOfImages: trustedParameters?.numberOfImages
+                  ?? requestedNumberOfImages,
                 signal,
+                captureRequest: ctx.captureDesignImageRequest,
               })).imageAttachments,
             }
           : await callGeminiAndBuildResult(prompt, ctx.sessionId, {
-              aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
-              imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+              aspectRatio: trustedParameters?.aspectRatio
+                ?? requestedAspectRatio,
+              imageSize: trustedParameters?.imageSize
+                ?? requestedImageSize,
               referenceImagePaths,
               cwd: ctx.agentCwd,
               allowedRoots: ctx.allowedRoots,
-              numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+              numberOfImages: trustedParameters?.numberOfImages
+                ?? requestedNumberOfImages,
               trustedImageRoute: ctx.trustedImageRoute,
             }, signal)
         const toolResult = toPiToolResult(result, toolCallId)

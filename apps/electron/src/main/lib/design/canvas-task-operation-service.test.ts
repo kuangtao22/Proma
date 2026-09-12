@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import type { DesignJobRecord, DesignTraceEntry } from '@proma/shared'
+import type { CanvasWorkflowRun, DesignJobRecord, DesignTraceEntry } from '@proma/shared'
+import { createImageJobId } from './canvas-image-run-service'
 import {
   createCanvasTaskOperationService,
   type CanvasTaskReference,
@@ -27,12 +28,48 @@ function createJob(overrides: Partial<DesignJobRecord> = {}): DesignJobRecord {
   }
 }
 
+/** 构造最小持久工作流记录，明确每个图片执行身份都由原 owner 固定。 */
+function createWorkflowRun(overrides: Partial<CanvasWorkflowRun> = {}): CanvasWorkflowRun {
+  return {
+    schemaVersion: 1,
+    id: 'a'.repeat(48),
+    revision: 1,
+    projectId: 'project-1',
+    canvasId: 'canvas-1',
+    operationId: 'workflow-operation',
+    owner: { sessionId: 'workflow-session', runStartedAt: 10 },
+    status: 'completed',
+    initialCanvasRevision: 1,
+    observedCanvasRevision: 1,
+    rootNodeIds: ['node-1'],
+    goal: '工作流图片生成',
+    nodes: [{
+      nodeId: 'node-1', kind: 'image', identityHash: 'b'.repeat(64), plannedArtifactHash: null,
+      mediaConfigRevision: null, inputBindings: [], dependencyNodeIds: [], status: 'failed',
+      errorCode: 'CANVAS_IMAGE_RUN_FAILED',
+      execution: { kind: 'image', operationId: 'workflow-image-operation', batchId: 'batch-workflow', taskId: 'job-1' },
+      executionHistory: [], retryDisposition: 'terminal-failed', completedArtifactHash: null, completedAt: null,
+    }],
+    budget: {
+      maxMediaRuns: 1, consumedMediaRuns: 1, remainingMediaRuns: 0,
+      maxDurationMs: 1000, remainingDurationMs: 0, activeStartedAt: null,
+    },
+    autoResumeAfterAdoption: false,
+    cancelRequestedAt: null,
+    cancelledAt: null,
+    createdAt: 1,
+    updatedAt: 1,
+    ...overrides,
+  }
+}
+
 /** 创建可观察任务读写次数的服务夹具。 */
 function createFixture(
   initialJobs: DesignJobRecord[] = [createJob()],
   options: {
     failCandidateBatchSaveOnce?: boolean
     traceEntries?: DesignTraceEntry[]
+    workflowRuns?: CanvasWorkflowRun[]
   } = {},
 ) {
   const jobs = [...initialJobs]
@@ -131,6 +168,9 @@ function createFixture(
         }
       },
     },
+    ...(options.workflowRuns ? {
+      workflowRuns: { list: () => structuredClone(options.workflowRuns!) },
+    } : {}),
   })
   return {
     service,
@@ -315,8 +355,8 @@ describe('CanvasTaskOperationService', () => {
     const first = await fixture.service.retryTaskLocked({ ...reference, operationId: 'operation-1' })
     const replay = await fixture.service.retryTaskLocked({ ...reference, operationId: 'operation-1' })
 
-    expect(first).toEqual({ operationId: 'operation-1', originalJobId: 'job-1', replacementJobId: 'job-2' })
-    expect(replay).toEqual(first)
+    expect(first).toEqual({ operationId: 'operation-1', originalJobId: 'job-1', replacementJobId: 'job-2', created: true })
+    expect(replay).toEqual({ operationId: 'operation-1', originalJobId: 'job-1', replacementJobId: 'job-2', created: false })
     expect(fixture.retryCount).toBe(1)
     expect(fixture.jobs[1]?.imageModelSnapshot).toEqual(fixture.jobs[0]?.imageModelSnapshot)
     expect(fixture.jobs[1]?.finalImagePrompt).toBe(fixture.jobs[0]?.finalImagePrompt)
@@ -334,7 +374,7 @@ describe('CanvasTaskOperationService', () => {
     expect(fixture.retryInputs).toHaveLength(2)
   })
 
-  test('Given 已存在 replacement 的模型或正式引用漂移 When 重放旧任务 Then 拒绝复用异常快照', async () => {
+  test('Given 已存在 replacement 的模型、正式引用或提示词合同漂移 When 重放旧任务 Then 拒绝复用异常快照', async () => {
     const original = createJob({
       canvasInputReferences: [{
         nodeId: 'source-1', kind: 'image', revision: 3,
@@ -353,13 +393,20 @@ describe('CanvasTaskOperationService', () => {
         assetId: 'asset-other',
       }],
     })])
+    const frozenPromptOriginal = createJob({ imagePromptContract: 'frozen-config-v1' })
+    const changedPromptContract = createFixture([frozenPromptOriginal, createJob({
+      id: 'job-2', attemptNumber: 2, createdAt: 2,
+    })])
 
     await expect(changedModel.service.retryTaskLocked({ ...reference, operationId: 'operation-model' }))
       .rejects.toThrow('CANVAS_TASK_RETRY_SNAPSHOT_MISMATCH')
     await expect(changedReference.service.retryTaskLocked({ ...reference, operationId: 'operation-reference' }))
       .rejects.toThrow('CANVAS_TASK_RETRY_SNAPSHOT_MISMATCH')
+    await expect(changedPromptContract.service.retryTaskLocked({ ...reference, operationId: 'operation-prompt-contract' }))
+      .rejects.toThrow('CANVAS_TASK_RETRY_SNAPSHOT_MISMATCH')
     expect(changedModel.retryCount).toBe(0)
     expect(changedReference.retryCount).toBe(0)
+    expect(changedPromptContract.retryCount).toBe(0)
   })
 
   test('Given replacement 之后再次失败 When 用户引用新 attempt 重试 Then 创建下一 attempt', async () => {
@@ -371,7 +418,7 @@ describe('CanvasTaskOperationService', () => {
       ...reference, jobId: 'job-2', operationId: 'operation-2',
     })
 
-    expect(second).toEqual({ operationId: 'operation-2', originalJobId: 'job-2', replacementJobId: 'job-3' })
+    expect(second).toEqual({ operationId: 'operation-2', originalJobId: 'job-2', replacementJobId: 'job-3', created: true })
     expect(fixture.retryCount).toBe(2)
   })
 
@@ -394,6 +441,13 @@ describe('CanvasTaskOperationService', () => {
     })
   })
 
+  test('Given 母版与目标旧采用不同 When 重试恢复批次 Then 使用目标采用基线', async () => {
+    const fixture = createFixture([createJob({ candidateBatchId: '11111111-1111-4111-8111-111111111111',
+      canvasImageConfigRevision: 7, sourceAssetId: 'asset-master', canvasImageInitialAdoptedAssetId: null })])
+    await fixture.service.retryTaskLocked({ ...reference, operationId: 'operation-1' })
+    expect(fixture.retryInputs[0]).toMatchObject({ singleBatchRecovery: { initialAdoptedAssetId: null } })
+  })
+
   test('Given 旧任务缺少候选批次 When 重试 Then 复用 Manager 原快照重试并后台启动', async () => {
     const legacy = createFixture([createJob({ candidateBatchId: undefined })])
 
@@ -403,6 +457,52 @@ describe('CanvasTaskOperationService', () => {
     expect(legacy.retryCount).toBe(1)
     await Promise.resolve()
     expect(legacy.legacyRunCount).toBe(1)
+  })
+
+  test('Given 任一状态的工作流已记录当前图片任务 When 独立重试 Then 拒绝绕过原工作流预算', async () => {
+    const statuses: CanvasWorkflowRun['status'][] = [
+      'running', 'waiting-review', 'waiting-budget', 'completed', 'partial', 'failed', 'cancelled',
+    ]
+
+    for (const status of statuses) {
+      const fixture = createFixture([createJob()], {
+        workflowRuns: [createWorkflowRun({ status })],
+      })
+
+      await expect(fixture.service.retryTaskLocked({ ...reference, operationId: `independent-${status}` }))
+        .rejects.toThrow('CANVAS_WORKFLOW_TASK_RETRY_REQUIRES_RESUME')
+      expect(fixture.retryCount).toBe(0)
+    }
+  })
+
+  test('Given 工作流历史 attempt 或未知提交可证明图片归属 When 独立重试 Then 拒绝同一创作链', async () => {
+    const original = createJob({ id: 'job-workflow-original', attemptNumber: 1 })
+    const retry = createJob({ id: 'job-1', attemptNumber: 2 })
+    const historyRun = createWorkflowRun({ nodes: [{
+      ...createWorkflowRun().nodes[0]!,
+      execution: { kind: 'image', operationId: 'workflow-current', batchId: 'batch-current', taskId: 'job-current' },
+      executionHistory: [{
+        kind: 'image', operationId: 'workflow-original', batchId: 'batch-original', taskId: original.id,
+      }],
+    }] })
+    const historyFixture = createFixture([original, retry], { workflowRuns: [historyRun] })
+    await expect(historyFixture.service.retryTaskLocked({ ...reference, operationId: 'independent-history' }))
+      .rejects.toThrow('CANVAS_WORKFLOW_TASK_RETRY_REQUIRES_RESUME')
+    expect(historyFixture.retryCount).toBe(0)
+
+    const owner = { sessionId: 'workflow-unknown-session', runStartedAt: 23 }
+    const unknownJobId = createImageJobId(owner, 'workflow-unknown-operation', 'canvas-1', 'node-1')
+    const unknownRun = createWorkflowRun({
+      owner,
+      nodes: [{
+        ...createWorkflowRun().nodes[0]!,
+        execution: { kind: 'image', operationId: 'workflow-unknown-operation', batchId: null, taskId: null },
+      }],
+    })
+    const unknownFixture = createFixture([createJob({ id: unknownJobId })], { workflowRuns: [unknownRun] })
+    await expect(unknownFixture.service.retryTaskLocked({ ...reference, jobId: unknownJobId, operationId: 'independent-unknown' }))
+      .rejects.toThrow('CANVAS_WORKFLOW_TASK_RETRY_REQUIRES_RESUME')
+    expect(unknownFixture.retryCount).toBe(0)
   })
 
   test('Given 原任务缺少模型快照 When 重试 Then 在付费提交前明确失败', async () => {

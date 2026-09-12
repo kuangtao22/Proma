@@ -24,6 +24,7 @@ import type {
   CanvasImageJobControlInput,
   CanvasImageCandidateBatch,
   CanvasImageModuleConfig,
+  CanvasImageModuleChangedEvent,
   CanvasImageModuleSnapshot,
   CanvasImageTarget,
   CanvasMediaPreloadApi,
@@ -156,7 +157,7 @@ export interface DesignAdapter extends CanvasMediaPreloadApi,
   /** 只向监听器传递四元身份完整匹配的图片模块事件。 */
   onCanvasImageModuleChanged: (
     target: CanvasImageTarget,
-    listener: (event: CanvasImageTarget) => void,
+    listener: (event: CanvasImageModuleChangedEvent) => void,
   ) => ReturnType<DesignPreloadApi['onCanvasImageModuleChanged']>
   /** 加载目标原生 Canvas，避免与 legacy Design load 混淆。 */
   loadCanvas: (input: LoadCanvasInput) => Promise<CanvasWorkspaceSnapshot>

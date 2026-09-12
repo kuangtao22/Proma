@@ -1153,6 +1153,10 @@ export class AgentOrchestrator {
         trustedImageRoute: extensions.trustedImageRoute,
         resolveTrustedImageRoute: extensions.resolveTrustedImageRoute,
         captureDesignImageCall: extensions.captureDesignImageCall,
+        trustedImagePrompt: extensions.trustedImagePrompt,
+        trustedImageParameters: extensions.trustedImageParameters,
+        trustedReferenceImagePaths: extensions.trustedReferenceImagePaths,
+        captureDesignImageRequest: extensions.captureDesignImageRequest,
         ...(serverOpsFacade ? { serverOpsFacade } : {}),
       })
       checkpoint()
@@ -1398,7 +1402,7 @@ export class AgentOrchestrator {
           if (options.signal.aborted) {
             return { behavior: 'deny' as const, message: '操作已中止', toolUseID: options.toolUseID }
           }
-          if (extensions.toolApprovalPolicy?.getMode(toolName) === 'automatic') {
+          if (extensions.toolApprovalPolicy?.getMode(toolName, input) === 'automatic') {
             return { behavior: 'allow' as const, updatedInput: input, toolUseID: options.toolUseID }
           }
           const result = await permissionService.requestSingleApproval(

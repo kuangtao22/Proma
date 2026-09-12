@@ -36,6 +36,8 @@ export type CanvasImageModuleSaveState = 'saved' | 'dirty' | 'saving' | 'failed'
 export interface CanvasImageModuleDraft {
   prompt: string
   selectedModelProfileId: string | null
+  /** 普通图片模型编辑时选中的绑定图片节点；null 使用当前节点自身采用图。 */
+  editSourceNodeId: string | null
   mediaWorkflow?: CanvasImageMediaWorkflow | null
   aspectRatio: CanvasImageAspectRatio
   imageSize: CanvasImageSize
@@ -141,6 +143,15 @@ export const nativeCanvasStatesAtom = atom<Map<string, NativeCanvasState>>(new M
 
 /** 所有已挂载 Canvas 图片模块按完整四元身份隔离的状态。 */
 export const canvasImageModuleStatesAtom = atom<Map<string, CanvasImageModuleViewState>>(new Map())
+
+/**
+ * 创建只订阅单个图片模块对象引用的派生 atom。
+ * @param key 已通过完整四元身份构造的模块键。
+ * @returns 当前模块状态；尚未建立状态时返回 null。
+ */
+export function createCanvasImageModuleStateAtom(key: string) {
+  return atom((get) => get(canvasImageModuleStatesAtom).get(key) ?? null)
+}
 
 /** 图片模块状态支持局部对象或基于当前值的函数更新。 */
 export type CanvasImageModuleStateUpdate = Partial<CanvasImageModuleViewState>

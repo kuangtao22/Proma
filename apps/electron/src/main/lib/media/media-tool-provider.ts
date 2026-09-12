@@ -1155,8 +1155,18 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     singleApprovalToolNames: isExecutionCapable ? ['media_execute_run', 'media_cancel_run'] : [],
     toolApprovalPolicy: {
       /** 策略只对明确列出的工具及可执行上下文生效，实时读取用户设置。 */
-      getMode: (toolName) => isExecutionCapable && MEDIA_AUTOMATION_TOOL_NAMES.has(toolName)
-        ? mediaAuthorizationMode(dependencies) : 'ask',
+      getMode: (toolName, input) => {
+        if (!isExecutionCapable || !MEDIA_AUTOMATION_TOOL_NAMES.has(toolName)) return 'ask'
+        if (toolName === 'canvas_resume_workflow') {
+          /** 自主恢复不能扩大原预算；缺失或非法参数也不得成为免审扩额路径。 */
+          if (!input || typeof input !== 'object' || Array.isArray(input)) return 'ask'
+          for (const key of ['addMediaRuns', 'addDurationMs'] as const) {
+            const value = input[key]
+            if (value !== undefined && (typeof value !== 'number' || !Number.isSafeInteger(value) || value !== 0)) return 'ask'
+          }
+        }
+        return mediaAuthorizationMode(dependencies)
+      },
       /** 仅等待审批时订阅设置事件，不轮询配置或远端服务器。 */
       subscribe: (listener) => dependencies.configuration.subscribeAuthorizationMode?.(listener) ?? (() => {}),
     },

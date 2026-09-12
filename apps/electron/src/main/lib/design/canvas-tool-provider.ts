@@ -45,8 +45,12 @@ import type { AgentRunExtensions } from '../agent-run-extensions'
 import { isValidImageBytes } from '../image-content-validation'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
 import type { CanvasAgentConfigStore } from './canvas-agent-config-store'
-import type { CanvasAgentExecutionService } from './canvas-agent-execution-service'
+import type { CanvasAgentExecutionResult, CanvasAgentExecutionService } from './canvas-agent-execution-service'
+import { describeCanvasAgentPreparationFailure } from './canvas-agent-execution-service'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
+import { createCanvasAgentReviewTracker, resolveCanvasAgentReviewContext } from './canvas-agent-review'
+import type { CanvasAgentReviewContext, CanvasAgentReviewCoverage } from './canvas-agent-review'
+import { resolveCanvasAgentReviewPosition } from './canvas-agent-review-layout'
 import type {
   CanvasArtifactCreationResult,
   CanvasArtifactCreationService,
@@ -538,6 +542,10 @@ export interface CanvasToolRunContext {
   canvasAgentMode?: 'renderer-manual' | 'parent-orchestrated'
   /** 父编排工作流的 Host-only 身份，只在 parent-orchestrated 子运行中透传。 */
   parentWorkflow?: { runId: string; parentSessionId: string }
+  /** 单次专业审核的Host快照，与直接输入、执行依赖及长期配置分开。 */
+  reviewContext?: CanvasAgentReviewContext
+  /** Host-only 创建回执；仅执行上下文携带，不进入工具参数、IPC 或持久化。 */
+  onImageJobsCreated?: (canvasId: string, jobs: readonly { nodeId: string; jobId: string }[]) => void
 }
 
 /** Canvas Agent 按固定正向清单选择工具，未来新增能力默认拒绝。 */
@@ -617,6 +625,8 @@ export interface CanvasToolProviderDependencies {
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
 export interface CanvasToolRun extends Required<Pick<AgentRunExtensions, 'systemPromptAppend' | 'piCustomTools' | 'allowedToolNames' | 'singleApprovalToolNames'>> {
   allowedToolNamesMode: 'extend'
+  /** 运行终态返回本轮实际数据覆盖，不等同方案或媒体内容验收。 */
+  getReviewCoverage?: () => CanvasAgentReviewCoverage
   /** 仅已登记的任务或明确父编排运行需要完成核验。 */
   evaluateCompletion?: AgentRunExtensions['evaluateCompletion']
   /** 本轮实际装配的只读工具，供通用权限层在计划模式准入。 */
@@ -855,6 +865,8 @@ export function createCanvasToolRun(
   }
   /** 任务基线仅在首次登记成功后保留，重放 start 不能改用更新后的事实。 */
   let taskBaseline: CanvasTaskBaseline | undefined
+  /** 只在显式审核运行装配内存记录，普通运行没有新增图读取或常驻扫描。 */
+  const reviewTracker = context.reviewContext ? createCanvasAgentReviewTracker(context.reviewContext) : undefined
   /** 明确父编排必须交付；交互式问答仅在模型登记执行任务后启用核验。 */
   const task = createCanvasTaskContract({
     required: context.canvasAgentMode === 'parent-orchestrated' && context.permissionCeiling === 'execute',
@@ -862,6 +874,17 @@ export function createCanvasToolRun(
     verifyBatch: verifyTaskEvidence,
     validateScope: async (canvasId, signal) => { assertReadAccess(canvasId, signal) },
   })
+
+  /** 在启动调用时绑定合同，防止合同开始前发起的旧任务因迟到回执冒充新生成。 */
+  const taskExecutionContext = (): CanvasToolRunContext => {
+    const started = task.status()
+    if (started.phase !== 'working') return context
+    return { ...context, onImageJobsCreated: (canvasId, jobs) => {
+      if (canvasId === started.canvasId && task.status().phase === 'working') {
+        task.recordGeneratedJobs(canvasId, jobs)
+      }
+    } }
+  }
 
   /** 只用创建事务返回的身份登记后继，后置失败仍向模型返回已创建节点。 */
   const registerCreatedSuccessor = async (
@@ -966,6 +989,11 @@ export function createCanvasToolRun(
           permissionCeiling: context.permissionCeiling,
           task: task.status(),
           availableTools: [...availableToolNames],
+          ...(reviewTracker && context.reviewContext ? { review: {
+            mode: context.reviewContext.mode,
+            ...(context.reviewContext.mode === 'nodes' ? { nodeIds: context.reviewContext.nodeIds } : {}),
+            coverage: reviewTracker.status(),
+          } } : {}),
         })
       },
     }),
@@ -1313,8 +1341,11 @@ export function createCanvasToolRun(
             if (node.kind === 'agent') {
               /** Agent 正文只从节点正式 outputPointer 经权威服务校验后读取。 */
               readStage = 'agent-output'
-              fullContent = await dependencies.agentOutputs.read({ ...target, nodeId: node.id })
-              assertReadAccess(params.canvasId, signal)
+              /** 尚未首次运行的节点没有正式输出，直接读取配置；已有指针仍须严格校验正文。 */
+              if (node.outputPointer) {
+                fullContent = await dependencies.agentOutputs.read({ ...target, nodeId: node.id })
+                assertReadAccess(params.canvasId, signal)
+              }
               /** 配置读取复用受管 Store 的身份验证；只返回可编辑字段及独立 CAS 基线。 */
               readStage = 'agent-config'
               const config = await dependencies.agentConfigs.load({ ...target, nodeId: node.id })
@@ -1449,6 +1480,8 @@ export function createCanvasToolRun(
             if (proof) task.record(proof)
           }
         }
+        /** 仅计入最终预算裁剪后送达的数据；枚举摘要与模型自报不增加审核覆盖。 */
+        reviewTracker?.record(details)
         return toolResult(details as unknown as Record<string, unknown>, true)
       },
     }),
@@ -1773,7 +1806,7 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_update_image_config', label: '更新生图节点配置',
-      description: '局部更新已有生图节点的提示词、模型、工作流、画幅或上下文；工作流输入可先保存已知值，运行前必须补齐。分析失败用 preparation 保存错误码、节点/字段和中文原因，修复后传 null 清除。只保存配置，不会自动生图。',
+      description: '局部更新已有生图节点的提示词、模型、编辑底图、工作流、画幅或上下文；editSourceNodeId 只能选择通过 image.asset -> image.reference 绑定的图片节点，传 null 改用当前节点自身采用图。工作流输入可先保存已知值，运行前必须补齐。分析失败用 preparation 保存错误码、节点/字段和中文原因，修复后传 null 清除。只保存配置，不会自动生图。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -1783,6 +1816,10 @@ export function createCanvasToolRun(
         prompt: Type.Optional(Type.String({ maxLength: 256 * 1024 })),
         selectedModelProfileId: Type.Optional(Type.Union([
           Type.String({ minLength: 1, maxLength: 128 }),
+          Type.Null(),
+        ])),
+        editSourceNodeId: Type.Optional(Type.Union([
+          Type.String({ minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' }),
           Type.Null(),
         ])),
         mediaWorkflow: Type.Optional(Type.Union([
@@ -1826,6 +1863,7 @@ export function createCanvasToolRun(
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
           if (params.prompt === undefined
             && params.selectedModelProfileId === undefined
+            && params.editSourceNodeId === undefined
             && params.mediaWorkflow === undefined
             && params.aspectRatio === undefined
             && params.imageSize === undefined
@@ -1841,6 +1879,18 @@ export function createCanvasToolRun(
           const node = document.nodes.find((candidate) => candidate.id === params.nodeId)
           if (!node) throw new Error('CANVAS_NODE_NOT_FOUND')
           if (node.kind !== 'image') throw new Error('CANVAS_IMAGE_NODE_REQUIRED')
+          if (params.editSourceNodeId !== undefined && params.editSourceNodeId !== null) {
+            /** 编辑来源必须是当前权威图中通过精确图片端口绑定的其它图片节点。 */
+            const sourceNode = document.nodes.find((candidate) => candidate.id === params.editSourceNodeId)
+            const sourceBound = sourceNode?.kind === 'image'
+              && sourceNode.id !== node.id
+              && document.edges.some((edge) => edge.sourceNodeId === sourceNode.id
+                && edge.sourcePort === 'image.asset'
+                && edge.targetNodeId === node.id
+                && edge.targetPort === 'image.reference'
+                && edge.relation !== 'association')
+            if (!sourceBound) throw new Error('CANVAS_IMAGE_EDIT_SOURCE_INVALID')
+          }
           /** 当前配置为未提供字段提供基线，并由 config revision 防止并发覆盖。 */
           const imageTarget = { ...target, nodeId: node.id, imageModuleId: node.imageModuleId }
           const currentConfig = await dependencies.images.loadConfig(imageTarget)
@@ -1865,6 +1915,7 @@ export function createCanvasToolRun(
             expectedConfigRevision: params.expectedConfigRevision,
             prompt: params.prompt ?? currentConfig.prompt,
             selectedModelProfileId,
+            ...(params.editSourceNodeId === undefined ? {} : { editSourceNodeId: params.editSourceNodeId }),
             ...(mediaWorkflow ? { mediaWorkflow } : {}),
             preparation: params.preparation === undefined ? currentConfig.preparation ?? null : params.preparation,
             aspectRatio: params.aspectRatio ?? currentConfig.aspectRatio,
@@ -2170,7 +2221,7 @@ export function createCanvasToolRun(
     }),
     defineCanvasTool({
       name: 'canvas_run_agent', label: '运行 Canvas Agent',
-      description: '显式运行单个 Canvas Agent 并等待终态；不会自动运行下游节点或启动图片任务。',
+      description: '显式运行单个 Canvas Agent 并等待终态；不会自动运行下游节点或启动图片任务。专业审核用 reviewScope 明确整图或指定节点，返回 reviewCoverage 数据覆盖；首次导演规划可用 positionBeforeNodeIds 将该Agent移到制作节点前方，只改位置不加边。',
       parameters: Type.Object({
         canvasId: Type.String({ minLength: 1, maxLength: 128 }),
         nodeId: Type.String({ minLength: 1, maxLength: 128 }),
@@ -2179,6 +2230,13 @@ export function createCanvasToolRun(
         skillNames: Type.Optional(Type.Array(Type.String({ pattern: STABLE_AGENT_SKILL_NAME_PATTERN.source }), {
           maxItems: MAX_AGENT_RUN_SKILLS,
         })),
+        reviewScope: Type.Optional(Type.Union([
+          Type.Object({ mode: Type.Literal('canvas') }, { additionalProperties: false }),
+          Type.Object({ mode: Type.Literal('nodes'), nodeIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }),
+            { minItems: 1, maxItems: 128 }) }, { additionalProperties: false }),
+        ])),
+        positionBeforeNodeIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }),
+          { minItems: 1, maxItems: 128 })),
       }, { additionalProperties: false }),
       execute: async (toolCallId, params, signal) => {
         dependencies.access.authorizeRead(context)
@@ -2194,24 +2252,59 @@ export function createCanvasToolRun(
         const agentTarget = { ...target, nodeId: node.id }
         const instruction = requireAgentRunInstruction(params.instruction)
         const skillNames = requireAgentRunSkillNames(params.skillNames)
+        /** 非法审核范围在任何位置写入之前拒绝，执行服务仍会在最终启动快照复验。 */
+        if (params.reviewScope) resolveCanvasAgentReviewContext(document, node.id, params.reviewScope)
+        /** 位置提交与模型运行分开持锁，长时间推理不占用画布写锁。 */
+        const executionRevision = params.positionBeforeNodeIds
+          ? await dependencies.access.runWrite(context, async () => {
+              /** CAS初检确保移动不覆盖用户刚完成的修改。 */
+              const snapshot = loadReadSnapshot(target, signal, params.expectedRevision)
+              /** 布局只计算当前Agent的新位置，需求和参考节点保持原位。 */
+              const position = resolveCanvasAgentReviewPosition(snapshot.document, node.id, params.positionBeforeNodeIds!)
+              if (position.x === node.position.x && position.y === node.position.y) return snapshot.document.revision
+              /** 使用现有原子批次与结构锁，只提交一个位置，无业务边变更。 */
+              const moved = await dependencies.batch.execute(parseCanvasBatchOperationEnvelope({
+                ...target, baseRevision: snapshot.document.revision,
+                operations: [{ type: 'move-nodes', positions: [{ nodeId: node.id, position }] }],
+                sourceSessionId: context.sessionId, sourceRunStartedAt: context.runStartedAt,
+                sourceToolCallId: createHash('sha256').update(`review-position:${toolCallId}`).digest('hex'),
+              }))
+              assertReadAccess(params.canvasId, signal)
+              return moved.document.revision
+            })
+          : params.expectedRevision
         /** custom tool 的取消信号直接传给统一执行服务，不经过 Renderer IPC 或递归 Pi 工具。 */
         const result = await dependencies.agentExecution.execute({
           mode: 'parent-orchestrated',
           target: agentTarget,
           parentSessionId: context.sessionId,
-          expectedGraphRevision: params.expectedRevision,
+          expectedGraphRevision: executionRevision,
           instruction,
           ...(skillNames ? { skillNames } : {}),
+          ...(params.reviewScope ? { reviewScope: params.reviewScope } : {}),
           userMessageUuid: toolCallId,
           startedAt: context.runStartedAt,
           signal,
+        }).catch((error: unknown): CanvasAgentExecutionResult => {
+          /** 可修复配置问题回到同一节点；撤权和版本冲突仍原样拒绝，不变成普通完成回执。 */
+          const failure = describeCanvasAgentPreparationFailure(error)
+          if (!failure) throw error
+          return { status: 'errored' as const, failure }
         })
         if (result.status !== 'completed') {
+          assertReadAccess(params.canvasId, signal)
           return toolResult({
             nodeId: node.id,
+            nodeTitle: node.title,
             status: result.status,
             downstreamNodeIds: [],
             outputSummary: '',
+            ...(result.failure ? { failure: result.failure } : {}),
+            ...(result.status === 'errored' ? { nextAction: {
+              tool: 'canvas_read', canvasId: params.canvasId, nodeIds: [node.id],
+              reason: '先核对原节点的配置、已有正式输出和失败原因；检查已完成工作后再决定如何继续。',
+            } } : {}),
+            ...(result.reviewCoverage ? { reviewCoverage: result.reviewCoverage } : {}),
           })
         }
         if (!result.output
@@ -2222,12 +2315,15 @@ export function createCanvasToolRun(
         }
         /** 正式 pointer 对应的权威正文只用于生成有界摘要，不回查任意末条消息。 */
         const output = await dependencies.agentOutputs.readAtPointer(agentTarget, result.output.pointer)
+        assertReadAccess(params.canvasId, signal)
         return toolResult({
           nodeId: node.id,
+          nodeTitle: node.title,
           status: result.status,
           outputPointer: result.output.pointer,
           downstreamNodeIds: result.output.downstreamNodeIds,
           outputSummary: truncateUtf8(output, MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES),
+          ...(result.reviewCoverage ? { reviewCoverage: result.reviewCoverage } : {}),
         })
       },
     }),
@@ -2250,7 +2346,7 @@ export function createCanvasToolRun(
         const document = dependencies.documents.load({ projectId: context.projectId, canvasId: input.canvasId }).document
         if (document.revision !== input.expectedRevision) throw new Error('CANVAS_REVISION_CONFLICT')
         const result: CanvasRunWorkflowResult = parseCanvasRunWorkflowResult(
-          await dependencies.workflowExecution.execute(context, input, toolCallId, signal),
+          await dependencies.workflowExecution.execute(taskExecutionContext(), input, toolCallId, signal),
         )
         return toolResult({ ...result })
       },
@@ -2310,7 +2406,7 @@ export function createCanvasToolRun(
           throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
         }
         dependencies.access.requireLinkedCanvas(context, params.canvasId)
-        const result = await dependencies.workflowExecution.resume(context, {
+        const result = await dependencies.workflowExecution.resume(taskExecutionContext(), {
           projectId: context.projectId, canvasId: params.canvasId, runId: params.runId,
           ...(params.expectedRunRevision === undefined ? {} : { expectedRunRevision: params.expectedRunRevision }),
           ...(params.resumeOperationId === undefined ? {} : { resumeOperationId: params.resumeOperationId }),
@@ -2351,6 +2447,8 @@ export function createCanvasToolRun(
         signal?.throwIfAborted()
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_RUN_REQUIRES_EXPLICIT_EXECUTE')
+        /** 在异步预检之前捕获合同；预检期间的新 start 不追认旧调用。 */
+        const executionContext = taskExecutionContext()
         return dependencies.access.runWrite(context, async () => {
           signal?.throwIfAborted()
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
@@ -2380,7 +2478,7 @@ export function createCanvasToolRun(
           /** 图片及无需运行的内容节点继续复用既有批量服务。 */
           const nonMediaNodes = nodes.filter((node) => node.kind !== 'audio' && node.kind !== 'video')
           const imageResult = nonMediaNodes.length > 0
-            ? await dependencies.imageRuns.run(context, target, nonMediaNodes, toolCallId, {
+            ? await dependencies.imageRuns.run(executionContext, target, nonMediaNodes, toolCallId, {
                 signal: signal ?? new AbortController().signal,
                 deadlineAt: Date.now() + MAX_IMAGE_RUN_START_MS,
               })
@@ -2447,6 +2545,7 @@ export function createCanvasToolRun(
   const operationTools = createCanvasOperationTools(
     dependencies.operations ?? {}, context, dependencies.access,
     (toolCallId) => createArtifactOperationId(context, toolCallId),
+    taskExecutionContext,
   )
   /** 新操作与兼容工作流入口同名时使用已装配的统一处理器，避免向模型注册重复工具。 */
   const operationToolNames = new Set(operationTools.map((tool) => tool.name))
@@ -2552,11 +2651,14 @@ export function createCanvasToolRun(
         title: reference.title,
       })))}。
 - 开始生产前先用 canvas_get_context 确认作用域，再用 canvas_read 读取当前 revision 与直接输入节点；连线不是装饰，也不能只凭标题推断正文。
+- 若 canvas_get_context 返回 review，则本轮还有独立审核范围，直接输入不是全部审核目标。先按 review.coverage.scopeRevision 完成所有目标当前正文/配置与关系读取，再写方案；mode=canvas 时用 canvas_list_nodes 不带类型过滤分页枚举（排除自身），mode=nodes 时读取给定 nodeIds。用 canvas_get_context 查看未读、失败、截断和缺边样本，缺边按端点成对补读。样本最多32项，以总数判断是否补齐。旧revision冲突时报告本轮基线过期，不混用新旧版本声称全量完成。
+- review.coverage.complete 只表示固定基线的当前节点数据和关联边已送达，不含完整历史目录、视觉、试听或语义审核；配置版本可能独立变化，方案须记录实际 configRevision/素材版本，主 Agent 在生成前重新核验。报告逐节点列出版本、判断依据、阻塞问题、修改建议和未复核项。先完成读取，再创建或更新方案，避免自己的写入提前改变审核基线。
 - 任务要求产出文档、WebView 或图片配置时，由当前 Canvas Agent 直接创建或更新当前画布的下游产物，并以工具返回结果为准。
 - 不得创建、关联、解除关联或切换其它画布，也不得把任务转交给普通 Agent 或协作会话。`
     : ''
 
   return {
+    ...(reviewTracker ? { getReviewCoverage: () => reviewTracker.status() } : {}),
     evaluateCompletion: (signal) => task.evaluate(signal),
     systemPromptAppend: `## 画布工具
 请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
@@ -2564,6 +2666,15 @@ export function createCanvasToolRun(
 明确执行画布任务时先用 canvas_task start 登记真实交付要求，并按可用能力自主读取、配置、执行、验证和修复。response 仅适用于文本本身就是用户交付，不能用它代替要求的节点或真实生成结果。canvas_read 返回 content/configuration/adopted 证据，canvas_inspect_images 返回真实图像检查的 inspection 证据；用 evidenceId 完成全部要求后调用 canvas_task complete。配置已保存不表示可运行，媒体采用不表示质量通过。音视频 metadataOnly 与 WebView 源码不能代替内容或交互检查，缺少能力时 canvas_task block 报告具体原因。完成前 Host 会复验产物版本；有合法下一步的未完成任务在原会话和预算内继续，不能重建运行或降低交付要求来绕过核验。普通能力咨询和无需画布产物的问答不必登记任务。任务要求新增产物时，保留源输入，读取新产物作为完成证据。
 
 当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
+
+先依据当前任务的用途、受众、交付、已有素材、阶段和成本约束选择制作模式，再按真实模型/工作流能力选择生成模式。单项试验可直接完成，系列产物先统一规范，多镜头视频先导演规划，已有素材剪辑先梳理素材和时间线；工程与研究沿各自的专业分工，不套用导演。产品推广、教程、叙事、氛围展示各按卖点与行动引导、步骤正确、角色因果、视听节奏来评审。解释推荐模式的依据和用户影响，不按关键词、节点数量或模型名称硬编码。复杂生产或适配评审时按 canvas-production 入口读取 references/production-review.md。
+精确尺寸、文案、几何适配或反复失败时，读取 canvas-production 的 references/production-recovery.md，选择可验证精度匹配的真实制作能力。新图片任务冻结配置提示词；优化应先改配置再创建候选，retry保持原快照。updated+inspection用于本合同启动后生成并检查的候选，existing+inspection用于已有版本；检查完成、质量通过、正式采用分别汇报。无法验证时明确说明，不为补证据重生成。工作流图片通过原resume定向重试，预算内恢复沿用当前策略，正数扩额需要确认；failure/nextAction先引导读取原节点，不能盲目重跑。
+
+只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演。创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议，不调用执行工具，也不声称已保存或运行导演。用户已授权规划、制作或修复多镜头视频且缺少适用方案时，普通 Agent 创建或复用导演 Canvas Agent，通过 canvas_run_agent 单独产出方案，读取真实正文后由主 Agent 评审，再安排各阶段生成；不要从未经评审的规划起点直接运行整个工作流。固定分支 Agent 完成本职方案，不递归创建或调度其它 Agent。方案明确镜头时长、机位/运动、动作起止、转场、关键帧和资产来源、图片/视频/声音提示词、音轨与验收；连续动作可复用精确素材，切镜不强制首尾相等，规划尾帧不保证成片实际末帧一致。
+
+导演首次接管已有视频时，先分页枚举全部类型，根据用途和真实内容划定本任务范围，包括漏连和孤立节点；整张画布属于本视频时 canvas_run_agent 使用 reviewScope={mode:"canvas"}，混合任务或局部复核使用 reviewScope={mode:"nodes",nodeIds:[...]}，显式范围每次最多128个节点，超出时分批复核并汇总全部范围。首次创建或复用导演需要放在制作流程前端时，传 positionBeforeNodeIds 指定本任务制作节点；需求与参考资产不作为必须放在导演之后的目标。位置只影响展示，不为审核添加执行依赖，也不重排其它节点。已有有效方案只缺审核覆盖时由主 Agent 补读，不能因此重跑导演。检查返回的 reviewCoverage，未读/截断/失败/缺边不能称为完整审核；失败有界重读或报告阻塞，不为补覆盖重新生成素材。后续根据修改节点、真实依赖和镜头连续性确定受影响集合，使用局部范围，不重复整图扫描或已满足节点的生成。审核范围与执行范围分开，主 Agent 仍是唯一总编排。
+
+评审给出结论、依据、阻塞问题、改进建议和下一步，问题须定位产物并说明用户影响、修复及复核办法。只评审时只读，不自动建报告或生成；单项任务无需额外创建规划和评审文档。已授权执行且需要维护多阶段方案时保存可复读的方案与评审记录，开始时将其与最终产物一起登记在原 canvas_task，不中途替换合同或以方案代替成片交付。有阻塞先修复，无阻塞沿已有授权和预算推进，不把普通建议变成额外确认。评审通过不等于生成授权；方案或上游正式素材变化需局部重审，已满足且未变化的产物不重做。内容证据只证明版本存在，方案质量仍由 Agent 判断，不能声称 Host 已自动评审。下一阶段所需真实素材未验收时不得提前启动。
 
 创建或修改前先用 canvas_get_context 获取权威关联；已有合适画布时直接复用，不要要求用户另建已经存在的画布。没有可用画布且用户已明确选择画布产物时，才用 canvas_manage 创建并关联。需要独立 Canvas Agent 分工时，普通 Agent 自行调用 canvas_create_agent，不要求用户手工创建。已有授权本地图片使用 canvas_import_image 导入为正式采用参考图，不要求用户拖入原生 Canvas。正文只通过 canvas_create_artifact 或 canvas_update_artifact 保存，图片画幅、尺寸、模型或上下文通过 canvas_update_image_config 局部修改，canvas_apply_changes 只处理结构；有关联来源时提供准确 relation。重建流程必须先验证并建立可执行的新链路，再删除旧节点。WebView 创建成功后即可直接预览，不得为 WebView 调用 canvas_run_nodes；图片仅在用户明确要求立即生成时才调用 canvas_run_nodes。图片任务启动不代表已完成；首次成功且节点仍无默认素材、配置未变时，Host 自动将首份素材设为默认，后续生成仍是候选且不覆盖旧版。汇报前读取真实 adopted 状态，默认选中不代表视觉验收通过，也不会自动续跑工作流。可用 canvas_get_image_candidates 读取真实候选缩略图，用户已授权采用时用 canvas_adopt_image_candidates 提交精确 candidateHash。
 
