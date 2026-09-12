@@ -778,30 +778,42 @@ function sanitizeOversizedMessage(msg: SDKMessage, originalLength: number): SDKM
   const truncationNote = `\n[内容已截断: 原始 ${(originalLength / 1024).toFixed(0)}K chars 超出存储限制]`
   const truncationThreshold = MAX_SDK_MESSAGE_LENGTH / 2
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const clone: any = JSON.parse(JSON.stringify(msg))
-  const content = clone.message?.content
+  /** 清理仅修改 JSON 深拷贝；调用方持有的原始 Pi 消息必须继续可用于运行时与展示投影。 */
+  const clone = JSON.parse(JSON.stringify(msg)) as Record<string, unknown>
+  const message = clone.message && typeof clone.message === 'object'
+    ? clone.message as Record<string, unknown>
+    : undefined
+  const content = message?.content
   if (Array.isArray(content)) {
     for (let i = 0; i < content.length; i++) {
       const block = content[i]
       if (!block || typeof block !== 'object') continue
+      const mutableBlock = block as Record<string, unknown>
 
       // 截断超长 text block
-      if (block.type === 'text' && typeof block.text === 'string' && block.text.length > truncationThreshold) {
-        block.text = block.text.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
+      if (mutableBlock.type === 'text' && typeof mutableBlock.text === 'string' && mutableBlock.text.length > truncationThreshold) {
+        mutableBlock.text = mutableBlock.text.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
       }
 
       // 截断超大 tool_result
-      if (block.type === 'tool_result') {
-        if (typeof block.content === 'string' && block.content.length > truncationThreshold) {
-          block.content = block.content.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
+      if (mutableBlock.type === 'tool_result') {
+        if (typeof mutableBlock.content === 'string' && mutableBlock.content.length > truncationThreshold) {
+          mutableBlock.content = mutableBlock.content.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
         }
-        // 剥离 base64 图片数据
-        if (Array.isArray(block.content)) {
-          block.content = block.content.map((item: Record<string, unknown>) => {
-            if (item?.type === 'image' && (item.source as Record<string, unknown>)?.data) {
-              const dataLen = String((item.source as Record<string, unknown>).data).length
-              return { type: 'image', _truncated: true, _originalLength: dataLen }
+        // 同时识别 Pi 顶层 data 与旧 Anthropic source.data，只剥离真正的大图。
+        if (Array.isArray(mutableBlock.content)) {
+          mutableBlock.content = mutableBlock.content.map((item: unknown) => {
+            if (!item || typeof item !== 'object') return item
+            const image = item as Record<string, unknown>
+            if (image.type !== 'image') return item
+            const source = image.source && typeof image.source === 'object'
+              ? image.source as Record<string, unknown>
+              : undefined
+            const imageData = typeof image.data === 'string'
+              ? image.data
+              : typeof source?.data === 'string' ? source.data : undefined
+            if (imageData && imageData.length > truncationThreshold) {
+              return { type: 'image', _truncated: true, _originalLength: imageData.length }
             }
             return item
           })
@@ -811,8 +823,20 @@ function sanitizeOversizedMessage(msg: SDKMessage, originalLength: number): SDKM
   }
 
   // 截断 error.message
-  if (clone.error && typeof clone.error === 'object' && typeof clone.error.message === 'string' && clone.error.message.length > truncationThreshold) {
-    clone.error.message = clone.error.message.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
+  const error = clone.error && typeof clone.error === 'object' ? clone.error as Record<string, unknown> : undefined
+  if (error && typeof error.message === 'string' && error.message.length > truncationThreshold) {
+    error.message = error.message.slice(0, TRUNCATED_PREVIEW_LENGTH) + truncationNote
+  }
+
+  /** 极端多块结果仍超限时，仅压缩工具正文；顶层身份和终态元数据保持不变。 */
+  if (JSON.stringify(clone).length > MAX_SDK_MESSAGE_LENGTH && Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      const mutableBlock = block as Record<string, unknown>
+      if (mutableBlock.type !== 'tool_result') continue
+      mutableBlock.content = [{ type: 'text', text: truncationNote.trimStart() }]
+      if (JSON.stringify(clone).length <= MAX_SDK_MESSAGE_LENGTH) break
+    }
   }
 
   return clone as SDKMessage

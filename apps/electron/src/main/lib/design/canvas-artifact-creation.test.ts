@@ -88,6 +88,27 @@ function createFixture(options: {
 }
 
 describe('Canvas Agent 产物原子创建服务', () => {
+  test('Given 创建已提交但调用方丢失回执 When 按原来源重放 Then 对账同一节点且不重复写入', async () => {
+    const fixture = createFixture()
+    const input = {
+      ...target,
+      baseRevision: 3,
+      artifactType: 'document' as const,
+      title: '生产说明',
+      content: '# 生产说明',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-lost-receipt' },
+    }
+    const created = await fixture.service.create(input)
+    const replayed = await fixture.service.create({ ...input, baseRevision: created.revision })
+    const resolved = fixture.service.resolveCreated({
+      ...target, artifactType: 'document', source: input.source,
+    })
+
+    expect(replayed).toEqual({ ...created, revision: created.revision })
+    expect(resolved).toMatchObject({ nodeId: created.nodeId, revision: created.revision, artifactType: 'document' })
+    expect(fixture.batches).toHaveLength(1)
+    expect(fixture.prepared).toHaveLength(1)
+  })
   test('Given WebView 产物关联来源节点 When 创建 Then 先准备真实 HTML 并在来源右侧提交节点与连线', async () => {
     const fixture = createFixture()
     const result = await fixture.service.create({

@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
-import { realpathSync } from 'node:fs'
+import { constants, lstatSync, realpathSync } from 'node:fs'
+import { chmod, mkdtemp, open, rm, type FileHandle } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { AgentMessage, AgentSessionMeta, MediaAssetRecord, MediaAssetRef, MediaKind, SDKMessage } from '@proma/shared'
 import { openAuthorizedAgentMediaSource } from '../design/design-session-bridge'
 import type { MediaAssetService } from './media-asset-service'
@@ -11,6 +13,7 @@ const MAX_RAW_SOURCE_ENTRIES = 512
 const MAX_IMPORT_SOURCES = 32
 const MAX_SOURCE_CONTEXTS = 64
 const MAX_MEDIA_SOURCE_BYTES = 128 * 1024 * 1024
+const MEDIA_HASH_CHUNK_BYTES = 1024 * 1024
 
 /** 普通 Agent 或 Canvas Agent 调用来源服务时由 Host 固化的项目会话身份。 */
 export interface MediaSourceContext {
@@ -42,6 +45,15 @@ export interface MediaAssetFile {
   path: string
   asset: MediaAssetRef
   record: MediaAssetRecord
+}
+
+/** 内部稳定句柄绑定已验证记录，供流式 hash 与私有快照共用。 */
+interface StableMediaAssetHandle {
+  handle: FileHandle
+  sourcePath: string
+  record: MediaAssetRecord
+  size: number
+  identity: { dev: number; ino: number; mtimeMs: number }
 }
 
 /** 会话来源读取和项目资产登记依赖。 */
@@ -212,15 +224,75 @@ function localSourceError(error: unknown): Error {
 /** 收敛正式资产文件解析错误，不把未授权本地路径带回 Agent。 */
 function assetFileError(error: unknown): Error {
   const message = error instanceof Error ? error.message : ''
+  if (error instanceof Error && error.name === 'AbortError') return error
   if (message === 'MEDIA_ASSET_NOT_AUTHORIZED' || message === 'MEDIA_ASSET_CHANGED') {
     return error instanceof Error ? error : new Error(message)
   }
   if (message === 'MEDIA_ASSET_FILE_REVOKED') return error instanceof Error ? error : new Error(message)
+  if (message === 'MEDIA_ASSET_FILE_SIZE_LIMIT' || message === 'MEDIA_ASSET_FILE_NOT_AUTHORIZED') {
+    return error instanceof Error ? error : new Error(message)
+  }
+  if (message.includes('不能超过')) return new Error('MEDIA_ASSET_FILE_SIZE_LIMIT', { cause: error })
   if (message.includes('授权目录') || message.includes('符号链接') || message.includes('普通文件')
     || message.includes('身份') || message.includes('读取期间') || message.includes('校验期间')) {
     return new Error('MEDIA_ASSET_FILE_NOT_AUTHORIZED', { cause: error })
   }
   return new Error('MEDIA_ASSET_FILE_UNAVAILABLE', { cause: error })
+}
+
+/** 校验调用方读取预算，旧入口仍以统一128MiB为硬上限。 */
+function assertAssetMaxBytes(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_MEDIA_SOURCE_BYTES) {
+    throw new Error('MEDIA_ASSET_FILE_SIZE_LIMIT_INVALID')
+  }
+}
+
+/** 在文件边界统一抛出不包含路径的标准取消错误。 */
+function throwIfAssetAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  const error = new Error('媒体资产读取已取消')
+  error.name = 'AbortError'
+  throw error
+}
+
+/** 比较稳定 fd 身份，检测复制或 hash 期间的原文件修改。 */
+async function assertStableHandle(source: StableMediaAssetHandle): Promise<void> {
+  const current = await source.handle.stat()
+  if (!current.isFile() || current.dev !== source.identity.dev || current.ino !== source.identity.ino
+    || current.size !== source.size || current.mtimeMs !== source.identity.mtimeMs) {
+    throw new Error('MEDIA_ASSET_CHANGED')
+  }
+}
+
+/** 以1MiB复用缓冲区异步分块读取，可选同步写入私有快照。 */
+async function hashStableHandle(source: StableMediaAssetHandle, destination?: FileHandle, signal?: AbortSignal): Promise<string> {
+  throwIfAssetAborted(signal)
+  await assertStableHandle(source)
+  const hash = createHash('sha256')
+  const buffer = Buffer.allocUnsafe(Math.min(MEDIA_HASH_CHUNK_BYTES, Math.max(1, source.size)))
+  let offset = 0
+  while (offset < source.size) {
+    throwIfAssetAborted(signal)
+    const requested = Math.min(buffer.byteLength, source.size - offset)
+    const { bytesRead } = await source.handle.read(buffer, 0, requested, offset)
+    if (bytesRead < 1) throw new Error('MEDIA_ASSET_CHANGED')
+    const chunk = buffer.subarray(0, bytesRead)
+    hash.update(chunk)
+    if (destination) {
+      let written = 0
+      while (written < bytesRead) {
+        const result = await destination.write(chunk, written, bytesRead - written, offset + written)
+        if (result.bytesWritten < 1) throw new Error('MEDIA_ASSET_CHANGED')
+        written += result.bytesWritten
+      }
+    }
+    offset += bytesRead
+  }
+  throwIfAssetAborted(signal)
+  await assertStableHandle(source)
+  const digest = hash.digest('hex')
+  if (digest !== source.record.hash) throw new Error('MEDIA_ASSET_CHANGED')
+  return digest
 }
 
 /** 从会话持久化附件安全导入统一项目资产。 */
@@ -230,6 +302,147 @@ export class MediaSourceService {
 
   constructor(private readonly dependencies: MediaSourceServiceDependencies) {
     this.createSourceRef = dependencies.createSourceRef ?? randomUUID
+  }
+
+  /** 打开并绑定当前授权根内的正式资产，大小检查发生在分配读取缓冲区之前。 */
+  private async openStableAssetHandle(
+    context: MediaSourceContext,
+    asset: MediaAssetRef,
+    maxBytes: number,
+    signal?: AbortSignal,
+  ): Promise<StableMediaAssetHandle> {
+    throwIfAssetAborted(signal)
+    assertAssetMaxBytes(maxBytes)
+    const session = await requireAuthorizedSession(this.dependencies, context, 'list')
+    const getRecord = this.dependencies.assets.getRecord
+    const resolveAssetPath = this.dependencies.assets.resolveAssetPath
+    if (!this.dependencies.getLocalFileAccess || !getRecord || !resolveAssetPath) {
+      throw new Error('MEDIA_ASSET_FILE_UNAVAILABLE')
+    }
+    let handle: FileHandle | undefined
+    try {
+      const record = getRecord.call(this.dependencies.assets, context.projectId, asset)
+      const resolvedPath = resolveAssetPath.call(this.dependencies.assets, context.projectId, asset)
+      const access = this.dependencies.getLocalFileAccess(session, context.projectId)
+      const requestedPath = resolve(access.baseDir, resolvedPath)
+      const requestedState = lstatSync(requestedPath)
+      if (!requestedState.isFile() || requestedState.isSymbolicLink()) throw new Error('MEDIA_ASSET_FILE_NOT_AUTHORIZED')
+      const sourcePath = realpathSync(requestedPath)
+      if (!isCurrentlyAuthorizedLocalPath(sourcePath, access)) throw new Error('MEDIA_ASSET_FILE_NOT_AUTHORIZED')
+      handle = await open(requestedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+      throwIfAssetAborted(signal)
+      const opened = await handle.stat()
+      const canonical = lstatSync(sourcePath)
+      if (!opened.isFile() || !canonical.isFile() || canonical.isSymbolicLink()
+        || opened.dev !== canonical.dev || opened.ino !== canonical.ino
+        || opened.size !== canonical.size || opened.mtimeMs !== canonical.mtimeMs) {
+        throw new Error('MEDIA_ASSET_CHANGED')
+      }
+      if (opened.size > maxBytes) throw new Error('MEDIA_ASSET_FILE_SIZE_LIMIT')
+      if (opened.size !== record.byteSize) throw new Error('MEDIA_ASSET_CHANGED')
+      return {
+        handle, sourcePath, record, size: opened.size,
+        identity: { dev: opened.dev, ino: opened.ino, mtimeMs: opened.mtimeMs },
+      }
+    } catch (error) {
+      await handle?.close().catch(() => undefined)
+      throw assetFileError(error)
+    }
+  }
+
+  /** 分块读取结束后 fresh 复核授权、正式路径和精确资产记录。 */
+  private async revalidateStableAsset(
+    context: MediaSourceContext,
+    asset: MediaAssetRef,
+    source: StableMediaAssetHandle,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    throwIfAssetAborted(signal)
+    const session = await requireAuthorizedSession(this.dependencies, context, 'list')
+    const getRecord = this.dependencies.assets.getRecord
+    const resolveAssetPath = this.dependencies.assets.resolveAssetPath
+    if (!this.dependencies.getLocalFileAccess || !getRecord || !resolveAssetPath) {
+      throw new Error('MEDIA_ASSET_FILE_UNAVAILABLE')
+    }
+    const record = getRecord.call(this.dependencies.assets, context.projectId, asset)
+    const resolvedPath = resolveAssetPath.call(this.dependencies.assets, context.projectId, asset)
+    const access = this.dependencies.getLocalFileAccess(session, context.projectId)
+    if (!isCurrentlyAuthorizedLocalPath(source.sourcePath, access)) throw new Error('MEDIA_ASSET_FILE_REVOKED')
+    if (realpathSync(resolvedPath) !== source.sourcePath
+      || record.hash !== source.record.hash || record.byteSize !== source.record.byteSize
+      || record.id !== source.record.id || record.revision !== source.record.revision
+      || record.mediaKind !== source.record.mediaKind) {
+      throw new Error('MEDIA_ASSET_CHANGED')
+    }
+  }
+
+  /** 仅以稳定 fd 异步分块复验完整 hash，不创建同等大小 Buffer 或磁盘副本。 */
+  async verifyAssetFile(
+    context: MediaSourceContext,
+    asset: MediaAssetRef,
+    maxBytes = MAX_MEDIA_SOURCE_BYTES,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const source = await this.openStableAssetHandle(context, asset, maxBytes, signal)
+    try {
+      await hashStableHandle(source, undefined, signal)
+      await this.revalidateStableAsset(context, asset, source, signal)
+    } catch (error) {
+      throw assetFileError(error)
+    } finally {
+      await source.handle.close()
+    }
+  }
+
+  /** 把可信资产复制为本次调用独占快照，回调结束后无条件清理。 */
+  async withAssetFile<T>(
+    context: MediaSourceContext,
+    asset: MediaAssetRef,
+    maxBytes: number,
+    effect: (snapshot: MediaAssetFile) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const source = await this.openStableAssetHandle(context, asset, maxBytes, signal)
+    let directory = ''
+    const extension = /^\.[A-Za-z0-9]{1,10}$/.test(extname(source.sourcePath)) ? extname(source.sourcePath) : '.media'
+    let snapshotPath = ''
+    let destination: FileHandle | undefined
+    let ready = false
+    try {
+      directory = await mkdtemp(join(tmpdir(), 'proma-media-asset-'))
+      await chmod(directory, 0o700)
+      snapshotPath = join(directory, `asset${extension}`)
+      destination = await open(snapshotPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+      await hashStableHandle(source, destination, signal)
+      await destination.sync()
+      await destination.close()
+      destination = undefined
+      await this.revalidateStableAsset(context, asset, source, signal)
+      ready = true
+    } catch (error) {
+      throw assetFileError(error)
+    } finally {
+      await destination?.close().catch(() => undefined)
+      await source.handle.close().catch(() => undefined)
+      if (!ready && directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+    }
+    try {
+      throwIfAssetAborted(signal)
+      const result = await effect({
+        path: snapshotPath,
+        asset: structuredClone(asset),
+        record: structuredClone(source.record),
+      })
+      throwIfAssetAborted(signal)
+      try {
+        await this.revalidateStableAsset(context, asset, source, signal)
+      } catch (error) {
+        throw assetFileError(error)
+      }
+      return result
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   }
 
   /** 列出当前会话结构化媒体来源，并签发只存在于主进程内存的不透明引用。 */
@@ -390,50 +603,14 @@ export class MediaSourceService {
   }
 
   /** 将可信资产引用解析为当前 Agent 已有授权根内的单个文件，不新增目录授权。 */
-  async getAssetFile(context: MediaSourceContext, asset: MediaAssetRef): Promise<MediaAssetFile> {
-    const session = await requireAuthorizedSession(this.dependencies, context, 'list')
-    const getRecord = this.dependencies.assets.getRecord
-    const resolveAssetPath = this.dependencies.assets.resolveAssetPath
-    if (!this.dependencies.getLocalFileAccess || !getRecord || !resolveAssetPath) {
-      throw new Error('MEDIA_ASSET_FILE_UNAVAILABLE')
-    }
-    /** 资产层先验证项目、revision、hash 和媒体类型，再解析 Host 管理的正式路径。 */
-    const record = getRecord.call(this.dependencies.assets, context.projectId, asset)
-    const resolvedPath = resolveAssetPath.call(this.dependencies.assets, context.projectId, asset)
-    const initialAccess = this.dependencies.getLocalFileAccess(session, context.projectId)
-    let authorized: ReturnType<typeof openAuthorizedAgentMediaSource>
+  async getAssetFile(context: MediaSourceContext, asset: MediaAssetRef, maxBytes = MAX_MEDIA_SOURCE_BYTES): Promise<MediaAssetFile> {
+    const source = await this.openStableAssetHandle(context, asset, maxBytes)
     try {
-      authorized = openAuthorizedAgentMediaSource({
-        inputPath: resolvedPath,
-        baseDir: initialAccess.baseDir,
-        allowedRoots: initialAccess.allowedRoots,
-        maxBytes: MAX_MEDIA_SOURCE_BYTES,
-        label: '媒体',
-      })
+      await hashStableHandle(source)
+      await this.revalidateStableAsset(context, asset, source)
+      return { path: source.sourcePath, asset: structuredClone(asset), record: structuredClone(source.record) }
     } catch (error) {
       throw assetFileError(error)
-    }
-    try {
-      /** no-follow 稳定句柄完整读取并核对正式记录，防止路径解析后被置换。 */
-      const pathBytes = authorized.readBytes()
-      if (pathBytes.byteLength !== record.byteSize
-        || createHash('sha256').update(pathBytes).digest('hex') !== record.hash) {
-        throw new Error('MEDIA_ASSET_CHANGED')
-      }
-      /** 完整读取后 fresh 检查会话和授权根；撤权后不能返回可传播的本地路径。 */
-      const refreshedSession = await requireAuthorizedSession(this.dependencies, context, 'list')
-      const refreshedAccess = this.dependencies.getLocalFileAccess(refreshedSession, context.projectId)
-      if (!isCurrentlyAuthorizedLocalPath(authorized.sourcePath, refreshedAccess)) {
-        throw new Error('MEDIA_ASSET_FILE_REVOKED')
-      }
-      /** 再次解析权威记录，确保等待读取期间没有切换到另一正式文件。 */
-      const refreshedPath = resolveAssetPath.call(this.dependencies.assets, context.projectId, asset)
-      if (realpathSync(refreshedPath) !== authorized.sourcePath) throw new Error('MEDIA_ASSET_CHANGED')
-      return { path: authorized.sourcePath, asset: structuredClone(asset), record: structuredClone(record) }
-    } catch (error) {
-      throw assetFileError(error)
-    } finally {
-      authorized.close()
-    }
+    } finally { await source.handle.close() }
   }
 }

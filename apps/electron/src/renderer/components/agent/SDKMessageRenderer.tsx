@@ -20,6 +20,7 @@ import { ContentBlock } from './ContentBlock'
 import { TurnFileChangesSummary, buildTurnFileNameMap } from './TurnFileChangesSummary'
 import { TurnSkillUsageSummary } from './TurnSkillUsageSummary'
 import { ProcessBlockGroup, buildAssistantTurnRenderItems } from './ProcessBlockGroup'
+import { AgentTerminalNotice } from './AgentTerminalNotice'
 import { extractToolResultText, TASK_TOOL_NAMES } from './task-progress'
 import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
 // 会话转录的纯逻辑(Turn 分组 / 快照去重 / 预览)已下沉到 @proma/session-core 作为唯一真源。
@@ -89,6 +90,7 @@ import {
   isThinkingSignatureError,
 } from '@proma/shared'
 import type { ToolActivity } from '@/atoms/agent-atoms'
+import { resolveAgentTerminalNotice } from '@/lib/agent-terminal-result'
 
 // ===== SDKMessageRenderer Props =====
 
@@ -438,6 +440,8 @@ export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, 
 
   // 从 turnMessages 中提取 result 消息的耗时和用量
   const { durationMs, usage } = extractTurnUsage(turn.turnMessages)
+  // 助手正文可能先于 Host 验收结果产生；最终状态必须以 result 终态为准。
+  const terminalNotice = resolveAgentTerminalNotice(turn.turnMessages, turn.assistantMessages)
 
   // 只在用户点击停止时显示中断徽章。
   // aborted_streaming / aborted_tools 是流式追加消息时的软中断，语义是继续补充信息。
@@ -498,8 +502,22 @@ export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, 
     )
   }
 
-  // 如果没有任何内容
-  if (enrichedBlocks.length === 0 && !hasError) return null
+  // 没有正文但 Host 已给出失败终态时，仍保留一条明确可见的结果。
+  if (enrichedBlocks.length === 0 && !hasError) {
+    if (!terminalNotice) return null
+    return (
+      <Message from="assistant">
+        <MessageHeader
+          model={turn.model ? resolveModelDisplayName(turn.model, channels) : undefined}
+          time={turn.createdAt ? formatMessageTime(turn.createdAt) : undefined}
+          logo={<AssistantLogo model={turn.model} />}
+        />
+        <MessageContent>
+          <AgentTerminalNotice notice={terminalNotice} />
+        </MessageContent>
+      </Message>
+    )
+  }
 
   const renderTopLevelBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
     // 任务进度由底部浮层统一呈现，输出记录不再重复显示任务卡。
@@ -566,6 +584,7 @@ export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, 
             )
           })}
         </div>
+        {terminalNotice && <AgentTerminalNotice notice={terminalNotice} />}
         {/* 如果有错误但也有内容块，在末尾以 tail 形式挂错误横幅附错误提示 + 重试按钮，保留正文本身的 markdown 排版 */}
         {hasError && errorContent && topLevelBlocks.length > 0 && (
           <AssistantErrorTail

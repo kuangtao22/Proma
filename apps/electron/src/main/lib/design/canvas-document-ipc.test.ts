@@ -504,6 +504,7 @@ function createContext(options: {
     ...(options.enableToolProviderRuntime ? { toolAccess: options.toolAccess ?? createToolAccess() } : {}),
     ...(options.taskOperations ? { taskOperations: options.taskOperations } : {}),
     artifacts: {
+      resolveCreated: () => null,
       create: async (input) => {
         artifactCalls.push(structuredClone(input))
         return {
@@ -3918,6 +3919,7 @@ describe('原生 Canvas 文档 IPC', () => {
         }),
       },
       artifacts: {
+        resolveCreated: () => null,
         create: async (input: {
           canvasId: string
           artifactType: 'document' | 'webview' | 'image' | 'audio' | 'video'

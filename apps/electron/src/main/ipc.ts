@@ -241,6 +241,7 @@ import { createCanvasDocumentStore } from './lib/design/canvas-document-store'
 import { createCanvasImageRunService } from './lib/design/canvas-image-run-service'
 import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
 import { createCanvasWorkflowRunStore } from './lib/design/canvas-workflow-run-store'
+import { createCanvasTaskStore } from './lib/design/canvas-task-store'
 import { createCanvasArtifactExportService } from './lib/design/canvas-artifact-export-service'
 import { createCanvasWorkflowMediaAdapter, findCanvasWorkflowConfirmedMediaOutput } from './lib/design/canvas-workflow-runtime-adapters'
 import { createCanvasWorkflowResumeScheduler, shouldResumeCanvasWorkflow } from './lib/design/canvas-workflow-resume-scheduler'
@@ -452,6 +453,7 @@ import { MediaDesignAssets } from './lib/media/media-design-assets'
 import { MediaAssetService } from './lib/media/media-asset-service'
 import { MediaAssetThumbnailService } from './lib/media/media-asset-thumbnail-service'
 import { MediaSourceService } from './lib/media/media-source-service'
+import { createMediaDeliveryInspectionService } from './lib/media/media-delivery-inspection-service'
 import { assertMediaProbeAvailable } from './lib/media/media-file-probe'
 import { createMediaToolRun } from './lib/media/media-tool-provider'
 import { createMediaImageCatalog } from './lib/media/media-image-catalog'
@@ -3298,6 +3300,11 @@ export function registerIpcHandlers(): void {
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
     onChanged: (run) => canvasWorkflowResumeScheduler.changed(run),
   })
+  /** 业务交付跨 Agent 回合保存；不复制工作流的执行预算与媒体正文。 */
+  const canvasTaskStore = createCanvasTaskStore({
+    pathResolver: designPathResolver,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
   /** 准备交接独立写入父 Canvas 的事务目录，不与运行 journal 争用 CAS。 */
   const canvasMediaHandoffs = createCanvasMediaHandoffStore({
     getDirectory: (target) => join(designPathResolver.resolveCanvas(target.projectId, target.canvasId).transactionsDir, 'media-handoffs'),
@@ -3490,6 +3497,7 @@ export function registerIpcHandlers(): void {
     })().catch(() => console.warn('[Canvas 工作流] 启动恢复暂未完成，保留原运行记录'))
   })
   registerCanvasDocumentIpcHandlers({
+    taskStore: canvasTaskStore,
     taskOperations: canvasTaskOperations,
     artifactExport: canvasArtifactExport,
     resolveWorkflowUiContext: (input) => {
@@ -3609,6 +3617,12 @@ export function registerIpcHandlers(): void {
     },
     getProjectReadOnlyReason: getDesignProjectReadOnlyReason,
     toolAccess: canvasToolAccess,
+    mediaInspection: {
+      inspect: createMediaDeliveryInspectionService({
+        withAssetFile: (current, asset, maxBytes, effect, signal) => mediaSources.withAssetFile(current, asset, maxBytes, effect, signal),
+      }).inspect,
+      verifyAsset: (current, asset, signal) => mediaSources.verifyAssetFile(current, asset, 128 * 1024 * 1024, signal),
+    },
     mediaTools: (context) => createMediaToolRun({
       configuration: getMediaConfiguration(), resources: mediaResources, runs: mediaRuns, supervisor: mediaSupervisor,
       authorize: (current, operation) => {

@@ -14,6 +14,11 @@ function readCanvasProductionSkill(): string {
     : ''
 }
 
+/** 读取随 Skill 分发的制作恢复合同。 */
+function readProductionRecoveryReference(): string {
+  return readFileSync(join(canvasProductionSkillPath, '../references/production-recovery.md'), 'utf-8')
+}
+
 test('Given 导演首次接管或局部复核 When 读取规范 Then 显式审核范围与位置及生成依赖分别定义', () => {
   /** 默认入口和详细合同均须说明新增工具字段，避免只有代码支持而模型不会调用。 */
   const skill = readCanvasProductionSkill()
@@ -33,12 +38,49 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.27"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.31"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
   expect(skill).toContain('普通代码')
   expect(skill).toContain('不要强行转入画布')
+})
+
+test('Given 跨回合画布生产 When 读取 Skill Then 先恢复不可降级合同再执行写操作并以 Host 终态收口', () => {
+  const skill = readCanvasProductionSkill()
+  const recovery = readProductionRecoveryReference()
+
+  for (const rule of [
+    '`canvas_task(action=status)`',
+    '`canvas_task(action=resume)`',
+    '`canvas_task(action=start)`',
+    '`canvas_task(action=recover)`',
+    '`canvas_task(action=rebind)`',
+    '任何创建、更新、导入、运行或采用之前',
+    '不能降低、删除或替换原交付要求',
+    '整体任务是否完成以 Host 最终终态为准',
+  ]) {
+    expect(skill).toContain(rule)
+    expect(recovery).toContain(rule)
+  }
+})
+
+test('Given 音视频采用结果需要内容验收 When 读取 Skill Then 技术解码、抽样评审和完整观看严格分层', () => {
+  const skill = readCanvasProductionSkill()
+  const recovery = readProductionRecoveryReference()
+
+  for (const rule of [
+    '`canvas_inspect_media_content`',
+    '`canvas_review_media`',
+    '`inspectionEvidenceId`',
+    '技术解码成功不等于看过完整内容',
+    '有界抽帧',
+    '不能声称看过全片或听过完整音轨',
+    '当前只支持 `sampled`',
+  ]) {
+    expect(skill).toContain(rule)
+    expect(recovery).toContain(rule)
+  }
 })
 
 test('Given 按用途编排与视频评审 When 读取默认 Skill Then 运行前入口可达且详细合同随 Skill 分发', () => {

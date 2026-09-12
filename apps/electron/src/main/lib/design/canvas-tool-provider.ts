@@ -16,6 +16,7 @@ import type {
   CanvasMediaPreparationStatus,
   CanvasMediaModuleSnapshot,
   CanvasMediaTarget,
+  MediaAssetRef,
   CanvasNode,
   CanvasNodeReference,
   CanvasRunWorkflowResult,
@@ -64,7 +65,12 @@ import type { CanvasMediaService } from './canvas-media-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import { CANVAS_TASK_WAIT_MAX_MS, createCanvasOperationTools, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import { CANVAS_READ_ONLY_TOOL_NAMES, isCanvasAgentToolAllowed } from './canvas-agent-tool-policy'
-import { createCanvasTaskContract, describeCanvasTaskEvidence, type CanvasTaskBaseline, type CanvasTaskEvidence } from './canvas-task-contract'
+import { createCanvasTaskContract, describeCanvasTaskEvidence, projectCanvasTaskStatus, type CanvasTaskBaseline, type CanvasTaskEvidence } from './canvas-task-contract'
+import type { CanvasTaskPendingOperation, CanvasTaskState } from './canvas-task-contract'
+import type { createCanvasTaskStore } from './canvas-task-store'
+import { requiresCanvasTask } from './canvas-task-tool-policy'
+import { createCanvasTaskMediaReview, type CanvasTaskMediaTarget } from './canvas-task-media-review'
+import type { createMediaDeliveryInspectionService } from '../media/media-delivery-inspection-service'
 import { createCanvasTaskEvidence, resolveCanvasTaskBaseline, resolveCanvasTaskEvidence } from './canvas-task-evidence'
 import { CANVAS_AGENT_MUTATION_SCHEMA, CANVAS_UPSERT_EDGES_EXAMPLE } from './canvas-mutation-tool-schema'
 import {
@@ -574,6 +580,8 @@ export interface CanvasToolImageImportInput extends CanvasTarget {
 
 /** Provider 只依赖现有权威 Store、Task8 batch 与执行接缝。 */
 export interface CanvasToolProviderDependencies {
+  /** 生产始终注入持久交付状态；独立旧工具测试可省略持久层。 */
+  taskStore?: ReturnType<typeof createCanvasTaskStore>
   /** UI 与 Agent 共用的任务、版本、恢复和持久工作流操作。 */
   operations?: CanvasOperationToolHandlers
   access: Pick<CanvasToolAccessFacade,
@@ -595,7 +603,7 @@ export interface CanvasToolProviderDependencies {
   workflowExecution: Pick<CanvasWorkflowExecutionService, 'execute' | 'resume' | 'cancel' | 'get' | 'list' | 'registerCreatedSuccessor'>
     & Partial<Pick<CanvasWorkflowExecutionService, 'recordCreatedSuccessorRegistrationFailure'>>
   readNodeContent?: (target: CanvasTarget, node: CanvasNode) => Promise<string>
-  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
+  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent' | 'resolveCreated'>
   /** 主进程在调用导入事务前负责解析并验证本地路径。 */
   importImage: (input: CanvasToolImageImportInput) => Promise<CanvasArtifactCreationResult>
   textArtifacts: Pick<CanvasTextArtifactService, 'read' | 'listVersions' | 'update'>
@@ -620,6 +628,11 @@ export interface CanvasToolProviderDependencies {
     & Partial<Pick<CanvasMediaService, 'attachImportedAssets' | 'checkPreparation'>>
   /** 普通与 Canvas Agent 复用同一 Host 媒体能力，缺省时不注册占位工具。 */
   mediaTools?: (context: CanvasToolRunContext) => CanvasToolRun
+  /** 音视频技术检查与精确资产复验；没有可用服务时不注册伪能力。 */
+  mediaInspection?: {
+    inspect: ReturnType<typeof createMediaDeliveryInspectionService>['inspect']
+    verifyAsset: (context: CanvasToolRunContext, asset: MediaAssetRef, signal?: AbortSignal) => Promise<void>
+  }
 }
 
 /** Provider 产出的单轮扩展；extend 保留普通 Agent 原有工具。 */
@@ -803,7 +816,7 @@ function requireAgentRunSkillNames(value: string[] | undefined): string[] | unde
   return skillNames
 }
 
-/** 为普通项目 Agent 创建不持久化的单轮 Canvas 工具。 */
+/** 为普通项目 Agent 创建单轮工具；业务交付通过显式任务绑定跨轮延续。 */
 export function createCanvasToolRun(
   dependencies: CanvasToolProviderDependencies,
   context: CanvasToolRunContext,
@@ -828,6 +841,24 @@ export function createCanvasToolRun(
     return snapshot
   }
 
+  /** 只取当前正式采用的唯一主媒体，拒绝把附件或多个候选任意选成最终成片。 */
+  const readMediaReviewTarget = async (canvasId: string, nodeId: string, signal: AbortSignal): Promise<CanvasTaskMediaTarget> => {
+    const target = { projectId: context.projectId, canvasId }
+    const snapshot = loadReadSnapshot(target, signal)
+    const node = snapshot.document.nodes.find(candidate => candidate.id === nodeId)
+    if (!node || (node.kind !== 'video' && node.kind !== 'audio')) throw new Error('CANVAS_MEDIA_NODE_REQUIRED')
+    if (snapshot.nodeIssues.some(issue => issue.nodeId === nodeId)) throw new Error('CANVAS_MEDIA_NODE_UNAVAILABLE')
+    const media = await dependencies.canvasMedia.load({ ...target, nodeId, mediaModuleId: node.mediaModuleId, mediaKind: node.kind })
+    const primary = media.config.adoptedOutputs.filter(output => output.mediaKind === node.kind && output.role === 'primary')
+    if (primary.length !== 1) throw new Error('CANVAS_MEDIA_SINGLE_ADOPTED_PRIMARY_REQUIRED')
+    const asset = primary[0]!.asset
+    if (!media.assets.some(record => record.id === asset.assetId && record.revision === asset.revision && record.hash === asset.hash)) {
+      throw new Error('CANVAS_MEDIA_ASSET_UNAVAILABLE')
+    }
+    loadReadSnapshot(target, signal, snapshot.document.revision)
+    return { asset, proof: createCanvasTaskEvidence(canvasId, node, 'adopted', [node.mediaModuleId, media.config.adoptedOutputs]) }
+  }
+
   /** 整批交付固定同一图快照，防止各项结果分别来自不同 revision。 */
   const verifyTaskEvidence = async (proofs: readonly CanvasTaskEvidence[], signal: AbortSignal): Promise<boolean> => {
     if (proofs.length === 0) return true
@@ -843,10 +874,18 @@ export function createCanvasToolRun(
       const current = await resolveCanvasTaskEvidence(dependencies, context.projectId, node, proof)
       assertReadAccess(target.canvasId, signal)
       if (current?.identity !== proof.identity) return false
+      if (proof.mediaInspection) {
+        if (!dependencies.mediaInspection) throw new Error('CANVAS_MEDIA_INSPECTION_UNAVAILABLE')
+        const media = await readMediaReviewTarget(proof.canvasId, proof.nodeId, signal)
+        if (media.proof.identity !== proof.identity || media.asset.hash !== proof.mediaInspection.assetHash) return false
+        /** 完成时复核文件实际字节哈希，不能仅靠旧 Registry 元数据沿用验收。 */
+        await dependencies.mediaInspection.verifyAsset(context, media.asset, signal)
+        assertReadAccess(target.canvasId, signal)
+      }
     }
-    /** 配置可独立于图 revision 保存；批次末尾再核对配置，防止后项读取期间前项被修改。 */
+    /** 配置及媒体采用可独立于图 revision 保存；批次末尾复验，防止后项读取期间前项被修改。 */
     for (const proof of proofs) {
-      if (proof.validation !== 'configuration') continue
+      if (proof.validation !== 'configuration' && !proof.mediaInspection) continue
       const node = nodesById.get(proof.nodeId)!
       assertReadAccess(target.canvasId, signal)
       const current = await resolveCanvasTaskEvidence(dependencies, context.projectId, node, proof)
@@ -868,22 +907,174 @@ export function createCanvasToolRun(
   /** 只在显式审核运行装配内存记录，普通运行没有新增图读取或常驻扫描。 */
   const reviewTracker = context.reviewContext ? createCanvasAgentReviewTracker(context.reviewContext) : undefined
   /** 明确父编排必须交付；交互式问答仅在模型登记执行任务后启用核验。 */
-  const task = createCanvasTaskContract({
+  const taskOptions = {
     required: context.canvasAgentMode === 'parent-orchestrated' && context.permissionCeiling === 'execute',
-    verify: (proof, signal) => verifyTaskEvidence([proof], signal),
+    verify: (proof: CanvasTaskEvidence, signal: AbortSignal) => verifyTaskEvidence([proof], signal),
     verifyBatch: verifyTaskEvidence,
-    validateScope: async (canvasId, signal) => { assertReadAccess(canvasId, signal) },
-  })
+    validateScope: async (canvasId: string, signal: AbortSignal) => { assertReadAccess(canvasId, signal) },
+  }
+  /** 未执行的普通问答只使用临时记录，不隐式接管历史未完成任务。 */
+  let task = createCanvasTaskContract(taskOptions)
+  /** 持久任务只有在 start/resume 后才加入本轮完成检查。 */
+  let taskEngaged = false
+
+  /** 查看指定画布的本会话活动任务；每次都复验关联与读取权限。 */
+  const readStoredTask = (canvasId: string) => {
+    assertReadAccess(canvasId)
+    return dependencies.taskStore?.getActive({ projectId: context.projectId, canvasId, sessionId: context.sessionId }) ?? null
+  }
+
+  /** 将可信存储接到合同状态提交；CAS 失败时不会更新本轮内存。 */
+  const bindTask = (canvasId: string, restored?: CanvasTaskState): void => {
+    const store = dependencies.taskStore
+    if (!store) return
+    assertReadAccess(canvasId)
+    const target = { projectId: context.projectId, canvasId, sessionId: context.sessionId }
+    const snapshot = store.get(target)
+    if (restored && JSON.stringify(snapshot.active) !== JSON.stringify(restored)) throw new Error('CANVAS_TASK_STORE_CONFLICT')
+    let revision = snapshot.revision
+    task = createCanvasTaskContract({ ...taskOptions, ...(restored ? { initialState: restored } : {}),
+      onStateChange: (state) => {
+        assertReadAccess(canvasId)
+        if (!state.canvasId) return
+        const saved = dependencies.access.runWrite(context, () => store.save(target, revision, state))
+        revision = saved.revision
+      },
+    })
+    taskBaseline = restored?.baseline
+  }
 
   /** 在启动调用时绑定合同，防止合同开始前发起的旧任务因迟到回执冒充新生成。 */
   const taskExecutionContext = (): CanvasToolRunContext => {
+    /** 捕获此次执行所属的合同实例，后续绑定另一任务不得接收迟到回执。 */
+    const executionTask = task
     const started = task.status()
     if (started.phase !== 'working') return context
     return { ...context, onImageJobsCreated: (canvasId, jobs) => {
-      if (canvasId === started.canvasId && task.status().phase === 'working') {
-        task.recordGeneratedJobs(canvasId, jobs)
+      if (task === executionTask && canvasId === started.canvasId && executionTask.status().phase === 'working') {
+        executionTask.recordGeneratedJobs(canvasId, jobs)
       }
     } }
+  }
+
+  /** 从合同、画布和原始工具调用派生稳定操作 ID，跨 Provider 恢复仍指向同一意图。 */
+  const createTaskOperationId = (taskId: string, canvasId: string, toolCallId: string): string => (
+    `create-${createHash('sha256').update(`${taskId}\u0000${canvasId}\u0000${toolCallId}`).digest('hex')}`
+  )
+
+  /** 创建回执只记录节点来源事实；正式内容或采用验收仍必须通过 canvas_read 签发。 */
+  const createCompletedReceipt = (
+    pending: CanvasTaskPendingOperation,
+    result: { canvasId: string; nodeId: string; revision: number },
+  ) => {
+    if (!pending.nodeKind) throw new Error('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED')
+    const validation: CanvasTaskEvidence['validation'] = pending.nodeKind === 'document' || pending.nodeKind === 'webview'
+      ? 'content'
+      : 'configuration'
+    return {
+      ...pending,
+      status: 'completed' as const,
+      nodeId: result.nodeId,
+      nodeKind: pending.nodeKind,
+      after: {
+        canvasId: result.canvasId,
+        nodeId: result.nodeId,
+        nodeKind: pending.nodeKind,
+        validation,
+        identity: createHash('sha256')
+          .update(JSON.stringify([result.nodeId, result.revision, pending.sourceToolCallId]))
+          .digest('hex'),
+      },
+    }
+  }
+
+  /** 对账只接受由原始会话、运行时间和 toolCallId 派生的权威节点。 */
+  const resolveCreatedOperation = (pending: CanvasTaskPendingOperation) => {
+    if (!pending.nodeKind || !['agent', 'document', 'webview', 'image', 'audio', 'video'].includes(pending.nodeKind)) return null
+    return dependencies.artifacts.resolveCreated({
+      projectId: context.projectId,
+      canvasId: pending.canvasId,
+      artifactType: pending.nodeKind as 'agent' | 'document' | 'webview' | 'image' | 'audio' | 'video',
+      source: {
+        sessionId: context.sessionId,
+        runStartedAt: pending.startedAt,
+        toolCallId: pending.sourceToolCallId,
+      },
+    })
+  }
+
+  /** 在恢复任务时补齐已提交但回执丢失的创建操作；未知来源继续保留 pending。 */
+  const reconcilePendingCreatedOperations = () => {
+    for (const receipt of task.exportState().operationReceipts) {
+      if (receipt.status !== 'pending' || receipt.kind !== 'created') continue
+      const resolved = resolveCreatedOperation(receipt)
+      if (!resolved || resolved.artifactType !== receipt.nodeKind) continue
+      try {
+        task.recordOperation(createCompletedReceipt(receipt, resolved))
+      } catch (error) {
+        /** 对账写入再次失败时保留 pending 并返回状态，不能把已存在节点包装成工具失败。 */
+        if (!task.status().pendingOperationIds.includes(receipt.operationId)) throw error
+      }
+    }
+    return task.status()
+  }
+
+  /** 创建副作用采用 pending -> 权威来源查询/执行 -> completed 的统一两阶段合同。 */
+  const runCreatedOperation = async <TResult extends {
+    canvasId: string
+    nodeId: string
+    revision: number
+    sourceToolCallId: string
+  }>(
+    canvasId: string,
+    nodeKind: 'agent' | 'document' | 'webview' | 'image' | 'audio' | 'video',
+    toolCallId: string,
+    effect: () => Promise<TResult>,
+  ): Promise<TResult & { taskRegistration?: {
+    operationId: string
+    status: 'completed' | 'pending'
+    reasonCode?: string
+    nextAction?: { tool: 'canvas_task'; action: 'resume'; canvasId: string; taskId: string }
+  } }> => {
+    const status = task.status()
+    if (!taskEngaged || status.phase !== 'working' || status.canvasId !== canvasId) return effect()
+    /** 捕获原合同实例，避免并发迟到结果写入后来绑定的另一任务。 */
+    const operationTask = task
+    const pending: CanvasTaskPendingOperation = {
+      status: 'pending',
+      operationId: createTaskOperationId(status.taskId, canvasId, toolCallId),
+      sourceToolCallId: toolCallId,
+      startedAt: context.runStartedAt,
+      taskId: status.taskId,
+      canvasId,
+      kind: 'created',
+      nodeKind,
+    }
+    operationTask.recordOperation(pending)
+    const replayed = resolveCreatedOperation(pending)
+    const result = (replayed ?? await effect()) as TResult
+    const authoritative = resolveCreatedOperation(pending)
+    if (!authoritative || authoritative.nodeId !== result.nodeId || authoritative.artifactType !== nodeKind) {
+      return { ...result, taskRegistration: {
+        operationId: pending.operationId,
+        status: 'pending',
+        reasonCode: 'CANVAS_TASK_CREATED_RESULT_UNCONFIRMED',
+        nextAction: { tool: 'canvas_task', action: 'resume', canvasId, taskId: status.taskId },
+      } }
+    }
+    try {
+      operationTask.recordOperation(createCompletedReceipt(pending, authoritative))
+    } catch (error) {
+      /** pending 仍存在说明仅完成回执提交失败；创建事实已经由权威来源查询确认。 */
+      if (!operationTask.status().pendingOperationIds.includes(pending.operationId)) throw error
+      return { ...result, taskRegistration: {
+        operationId: pending.operationId,
+        status: 'pending',
+        reasonCode: 'CANVAS_TASK_OPERATION_RECEIPT_PERSIST_FAILED',
+        nextAction: { tool: 'canvas_task', action: 'resume', canvasId, taskId: status.taskId },
+      } }
+    }
+    return { ...result, taskRegistration: { operationId: pending.operationId, status: 'completed' } }
   }
 
   /** 只用创建事务返回的身份登记后继，后置失败仍向模型返回已创建节点。 */
@@ -911,10 +1102,13 @@ export function createCanvasToolRun(
   const tools: ToolDefinition[] = [
     defineCanvasTool({
       name: 'canvas_task', label: '画布任务交付',
-      description: '执行前用 start 登记交付。节点要求指定 nodeKind、validation 和 change：existing/updated 必须填写 nodeId，created 交付新节点；Host 捕获修改基线。response 仅用于文本本身就是交付。读取完整真实节点或图片取得 evidenceId 后 complete；缺少必要输入/能力时 block，status 查询本轮状态。不可降低要求，不是生成或授权工具。',
+      description: '执行前 start 登记交付；跨回合先 status 查看并 resume 原 taskId。created 是新节点，updated 是原节点新产物。读取真实证据后 complete；recover 复验原要求，rebind 只允许关联 Host 记录的新建操作。缺少必要输入/能力用 block。不能降低要求、重置预算或拿报告代替成片。',
       parameters: Type.Object({
-        action: Type.Union((['start', 'status', 'complete', 'block'] as const).map(value => Type.Literal(value))),
+        action: Type.Union((['start', 'status', 'resume', 'recover', 'rebind', 'complete', 'block'] as const).map(value => Type.Literal(value))),
         canvasId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        taskId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        requirementId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+        operationId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
         requirements: Type.Optional(Type.Array(Type.Object({
           id: Type.String({ minLength: 1, maxLength: 64 }),
           description: Type.String({ minLength: 1, maxLength: 1024 }),
@@ -922,6 +1116,15 @@ export function createCanvasToolRun(
           nodeId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
           change: Type.Optional(Type.Union((['existing', 'updated', 'created'] as const).map(value => Type.Literal(value)))),
           validation: Type.Union((['response', 'content', 'configuration', 'adopted', 'inspection'] as const).map(value => Type.Literal(value))),
+          mediaReview: Type.Optional(Type.Object({
+            stage: Type.Union([Type.Literal('preview'), Type.Literal('final')]),
+            requireAudio: Type.Optional(Type.Boolean()),
+            minDurationSeconds: Type.Optional(Type.Number({ minimum: 0, maximum: 86400 })),
+            maxDurationSeconds: Type.Optional(Type.Number({ minimum: 0, maximum: 86400 })),
+            width: Type.Optional(Type.Integer({ minimum: 1, maximum: 16384 })),
+            height: Type.Optional(Type.Integer({ minimum: 1, maximum: 16384 })),
+            contentCoverage: Type.Union([Type.Literal('technical'), Type.Literal('sampled'), Type.Literal('full')]),
+          }, { additionalProperties: false })),
         }, { additionalProperties: false }), { minItems: 1, maxItems: 32 })),
         submissions: Type.Optional(Type.Array(Type.Object({
           id: Type.String({ minLength: 1, maxLength: 64 }),
@@ -937,10 +1140,40 @@ export function createCanvasToolRun(
         /** status/block 和纯文本完成也不能保留已解除关联的 Canvas 权限。 */
         const registeredCanvasId = task.status().canvasId
         if (registeredCanvasId) assertReadAccess(registeredCanvasId, signal)
+        /** 只读状态查询不使本轮咨询继承旧任务的完成责任。 */
+        if (params.action === 'status' && !registeredCanvasId && dependencies.taskStore) {
+          const canvasId = params.canvasId ?? getContext()?.lastActiveCanvasId ?? getContext()?.defaultCanvasId
+          const stored = canvasId ? readStoredTask(canvasId) : null
+          return toolResult(stored ? { ...projectCanvasTaskStatus(stored.state),
+            resumable: true, nextAction: { tool: 'canvas_task', action: 'resume', canvasId, taskId: stored.state.taskId },
+          } : task.status())
+        }
+        if (params.action === 'resume') {
+          if (!params.canvasId || !dependencies.taskStore) throw new Error('CANVAS_TASK_RESUME_UNAVAILABLE')
+          const stored = readStoredTask(params.canvasId)
+          if (!stored || (params.taskId && params.taskId !== stored.state.taskId)) throw new Error('CANVAS_TASK_NOT_FOUND')
+          if (registeredCanvasId && task.status().taskId !== stored.state.taskId) throw new Error('CANVAS_TASK_ALREADY_STARTED')
+          if (registeredCanvasId && task.status().taskId === stored.state.taskId) {
+            return toolResult(reconcilePendingCreatedOperations())
+          }
+          bindTask(params.canvasId, stored.state)
+          taskEngaged = true
+          return toolResult(reconcilePendingCreatedOperations())
+        }
         if (params.action === 'start') {
           if (!params.canvasId || !params.requirements) throw new Error('CANVAS_TASK_REQUIREMENTS_INVALID')
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
           if (registeredCanvasId) return toolResult(task.start(params.canvasId, params.requirements, taskBaseline))
+          if (dependencies.taskStore) {
+            const stored = readStoredTask(params.canvasId)
+            if (stored && stored.state.phase !== 'completed') {
+              throw new Error(`CANVAS_TASK_ACTIVE_EXISTS: 请用 canvas_task resume 继续原任务 ${stored.state.taskId}，不能覆盖原目标。`)
+            }
+            if (stored) dependencies.access.runWrite(context, () => dependencies.taskStore!.archive({
+              projectId: context.projectId, canvasId: params.canvasId!, sessionId: context.sessionId,
+            }, stored.revision, stored.state.taskId))
+            bindTask(params.canvasId)
+          }
           /** 新建/修改以执行前的 Host 节点事实为基线，不能拿原输入冒充新交付。 */
           let baseline: CanvasTaskBaseline | undefined
           if (params.requirements.some(item => item.change === 'created' || item.change === 'updated')) {
@@ -961,7 +1194,17 @@ export function createCanvasToolRun(
           }
           const status = task.start(params.canvasId, params.requirements, baseline)
           taskBaseline = baseline
+          taskEngaged = true
           return toolResult(status)
+        }
+        if (params.action === 'recover') {
+          taskEngaged = true
+          reconcilePendingCreatedOperations()
+          return toolResult(await task.recover(signal ?? new AbortController().signal))
+        }
+        if (params.action === 'rebind') {
+          if (!params.requirementId || !params.operationId) throw new Error('CANVAS_TASK_REBIND_INVALID')
+          return toolResult(task.rebind({ requirementId: params.requirementId, operationId: params.operationId }))
         }
         if (params.action === 'complete') {
           return toolResult(await task.complete(params.submissions ?? [], signal ?? new AbortController().signal))
@@ -988,6 +1231,14 @@ export function createCanvasToolRun(
           })),
           permissionCeiling: context.permissionCeiling,
           task: task.status(),
+          ...(dependencies.taskStore && (binding?.lastActiveCanvasId ?? binding?.defaultCanvasId) ? {
+            resumableTask: (() => {
+              const stored = readStoredTask((binding!.lastActiveCanvasId ?? binding!.defaultCanvasId)!)
+              return stored ? { taskId: stored.state.taskId, canvasId: stored.state.canvasId,
+                phase: stored.state.phase, requirements: stored.state.requirements,
+                blockingReason: stored.state.blockingReason } : null
+            })(),
+          } : {}),
           availableTools: [...availableToolNames],
           ...(reviewTracker && context.reviewContext ? { review: {
             mode: context.reviewContext.mode,
@@ -1274,7 +1525,7 @@ export function createCanvasToolRun(
         if (dependencies.documents.load(target).document.revision !== params.expectedRevision) {
           throw new Error('CANVAS_REVISION_CONFLICT')
         }
-        for (const proof of inspectionProofs) task.record(proof)
+        task.recordMany(inspectionProofs)
         return {
           content,
           details: {
@@ -1474,12 +1725,8 @@ export function createCanvasToolRun(
           missingNodeIds: [...explicitNodeIds].filter((nodeId) => !existingNodeIds.has(nodeId)),
           complete: false,
         }, fullContents)
-        for (const entry of details.nodes) {
-          for (const reference of entry.evidence ?? []) {
-            const proof = pendingProofs.get(reference.evidenceId)
-            if (proof) task.record(proof)
-          }
-        }
+        task.recordMany(details.nodes.flatMap(entry => (entry.evidence ?? [])
+          .flatMap(reference => pendingProofs.has(reference.evidenceId) ? [pendingProofs.get(reference.evidenceId)!] : [])))
         /** 仅计入最终预算裁剪后送达的数据；枚举摘要与模型自报不增加审核覆盖。 */
         reviewTracker?.record(details)
         return toolResult(details as unknown as Record<string, unknown>, true)
@@ -1556,7 +1803,7 @@ export function createCanvasToolRun(
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
-          const result = await dependencies.artifacts.createAgent({
+          const result = await runCreatedOperation(params.canvasId, 'agent', toolCallId, () => dependencies.artifacts.createAgent({
             projectId: context.projectId,
             canvasId: params.canvasId,
             baseRevision: params.baseRevision,
@@ -1569,12 +1816,13 @@ export function createCanvasToolRun(
               runStartedAt: context.runStartedAt,
               toolCallId,
             },
-          })
+          }))
           return toolResult({
             canvasId: result.canvasId,
             nodeId: result.nodeId,
             revision: result.revision,
             sourceToolCallId: result.sourceToolCallId,
+            ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
           })
         })
       },
@@ -1603,7 +1851,7 @@ export function createCanvasToolRun(
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
-          const result = await dependencies.importImage({
+          const result = await runCreatedOperation(params.canvasId, 'image', toolCallId, () => dependencies.importImage({
             projectId: context.projectId,
             canvasId: params.canvasId,
             baseRevision: params.baseRevision,
@@ -1618,13 +1866,14 @@ export function createCanvasToolRun(
               runStartedAt: context.runStartedAt,
               toolCallId,
             },
-          })
+          }))
           return toolResult({
             canvasId: result.canvasId,
             nodeId: result.nodeId,
             revision: result.revision,
-            artifactType: result.artifactType,
+            artifactType: 'image',
             sourceToolCallId: result.sourceToolCallId,
+            ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
         })
@@ -1655,7 +1904,7 @@ export function createCanvasToolRun(
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
-          const result = await dependencies.artifacts.create({
+          const result = await runCreatedOperation(params.canvasId, params.artifactType, toolCallId, () => dependencies.artifacts.create({
             projectId: context.projectId,
             canvasId: params.canvasId,
             baseRevision: params.baseRevision,
@@ -1671,13 +1920,14 @@ export function createCanvasToolRun(
               runStartedAt: context.runStartedAt,
               toolCallId,
             },
-          })
+          }))
           return toolResult({
             canvasId: result.canvasId,
             nodeId: result.nodeId,
             revision: result.revision,
-            artifactType: result.artifactType,
+            artifactType: params.artifactType,
             sourceToolCallId: result.sourceToolCallId,
+            ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
         })
@@ -1703,7 +1953,7 @@ export function createCanvasToolRun(
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
-          const result = await dependencies.artifacts.create({
+          const result = await runCreatedOperation(params.canvasId, params.mediaKind, toolCallId, () => dependencies.artifacts.create({
             projectId: context.projectId,
             canvasId: params.canvasId,
             baseRevision: params.baseRevision,
@@ -1714,14 +1964,15 @@ export function createCanvasToolRun(
             ...(params.sourceNodeId ? { sourceNodeId: params.sourceNodeId } : {}),
             ...(params.relation ? { relation: params.relation as CanvasEdgeRelation } : {}),
             source: { sessionId: context.sessionId, runStartedAt: context.runStartedAt, toolCallId },
-          })
+          }))
           return toolResult({
             canvasId: result.canvasId,
             nodeId: result.nodeId,
             revision: result.revision,
-            mediaKind: result.artifactType,
+            mediaKind: params.mediaKind,
             configRevision: 0,
             requiresConfiguration: true,
+            ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
         })
@@ -2606,10 +2857,53 @@ export function createCanvasToolRun(
   /** Canvas Agent 的可信模式只缩减能力；普通 Agent 继续保留既有工具与审批。 */
   const mediaRun = dependencies.mediaTools?.(context)
   if (mediaRun) tools.push(...mediaRun.piCustomTools)
+  if (dependencies.mediaInspection) {
+    const inspection = dependencies.mediaInspection
+    tools.push(...createCanvasTaskMediaReview({
+      getTask: () => task,
+      readTarget: readMediaReviewTarget,
+      inspect: (asset, signal) => inspection.inspect(context, asset, {
+        audioPolicy: 'optional', ...(asset.mediaKind === 'video' ? { visualSamples: { count: 8 } } : {}),
+      }, signal),
+      verifyAsset: async (asset, signal) => {
+        signal.throwIfAborted()
+        await inspection.verifyAsset(context, asset, signal)
+        signal.throwIfAborted()
+      },
+    }))
+  }
   const isCanvasAgent = context.canvasAgentTarget !== undefined
-  const availableTools = isCanvasAgent
+  const modeTools = isCanvasAgent
     ? filterCanvasAgentToolsForMode(tools, context.canvasAgentMode ?? 'renderer-manual')
     : tools
+  /** 生产写入口统一检查合同，门禁发生在实际副作用之前。 */
+  const availableTools = !dependencies.taskStore ? modeTools : modeTools.map((tool): ToolDefinition => ({
+    ...tool,
+    execute: async (...args: Parameters<ToolDefinition['execute']>) => {
+      const params = args[1] as Record<string, unknown>
+      /** 独立媒体工具不因同项目有画布而自动被认作画布任务。 */
+      const participates = !tool.name.startsWith('media_') || taskEngaged || Boolean(context.canvasAgentTarget)
+      if (participates && requiresCanvasTask(tool.name, params)) {
+        dependencies.access.authorizeRead(context)
+        const canvasId = typeof params.canvasId === 'string' ? params.canvasId : task.status().canvasId
+        if (canvasId) assertReadAccess(canvasId, args[2])
+        let status = task.status()
+        if (!taskEngaged || !status.canvasId || status.canvasId !== canvasId) {
+          throw new Error('CANVAS_TASK_START_REQUIRED: 请先用 canvas_task status 查看原任务；已有任务用 resume，首次执行用 start 登记交付，再继续本操作。')
+        }
+        if (status.phase !== 'working') {
+          throw new Error('CANVAS_TASK_RECOVERY_REQUIRED: 请先用 canvas_task recover 复验并恢复原任务；不能覆盖合同或重复生成。')
+        }
+        if (status.pendingOperationIds.length > 0) {
+          status = reconcilePendingCreatedOperations()
+          if (status.pendingOperationIds.length > 0) {
+            throw new Error('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED: 已有创建操作结果尚未确认，请先恢复原回执，不能继续产生新的写入副作用。')
+          }
+        }
+      }
+      return tool.execute(...args)
+    },
+  }))
   /** 能力发现和返回的实际工具名单共享同一运行模式结果。 */
   const availableToolNames = new Set(availableTools.map((tool) => tool.name))
   /** 新操作提示只列出本轮真实装配并经运行模式过滤后的工具，避免 fallback 声称不存在的能力。 */
@@ -2659,11 +2953,13 @@ export function createCanvasToolRun(
 
   return {
     ...(reviewTracker ? { getReviewCoverage: () => reviewTracker.status() } : {}),
-    evaluateCompletion: (signal) => task.evaluate(signal),
+    evaluateCompletion: (signal) => !dependencies.taskStore || taskEngaged || taskOptions.required
+      ? task.evaluate(signal) : Promise.resolve({ action: 'complete' }),
     systemPromptAppend: `## 画布工具
 请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
 
-明确执行画布任务时先用 canvas_task start 登记真实交付要求，并按可用能力自主读取、配置、执行、验证和修复。response 仅适用于文本本身就是用户交付，不能用它代替要求的节点或真实生成结果。canvas_read 返回 content/configuration/adopted 证据，canvas_inspect_images 返回真实图像检查的 inspection 证据；用 evidenceId 完成全部要求后调用 canvas_task complete。配置已保存不表示可运行，媒体采用不表示质量通过。音视频 metadataOnly 与 WebView 源码不能代替内容或交互检查，缺少能力时 canvas_task block 报告具体原因。完成前 Host 会复验产物版本；有合法下一步的未完成任务在原会话和预算内继续，不能重建运行或降低交付要求来绕过核验。普通能力咨询和无需画布产物的问答不必登记任务。任务要求新增产物时，保留源输入，读取新产物作为完成证据。
+明确执行画布任务时先用 canvas_task status 查询；存在未完成任务就按 taskId resume，首次执行才用 canvas_task start 在写入前登记真实交付要求，并按可用能力自主读取、配置、执行、验证和修复。response 仅适用于文本本身就是用户交付，不能用它代替要求的节点或真实生成结果。canvas_read 返回 content/configuration/adopted 证据，canvas_inspect_images 返回真实图像检查的 inspection 证据；用 evidenceId 完成全部要求后调用 canvas_task complete。配置已保存不表示可运行，媒体采用不表示质量通过。音视频 metadataOnly 与 WebView 源码不能代替内容或交互检查，缺少能力时 canvas_task block 报告具体原因。完成前 Host 会复验产物版本；有合法下一步的未完成任务在原会话和预算内继续，不能重建运行或降低交付要求来绕过核验。普通能力咨询和无需画布产物的问答不必登记任务。任务要求新增产物时，保留源输入，读取新产物作为完成证据。
+音视频采用要求根据用途填写 mediaReview（stage、contentCoverage、音轨/时长/尺寸）。technical 仅适合技术素材，sampled 只代表有限抽样；完整成片视听验收需 full，能力不足明确 block，不能省略条件或降级。当前可用 canvas_inspect_media_content 时先读取真实采用素材，再在下一轮看过实际样本后 canvas_review_media；同批盲评不允许，样本只供紧接着的模型请求，重看时重新检查同一素材而非生成。完成提交评审后的 evidence.evidenceId，元数据、检查前ID或报告正文不能替代评审。
 
 当任务需要网页原型、图片设计稿、文档或多个可关联产物时，先读取并遵循 \`canvas-production\` Skill。Skill 不可用时按以下最小规则继续：产物类型会改变交付结果且用户未说明时，只询问一次；用户已明确类型时直接执行；明确要求修改项目 HTML、React、组件或其它代码文件时继续普通 Agent。
 

@@ -126,8 +126,10 @@ import type {
   CanvasToolImageImportInput,
   CanvasToolRunContext,
   CanvasToolRun,
+  CanvasToolProviderDependencies,
 } from './canvas-tool-provider'
 import { createCanvasToolRun } from './canvas-tool-provider'
+import type { createCanvasTaskStore } from './canvas-task-store'
 import { CANVAS_TASK_WAIT_MAX_MS, paginateCanvasOperationRecords, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import type { CanvasTaskOperationService } from './canvas-task-operation-service'
 import { waitForCanvasImageTaskTerminal } from './canvas-task-waiter'
@@ -181,6 +183,8 @@ export function createCanvasOperationSerializer(): CanvasOperationSerializer {
 
 /** 注册原生 Canvas 文档 IPC 的可信依赖。 */
 export interface CanvasDocumentIpcOptions {
+  /** Agent 交付合同持久化；原生 UI 操作仍沿用自身事务入口。 */
+  taskStore?: ReturnType<typeof createCanvasTaskStore>
   ipc: CanvasDocumentIpcRegistrar
   listAuthorizedWebContents: () => WebContents[]
   guard: Pick<WorkspaceOperationGuard, 'runWorkspaceWrite'>
@@ -194,7 +198,7 @@ export interface CanvasDocumentIpcOptions {
     execute?: (input: CanvasBatchOperationEnvelope) => Promise<CanvasBatchOperationResult>
   }
   /** 普通 Agent 创建 WebView 或图片节点时复用的原子产物服务。 */
-  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent'>
+  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'createAgent' | 'resolveCreated'>
   /** 普通 Agent 的本地图片导入在生产装配层完成路径授权。 */
   importImage: (input: CanvasToolImageImportInput) => Promise<CanvasArtifactCreationResult>
   /** 普通 Agent 文档与 WebView 读写复用生产唯一文本事务服务。 */
@@ -269,6 +273,8 @@ export interface CanvasDocumentIpcOptions {
   toolAccess?: CanvasToolAccessFacade
   /** 两类交互 Agent 的共享媒体工具由生产 Host 注入。 */
   mediaTools?: (context: CanvasToolRunContext) => CanvasToolRun
+  /** 正式媒体检查复用 Host 可信素材入口与有界解码服务。 */
+  mediaInspection?: CanvasToolProviderDependencies['mediaInspection']
 }
 
 /** Registry 中可执行统一导出的内部适配器。 */
@@ -1583,6 +1589,7 @@ export function registerCanvasDocumentIpcHandlers(
       value: {
         referenceResolver: toolAccess.referenceResolver,
         createRun: (context) => createCanvasToolRun({
+          taskStore: options.taskStore,
           operations: canvasOperationHandlers,
           access: toolAccess,
           documents: options.store,
@@ -1635,6 +1642,7 @@ export function registerCanvasDocumentIpcHandlers(
             adopt: async () => { throw new Error('CANVAS_MEDIA_UNAVAILABLE') },
           },
           mediaTools: options.mediaTools,
+          mediaInspection: options.mediaInspection,
         }, context),
         documents: options.store,
         agentConfigs: options.agent.configs,

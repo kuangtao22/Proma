@@ -71,6 +71,21 @@ export interface CanvasAgentArtifactCreationResult {
   sourceToolCallId: string
 }
 
+/** 按原始工具来源对账已创建节点，不需要重放正文或本地文件路径。 */
+export interface CanvasArtifactSourceLookup extends CanvasTarget {
+  artifactType: CanvasArtifactType | 'agent'
+  source: CanvasChangeSource
+}
+
+/** 来源对账只返回权威节点和当前图 revision。 */
+export interface CanvasArtifactSourceResult {
+  canvasId: string
+  nodeId: string
+  revision: number
+  artifactType: CanvasArtifactType | 'agent'
+  sourceToolCallId: string
+}
+
 /** 产物创建服务只编排现有权威 Store、内容 Store 与 batch。 */
 export interface CanvasArtifactCreationDependencies {
   documents: {
@@ -87,6 +102,7 @@ export interface CanvasArtifactCreationDependencies {
 export interface CanvasArtifactCreationService {
   create: (input: CanvasArtifactCreationInput) => Promise<CanvasArtifactCreationResult>
   createAgent: (input: CanvasAgentArtifactCreationInput) => Promise<CanvasAgentArtifactCreationResult>
+  resolveCreated: (input: CanvasArtifactSourceLookup) => CanvasArtifactSourceResult | null
 }
 
 /** 自动创建节点之间保留的最小净间距。 */
@@ -398,7 +414,26 @@ function documentReferencesContent(document: CanvasDocument, contentId: string):
 export function createCanvasArtifactCreationService(
   dependencies: CanvasArtifactCreationDependencies,
 ): CanvasArtifactCreationService {
+  /** 用稳定来源身份定位且校验权威节点，未知或冲突来源返回 null。 */
+  const resolveCreated = (input: CanvasArtifactSourceLookup): CanvasArtifactSourceResult | null => {
+    const identity = createArtifactIdentity(input)
+    const document = dependencies.documents.load({ projectId: input.projectId, canvasId: input.canvasId }).document
+    const node = document.nodes.find((candidate) => candidate.id === identity.nodeId)
+    const owned = input.artifactType === 'agent'
+      ? node?.kind === 'agent' && node.agentSessionId === identity.agentSessionId
+      : node !== undefined && isOwnedArtifactNode(node, input.artifactType, identity.contentId)
+    if (!node || !owned) return null
+    return {
+      canvasId: input.canvasId,
+      nodeId: node.id,
+      revision: document.revision,
+      artifactType: input.artifactType,
+      sourceToolCallId: input.source.toolCallId,
+    }
+  }
+
   return {
+    resolveCreated,
     create: async (input) => {
       /** 目标 Canvas 身份贯穿所有权威读取和写入。 */
       const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
@@ -406,6 +441,13 @@ export function createCanvasArtifactCreationService(
       const identity = createArtifactIdentity(input)
       /** 写内容前先验证初始 revision、来源节点和默认位置。 */
       const initialDocument = dependencies.documents.load(target).document
+      const replayed = resolveCreated(input)
+      if (replayed && replayed.artifactType !== 'agent') {
+        return {
+          canvasId: replayed.canvasId, nodeId: replayed.nodeId, revision: replayed.revision,
+          artifactType: replayed.artifactType, sourceToolCallId: replayed.sourceToolCallId,
+        }
+      }
       createArtifactOperations(input, initialDocument, identity)
       /** 图片沿用项目当前默认模型；音视频创建空模块，工作流配置由独立 CAS 工具保存。 */
       const preparedInput: PrepareCanvasArtifactContentInput = input.artifactType === 'image'
@@ -485,6 +527,13 @@ export function createCanvasArtifactCreationService(
     createAgent: async (input) => {
       const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
       const identity = createArtifactIdentity(input)
+      const replayed = resolveCreated({ ...input, artifactType: 'agent' })
+      if (replayed) {
+        return {
+          canvasId: replayed.canvasId, nodeId: replayed.nodeId,
+          revision: replayed.revision, sourceToolCallId: replayed.sourceToolCallId,
+        }
+      }
       /** 同一工具调用只允许一次权威重读重试，节点和会话身份始终不变。 */
       const execute = async (baseRevision: number, sourceToolCallId: string): Promise<CanvasAgentArtifactCreationResult> => {
         const document = dependencies.documents.load(target).document

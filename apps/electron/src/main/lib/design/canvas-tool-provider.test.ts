@@ -1,5 +1,8 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Value } from 'typebox/value'
 import { validateToolArguments } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
@@ -14,9 +17,365 @@ import {
 } from './canvas-tool-provider'
 import type { CanvasOperationToolHandlers } from './canvas-operation-tools'
 import { createCanvasAgentReviewTracker, resolveCanvasAgentReviewContext } from './canvas-agent-review'
+import { createCanvasTaskStore } from './canvas-task-store'
+import type { CanvasPaths } from './design-paths'
+import type { MediaAssetRef } from '@proma/shared'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
+
+/** 装配真实 Provider 媒体验收链，文件解码边界以固定可核对的结果替代。 */
+async function createMediaReviewFixture(hasAudio = true) {
+  const fixture = createFixture()
+  const document = fixture.dependencies.documents.load(target).document
+  document.nodes.push({ id: 'video-1', kind: 'video', title: '成片', position: { x: 0, y: 0 }, mediaModuleId: 'media-1' })
+  fixture.dependencies.documents.load = () => ({ document: structuredClone(document), writable: true, nodeIssues: [] })
+  const asset: MediaAssetRef = { assetId: 'video-asset', revision: 1, hash: 'a'.repeat(64), mediaKind: 'video' }
+  const snapshot = await fixture.dependencies.canvasMedia.load({ ...target, nodeId: 'video-1', mediaModuleId: 'media-1', mediaKind: 'video' })
+  const metadata = { width: 1080, height: 1440, durationMs: 18000, fps: 30, codec: 'h264', hasAudio }
+  snapshot.config.adoptedOutputs = [{ key: 'primary', mediaKind: 'video', role: 'primary', order: 0,
+    candidateId: 'candidate-1', runId: 'run-1', asset }]
+  snapshot.assets = [{ id: asset.assetId, revision: 1, hash: asset.hash, mediaKind: 'video', metadata,
+    filename: 'video.mp4', byteSize: 1000, mediaType: 'video/mp4', createdAt: 1 }]
+  fixture.dependencies.canvasMedia.load = async () => structuredClone(snapshot)
+  let assetChecks = 0
+  fixture.dependencies.mediaInspection = {
+    verifyAsset: async () => { assetChecks += 1 },
+    inspect: async () => ({ summary: {
+      asset, evidenceHash: asset.hash, technical: { status: 'passed', facts: { mediaKind: 'video', ...metadata } },
+      checks: { width: 'unchecked', height: 'unchecked', durationMs: 'unchecked', fps: 'unchecked', audio: 'unchecked', decode: 'pass' },
+      probe: { status: 'available' }, coverage: 'sampled', decodeCoverage: 'full', sampledTimesMs: [0, 9000, 17000],
+      audioCoverage: hasAudio ? 'technical' : 'none', contentVerdict: 'unknown', checkedConditions: ['decode'],
+      unchecked: ['full-video-content', 'audio-content'],
+    }, samples: [0, 9000, 17000].map(timeMs => ({ timeMs, mediaType: 'image/jpeg' as const, bytes: new Uint8Array([1, 2, 3]) })) }),
+  }
+  return { ...fixture, snapshot, getAssetChecks: () => assetChecks }
+}
+
+test('Given 正式视频仅有元数据 When 要求预演样本评审 Then 必须解码、读取样本并绑定评审证据才能完成', async () => {
+  const fixture = await createMediaReviewFixture()
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const signal = new AbortController().signal
+  await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+    { id: 'video', nodeId: 'video-1', nodeKind: 'video', validation: 'adopted', description: '预演评审',
+      mediaReview: { stage: 'preview', contentCoverage: 'sampled', requireAudio: true, width: 1080, minDurationSeconds: 18 } },
+  ] }, 'start', signal)
+  const read = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['video-1'] }, 'read', signal)
+  const metadataId = (read.details as { nodes: Array<{ evidence: Array<{ evidenceId: string; validation: string }> }> })
+    .nodes[0]!.evidence.find(item => item.validation === 'adopted')!.evidenceId
+  await expect(executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId: metadataId }] }, 'complete-1', signal))
+    .rejects.toThrow('CANVAS_TASK_MEDIA_INSPECTION_REQUIRED')
+  const inspected = await executeTool(run.piCustomTools, 'canvas_inspect_media_content', { canvasId: 'canvas-1', nodeId: 'video-1' }, 'inspect', signal)
+  expect(inspected.content.filter(item => item.type === 'image')).toHaveLength(3)
+  const inspectionEvidenceId = (inspected.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+  await expect(executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId: inspectionEvidenceId }] }, 'complete-2', signal))
+    .rejects.toThrow('CANVAS_TASK_MEDIA_REVIEW_REQUIRED')
+  await expect(executeTool(run.piCustomTools, 'canvas_review_media', { canvasId: 'canvas-1', nodeId: 'video-1', inspectionEvidenceId,
+    coverage: 'full', verdict: 'passed', notes: '完整视频通过' }, 'overclaim', signal)).rejects.toThrow('MEDIA_REVIEW_COVERAGE_OVERCLAIMED')
+  const reviewed = await executeTool(run.piCustomTools, 'canvas_review_media', { canvasId: 'canvas-1', nodeId: 'video-1', inspectionEvidenceId,
+    coverage: 'sampled', verdict: 'passed', notes: '三个样本通过，未观看完整视频或听取音轨' }, 'review', signal)
+  const evidenceId = (reviewed.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+  expect((await executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId }] }, 'complete-3', signal)).details)
+    .toMatchObject({ phase: 'completed' })
+  expect(fixture.getAssetChecks()).toBeGreaterThanOrEqual(2)
+  /** 原登记维度不变；换素材后旧评审无法继续冒充有效交付。 */
+  fixture.snapshot.config.adoptedOutputs[0]!.asset.hash = 'b'.repeat(64)
+  fixture.snapshot.assets[0]!.hash = 'b'.repeat(64)
+  await expect(executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId }] }, 'complete-stale', signal))
+    .rejects.toThrow('CANVAS_TASK_EVIDENCE_STALE')
+})
+
+test('Given 静音预演 When 合同分别要求有声和允许静音 Then 依据实际音轨决定技术交付', async () => {
+  for (const requireAudio of [true, false]) {
+    const fixture = await createMediaReviewFixture(false)
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const signal = new AbortController().signal
+    await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+      { id: 'video', nodeId: 'video-1', nodeKind: 'video', validation: 'adopted', description: '技术素材',
+        mediaReview: { stage: 'preview', contentCoverage: 'technical', requireAudio } },
+    ] }, 'start', signal)
+    const checked = await executeTool(run.piCustomTools, 'canvas_inspect_media_content', { canvasId: 'canvas-1', nodeId: 'video-1' }, 'inspect', signal)
+    const evidenceId = (checked.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+    const completion = executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId }] }, 'complete', signal)
+    if (requireAudio) await expect(completion).rejects.toThrow('CANVAS_TASK_MEDIA_AUDIO_REQUIRED')
+    else expect((await completion).details).toMatchObject({ phase: 'completed' })
+  }
+})
+
+test('Given 已评审媒体持久任务 When 下一回合恢复交付 Then 复核同一资产且不重复解码或生成', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'proma-media-task-resume-'))
+  try {
+    const fixture = await createMediaReviewFixture()
+    const store = createCanvasTaskStore({ pathResolver: { resolveCanvas: () => ({ canvasRoot: directory } as CanvasPaths) },
+      runWorkspaceWrite: (_projectId, effect) => effect() })
+    fixture.dependencies.taskStore = store
+    const inspectSpy = spyOn(fixture.dependencies.mediaInspection!, 'inspect')
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const signal = new AbortController().signal
+    const started = await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+      { id: 'video', nodeId: 'video-1', nodeKind: 'video', validation: 'adopted', description: '预演样本',
+        mediaReview: { stage: 'preview', contentCoverage: 'sampled' } },
+    ] }, 'start', signal)
+    const taskId = (started.details as { taskId: string }).taskId
+    const inspected = await executeTool(run.piCustomTools, 'canvas_inspect_media_content', { canvasId: 'canvas-1', nodeId: 'video-1' }, 'inspect', signal)
+    const inspectionEvidenceId = (inspected.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+    const reviewed = await executeTool(run.piCustomTools, 'canvas_review_media', { canvasId: 'canvas-1', nodeId: 'video-1', inspectionEvidenceId,
+      coverage: 'sampled', verdict: 'passed', notes: '仅三个样本通过' }, 'review', signal)
+    const evidenceId = (reviewed.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+    await executeTool(run.piCustomTools, 'canvas_task', { action: 'block', reason: '本回合交接' }, 'block', signal)
+    const next = createCanvasToolRun(fixture.dependencies, { ...fixture.context, runStartedAt: 100 })
+    await executeTool(next.piCustomTools, 'canvas_task', { action: 'resume', canvasId: 'canvas-1', taskId }, 'resume', signal)
+    await expect(executeTool(next.piCustomTools, 'canvas_review_media', { canvasId: 'canvas-1', nodeId: 'video-1', inspectionEvidenceId,
+      coverage: 'sampled', verdict: 'passed', notes: '试图在新回合不看样本就评审' }, 'review-old', signal)).rejects.toThrow('CANVAS_MEDIA_SAMPLES_REQUIRED')
+    await executeTool(next.piCustomTools, 'canvas_task', { action: 'recover' }, 'recover', signal)
+    expect((await executeTool(next.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId }] }, 'complete', signal)).details)
+      .toMatchObject({ taskId, phase: 'completed' })
+    expect(inspectSpy).toHaveBeenCalledTimes(1)
+    expect(fixture.runInputs).toHaveLength(0)
+    const saved = store.getActive({ ...target, sessionId: fixture.context.sessionId })!.state
+    expect(saved.proofs.some(item => item.evidence.mediaInspection?.verdict === 'passed')).toBe(true)
+    expect(JSON.stringify(saved)).not.toContain('"bytes"')
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('Given 已评审素材 When 完成检查期间正式采用版本变化 Then 拒绝旧评审完成', async () => {
+  const fixture = await createMediaReviewFixture()
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  const signal = new AbortController().signal
+  await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+    { id: 'video', nodeId: 'video-1', nodeKind: 'video', validation: 'adopted', description: '技术检查',
+      mediaReview: { stage: 'preview', contentCoverage: 'technical' } },
+  ] }, 'start', signal)
+  const inspected = await executeTool(run.piCustomTools, 'canvas_inspect_media_content', { canvasId: 'canvas-1', nodeId: 'video-1' }, 'inspect', signal)
+  const evidenceId = (inspected.details as { evidence: { evidenceId: string } }).evidence.evidenceId
+  fixture.dependencies.mediaInspection!.verifyAsset = async () => {
+    fixture.snapshot.config.adoptedOutputs[0]!.asset.hash = 'b'.repeat(64)
+    fixture.snapshot.assets[0]!.hash = 'b'.repeat(64)
+  }
+  await expect(executeTool(run.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'video', evidenceId }] }, 'complete', signal))
+    .rejects.toThrow('CANVAS_TASK_EVIDENCE_STALE')
+})
+
+test('Given 已登记并更新的任务 When 下一回合恢复 Then 保留原基线、读取新证据并完成且不重做', async () => {
+  /** 隔离真实持久文件，第二个 Provider 模拟下一回合而不复用合同闭包。 */
+  const directory = mkdtempSync(join(tmpdir(), 'proma-provider-task-'))
+  try {
+    const fixture = createFixture()
+    fixture.dependencies.taskStore = createCanvasTaskStore({
+      pathResolver: { resolveCanvas: () => ({ canvasRoot: directory } as CanvasPaths) },
+      runWorkspaceWrite: (_projectId, effect) => effect(),
+    })
+    const first = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const started = await executeTool(first.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+      { id: 'report', nodeId: 'doc-1', nodeKind: 'document', change: 'updated', validation: 'content', description: '更新评审' },
+    ] })
+    const taskId = (started.details as { taskId: string }).taskId
+    await executeTool(first.piCustomTools, 'canvas_update_artifact', {
+      canvasId: 'canvas-1', nodeId: 'doc-1', baseRevision: 3, expectedContentRevision: 2, content: '已完成本轮评审',
+    })
+    const next = createCanvasToolRun(fixture.dependencies, { ...fixture.context, runStartedAt: 100 })
+    expect((await executeTool(next.piCustomTools, 'canvas_task', { action: 'status', canvasId: 'canvas-1' })).details)
+      .toMatchObject({ taskId, phase: 'working', resumable: true })
+    expect(await next.evaluateCompletion?.(new AbortController().signal)).toEqual({ action: 'complete' })
+    await expect(executeTool(next.piCustomTools, 'canvas_task', { action: 'start', canvasId: 'canvas-1', requirements: [
+      { id: 'other', validation: 'response', description: '替代旧要求' },
+    ] })).rejects.toThrow('CANVAS_TASK_ACTIVE_EXISTS')
+    await executeTool(next.piCustomTools, 'canvas_task', { action: 'resume', canvasId: 'canvas-1', taskId })
+    const read = await executeTool(next.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['doc-1'] })
+    const evidenceId = (read.details as { nodes: Array<{ evidence: Array<{ evidenceId: string }> }> }).nodes[0]!.evidence[0]!.evidenceId
+    expect((await executeTool(next.piCustomTools, 'canvas_task', { action: 'complete', submissions: [{ id: 'report', evidenceId }] })).details)
+      .toMatchObject({ taskId, phase: 'completed' })
+    expect(fixture.textUpdateInputs).toHaveLength(1)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('Given 创建节点成功但完成回执落盘失败 When 下一回合恢复 Then 按原来源对账且不重复创建', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'proma-provider-created-receipt-'))
+  try {
+    const fixture = createFixture()
+    const persistentStore = createCanvasTaskStore({
+      pathResolver: { resolveCanvas: () => ({ canvasRoot: directory } as CanvasPaths) },
+      runWorkspaceWrite: (_projectId, effect) => effect(),
+    })
+    let rejectCompletedReceipt = true
+    fixture.dependencies.taskStore = {
+      ...persistentStore,
+      save: (storeTarget, expectedRevision, state) => {
+        if (rejectCompletedReceipt && state.operationReceipts.some(receipt => receipt.status === 'completed')) {
+          rejectCompletedReceipt = false
+          throw new Error('SIMULATED_COMPLETED_RECEIPT_WRITE_FAILURE')
+        }
+        return persistentStore.save(storeTarget, expectedRevision, state)
+      },
+    }
+    const originalLoad = fixture.dependencies.documents.load
+    let created = false
+    let createCalls = 0
+    fixture.dependencies.documents.load = (canvasTarget) => {
+      const snapshot = originalLoad(canvasTarget)
+      if (created && !snapshot.document.nodes.some(node => node.id === 'recovered-document')) {
+        snapshot.document.revision = 4
+        snapshot.document.nodes.push({
+          id: 'recovered-document', kind: 'document', title: '生产报告', position: { x: 0, y: 200 },
+          documentId: 'recovered-content', contentRevision: 1,
+        })
+      }
+      return snapshot
+    }
+    fixture.dependencies.artifacts.create = async (input) => {
+      createCalls += 1
+      created = true
+      return {
+        canvasId: input.canvasId, nodeId: 'recovered-document', revision: 4,
+        artifactType: input.artifactType, sourceToolCallId: input.source.toolCallId,
+      }
+    }
+    fixture.dependencies.artifacts.resolveCreated = (input) => created
+      && input.artifactType === 'document'
+      && input.source.sessionId === 'session-1'
+      && input.source.runStartedAt === 99
+      && input.source.toolCallId === 'tool-create-recoverable'
+      ? {
+          canvasId: input.canvasId, nodeId: 'recovered-document', revision: 4,
+          artifactType: 'document', sourceToolCallId: input.source.toolCallId,
+        }
+      : null
+
+    const first = createCanvasToolRun(fixture.dependencies, fixture.context)
+    const started = await executeTool(first.piCustomTools, 'canvas_task', {
+      action: 'start', canvasId: 'canvas-1', requirements: [{
+        id: 'report', description: '创建生产报告', nodeKind: 'document', change: 'created', validation: 'content',
+      }],
+    })
+    const taskId = (started.details as { taskId: string }).taskId
+    const createdResult = await executeTool(first.piCustomTools, 'canvas_create_artifact', {
+      canvasId: 'canvas-1', baseRevision: 3, artifactType: 'document', title: '生产报告', content: '# 已完成',
+    }, 'tool-create-recoverable')
+    expect(createdResult.details).toMatchObject({
+      nodeId: 'recovered-document',
+      taskRegistration: {
+        status: 'pending', reasonCode: 'CANVAS_TASK_OPERATION_RECEIPT_PERSIST_FAILED',
+        nextAction: { tool: 'canvas_task', action: 'resume', canvasId: 'canvas-1', taskId },
+      },
+    })
+    expect(createCalls).toBe(1)
+
+    const next = createCanvasToolRun(fixture.dependencies, { ...fixture.context, runStartedAt: 100 })
+    const resumed = await executeTool(next.piCustomTools, 'canvas_task', {
+      action: 'resume', canvasId: 'canvas-1', taskId,
+    })
+    const operation = (resumed.details as {
+      operationReceipts: Array<{ operationId: string; status: string; nodeId?: string }>
+    }).operationReceipts[0]!
+    expect(operation).toMatchObject({ status: 'completed', nodeId: 'recovered-document' })
+    expect(createCalls).toBe(1)
+    await executeTool(next.piCustomTools, 'canvas_task', {
+      action: 'rebind', requirementId: 'report', operationId: operation.operationId,
+    })
+    const read = await executeTool(next.piCustomTools, 'canvas_read', {
+      canvasId: 'canvas-1', nodeIds: ['recovered-document'],
+    })
+    const evidenceId = (read.details as { nodes: Array<{ evidence: Array<{ evidenceId: string }> }> })
+      .nodes[0]!.evidence[0]!.evidenceId
+    expect((await executeTool(next.piCustomTools, 'canvas_task', {
+      action: 'complete', submissions: [{ id: 'report', evidenceId }],
+    })).details).toMatchObject({ phase: 'completed' })
+
+    const publicStatus = await executeTool(
+      createCanvasToolRun(fixture.dependencies, { ...fixture.context, runStartedAt: 101 }).piCustomTools,
+      'canvas_task', { action: 'status', canvasId: 'canvas-1' },
+    )
+    expect(publicStatus.details).not.toHaveProperty('proofs')
+    expect(publicStatus.details).not.toHaveProperty('submissions')
+    expect(publicStatus.details).not.toHaveProperty('generatedJobs')
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('Given 创建结果无法按原来源确认 When 继续正式写入 Then 保留pending并在副作用前阻断', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'proma-provider-unconfirmed-created-'))
+  try {
+    const fixture = createFixture()
+    fixture.dependencies.taskStore = createCanvasTaskStore({
+      pathResolver: { resolveCanvas: () => ({ canvasRoot: directory } as CanvasPaths) },
+      runWorkspaceWrite: (_projectId, effect) => effect(),
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+    await executeTool(run.piCustomTools, 'canvas_task', {
+      action: 'start', canvasId: 'canvas-1', requirements: [{
+        id: 'report', description: '创建生产报告', nodeKind: 'document', change: 'created', validation: 'content',
+      }],
+    })
+    const created = await executeTool(run.piCustomTools, 'canvas_create_artifact', {
+      canvasId: 'canvas-1', baseRevision: 3, artifactType: 'document', title: '生产报告', content: '# 已完成',
+    }, 'tool-create-unconfirmed')
+    expect(created.details).toMatchObject({
+      nodeId: 'artifact-created',
+      taskRegistration: { status: 'pending', reasonCode: 'CANVAS_TASK_CREATED_RESULT_UNCONFIRMED' },
+    })
+
+    await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'upsert-edges', edges: [] }],
+    })).rejects.toThrow('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED')
+    expect(fixture.batchInputs).toHaveLength(0)
+  } finally { rmSync(directory, { recursive: true, force: true }) }
+})
+
+test('Given 音视频节点属于新建交付 When 创建媒体卡片 Then 同样登记可恢复完成回执', async () => {
+  for (const mediaKind of ['audio', 'video'] as const) {
+    const directory = mkdtempSync(join(tmpdir(), `proma-provider-created-${mediaKind}-`))
+    try {
+      const fixture = createFixture()
+      fixture.dependencies.taskStore = createCanvasTaskStore({
+        pathResolver: { resolveCanvas: () => ({ canvasRoot: directory } as CanvasPaths) },
+        runWorkspaceWrite: (_projectId, effect) => effect(),
+      })
+      fixture.dependencies.artifacts.resolveCreated = (input) => (
+        input.artifactType === mediaKind && fixture.artifactInputs.length === 1
+          ? {
+              canvasId: input.canvasId, nodeId: 'artifact-created', revision: 4,
+              artifactType: mediaKind, sourceToolCallId: input.source.toolCallId,
+            }
+          : null
+      )
+      const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+      await executeTool(run.piCustomTools, 'canvas_task', {
+        action: 'start', canvasId: 'canvas-1', requirements: [{
+          id: `created-${mediaKind}`, description: `创建${mediaKind}卡片`, nodeKind: mediaKind,
+          change: 'created', validation: 'configuration',
+        }],
+      })
+      const result = await executeTool(run.piCustomTools, 'canvas_create_media', {
+        canvasId: 'canvas-1', baseRevision: 3, mediaKind, title: `${mediaKind}卡片`,
+      }, `tool-create-${mediaKind}`)
+      expect(result.details).toMatchObject({
+        nodeId: 'artifact-created', mediaKind,
+        taskRegistration: { status: 'completed' },
+      })
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  }
+})
+
+test('Given 生产装配持久任务 When 未登记便导入终验图 Then 在创建前拒绝并指向登记动作', async () => {
+  /** 最小空存储用于验证写入前门禁，不能把读出的空任务当成生成授权。 */
+  const fixture = createFixture()
+  Object.assign(fixture.dependencies, { taskStore: { getActive: () => null } })
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  await expect(executeTool(run.piCustomTools, 'canvas_import_image', {
+    canvasId: 'canvas-1', baseRevision: 3, title: '终验图', localPath: '/tmp/verification.png',
+  })).rejects.toThrow('CANVAS_TASK_START_REQUIRED')
+  expect(fixture.importedImageInputs).toHaveLength(0)
+})
+
+test('Given 没有任务的普通问答 When 读取现有画布 Then 不登记、不生成且正常结束', async () => {
+  /** 未参与执行的问答不会因同项目开启画布而承担交付门禁。 */
+  const fixture = createFixture()
+  Object.assign(fixture.dependencies, { taskStore: { getActive: () => null } })
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  await executeTool(run.piCustomTools, 'canvas_read', { canvasId: 'canvas-1', nodeIds: ['doc-1'] })
+  expect(await run.evaluateCompletion?.(new AbortController().signal)).toEqual({ action: 'complete' })
+  expect(fixture.runInputs).toHaveLength(0)
+})
 
 test('Given 专业节点执行失败 When 父编排接收回执 Then 包含实际节点诊断和只读恢复动作', async () => {
   const fixture = createFixture()
@@ -683,6 +1042,7 @@ function createFixture(options: {
     },
     readNodeContent: async (_target, node) => node.kind === 'document' ? 'A'.repeat(40_000) : '',
     artifacts: {
+      resolveCreated: () => null,
       create: async (input) => {
         artifactInputs.push(structuredClone(input) as unknown as Record<string, unknown>)
         return {

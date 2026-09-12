@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { createCanvasTaskContract, type CanvasTaskEvidence } from './canvas-task-contract'
+import {
+  createCanvasTaskContract,
+  type CanvasTaskEvidence,
+  type CanvasTaskOperationReceipt,
+} from './canvas-task-contract'
 
 /** 同一权威文档版本的最小产物证据；测试不访问真实项目。 */
 const evidence: CanvasTaskEvidence = { canvasId: 'canvas', nodeId: 'doc', nodeKind: 'document', validation: 'content', identity: 'revision-1' }
@@ -9,6 +13,198 @@ const existingRequirement = {
 }
 
 describe('Canvas 任务交付合同', () => {
+  test('Given 状态提交失败 When 启动任务 Then 内存状态不提前推进', () => {
+    const task = createCanvasTaskContract({
+      required: true,
+      taskId: 'task-persist-failure',
+      verify: async () => true,
+      onStateChange: () => { throw new Error('CANVAS_TASK_STORE_CONFLICT') },
+    })
+
+    expect(() => task.start('canvas', [existingRequirement])).toThrow('CANVAS_TASK_STORE_CONFLICT')
+    expect(task.status()).toMatchObject({ taskId: 'task-persist-failure', phase: 'unplanned', canvasId: null })
+  })
+
+  test('Given 已持久化执行状态 When 重建合同 Then 原始要求基线和证据继续可用', async () => {
+    const first = createCanvasTaskContract({ required: true, taskId: 'task-resume', verify: async () => true })
+    first.start('canvas', [existingRequirement])
+    const proof = first.record(evidence)
+    const restored = createCanvasTaskContract({
+      required: true,
+      taskId: 'task-resume',
+      initialState: first.exportState(),
+      verify: async () => true,
+    })
+
+    expect(restored.status()).toMatchObject({ taskId: 'task-resume', phase: 'working', canvasId: 'canvas' })
+    expect((await restored.complete([{ id: 'report', evidenceId: proof.evidenceId }], new AbortController().signal)).phase)
+      .toBe('completed')
+  })
+
+  test('Given Host记录本任务创建回执 When 修正created绑定 Then 可沿真实节点完成', async () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-created', verify: async () => true })
+    task.start('canvas', [{
+      id: 'new-image', description: '创建图片', nodeId: 'planned-node', nodeKind: 'image',
+      change: 'created', validation: 'inspection',
+    }], { nodeIds: ['old-node'], evidence: [] })
+    const pending: CanvasTaskOperationReceipt = {
+      status: 'pending', operationId: 'operation-create-image', sourceToolCallId: 'tool-create-image',
+      startedAt: 10, taskId: 'task-created', canvasId: 'canvas', kind: 'created',
+    }
+    const receipt: CanvasTaskOperationReceipt = {
+      ...pending, status: 'completed', nodeId: 'actual-node', nodeKind: 'image',
+      after: { canvasId: 'canvas', nodeId: 'actual-node', nodeKind: 'image', validation: 'inspection', identity: 'image-v1' },
+    }
+    task.recordOperation(pending)
+    task.recordOperation(receipt)
+    task.rebind({ requirementId: 'new-image', operationId: receipt.operationId })
+    const proof = task.record(receipt.after)
+
+    expect((await task.complete([{ id: 'new-image', evidenceId: proof.evidenceId }], new AbortController().signal)).phase)
+      .toBe('completed')
+  })
+
+  test('Given created绑定再次修正 When 保存修订 Then 保留旧记录并以最后可信回执生效', async () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-amendment', verify: async () => true })
+    task.start('canvas', [{
+      id: 'created-doc', description: '创建文档', nodeKind: 'document', change: 'created', validation: 'content',
+    }], { nodeIds: [], evidence: [] })
+    for (const [operationId, nodeId] of [['create-first', 'doc-first'], ['create-corrected', 'doc-corrected']] as const) {
+      const pending: CanvasTaskOperationReceipt = {
+        status: 'pending', operationId, sourceToolCallId: `tool-${operationId}`, startedAt: 10,
+        taskId: 'task-amendment', canvasId: 'canvas', kind: 'created',
+      }
+      task.recordOperation(pending)
+      task.recordOperation({
+        ...pending, status: 'completed', nodeId, nodeKind: 'document',
+        after: { canvasId: 'canvas', nodeId, nodeKind: 'document', validation: 'content', identity: `${nodeId}-v1` },
+      })
+      task.rebind({ requirementId: 'created-doc', operationId })
+    }
+    const state = task.exportState()
+    expect(state.bindings).toHaveLength(2)
+    const corrected = task.record({
+      canvasId: 'canvas', nodeId: 'doc-corrected', nodeKind: 'document', validation: 'content', identity: 'doc-corrected-v1',
+    })
+    await expect(task.complete([{ id: 'created-doc', evidenceId: corrected.evidenceId }], new AbortController().signal))
+      .resolves.toMatchObject({ phase: 'completed' })
+  })
+
+  test('Given pending已声明创建目标 When completed更换目标 Then 拒绝篡改原操作意图', () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-intent', verify: async () => true })
+    task.start('canvas', [{
+      id: 'created-doc', description: '创建文档', nodeKind: 'document', change: 'created', validation: 'content',
+    }], { nodeIds: [], evidence: [] })
+    const pending: CanvasTaskOperationReceipt = {
+      status: 'pending', operationId: 'create-doc', sourceToolCallId: 'tool-create-doc', startedAt: 10,
+      taskId: 'task-intent', canvasId: 'canvas', kind: 'created', nodeId: 'planned-doc', nodeKind: 'document',
+      before: { canvasId: 'canvas', nodeId: 'planned-doc', nodeKind: 'document', validation: 'content', absent: true },
+    }
+    task.recordOperation(pending)
+
+    expect(() => task.recordOperation({
+      ...pending, status: 'completed', nodeId: 'other-doc', nodeKind: 'document',
+      before: { canvasId: 'canvas', nodeId: 'other-doc', nodeKind: 'document', validation: 'content', absent: true },
+      after: { canvasId: 'canvas', nodeId: 'other-doc', nodeKind: 'document', validation: 'content', identity: 'other-v1' },
+    })).toThrow('CANVAS_TASK_OPERATION_CONFLICT')
+    expect(task.status().pendingOperationIds).toEqual(['create-doc'])
+  })
+
+  test('Given 未知来源或旧任务回执 When 修正绑定 Then 拒绝且保留阻断状态', () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-current', verify: async () => true })
+    task.start('canvas', [{
+      id: 'new-image', description: '创建图片', nodeKind: 'image', change: 'created', validation: 'inspection',
+    }], { nodeIds: [], evidence: [] })
+    task.block('blocked', '缺少可信来源')
+    const oldReceipt: CanvasTaskOperationReceipt = {
+      status: 'pending', operationId: 'operation-old', sourceToolCallId: 'tool-old', startedAt: 1,
+      taskId: 'task-old', canvasId: 'canvas', kind: 'created',
+    }
+
+    expect(() => task.recordOperation(oldReceipt)).toThrow('CANVAS_TASK_OPERATION_TASK_MISMATCH')
+    expect(() => task.rebind({ requirementId: 'new-image', operationId: 'missing' })).toThrow('CANVAS_TASK_OPERATION_NOT_FOUND')
+    expect(task.status()).toMatchObject({ phase: 'blocked', blockingReason: '缺少可信来源' })
+  })
+
+  test('Given 已阻断任务 When 原要求后来具备可信证据 Then 可直接完成而不降低要求', async () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-unblocked', verify: async () => true })
+    task.start('canvas', [existingRequirement])
+    task.block('blocked', '等待真实文件')
+    const proof = task.record(evidence)
+
+    expect((await task.complete([{ id: 'report', evidenceId: proof.evidenceId }], new AbortController().signal)).phase)
+      .toBe('completed')
+    expect(task.status().requirements).toEqual([existingRequirement])
+  })
+
+  test('Given 视频正式交付要求 When Host保存抽样检查证据 Then 重启后保留可核验字段', async () => {
+    const task = createCanvasTaskContract({
+      required: true,
+      taskId: 'task-video-review',
+      verify: async (proof) => proof.mediaInspection?.coverage === 'sampled'
+        && proof.mediaInspection.verdict === 'passed',
+    })
+    task.start('canvas', [{
+      id: 'final-video', description: '正式成片', nodeId: 'video-one', nodeKind: 'video', validation: 'adopted',
+      mediaReview: {
+        stage: 'final', requireAudio: true, minDurationSeconds: 15, maxDurationSeconds: 20,
+        width: 1080, height: 1440, contentCoverage: 'technical',
+      },
+    }])
+    const proof = task.record({
+      canvasId: 'canvas', nodeId: 'video-one', nodeKind: 'video', validation: 'adopted', identity: 'video-hash',
+      mediaInspection: {
+        assetHash: 'a'.repeat(64), technicalStatus: 'passed', decoded: true, coverage: 'sampled',
+        sampledTimesMs: [0, 9000, 17999], verdict: 'passed', notes: '抽样帧与音轨检查通过',
+        width: 1080, height: 1440, durationMs: 18000, fps: 30, hasAudio: true,
+      },
+    })
+    const restored = createCanvasTaskContract({
+      required: true, taskId: 'task-video-review', initialState: task.exportState(),
+      verify: async (saved) => saved.mediaInspection?.sampledTimesMs.length === 3,
+    })
+
+    await expect(restored.complete([{ id: 'final-video', evidenceId: proof.evidenceId }], new AbortController().signal))
+      .resolves.toMatchObject({ phase: 'completed' })
+  })
+
+  test('Given 图片或伪造无界媒体检查 When 记录证据 Then 核心状态拒绝保存', () => {
+    const task = createCanvasTaskContract({ required: true, verify: async () => true })
+    expect(() => task.record({
+      canvasId: 'canvas', nodeId: 'image-one', nodeKind: 'image', validation: 'adopted', identity: 'image',
+      mediaInspection: {
+        assetHash: 'a'.repeat(64), technicalStatus: 'passed', decoded: true, coverage: 'full',
+        sampledTimesMs: [], verdict: 'passed', notes: '不应允许图片伪造音视频检查',
+      },
+    })).toThrow('CANVAS_TASK_STATE_INVALID')
+  })
+
+  test('Given 一次工具读取多节点 When 批量登记证据 Then 只提交一次持久状态', () => {
+    let commits = 0
+    const task = createCanvasTaskContract({
+      required: true, verify: async () => true, onStateChange: () => { commits += 1 },
+    })
+    task.start('canvas', [existingRequirement])
+    commits = 0
+
+    const references = task.recordMany([
+      evidence,
+      { ...evidence, nodeId: 'doc-two', identity: 'revision-two' },
+    ])
+
+    expect(references).toHaveLength(2)
+    expect(commits).toBe(1)
+  })
+
+  test('Given 工具读取没有可签证据 When 批量登记空结果 Then 不产生磁盘写', () => {
+    let commits = 0
+    const task = createCanvasTaskContract({
+      required: false, verify: async () => true, onStateChange: () => { commits += 1 },
+    })
+
+    expect(task.recordMany([])).toEqual([])
+    expect(commits).toBe(0)
+  })
   test('Given 新导入的图片节点 When 检查真实图片 Then created不强制额外付费生成', async () => {
     const task = createCanvasTaskContract({ required: true, verify: async () => true })
     task.start('canvas', [{ id: 'import', description: '导入并检查图片', nodeKind: 'image', change: 'created', validation: 'inspection' }], {
@@ -247,5 +443,21 @@ describe('Canvas 任务交付合同', () => {
     scopeAvailable = false
     await expect(task.evaluate(new AbortController().signal)).rejects.toThrow('CANVAS_ACCESS_DENIED')
     expect(scopeChecks).toBe(2)
+  })
+
+  test('Given 阻塞任务仍有未对账操作 When 恢复 Then 保持阻塞并要求先完成来源对账', async () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-pending-recovery', verify: async () => true })
+    task.start('canvas', [{
+      id: 'created-doc', description: '创建文档', nodeKind: 'document', change: 'created', validation: 'content',
+    }], { nodeIds: ['doc'], evidence: [] })
+    task.recordOperation({
+      status: 'pending', operationId: 'operation-pending-document', sourceToolCallId: 'tool-create-document',
+      startedAt: 10, taskId: 'task-pending-recovery', canvasId: 'canvas', kind: 'created', nodeKind: 'document',
+    })
+    task.block('blocked', '创建结果回执尚未确认')
+
+    await expect(task.recover(new AbortController().signal))
+      .rejects.toThrow('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED')
+    expect(task.status()).toMatchObject({ phase: 'blocked', pendingOperationIds: ['operation-pending-document'] })
   })
 })

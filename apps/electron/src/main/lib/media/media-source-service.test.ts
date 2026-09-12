@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { AgentSessionMeta, MediaAssetRecord, MediaAssetRef, SDKMessage } from '@proma/shared'
@@ -112,6 +112,13 @@ function fixture() {
     assetRef,
     assetRecord,
     setAssetPath: (next: string) => { assetPath = next },
+    setAssetBytes: (bytes: Uint8Array) => {
+      writeFileSync(assetPath, bytes)
+      const hash = createHash('sha256').update(bytes).digest('hex')
+      assetRef.hash = hash
+      assetRecord.hash = hash
+      assetRecord.byteSize = bytes.byteLength
+    },
     setBeforeAuthorization: (effect: () => void) => { beforeAuthorization = effect },
   }
 }
@@ -374,6 +381,101 @@ describe('会话媒体来源服务', () => {
 
     expect(file).toEqual({ path: realpathSync(join(f.projectRoot, 'asset.mp4')), asset: f.assetRef, record: f.assetRecord })
     expect(f.authorizations).toEqual(['list', 'list'])
+  })
+
+  test('Given 调用方设置更小读取上限 When 资产实际大小超限 Then 在完整hash读取前拒绝', async () => {
+    const f = fixture()
+
+    await expect(f.service.getAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      f.assetRecord.byteSize - 1,
+    )).rejects.toThrow('MEDIA_ASSET_FILE_SIZE_LIMIT')
+    expect(f.authorizations).toEqual(['list'])
+  })
+
+  test('Given 正式路径在检查期间被替换后恢复 When 使用资产快照 Then 消费方始终读取同一已验证字节且结束清理', async () => {
+    const f = fixture()
+    const originalBytes = readFileSync(join(f.projectRoot, 'asset.mp4'))
+    let snapshotPath = ''
+
+    const observed = await f.service.withAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      128 * 1024 * 1024,
+      async (snapshot) => {
+        snapshotPath = snapshot.path
+        expect(snapshot.path).not.toBe(realpathSync(join(f.projectRoot, 'asset.mp4')))
+        writeFileSync(join(f.projectRoot, 'asset.mp4'), Buffer.from('temporary replacement'))
+        const first = readFileSync(snapshot.path)
+        writeFileSync(join(f.projectRoot, 'asset.mp4'), originalBytes)
+        const second = readFileSync(snapshot.path)
+        return [first, second]
+      },
+    )
+
+    expect(observed[0]).toEqual(originalBytes)
+    expect(observed[1]).toEqual(originalBytes)
+    expect(existsSync(snapshotPath)).toBe(false)
+  })
+
+  test('Given 大型可信资产 When 仅复验hash Then 分块读取会让出事件循环且不复制同等大小内存', async () => {
+    const f = fixture()
+    const largeBytes = Buffer.alloc(16 * 1024 * 1024, 7)
+    f.setAssetBytes(largeBytes)
+    const memoryBefore = process.memoryUsage().arrayBuffers
+    let eventLoopAdvanced = false
+    setImmediate(() => { eventLoopAdvanced = true })
+
+    await f.service.verifyAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      32 * 1024 * 1024,
+    )
+
+    const addedArrayBufferBytes = process.memoryUsage().arrayBuffers - memoryBefore
+    expect(eventLoopAdvanced).toBe(true)
+    expect(addedArrayBufferBytes).toBeLessThan(4 * 1024 * 1024)
+  })
+
+  test('Given 快照消费结束时来源授权被撤销 When 返回结果 Then 拒绝结果并清理私有快照', async () => {
+    const f = fixture()
+    let snapshotPath = ''
+
+    await expect(f.service.withAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      128 * 1024 * 1024,
+      async (snapshot) => {
+        snapshotPath = snapshot.path
+        f.setLocalRoots([])
+        return 'should-not-return'
+      },
+    )).rejects.toThrow('MEDIA_ASSET_FILE_REVOKED')
+
+    expect(existsSync(snapshotPath)).toBe(false)
+  })
+
+  test('Given 检查开始前已经取消 When 建立或复验资产 Then 抛AbortError且不进入快照回调', async () => {
+    const f = fixture()
+    const controller = new AbortController()
+    controller.abort()
+    let called = false
+
+    await expect(f.service.withAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      128 * 1024 * 1024,
+      async () => { called = true },
+      controller.signal,
+    )).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(f.service.verifyAssetFile(
+      { projectId: 'project-1', sessionId: 'session-1' },
+      f.assetRef,
+      128 * 1024 * 1024,
+      controller.signal,
+    )).rejects.toMatchObject({ name: 'AbortError' })
+    expect(called).toBe(false)
   })
 
   test('Given 跨项目或伪造 hash 的资产引用 When 获取文件 Then 在返回路径前拒绝', async () => {

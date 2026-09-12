@@ -2,7 +2,7 @@
 name: canvas-production
 description: Proma 画布生产与 Agent 编排 Skill。用户希望创建、迭代或评审网页原型、图片设计稿、文档、产品套图、整套交互视觉稿、漫剧分镜、多镜头视频、音视频剪辑、程序规划或其他需要多个可关联产物的任务时使用。根据用途选择制作模式、安排专业 Agent、评审方案与实际产物，并通过 Proma 内置 canvas_* 工具执行；普通代码修改、一次性文本回答或不需要长期产物图的任务不要强行转入画布。
 group: proma
-version: "1.0.27"
+version: "1.0.31"
 ---
 
 # 画布生产
@@ -40,6 +40,7 @@ version: "1.0.27"
 6. 先建立可评审的结构和内容，再按用户意图运行需要计算或付费的节点。
 7. 根据当前工作流用途选择制作模式，先评审方案再投入生成；模式适配、技术可执行与真实产物达标分别核验。
 8. 精确尺寸、文字、几何适配或反复失败时，先读取[制作精度与自主恢复](references/production-recovery.md)，按验收精度选择实际可用的制作方法；不要仅靠重复生成解决可确定计算的问题。
+9. 制作分镜拼图、接触表或评审预览时，先核对原帧与预览的纵横比；优先使用本 Skill 的 `scripts/contact_sheet.py` 等比例排版。拼图仅用于概览，内容验收还须查看原比例单帧与缺陷局部，具体步骤见制作精度与自主恢复。
 
 ## 普通 Agent 与 Canvas Agent
 
@@ -53,17 +54,22 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 
 若 `canvas_get_context` 返回 `review`，还须读取本轮独立审核范围；直接输入不能代替完整审核目标。按 `review.coverage.scopeRevision` 分批读完当前正文、配置和关系，再写方案，通过同一上下文查询未读、失败、截断和缺边样本；样本最多32项，总数才表示剩余范围。`reviewCoverage.complete` 只证明该基线的当前节点数据与关系已送达，不证明完整历史、视觉、试听或语义审核通过。
 
-明确执行画布任务时，在修改或创建前调用 `canvas_task(action=start)` 登记交付要求。根据完整任务语义填写每项 `id`、`description`、`validation`，不按关键词或模型名称选择行为：
+明确执行画布任务时，任何创建、更新、导入、运行或采用之前都必须先建立任务合同。跨回合先用 `canvas_task(action=status)` 查询活动任务：存在原任务就用 `canvas_task(action=resume)` 恢复同一 `taskId`；只有不存在活动任务时，才用 `canvas_task(action=start)` 在第一次写操作前登记完整交付要求。根据完整任务语义填写每项 `id`、`description`、`validation`，不按关键词或模型名称选择行为：
 
 - 文本本身就是交付时使用 `response`，完成时提交实际正文；不能拿计划说明代替用户要求的产物。
 - 节点交付还需填写 `nodeKind` 与 `change`。检查现有目标用 `existing`，修改用 `updated`，均指定 `nodeId`；新增用 `created`，不能将原输入作为新产物。
 - `content` 证明正式正文存在；`configuration` 证明配置保存；`adopted` 证明正式素材采用；`inspection` 证明真实图片已送达模型。配置不代表生成完成，默认采用不代表质量合格。
 - 生成并检查新候选使用 `updated + inspection`，先 start 再运行，完成时引用本合同创建的精确 jobId 证据；候选不合格也可完成“生成并检查”，但须明确拒绝采用原因，不能宣称质量通过。检查既有候选使用 `existing + inspection`。缺少本轮创建身份时先核对原任务，不为补证据重复生成。
 - `canvas_read` 为完整读取的正文、配置和音视频采用事实返回 `evidence`；图片须用 `canvas_inspect_images` 获取 `evidenceId`，正式采用图片还返回独立的 `adoptedEvidenceId`。一份证据只能满足一项要求，截断或读取失败时缩小范围重读。
+- 音视频交付在 `adopted` 要求中明确填写 `mediaReview`：`stage` 区分 preview/final，`contentCoverage` 区分 technical/sampled/full；按用户用途填写 `requireAudio`、`width`、`height`、`minDurationSeconds`、`maxDurationSeconds`。新素材可在已有节点上用 updated，不必新建卡片。仅交付可解码技术素材才用 technical；抽样预演用 sampled；要求完整成片视听验收时保留 full，当前能力不足就明确 block，不能降为抽样或省略 mediaReview 绕过验收。
+- 音视频内容验收先用 `canvas_inspect_media_content` 读取真实已采用媒体的技术解码与有界抽帧，再把工具返回的 `inspectionEvidenceId` 交给 `canvas_review_media`，记录 Agent 对实际收到样本的 `verdict`、`coverage` 和备注。技术解码成功不等于看过完整内容；有界抽帧只能支持当前的 `sampled` 覆盖，不能声称看过全片或听过完整音轨。当前只支持 `sampled`，请求 `full` 时由 Host 明确拒绝，不得把抽样结果改写为完整验收。音频当前只提供技术检查，听取内容的要求仍待验收。完成提交使用评审返回的 `evidence.evidenceId`，不能拿评审前的检查 ID 代替。
 - 按声明目标检查质量，引用证据后调用 `canvas_task(action=complete)`。Host 会重新核验精确节点、产物与版本；旧证据失效时沿原任务修复，不降低要求或重复创建运行。
+- 媒体样本仅供紧接着的模型请求使用，不进入持久历史；先读取，下一轮看到实际画面后再评审，不能在同批工具中读取后立即盲评。重启、压缩或需要再次看图时重新检查同一素材；已完成的评审可按精确资产证据恢复，无需重生成。不支持图片输入的模型只能核对技术事实，不能提交样本内容通过。
 - 缺少必要输入、授权或验收能力时，使用 `canvas_task(action=block, blockedStatus=needs-input|blocked, reason=...)` 报告具体阻碍。音视频元数据与 WebView 源码不能冒充试听、观看或交互验收。
 
-父编排的执行节点在完成前必须登记交付；合法纯文本任务仍可使用 `response`。已登记但未交付的任务会在原 Pi 会话与预算内有界续行，最多三次，仍未完成则以受阻结束。普通问答不必登记。重启或新一轮恢复时先查询既有工作流、原节点与原任务记录，重新核对本轮合同，不重放已提交生成。
+父编排的执行节点在完成前必须登记交付；合法纯文本任务仍可使用 `response`。任务被 block 后，先 `canvas_task(action=status)` 核对原因与可恢复步骤，再 `canvas_task(action=resume)` 接回持久任务；必要输入或能力恢复后调用 `canvas_task(action=recover)` 重新验证作用域并继续。新增节点的目标绑定错误时，只能用 `canvas_task(action=rebind)` 关联同一任务内 Host 已记录为 completed 的创建操作，不能复制节点或追认合同开始前的产物。恢复期间不能降低、删除或替换原交付要求，也不能重置原预算。
+
+已登记但未交付的任务会在原 Pi 会话与预算内有界续行，最多三次，仍未完成则以受阻结束。普通问答不必登记。重启或新一轮恢复时先查询既有工作流、原节点与原任务记录，重新核对原合同，不重放已提交生成。助手正文、Todo 或子阶段显示 completed 都不代表总体交付完成；整体任务是否完成以 Host 最终终态为准，Host 报告 blocked、检查失败或续行耗尽时必须如实告知用户。
 
 `canvas_read.availableActions` 将当前节点能力映射到本轮真实工具；它受运行来源和计划模式约束，不是额外授权。所有 Canvas Agent 可使用当前可用的读取、搜索工具。交互式 Canvas Agent 还可沿原权限使用文件、Shell 和受管浏览器完成工程与预览；正式画布内容仍通过 `canvas_*` 写入。父工作流的子 Agent 不获得 Shell、任意 MCP 或浏览器写交互权限，需要这些能力时向父任务报告明确阻碍。
 

@@ -6,6 +6,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { installCanvasMediaSampleLifecycle } from './pi-canvas-media-samples'
 import { spawn } from 'node:child_process'
 import type { Dispatcher } from 'undici'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
@@ -1504,11 +1505,15 @@ export class PiAgentAdapter implements AgentProviderAdapter {
     active.onSkillActivated = input.onSkillActivated
     let unsubscribe: (() => void) | undefined
     let requestProxyDispatcher: Dispatcher | undefined
+    /** 音视频抽样只保留到下一次模型读取，结束或取消时主动释放。 */
+    let releaseMediaSamples: (() => void) | undefined
 
     const cleanupActiveSession = (): void => {
       try {
         unsubscribe?.()
         unsubscribe = undefined
+        releaseMediaSamples?.()
+        releaseMediaSamples = undefined
         if (!active.disposed) {
           active.disposed = true
           active.completionEvaluationAbortController?.abort()
@@ -1718,6 +1723,9 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       )
       installRuntimeGuardHooks(session, runtimeGuard)
       installCurrentSessionCompactionHooks(session)
+      if (customTools.some(tool => tool.name === 'canvas_inspect_media_content')) {
+        releaseMediaSamples = installCanvasMediaSampleLifecycle(session.agent)
+      }
       active.session = session
       resolveActiveReady(active, session)
 

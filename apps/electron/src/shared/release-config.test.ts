@@ -9,6 +9,6 @@ test('fork Release 来源统一指向 kuangtao22/Proma', () => {
   })
 })
 
-test('更新下载入口统一指向 Proma 官方下载页', () => {
-  expect(PROMA_DOWNLOAD_URL).toBe('https://proma.cool/download')
+test('更新下载入口统一指向 fork 的最新 Release 页面', () => {
+  expect(PROMA_DOWNLOAD_URL).toBe(`${PROMA_RELEASE_REPOSITORY.webUrl}/releases/latest`)
 })

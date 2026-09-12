@@ -167,6 +167,42 @@ afterAll(() => {
 })
 
 describe('Agent 会话 JSONL 读取', () => {
+  test('Given Pi与旧格式图片混合的超大工具结果 When 落盘 Then 只剥离大图且单行不超过256K', () => {
+    const sessionId = 'session-oversized-tool-images'
+    writeAgentSessionJsonl(sessionId, [])
+    const message = {
+      type: 'user',
+      message: { content: [{
+        type: 'tool_result', tool_use_id: 'tool-images', content: [
+          { type: 'text', text: '保留工具摘要' },
+          { type: 'image', data: 'P'.repeat(180_000), mimeType: 'image/png' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'L'.repeat(180_000) } },
+          { type: 'image', data: 'small-pi', mimeType: 'image/png' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'small-legacy' } },
+        ],
+      }] },
+    } as unknown as SDKMessage
+    const original = structuredClone(message)
+
+    manager.appendSDKMessages(sessionId, [message])
+
+    expect(message).toEqual(original)
+    const line = readFileSync(join(tempHome, '.proma', 'agent-sessions', `${sessionId}.jsonl`), 'utf-8').trimEnd()
+    expect(Buffer.byteLength(line, 'utf8')).toBeLessThanOrEqual(256 * 1024)
+    const stored = JSON.parse(line) as {
+      message: { content: Array<{ content: Array<Record<string, unknown>> }> }
+    }
+    const content = stored.message.content[0]!.content
+    expect(content[1]).toMatchObject({ type: 'image', _truncated: true, _originalLength: 180_000 })
+    expect(content[1]).not.toHaveProperty('data')
+    expect(content[2]).toMatchObject({ type: 'image', _truncated: true, _originalLength: 180_000 })
+    expect(content[2]).not.toHaveProperty('source')
+    expect(content[3]).toEqual({ type: 'image', data: 'small-pi', mimeType: 'image/png' })
+    expect(content[4]).toEqual({
+      type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'small-legacy' },
+    })
+  })
+
   test('Given 历史内嵌图片与损坏行 When 加载展示历史 Then 返回轻量消息且原始历史可完整恢复', async () => {
     /** 模拟旧版本已写入的 Pi 图片，不触碰真实会话文件。 */
     const original = { type: 'user', uuid: 'image-history', parent_tool_use_id: null, message: { content: [{
