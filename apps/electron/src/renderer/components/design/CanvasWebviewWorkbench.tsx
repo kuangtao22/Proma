@@ -30,6 +30,11 @@ import {
   CanvasWebviewDeviceSegmentedControl,
   createCanvasWebviewFrameIdentity,
 } from './CanvasWebviewPreview'
+import {
+  CANVAS_WEBVIEW_VIEWPORT_BRIDGE_SCRIPT,
+  CANVAS_WEBVIEW_VIEWPORT_INIT_MESSAGE_TYPE,
+  createCanvasWebviewViewportPortWheelEventInit,
+} from './canvas-webview-viewport-bridge'
 
 /** WebView 工作台依赖预览读取和完整文本产物生命周期能力。 */
 export interface CanvasWebviewWorkbenchAdapter {
@@ -94,7 +99,7 @@ const CANVAS_WEBVIEW_CSP = [
 export function createSandboxedCanvasWebviewHtml(html: string): string {
   /** CSP 使用双引号属性，策略中的单引号无需额外转义。 */
   const meta = `<meta http-equiv="Content-Security-Policy" content="${CANVAS_WEBVIEW_CSP}">`
-  return `<!doctype html>${meta}${html}`
+  return `<!doctype html>${meta}${CANVAS_WEBVIEW_VIEWPORT_BRIDGE_SCRIPT}${html}`
 }
 
 /** 判断异步返回的预览是否仍属于当前完整节点身份。 */
@@ -210,6 +215,90 @@ export function createCanvasWebviewFrameKey(target: CanvasTextArtifactSnapshot['
 export interface CanvasWebviewFrameState {
   key: string
   srcDoc: string
+}
+
+/** 可复用的隔离原型 iframe 输入。 */
+export interface CanvasWebviewPreviewFrameProps {
+  frameState: CanvasWebviewFrameState
+  title: string
+  className?: string
+}
+
+/**
+ * 渲染隔离原型，并把 iframe 内的缩放手势安全转发给外层画布。
+ * 普通滚轮不经过消息桥，继续交给原型页面自身处理。
+ */
+export function CanvasWebviewPreviewFrame(
+  props: CanvasWebviewPreviewFrameProps,
+): React.ReactElement {
+  /** 保存当前 iframe，消息只允许由它自己的 contentWindow 发出。 */
+  const frameRef = React.useRef<HTMLIFrameElement>(null)
+  /** 当前加载文档独占的父侧消息端口。 */
+  const viewportPortRef = React.useRef<MessagePort | null>(null)
+
+  /** 关闭上一文档的端口并解除消息回调。 */
+  const closeViewportPort = React.useCallback((): void => {
+    const port = viewportPortRef.current
+    if (!port) return
+    port.onmessage = null
+    port.close()
+    viewportPortRef.current = null
+  }, [])
+
+  /** 每次 iframe 文档加载后建立一次不可由业务 HTML 获取的私有通道。 */
+  const handleFrameLoad = React.useCallback((): void => {
+    const frame = frameRef.current
+    const frameWindow = frame?.contentWindow
+    if (!frame || !frameWindow) return
+    closeViewportPort()
+    /** 每次 load 使用新通道，使旧文档迟到消息自然失效。 */
+    const channel = new MessageChannel()
+    channel.port1.onmessage = (event: MessageEvent<unknown>): void => {
+      if (frameRef.current !== frame || viewportPortRef.current !== channel.port1) return
+      /** 使用浏览器当前几何数据还原缩放后的屏幕落点。 */
+      const rect = frame.getBoundingClientRect()
+      const wheelInit = createCanvasWebviewViewportPortWheelEventInit(event.data, {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        contentWidth: frame.clientWidth,
+        contentHeight: frame.clientHeight,
+      })
+      if (!wheelInit) return
+      frame.dispatchEvent(new WheelEvent('wheel', wheelInit))
+    }
+    channel.port1.start()
+    viewportPortRef.current = channel.port1
+
+    try {
+      /** 使用父页面原生方法，避免 iframe 正文覆写自身 window.postMessage 后截获端口。 */
+      const postMessage = window.postMessage
+      Reflect.apply(postMessage, frameWindow, [{
+        type: CANVAS_WEBVIEW_VIEWPORT_INIT_MESSAGE_TYPE,
+      }, {
+        targetOrigin: '*',
+        transfer: [channel.port2],
+      }])
+    } catch {
+      closeViewportPort()
+      channel.port2.close()
+    }
+  }, [closeViewportPort])
+
+  React.useEffect(() => closeViewportPort, [closeViewportPort])
+
+  return (
+    <iframe
+      key={props.frameState.key}
+      ref={frameRef}
+      className={props.className}
+      title={props.title}
+      sandbox="allow-scripts"
+      srcDoc={props.frameState.srcDoc}
+      onLoad={handleFrameLoad}
+    />
+  )
 }
 
 /** 从已接管 artifact 创建 iframe 输入，保存成功前保持完全不变。 */
@@ -585,7 +674,7 @@ export function CanvasWebviewWorkbench(props: CanvasWebviewWorkbenchProps): Reac
 
         <div className={cn('absolute inset-0 items-center justify-center overflow-auto bg-muted/20 p-3', mode === 'preview' ? 'flex' : 'hidden')} data-device-preset={props.node.devicePreset} aria-hidden={mode !== 'preview'}>
           <div className={props.node.devicePreset === 'mobile' ? 'h-full max-h-[844px] w-auto max-w-full overflow-hidden rounded-[8px] border border-border bg-white shadow-sm aspect-[390/844]' : 'h-full w-full overflow-hidden bg-white'}>
-            <iframe key={frameState.key} className="h-full w-full border-0 bg-white" title={`${props.node.title}预览`} sandbox="allow-scripts" srcDoc={frameState.srcDoc} />
+            <CanvasWebviewPreviewFrame key={frameState.key} frameState={frameState} className="h-full w-full border-0 bg-white" title={`${props.node.title}预览`} />
           </div>
         </div>
 

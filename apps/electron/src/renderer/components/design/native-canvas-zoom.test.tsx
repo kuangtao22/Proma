@@ -343,11 +343,12 @@ describe('原生 Canvas 缩放挂载回归', () => {
       const finalViewport: DesignViewport = { x: 50, y: 60, zoom: 1.6 }
 
       act(() => { captured!.onMoveStart?.({} as never, movingViewport) })
-      act(() => { captured!.onMove?.({} as never, movingViewport) })
+      act(() => { captured!.onViewportChange?.(movingViewport) })
       expect(captured?.viewport).toEqual(movingViewport)
       expect(geometryStore.getSnapshot().viewport).toEqual(movingViewport)
       expect(mutations).toEqual([])
 
+      act(() => { captured!.onViewportChange?.(finalViewport) })
       act(() => { captured!.onMoveEnd?.({} as never, finalViewport) })
       expect(captured?.viewport).toEqual(finalViewport)
       expect(mutations).toEqual([{ type: 'set-viewport', viewport: finalViewport }])
@@ -375,7 +376,7 @@ describe('原生 Canvas 缩放挂载回归', () => {
       const authoritativeViewport: DesignViewport = { x: 90, y: 80, zoom: 0.8 }
 
       act(() => { captured!.onMoveStart?.({} as never, localViewport) })
-      act(() => { captured!.onMove?.({} as never, localViewport) })
+      act(() => { captured!.onViewportChange?.(localViewport) })
       act(() => {
         host.render(
           <NativeCanvasGraph
@@ -391,6 +392,155 @@ describe('原生 Canvas 缩放挂载回归', () => {
       expect(captured?.viewport).toEqual(authoritativeViewport)
       expect(geometryStore.getSnapshot().viewport).toEqual(authoritativeViewport)
       expect(mutations).toEqual([])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 缩小后双指平移 When 第一帧只有 transform 和 start Then 立即显示新位置且不提前提交', () => {
+    /** XYFlow 滚动平移首帧不会触发 onMove，受控视口必须使用完整 transform 回调。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    document.viewport = { x: 120, y: 80, zoom: 0.1 }
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    const graphProps = createGraphProps(geometryStore, mutation => mutations.push(mutation), props => { captured = props; return null })
+    const host = createGraphRoot()
+    const panned: DesignViewport = { x: 108, y: 75, zoom: 0.1 }
+    try {
+      act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
+      act(() => {
+        captured!.onViewportChange?.(panned)
+        captured!.onMoveStart?.({} as never, panned)
+      })
+      expect(captured?.viewport).toEqual(panned)
+      expect(geometryStore.getSnapshot().viewport).toEqual(panned)
+      expect(mutations).toEqual([])
+      act(() => { captured!.onMoveEnd(null, panned) })
+      expect(mutations).toEqual([{ type: 'set-viewport', viewport: panned }])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 缩放后立即双指平移 When 旧缩放结束迟到 Then 不回跳且只提交最后的平移', () => {
+    /** 复现缩放和滚动平移分别延迟结束的交错顺序，旧结束位置不得覆盖最新 transform。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    const graphProps = createGraphProps(geometryStore, mutation => mutations.push(mutation), props => { captured = props; return null })
+    const host = createGraphRoot()
+    const zoomed: DesignViewport = { x: 200, y: 150, zoom: 0.1 }
+    const panned: DesignViewport = { x: 128, y: 120, zoom: 0.1 }
+    try {
+      act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
+      act(() => {
+        captured!.onMoveStart?.(null, document.viewport)
+        captured!.onViewportChange?.(zoomed)
+        captured!.onViewportChange?.(panned)
+        captured!.onMoveStart?.({} as never, panned)
+      })
+      act(() => { captured!.onMoveEnd(null, zoomed) })
+      expect(captured?.viewport).toEqual(panned)
+      expect(geometryStore.getSnapshot().viewport).toEqual(panned)
+      expect(mutations).toEqual([])
+      act(() => { captured!.onMoveEnd(null, panned) })
+      expect(mutations).toEqual([{ type: 'set-viewport', viewport: panned }])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 手势中收到节点定位 When XYFlow 内部同步回调到达 Then 不清除待应用定位或重复提交', () => {
+    /** syncViewport 的内部回调不是用户手势，不能清空 deferred 或回写会话视图。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    const graphProps = createGraphProps(geometryStore, mutation => mutations.push(mutation), props => { captured = props; return null })
+    const host = createGraphRoot()
+    const panned: DesignViewport = { x: 128, y: 120, zoom: 0.1 }
+    const focused: DesignViewport = { x: 40, y: 50, zoom: 0.75 }
+    const internalSync = { sync: true } as never
+    try {
+      act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
+      act(() => {
+        captured!.onMoveStart?.(null, document.viewport)
+        captured!.onViewportChange?.(panned)
+      })
+      act(() => { host.render(<NativeCanvasGraph document={{ ...document, viewport: focused }} {...graphProps} />) })
+      act(() => {
+        captured!.onMoveStart?.(internalSync, panned)
+        captured!.onMoveEnd(internalSync, panned)
+      })
+      expect(mutations).toEqual([])
+      act(() => { captured!.onMoveEnd(null, panned) })
+      expect(captured?.viewport).toEqual(focused)
+      expect(mutations).toEqual([])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 新手势与旧回调坐标相同 When 旧结束事件迟到 Then 不提前应用手势中收到的定位', () => {
+    /** 使用真实事件时间顺序区分坐标偶然相同的两轮手势。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    const graphProps = createGraphProps(geometryStore, mutation => mutations.push(mutation), props => { captured = props; return null })
+    const host = createGraphRoot()
+    const panned: DesignViewport = { x: 128, y: 120, zoom: 0.1 }
+    const focused: DesignViewport = { x: 40, y: 50, zoom: 0.75 }
+    try {
+      act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
+      act(() => {
+        captured!.onMoveStart?.({ timeStamp: 200 } as never, panned)
+        captured!.onViewportChange?.(panned)
+      })
+      act(() => { host.render(<NativeCanvasGraph document={{ ...document, viewport: focused }} {...graphProps} />) })
+      act(() => { captured!.onMoveEnd({ timeStamp: 100 } as never, panned) })
+      expect(captured?.viewport).toEqual(panned)
+      expect(mutations).toEqual([])
+      act(() => { captured!.onMoveEnd({ timeStamp: 250 } as never, panned) })
+      expect(captured?.viewport).toEqual(focused)
+      expect(mutations).toEqual([])
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 上轮位置提交回显晚于新平移 When 当前手势结束 Then 不把自身回显误当外部定位', () => {
+    /** Jotai 提交和父级 document Effect 之间可能已经收到下一轮输入。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 1)
+    const geometryStore = createNativeCanvasTransientGeometryStore(document)
+    const mutations: CanvasMutation[] = []
+    let captured: NativeCanvasFlowProps | undefined
+    const graphProps = createGraphProps(geometryStore, mutation => mutations.push(mutation), props => { captured = props; return null })
+    const host = createGraphRoot()
+    const zoomed: DesignViewport = { x: 200, y: 150, zoom: 0.1 }
+    const panned: DesignViewport = { x: 128, y: 120, zoom: 0.1 }
+    try {
+      act(() => { host.render(<NativeCanvasGraph document={document} {...graphProps} />) })
+      act(() => {
+        captured!.onMoveStart?.(null, document.viewport)
+        captured!.onViewportChange?.(zoomed)
+        captured!.onMoveEnd(null, zoomed)
+        captured!.onViewportChange?.(panned)
+        captured!.onMoveStart?.(null, panned)
+      })
+      act(() => { host.render(<NativeCanvasGraph document={{ ...document, viewport: zoomed }} {...graphProps} />) })
+      act(() => { captured!.onMoveEnd(null, panned) })
+      expect(captured?.viewport).toEqual(panned)
+      expect(mutations).toEqual([
+        { type: 'set-viewport', viewport: zoomed }, { type: 'set-viewport', viewport: panned },
+      ])
     } finally {
       act(() => { host.unmount() })
       host.restore()

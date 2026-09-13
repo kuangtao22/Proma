@@ -66,6 +66,35 @@ describe('Canvas WebView 工作台', () => {
     expect(html).toContain('<main>内容</main>')
   })
 
+  test('Given 原型包含普通滚动与缩放手势 When 构造预览 Then CSP 后注入仅缩放桥且早于业务 HTML', () => {
+    const source = '<main data-source="agent-html">内容</main>'
+    const html = createSandboxedCanvasWebviewHtml(source)
+    const cspIndex = html.indexOf('Content-Security-Policy')
+    const bridgeIndex = html.indexOf('proma:canvas-webview-viewport-wheel')
+    const sourceIndex = html.indexOf(source)
+
+    expect(bridgeIndex).toBeGreaterThan(cspIndex)
+    expect(bridgeIndex).toBeLessThan(sourceIndex)
+    expect(html).toContain('if (!getIsTrusted(event) || (!getCtrlKey(event) && !getMetaKey(event))) return')
+    expect(html).toContain('cancelDefault(event)\n    stopNow(event)')
+    expect(html).toContain('getIsTrusted(event)')
+    expect(html).toContain('const getIsTrusted=(event)=>event.isTrusted')
+    expect(html).not.toContain("descriptor(Event.prototype,'isTrusted')")
+    expect(html).toContain('getSource(event) !== expectedParent')
+    expect(html).toContain('getPorts(event)')
+    expect(html).toContain('postPortMessage')
+  })
+
+  test('Given 不可信原型可伪造公开 message When 挂载预览 iframe Then 父页面只通过私有 MessageChannel 接收缩放', () => {
+    const source = readFileSync(join(import.meta.dir, 'CanvasWebviewWorkbench.tsx'), 'utf8')
+
+    expect(source).toContain('new MessageChannel()')
+    expect(source).toContain('const postMessage = window.postMessage')
+    expect(source).not.toContain('Window.prototype.postMessage')
+    expect(source).toContain('transfer: [channel.port2]')
+    expect(source).not.toContain("window.addEventListener('message', handleMessage)")
+  })
+
   test('Given Agent HTML 在 head 前放置脚本 When 构造预览 Then CSP 仍先于全部不可信正文', () => {
     /** 模拟故意把脚本放在标准文档结构之前的原型正文。 */
     const source = '<script>location.href="https://example.com/leak"</script><html><head></head><body>内容</body></html>'

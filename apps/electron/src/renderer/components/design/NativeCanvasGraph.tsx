@@ -28,7 +28,6 @@ import type {
   NodeProps,
   NodeTypes,
   OnConnect,
-  OnMove,
   OnMoveEnd,
   OnMoveStart,
   OnNodeDrag,
@@ -553,20 +552,31 @@ export interface NativeCanvasViewportState {
 /** viewport reducer 支持文档重渲染与手势事件按单一顺序收敛。 */
 export type NativeCanvasViewportEvent =
   | { type: 'document-sync'; viewport: CanvasDocument['viewport'] }
+  | { type: 'document-ack'; viewport: CanvasDocument['viewport'] }
   | { type: 'move-start' }
   | { type: 'move'; viewport: CanvasDocument['viewport'] }
   | { type: 'move-end'; viewport: CanvasDocument['viewport'] }
+
+/** 比较两个视口的实际变换；入参为画布坐标和缩放，返回是否完全一致。 */
+function isNativeCanvasViewportEqual(left: DesignViewport, right: DesignViewport): boolean {
+  return left.x === right.x && left.y === right.y && left.zoom === right.zoom
+}
+
+/** 识别 XYFlow 受控属性同步事件；入参为移动回调来源，返回是否属于内部回显。 */
+function isNativeCanvasViewportSyncEvent(event: Parameters<OnMoveStart>[0]): boolean {
+  return Boolean(event && 'sync' in event && event.sync === true)
+}
 
 /** 计算下一 viewport 状态，确保恢复快照不会被迟到的本地手势覆盖。 */
 export function reduceNativeCanvasViewportState(
   state: NativeCanvasViewportState,
   event: NativeCanvasViewportEvent,
 ): NativeCanvasViewportState {
+  /** 自身提交的父级回显只确认基线，不覆盖已经开始的下一轮平移。 */
+  if (event.type === 'document-ack') return { ...state, documentViewport: event.viewport }
   if (event.type === 'document-sync') {
     /** 普通 graph revision 可能重建文档对象，但相同 viewport 不应打断本地手势。 */
-    const unchanged = event.viewport.x === state.documentViewport.x
-      && event.viewport.y === state.documentViewport.y
-      && event.viewport.zoom === state.documentViewport.zoom
+    const unchanged = isNativeCanvasViewportEqual(event.viewport, state.documentViewport)
     if (unchanged) return state
     return state.gestureActive
       ? { ...state, deferredViewport: event.viewport, documentViewport: event.viewport }
@@ -577,7 +587,7 @@ export function reduceNativeCanvasViewportState(
           documentViewport: event.viewport,
         }
   }
-  if (event.type === 'move-start') return { ...state, gestureActive: true, deferredViewport: null }
+  if (event.type === 'move-start') return { ...state, gestureActive: true }
   if (event.type === 'move') return { ...state, viewport: event.viewport }
   return {
     viewport: state.deferredViewport ?? event.viewport,
@@ -748,6 +758,10 @@ export function NativeCanvasGraph({
   /** 同步镜像供结束回调判断手势中是否收到了权威 viewport。 */
   const viewportStateRef = React.useRef(viewportState)
   viewportStateRef.current = viewportState
+  /** 最近一次真实手势的事件时间，阻止上一轮相同坐标的延迟结束提前完成本轮。 */
+  const gestureStartedAtRef = React.useRef<number | null>(null)
+  /** 待父级确认的本地最终值只占一个视口，不缓存逐帧轨迹。 */
+  const localViewportCommitRef = React.useRef<DesignViewport | null>(null)
   /** 同步推进 ref 与 React 状态，避免连续 XYFlow 事件受批处理时序影响。 */
   const updateViewportState = React.useCallback((event: NativeCanvasViewportEvent): NativeCanvasViewportState => {
     /** 基于最近一次事件结果而非最近一次 React render 计算下一状态。 */
@@ -901,8 +915,12 @@ export function NativeCanvasGraph({
   }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateNodeIds, imagePreviews, mediaProgressByNodeId, nodeActivityStates, nodeIssues, pendingWebviewDeviceNodeIds, referenceNode, runningSessionIds, webviewDevicePresetChange, webviewPreviewLoader, workbenchNodeChange, writable, projectionCallbackBridge])
 
   React.useEffect(() => {
+    /** Jotai 视图回显与用户显式定位共用 document prop，必须按本地提交身份区分。 */
+    const isLocalAcknowledgement = localViewportCommitRef.current !== null
+      && isNativeCanvasViewportEqual(document.viewport, localViewportCommitRef.current)
+    if (isLocalAcknowledgement) localViewportCommitRef.current = null
     /** 几何 Store 复用 reducer 结果，手势中不会被迟到的远端 viewport 覆盖。 */
-    const nextViewportState = updateViewportState({ type: 'document-sync', viewport: document.viewport })
+    const nextViewportState = updateViewportState({ type: isLocalAcknowledgement ? 'document-ack' : 'document-sync', viewport: document.viewport })
     geometryStore.syncDocument(document, nextViewportState.viewport)
   }, [document, geometryStore, updateViewportState])
 
@@ -1003,18 +1021,26 @@ export function NativeCanvasGraph({
   }, [activeTool, document.canvasId, document.edges, writable])
 
   /** 视口手势开始后暂缓远端 viewport 覆盖本地逐帧反馈。 */
-  const handleMoveStart = React.useCallback<OnMoveStart>(() => {
+  const handleMoveStart = React.useCallback<OnMoveStart>((event) => {
+    if (isNativeCanvasViewportSyncEvent(event)) return
+    gestureStartedAtRef.current = event && Number.isFinite(event.timeStamp) ? event.timeStamp : null
     updateViewportState({ type: 'move-start' })
   }, [updateViewportState])
 
-  /** 视口逐帧变化只更新组件局部受控值。 */
-  const handleMove = React.useCallback<OnMove>((_event, viewport) => {
+  /** 接收完整 transform 流，包括双指平移首帧及程序化缩放，不逐帧提交会话状态。 */
+  const handleViewportChange = React.useCallback<NonNullable<NativeCanvasFlowProps['onViewportChange']>>((viewport) => {
     updateViewportState({ type: 'move', viewport })
     geometryStore.updateViewport(viewport)
   }, [geometryStore, updateViewportState])
 
   /** 视口手势结束时只提交最终 viewport；权威更新在途时直接采用远端且不回写旧值。 */
-  const handleMoveEnd = React.useCallback<OnMoveEnd>((_event, viewport) => {
+  const handleMoveEnd = React.useCallback<OnMoveEnd>((event, viewport) => {
+    if (isNativeCanvasViewportSyncEvent(event) || !viewportStateRef.current.gestureActive) return
+    /** 滚动与缩放的结束各自延迟到达，只接受属于当前手势且仍匹配最新 transform 的结果。 */
+    const startedAt = gestureStartedAtRef.current
+    if (startedAt !== null && (!event || !Number.isFinite(event.timeStamp) || event.timeStamp < startedAt)) return
+    if (!isNativeCanvasViewportEqual(viewport, viewportStateRef.current.viewport)) return
+    gestureStartedAtRef.current = null
     /** 手势中收到的远端 viewport 优先级高于本地结束事件。 */
     const hasDeferredViewport = viewportStateRef.current.deferredViewport !== null
     /** 工作台采用与 ReactFlow 相同的最终 viewport，包括手势中的远端权威更新。 */
@@ -1022,6 +1048,7 @@ export function NativeCanvasGraph({
     geometryStore.updateViewport(nextViewportState.viewport)
     if (!writable) return
     if (hasDeferredViewport) return
+    localViewportCommitRef.current = viewport
     onMutation(createViewportCanvasMutation(viewport))
   }, [geometryStore, onMutation, updateViewportState, writable])
 
@@ -1079,7 +1106,7 @@ export function NativeCanvasGraph({
     onEdgeClick: handleEdgeClick,
     onSelectionChange: handleSelectionChange,
     onMoveStart: handleMoveStart,
-    onMove: handleMove,
+    onViewportChange: handleViewportChange,
     onMoveEnd: handleMoveEnd,
     onNodeClick: handleNodeClick,
     onNodeDoubleClick: handleNodeDoubleClick,

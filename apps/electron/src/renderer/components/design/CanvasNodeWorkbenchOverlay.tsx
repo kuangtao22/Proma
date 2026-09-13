@@ -2,6 +2,7 @@ import * as React from 'react'
 import type { CanvasLayoutRect, CanvasNode, CanvasNodeKind, DesignViewport } from '@proma/shared'
 import { MoveDiagonal2, RotateCcw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { bindCanvasWorkbenchWheel } from './canvas-workbench-wheel'
 
 /** 工作台在画布坐标系中的宽高。 */
 export interface CanvasWorkbenchSize {
@@ -184,6 +185,11 @@ export function CanvasNodeWorkbenchOverlay(props: CanvasNodeWorkbenchOverlayProp
     return () => section.ownerDocument.removeEventListener('click', handleOutsideClick)
   }, [props.dismissOnOutsideClick])
   const resizeSessionRef = React.useRef<{ pointerId: number; pointerOrigin: { x: number; y: number } } | null>(null)
+  React.useEffect(() => {
+    /** 详情只在展开期间接管自身及所属菜单的滚轮，不重建正文或独立维护画布视口。 */
+    const section = sectionRef.current
+    if (section) return bindCanvasWorkbenchWheel(section, () => resizeSessionRef.current !== null)
+  }, [])
   /** 高频尺寸预览不进入会话 atom 或图文档。 */
   const [previewSize, setPreviewSize] = React.useState(effectiveSize)
   const onSizeChangeRef = React.useRef(props.onSizeChange)

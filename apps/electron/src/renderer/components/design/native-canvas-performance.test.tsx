@@ -604,7 +604,7 @@ describe('原生 Canvas 大画布性能预算', () => {
       />,
     )
 
-    captured!.onMove?.({} as never, { x: 100, y: 200, zoom: 2 })
+    captured!.onViewportChange?.({ x: 100, y: 200, zoom: 2 })
     expect(geometryStore.getSnapshot().viewport).toEqual({ x: 100, y: 200, zoom: 2 })
     expect(geometryStore.getSnapshot().nodePositions.get('agent-1')).toEqual({ x: 10, y: 20 })
 

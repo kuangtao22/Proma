@@ -1,5 +1,7 @@
 import * as React from 'react'
 import type { CanvasDocument, CanvasEdgeRelation, CanvasNodeKind } from '@proma/shared'
+import { atom, useAtom } from 'jotai'
+import { useCommandState } from 'cmdk'
 import { Bot, Check, FileImage, FileText, ListTree, Monitor, Music, Video } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Command, CommandEmpty, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
@@ -24,6 +26,9 @@ const NODE_PRESENTATION = {
   audio: { label: '音频', icon: Music },
   video: { label: '视频', icon: Video },
 } satisfies Record<CanvasNodeKind, { label: string; icon: typeof Bot }>
+
+/** 类型入口复用现有展示定义；全部用于清除类型条件，顺序不随数量变化。 */
+const NODE_FILTER_KINDS: readonly (CanvasNodeKind | 'all')[] = ['all', ...Object.keys(NODE_PRESENTATION) as CanvasNodeKind[]]
 
 /** 与画布连线一致的关系名称。 */
 const RELATION_LABELS: Record<CanvasEdgeRelation, string> = {
@@ -62,17 +67,58 @@ function NativeCanvasNavigationRow({ item, selected }: {
   </>
 }
 
+/** 读取 Command 的实际匹配数；入参为当前分类名称及画布总数，返回搜索结果提示。 */
+function NativeCanvasNavigationCount({ label, total }: { label: string; total: number }): React.ReactElement {
+  /** 只订阅匹配数量，避免键盘高亮变化重绘筛选控件与关系列表。 */
+  const count = useCommandState((state) => state.filtered.count)
+  return <div role="status" className="px-3 pb-2 text-xs text-muted-foreground">
+    {label} · {count} / {total}
+  </div>
+}
+
 /** 打开时才挂载列表与搜索索引，关闭后不承担图更新开销。 */
 function NativeCanvasNodeNavigationMenu({ nodes, edges, selectedNodeIds, onNavigate }: NativeCanvasNodeNavigatorProps): React.ReactElement {
+  /** 分类只属于当前菜单，关闭即释放，不写入共享图或跨会话状态。 */
+  const kindAtom = React.useMemo(() => atom<CanvasNodeKind | 'all'>('all'), [])
+  const [kind, setKind] = useAtom(kindAtom)
   /** 只依赖节点与连线数组，不随视口、选区或每帧进度重新构建关系。 */
   const items = React.useMemo(() => buildNativeCanvasNavigationItems(nodes, edges), [nodes, edges])
   const selected = React.useMemo(() => new Set(selectedNodeIds), [selectedNodeIds])
+  /** 每代索引仅统计一次，按钮数量不受关键词影响，便于查看各类节点规模。 */
+  const kindCounts = React.useMemo(() => {
+    /** 只累计轻量类型计数，不复制节点正文或关系。 */
+    const counts = new Map<CanvasNodeKind, number>()
+    for (const item of items) counts.set(item.kind, (counts.get(item.kind) ?? 0) + 1)
+    return counts
+  }, [items])
+  /** 先按真实类型限制候选，关键词仍交由 Command 搜索；关系保留完整上下游。 */
+  const visibleItems = React.useMemo(() => kind === 'all' ? items : items.filter((item) => item.kind === kind), [items, kind])
+  /** 当前类型名称用于计数和可恢复的空状态。 */
+  const kindLabel = kind === 'all' ? '全部节点' : NODE_PRESENTATION[kind].label
   return <Command label="画布节点" loop>
     <CommandInput placeholder="搜索节点名称、类型…" aria-label="搜索画布节点" />
-    <div className="border-b px-3 py-2 text-xs text-muted-foreground">全部节点 · {items.length}</div>
+    <div className="border-b">
+      <div role="group" aria-label="节点类型筛选" className="flex flex-wrap gap-1 px-2 py-2"
+        onKeyDown={(event) => event.stopPropagation()}>
+        {NODE_FILTER_KINDS.map((filterKind) => {
+          /** 分类使用稳定类型身份，零数量也可选择以明确展示空状态。 */
+          const label = filterKind === 'all' ? '全部' : NODE_PRESENTATION[filterKind].label
+          const count = filterKind === 'all' ? items.length : kindCounts.get(filterKind) ?? 0
+          return <Button key={filterKind} type="button" size="sm"
+            variant={kind === filterKind ? 'secondary' : 'ghost'}
+            className="h-7 gap-1.5 rounded-md px-2 text-xs"
+            aria-pressed={kind === filterKind} data-canvas-navigation-kind={filterKind}
+            onClick={() => setKind(filterKind)}>
+            {label}<span className="text-[10px] tabular-nums text-muted-foreground">{count}</span>
+          </Button>
+        })}
+      </div>
+      <NativeCanvasNavigationCount label={kindLabel} total={items.length} />
+    </div>
     <CommandList className="max-h-[min(420px,55vh)] p-1">
-      <CommandEmpty>{items.length === 0 ? '画布中暂无节点' : '没有匹配的节点'}</CommandEmpty>
-      {items.map((item) => <CommandItem
+      <CommandEmpty>{items.length === 0 ? '画布中暂无节点'
+        : visibleItems.length === 0 ? `画布中暂无${kindLabel}节点` : '没有匹配的节点'}</CommandEmpty>
+      {visibleItems.map((item) => <CommandItem
         key={item.id}
         value={item.id}
         keywords={[item.title, NODE_PRESENTATION[item.kind].label]}
