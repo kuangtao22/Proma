@@ -686,7 +686,7 @@ describe('媒体 Agent 工具提供器', () => {
     expect(f.prepared).toHaveLength(0)
   })
 
-  test('Given 未绑定或失效服务器 When 自动查询资源 Then 不回退到第一台服务器且保留明确状态', async () => {
+  test('Given 失效绑定或未绑定且仅一台启用服务器 When 查询资源 Then 保留失效选择而空绑定可继续发现', async () => {
     const f = fixture()
     f.dependencies.getCanvasConnection = () => 'deleted-gpu'
     const run = createMediaToolRun(f.dependencies, context)
@@ -695,10 +695,96 @@ describe('媒体 Agent 工具提供器', () => {
     await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'workflows' }))
       .rejects.toThrow('MEDIA_CONNECTION_UNAVAILABLE')
     f.dependencies.getCanvasConnection = () => null
-    await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'workflows' }))
-      .rejects.toThrow('MEDIA_CANVAS_CONNECTION_REQUIRED')
+    expect((await executeTool(run.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' })).details)
+      .toMatchObject({ connectionStatus: 'unbound', selectedConnection: null,
+        effectiveConnection: { id: 'gpu', enabled: true }, connectionSource: 'single-enabled' })
+    expect((await executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'workflows' })).details)
+      .toMatchObject({ connectionId: 'gpu' })
     const explicit = await executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', connectionId: 'gpu', kind: 'nodes' })
     expect(explicit.details).toMatchObject({ connectionId: 'gpu' })
+  })
+
+  test('Given 新画布仅有一台启用服务器 When 普通和固定画布 Agent 发现与检查工作流 Then 使用唯一连接且不准备生成', async () => {
+    /** 两种 Agent 身份必须使用相同的连接解析与画布权限校验。 */
+    for (const fixed of [false, true]) {
+      /** 独立 Host 夹具与读取计数，确保只有只读权限被调用。 */
+      const f = fixture()
+      f.dependencies.getCanvasConnection = (_current, canvasId) => {
+        expect(canvasId).toBe('canvas-1')
+        return null
+      }
+      /** 固定画布 Agent 省略参数，普通 Agent 显式携带所属画布。 */
+      const run = createMediaToolRun(f.dependencies, { ...context,
+        ...(fixed ? { canvasAgentTarget: { projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'node-1' } } : {}) })
+      /** 同一目标的各只读入口都应从 Host 已验证的空绑定继续。 */
+      const target = fixed ? {} : { canvasId: 'canvas-1' }
+      expect((await executeTool(run.piCustomTools, 'media_discover_workflows', { ...target, mediaKind: 'image' })).details)
+        .toMatchObject({ connectionId: 'gpu' })
+      await executeTool(run.piCustomTools, 'media_get_node_schema', { ...target, classTypes: ['SaveImage'] })
+      await executeTool(run.piCustomTools, 'media_inspect_workflow', { ...target, definition: workflow })
+      expect(f.calls.every((call) => call.operation === 'read')).toBeTrue()
+      expect(f.prepared).toEqual([])
+      expect(f.cachedWorkflows).toEqual([])
+      expect(f.publishedProjectIds).toEqual([])
+      expect(run.toolApprovalPolicy?.getMode('media_execute_run')).toBe('ask')
+      await expect(executeTool(run.piCustomTools, 'media_prepare_run', {
+        workflowId: 'draft', workflowRevision: 1, connectionId: 'gpu', mediaKind: 'image', inputs: {},
+      })).rejects.toThrow('MEDIA_CANVAS_TARGET_USE_CANVAS_TOOLS')
+    }
+  })
+
+  test('Given 未绑定画布的服务器目录变化 When 查询 Then 仅使用唯一启用项且不缓存先前选择', async () => {
+    /** 同轮模拟新增与停用连接，不能把上一次的唯一结果当持久默认。 */
+    const f = fixture()
+    const originalCatalog = f.dependencies.configuration.listProject()
+    let connections = originalCatalog.connections
+    f.dependencies.configuration.listProject = () => ({ ...originalCatalog, connections })
+    f.dependencies.getCanvasConnection = () => null
+    /** 工具轮次保留不变，配置快照必须在每次调用时重新解析。 */
+    const run = createMediaToolRun(f.dependencies, context)
+    expect((await executeTool(run.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' })).details)
+      .toMatchObject({ effectiveConnection: { id: 'gpu' }, connectionSource: 'single-enabled' })
+    connections = [{ ...connections[0]!, id: 'other', name: '另一台' }, ...connections]
+    expect((await executeTool(run.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' })).details)
+      .toMatchObject({ effectiveConnection: null, connectionSource: null, connectionStatus: 'unbound' })
+    await expect(executeTool(run.piCustomTools, 'media_discover_workflows', { canvasId: 'canvas-1', mediaKind: 'image' }))
+      .rejects.toThrow('MEDIA_CANVAS_CONNECTION_REQUIRED')
+    connections = connections.map((connection) => ({ ...connection, enabled: connection.id === 'gpu' }))
+    expect((await executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'nodes' })).details)
+      .toMatchObject({ connectionId: 'gpu' })
+    connections = connections.map((connection) => ({ ...connection, enabled: false }))
+    expect((await executeTool(run.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' })).details)
+      .toMatchObject({ effectiveConnection: null, connectionSource: null })
+    await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'nodes' }))
+      .rejects.toThrow('MEDIA_CANVAS_CONNECTION_REQUIRED')
+    connections = []
+    await expect(executeTool(run.piCustomTools, 'media_get_node_schema', { canvasId: 'canvas-1', classTypes: ['SaveImage'] }))
+      .rejects.toThrow('MEDIA_CANVAS_CONNECTION_REQUIRED')
+  })
+
+  test('Given 显式连接、已有绑定或作用域校验失败 When 解析唯一服务器 Then 保留优先级且不绕过校验', async () => {
+    /** 启用目录和当前绑定各自变化，显式错误不能回退到其它连接。 */
+    const f = fixture()
+    const originalCatalog = f.dependencies.configuration.listProject()
+    f.dependencies.configuration.listProject = () => ({ ...originalCatalog,
+      connections: [{ ...originalCatalog.connections[0]!, id: 'other' }, ...originalCatalog.connections] })
+    f.dependencies.getCanvasConnection = () => 'gpu'
+    const run = createMediaToolRun(f.dependencies, context)
+    expect((await executeTool(run.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' })).details)
+      .toMatchObject({ selectedConnection: { id: 'gpu' }, effectiveConnection: { id: 'gpu' }, connectionSource: 'canvas-binding' })
+    expect((await executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', connectionId: 'other', kind: 'nodes' })).details)
+      .toMatchObject({ connectionId: 'other' })
+    await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', connectionId: 'missing', kind: 'nodes' }))
+      .rejects.toThrow('MEDIA_CONNECTION_UNAVAILABLE')
+    f.dependencies.configuration.listProject = () => originalCatalog
+    f.dependencies.getCanvasConnection = () => { throw new Error('CANVAS_NOT_LINKED') }
+    await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'nodes' }))
+      .rejects.toThrow('CANVAS_NOT_LINKED')
+    delete f.dependencies.getCanvasConnection
+    await expect(executeTool(run.piCustomTools, 'media_list_resources', { canvasId: 'canvas-1', kind: 'nodes' }))
+      .rejects.toThrow('MEDIA_CANVAS_CONNECTION_REQUIRED')
+    await expect(executeTool(run.piCustomTools, 'media_list_resources', { kind: 'nodes' }))
+      .rejects.toThrow('MEDIA_CONNECTION_REQUIRED')
   })
 
   test('Given 固定画布的 Agent When 传入另一画布 Then 拒绝读取它的默认连接', async () => {

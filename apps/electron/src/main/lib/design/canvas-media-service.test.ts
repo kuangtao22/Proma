@@ -36,6 +36,19 @@ const origin = {
   },
 }
 
+test('Given 编排媒体预算 When 准备失败或即将启动 Then 校验通过后才调用Host预留并保留原运行用于恢复', async () => {
+  let reservations = 0
+  const store = createStore()
+  const service = createService(store, run('prepared'))
+  const beforeStart = (): void => { reservations++; throw new Error('CANVAS_ORCHESTRATION_MEDIA_BUDGET_EXHAUSTED') }
+  await expect(service.run({ ...target, expectedConfigRevision: 99, operationId: 'invalid' }, origin, { beforeStart })).rejects.toThrow('CANVAS_MEDIA_CONFIG_CONFLICT')
+  expect(reservations).toBe(0)
+  await expect(service.run({ ...target, expectedConfigRevision: 2, operationId: 'prepared-once' }, origin, { beforeStart })).rejects.toThrow('CANVAS_ORCHESTRATION_MEDIA_BUDGET_EXHAUSTED')
+  expect(reservations).toBe(1)
+  expect(store.current().operations).toHaveLength(1)
+  expect(store.current().candidates).toHaveLength(0)
+})
+
 /** 创建带独立视频、音轨和海报输出的媒体配置。 */
 function config(revision = 2): CanvasMediaModuleConfig {
   return {

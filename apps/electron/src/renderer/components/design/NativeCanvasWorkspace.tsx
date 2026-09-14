@@ -44,6 +44,13 @@ import {
   releaseNativeCanvasStructuralOperationAtom,
   updateNativeCanvasStateAtom,
 } from '@/atoms/native-canvas-atoms'
+import {
+  createCanvasOrchestrationKey,
+  createCanvasOrchestrationStateAtom,
+  createInitialCanvasOrchestrationState,
+  removeCanvasOrchestrationStateAtom,
+  updateCanvasOrchestrationStateAtom,
+} from '@/atoms/canvas-orchestration-atoms'
 import type {
   CanvasImageModuleDraft,
   CanvasImageModuleSaveState,
@@ -91,6 +98,11 @@ import type { DesignAdapter } from '@/lib/design-adapter'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { addCanvasNodeReferences } from '@/lib/agent-message-queue'
 import { CanvasAgentRecoveryPanel } from './CanvasAgentRecoveryPanel'
+import {
+  CanvasOrchestrationPanel,
+  createCanvasOrchestrationController,
+  type CanvasOrchestrationController,
+} from './CanvasOrchestrationPanel'
 import {
   buildCanvasComfyUiConnectionOptions,
   CanvasComfyUiConnectionPicker,
@@ -230,6 +242,9 @@ export interface NativeCanvasAdapter {
   loadCanvas: DesignAdapter['loadCanvas']
   saveCanvas: DesignAdapter['saveCanvas']
   onCanvasChanged: DesignAdapter['onCanvasChanged']
+  /** 编排面板只读取当前画布的轻量记录并订阅独立 revision。 */
+  getCanvasOrchestration?: DesignAdapter['getCanvasOrchestration']
+  onCanvasOrchestrationChanged?: DesignAdapter['onCanvasOrchestrationChanged']
   /** 工作流历史仅在用户打开弹窗时按需读取和订阅。 */
   listCanvasWorkflowRuns?: DesignAdapter['listCanvasWorkflowRuns']
   getCanvasWorkflowRun?: DesignAdapter['getCanvasWorkflowRun']
@@ -1525,6 +1540,84 @@ export function createNativeCanvasWorkspaceControllerRegistry(
   }
 }
 
+/** 共享编排 controller 的单个视图租约。 */
+export interface CanvasOrchestrationControllerLease {
+  controller: CanvasOrchestrationController
+  release: () => void
+}
+
+/** 同一 Jotai store 内按 Canvas 共享编排读取与事件订阅。 */
+export interface CanvasOrchestrationControllerRegistry {
+  acquire: (
+    owner: object,
+    stateKey: string,
+    createController: () => CanvasOrchestrationController,
+    removeState: () => void,
+  ) => CanvasOrchestrationControllerLease
+}
+
+/** registry 内单画布的 controller、视图引用和待释放代次。 */
+interface CanvasOrchestrationControllerRegistryEntry {
+  controller: CanvasOrchestrationController
+  activeLeaseIds: Set<number>
+  pendingDisposeId: number | null
+  removeState: () => void
+}
+
+/**
+ * 创建按 store 与 Canvas 双重隔离的编排 controller registry。
+ * @param scheduleMicrotask 最后引用释放后的延迟确认调度器。
+ * @returns 同 Canvas 单 GET/订阅、StrictMode 安全且引用计数的 registry。
+ */
+export function createCanvasOrchestrationControllerRegistry(
+  scheduleMicrotask: NativeCanvasWorkbenchCleanupScheduler,
+): CanvasOrchestrationControllerRegistry {
+  const entriesByOwner = new WeakMap<object, Map<string, CanvasOrchestrationControllerRegistryEntry>>()
+  let nextIdentity = 1
+  return {
+    acquire: (owner, stateKey, createController, removeState) => {
+      let entries = entriesByOwner.get(owner)
+      if (!entries) {
+        entries = new Map()
+        entriesByOwner.set(owner, entries)
+      }
+      let entry = entries.get(stateKey)
+      if (!entry) {
+        const controller = createController()
+        entry = { controller, activeLeaseIds: new Set(), pendingDisposeId: null, removeState }
+        entries.set(stateKey, entry)
+        void controller.load()
+      }
+      entry.pendingDisposeId = null
+      const leaseId = nextIdentity
+      nextIdentity += 1
+      entry.activeLeaseIds.add(leaseId)
+      let released = false
+      return {
+        controller: entry.controller,
+        release: () => {
+          if (released) return
+          released = true
+          entry!.activeLeaseIds.delete(leaseId)
+          if (entry!.activeLeaseIds.size > 0) return
+          const disposeId = nextIdentity
+          nextIdentity += 1
+          entry!.pendingDisposeId = disposeId
+          scheduleMicrotask(() => {
+            if (entries!.get(stateKey) !== entry
+              || entry!.pendingDisposeId !== disposeId
+              || entry!.activeLeaseIds.size > 0) return
+            entries!.delete(stateKey)
+            entry!.pendingDisposeId = null
+            entry!.controller.dispose()
+            entry!.removeState()
+          })
+        },
+      }
+    },
+  }
+}
+
 /** 当前 controller 持有的单个在途保存批次。 */
 interface ActiveNativeCanvasSave {
   generation: number
@@ -1918,6 +2011,11 @@ export function createNativeCanvasWorkspaceController(
 
 /** Renderer 内所有同 graph Workspace 共享的唯一 controller registry。 */
 const nativeCanvasWorkspaceControllerRegistry = createNativeCanvasWorkspaceControllerRegistry(
+  (task) => { void Promise.resolve().then(task) },
+)
+
+/** Renderer 内同 store、同 Canvas 的视图共享唯一编排 controller。 */
+const canvasOrchestrationControllerRegistry = createCanvasOrchestrationControllerRegistry(
   (task) => { void Promise.resolve().then(task) },
 )
 
@@ -2618,6 +2716,8 @@ export function NativeCanvasWorkspace({
   const states = useAtomValue(nativeCanvasStatesAtom)
   const viewStates = useAtomValue(agentCanvasViewStatesAtom)
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
+  const updateCanvasOrchestrationState = useSetAtom(updateCanvasOrchestrationStateAtom)
+  const removeCanvasOrchestrationState = useSetAtom(removeCanvasOrchestrationStateAtom)
   const initializeAgentCanvasViewState = useSetAtom(initializeAgentCanvasViewStateAtom)
   const removeAgentCanvasViewState = useSetAtom(removeAgentCanvasViewStateAtom)
   const updateAgentCanvasViewState = useSetAtom(updateAgentCanvasViewStateAtom)
@@ -2636,6 +2736,7 @@ export function NativeCanvasWorkspace({
   const runGenerations = useAtomValue(canvasAgentRunGenerationsAtom)
   const optimisticRunGenerations = useAtomValue(canvasAgentOptimisticRunGenerationsAtom)
   const controllerRef = React.useRef<NativeCanvasWorkspaceController | null>(null)
+  const orchestrationControllerRef = React.useRef<CanvasOrchestrationController | null>(null)
   const commandRef = React.useRef<CanvasNodeCreateCommandController | null>(null)
   const trashControllerRef = React.useRef<NativeCanvasTrashController | null>(null)
   const workflowRunControllerRef = React.useRef<NativeCanvasWorkflowRunController | null>(null)
@@ -2829,6 +2930,22 @@ export function NativeCanvasWorkspace({
   /** SSR 首帧使用该 key 专属的全新状态，不启动任何消息或 Canvas API。 */
   const fallbackState = React.useMemo(createInitialNativeCanvasState, [stateKey])
   const state = states.get(stateKey) ?? fallbackState
+  /** 编排记录使用独立双身份 key，不与普通图 revision 或会话视图混合。 */
+  const orchestrationKey = React.useMemo(
+    () => createCanvasOrchestrationKey(target.projectId, target.canvasId),
+    [target.canvasId, target.projectId],
+  )
+  /** 派生 atom 在当前 Canvas 生命周期内保持稳定，Map 中其它 key 更新不会触发此视图重绘。 */
+  const orchestrationStateAtom = React.useMemo(
+    () => createCanvasOrchestrationStateAtom(orchestrationKey),
+    [orchestrationKey],
+  )
+  const storedOrchestrationState = useAtomValue(orchestrationStateAtom)
+  const fallbackOrchestrationState = React.useMemo(
+    createInitialCanvasOrchestrationState,
+    [orchestrationKey],
+  )
+  const orchestrationState = storedOrchestrationState ?? fallbackOrchestrationState
   /** SSR 或首次 LOAD effect 前使用文档视口构造一次性视图回退。 */
   const fallbackViewState = React.useMemo(
     () => createAgentCanvasViewFallback(state),
@@ -3052,6 +3169,45 @@ export function NativeCanvasWorkspace({
       if (controllerRef.current === lease.controller) controllerRef.current = null
     }
   }, [adapter, stateKey, store, target.canvasId, target.projectId, updateNativeCanvasState])
+
+  React.useEffect(() => {
+    /** 局部固定已启用的编排能力，controller 创建闭包不依赖可选属性断言。 */
+    const getCanvasOrchestration = adapter.getCanvasOrchestration
+    const onCanvasOrchestrationChanged = adapter.onCanvasOrchestrationChanged
+    if (!getCanvasOrchestration || !onCanvasOrchestrationChanged) {
+      removeCanvasOrchestrationState(orchestrationKey)
+      return
+    }
+    /** 同一 store 的多个会话视图共享一次 GET 与订阅，最后释放者负责回收状态。 */
+    const lease = canvasOrchestrationControllerRegistry.acquire(
+      store,
+      orchestrationKey,
+      () => createCanvasOrchestrationController({
+        target: { projectId: target.projectId, canvasId: target.canvasId },
+        getRecord: getCanvasOrchestration,
+        onChanged: onCanvasOrchestrationChanged,
+        onStateChange: (nextState) => updateCanvasOrchestrationState({
+          key: orchestrationKey,
+          update: nextState,
+        }),
+      }),
+      () => removeCanvasOrchestrationState(orchestrationKey),
+    )
+    orchestrationControllerRef.current = lease.controller
+    return () => {
+      lease.release()
+      if (orchestrationControllerRef.current === lease.controller) orchestrationControllerRef.current = null
+    }
+  }, [
+    adapter.getCanvasOrchestration,
+    adapter.onCanvasOrchestrationChanged,
+    orchestrationKey,
+    removeCanvasOrchestrationState,
+    store,
+    target.canvasId,
+    target.projectId,
+    updateCanvasOrchestrationState,
+  ])
 
   React.useEffect(() => {
     const disposeCleanup = mountNativeCanvasSessionView(
@@ -4163,6 +4319,12 @@ export function NativeCanvasWorkspace({
           </div>
         ) : state.snapshot ? (
           <div className="relative h-full">
+            <CanvasOrchestrationPanel
+              state={orchestrationState}
+              nodes={state.snapshot.document.nodes}
+              onNavigate={navigateToCanvasNode}
+              onRetry={() => { void orchestrationControllerRef.current?.load() }}
+            />
             <div
               ref={canvasSurfaceRef}
               data-native-canvas-surface

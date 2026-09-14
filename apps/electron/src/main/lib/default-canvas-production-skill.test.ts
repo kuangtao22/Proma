@@ -38,12 +38,30 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.31"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.36"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
   expect(skill).toContain('普通代码')
   expect(skill).toContain('不要强行转入画布')
+})
+
+test('Given 活动编排收到用户校正 When 读取 Skill Then 沿原委托传递校正且正确复读初始正文', () => {
+  const skill = readCanvasProductionSkill()
+  for (const rule of [
+    '`followUp.id`', '`expectedRevision`', '`supersedesId`', '不能改写原 request', '不能再次 `canvas_delegate`',
+    '`revision=0` 是真实初始版本', '`contentState`', '`canvas_read`', '历史数组为空不能单独证明正文丢失',
+  ]) expect(skill).toContain(rule)
+})
+
+test('Given 新画布缺少默认服务器 When 读取生产指引 Then 区分唯一可用连接与真正需要用户选择的阻塞', () => {
+  /** 工具会返回独立的有效连接，Skill 必须使用它而非继续把未绑定判为不可执行。 */
+  const skill = readCanvasProductionSkill()
+  expect(skill).toContain('effectiveConnection')
+  expect(skill).toContain('connectionSource')
+  expect(skill).toContain('single-enabled')
+  expect(skill).toContain('不写入画布默认绑定')
+  expect(skill).not.toContain('服务器未绑定或失效时让用户在画布顶部选择')
 })
 
 test('Given 跨回合画布生产 When 读取 Skill Then 先恢复不可降级合同再执行写操作并以 Host 终态收口', () => {
@@ -96,7 +114,7 @@ test('Given 按用途编排与视频评审 When 读取默认 Skill Then 运行�
   /** 文档合同验证可达性与关键边界，不声称静态测试已经验证模型的导演能力。 */
   const review = readFileSync(reviewPath, 'utf-8')
   for (const rule of ['制作模式', '生成模式', '阻塞问题', '改进建议', '实际末帧',
-    'canvas_run_agent', 'canvas_task', 'metadataOnly', '只读', '主 Agent', '版本']) {
+    'canvas_run_agent', 'canvas_task', 'metadataOnly', '只读', '画布编排 Agent', '版本']) {
     expect(review).toContain(rule)
   }
   expect(review).toContain('只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演')

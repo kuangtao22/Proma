@@ -22,9 +22,6 @@ import {
   agentSessionDraftHtmlAtom,
   agentSessionsAtom,
   agentMessageRefreshAtom,
-  allPendingPermissionRequestsAtom,
-  allPendingAskUserRequestsAtom,
-  allPendingExitPlanRequestsAtom,
   agentPromptSuggestionsAtom,
   recentlyModifiedPathsAtom,
   RECENTLY_MODIFIED_TTL_MS,
@@ -62,7 +59,6 @@ import {
   getCanvasWorkspaceTab,
   agentSidePanelSplitMapAtom,
   getDelegationSidePanelTab,
-  askUserDraftsAtom,
   agentPendingPromptAtom,
   agentCanvasWorkspaceStateMapAtom,
   rememberAgentCanvasWorkspaceTab,
@@ -151,6 +147,7 @@ import { getChangedWorkspaceComponentFromSdkMessage, shouldRevealChangedWorkspac
 import { mergeActiveAgentSessionSnapshot } from '@/lib/agent-active-session-snapshot'
 import { buildTodoAgentPrompt } from '@/lib/todo-agent-prompt'
 import { parseCanvasArtifactToolResult } from '@/lib/agent-canvas-artifact-result'
+import { createPendingRequestRecoveryCoordinator } from '@/lib/agent-pending-request-recovery'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -895,12 +892,12 @@ function createCanvasArtifactToolKey(sessionId: string, toolUseId: string): stri
  * @returns 可接收扁平 AgentEvent 的消费者与清理函数。
  */
 export function startGlobalAgentCanvasArtifactConsumer(store: Store): GlobalAgentCanvasArtifactConsumer {
-  /** 只有真实 canvas_create_artifact start 才能授权同会话结果触发导航。 */
+  /** 只有真实产物创建或图片导入 start 才能授权同会话结果触发导航。 */
   const pendingToolKeys = new Set<string>()
   return {
     handle: (sessionId, event) => {
       if (event.type === 'tool_start') {
-        if (event.toolName === 'canvas_create_artifact') {
+        if (event.toolName === 'canvas_create_artifact' || event.toolName === 'canvas_import_image') {
           pendingToolKeys.add(createCanvasArtifactToolKey(sessionId, event.toolUseId))
         }
         return
@@ -957,6 +954,11 @@ export function useGlobalAgentListeners(): void {
     const pendingGitMutateTools = new Map<string, string>()
     /** 创建产物后只导航执行该工具的普通 Agent 会话。 */
     const canvasArtifactConsumer = startGlobalAgentCanvasArtifactConsumer(store)
+    /** 主进程仍持有的审批与问答必须随运行态一并恢复，避免重载后只剩运行计时。 */
+    const pendingRequestRecovery = createPendingRequestRecoveryCoordinator(store, {
+      loadSnapshot: () => window.electronAPI.getPendingRequests(),
+      onError: (error) => console.error('[GlobalAgentListeners] 待处理交互请求恢复失败:', error),
+    })
 
     /** 普通 Agent Canvas activity 只在应用顶层消费一次，不依赖 SidePanel 挂载。 */
     const canvasActivityConsumer = startGlobalAgentCanvasActivityConsumer(store, {
@@ -1697,6 +1699,7 @@ export function useGlobalAgentListeners(): void {
           }
 
           canvasArtifactConsumer.handle(sessionId, event)
+          pendingRequestRecovery.handle(sessionId, event)
 
           // 会话首次进入 running 时，清除旧的完成提醒状态
           if (event.type !== 'prompt_suggestion') {
@@ -1859,13 +1862,6 @@ export function useGlobalAgentListeners(): void {
               return map
             })
           } else if (event.type === 'permission_request') {
-            // 权限请求入队（统一通道，不区分当前/后台会话）
-            store.set(allPendingPermissionRequestsAtom, (prev) => {
-              const map = new Map(prev)
-              const current = map.get(sessionId) ?? []
-              map.set(sessionId, [...current, event.request])
-              return map
-            })
             // 桌面通知（带提示音 + 会话导航）
             sendBlockingNotification(
               sessionId,
@@ -1876,13 +1872,6 @@ export function useGlobalAgentListeners(): void {
               'permissionRequest'
             )
           } else if (event.type === 'ask_user_request') {
-            // AskUser 请求入队（统一通道，不区分当前/后台会话）
-            store.set(allPendingAskUserRequestsAtom, (prev) => {
-              const map = new Map(prev)
-              const current = map.get(sessionId) ?? []
-              map.set(sessionId, [...current, event.request])
-              return map
-            })
             // 桌面通知（带提示音 + 会话导航）
             sendBlockingNotification(
               sessionId,
@@ -1890,33 +1879,7 @@ export function useGlobalAgentListeners(): void {
               event.request.questions[0]?.question ?? 'Agent 有问题需要你回答',
               'permissionRequest'
             )
-          } else if (event.type === 'ask_user_resolved') {
-            // AskUser 可能由协作父会话代答，收到 resolved 后清理所有会话中的残留请求和草稿
-            store.set(allPendingAskUserRequestsAtom, (prev) => {
-              let changed = false
-              const map = new Map(prev)
-              prev.forEach((requests, pendingSessionId) => {
-                const nextRequests = requests.filter((request) => request.requestId !== event.requestId)
-                if (nextRequests.length !== requests.length) changed = true
-                if (nextRequests.length === 0) map.delete(pendingSessionId)
-                else map.set(pendingSessionId, nextRequests)
-              })
-              return changed ? map : prev
-            })
-            store.set(askUserDraftsAtom, (prev) => {
-              if (!prev.has(event.requestId)) return prev
-              const map = new Map(prev)
-              map.delete(event.requestId)
-              return map
-            })
           } else if (event.type === 'exit_plan_mode_request') {
-            // ExitPlanMode 请求入队
-            store.set(allPendingExitPlanRequestsAtom, (prev) => {
-              const map = new Map(prev)
-              const current = map.get(sessionId) ?? []
-              map.set(sessionId, [...current, event.request])
-              return map
-            })
             // 退出 Plan 模式指示状态
             store.set(agentPlanModeSessionsAtom, (prev: Set<string>) => {
               if (!prev.has(sessionId)) return prev
@@ -2213,6 +2176,11 @@ export function useGlobalAgentListeners(): void {
         })
 
         // STREAM_COMPLETE 表示后端已完全结束 — 立即标记 running: false
+        /** 只清理当前运行的真实终态请求，旧轮完成和后台等待不能清掉新问答。 */
+        if (!backgroundTasksPending && isTerminalEventForCurrentRun(
+          store.get(agentSessionStreamingStateAtomFamily(data.sessionId)), data,
+        )) pendingRequestRecovery.completeSession(data.sessionId)
+
         // 同时将所有未完成的工具活动标记为已完成，防止 subagent spinner 继续转动
         // （complete 事件只清除 retrying，保持 running: true 以防竞态）
         // 竞态保护：通过 startedAt 区分新旧流，防止旧流的 complete 事件重置新流的 running 状态
@@ -2621,9 +2589,12 @@ export function useGlobalAgentListeners(): void {
     const unsubscribeVisibleSession = store.sub(activeSessionIdAtom, syncVisibleAgentStreamSession)
     /** 所有 lifecycle listener 注册完成后再发起 snapshot，消除订阅建立前的事件窗口。 */
     void canvasAgentBootstrapCoordinator.start()
+    /** 先建立实时订阅再拉快照，在途已回答请求由恢复器排除。 */
+    void pendingRequestRecovery.start()
 
     return () => {
       canvasAgentBootstrapCoordinator.dispose()
+      pendingRequestRecovery.dispose()
       cleanupEvent()
       streamEventBatcher.dispose()
       unsubscribeVisibleSession()

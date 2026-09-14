@@ -25,6 +25,23 @@ const context: CanvasToolRunContext = {
   permissionCeiling: 'execute',
 }
 
+test('Given 编排预算 When 图片预检失败或成功 Then 仅预检全部通过后预留并且拒绝时不创建或启动', async () => {
+  let reservations = 0
+  const failed = createHarness({ preflight: async () => { throw new Error('INVALID_CONFIG') } })
+  await failed.service.run({ ...context, reserveMediaRuns: () => { reservations++ } }, target, [createImageNode('image-1')], 'preflight')
+  expect(reservations).toBe(0)
+  expect(failed.jobs.size).toBe(0)
+  const ready = createHarness()
+  await expect(ready.service.run({ ...context, reserveMediaRuns: (_operationId, count) => {
+    reservations += count
+    expect(ready.calls).toContain('preflight:image-1')
+    expect(ready.jobs.size).toBe(0)
+    throw new Error('CANVAS_ORCHESTRATION_MEDIA_BUDGET_EXHAUSTED')
+  } }, target, [createImageNode('image-1')], 'budget')).rejects.toThrow('CANVAS_ORCHESTRATION_MEDIA_BUDGET_EXHAUSTED')
+  expect(reservations).toBe(1)
+  expect(ready.jobs.size).toBe(0)
+})
+
 test('Given 本轮生成合同 When 新建批次并重放调用 Then 只对首次真实新建回传来源且早于启动', async () => {
   /** 接收器只保存任务身份，图片字节不进入合同。 */
   const received: Array<{ nodeId: string; jobId: string }> = []

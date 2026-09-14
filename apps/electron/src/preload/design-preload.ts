@@ -12,6 +12,8 @@ import {
   parseCanvasWorkflowRun,
   parseCanvasWorkflowRunChangedEvent,
   parseCanvasWorkflowRunPage,
+  parseCanvasOrchestrationChangedEvent,
+  parseCanvasOrchestrationRecord,
 } from '@proma/shared'
 import type {
   CanvasImageJobActivity,
@@ -42,6 +44,9 @@ import type {
   CanvasWorkflowRunListInput,
   CanvasWorkflowRunPage,
   CanvasWorkflowRunTarget,
+  CanvasOrchestrationChangedEvent,
+  CanvasOrchestrationRecord,
+  CanvasTarget,
   CanvasTextArtifactIdentity,
   CanvasTextArtifactMutationResult,
   CanvasTextArtifactSnapshot,
@@ -130,6 +135,10 @@ export interface AdoptCanvasImageAssetInput extends CanvasImageJobControlInput {
 
 /** Renderer 获得的稳定 Design API。 */
 export interface DesignPreloadApi {
+  /** 轻量读取当前画布的持久编排记录，不加载完整画布图。 */
+  getCanvasOrchestration: (input: CanvasTarget) => Promise<CanvasInvokeResult<CanvasOrchestrationRecord | null>>
+  /** 订阅独立编排 revision 变化，Renderer 决定是否重读当前画布记录。 */
+  onCanvasOrchestrationChanged: (listener: (event: CanvasOrchestrationChangedEvent) => void) => () => void
   /** 加载绑定精确正文 revision 的文档或 WebView 产物。 */
   loadCanvasTextArtifact: (input: CanvasTextArtifactTarget) => Promise<CanvasInvokeResult<CanvasTextArtifactSnapshot>>
   /** 在图与正文双重基线上提交新的文本产物修订。 */
@@ -295,6 +304,11 @@ function selectCanvasWorkflowRunTarget(input: CanvasWorkflowRunTarget): CanvasWo
     projectId: input.projectId, canvasId: input.canvasId,
     sessionId: input.sessionId, runId: input.runId,
   }
+}
+
+/** 从 Renderer 输入中只拣选 Canvas 编排公开目标。 */
+function selectCanvasOrchestrationTarget(input: CanvasTarget): CanvasTarget {
+  return { projectId: input.projectId, canvasId: input.canvasId }
 }
 
 /** 从 Renderer 输入中只拣选工作流历史分页字段。 */
@@ -504,6 +518,30 @@ async function invokeCanvasWorkflowSafely<T>(
   }
 }
 
+/** 调用编排读取 IPC，并在 Preload 边界严格重建可空记录。 */
+async function invokeCanvasOrchestrationSafely(
+  ipc: DesignPreloadIpc,
+  input: CanvasTarget,
+): Promise<CanvasInvokeResult<CanvasOrchestrationRecord | null>> {
+  const target = selectCanvasOrchestrationTarget(input)
+  const result = await invokeCanvasSafely<CanvasOrchestrationRecord | null>(
+    ipc,
+    DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
+    target,
+    CANVAS_PRELOAD_FALLBACKS.workflow,
+  )
+  if (!result.ok || result.value === null) return result
+  try {
+    const record = parseCanvasOrchestrationRecord(result.value)
+    if (record.projectId !== target.projectId || record.canvasId !== target.canvasId) {
+      throw new Error('CANVAS_ORCHESTRATION_TARGET_MISMATCH')
+    }
+    return { ok: true, value: record }
+  } catch {
+    return { ok: false, error: { ...CANVAS_PRELOAD_FALLBACKS.workflow } }
+  }
+}
+
 /** 在 Preload 跨进程入口严格重建图片模块成功快照。 */
 async function invokeCanvasImageSnapshotSafely(
   ipc: DesignPreloadIpc,
@@ -527,6 +565,23 @@ async function invokeCanvasImageSnapshotSafely(
 /** 创建不暴露 ipcRenderer 本体的 Design preload API。 */
 export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi {
   return {
+    getCanvasOrchestration: (input) => invokeCanvasOrchestrationSafely(ipc, input),
+    onCanvasOrchestrationChanged: (listener) => {
+      const handler = (_event: IpcRendererEvent, value: unknown): void => {
+        let event: CanvasOrchestrationChangedEvent
+        try {
+          event = parseCanvasOrchestrationChangedEvent(value)
+        } catch {
+          /** 非法或夹带内部字段的事件不得进入 Renderer。 */
+          return
+        }
+        listener(event)
+      }
+      ipc.on(DESIGN_IPC_CHANNELS.CANVAS_ORCHESTRATION_CHANGED, handler)
+      return makeIdempotentRelease(() => {
+        ipc.removeListener(DESIGN_IPC_CHANNELS.CANVAS_ORCHESTRATION_CHANGED, handler)
+      })
+    },
     loadCanvasTextArtifact: (input) => invokeCanvasSafely(
       ipc,
       CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,

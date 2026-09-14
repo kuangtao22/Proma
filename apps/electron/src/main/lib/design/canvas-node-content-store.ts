@@ -24,6 +24,7 @@ import {
   createInitialCanvasMediaModuleState,
   parseCanvasMediaModuleState,
 } from './canvas-media-store'
+import { EMPTY_WEBVIEW_HTML } from './canvas-text-artifact-content'
 
 /** 内容目录单次列表的硬上限，与 native helper 保持一致。 */
 const MAX_CONTENT_ENTRIES = 512
@@ -35,8 +36,6 @@ const MAX_CONTENT_TEXT_LENGTH = 256 * 1024
 const MAX_LEGACY_SOURCE_URL_LENGTH = 2_048
 /** Canvas 内容稳定 ID 的业务边界。 */
 const CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
-/** Webview 空内容固定为不含脚本和外链的离线文档。 */
-const EMPTY_WEBVIEW_HTML = '<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>未命名原型</title>\n</head>\n<body></body>\n</html>\n'
 
 /** 准备空内容的稳定身份。 */
 export interface PrepareCanvasNodeContentInput {

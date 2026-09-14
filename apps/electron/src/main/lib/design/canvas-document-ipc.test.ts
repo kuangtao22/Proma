@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { CANVAS_IPC_CHANNELS, createEmptyCanvasDocument, parseGetCanvasImageCandidateBatchInput } from '@proma/shared'
+import { CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, createEmptyCanvasDocument, parseGetCanvasImageCandidateBatchInput } from '@proma/shared'
 import type {
   AgentSessionMeta,
   CanvasAgentTarget,
@@ -18,6 +18,7 @@ import type {
   CanvasImageJobActivity,
   CanvasImageCandidateBatch,
   CanvasImageTarget,
+  CanvasOrchestrationRecord,
   CanvasWebviewSnapshot,
   CanvasWebviewTarget,
   CanvasWebviewPreviewSnapshot,
@@ -39,6 +40,8 @@ import type { CanvasImageRunService } from './canvas-image-run-service'
 import type { CanvasImageCandidateAdoptionReconciliation } from './canvas-image-candidate-batch-service'
 import type { CanvasWorkflowExecutionService } from './canvas-workflow-execution-service'
 import type { CanvasTaskOperationService } from './canvas-task-operation-service'
+import type { CanvasTextArtifactService } from './canvas-text-artifact-service'
+import { EMPTY_WEBVIEW_HTML } from './canvas-text-artifact-content'
 import {
   DOCUMENT_ARTIFACT_DESCRIPTOR,
   IMAGE_ARTIFACT_DESCRIPTOR,
@@ -311,6 +314,12 @@ function createContext(options: {
   /** 工作流 UI 只允许当前真实会话，不能借用运行记录中的 owner。 */
   resolveWorkflowUiContext?: import('./canvas-document-ipc').CanvasDocumentIpcOptions['resolveWorkflowUiContext']
   agentOutput?: (target: CanvasAgentTarget) => Promise<string>
+  /** 注入初始正文读取，复现空历史但已有正文及读取故障。 */
+  textArtifactRead?: CanvasTextArtifactService['read']
+  /** 独立注入已提交版本目录，避免把初始正文混入底层历史 fixture。 */
+  textArtifactListVersions?: CanvasTextArtifactService['listVersions']
+  /** Renderer 编排读取与 Agent 工具复用同一主进程服务。 */
+  orchestration?: import('./canvas-document-ipc').CanvasDocumentIpcOptions['orchestration']
 } = {}) {
   /** 当前注册的 invoke handler。 */
   const handlers = new Map<string, TestHandler>()
@@ -362,6 +371,7 @@ function createContext(options: {
     descriptor: DOCUMENT_ARTIFACT_DESCRIPTOR,
     read: async (input: import('@proma/shared').CanvasTextArtifactTarget) => {
       calls.push('artifact:read')
+      if (options.textArtifactRead) return options.textArtifactRead(input)
       return {
         target: input,
         revision: {
@@ -374,6 +384,7 @@ function createContext(options: {
     },
     listVersions: async (input: import('@proma/shared').CanvasTextArtifactIdentity) => {
       calls.push('artifact:list')
+      if (options.textArtifactListVersions) return options.textArtifactListVersions(input)
       return [{
         kind: input.kind, contentId: input.contentId, revision: 1, parentRevision: 0,
         contentHash: 'a'.repeat(64), createdBy: { type: 'user' as const }, createdAt: 1,
@@ -433,6 +444,7 @@ function createContext(options: {
       removeHandler: (channel) => { removed.push(channel); handlers.delete(channel) },
     },
     listAuthorizedWebContents: () => options.authorized ?? [sender],
+    ...(options.orchestration ? { orchestration: options.orchestration } : {}),
     ...(options.operationSerializer ? { operationSerializer: options.operationSerializer } : {}),
     guard: {
       runWorkspaceWrite: (projectId, effect) => {
@@ -909,6 +921,72 @@ function createContext(options: {
 }
 
 describe('原生 Canvas 文档 IPC', () => {
+  test('Given 授权窗口读取编排 When 目标严格合法 Then 先复核原生画布再返回同一服务记录', async () => {
+    const orchestrationTargets: CanvasTarget[] = []
+    const record: CanvasOrchestrationRecord = {
+      schemaVersion: 1, id: 'orchestration-1', revision: 1, projectId: 'project-1', canvasId: 'canvas-1',
+      ownerSessionId: 'session-1', request: { requestId: 'request-1', goal: '完成原型', intent: 'design',
+        constraints: [], referenceNodeIds: [], deliverables: [] }, coordinatorNodeId: null, coordinatorSessionId: null,
+      status: 'planning', steps: [], summary: '', runStartedAt: null, createdAt: 1, updatedAt: 1,
+      budget: { maxAgentRuns: 32, agentRunsUsed: 0, maxMediaRuns: 0, mediaRunsUsed: 0 },
+    }
+    const context = createContext({
+      readSnapshot: () => ({ document: createDocument(1), writable: true, nodeIssues: [] }),
+      orchestration: {
+        get: (target) => { orchestrationTargets.push(target); return record },
+      } as import('./canvas-orchestration-service').CanvasOrchestrationService,
+    })
+    await expect(invoke(context.handlers, DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION, context.sender, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })).resolves.toEqual({ ok: true, value: record })
+    expect(context.storeInputs).toEqual([{ projectId: 'project-1', canvasId: 'canvas-1' }])
+    expect(orchestrationTargets).toEqual([{ projectId: 'project-1', canvasId: 'canvas-1' }])
+    expect(context.registration.channels).toContain(DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION)
+    expect(context.registration.channels).not.toContain(DESIGN_IPC_CHANNELS.CANVAS_ORCHESTRATION_CHANGED)
+  })
+
+  test('Given 编排读取伪造字段或未授权窗口 When 调用 Then 不进入 Store 与服务', async () => {
+    let reads = 0
+    const foreign = createSender(99)
+    const context = createContext({
+      orchestration: {
+        get: () => { reads += 1; return null },
+      } as unknown as import('./canvas-orchestration-service').CanvasOrchestrationService,
+    })
+    for (const input of [
+      { projectId: 'project-1', canvasId: 'canvas-1', sessionId: 'forged' },
+      { projectId: '../escape', canvasId: 'canvas-1' },
+    ]) {
+      const result = await invoke(context.handlers, DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION, context.sender, input)
+      expect(result).toMatchObject({ ok: false })
+    }
+    const unauthorized = await invoke(context.handlers, DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION, foreign, {
+      projectId: 'project-1', canvasId: 'canvas-1',
+    })
+    expect(unauthorized).toMatchObject({ ok: false })
+    expect(context.storeInputs).toEqual([])
+    expect(reads).toBe(0)
+  })
+
+  test('Given 生产编排服务已注入 When 创建普通 Agent 工具运行 Then 委托能力来自同一服务实例', () => {
+    const orchestration = {
+      get: () => null,
+    } as unknown as import('./canvas-orchestration-service').CanvasOrchestrationService
+    const context = createContext({ enableToolProviderRuntime: true, orchestration })
+    try {
+      const run = getCanvasToolProviderRuntime()!.createRun({
+        projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99,
+        explicitReferences: [], permissionCeiling: 'execute',
+      })
+      expect(run.piCustomTools.filter(tool => tool.name.includes('orchestration') || tool.name === 'canvas_delegate')
+        .map(tool => tool.name)).toEqual([
+          'canvas_delegate', 'canvas_get_orchestration', 'canvas_resume_orchestration', 'canvas_cancel_orchestration',
+        ])
+    } finally {
+      context.registration.dispose()
+    }
+  })
+
   test('Given 当前采用图片 When 统一导出 Then 路径只来自主进程并复用素材服务', async () => {
     const job = createImageJob(imageTargetA, 'job-a', 'asset-a')
     const context = createContext({
@@ -3789,9 +3867,10 @@ describe('原生 Canvas 文档 IPC', () => {
     errorSpy.mockRestore()
   })
 
-  test('Given 已注册处理器 When 重复 dispose Then 仅移除三十个固定 invoke 通道一次', () => {
+  test('Given 已注册处理器 When 重复 dispose Then 仅移除本注册器固定 invoke 通道一次', () => {
     const context = createContext()
     expect(context.registration.channels).toEqual([
+      DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
       CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
@@ -3834,6 +3913,7 @@ describe('原生 Canvas 文档 IPC', () => {
     context.registration.dispose()
 
     expect(context.removed).toEqual([
+      DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
       CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
@@ -4124,6 +4204,7 @@ describe('原生 Canvas 文档 IPC', () => {
     expect(getCanvasToolProviderRuntime()).toBeNull()
     expect(handlers.size).toBe(0)
     expect(removed).toEqual([
+      DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
       CANVAS_IPC_CHANNELS.LOAD,
       CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
       CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
@@ -4162,7 +4243,7 @@ describe('原生 Canvas 文档 IPC', () => {
     ])
 
     registrationA.dispose()
-    expect(removed).toHaveLength(35)
+    expect(removed).toHaveLength(36)
   })
 
   test('Given 生产任务服务已装配 When Agent 查询和停止 Then 权威解析模块身份并复用同一服务', async () => {
@@ -4565,11 +4646,114 @@ describe('原生 Canvas 文档 IPC', () => {
       expect(list).toBeDefined()
       const versions = await list!.execute('list-1', { canvasId: 'canvas-1', nodeId: 'doc-1' } as never, undefined as never, undefined as never, undefined as never)
       expect(versions.details).toMatchObject({ versions: [{ version: { kind: 'document', revision: 1 }, adopted: false }], currentVersion: 2 })
+      expect(context.calls).not.toContain('artifact:read')
       const read = run.piCustomTools.find((tool) => tool.name === 'canvas_read_version')!
       const result = await read.execute('read-1', { canvasId: 'canvas-1', nodeId: 'doc-1', version: { kind: 'document', revision: 1 } } as never, undefined as never, undefined as never, undefined as never)
       expect(result.details).toMatchObject({ version: { kind: 'document', revision: 1 }, content: '<main>首页</main>' })
       expect(context.calls).not.toContain('artifact:adopt')
       expect(JSON.stringify(versions.details)).not.toContain('content-1')
+    } finally { context.registration.dispose() }
+  })
+
+  /** 初始版本必须按真实正文区分已有成果与空占位，不能看历史目录长度。 */
+  for (const initialCase of [
+    { kind: 'document' as const, content: '# 制作方案\n先核验素材再设计镜头。', contentState: 'present' },
+    { kind: 'webview' as const, content: '<main>交互原型</main>', contentState: 'present' },
+    { kind: 'document' as const, content: ' \n ', contentState: 'empty' },
+    { kind: 'webview' as const, content: EMPTY_WEBVIEW_HTML, contentState: 'empty' },
+  ]) test(`Given ${initialCase.kind} 初始正文为 ${initialCase.contentState} When 查询空版本历史 Then 返回真实版本零且不冒充验收`, async () => {
+    /** 精确当前节点身份由权威图提供，工具不接收 contentId。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: 'initial-1', title: '初始产物', position: { x: 0, y: 0 }, contentRevision: 0,
+      ...(initialCase.kind === 'document' ? { kind: 'document', documentId: 'content-1' } : { kind: 'webview', prototypeId: 'content-1', devicePreset: 'desktop' }) }]
+    /** 读取签名与生产服务一致，作者仅为底层兼容字段，不能作为真实作者投影。 */
+    const context = createContext({ enableToolProviderRuntime: true, loadResult: { document, writable: true, nodeIssues: [] },
+      textArtifactListVersions: async () => [],
+      textArtifactRead: async (target) => ({ target, content: initialCase.content, revision: {
+        kind: target.kind, contentId: target.contentId, revision: 0, parentRevision: null,
+        contentHash: 'b'.repeat(64), createdAt: 123, createdBy: { type: 'user' },
+      } }),
+    })
+    try {
+      /** 通过生产 Provider 装配的工具调用，证明模型实际可见的结果。 */
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const result = await run.piCustomTools.find((tool) => tool.name === 'canvas_list_versions')!.execute('initial-list',
+        { canvasId: 'canvas-1', nodeId: 'initial-1' } as never, undefined as never, undefined as never, undefined as never)
+      expect(result.details).toMatchObject({ revision: 4, currentVersion: 0, total: 1, nextCursor: null,
+        versions: [{ version: { kind: initialCase.kind, revision: 0 }, adopted: true, initial: true,
+          contentState: initialCase.contentState, contentHash: 'b'.repeat(64), createdAt: 123 }],
+        nextAction: { tool: 'canvas_read', arguments: { canvasId: 'canvas-1', nodeIds: ['initial-1'] } },
+      })
+      expect(JSON.stringify(result.details)).not.toMatch(/createdBy|content-1|evidenceId/)
+      expect(context.calls.filter((call) => call === 'artifact:read')).toHaveLength(1)
+      expect(context.calls).not.toContain('artifact:update')
+      expect(context.calls).not.toContain('artifact:adopt')
+      expect(document.revision).toBe(4)
+      /** 直接执行返回的下一步参数，验证恢复指引能读到正文与真实内容证据。 */
+      const nextAction = (result.details as { nextAction: { tool: string; arguments: { canvasId: string; nodeIds: string[] } } }).nextAction
+      const read = await run.piCustomTools.find((tool) => tool.name === nextAction.tool)!.execute('initial-read',
+        nextAction.arguments as never, undefined as never, undefined as never, undefined as never)
+      const readNode = (read.details as { nodes: Array<{ content: string; evidence: Array<{ validation: string }>; readError?: unknown }> }).nodes[0]!
+      expect(readNode.content).toBe(initialCase.content)
+      expect(readNode.readError).toBeUndefined()
+      expect(readNode.evidence.some((proof) => proof.validation === 'content')).toBe(initialCase.contentState === 'present')
+    } finally { context.registration.dispose() }
+  })
+
+  /** 读取失败、身份漂移或撤权不能被“初始版本兼容”吞掉。 */
+  for (const failure of ['missing', 'corrupt', 'identity', 'revision', 'graph', 'node-identity', 'node-revision', 'access'] as const) {
+    test(`Given 初始版本读取发生 ${failure} When 查询版本 Then 拒绝不可信列表`, async () => {
+      /** 测试异步读取期间的权威图及访问状态。 */
+      const document = createDocument(4)
+      document.nodes = [{ id: 'doc-1', kind: 'document', title: '制作方案', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 0 }]
+      let revoked = false
+      const context = createContext({ enableToolProviderRuntime: true, loadResult: { document, writable: true, nodeIssues: [] },
+        toolAccess: { ...createToolAccess(), authorizeRead: () => { if (revoked) throw new Error('CANVAS_READ_REVOKED') } },
+        textArtifactListVersions: async () => [],
+        textArtifactRead: async (target) => {
+          if (failure === 'missing') throw new Error('CANVAS_CONTENT_NOT_FOUND')
+          if (failure === 'corrupt') throw new Error('CANVAS_CONTENT_CORRUPT')
+          if (failure === 'graph') document.revision += 1
+          if (failure === 'node-identity') document.nodes = document.nodes.map((node) => node.kind === 'document' ? { ...node, documentId: 'rebound-content' } : node)
+          if (failure === 'node-revision') document.nodes = document.nodes.map((node) => node.kind === 'document' ? { ...node, contentRevision: 1 } : node)
+          if (failure === 'access') revoked = true
+          return { target, content: '# 方案', revision: { kind: target.kind,
+            contentId: failure === 'identity' ? 'other-content' : target.contentId,
+            revision: failure === 'revision' ? 1 : 0, parentRevision: null,
+            contentHash: 'a'.repeat(64), createdAt: 1, createdBy: { type: 'user' } } }
+        },
+      })
+      try {
+        /** 在真实工具调用边界验证异常传播，不能返回 total 0 掩盖故障。 */
+        const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+        await expect(run.piCustomTools.find((tool) => tool.name === 'canvas_list_versions')!.execute('invalid-list',
+          { canvasId: 'canvas-1', nodeId: 'doc-1' } as never, undefined as never, undefined as never, undefined as never)).rejects.toThrow({
+            missing: 'CANVAS_CONTENT_NOT_FOUND', corrupt: 'CANVAS_CONTENT_CORRUPT',
+            identity: 'CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT', revision: 'CANVAS_ARTIFACT_REVISION_CONFLICT',
+            graph: 'CANVAS_REVISION_CONFLICT', access: 'CANVAS_READ_REVOKED',
+            'node-identity': 'CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT', 'node-revision': 'CANVAS_ARTIFACT_REVISION_CONFLICT',
+          }[failure])
+        expect(context.calls).not.toContain('artifact:update')
+      } finally { context.registration.dispose() }
+    })
+  }
+
+  test('Given 初始版本与历史目录重复 When 分页查询 Then 版本零只出现一次且游标包含初始项', async () => {
+    /** 历史目录可出现兼容版本零；当前精确读取应覆盖其摘要。 */
+    const document = createDocument(4)
+    document.nodes = [{ id: 'doc-1', kind: 'document', title: '方案', position: { x: 0, y: 0 }, documentId: 'content-1', contentRevision: 0 }]
+    const context = createContext({ enableToolProviderRuntime: true, loadResult: { document, writable: true, nodeIssues: [] },
+      textArtifactListVersions: async (target) => [0, 1].map((revision) => ({ kind: target.kind, contentId: target.contentId,
+        revision, parentRevision: revision > 0 ? revision - 1 : null, contentHash: 'c'.repeat(64), createdAt: 10, createdBy: { type: 'user' } })),
+    })
+    try {
+      /** limit 一项验证插入初始版本后分页总数与游标位置一致。 */
+      const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
+      const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_list_versions')!
+      const first = await tool.execute('page-1', { canvasId: 'canvas-1', nodeId: 'doc-1', limit: 1 } as never, undefined as never, undefined as never, undefined as never)
+      expect(first.details).toMatchObject({ total: 2, versions: [{ version: { kind: 'document', revision: 0 }, initial: true, adopted: true, contentHash: 'a'.repeat(64) }] })
+      const second = await tool.execute('page-2', { canvasId: 'canvas-1', nodeId: 'doc-1', limit: 1, cursor: (first.details as { nextCursor: string }).nextCursor } as never, undefined as never, undefined as never, undefined as never)
+      expect(second.details).toMatchObject({ total: 2, nextCursor: null, versions: [{ version: { kind: 'document', revision: 1 }, adopted: false }] })
     } finally { context.registration.dispose() }
   })
 

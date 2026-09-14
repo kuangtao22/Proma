@@ -44,6 +44,19 @@ const mediaSnapshot = (
   assets: [],
 })
 
+/** 为轻量模块快照加入已导入并采用的本地素材，不依赖远端运行记录。 */
+function addAdoptedLocalOutput(snapshot: CanvasMediaModuleSnapshot): void {
+  const output = { key: 'video', mediaKind: 'video' as const, role: 'primary' as const, order: 0 }
+  const asset = { assetId: 'asset-local', revision: 1, hash: 'a'.repeat(64), mediaKind: 'video' as const }
+  snapshot.config.outputs = [output]
+  snapshot.config.adoptedOutputs = [{ ...output, candidateId: 'candidate-local', runId: 'local-import', asset }]
+  snapshot.candidates = [{
+    id: 'candidate-local', operationId: 'operation-local', runId: 'local-import', sourceConfigRevision: 1,
+    source: { kind: 'local-import', operationId: 'operation-local', sourceSessionId: 'session-local' },
+    outputs: [{ ...output, asset }], createdAt: 1,
+  }]
+}
+
 const job = (id: string): DesignJobRecord => ({
   id, creativeTaskId: `task-${id}`, attemptNumber: 1, projectId: 'project-a',
   target: { kind: 'canvas-image', canvasId: 'canvas-a', nodeId: `node-${id}`, imageModuleId: `module-${id}` },
@@ -239,6 +252,61 @@ describe('Canvas AV 节点进度控制器', () => {
     controller.dispose()
     await controller.whenIdle()
     expect(projections.at(-1)?.size).toBe(0)
+  })
+
+  test('Given 本地素材已导入并采用且没有远端运行 When 加载模块 Then 投影显示已有素材且不宣称验收通过', async () => {
+    /** 本地导入允许 profile/workflow 为空，素材事实直接来自 adoptedOutputs。 */
+    const target = mediaTarget()
+    const snapshot = mediaSnapshot(target, [])
+    addAdoptedLocalOutput(snapshot)
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({
+      projectId: target.projectId,
+      canvasMediaLoad: async () => structuredClone(snapshot),
+      onCanvasMediaChanged: () => () => undefined,
+      onMediaRunChanged: () => () => undefined,
+      acquireProjectWatch: async () => undefined,
+      releaseProjectWatch: async () => undefined,
+      onChange: (progress) => projections.push(new Map(progress)),
+    })
+
+    controller.setTargets([target])
+    controller.start()
+    await controller.whenIdle()
+
+    expect(projections.at(-1)?.get(target.nodeId)).toMatchObject({
+      phase: 'pending', phaseLabel: '已有素材', hasAdoptedOutput: true,
+    })
+    expect(projections.at(-1)?.get(target.nodeId)?.phaseLabel).not.toContain('验收')
+    controller.dispose()
+  })
+
+  test.each([
+    ['running', '运行中'],
+    ['failed', '生成失败'],
+  ] as const)('Given 已有采用素材且新生成%s When 投影模块 Then 同时保留素材事实与运行阶段', async (phase, phaseLabel) => {
+    const target = mediaTarget()
+    const snapshot = mediaSnapshot(target, [run(2, { phase })])
+    addAdoptedLocalOutput(snapshot)
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({
+      projectId: target.projectId,
+      canvasMediaLoad: async () => structuredClone(snapshot),
+      onCanvasMediaChanged: () => () => undefined,
+      onMediaRunChanged: () => () => undefined,
+      acquireProjectWatch: async () => undefined,
+      releaseProjectWatch: async () => undefined,
+      onChange: (progress) => projections.push(new Map(progress)),
+    })
+
+    controller.setTargets([target])
+    controller.start()
+    await controller.whenIdle()
+
+    expect(projections.at(-1)?.get(target.nodeId)).toMatchObject({
+      phase, phaseLabel, hasAdoptedOutput: true,
+    })
+    controller.dispose()
   })
 
   test('Given 画布没有 AV 目标 When 控制器启动和释放 Then 不申请空项目 watch', async () => {

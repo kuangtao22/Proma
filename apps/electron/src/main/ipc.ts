@@ -242,6 +242,11 @@ import { createCanvasImageRunService } from './lib/design/canvas-image-run-servi
 import { createCanvasWorkflowExecutionService } from './lib/design/canvas-workflow-execution-service'
 import { createCanvasWorkflowRunStore } from './lib/design/canvas-workflow-run-store'
 import { createCanvasTaskStore } from './lib/design/canvas-task-store'
+import { createCanvasOrchestrationStore } from './lib/design/canvas-orchestration-store'
+import { createCanvasExecutionOwnership } from './lib/design/canvas-execution-ownership'
+import { createCanvasOrchestrationRuntime, canvasOrchestratorContext } from './lib/design/canvas-orchestration-runtime'
+import { authorizeCanvasMediaActor } from './lib/design/canvas-orchestration-media-access'
+import type { CanvasOrchestrationService } from './lib/design/canvas-orchestration-service'
 import { createCanvasArtifactExportService } from './lib/design/canvas-artifact-export-service'
 import { createCanvasWorkflowMediaAdapter, findCanvasWorkflowConfirmedMediaOutput } from './lib/design/canvas-workflow-runtime-adapters'
 import { createCanvasWorkflowResumeScheduler, shouldResumeCanvasWorkflow } from './lib/design/canvas-workflow-resume-scheduler'
@@ -259,7 +264,7 @@ import {
   parseCanvasNodeContentMetaContent,
 } from './lib/design/canvas-node-content-store'
 import { createCanvasContentNodeLifecycle } from './lib/design/canvas-content-node-lifecycle'
-import { createCanvasImageModuleStore } from './lib/design/canvas-image-module-store'
+import { createCanvasImageModuleStore, deriveCanvasImageArtifactVersions } from './lib/design/canvas-image-module-store'
 import { createCanvasImageJobTargetAdapter } from './lib/design/canvas-image-job-target'
 import { createCanvasImageInputResolver } from './lib/design/canvas-image-input-resolver'
 import { createCanvasImageCandidateBatchStore } from './lib/design/canvas-image-candidate-batch-store'
@@ -2144,6 +2149,10 @@ export function registerIpcHandlers(): void {
   const canvasSessionStore = new CanvasSessionStore({ pathResolver: designPathResolver })
   /** 原生 Canvas 文档复用同一会话索引作为项目与 Canvas 双身份授权事实。 */
   const canvasDocumentStore = createCanvasDocumentStore({ sessions: canvasSessionStore })
+  /** 编排身份必须先有持久事实，实际执行服务稍后在能力齐备时组合。 */
+  const canvasOrchestrationStore = createCanvasOrchestrationStore({ pathResolver: designPathResolver,
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect) })
+  let canvasOrchestrationService: CanvasOrchestrationService
   /** Canvas 图、配置、候选批次与节点写操作共享唯一键控串行器。 */
   const canvasOperationSerializer = createCanvasOperationSerializer()
   /** Canvas 与 legacy Design 共用仍存活主窗口授权边界。 */
@@ -2591,12 +2600,8 @@ export function registerIpcHandlers(): void {
         const node = document.nodes.find((candidate) => candidate.id === target.nodeId)
         if (!node || node.kind !== target.mediaKind || node.mediaModuleId !== target.mediaModuleId) throw new Error('MEDIA_CANVAS_TARGET_INVALID')
       }
-      if (origin?.actor && operation !== 'collect') {
-        const actor = origin.actor
-        canvasToolAccess.authorizeRead({ projectId, sessionId: actor.sessionId, runStartedAt: actor.runStartedAt, explicitReferences: [], permissionCeiling: 'execute',
-          ...(actor.canvasId && actor.nodeId ? { canvasAgentTarget: { projectId, canvasId: actor.canvasId, nodeId: actor.nodeId }, canvasAgentMode: actor.mode === 'parent-orchestrated' ? 'parent-orchestrated' as const : 'renderer-manual' as const } : {}) })
-        if (operation === 'execute' && (actor.mode === 'parent-orchestrated' || getAgentSessionMeta(actor.sessionId)?.permissionMode === 'plan')) throw new Error('MEDIA_EXECUTION_NOT_AUTHORIZED')
-      }
+      authorizeCanvasMediaActor({ access: canvasToolAccess, getOrchestration: target => canvasOrchestrationStore.get(target),
+        getPermissionMode: sessionId => getAgentSessionMeta(sessionId)?.permissionMode }, projectId, operation, origin)
     },
     readAsset: (projectId, asset) => mediaAssets.read(projectId, asset),
     registerOutput: (projectId, operationId, bytes, contentType, origin) => mediaAssets.register(projectId, operationId, bytes, contentType, origin),
@@ -2737,6 +2742,14 @@ export function registerIpcHandlers(): void {
     prepareStart: reconcileCanvasAgent,
     validateParentAccess: ({ target, parentSessionId, startedAt }) => {
       /** 父会话与 binding 在 prepareStart 的同一写临界区 fresh-read。 */
+      const orchestration = canvasOrchestrationStore.get(target)
+      if (orchestration?.coordinatorSessionId === parentSessionId) {
+        const parentContext = canvasOrchestratorContext(orchestration)
+        canvasOrchestrationService.assertActor({ ...target, sessionId: parentSessionId,
+          orchestrationId: orchestration.id, runStartedAt: parentContext.runStartedAt })
+        canvasToolAccess.requireLinkedCanvas(parentContext, target.canvasId)
+        return
+      }
       canvasToolAccess.requireLinkedCanvas({
         projectId: target.projectId,
         sessionId: parentSessionId,
@@ -2745,6 +2758,14 @@ export function registerIpcHandlers(): void {
         permissionCeiling: 'execute',
       }, target.canvasId)
     },
+    validateOrchestrationAccess: ({ target, parentSessionId, orchestrationId, startedAt }) => {
+      const record = canvasOrchestrationStore.get(target)
+      if (!record || record.id !== orchestrationId || record.ownerSessionId !== parentSessionId
+        || record.coordinatorNodeId !== target.nodeId || !record.coordinatorSessionId) throw new Error('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+      canvasOrchestrationService.assertActor({ ...target, sessionId: record.coordinatorSessionId,
+        orchestrationId, runStartedAt: startedAt })
+    },
+    validateOrchestrationBranch: input => { canvasOrchestrationService.assertBranch(input) },
     getSession: getAgentSessionMeta,
     configs: canvasAgentConfigStore,
     getWorkspaceSkills: (projectId) => {
@@ -3300,10 +3321,44 @@ export function registerIpcHandlers(): void {
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
     onChanged: (run) => canvasWorkflowResumeScheduler.changed(run),
   })
+  /** 两套现有 journal 共同决定执行准入，短锁只覆盖检查与登记，不常驻占用模型运行。 */
+  const canvasExecutionOwnership = createCanvasExecutionOwnership({
+    pathResolver: designPathResolver,
+    getOrchestration: target => canvasOrchestrationStore.get(target),
+    listWorkflows: target => canvasWorkflowRuns.list(target),
+    runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
   /** 业务交付跨 Agent 回合保存；不复制工作流的执行预算与媒体正文。 */
   const canvasTaskStore = createCanvasTaskStore({
     pathResolver: designPathResolver,
     runWorkspaceWrite: (projectId, effect) => workspaceOperationGuard.runWorkspaceWrite(projectId, effect),
+  })
+  /** 普通委托、专业分派和 UI 读取共享此唯一实例，复用真实产物与 Pi 生命周期。 */
+  canvasOrchestrationService = createCanvasOrchestrationRuntime({
+    executionOwnership: canvasExecutionOwnership,
+    store: canvasOrchestrationStore, access: canvasToolAccess, documents: canvasDocumentStore,
+    artifacts: canvasArtifactCreation, execution: canvasAgentExecutionService,
+    getAgentMessages: getAgentSessionSDKMessages, isAgentBusy: isAgentSessionBusy,
+    createRun: context => getCanvasToolProviderRuntime()?.createRun(context),
+    evidence: {
+      textArtifacts: canvasTextArtifactService, agentConfigs: canvasAgentConfigStore, agentOutputs: canvasAgentOutputService,
+      canvasMedia: canvasMediaService,
+      images: {
+        loadConfig: target => canvasImageModuleStore.load(target),
+        load: async target => ({ config: await canvasImageModuleStore.load(target), jobs: designJobManager.listCanvasImageJobs(target) }),
+        save: input => canvasImageModuleStore.save(input),
+        listVersions: async target => deriveCanvasImageArtifactVersions(target, designJobManager.listCanvasImageJobs(target),
+          designStore.requireStableAuthoritativeDocument(target.projectId).assets),
+        readThumbnail: async (projectId, assetId) => designAssetService.readStoredThumbnail(projectId, assetId),
+      },
+    },
+    onChanged: record => {
+      for (const contents of listAuthorizedDesignWebContents()) {
+        try { contents.send(DESIGN_IPC_CHANNELS.CANVAS_ORCHESTRATION_CHANGED,
+          { projectId: record.projectId, canvasId: record.canvasId, revision: record.revision }) }
+        catch { console.warn('[画布编排] 单窗口计划广播失败，保留持久状态供补读') }
+      }
+    },
   })
   /** 准备交接独立写入父 Canvas 的事务目录，不与运行 journal 争用 CAS。 */
   const canvasMediaHandoffs = createCanvasMediaHandoffStore({
@@ -3340,6 +3395,7 @@ export function registerIpcHandlers(): void {
   app.once('before-quit', () => canvasWorkflowResumeScheduler.dispose())
   /** 显式工作流复用唯一 Agent、图片与媒体服务。 */
   const canvasWorkflowExecutionService = createCanvasWorkflowExecutionService({
+    executionOwnership: canvasExecutionOwnership,
     load: (target) => canvasDocumentStore.load(target).document,
     validateAccess: (context, canvasId) => {
       canvasToolAccess.requireLinkedCanvas(context, canvasId)
@@ -3488,6 +3544,12 @@ export function registerIpcHandlers(): void {
       for (const workspace of listAgentWorkspaces()) {
         try {
           for (const canvas of canvasSessionStore.list({ projectId: workspace.id })) {
+            /** 重启只对账编排状态，恢复模型由原普通会话显式继续，不自动外发新调用。 */
+            try {
+              const target = { projectId: workspace.id, canvasId: canvas.id }
+              const orchestration = canvasOrchestrationStore.get(target)
+              if (orchestration) await canvasOrchestrationService.recover({ ...target, sessionId: orchestration.ownerSessionId })
+            } catch { console.warn('[画布编排] 原委托启动对账暂未完成，保留记录供继续') }
             try { runs.push(...canvasWorkflowRuns.list({ projectId: workspace.id, canvasId: canvas.id })) }
             catch { console.warn('[Canvas 工作流] 单画布记录暂不可用，继续其它画布恢复') }
           }
@@ -3497,6 +3559,7 @@ export function registerIpcHandlers(): void {
     })().catch(() => console.warn('[Canvas 工作流] 启动恢复暂未完成，保留原运行记录'))
   })
   registerCanvasDocumentIpcHandlers({
+    orchestration: canvasOrchestrationService,
     taskStore: canvasTaskStore,
     taskOperations: canvasTaskOperations,
     artifactExport: canvasArtifactExport,

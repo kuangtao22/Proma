@@ -3,6 +3,26 @@ import type { CanvasWorkflowRun } from '@proma/shared'
 import { createCanvasWorkflowResumeScheduler, shouldResumeCanvasWorkflow } from './canvas-workflow-resume-scheduler'
 
 describe('Canvas 工作流持久期限调度', () => {
+  test('Given 新编排已接管 When 旧期限恢复被拒绝 Then 停止自动退避且允许后续明确重新安排', async () => {
+    /** 记录实际唤醒，确保确定的所有权冲突不会变成后台轮询。 */
+    const timers: Array<() => void> = []
+    let resumes = 0
+    const scheduler = createCanvasWorkflowResumeScheduler({
+      resume: async () => { resumes++; throw new Error('CANVAS_ORCHESTRATION_OWNS_EXECUTION') },
+      onError: () => undefined,
+      setTimer: callback => { timers.push(callback); return { cancel: () => undefined } },
+    })
+    const input = { projectId: 'project', canvasId: 'canvas', workflowRunId: 'run', ownerSessionId: 'owner', resumeAt: 0 }
+    scheduler.schedule(input)
+    timers[0]!()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(resumes).toBe(1)
+    expect(timers).toHaveLength(1)
+    scheduler.schedule(input)
+    expect(timers).toHaveLength(2)
+    scheduler.dispose()
+  })
   test('Given 取消意图在终态前中断 When 启动筛选与调度 Then 立即恢复收敛且不受自动采用设置影响', async () => {
     const calls: string[] = []
     const timers: Array<{ fire(): void; delay: number }> = []

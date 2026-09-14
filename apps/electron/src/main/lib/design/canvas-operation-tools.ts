@@ -254,7 +254,7 @@ export function createCanvasOperationTools(
     ...define('canvas_get_task', '查看图片任务', `查看指定节点任务的真实状态、尝试、最终提示词和按需日志，不重新生成。waitMs 可在 0 到 ${CANVAS_TASK_WAIT_MAX_MS} 毫秒内等待同一 job 进入终态；超时且仍在运行时继续用同一 job 查询，成功后再看图，失败时报告真实 error。`, taskReadSchema, handlers.getTask, false),
     ...define('canvas_cancel_task', '停止图片任务', '停止明确指定的现有任务；返回实际终态，不保证远端已取消或费用退回。', taskWriteSchema, handlers.cancelTask, true),
     ...define('canvas_retry_task', '重试图片任务', '按原任务固化模型、提示词和输入重试，可能产生模型费用；返回 replacementJobId 后必须调用 canvas_get_task 并沿同一 replacementJobId 等待真实终态。', taskWriteSchema, handlers.retryTask, true),
-    ...define('canvas_list_versions', '查看产物版本', '分页列出节点可用版本及当前采用状态，为检查和明确采用提供准确引用。', versionsSchema, handlers.listVersions, false),
+    ...define('canvas_list_versions', '查看产物版本', '分页列出节点可用版本及当前采用状态。文档与 WebView 的初始版本为 0，initial/contentState 区分已有正文和空占位；没有后续提交历史不代表正文缺失。请用 canvas_read 读取当前正文及内容证据，版本列表本身不代表验收通过。', versionsSchema, handlers.listVersions, false),
     ...define('canvas_read_version', '读取历史正文', '读取指定文档或 WebView 版本正文；图片请用 canvas_inspect_images 精确看图。', versionReadSchema, handlers.readVersion, false),
     ...define('canvas_adopt_version', '采用产物版本', '按明确意图采用精确图片、文档或 WebView 版本，校验当前图及配置/正文 revision；不会自动继续生成。', versionAdoptSchema, handlers.adoptVersion, true),
     ...define('canvas_adopt_candidate_batch', '采用图片候选批次', '按明确意图原子采用候选批次；all 要求全部条目成功，succeeded 采用当前全部成功候选，不接受模型自选任意子集。', candidateBatchAdoptSchema, adoptCandidateBatch, true),

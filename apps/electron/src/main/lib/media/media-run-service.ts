@@ -27,7 +27,7 @@ export interface MediaRunOrigin {
   actor?: {
     sessionId: string
     runStartedAt: number
-    mode: 'project-agent' | 'renderer-manual' | 'parent-orchestrated'
+    mode: 'project-agent' | 'renderer-manual' | 'parent-orchestrated' | 'canvas-orchestrator'
     canvasId?: string
     nodeId?: string
   }
@@ -39,7 +39,7 @@ export interface MediaRunOrigin {
 export interface MediaRunServiceDependencies {
   configuration: MediaConfigStore
   getRunsDirectory(projectId: string): string
-  authorize(projectId: string, operation: 'read' | 'prepare' | 'execute' | 'collect', origin?: MediaRunOrigin): void
+  authorize(projectId: string, operation: 'read' | 'prepare' | 'execute' | 'collect' | 'cancel', origin?: MediaRunOrigin): void
   /** 固定工作流的本机输出处理能力必须在付费提交前可用。 */
   assertOutputSupport?: (workflow: MediaWorkflowDefinition) => Promise<void>
   readAsset(projectId: string, asset: MediaAssetRef): Promise<Uint8Array>
@@ -666,11 +666,11 @@ export class MediaRunService {
 
   /** 定向取消与本地阶段更新在同一个项目迁移保护范围内。 */
   private async cancelOwned(projectId: string, runId: string): Promise<MediaRunSnapshot> {
-    this.dependencies.authorize(projectId, 'execute')
+    this.dependencies.authorize(projectId, 'cancel')
     const release = acquireMediaFileLock(join(this.directory(projectId), `${this.id(runId)}.lock`))
     try {
       const manifest = this.load(projectId, runId)
-      this.dependencies.authorize(projectId, 'execute', manifest.origin)
+      this.dependencies.authorize(projectId, 'cancel', manifest.origin)
       if (['succeeded', 'failed', 'cancelled'].includes(manifest.snapshot.phase)) return this.snapshot(manifest)
       if (!manifest.submission) {
         manifest.snapshot.phase = 'cancelled'
@@ -846,7 +846,8 @@ export class MediaRunService {
       if (originValue[actorField] === undefined) continue
       const actor = record(originValue[actorField])
       keys(actor, ['sessionId', 'runStartedAt', 'mode'], ['canvasId', 'nodeId'])
-      if (actor.mode !== 'project-agent' && actor.mode !== 'renderer-manual' && actor.mode !== 'parent-orchestrated') throw new Error('MEDIA_RUN_INVALID')
+      if (actor.mode !== 'project-agent' && actor.mode !== 'renderer-manual' && actor.mode !== 'parent-orchestrated'
+        && actor.mode !== 'canvas-orchestrator') throw new Error('MEDIA_RUN_INVALID')
       if ((actor.mode === 'project-agent') !== (actor.canvasId === undefined && actor.nodeId === undefined)
         || (actor.mode !== 'project-agent' && (actor.canvasId === undefined || actor.nodeId === undefined))) throw new Error('MEDIA_RUN_INVALID')
       origin[actorField] = { sessionId: identifier(actor.sessionId), runStartedAt: integer(actor.runStartedAt, 1), mode: actor.mode,

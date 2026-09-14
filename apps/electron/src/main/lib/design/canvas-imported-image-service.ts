@@ -7,6 +7,7 @@ import type {
   DesignPoint,
 } from '@proma/shared'
 import type { CanvasArtifactCreationService, CanvasArtifactCreationResult } from './canvas-artifact-creation'
+import { CanvasArtifactPreflightError } from './canvas-artifact-preflight'
 import type {
   DesignAssetImportBatch,
   DesignAssetService,
@@ -30,7 +31,7 @@ export interface CanvasImportedImageInput extends CanvasTarget {
 export interface CanvasImportedImageServiceDependencies {
   assets: Pick<DesignAssetService, 'importAuthorizedImageSources'>
   design: Pick<DesignStore, 'requireStableAuthoritativeDocument' | 'mutate'>
-  artifacts: Pick<CanvasArtifactCreationService, 'create'>
+  artifacts: Pick<CanvasArtifactCreationService, 'create' | 'validateCreate'>
   warn?: (message: string) => void
 }
 
@@ -78,6 +79,19 @@ export function createCanvasImportedImageService(
       let importedAsset: DesignAsset | undefined
       let metadataCommitted = false
       try {
+        /** 图片解码、文件 promotion 与元数据写入前先证明 Canvas 输入可创建。 */
+        dependencies.artifacts.validateCreate({
+          projectId: input.projectId,
+          canvasId: input.canvasId,
+          baseRevision: input.baseRevision,
+          artifactType: 'image',
+          title: input.title,
+          content: input.prompt?.trim() || '当前采用图片是创作参考素材；需要生成新版本前先补充明确提示词。',
+          ...(input.position ? { position: input.position } : {}),
+          ...(input.sourceNodeId ? { sourceNodeId: input.sourceNodeId } : {}),
+          ...(input.relation ? { relation: input.relation } : {}),
+          source: input.source,
+        })
         /** 恢复提升必须在图片解码和正式文件 promotion 前先阻断。 */
         const initialDesign = dependencies.design.requireStableAuthoritativeDocument(input.projectId)
         batch = await dependencies.assets.importAuthorizedImageSources(
@@ -125,7 +139,15 @@ export function createCanvasImportedImageService(
             warn(`Canvas 图片导入元数据回滚失败: ${String(cleanupError)}`)
           }
         }
-        batch?.rollback()
+        try {
+          batch?.rollback()
+        } catch (cleanupError) {
+          warn(`Canvas 图片导入文件回滚失败: ${String(cleanupError)}`)
+        }
+        /** promotion 开始后 rollback 只返回 void，无法证明磁盘清理完整，必须保留未知提交语义。 */
+        if (error instanceof CanvasArtifactPreflightError && batch) {
+          throw new Error('CANVAS_IMAGE_IMPORT_COMPENSATION_UNCERTAIN', { cause: error })
+        }
         throw error
       }
     },

@@ -104,6 +104,7 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       toolUseId: 'tool-artifact-1',
       result: JSON.stringify({
         canvasId: 'canvas-1', nodeId: 'node-1', revision: 4, artifactType: 'webview',
+        taskRegistration: { operationId: 'operation-1', status: 'completed' },
       }),
       isError: false,
     })
@@ -114,6 +115,50 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       selectedNodeId: 'node-1',
       selectedNodeIds: ['node-1'],
       expandedNodeId: 'node-1',
+    })
+    expect(store.get(activeTabIdAtom)).toBe('foreground-tab')
+    expect(store.get(currentAgentSessionIdAtom)).toBe('agent-foreground')
+    consumer.dispose()
+  })
+
+  test('Given 后台 Agent 导入图片且任务登记待对账 When 成功结果到达 Then 定位已创建节点且不抢当前焦点', () => {
+    const store = createStore()
+    store.set(activeTabIdAtom, 'foreground-tab')
+    store.set(currentAgentSessionIdAtom, 'agent-foreground')
+    store.set(agentSessionsAtom, [
+      { id: 'agent-foreground', title: '前台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+      { id: 'agent-background', title: '后台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
+    ])
+    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const viewKey = createAgentCanvasViewKey('agent-background', 'project-1', 'canvas-import')
+    store.set(initializeAgentCanvasViewStateAtom, {
+      key: viewKey,
+      viewport: { x: 10, y: 20, zoom: 0.8 },
+    })
+
+    consumer.handle('agent-background', {
+      type: 'tool_start', toolName: 'canvas_import_image', toolUseId: 'tool-import-1', input: {},
+    })
+    consumer.handle('agent-background', {
+      type: 'tool_result', toolUseId: 'tool-import-1', isError: false,
+      result: JSON.stringify({
+        canvasId: 'canvas-import', nodeId: 'image-1', revision: 8, artifactType: 'image',
+        sourceToolCallId: 'tool-import-1',
+        taskRegistration: {
+          operationId: 'operation-import-1',
+          status: 'pending',
+          reasonCode: 'CANVAS_TASK_CREATED_RESULT_UNCONFIRMED',
+          nextAction: {
+            tool: 'canvas_task', action: 'resume', canvasId: 'canvas-import', taskId: 'task-1',
+          },
+        },
+      }),
+    })
+
+    expect(store.get(agentCanvasViewStatesAtom).get(viewKey)).toMatchObject({
+      selectedNodeId: 'image-1',
+      selectedNodeIds: ['image-1'],
+      expandedNodeId: 'image-1',
     })
     expect(store.get(activeTabIdAtom)).toBe('foreground-tab')
     expect(store.get(currentAgentSessionIdAtom)).toBe('agent-foreground')

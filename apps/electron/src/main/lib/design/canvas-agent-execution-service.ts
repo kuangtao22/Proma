@@ -52,11 +52,20 @@ export interface CanvasParentOrchestratedAgentExecutionRequest {
   signal?: AbortSignal
   /** 父编排本轮审核范围；仅作为运行上下文，不改变画布关系或输入引用。 */
   reviewScope?: CanvasAgentReviewScope
+  /** 受管专业分派的身份，只由编排服务注入。 */
+  orchestration?: { id: string; stepId: string }
+}
+
+/** 专属编排运行复用 Headless 生命周期，但必须另行验证持久委托归属。 */
+export interface CanvasOrchestratorAgentExecutionRequest extends Omit<CanvasParentOrchestratedAgentExecutionRequest, 'mode' | 'orchestration'> {
+  mode: 'canvas-orchestrator'
+  orchestrationId: string
 }
 
 export type CanvasAgentExecutionRequest =
   | CanvasRendererManualAgentExecutionRequest
   | CanvasParentOrchestratedAgentExecutionRequest
+  | CanvasOrchestratorAgentExecutionRequest
 
 /** 统一运行只在合法成功时携带正式输出提交结果。 */
 export interface CanvasAgentExecutionResult {
@@ -159,6 +168,14 @@ export interface CanvasAgentExecutionServiceDependencies {
     target: CanvasAgentTarget
     parentSessionId: string
     startedAt: number
+  }) => void
+  /** 在启动临界区检查运行身份与持久委托，缺失时禁止编排运行。 */
+  validateOrchestrationAccess?: (input: {
+    target: CanvasAgentTarget; parentSessionId: string; orchestrationId: string; startedAt: number
+  }) => void
+  /** 专业分支必须属于当前编排者及未完成的指定步骤。 */
+  validateOrchestrationBranch?: (input: {
+    target: CanvasAgentTarget; parentSessionId: string; orchestrationId: string; stepId: string; startedAt: number; userMessageUuid: string
   }) => void
   getSession: (sessionId: string) => AgentSessionMeta | undefined
   configs: Pick<CanvasAgentConfigStore, 'load'>
@@ -267,7 +284,7 @@ export function createCanvasAgentExecutionService(
       const config = await dependencies.configs.load(request.target)
       const selectedSkillNames = [
         ...config.skillNames,
-        ...(request.mode === 'parent-orchestrated' ? request.skillNames ?? [] : []),
+        ...(request.mode !== 'renderer-manual' ? request.skillNames ?? [] : []),
       ]
       const skillSlugs = resolveSkillSlugs(selectedSkillNames, dependencies.getWorkspaceSkills(request.target.projectId))
       const key = targetKey(request.target)
@@ -277,7 +294,7 @@ export function createCanvasAgentExecutionService(
         if (currentSnapshot.nodeIssues.some((issue) => issue.nodeId === request.target.nodeId)) {
           throw new Error('CANVAS_AGENT_OWNER_INVALID')
         }
-        if (request.mode === 'parent-orchestrated') {
+        if (request.mode !== 'renderer-manual') {
           if (request.parentWorkflow
             && request.parentWorkflow.parentSessionId !== request.parentSessionId) {
             throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
@@ -290,6 +307,16 @@ export function createCanvasAgentExecutionService(
             parentSessionId: request.parentSessionId,
             startedAt: request.startedAt,
           })
+          if (request.mode === 'canvas-orchestrator') {
+            if (!dependencies.validateOrchestrationAccess) throw new Error('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+            dependencies.validateOrchestrationAccess({ target: request.target, parentSessionId: request.parentSessionId,
+              orchestrationId: request.orchestrationId, startedAt: request.startedAt })
+          } else if (request.orchestration) {
+            if (!dependencies.validateOrchestrationBranch) throw new Error('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+            dependencies.validateOrchestrationBranch({ target: request.target, parentSessionId: request.parentSessionId,
+              orchestrationId: request.orchestration.id, stepId: request.orchestration.stepId,
+              startedAt: request.startedAt, userMessageUuid: request.userMessageUuid })
+          }
         }
         const currentOwner = requireCanvasAgentRunOwner({
           target: request.target,
@@ -314,7 +341,7 @@ export function createCanvasAgentExecutionService(
         const runGeneration = previous?.sessionId === currentOwner.session.id ? previous.generation + 1 : 1
         const inputReferences = listCanvasAgentBoundInputReferences(currentSnapshot.document, currentOwner.node.id)
         /** 在最终权威图解析审核范围，保留直接输入的原有语义。 */
-        const reviewContext: CanvasAgentReviewContext | undefined = request.mode === 'parent-orchestrated' && request.reviewScope
+        const reviewContext: CanvasAgentReviewContext | undefined = request.mode !== 'renderer-manual' && request.reviewScope
           ? resolveCanvasAgentReviewContext(currentSnapshot.document, currentOwner.node.id, request.reviewScope)
           : undefined
         const canvasRun = dependencies.createCanvasRun({
@@ -328,6 +355,11 @@ export function createCanvasAgentExecutionService(
             : {}),
           canvasAgentTarget: request.target,
           canvasAgentMode: request.mode,
+          ...(request.mode === 'canvas-orchestrator' ? { canvasOrchestrationId: request.orchestrationId } : {}),
+          ...(request.mode === 'parent-orchestrated' && request.orchestration
+            ? { canvasOrchestrationId: request.orchestration.id, canvasOrchestrationStepId: request.orchestration.stepId,
+              canvasOrchestrationParentSessionId: request.parentSessionId,
+              canvasOrchestrationUserMessageUuid: request.userMessageUuid } : {}),
           ...(reviewContext ? { reviewContext } : {}),
           ...(request.mode === 'parent-orchestrated' && request.parentWorkflow
             ? { parentWorkflow: request.parentWorkflow }
@@ -370,7 +402,7 @@ export function createCanvasAgentExecutionService(
         ownsLiveChild = false
       }
       const onAbort = (): void => {
-        if (request.mode !== 'parent-orchestrated' || !ownsLiveChild) return
+        if (request.mode === 'renderer-manual' || !ownsLiveChild) return
         terminalStatus = 'cancelled'
         ownsLiveChild = false
         dependencies.stopOwnedAgent({ sessionId: currentOwner.session.id, startedAt: request.startedAt })
@@ -379,8 +411,8 @@ export function createCanvasAgentExecutionService(
         unsubscribeStopped = dependencies.subscribeStopped(currentOwner.session.id, request.startedAt, () => {
           setTerminalStatus('cancelled')
         })
-        if (request.mode === 'parent-orchestrated') request.signal?.addEventListener('abort', onAbort, { once: true })
-        if (request.mode === 'parent-orchestrated' && request.signal?.aborted) {
+        if (request.mode !== 'renderer-manual') request.signal?.addEventListener('abort', onAbort, { once: true })
+        if (request.mode !== 'renderer-manual' && request.signal?.aborted) {
           terminalStatus = 'cancelled'
           /** 取消回执只保留本轮已取得的内存覆盖，不发起额外读取。 */
           const reviewCoverage = canvasRun?.getReviewCoverage?.()
@@ -449,7 +481,7 @@ export function createCanvasAgentExecutionService(
         }
       } finally {
         ownsLiveChild = false
-        if (request.mode === 'parent-orchestrated') request.signal?.removeEventListener('abort', onAbort)
+        if (request.mode !== 'renderer-manual') request.signal?.removeEventListener('abort', onAbort)
         unsubscribeStopped()
         releaseStart()
         dependencies.outputs.releaseGeneration({

@@ -431,6 +431,11 @@ export function createCanvasImageRunService(
           }
         }
 
+        /** 全部配置预检成功后才扣编排额度；重复同一批次沿用原持久预留。 */
+        if (context.reserveMediaRuns) {
+          if (options?.signal.aborted) throw new Error('CANVAS_IMAGE_RUN_ABORTED')
+          context.reserveMediaRuns(candidateBatchId, prepared.length)
+        }
         /** 已建立 journal 的任务及其本轮创建归属。 */
         const jobs: Array<{
           node: Extract<CanvasNode, { kind: 'image' }>

@@ -76,7 +76,7 @@ async function executeTool(
 }
 
 describe('远端工作流直接使用与运行准备集成', () => {
-  test('Given 画布绑定连接和真实 UI 工作流 When 直接使用 Then 自动快照可复用且卡片字段与任务恢复保持完整', async () => {
+  test.each(['gpu', null])('Given 画布连接为 %s 且仅一台启用服务器 When 直接使用真实 UI 工作流 Then 自动快照可复用且任务身份固定', async (canvasConnection) => {
     /** 隔离的真实 MediaConfigStore 数据根。 */
     const root = mkdtempSync(join(tmpdir(), 'proma-remote-workflow-integration-'))
     temporaryDirectories.push(root)
@@ -168,12 +168,24 @@ describe('远端工作流直接使用与运行准备集成', () => {
       listAssets: async () => [],
       registerRemoteAsset: async () => asset,
       listModels: async () => [],
-      getCanvasConnection: (_runContext, canvasId) => canvasId === 'canvas-1' ? 'gpu' : null,
+      getCanvasConnection: (_runContext, canvasId) => {
+        expect(canvasId).toBe('canvas-1')
+        return canvasConnection
+      },
     }
     /** 当前轮媒体工具集合。 */
     const toolRun = createMediaToolRun(dependencies, context)
 
-    /** 首次发现省略 connectionId，仅依赖可信画布绑定。 */
+    /** 未绑定与已有绑定都能返回本次有效连接，但只读发现不会保存用户偏好。 */
+    const catalog = await executeTool(toolRun.piCustomTools, 'media_list_workflows', { canvasId: 'canvas-1' }, 'catalog')
+    expect(catalog.details).toMatchObject({
+      selectedConnection: canvasConnection ? { id: 'gpu', name: '画布 GPU', enabled: true } : null,
+      connectionStatus: canvasConnection ? 'available' : 'unbound',
+      effectiveConnection: { id: 'gpu', name: '画布 GPU', enabled: true },
+      connectionSource: canvasConnection ? 'canvas-binding' : 'single-enabled',
+    })
+    expect(configuration.read().revision).toBe(1)
+    /** 首次发现省略 connectionId，解析可信绑定或唯一启用服务器。 */
     const firstDiscovery = await executeTool(toolRun.piCustomTools, 'media_discover_workflows', {
       canvasId: 'canvas-1', mediaKind: 'image', inputKinds: ['image'], limit: 6,
     }, 'discover-1')

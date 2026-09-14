@@ -98,6 +98,33 @@ describe('Canvas 任务状态存储', () => {
     expect(fixture.writes).toEqual([fixture.projectId])
   })
 
+  test('Given pending、completed和rejected回执已保存 When 进程重启读取 Then 三种状态均保持兼容', () => {
+    const fixture = createFixture()
+    const target = { projectId: fixture.projectId, canvasId: fixture.canvasId, sessionId: 'session-receipts' }
+    const state = workingState('task-receipts', fixture.canvasId)
+    state.operationReceipts = [
+      {
+        status: 'pending', operationId: 'pending-create', sourceToolCallId: 'tool-pending', startedAt: 1,
+        taskId: state.taskId, canvasId: fixture.canvasId, kind: 'created',
+      },
+      {
+        status: 'completed', operationId: 'completed-create', sourceToolCallId: 'tool-completed', startedAt: 2,
+        taskId: state.taskId, canvasId: fixture.canvasId, kind: 'created', nodeId: 'created-doc', nodeKind: 'document',
+        after: {
+          canvasId: fixture.canvasId, nodeId: 'created-doc', nodeKind: 'document',
+          validation: 'content', identity: 'revision-1',
+        },
+      },
+      {
+        status: 'rejected', operationId: 'rejected-create', sourceToolCallId: 'tool-rejected', startedAt: 3,
+        taskId: state.taskId, canvasId: fixture.canvasId, kind: 'created', reasonCode: 'SOURCE_NODE_REQUIRED',
+      },
+    ]
+
+    fixture.store.save(target, 0, state)
+    expect(fixture.store.getActive(target)?.state.operationReceipts).toEqual(state.operationReceipts)
+  })
+
   test('Given 已有未完成任务 When 以旧revision保存另一任务 Then 不覆盖且并发CAS失败', () => {
     const fixture = createFixture()
     const target = { projectId: fixture.projectId, canvasId: fixture.canvasId, sessionId: 'session-one' }

@@ -15,6 +15,8 @@ import type {
 export interface MediaRunProgressProjection {
   phase: MediaRunPhase | 'pending'
   phaseLabel: string
+  /** 已采用输出只表示卡片已有可用素材，不等同于人工或视觉验收通过。 */
+  hasAdoptedOutput?: boolean
   /** Comfy 只提供当前节点采样计数，不能解释为整体任务百分比。 */
   nodeProgressLabel?: string
   /** 折叠卡片仅汇总本地配置与连接事实，不宣称已完成运行前校验。 */
@@ -145,13 +147,24 @@ export function createCanvasMediaNodeProgressController(
       const run = selectCanvasMediaNodeRun(runs)
       /** 配置摘要只来自已有模块 LOAD，不为卡片状态额外请求服务器。 */
       const configuration = configurationByNodeId.get(nodeId)
+      /** adoptedOutputs 是素材事实；它与当前是否存在远端生成任务相互独立。 */
+      const hasAdoptedOutput = (configuration?.adoptedOutputs.length ?? 0) > 0
       if (run && isActiveMediaRun(run)) progress.set(nodeId, projectMediaRunProgress(run))
+      else if (hasAdoptedOutput && run) progress.set(nodeId, projectMediaRunProgress(run))
+      else if (hasAdoptedOutput) progress.set(nodeId, {
+        phase: 'pending', phaseLabel: '已有素材',
+        ...(configuration?.preparation
+          ? { nodeProgressLabel: `${configuration.preparation.code} · ${configuration.preparation.message}` }
+          : {}),
+      })
       else if (configuration?.preparation) progress.set(nodeId, {
         phase: 'pending', phaseLabel: '待配置',
         nodeProgressLabel: `${configuration.preparation.code} · ${configuration.preparation.message}`,
       })
       else if (run) progress.set(nodeId, projectMediaRunProgress(run))
       else progress.set(nodeId, { phase: 'pending', phaseLabel: configuration?.profile || configuration?.workflow ? '参数待检查' : '待配置' })
+      /** 素材标记附加在运行投影上，使新任务失败时仍保留旧素材可用事实。 */
+      if (hasAdoptedOutput) progress.set(nodeId, { ...progress.get(nodeId)!, hasAdoptedOutput: true })
       if (configuration && inspectConnections) {
         /** 只有精确目标仍属于当前图，才向顶部汇总可恢复准备状态。 */
         const target = targetsByNodeId.get(nodeId)

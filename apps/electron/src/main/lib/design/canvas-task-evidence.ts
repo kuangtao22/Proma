@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto'
 import type { CanvasNode } from '@proma/shared'
 import type { CanvasToolProviderDependencies } from './canvas-tool-provider'
 import type { CanvasTaskAbsentArtifact, CanvasTaskEvidence } from './canvas-task-contract'
+import { hasCanvasTextArtifactContent } from './canvas-text-artifact-content'
+
+/** 版本复验只依赖正式读取能力，可由 Provider 与编排 Host 共用。 */
+export type CanvasTaskEvidenceDependencies = Pick<CanvasToolProviderDependencies, 'textArtifacts' | 'agentConfigs' | 'agentOutputs' | 'images' | 'canvasMedia'>
 
 /** 将真实版本事实压成无正文、无路径的证据身份。 */
 export function createCanvasTaskEvidence(
@@ -13,7 +17,7 @@ export function createCanvasTaskEvidence(
 
 /** 按精确节点和已签发维度复读证据；调用方负责前后复验作用域与图版本。 */
 async function resolveCanvasTaskFact(
-  dependencies: CanvasToolProviderDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
+  dependencies: CanvasTaskEvidenceDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
   /** 仅任务启动基线可记录确定的空产物；完成证据始终要求真实交付。 */
   allowAbsent = false,
 ): Promise<CanvasTaskEvidence | CanvasTaskAbsentArtifact | undefined> {
@@ -27,9 +31,10 @@ async function resolveCanvasTaskFact(
   if (node.kind === 'document' || node.kind === 'webview') {
     const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
     if (proof.validation !== 'content') return undefined
-    if (node.contentRevision < 1) return allowAbsent && node.contentRevision === 0 ? absent() : undefined
+    /** 初始 revision 0 也可能包含正式正文，先通过权威服务复验身份及内容。 */
     const snapshot = await dependencies.textArtifacts.read({ ...target, kind: node.kind, contentId, contentRevision: node.contentRevision })
-    return snapshot.content.trim() ? create([contentId, node.contentRevision, snapshot.content]) : undefined
+    if (hasCanvasTextArtifactContent(node.kind, snapshot.content)) return create([contentId, node.contentRevision, snapshot.content])
+    return allowAbsent && node.contentRevision === 0 ? absent() : undefined
   }
   if (node.kind === 'agent') {
     if (proof.validation === 'configuration') {
@@ -72,7 +77,7 @@ async function resolveCanvasTaskFact(
 
 /** 完成验收只返回真实产物；即使空状态合法，也不能签发交付证据。 */
 export async function resolveCanvasTaskEvidence(
-  dependencies: CanvasToolProviderDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
+  dependencies: CanvasTaskEvidenceDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
 ): Promise<CanvasTaskEvidence | undefined> {
   const fact = await resolveCanvasTaskFact(dependencies, projectId, node, proof)
   return fact && !('absent' in fact) ? fact : undefined
@@ -80,7 +85,7 @@ export async function resolveCanvasTaskEvidence(
 
 /** 启动时区分空草稿与读取故障，使同一节点可从未交付推进到首次正式产物。 */
 export function resolveCanvasTaskBaseline(
-  dependencies: CanvasToolProviderDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
+  dependencies: CanvasTaskEvidenceDependencies, projectId: string, node: CanvasNode, proof: CanvasTaskEvidence,
 ): Promise<CanvasTaskEvidence | CanvasTaskAbsentArtifact | undefined> {
   return resolveCanvasTaskFact(dependencies, projectId, node, proof, true)
 }

@@ -2,7 +2,7 @@
 name: canvas-production
 description: Proma 画布生产与 Agent 编排 Skill。用户希望创建、迭代或评审网页原型、图片设计稿、文档、产品套图、整套交互视觉稿、漫剧分镜、多镜头视频、音视频剪辑、程序规划或其他需要多个可关联产物的任务时使用。根据用途选择制作模式、安排专业 Agent、评审方案与实际产物，并通过 Proma 内置 canvas_* 工具执行；普通代码修改、一次性文本回答或不需要长期产物图的任务不要强行转入画布。
 group: proma
-version: "1.0.31"
+version: "1.0.36"
 ---
 
 # 画布生产
@@ -44,9 +44,19 @@ version: "1.0.31"
 
 ## 普通 Agent 与 Canvas Agent
 
-普通 Agent 负责跨画布选择和整体编排；当前会话位于 Canvas Agent 节点时，画布身份已经由系统固定，只处理自身画布中的当前分支。
+普通 Agent 负责跨画布选择、用户沟通和目标约束。跨专业、跨阶段且需要长期产物的任务，在实际提供 `canvas_delegate` 时交给画布专属编排 Agent；同一活动委托只由画布编排者维护流程。其它普通任务沿原工具完成。当前会话位于 Canvas Agent 节点时，画布身份由系统固定，能力取决于 Host 签发的运行角色，不能依据节点标题自行升级。
 
-任务需要独立角色长期承接分镜、视觉、文案或其它分支时，普通 Agent 自行调用 `canvas_create_agent` 创建 Canvas Agent 节点，并根据真实输入建立关系；不得声称没有创建能力，也不得把这一步转交给用户手工完成。当前会话位于 Canvas Agent 节点时，不再创建下级 Agent，由当前 Canvas Agent 直接完成自身分支。
+委托前用 `canvas_get_orchestration` 查询原任务；首次提交稳定 requestId、完整目标、约束、参考节点和最终交付物，后续通过 `canvas_resume_orchestration` 沿同一委托继续，停止用 `canvas_cancel_orchestration`。用户对活动任务补充校正时，在恢复调用中提交稳定 `followUp.id`、查询所得当前 `expectedRevision` 和完整 `instruction`；不能改写原 request，也不能再次 `canvas_delegate`。相同 followUp 重放复用原状态和执行预算；明确 failed 后使用新 followUp ID 重试。返回 started 时先查询 `followUps` 原文与状态；只有确认原执行已停止且委托为 blocked，才能用新 ID 的 `supersedesId` 指向旧尝试，Host 会保留旧 UUID 和额度并把它标为 abandoned，不能无条件换 ID 重发。design 只准备设计与配置；produce/revise 允许在当前媒体授权策略内执行；纯只读评审不创建委托或报告。委托后普通 Agent 不同时修改同一画布流程。
+
+画布编排者先读取原委托与 `canvas_get_context` 的 requiredDeliverables，沿同一 taskId 建立或恢复最终交付合同。用 `canvas_update_plan` 维护完整专业阶段，再用 `canvas_dispatch` 运行依赖已通过的步骤。每步包含职责、工作、输入、依赖、真实输出映射和验收标准；未来产物先留在计划里，不用空卡片冒充已经完成的工作。专业产物返回 needs-review 后读取真实内容，调用 `canvas_review_step` 评审；通过后才推进依赖阶段。阶段完成、媒体生成、采用和质量验收分别判断，最终先 `canvas_task complete` 再 `canvas_finish_orchestration`。
+
+视频按缺口组织创意与导演统筹、脚本设计、镜头/转场、美术、声音、素材制作、剪辑和视听验收；UI 按用户任务、信息结构、交互流程/状态、视觉、原型和交互验证组织；策划、计划、业务流程按目标、资源、里程碑、决策、异常和交接安排专业阶段。不要强制套齐所有角色，复用有效版本并局部重审。计划、专业分工、产物关系、执行依赖和评审反馈独立表达，反馈不能直接连成执行依赖环。
+
+专业分支的写入限制在当前步骤产物，新增产物由 Host 依据真实创建来源登记。分支不再次调度 Agent，不启动媒体；编排者通过 `canvas_run_nodes` 执行精确媒体节点并负责查询、检查与采用。旧整图工作流从 Agent 起点递归运行，专属编排使用受管分派入口，不借它绕过阶段或预算。预算与创建回执持久保存，重复请求复用原任务，取消后迟到结果不能推进旧计划。恢复先对账，未知结果不能作为重新生成理由。
+
+后台编排和专业节点不会因角色变化自动获得 Shell 或浏览器交互。当前缺少完整音视频感知、原型实际交互验证或本地后期能力时，记录具体缺口并保持未验收；不能声称新增专业 Agent 已经补齐这些执行能力。最终音视频交付保留 full 标准，抽样只能支持 sampled。等待状态不会让模型常驻空转，也不承诺尚未提供的自动模型唤醒。
+
+任务尚未委托且只需一个独立角色长期承接分镜、视觉、文案或其它分支时，普通 Agent 自行调用 `canvas_create_agent` 创建 Canvas Agent 节点，并根据真实输入建立关系；不得声称没有创建能力，也不得把这一步转交给用户手工完成。普通专业 Canvas Agent 不再创建下级 Agent；专属编排者仅通过 `canvas_dispatch` 受管分派。
 
 普通 Agent 先用 `canvas_read` 读取 Canvas Agent 的 `artifact.config` 与 `artifact.configRevision`，再用 `canvas_update_agent_config` 局部更新长期职责、模型和已安装的专业 Skill；`expectedGraphRevision` 使用读取结果的顶层 `revision`，`expectedConfigRevision` 使用 `artifact.configRevision`。配置因响应预算被省略而返回 `configOmitted` 时，缩小到单个节点重新读取，不猜测旧配置或版本。需要专业分工时，优先复用用户已启用且与任务匹配的 Skill；Skill 负责方法和领域质量，节点关系、运行权限与正式产物仍由 Host 合同控制。
 
@@ -119,7 +129,7 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 4. 每轮修改后重新读取实际产物和版本，复核受影响下游。图片按精确任务版本读取真实缩略图；音视频的 `metadataOnly`、WebView 源码或“任务成功”均不能替代实际内容、交互验收。没有可用内容分析能力时明确标记未复核，不宣称全部通过。
 5. 默认最多两轮自动修复，每轮只处理仍有证据的问题；达到上限后列出剩余错误与阻塞原因，不重复相同操作。已有工作流沿用原运行身份、原工作流预算和停止状态，不能通过新建运行重置预算；预算耗尽需按已有授权范围扩额，否则报告等待授权。提交结果未知、远端仍运行或待补收输出时只能查询原任务，不能再次提交生成。两轮是 Agent 编排规则，实际费用与作用域限制仍由 Host 执行。
 
-严格约束或再次失败时，按[制作精度与自主恢复](references/production-recovery.md)分别检查输入、制作能力和验收方法。每次内容修复说明新的依据与输入变化；工作流图片通过原 `canvas_resume_workflow` 定向重试，不能用独立重试绕开预算。恢复工具支持 `expectedRunRevision`、`resumeOperationId`、`retryNodeIds` 与预算追加，沿用同一次恢复身份；正数扩额需要确认。`canvas_run_agent` 的 `nodeTitle`、`failure` 与 `nextAction` 表示实际执行节点及诊断，先读取原节点再决定续做，不因另一个旧节点报错而重建当前工作。
+持久委托内沿 `canvas_resume_orchestration` 继续；专业步骤走 `canvas_dispatch`，媒体走 `canvas_run_nodes`，不使用旧整图恢复或未提供的固定快照重试入口。以下整图恢复规则仅用于未采用持久委托的已有工作流。严格约束或再次失败时，按[制作精度与自主恢复](references/production-recovery.md)分别检查输入、制作能力和验收方法。每次内容修复说明新的依据与输入变化；工作流图片通过原 `canvas_resume_workflow` 定向重试，不能用独立重试绕开预算。恢复工具支持 `expectedRunRevision`、`resumeOperationId`、`retryNodeIds` 与预算追加，沿用同一次恢复身份；正数扩额需要确认。`canvas_run_agent` 的 `nodeTitle`、`failure` 与 `nextAction` 表示实际执行节点及诊断，先读取原节点再决定续做，不因另一个旧节点报错而重建当前工作。
 
 结束时汇报检查范围、已修复节点及实际复核结果、未复核节点与具体原因；新建成功、配置保存或生成完成不能单独作为内容验收结论。
 
@@ -129,7 +139,7 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 
 复杂生产、视频制作或工作流适配评审时，先读取 [制作模式与评审合同](references/production-review.md)，给出推荐模式、依据和对用户的影响。然后根据实际可用模型/工作流选择生成模式，核对输入角色、输出、时长和素材要求；首尾帧驱动只是选项，不能把所有视频都变成首尾帧串联。已有工作流不适配时先解释缺口与替代办法，保留仍适用的节点和素材。
 
-只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演。创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议，不调用执行工具，也不声称已保存或运行导演。用户已授权规划、制作或修复多镜头视频，且缺少适用于当前目标和素材版本的方案时，由普通 Agent 创建或复用导演 Canvas Agent，用 `canvas_run_agent` 单独完成或更新方案，再读取真实正文并评审；不要把未经评审的规划起点直接交给会自动推进下游的工作流。导演明确镜头、衔接、首尾帧来源、资产、图片/视频/声音提示词和验收标准，主 Agent 统一安排生成。固定分支 Agent 直接完成自身职责，不递归创建导演或调度其它 Agent。
+只评审时不创建或运行导演；已有当前有效方案时直接读取评审，不重跑导演。创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议，不调用执行工具，也不声称已保存或运行导演。在尚未采用持久委托的单项路径，用户已授权规划、制作或修复多镜头视频，且缺少适用于当前目标和素材版本的方案时，由普通 Agent 创建或复用导演 Canvas Agent，用 `canvas_run_agent` 单独完成或更新方案，再读取真实正文并评审；不要把未经评审的规划起点直接交给会自动推进下游的工作流。导演明确镜头、衔接、首尾帧来源、资产、图片/视频/声音提示词和验收标准，主 Agent 统一安排生成。固定分支 Agent 直接完成自身职责，不递归创建导演或调度其它 Agent。
 
 导演首次接管已有视频，主 Agent 先分页枚举全部节点类型，以真实内容划定本任务范围，包括漏连和孤立节点。整张画布属于本视频时，`canvas_run_agent` 传 `reviewScope: {mode: "canvas"}`；混合任务或局部复核传 `reviewScope: {mode: "nodes", nodeIds: [...]}`。首次前置导演时用 `positionBeforeNodeIds` 指定制作节点，需求和参考资产仍可在导演之前；该参数只移动导演，不为审核添加执行依赖或重排其它节点。返回的 `reviewCoverage` 必须核对未读、失败、截断与缺边，方案逐节点记录检查版本、依据、问题及修复建议。已有有效方案只缺覆盖时由主 Agent 补读，不因此重跑导演。后续局部复核根据变更、真实依赖和镜头连续性确定范围，不重复检查和生成未受影响节点。完整操作与范围上限见制作模式与评审合同。
 
@@ -170,7 +180,7 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 
 准备请求时，任务 trace 中的“图片请求已准备”只能证明 Proma 已按顺序整理出 `assetId`、`hash` 和图片数量；它不代表远端服务已经收到、接受或开始处理图片。生成后仍须按原 `jobId` 查询并检查精确候选版本。无 `mask` 的编辑不能保证局部锁定；提示词可约束意图，但必须查看真实输出，不能把未改变的局部当作已保证的模型合同。
 
-优化与原快照重试是两类操作：优化会修改提示词、图源、配置或输入，必须保存新配置并作为新请求运行；用户要求重试原任务时使用 `canvas_retry_task`；即使当前节点配置或连线已改变，重试仍沿用原任务快照。要让新配置生效，必须创建新请求。不得在修改后把新请求描述为原快照重试，也不得用重试覆盖尚待验收的候选。
+优化与原快照重试是两类操作：优化会修改提示词、图源、配置或输入，必须保存新配置并作为新请求运行；未采用持久委托且工具可用时，用户要求重试原任务使用 `canvas_retry_task`；即使当前节点配置或连线已改变，重试仍沿用原任务快照。要让新配置生效，必须创建新请求。不得在修改后把新请求描述为原快照重试，也不得用重试覆盖尚待验收的候选。
 
 母版与成对帧必须使用同一份清单并排验收：卡槽适配、道具、机位、构图和手位。先检查母版；母版不合格时先不扩散到成对帧或其它衍生节点，修复并复核母版后再继续下游生成或采用。
 
@@ -182,11 +192,11 @@ Canvas Agent 开始任务时，先通过 `canvas_get_context` 获取直接输入
 
 WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存正式内容后即可作为下游输入。不要为 WebView 调用 `canvas_run_nodes`，也不要把文档或 WebView 当成模型执行步骤。
 
-普通 Agent 只需要执行一个专业分支时，使用 `canvas_run_agent`，传入当前 graph revision 和明确的本轮任务。该工具只运行一个 Canvas Agent，不会自动推进下游；需要继续其它节点时，由普通 Agent 根据用户意图再次显式运行。
+任务尚未委托且普通 Agent 只需要执行一个专业分支时，使用 `canvas_run_agent`，传入当前 graph revision 和明确的本轮任务。该工具只运行一个 Canvas Agent，不会自动推进下游；需要继续其它节点时，由普通 Agent 根据用户意图再次显式运行。
 
 批量生产前先完成 2.3 的模式适配与方案评审，并检查当前阶段所需输入。导演方案通过后，生成仍按资产、镜头、后期等阶段推进；下一阶段需要的真实素材未验收时不得提前启动。评审记录过期时重新读取当前版本，不能用旧结论放行。
 
-用户明确要求执行整套画布方案时，优先使用 `canvas_run_workflow`，从一个或多个 Agent 起点仅运行指定起点可达的下游。不能仅因为存在连线就自动运行，也不能把同一画布的无关分支纳入本次执行。工作流中的 Canvas Agent 不能递归运行其它 Agent 或工作流。
+在尚未采用持久委托的既有执行图中，用户明确要求执行整套画布方案时，优先使用 `canvas_run_workflow`，从一个或多个 Agent 起点仅运行指定起点可达的下游。不能仅因为存在连线就自动运行，也不能把同一画布的无关分支纳入本次执行。工作流中的 Canvas Agent 不能递归运行其它 Agent 或工作流。
 
 `canvas_run_workflow` 的 `maxImageRuns` 是图片、音频、视频共用的本次媒体生成次数上限，实际运行不得超过 `maxImageRuns`。图片节点首次成功且仍无默认素材、配置未变时，Host 会将第一份成功素材设为默认；已有默认素材的后续生成继续保留候选。工作流不会因默认素材变化自行续跑，必须按原运行的状态和用户继续指令推进；不得用旧正式图片假装新结果继续下游，也不重复运行已经满足且未变更的节点。
 
@@ -214,7 +224,7 @@ WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存
 
 生成授权以 `media_list_workflows` / `media_discover_workflows` 回执中的 `authorizationMode` 为准：`ask` 表示每次确认；`automatic` 表示用户已将当前任务的媒体生产交给 Agent，可连续选型、配置、生成、检查与采用合适候选后继续，不对已授权的常规步骤反复询问。自主模式也允许在确认远端无适用工作流后，按服务器实际资源新建并保存本地；它不允许超出当前任务和预算、忽略停止要求、重复提交未知结果的任务或虚构内容验收。未读取策略时先查询，不能仅凭会话的完全自动模式推断媒体授权。
 
-1. 用 `media_list_api_models` 查询当前画布允许的可执行 API 模型，用 `media_list_workflows(canvasId)` 读取画布绑定的 ComfyUI 服务和本地工作流。普通 Agent 传入当前画布 ID，画布 Agent 自动使用固定画布。服务器未绑定或失效时让用户在画布顶部选择；不擅自修改绑定，也不默认选择第一台服务器。API 模型列表为空不表示 ComfyUI 没有工作流。
+1. 用 `media_list_api_models` 查询当前画布允许的可执行 API 模型，用 `media_list_workflows(canvasId)` 读取画布默认绑定、本次有效 ComfyUI 服务和本地工作流。普通 Agent 传入当前画布 ID，画布 Agent 自动使用固定画布。`selectedConnection` / `connectionStatus` 只表示用户默认绑定，查询与配置应同时看 `effectiveConnection` 和 `connectionSource`：未绑定且仅一台启用服务器时，Host 返回 `single-enabled`，直接发现工作流即可，不必让用户手动绑定，也不写入画布默认绑定。已有绑定失效、没有启用服务器或多台候选且用户未明确选择时，再让用户在画布顶部选择或修复；不能按目录顺序猜第一台。显式 `connectionId` 优先于默认绑定，已有节点与已准备任务继续使用固定的原连接。API 模型列表为空不表示 ComfyUI 没有工作流。
 2. 新任务优先查看绑定 ComfyUI 服务器的工作流，除用户明确指定本地模板或恢复原任务外，先调用 `media_discover_workflows`，提供输出 `mediaKind` 和实际素材 `inputKinds`（例如首尾两帧为两项 image），按页检查候选。目录与正文复用资源快照，只有明确需要更新时使用 `refresh=true`。结合节点标题、输入、连接及输出核实首尾帧等语义角色，数量匹配不能替代语义判断。UI 格式先尝试已有转换器；无法转换时报告具体节点、控件或连接问题。选定候选后原样传入 `descriptor`、`contentHash` 到 `media_use_remote_workflow` 直接使用，Host 自动保存内部执行快照，无需用户导入、创建或发布本地模板，也不要另存项目草稿。内容变化时重新发现与核查。需要深入检查时使用 `media_read_remote_workflow` / `media_get_node_schema`。
    完整目录仍无匹配时说明缺口：`ask` 模式先询问是否根据当前服务器已有模型和节点生成工作流并保存本地，等待明确同意后传 `creationIntent=user-confirmed`；`automatic` 模式可直接新建，传 `creationIntent=automatic-policy`，Host 会复核最新设置，无需再次询问。分页未完成、名称筛选无结果、读取失败、同步失败、转换失败均不能当作服务器没有匹配；继续分页、清除筛选或报告具体问题。两种模式都用 `media_list_resources` 查询实际 `models`/`nodes`，用 `media_get_node_schema`、`media_inspect_workflow` 校验真实接口、模型枚举、连线及输出，最后调用 `media_save_local_workflow` 保存可跨项目复用的本地模板。不得虚构模型或节点，保存不等于生成成功。
 3. 用 `media_inspect_workflow` 检查缺失参数，用 `media_match_assets` 匹配项目素材。用户附件通过 `media_list_sources` / `media_import_assets` 导入，本地 Shell/Skill 的明确产物通过 `media_import_local_file` 导入。上传和远端素材标识填充由 prepare 链路完成，不猜测远端文件名。
@@ -238,7 +248,7 @@ WebView 创建后即可预览，文档和 WebView 不需要单独运行；保存
 
 成功后读取该任务的精确候选图片并复核，已有采用授权时按原范围采用并继续后续步骤；没有采用授权时保留候选并说明待验收，不能默认宣称“不会自动采用”而忽略已有自主授权。失败则报告任务的实际错误、失败模型与阶段，保留当前卡片和旧素材。例如 `503 / No available compatible accounts` 表示生图渠道暂时没有可用兼容账号，不能解释成提示词错误、图片损坏或 ComfyUI 工作流错误，也不能通过修改画布结构解决；用户已要求的一次重试结束后仍失败，就报告渠道阻塞，不无上限重试。若任务只返回“没有可验证图片”，应说明缺少可用输出证据，不能编造具体服务原因。
 
-产物历史统一先用 `canvas_list_versions` 分页发现精确版本。文档和 WebView 历史正文使用 `canvas_read_version`；图片版本继续使用 `canvas_inspect_images` 看真实缩略图。用户明确选择单个版本或已授权本任务自主检查采用时，用 `canvas_adopt_version` 采用实际核对过的版本，并使用读取结果中的 Canvas revision 与版本 revision；整批采用还须符合任务的批次范围与混合版本约定，再用 `canvas_adopt_candidate_batch`。不能把“读取过”解释为允许采用。
+产物历史统一先用 `canvas_list_versions` 分页发现精确版本。文档和 WebView 的 `revision=0` 是真实初始版本：列表会返回 `initial` 与 `contentState`，`present` 表示有初始正文，`empty` 才表示当前为空；历史数组为空不能单独证明正文丢失。跟随返回的 `nextAction` 使用 `canvas_read` 读取初始正文和内容证据，正式历史正文再使用 `canvas_read_version`；读取错误须保留 unknown，不能沿旧阻塞结论判断损坏。图片版本继续使用 `canvas_inspect_images` 看真实缩略图。用户明确选择单个版本或已授权本任务自主检查采用时，用 `canvas_adopt_version` 采用实际核对过的版本，并使用读取结果中的 Canvas revision 与版本 revision；整批采用还须符合任务的批次范围与混合版本约定，再用 `canvas_adopt_candidate_batch`。不能把“读取过”解释为允许采用。
 
 导出精确版本使用 `canvas_export_artifact`。单项导出可指定项目内相对文件；批量导出最多十六项，只选择一次项目内相对目录或外部目录，并逐项核对 `saved`、`failed`、`cancelled` 结果。项目外选择窗口只适用于当前可见交互会话，后台运行不能借用其它窗口。覆盖已有文件需要明确 `overwrite`，历史版本不可用时不得改导当前版本；相同工具调用重放必须复用原结果，不再次弹窗或重复写文件。
 

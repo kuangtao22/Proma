@@ -18,12 +18,15 @@ import {
   createCanvasLayoutSpatialIndex,
   findCompactCanvasSlot,
   parseCanvasBatchOperationEnvelope,
+  CANVAS_IMAGE_NODE_WIDTH,
+  CANVAS_IMAGE_NODE_MAX_HEIGHT,
 } from '@proma/shared'
 import type { CanvasBatchOperationResult } from './canvas-agent-batch-operation'
 import type {
   CanvasNodeContentStore,
   PrepareCanvasArtifactContentInput,
 } from './canvas-node-content-store'
+import { throwCanvasArtifactPreflightError } from './canvas-artifact-preflight'
 
 /** Agent 可原子创建的画布产物类型；音视频先创建空媒体模块，再单独保存工作流配置。 */
 export type CanvasArtifactType = 'document' | 'webview' | 'image' | 'audio' | 'video'
@@ -90,6 +93,8 @@ export interface CanvasArtifactSourceResult {
 export interface CanvasArtifactCreationDependencies {
   documents: {
     load: (target: CanvasTarget) => CanvasWorkspaceSnapshot
+    /** 生产 Store 可在副作用前复用完整 mutation schema 校验。 */
+    validateBatchOperations?: (target: CanvasTarget, expectedRevision: number, operations: unknown[]) => CanvasMutation[]
   }
   content: Pick<CanvasNodeContentStore, 'prepareArtifactContent' | 'discardPreparedContent'>
   batch: {
@@ -100,6 +105,8 @@ export interface CanvasArtifactCreationDependencies {
 
 /** 原子产物创建服务的公开窄接口。 */
 export interface CanvasArtifactCreationService {
+  /** 在任何内容、素材或 batch 写入前验证创建输入。 */
+  validateCreate: (input: CanvasArtifactCreationInput) => void
   create: (input: CanvasArtifactCreationInput) => Promise<CanvasArtifactCreationResult>
   createAgent: (input: CanvasAgentArtifactCreationInput) => Promise<CanvasAgentArtifactCreationResult>
   resolveCreated: (input: CanvasArtifactSourceLookup) => CanvasArtifactSourceResult | null
@@ -111,6 +118,8 @@ const ARTIFACT_LAYOUT_GAP = 24
 const ARTIFACT_REQUESTED_POSITION_MARGIN = 1_600
 /** 常规 Agent、文档和无预览图片节点的折叠尺寸。 */
 const ARTIFACT_DEFAULT_SIZE: CanvasLayoutSize = { width: 288, height: 144 }
+/** 创建阶段不读取图片文件，预留与 Renderer 同源的最大预览尺寸。 */
+const ARTIFACT_IMAGE_SIZE: CanvasLayoutSize = { width: CANVAS_IMAGE_NODE_WIDTH, height: CANVAS_IMAGE_NODE_MAX_HEIGHT }
 /** 桌面 WebView 折叠卡片的稳定预览尺寸。 */
 const ARTIFACT_WEBVIEW_DESKTOP_SIZE: CanvasLayoutSize = { width: 384, height: 316 }
 /** 手机 WebView 折叠卡片的稳定预览尺寸。 */
@@ -164,6 +173,7 @@ function createArtifactIdentity(input: Pick<CanvasArtifactCreationInput, 'projec
 function resolveArtifactNodeSize(
   node: Pick<CanvasNode, 'kind'> & Partial<Pick<Extract<CanvasNode, { kind: 'webview' }>, 'devicePreset'>>,
 ): CanvasLayoutSize {
+  if (node.kind === 'image') return ARTIFACT_IMAGE_SIZE
   if (node.kind !== 'webview') return ARTIFACT_DEFAULT_SIZE
   return node.devicePreset === 'mobile'
     ? ARTIFACT_WEBVIEW_MOBILE_SIZE
@@ -414,10 +424,12 @@ function documentReferencesContent(document: CanvasDocument, contentId: string):
 export function createCanvasArtifactCreationService(
   dependencies: CanvasArtifactCreationDependencies,
 ): CanvasArtifactCreationService {
-  /** 用稳定来源身份定位且校验权威节点，未知或冲突来源返回 null。 */
-  const resolveCreated = (input: CanvasArtifactSourceLookup): CanvasArtifactSourceResult | null => {
+  /** 从同一份权威图判断稳定来源是否已经创建对应节点。 */
+  const resolveCreatedFromDocument = (
+    input: CanvasArtifactSourceLookup,
+    document: CanvasDocument,
+  ): CanvasArtifactSourceResult | null => {
     const identity = createArtifactIdentity(input)
-    const document = dependencies.documents.load({ projectId: input.projectId, canvasId: input.canvasId }).document
     const node = document.nodes.find((candidate) => candidate.id === identity.nodeId)
     const owned = input.artifactType === 'agent'
       ? node?.kind === 'agent' && node.agentSessionId === identity.agentSessionId
@@ -432,8 +444,69 @@ export function createCanvasArtifactCreationService(
     }
   }
 
+  /** 用稳定来源身份定位且校验权威节点，未知或冲突来源返回 null。 */
+  const resolveCreated = (input: CanvasArtifactSourceLookup): CanvasArtifactSourceResult | null => {
+    const document = dependencies.documents.load({ projectId: input.projectId, canvasId: input.canvasId }).document
+    return resolveCreatedFromDocument(input, document)
+  }
+
+  /** 只在无副作用边界内构造并验证普通产物操作。 */
+  const validateCreateAgainstDocument = (
+    input: CanvasArtifactCreationInput,
+    document: CanvasDocument,
+  ): void => {
+    const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
+    const identity = createArtifactIdentity(input)
+    if (resolveCreatedFromDocument(input, document)) return
+    try {
+      const operations = createArtifactOperations(input, document, identity)
+      /** 先验证 batch 外壳，再由生产 Store 复用完整 mutation 合同。 */
+      parseCanvasBatchOperationEnvelope({
+        ...target,
+        baseRevision: input.baseRevision,
+        operations,
+        sourceSessionId: input.source.sessionId,
+        sourceRunStartedAt: input.source.runStartedAt,
+        sourceToolCallId: input.source.toolCallId,
+      })
+      dependencies.documents.validateBatchOperations?.(target, input.baseRevision, operations)
+    } catch (error) {
+      throwCanvasArtifactPreflightError(error)
+    }
+  }
+
+  /** 只在无副作用边界内构造并验证 Agent 节点操作。 */
+  const validateAgentCreateAgainstDocument = (
+    input: CanvasAgentArtifactCreationInput,
+    document: CanvasDocument,
+  ): void => {
+    const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
+    const identity = createArtifactIdentity(input)
+    if (resolveCreatedFromDocument({ ...input, artifactType: 'agent' }, document)) return
+    try {
+      const operations = createAgentOperations(input, document, identity)
+      parseCanvasBatchOperationEnvelope({
+        ...target,
+        baseRevision: input.baseRevision,
+        operations,
+        sourceSessionId: input.source.sessionId,
+        sourceRunStartedAt: input.source.runStartedAt,
+        sourceToolCallId: input.source.toolCallId,
+      })
+      dependencies.documents.validateBatchOperations?.(target, input.baseRevision, operations)
+    } catch (error) {
+      throwCanvasArtifactPreflightError(error)
+    }
+  }
+
   return {
     resolveCreated,
+    validateCreate: (input) => {
+      const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
+      /** 读取失败在纯校验 catch 外，不能被误标为输入拒绝。 */
+      const document = dependencies.documents.load(target).document
+      validateCreateAgainstDocument(input, document)
+    },
     create: async (input) => {
       /** 目标 Canvas 身份贯穿所有权威读取和写入。 */
       const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
@@ -441,14 +514,14 @@ export function createCanvasArtifactCreationService(
       const identity = createArtifactIdentity(input)
       /** 写内容前先验证初始 revision、来源节点和默认位置。 */
       const initialDocument = dependencies.documents.load(target).document
-      const replayed = resolveCreated(input)
+      const replayed = resolveCreatedFromDocument(input, initialDocument)
       if (replayed && replayed.artifactType !== 'agent') {
         return {
           canvasId: replayed.canvasId, nodeId: replayed.nodeId, revision: replayed.revision,
           artifactType: replayed.artifactType, sourceToolCallId: replayed.sourceToolCallId,
         }
       }
-      createArtifactOperations(input, initialDocument, identity)
+      validateCreateAgainstDocument(input, initialDocument)
       /** 图片沿用项目当前默认模型；音视频创建空模块，工作流配置由独立 CAS 工具保存。 */
       const preparedInput: PrepareCanvasArtifactContentInput = input.artifactType === 'image'
         ? {
@@ -527,13 +600,16 @@ export function createCanvasArtifactCreationService(
     createAgent: async (input) => {
       const target: CanvasTarget = { projectId: input.projectId, canvasId: input.canvasId }
       const identity = createArtifactIdentity(input)
-      const replayed = resolveCreated({ ...input, artifactType: 'agent' })
+      /** 第一次 batch 前用同一份权威图完成纯输入预检。 */
+      const initialDocument = dependencies.documents.load(target).document
+      const replayed = resolveCreatedFromDocument({ ...input, artifactType: 'agent' }, initialDocument)
       if (replayed) {
         return {
           canvasId: replayed.canvasId, nodeId: replayed.nodeId,
           revision: replayed.revision, sourceToolCallId: replayed.sourceToolCallId,
         }
       }
+      validateAgentCreateAgainstDocument(input, initialDocument)
       /** 同一工具调用只允许一次权威重读重试，节点和会话身份始终不变。 */
       const execute = async (baseRevision: number, sourceToolCallId: string): Promise<CanvasAgentArtifactCreationResult> => {
         const document = dependencies.documents.load(target).document

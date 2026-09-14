@@ -7,6 +7,7 @@ import type {
 } from '@proma/shared'
 import { resolveCanvasEdgeBinding } from '@proma/shared'
 import { hasValidCanvasAgentOwnership } from '../agent-session-visibility'
+import type { CanvasAgentToolMode } from './canvas-agent-tool-policy'
 
 /** 所有 Canvas Agent 共用的读取与调研工具，仍经过原权限检查。 */
 export const CANVAS_AGENT_ALLOWED_TOOL_NAMES = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'] as const
@@ -22,7 +23,7 @@ const CANVAS_INTERACTIVE_TOOL_NAMES = [
 ] as const
 
 /** 按 Host 可信来源返回能力上限，工具执行仍沿用当前权限、目录和浏览器会话边界。 */
-export function resolveCanvasAgentBuiltinToolNames(mode: 'renderer-manual' | 'parent-orchestrated'): readonly string[] {
+export function resolveCanvasAgentBuiltinToolNames(mode: CanvasAgentToolMode): readonly string[] {
   return mode === 'renderer-manual' ? CANVAS_INTERACTIVE_TOOL_NAMES : CANVAS_AGENT_ALLOWED_TOOL_NAMES
 }
 
@@ -31,7 +32,7 @@ const MAX_CANVAS_AGENT_PROMPT_DATA_BYTES = 16 * 1024
 
 /** 构建 Canvas Agent 可信提示词所需的有界业务数据。 */
 export interface CanvasAgentExecutionPromptInput {
-  mode: 'renderer-manual' | 'parent-orchestrated'
+  mode: CanvasAgentToolMode
   nodeTitle: string
   instruction: string
   goal: string

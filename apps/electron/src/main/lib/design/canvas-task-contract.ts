@@ -98,8 +98,15 @@ export interface CanvasTaskCompletedOperation extends Omit<CanvasTaskPendingOper
   after: CanvasTaskEvidence
 }
 
+/** Host 在创建事务前确定拒绝的终态回执；不携带新节点或完成证据。 */
+export interface CanvasTaskRejectedOperation extends Omit<CanvasTaskPendingOperation, 'status' | 'kind'> {
+  status: 'rejected'
+  kind: 'created'
+  reasonCode: string
+}
+
 /** Host 工具边界记录的两阶段真实操作，不包含媒体正文。 */
-export type CanvasTaskOperationReceipt = CanvasTaskPendingOperation | CanvasTaskCompletedOperation
+export type CanvasTaskOperationReceipt = CanvasTaskPendingOperation | CanvasTaskCompletedOperation | CanvasTaskRejectedOperation
 
 /** created 要求与真实后继节点之间的追加绑定。 */
 export interface CanvasTaskRequirementBinding { requirementId: string; operationId: string; nodeId: string }
@@ -349,13 +356,13 @@ function fact(value: unknown): CanvasTaskEvidence | CanvasTaskAbsentArtifact {
   return input.absent === true ? absent(value) : evidence(value)
 }
 
-/** 严格解析两阶段操作记录。 */
+/** 严格解析操作记录，确保完成与事务前拒绝不会混用证据。 */
 function operation(value: unknown): CanvasTaskOperationReceipt {
   const input = object(value, [
     'status', 'operationId', 'sourceToolCallId', 'startedAt', 'taskId', 'canvasId', 'kind',
-    'nodeId', 'nodeKind', 'before', 'after',
+    'nodeId', 'nodeKind', 'before', 'after', 'reasonCode',
   ])
-  if ((input.status !== 'pending' && input.status !== 'completed')
+  if ((input.status !== 'pending' && input.status !== 'completed' && input.status !== 'rejected')
     || (input.kind !== 'created' && input.kind !== 'updated')
     || typeof input.startedAt !== 'number' || !Number.isSafeInteger(input.startedAt) || input.startedAt < 0) {
     throw new Error('CANVAS_TASK_STATE_INVALID')
@@ -372,9 +379,14 @@ function operation(value: unknown): CanvasTaskOperationReceipt {
   }
   if (base.kind === 'created' && base.before && !('absent' in base.before)) throw new Error('CANVAS_TASK_STATE_INVALID')
   if (input.status === 'pending') {
-    if (input.after !== undefined) throw new Error('CANVAS_TASK_STATE_INVALID')
+    if (input.after !== undefined || input.reasonCode !== undefined) throw new Error('CANVAS_TASK_STATE_INVALID')
     return { status: 'pending', ...base }
   }
+  if (input.status === 'rejected') {
+    if (base.kind !== 'created' || input.after !== undefined) throw new Error('CANVAS_TASK_STATE_INVALID')
+    return { status: 'rejected', ...base, kind: 'created', reasonCode: id(input.reasonCode) }
+  }
+  if (input.reasonCode !== undefined) throw new Error('CANVAS_TASK_STATE_INVALID')
   if (!base.nodeId || !base.nodeKind || input.after === undefined) throw new Error('CANVAS_TASK_STATE_INVALID')
   const after = evidence(input.after)
   if (after.canvasId !== base.canvasId || after.nodeId !== base.nodeId || after.nodeKind !== base.nodeKind
@@ -489,14 +501,15 @@ export function projectCanvasTaskStatus(state: CanvasTaskState) {
       kind: receipt.kind,
       ...(receipt.nodeKind ? { nodeKind: receipt.nodeKind } : {}),
       ...(receipt.nodeId ? { nodeId: receipt.nodeId } : {}),
+      ...(receipt.status === 'rejected' ? { reasonCode: receipt.reasonCode } : {}),
     })),
     operationCount: state.operationReceipts.length,
     pendingOperationIds: state.operationReceipts.filter((receipt) => receipt.status === 'pending').map((receipt) => receipt.operationId),
     recoverableSteps: state.phase === 'unplanned' ? ['start']
       : state.phase === 'completed' ? []
         : state.phase === 'blocked' || state.phase === 'needs-input'
-          ? ['recordOperation', 'rebind', 'recover', 'complete']
-          : ['record', 'recordOperation', 'rebind', 'complete', 'block'],
+          ? ['status', 'resume', 'rebind', 'recover', 'complete']
+          : ['status', 'resume', 'rebind', 'complete', 'block'],
     ...(state.blockingReason ? { blockingReason: state.blockingReason } : {}),
   }
 }
@@ -638,7 +651,7 @@ export function createCanvasTaskContract(options: CanvasTaskContractOptions) {
       }
       commit({ ...state, generatedJobs })
     },
-    /** 先登记 pending，再用同一不可变意图推进 completed；重放不会新增操作。 */
+    /** 先登记 pending，再用同一不可变意图推进 completed 或 rejected；终态重放不会新增操作。 */
     recordOperation(receipt: CanvasTaskOperationReceipt) {
       if (!state.canvasId || state.phase === 'completed') throw new Error('CANVAS_TASK_NOT_STARTED')
       if (receipt.taskId !== state.taskId) throw new Error('CANVAS_TASK_OPERATION_TASK_MISMATCH')
@@ -660,8 +673,14 @@ export function createCanvasTaskContract(options: CanvasTaskContractOptions) {
           || (existing.nodeKind !== undefined && existing.nodeKind !== parsed.nodeKind)
           || (existing.before !== undefined && JSON.stringify(existing.before) !== JSON.stringify(parsed.before))
         )
-        if (existing.status !== 'pending' || parsed.status !== 'completed'
-          || createdIntentChanged || JSON.stringify(immutable(existing)) !== JSON.stringify(immutable(parsed))) {
+        /** 拒绝发生在事务前，不能像 completed 一样补入权威返回的新节点身份。 */
+        const rejectedIntentChanged = parsed.status === 'rejected' && (
+          existing.nodeId !== parsed.nodeId || existing.nodeKind !== parsed.nodeKind
+          || JSON.stringify(existing.before) !== JSON.stringify(parsed.before)
+        )
+        if (existing.status !== 'pending' || (parsed.status !== 'completed' && parsed.status !== 'rejected')
+          || createdIntentChanged || rejectedIntentChanged
+          || JSON.stringify(immutable(existing)) !== JSON.stringify(immutable(parsed))) {
           throw new Error('CANVAS_TASK_OPERATION_CONFLICT')
         }
         operationReceipts[existingIndex] = parsed

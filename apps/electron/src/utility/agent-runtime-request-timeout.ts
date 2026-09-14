@@ -5,7 +5,7 @@ const DEFAULT_PARENT_REQUEST_TIMEOUT_MS = 120_000
 /** 允许使用图片生成长时限的可信工具名称。 */
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 /** 等待完整子 Agent 生命周期的单次专业运行工具。 */
-const CANVAS_AGENT_TOOL = 'canvas_run_agent'
+const CANVAS_AGENT_TOOLS = new Set(['canvas_run_agent', 'canvas_delegate', 'canvas_dispatch', 'canvas_resume_orchestration'])
 /** 保留既有批量执行时限；单个专业 Agent 不套用工作流预算。 */
 const CANVAS_EXECUTION_TOOLS = new Set(['canvas_run_workflow', 'canvas_run_nodes'])
 // 图片生成可能超过两分钟；只放宽可信图片工具，普通主进程能力仍快速暴露故障。
@@ -24,7 +24,7 @@ export function getParentRequestTimeoutMs(method: string, payload: unknown): num
   /** 当前跨进程能力请求声明的工具名；非工具请求保持 undefined。 */
   const toolName = (payload as { toolName?: unknown } | null)?.toolName
   if (method === AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL) return undefined
-  if (method === AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL && toolName === CANVAS_AGENT_TOOL) {
+  if (method === AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL && typeof toolName === 'string' && CANVAS_AGENT_TOOLS.has(toolName)) {
     return undefined
   }
   if (

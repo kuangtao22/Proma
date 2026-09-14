@@ -134,24 +134,40 @@ function resolveMediaCanvasId(context: CanvasToolRunContext, canvasId?: string):
   return fixedCanvasId ?? canvasId
 }
 
-/** 返回默认连接的可见状态；删除或停用时不隐藏用户的原选择。 */
-function canvasConnectionSelection(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, requestedCanvasId?: string) {
+/** 依据 Host 验证的画布和当前目录返回默认绑定及本次有效连接；只读解析不保存用户偏好。 */
+function canvasConnectionSelection(
+  dependencies: MediaToolProviderDependencies,
+  context: CanvasToolRunContext,
+  requestedCanvasId?: string,
+  catalog = dependencies.configuration.listProject(context.projectId),
+) {
+  /** 固定画布身份和所属权限仍由原 Host 入口校验。 */
   const canvasId = resolveMediaCanvasId(context, requestedCanvasId)
   const connectionId = canvasId ? dependencies.getCanvasConnection?.(context, canvasId) ?? null : null
-  const connection = connectionId ? dependencies.configuration.listProject(context.projectId).connections.find((item) => item.id === connectionId) : undefined
+  const connection = connectionId ? catalog.connections.find((item) => item.id === connectionId) : undefined
+  /** 已绑定但失效时保留原选择；只有经过 Host 验证的空绑定才允许使用唯一启用连接。 */
+  const enabledConnections = canvasId && dependencies.getCanvasConnection && !connectionId
+    ? catalog.connections.filter((item) => item.enabled) : []
+  const effectiveConnection = connectionId ? connection?.enabled ? connection : undefined
+    : enabledConnections.length === 1 ? enabledConnections[0] : undefined
   return {
     canvasId: canvasId ?? null,
     selectedConnection: connectionId ? { id: connectionId, name: connection?.name ?? connectionId, enabled: connection?.enabled ?? false } : null,
     connectionStatus: connectionId ? connection?.enabled ? 'available' : 'unavailable' : 'unbound',
+    effectiveConnection: effectiveConnection
+      ? { id: effectiveConnection.id, name: effectiveConnection.name, enabled: true } : null,
+    connectionSource: connectionId ? 'canvas-binding' : effectiveConnection ? 'single-enabled' : null,
   }
 }
 
-/** 显式连接优先，否则继承画布选择；绝不隐式选目录第一项。 */
+/** 显式连接优先，其次原画布绑定，最后仅使用空绑定的唯一启用项；多台服务器不按目录顺序猜选。 */
 function resolveMediaConnection(dependencies: MediaToolProviderDependencies, context: CanvasToolRunContext, input: { connectionId?: string; canvasId?: string }): string {
-  const selection = canvasConnectionSelection(dependencies, context, input.canvasId)
-  const connectionId = input.connectionId ?? selection.selectedConnection?.id
+  /** 选择与可用性判断使用同一配置快照，不重复读配置文件。 */
+  const catalog = dependencies.configuration.listProject(context.projectId)
+  const selection = canvasConnectionSelection(dependencies, context, input.canvasId, catalog)
+  const connectionId = input.connectionId ?? selection.selectedConnection?.id ?? selection.effectiveConnection?.id
   if (!connectionId) throw new Error(selection.canvasId ? 'MEDIA_CANVAS_CONNECTION_REQUIRED' : 'MEDIA_CONNECTION_REQUIRED')
-  const connection = dependencies.configuration.listProject(context.projectId).connections.find((item) => item.id === connectionId)
+  const connection = catalog.connections.find((item) => item.id === connectionId)
   if (!connection?.enabled) throw new Error('MEDIA_CONNECTION_UNAVAILABLE')
   return connectionId
 }
@@ -437,7 +453,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
   const tools: ToolDefinition[] = [
     defineTool({
       name: 'media_list_workflows', label: '列出媒体工作流',
-      description: '读取画布绑定的 ComfyUI 服务器及本地已保存模板摘要。新任务优先用 media_discover_workflows 查询服务器；内部执行快照不作为可复用模板推荐，不默认选择第一项。',
+      description: '读取画布 ComfyUI 默认绑定、本次 effectiveConnection 与本地模板摘要。未绑定且仅一台启用服务器时可直接发现工作流，不必先手动绑定；connectionSource 说明连接来源，读取不保存偏好。新任务优先用 media_discover_workflows 查询服务器；内部执行快照不作为可复用模板推荐，不默认选择第一项。',
       parameters: Type.Object({
         canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         offset: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -475,7 +491,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
           preferredSource: 'comfyui-server',
           authorizationMode: mediaAuthorizationMode(dependencies),
           availableActions: ['media_discover_workflows'],
-          ...canvasConnectionSelection(dependencies, context, params.canvasId),
+          ...canvasConnectionSelection(dependencies, context, params.canvasId, catalog),
         })
       },
     }),
@@ -526,7 +542,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
     }),
     defineTool({
       name: 'media_discover_workflows', label: '匹配远端工作流',
-      description: '未指定工作流时，从画布绑定或显式 ComfyUI 连接分页读取候选，检查真实节点、媒体输入数量、输出和当前服务器兼容性。复用资源快照；UI 图仅在确定映射时转换，返回阻塞原因。candidate 只表示结构候选，还需核对首尾帧等语义角色；不保存、不生成、不按名称默认选第一项。',
+      description: '未指定工作流时，从显式连接、画布绑定或未绑定画布的唯一启用 ComfyUI 服务器分页读取候选，检查真实节点、媒体输入数量、输出和当前服务器兼容性。复用资源快照；UI 图仅在确定映射时转换，返回阻塞原因。candidate 只表示结构候选，还需核对首尾帧等语义角色；不保存、不生成、不按名称默认选第一项。',
       parameters: Type.Object({
         canvasId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
         connectionId: Type.Optional(Type.String({ pattern: IDENTIFIER_PATTERN })),
@@ -1145,7 +1161,7 @@ export function createMediaToolRun(dependencies: MediaToolProviderDependencies, 
   return {
     systemPromptAppend: `面向画布生成时，先用 canvas_get_context 和 canvas_read 复用目标卡片；尚无卡片时图片用 canvas_create_artifact，音视频用 canvas_create_media 创建，再发现与分析工作流。通过 media_list_workflows(canvasId) 读取画布绑定服务器、当前 authorizationMode，并查询 API 模型。
 生成授权由用户设置决定：ask 为每次确认；automatic 为 Agent 自主执行，已授权你围绕当前任务连续选型、配置、生成、检查和采用合适候选后继续，不要对已授权的常规步骤反复询问。自主权限不代表无限重试或扩大任务范围，仍遵守当前预算、计划模式、项目边界及用户停止要求；提交结果未知时只恢复原任务，不重复提交。采用前完成实际可用的内容检查，不把 metadataOnly 当成看过视频或听过音频，也不跳过工具要求的版本与候选身份。
-新任务优先查看 ComfyUI 服务器工作流：除用户明确指定本地模板或恢复原任务外，必须先调用 media_discover_workflows，传入目标媒体类型与真实媒体输入数量；普通 Agent 传 canvasId，画布 Agent 自动使用固定画布。未绑定时保留待配置卡片，请用户选择服务器，不默认选第一台。根据真实节点、标题、输入角色和输出核对语义适配性，不按文件名或数量相同认定首尾帧匹配。UI 格式先走转换分析。选定候选后，用精确 descriptor 和 contentHash 调用 media_use_remote_workflow 直接使用，Host 自动保留内部执行快照，无需用户创建、导入、发布模板，也不要另存项目草稿。再用 media_inspect_workflow 和 media_match_assets 读取真实字段、默认值和素材。
+新任务优先查看 ComfyUI 服务器工作流：除用户明确指定本地模板或恢复原任务外，必须先调用 media_discover_workflows，传入目标媒体类型与真实媒体输入数量；普通 Agent 传 canvasId，画布 Agent 自动使用固定画布。selectedConnection/connectionStatus 仅表示用户默认绑定；effectiveConnection 表示本次可用连接。未绑定且只有一台启用服务器时 connectionSource=single-enabled，可直接发现工作流，不必让用户手动绑定；不写入画布默认绑定。已有绑定失效、没有启用服务器或多台候选且无明确选择时，保留待配置卡片并请用户选择或修复，不按目录顺序选第一台。显式 connectionId 优先，已有节点配置和已准备任务保留原连接。根据真实节点、标题、输入角色和输出核对语义适配性，不按文件名或数量相同认定首尾帧匹配。UI 格式先走转换分析。选定候选后，用精确 descriptor 和 contentHash 调用 media_use_remote_workflow 直接使用，Host 自动保留内部执行快照，无需用户创建、导入、发布模板，也不要另存项目草稿。再用 media_inspect_workflow 和 media_match_assets 读取真实字段、默认值和素材。
 分页未完成须继续 nextOffset，名称筛选无结果须清除筛选；目录读取失败、同步失败和转换失败都不能当作没有匹配。完整检查仍无语义匹配时说明缺口：ask 模式先询问用户是否根据服务器已有模型和节点生成工作流并保存本地，明确同意后传 creationIntent=user-confirmed；automatic 模式可直接生成并传 creationIntent=automatic-policy，无需再次确认。两种模式都必须用 media_list_resources 查询实际 models/nodes，用 media_get_node_schema 和 media_inspect_workflow 验证接口、模型枚举、连线与输出，再调用 media_save_local_workflow 保存本地模板，禁止虚构模型或节点。权限以工具回执和 Host 最新设置为准，不能自行改变授权模式。
 立即用 canvas_update_image_config 或 canvas_update_media_config 固定工作流版本、连接和已知 typed 输入，缺失字段省略并留给用户补齐；不能虚构素材或连线。分析失败时在原卡片 preparation 中保存错误码及节点、字段、中文原因，原始响应和凭据不得写入诊断。参数满足要求且用户已要求生成时，清除 preparation 并调用 canvas_run_nodes，原卡片展示进度、错误和产物。普通画布任务不走独立 media_prepare_run；无 Canvas 目标的独立媒体任务和父编排 handoff 保持原入口。
 发现、使用和保存不会生成，执行和取消按当前生成授权处理；旧导入、项目草稿、公共发布和 profile 工具只兼容用户明确要求维护的历史流程，不作为新任务默认路径。只有 media_import_local_file 可接收 Shell 或 Skill 在当前授权根生成的明确本地文件路径；已有资产交给 ffmpeg 或分析 Skill 时使用 media_get_asset_file，并原样传入 MediaAssetRef。其它媒体工具不要传入项目 ID、Agent 身份、本地路径、远端素材名或凭据。`,

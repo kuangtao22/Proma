@@ -3,7 +3,7 @@ import { CANVAS_IMAGE_CANDIDATE_TOOL_NAMES } from './canvas-image-candidate-tool
 import { CANVAS_MEDIA_REVIEW_TOOL_NAMES } from './canvas-media-review-tools'
 
 /** Host 可信注入的 Canvas Agent 运行模式。 */
-export type CanvasAgentToolMode = 'renderer-manual' | 'parent-orchestrated'
+export type CanvasAgentToolMode = 'renderer-manual' | 'parent-orchestrated' | 'canvas-orchestrator'
 
 /** 计划模式可使用的画布查询与内存任务协议，未知工具不能按名称前缀自动放行。 */
 export const CANVAS_READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
@@ -11,7 +11,7 @@ export const CANVAS_READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   'canvas_task', 'canvas_get_context', 'canvas_list_nodes', 'canvas_read', 'canvas_inspect_images',
   'canvas_inspect_media', 'canvas_get_task', 'canvas_list_versions', 'canvas_read_version',
   'canvas_list_trash', 'canvas_list_workflows', 'canvas_get_workflow',
-  'canvas_get_workflow_run', 'canvas_list_workflow_runs',
+  'canvas_get_workflow_run', 'canvas_list_workflow_runs', 'canvas_get_orchestration',
 ])
 
 /** Renderer 手动运行保留完整的 Canvas Agent 交互能力。 */
@@ -83,8 +83,15 @@ const PARENT_ORCHESTRATED_TOOL_NAMES: ReadonlySet<string> = new Set([
   'canvas_list_workflow_runs',
 ])
 
+/** 编排者只能经受管分派入口创建专业任务，不能自由递归创建 Agent。 */
+const ORCHESTRATOR_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ...[...RENDERER_MANUAL_TOOL_NAMES].filter(name => !['canvas_resume_workflow', 'canvas_retry_task', 'media_execute_run'].includes(name)),
+  'canvas_update_plan', 'canvas_dispatch', 'canvas_review_step', 'canvas_finish_orchestration', 'canvas_get_orchestration',
+])
+
 /** 返回可信模式对应的固定正向集合，未知工具默认拒绝。 */
 function getAllowedToolNames(mode: CanvasAgentToolMode): ReadonlySet<string> {
+  if (mode === 'canvas-orchestrator') return ORCHESTRATOR_TOOL_NAMES
   return mode === 'parent-orchestrated'
     ? PARENT_ORCHESTRATED_TOOL_NAMES
     : RENDERER_MANUAL_TOOL_NAMES

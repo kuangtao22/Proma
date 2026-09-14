@@ -13,6 +13,7 @@ import type {
   CanvasTarget,
   CanvasWorkspaceSnapshot,
   CanvasNodeReference,
+  CanvasOrchestrationRecord,
   CreateCanvasAgentNodeInput,
   CreateCanvasContentNodeInput,
   DeleteCanvasNodeInput,
@@ -42,6 +43,10 @@ import {
   canvasAgentRunningSessionIdsAtom,
   nativeCanvasStatesAtom,
 } from '@/atoms/native-canvas-atoms'
+import {
+  canvasOrchestrationStatesAtom,
+  createCanvasOrchestrationKey,
+} from '@/atoms/canvas-orchestration-atoms'
 import {
   createInitialDesignProjectState,
   designProjectStatesAtom,
@@ -89,6 +94,7 @@ const {
   settleNativeCanvasStopDeleteAttempt,
   createNativeCanvasWorkspaceController,
   createNativeCanvasWorkspaceControllerRegistry,
+  createCanvasOrchestrationControllerRegistry,
   getNativeCanvasConnectedEdgeCount,
   getPendingCanvasStopDeleteGenerationStatus,
   isPendingCanvasStopDeleteCurrent,
@@ -520,6 +526,47 @@ describe('Agent Canvas 共享图与独立视图', () => {
     expect(rendered[0]?.nodes.find((node) => node.id === 'agent-1')?.selected).toBe(true)
     expect(rendered[1]?.viewport).toEqual({ x: 90, y: 80, zoom: 1.8 })
     expect(rendered[1]?.nodes.find((node) => node.id === 'agent-1')?.selected).toBe(false)
+  })
+
+  test('Given 当前画布已有编排记录 When 渲染工作区 Then 在画布内展示轻量流程摘要', () => {
+    const target = { projectId: 'project-1', canvasId: 'canvas-1' }
+    const graphKey = createNativeCanvasKey(target.projectId, target.canvasId)
+    const orchestrationKey = createCanvasOrchestrationKey(target.projectId, target.canvasId)
+    const snapshot = createSnapshot(1, target)
+    const record = {
+      schemaVersion: 1, id: 'orchestration-1', revision: 1,
+      projectId: target.projectId, canvasId: target.canvasId, ownerSessionId: 'session-1',
+      request: { requestId: 'request-1', goal: '制作专业短片', intent: 'produce', constraints: [], referenceNodeIds: [], deliverables: [] },
+      coordinatorNodeId: null, coordinatorSessionId: null, status: 'planning', steps: [],
+      summary: '正在安排脚本与镜头设计', runStartedAt: null, createdAt: 1, updatedAt: 1,
+    } satisfies CanvasOrchestrationRecord
+    const store = createStore()
+    store.set(nativeCanvasStatesAtom, new Map([[graphKey, {
+      ...createInitialNativeCanvasState(), phase: 'ready', snapshot,
+    }]]))
+    store.set(canvasOrchestrationStatesAtom, new Map([[orchestrationKey, {
+      phase: 'ready', record, error: null,
+    }]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <NativeCanvasWorkspace
+          sessionId="session-1"
+          target={target}
+          title="短片 Canvas"
+          adapter={{
+            loadCanvas: async () => snapshot,
+            saveCanvas: async () => snapshot.document,
+            onCanvasChanged: () => () => undefined,
+          }}
+          flowRenderer={() => <div />}
+        />
+      </Provider>,
+    )
+
+    expect(html).toContain('data-canvas-orchestration-panel="true"')
+    expect(html).toContain('制作专业短片')
+    expect(html).toContain('正在安排脚本与镜头设计')
   })
 
   test('Given 已加载共享图 When 更新会话 viewport Then 不产生 graph mutation 且 revision 保持不变', () => {
@@ -1554,6 +1601,41 @@ function createHarness(
 }
 
 describe('原生 Canvas controller 加载与事件', () => {
+  test('Given 同一 Canvas 的两个视图 When 获取并依次释放编排租约 Then 只读取订阅一次且最后释放后清理', async () => {
+    const tasks: Array<() => void> = []
+    const registry = createCanvasOrchestrationControllerRegistry((task) => tasks.push(task))
+    const owner = {}
+    const calls: string[] = []
+    const controller = {
+      load: async () => { calls.push('load') },
+      whenIdle: async () => undefined,
+      dispose: () => { calls.push('unsubscribe', 'dispose') },
+    }
+    let factories = 0
+    let cleanups = 0
+    const first = registry.acquire(owner, 'project-1:canvas-1', () => {
+      factories += 1
+      return controller
+    }, () => { cleanups += 1 })
+    const second = registry.acquire(owner, 'project-1:canvas-1', () => {
+      factories += 1
+      return controller
+    }, () => { cleanups += 1 })
+
+    await controller.whenIdle()
+    expect(factories).toBe(1)
+    expect(calls).toEqual(['load'])
+    first.release()
+    tasks.splice(0).forEach((task) => task())
+    expect(calls).toEqual(['load'])
+    expect(cleanups).toBe(0)
+
+    second.release()
+    tasks.splice(0).forEach((task) => task())
+    expect(calls).toEqual(['load', 'unsubscribe', 'dispose'])
+    expect(cleanups).toBe(1)
+  })
+
   test('Given 两个会话 effect 使用同一 graph key When 依次卸载 Then 单路 LOAD 且最后用户才释放 controller', () => {
     const tasks: Array<() => void> = []
     const registry = createNativeCanvasWorkspaceControllerRegistry((task) => tasks.push(task))
@@ -2456,7 +2538,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
       .toEqual({ x: 868, y: 210 })
   })
 
-  test('Given 横向节点已延伸到屏幕外 When 独立新增 Then 在当前视口紧凑避让且不改已有布局', () => {
+  test('Given 横向节点含未知高度图片并延伸到屏幕外 When 独立新增 Then 按保守图片高度紧凑避让且不改已有布局', () => {
     const document = createSnapshot(1).document
     document.viewport = { x: 0, y: 0, zoom: 1 }
     document.nodes = [
@@ -2474,7 +2556,7 @@ describe('原生 Canvas 添加 Agent 命令', () => {
     const original = structuredClone(document)
 
     expect(findNativeCanvasAgentNodeCreationPosition(document, { width: 800, height: 600 }))
-      .toEqual({ x: 568, y: 396 })
+      .toEqual({ x: -56, y: 396 })
     expect(document).toEqual(original)
   })
 

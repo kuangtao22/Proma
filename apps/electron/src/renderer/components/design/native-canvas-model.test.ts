@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
+import { applyCanvasMutations, CANVAS_IMAGE_NODE_MAX_HEIGHT, createEmptyCanvasDocument } from '@proma/shared'
 import type { CanvasDocument, CanvasMutation } from '@proma/shared'
 import { Position } from '@xyflow/react'
 import ELK from 'elkjs/lib/elk-api'
@@ -20,6 +20,7 @@ import {
   NATIVE_CANVAS_NODE_HEIGHT,
   NATIVE_CANVAS_NODE_WIDTH,
   overlapsNativeCanvasNodes,
+  patchNativeCanvasFlowNodeRuntimeState,
   replayNativeCanvasPositionMutations,
   resolveNativeCanvasNodeSize,
   toNativeCanvasFlowEdges,
@@ -159,6 +160,72 @@ describe('原生 Canvas 纯投影', () => {
       })
     },
   )
+
+  test.each(['audio', 'video'] as const)(
+    'Given %s 已导入并采用本地素材且没有远端运行 When 建立 Flow 数据 Then 显示已有素材但不宣称验收通过',
+    (kind) => {
+      const document = createDocument()
+      document.nodes.push({
+        id: 'media-1', kind, title: '媒体', position: { x: 0, y: 0 }, mediaModuleId: 'media-module',
+      })
+      const nodes = toNativeCanvasFlowNodes(document, {
+        nodeIssues: [], runningSessionIds: new Set(), canCreateChild: false,
+        onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+        mediaProgressByNodeId: new Map([['media-1', {
+          phase: 'pending', phaseLabel: '已有素材', hasAdoptedOutput: true,
+        }]]),
+      })
+
+      expect(nodes.find((node) => node.id === 'media-1')?.data).toMatchObject({
+        activityState: 'idle', statusLabel: '已有素材', summary: '已有可用素材',
+      })
+      expect(nodes.find((node) => node.id === 'media-1')?.data.summary).not.toContain('验收')
+    },
+  )
+
+  test.each([
+    ['running', '已有素材，正在生成新版本'],
+    ['failed', '已有素材，新版本生成失败'],
+  ] as const)(
+    'Given 视频已有素材且新生成%s When 建立 Flow 数据 Then 摘要保留旧素材可用事实',
+    (phase, summary) => {
+      const document = createDocument()
+      document.nodes.push({
+        id: 'media-1', kind: 'video', title: '媒体', position: { x: 0, y: 0 }, mediaModuleId: 'media-module',
+      })
+      const nodes = toNativeCanvasFlowNodes(document, {
+        nodeIssues: [], runningSessionIds: new Set(), canCreateChild: false,
+        onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+        mediaProgressByNodeId: new Map([['media-1', {
+          phase, phaseLabel: phase === 'running' ? '运行中' : '生成失败', hasAdoptedOutput: true,
+        }]]),
+      })
+
+      expect(nodes.find((node) => node.id === 'media-1')?.data).toMatchObject({
+        statusLabel: '已有素材', summary, mediaProgress: { phase, hasAdoptedOutput: true },
+      })
+    },
+  )
+
+  test('Given 音视频卡片已在画布 When 模块事件带来采用素材 Then 增量投影无需重建全图即可更新摘要', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'media-1', kind: 'video', title: '媒体', position: { x: 0, y: 0 }, mediaModuleId: 'media-module',
+    })
+    const flowNode = toNativeCanvasFlowNodes(document).find((node) => node.id === 'media-1')!
+    const canvasNode = document.nodes.find((node) => node.id === 'media-1')!
+    const patched = patchNativeCanvasFlowNodeRuntimeState(flowNode, canvasNode, {
+      nodeIssues: [], runningSessionIds: new Set(),
+      mediaProgressByNodeId: new Map([['media-1', {
+        phase: 'pending', phaseLabel: '已有素材', hasAdoptedOutput: true,
+      }]]),
+    })
+
+    expect(patched.data).toMatchObject({
+      statusLabel: '已有素材', summary: '已有可用素材',
+      mediaProgress: { phase: 'pending', hasAdoptedOutput: true },
+    })
+  })
 
   test.each([
     ['pending', 'idle'],
@@ -649,6 +716,18 @@ describe('原生 Canvas mutation', () => {
     })
   })
 
+  test('Given 全局已有未知比例图片 When 追加新节点 Then 落点与保守图片矩形保持最小间距', () => {
+    const nodes = [{ id: 'image', kind: 'image' as const, position: { x: 100, y: 40 } }]
+
+    const position = findNativeCanvasGlobalAppendPosition({ x: 0, y: 0 }, nodes)
+
+    expect(position).toEqual({
+      x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: 40,
+    })
+    expect(overlapsNativeCanvasNodes(position, nodes)).toBe(false)
+  })
+
   test('Given 来源右侧多个槽位已占用 When 扩展节点 Then 使用同一右侧紧凑区域的最近空槽', () => {
     const nodes = [
       { id: 'source', position: { x: -200, y: 40 } },
@@ -688,6 +767,26 @@ describe('原生 Canvas mutation', () => {
     })
   })
 
+  test('Given 源节点右侧是未知比例图片 When 创建同列兄弟 Then 越过图片最大占位高度', () => {
+    const nodes = [
+      { id: 'source', kind: 'agent' as const, position: { x: 100, y: 100 } },
+      {
+        id: 'image-blocker', kind: 'image' as const,
+        position: { x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP, y: 100 },
+      },
+    ]
+
+    expect(findAvailableNativeCanvasChildPosition('source', nodes)).toEqual({
+      x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+      y: 100 - NATIVE_CANVAS_NODE_HEIGHT - NATIVE_CANVAS_NODE_GAP,
+    })
+    expect(overlapsNativeCanvasNodes(
+      { x: 100 + NATIVE_CANVAS_NODE_WIDTH + NATIVE_CANVAS_NODE_GAP,
+        y: 100 - NATIVE_CANVAS_NODE_HEIGHT - NATIVE_CANVAS_NODE_GAP },
+      nodes,
+    )).toBe(false)
+  })
+
   test('Given 可视中心已有节点 When 添加 Agent Then 选择不重叠的相邻位置', () => {
     const visibleCenter = { x: 500, y: 300 }
     const centeredPosition = { x: 356, y: 228 }
@@ -697,6 +796,32 @@ describe('原生 Canvas mutation', () => {
     expect(findAvailableNativeCanvasNodePosition(visibleCenter, [
       { position: centeredPosition },
     ])).toEqual({ x: 668, y: 60 })
+  })
+
+  test('Given 可视中心落在未知比例图片潜在高度内 When 添加节点 Then 不使用视觉上暂为空闲的原锚点', () => {
+    const visibleCenter = { x: 500, y: 300 }
+    const centeredPosition = { x: 356, y: 228 }
+    const nodes = [{ id: 'image', kind: 'image' as const, position: { x: 356, y: 0 } }]
+
+    const position = findAvailableNativeCanvasNodePosition(visibleCenter, nodes)
+
+    expect(position).not.toEqual(centeredPosition)
+    expect(overlapsNativeCanvasNodes(position, nodes)).toBe(false)
+  })
+
+  test('Given 恢复时图片预览尚未加载 When 检查候选碰撞 Then 缺省使用最大高度且显式高度仍优先', () => {
+    const candidate = { x: 0, y: 200 }
+
+    expect(overlapsNativeCanvasNodes(candidate, [
+      { kind: 'image', position: { x: 0, y: 0 } },
+    ])).toBe(true)
+    expect(overlapsNativeCanvasNodes(candidate, [
+      { kind: 'image', position: { x: 0, y: 0 }, nodeHeight: NATIVE_CANVAS_NODE_HEIGHT },
+    ])).toBe(false)
+    expect(resolveNativeCanvasNodeSize({ kind: 'image' })).toEqual({
+      width: NATIVE_CANVAS_NODE_WIDTH,
+      height: NATIVE_CANVAS_NODE_HEIGHT,
+    })
   })
 
   test('Given 半网格节点阻塞中心候选 When 添加 Agent Then 寻找不重叠的相邻环槽', () => {

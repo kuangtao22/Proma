@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   CANVAS_IPC_CHANNELS,
+  DESIGN_IPC_CHANNELS,
   parseAdoptCanvasTextArtifactRevisionInput,
   parseCanvasTextArtifactIdentity,
   parseCanvasTextArtifactTarget,
@@ -132,12 +133,14 @@ import { createCanvasToolRun } from './canvas-tool-provider'
 import type { createCanvasTaskStore } from './canvas-task-store'
 import { CANVAS_TASK_WAIT_MAX_MS, paginateCanvasOperationRecords, type CanvasOperationToolHandlers } from './canvas-operation-tools'
 import type { CanvasTaskOperationService } from './canvas-task-operation-service'
+import { hasCanvasTextArtifactContent } from './canvas-text-artifact-content'
 import { waitForCanvasImageTaskTerminal } from './canvas-task-waiter'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasNodeReferenceResolver } from './canvas-node-reference-resolver'
 import type { CanvasAgentOutputService } from './canvas-agent-output-service'
 import type { CanvasAgentConfigStore } from './canvas-agent-config-store'
 import type { CanvasAgentExecutionService } from './canvas-agent-execution-service'
+import type { CanvasOrchestrationService } from './canvas-orchestration-service'
 import { requireCanvasAgentRunOwner } from './canvas-agent-run-policy'
 import {
   assertCreateCanvasAgentNodeInput,
@@ -275,6 +278,8 @@ export interface CanvasDocumentIpcOptions {
   mediaTools?: (context: CanvasToolRunContext) => CanvasToolRun
   /** 正式媒体检查复用 Host 可信素材入口与有界解码服务。 */
   mediaInspection?: CanvasToolProviderDependencies['mediaInspection']
+  /** 编排工具与 Renderer 读取复用主进程唯一持久服务。 */
+  orchestration?: CanvasOrchestrationService
 }
 
 /** Registry 中可执行统一导出的内部适配器。 */
@@ -1126,6 +1131,7 @@ export function registerCanvasDocumentIpcHandlers(
 ): CanvasDocumentIpcRegistration {
   /** CHANGED 仅用于 send，不注册 handler。 */
   const channels = [
+    DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
     CANVAS_IPC_CHANNELS.LOAD,
     CANVAS_IPC_CHANNELS.LOAD_TEXT_ARTIFACT,
     CANVAS_IPC_CHANNELS.UPDATE_TEXT_ARTIFACT,
@@ -1643,6 +1649,7 @@ export function registerCanvasDocumentIpcHandlers(
           },
           mediaTools: options.mediaTools,
           mediaInspection: options.mediaInspection,
+          ...(options.orchestration ? { orchestration: options.orchestration } : {}),
         }, context),
         documents: options.store,
         agentConfigs: options.agent.configs,
@@ -2006,14 +2013,37 @@ export function registerCanvasDocumentIpcHandlers(
           versions: page.entries, nextCursor: page.nextCursor, total: page.total }
       }
       const target = requireOperationTextTarget(input)
+      /** 固定查询开始时的图版本，异步读取后不能混入另一版节点事实。 */
+      const expectedCanvasRevision = document.revision
       const versions = await options.textArtifacts.listVersions(target)
       execution.validateAccess()
-      const page = paginateCanvasOperationRecords(versions.map((version) => ({
+      /** 初始正文不在后续提交目录中；仅当前为零时精确读取，不改变 UI 历史语义。 */
+      const initial = target.contentRevision === 0 ? await options.textArtifacts.read(target) : undefined
+      execution.validateAccess()
+      if (initial) {
+        if (initial.target.projectId !== target.projectId || initial.target.canvasId !== target.canvasId
+          || initial.target.nodeId !== target.nodeId || initial.target.kind !== target.kind
+          || initial.target.contentId !== target.contentId || initial.revision.kind !== target.kind
+          || initial.revision.contentId !== target.contentId) throw new Error('CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT')
+        if (initial.target.contentRevision !== 0 || initial.revision.revision !== 0) throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+        if (options.store.load(input).document.revision !== expectedCanvasRevision) throw new Error('CANVAS_REVISION_CONFLICT')
+        /** 同时复验节点归属和正文指针，避免异常恢复未推进图版本时泄露旧采用事实。 */
+        const currentTarget = requireOperationTextTarget(input)
+        if (currentTarget.kind !== target.kind || currentTarget.contentId !== target.contentId) throw new Error('CANVAS_TEXT_ARTIFACT_IDENTITY_CONFLICT')
+        if (currentTarget.contentRevision !== 0) throw new Error('CANVAS_ARTIFACT_REVISION_CONFLICT')
+      }
+      /** 可信初始读取覆盖兼容目录的同版本摘要；分页总数包含它，且不泄露合成作者。 */
+      const availableVersions = initial ? [initial.revision, ...versions.filter((version) => version.revision !== 0)] : versions
+      const page = paginateCanvasOperationRecords(availableVersions.map((version) => ({
         version: { kind: target.kind, revision: version.revision }, adopted: version.revision === target.contentRevision,
         createdAt: version.createdAt, contentHash: version.contentHash,
+        ...(initial && version.revision === 0 ? { initial: true,
+          contentState: hasCanvasTextArtifactContent(target.kind, initial.content) ? 'present' as const : 'empty' as const } : {}),
       })), `${input.projectId}/${input.canvasId}/${node.id}/${target.kind}`, input)
       return { canvasId: input.canvasId, nodeId: node.id, revision: document.revision, currentVersion: target.contentRevision,
-        versions: page.entries, nextCursor: page.nextCursor, total: page.total }
+        versions: page.entries, nextCursor: page.nextCursor, total: page.total,
+        ...(initial ? { nextAction: { tool: 'canvas_read', arguments: { canvasId: input.canvasId, nodeIds: [node.id] },
+          reason: '初始版本零是当前真实正文，历史为空不代表正文缺失；读取正文获取内容证据，列表本身不代表验收通过。' } } : {}) }
     }),
     readVersion: async (input, execution) => runArtifactReconciled(input, async () => {
       execution.validateAccess()
@@ -2100,6 +2130,16 @@ export function registerCanvasDocumentIpcHandlers(
       return { canvasId: input.canvasId, nodeId: input.nodeId, revision: result.snapshot.document.revision, rebuilt: true }
     },
   }
+
+  /** 编排 UI 读取只验证授权窗口和原生画布范围，不进入写事务或生命周期对账。 */
+  options.ipc.handle(DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION, (event, value) => invokeCanvasOperation('workflowRead', async () => {
+    assertAuthorizedSender(event, options)
+    /** 与 Canvas LOAD 共用 exact-key 目标解析，并通过原生 Store 复核项目及画布范围。 */
+    const target: CanvasTarget = parseLoadInput(value)
+    void (options.store.readSnapshot ?? options.store.load)(target)
+    if (!options.orchestration) throw new Error('CANVAS_ORCHESTRATION_UNAVAILABLE')
+    return options.orchestration.get(target)
+  }))
 
   /** 卡片活动读取不进入生命周期对账，正常进度只读取已维护的目标索引。 */
   options.ipc.handle(CANVAS_IPC_CHANNELS.LIST_IMAGE_ACTIVITY, (event, value) => invokeCanvasOperation('imageLoad', async () => {

@@ -25,6 +25,7 @@ import type { CanvasAgentOutputCommitResult } from './canvas-agent-output-servic
 import type { CanvasImageRunService } from './canvas-image-run-service'
 import type { CanvasWorkflowRunStore } from './canvas-workflow-run-store'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
+import type { CanvasExecutionOwnership } from './canvas-execution-ownership'
 import {
   createCanvasWorkflowNodeOperationId,
   createCanvasWorkflowNodeIdentityHash,
@@ -69,6 +70,8 @@ export interface CanvasWorkflowDeadlineHandle {
 
 /** 主进程工作流调度器依赖，只复用既有 Agent 与图片业务服务。 */
 export interface CanvasWorkflowExecutionServiceDependencies {
+  /** 生产组合与画布编排共用准入；查询、收集和取消不申请新的执行权。 */
+  executionOwnership?: CanvasExecutionOwnership
   load: (target: CanvasTarget) => CanvasDocument | Promise<CanvasDocument>
   validateAccess: (context: CanvasToolRunContext, canvasId: string) => void | Promise<void>
   isAgentBusy: (node: Extract<CanvasNode, { kind: 'agent' }>) => boolean
@@ -742,6 +745,8 @@ export function createCanvasWorkflowExecutionService(
     if (initialRun.cancelRequestedAt !== null) {
       return finalizeDurableCancellation(initialTarget, initialRun.id, now(), false)
     }
+    /** 恢复可能由后台直接调用，必须在模型/媒体外发之前验证同画布执行所有权。 */
+    dependencies.executionOwnership?.run(initialTarget, 'workflow', () => undefined)
     const releaseLease = dependencies.workflowRuns.acquireLease(initialTarget, initialRun.id)
     if (!releaseLease) return dependencies.workflowRuns.get(initialTarget, initialRun.id)
     const activeKey = `${initialRun.projectId}\0${initialRun.canvasId}`
@@ -1335,7 +1340,8 @@ export function createCanvasWorkflowExecutionService(
           const rootNode = document.nodes.find((node) => node.id === rootNodeId)
           if (rootNode?.kind === 'agent' && dependencies.isAgentBusy(rootNode)) throw new Error('SESSION_BUSY')
         }
-        const run = dependencies.workflowRuns.create({
+        /** 最后一次异步准备已结束，持久登记与另一套编排的准入检查不能交错。 */
+        const createRun = () => dependencies.workflowRuns!.create({
           ...target,
           operationId: toolCallId,
           owner: { sessionId: context.sessionId, runStartedAt: context.runStartedAt },
@@ -1347,9 +1353,14 @@ export function createCanvasWorkflowExecutionService(
           consumedMediaRuns: 0,
           autoResumeAfterAdoption: true,
         })
+        const run = dependencies.executionOwnership
+          ? dependencies.executionOwnership.run(target, 'workflow', createRun)
+          : createRun()
         notifyRunChanged(run)
         return projectDurableRunResult(await driveDurableRun(context, run, parentSignal))
       }
+      /** 共用准入的生产实例必须有可恢复 journal，不能降级到不持久的兼容执行器。 */
+      if (dependencies.executionOwnership) throw new Error('CANVAS_WORKFLOW_RUN_STORE_UNAVAILABLE')
       /** 目标身份只来自父运行项目和已解析输入 Canvas。 */
       const target = { projectId: context.projectId, canvasId: input.canvasId }
       const activeKey = `${target.projectId}\0${target.canvasId}`
@@ -1683,6 +1694,10 @@ export function createCanvasWorkflowExecutionService(
       let run = dependencies.workflowRuns.get(input, input.runId)
       if (run.owner.sessionId !== context.sessionId) {
         throw new Error('CANVAS_WORKFLOW_RUN_OWNER_INVALID')
+      }
+      /** 预算修订也不能先于执行准入；明确取消的收敛仍可绕过竞争阻断。 */
+      if (run.status !== 'completed' && run.status !== 'cancelled' && run.cancelRequestedAt === null && !signal?.aborted) {
+        dependencies.executionOwnership?.run(input, 'workflow', () => undefined)
       }
       if (hasAmendment) {
         if (signal?.aborted) throw new Error('CANVAS_WORKFLOW_ABORTED')

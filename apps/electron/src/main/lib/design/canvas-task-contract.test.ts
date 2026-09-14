@@ -3,6 +3,8 @@ import {
   createCanvasTaskContract,
   type CanvasTaskEvidence,
   type CanvasTaskOperationReceipt,
+  type CanvasTaskPendingOperation,
+  type CanvasTaskRejectedOperation,
 } from './canvas-task-contract'
 
 /** 同一权威文档版本的最小产物证据；测试不访问真实项目。 */
@@ -108,6 +110,94 @@ describe('Canvas 任务交付合同', () => {
       after: { canvasId: 'canvas', nodeId: 'other-doc', nodeKind: 'document', validation: 'content', identity: 'other-v1' },
     })).toThrow('CANVAS_TASK_OPERATION_CONFLICT')
     expect(task.status().pendingOperationIds).toEqual(['create-doc'])
+  })
+
+  test('Given Host在创建事务前确定拒绝 When 登记同一操作拒绝回执 Then 清除未决状态并允许恢复原合同', async () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-rejected', verify: async () => true })
+    const requirements = [{
+      id: 'created-doc', description: '创建文档', nodeKind: 'document' as const,
+      change: 'created' as const, validation: 'content' as const,
+    }]
+    const baseline = { nodeIds: ['source-doc'], evidence: [] }
+    task.start('canvas', requirements, baseline)
+    const pending = {
+      status: 'pending', operationId: 'create-doc', sourceToolCallId: 'tool-create-doc', startedAt: 10,
+      taskId: 'task-rejected', canvasId: 'canvas', kind: 'created', nodeKind: 'document',
+    } satisfies CanvasTaskPendingOperation
+    const rejected: CanvasTaskRejectedOperation = {
+      ...pending, status: 'rejected', reasonCode: 'SOURCE_NODE_REQUIRED',
+    }
+    task.recordOperation(pending)
+    task.block('blocked', '创建参数在事务前被拒绝')
+
+    task.recordOperation(rejected)
+    task.recordOperation(rejected)
+    expect(task.status()).toMatchObject({
+      phase: 'blocked', pendingOperationIds: [],
+      operationReceipts: [{ operationId: 'create-doc', status: 'rejected', kind: 'created' }],
+    })
+    await expect(task.recover(new AbortController().signal)).resolves.toMatchObject({ phase: 'working' })
+    expect(task.exportState()).toMatchObject({ requirements, baseline, bindings: [] })
+  })
+
+  test('Given rejected是无副作用终态 When 篡改、跨任务、伪造完成或绑定 Then 全部拒绝', () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-rejected-terminal', verify: async () => true })
+    task.start('canvas', [{
+      id: 'created-doc', description: '创建文档', nodeKind: 'document', change: 'created', validation: 'content',
+    }], { nodeIds: [], evidence: [] })
+    const pending = {
+      status: 'pending', operationId: 'create-doc', sourceToolCallId: 'tool-create-doc', startedAt: 10,
+      taskId: 'task-rejected-terminal', canvasId: 'canvas', kind: 'created',
+    } satisfies CanvasTaskPendingOperation
+    task.recordOperation(pending)
+    task.recordOperation({ ...pending, status: 'rejected', reasonCode: 'SOURCE_NODE_REQUIRED' })
+
+    expect(() => task.recordOperation({
+      ...pending, status: 'rejected', reasonCode: 'DIFFERENT_REASON',
+    })).toThrow('CANVAS_TASK_OPERATION_CONFLICT')
+    expect(() => task.recordOperation({
+      ...pending, status: 'rejected', nodeId: 'invented-doc', reasonCode: 'SOURCE_NODE_REQUIRED',
+    })).toThrow('CANVAS_TASK_OPERATION_CONFLICT')
+    expect(() => task.recordOperation({
+      ...pending, status: 'rejected', taskId: 'task-other', reasonCode: 'SOURCE_NODE_REQUIRED',
+    })).toThrow('CANVAS_TASK_OPERATION_TASK_MISMATCH')
+    expect(() => task.recordOperation({
+      ...pending, status: 'completed', nodeId: 'invented-doc', nodeKind: 'document',
+      after: {
+        canvasId: 'canvas', nodeId: 'invented-doc', nodeKind: 'document',
+        validation: 'content', identity: 'invented-v1',
+      },
+    })).toThrow('CANVAS_TASK_OPERATION_CONFLICT')
+    expect(() => task.rebind({ requirementId: 'created-doc', operationId: 'create-doc' }))
+      .toThrow('CANVAS_TASK_REBIND_NOT_ALLOWED')
+  })
+
+  test('Given 非法拒绝回执 When Host登记 Then 拒绝非创建操作、无界原因和伪造产物字段', () => {
+    const task = createCanvasTaskContract({ required: true, taskId: 'task-invalid-rejected', verify: async () => true })
+    task.start('canvas', [existingRequirement])
+    const updatedPending: CanvasTaskOperationReceipt = {
+      status: 'pending', operationId: 'update-doc', sourceToolCallId: 'tool-update-doc', startedAt: 10,
+      taskId: 'task-invalid-rejected', canvasId: 'canvas', kind: 'updated', nodeId: 'doc', nodeKind: 'document',
+      before: evidence,
+    }
+    task.recordOperation(updatedPending)
+
+    expect(() => task.recordOperation({
+      ...updatedPending, status: 'rejected', reasonCode: 'PRECONDITION_FAILED',
+    } as CanvasTaskRejectedOperation)).toThrow('CANVAS_TASK_OPERATION_INVALID')
+    expect(() => task.recordOperation({
+      status: 'rejected', operationId: 'invalid-reason', sourceToolCallId: 'tool-invalid-reason', startedAt: 11,
+      taskId: 'task-invalid-rejected', canvasId: 'canvas', kind: 'created', reasonCode: '',
+    })).toThrow('CANVAS_TASK_OPERATION_INVALID')
+    expect(() => task.recordOperation({
+      status: 'rejected', operationId: 'oversized-reason', sourceToolCallId: 'tool-oversized-reason', startedAt: 11,
+      taskId: 'task-invalid-rejected', canvasId: 'canvas', kind: 'created', reasonCode: 'R'.repeat(129),
+    })).toThrow('CANVAS_TASK_OPERATION_INVALID')
+    expect(() => task.recordOperation({
+      status: 'rejected', operationId: 'forged-after', sourceToolCallId: 'tool-forged-after', startedAt: 12,
+      taskId: 'task-invalid-rejected', canvasId: 'canvas', kind: 'created', reasonCode: 'REJECTED',
+      after: { ...evidence, nodeId: 'forged-doc' },
+    } as CanvasTaskRejectedOperation)).toThrow('CANVAS_TASK_OPERATION_INVALID')
   })
 
   test('Given 未知来源或旧任务回执 When 修正绑定 Then 拒绝且保留阻断状态', () => {
@@ -458,6 +548,9 @@ describe('Canvas 任务交付合同', () => {
 
     await expect(task.recover(new AbortController().signal))
       .rejects.toThrow('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED')
-    expect(task.status()).toMatchObject({ phase: 'blocked', pendingOperationIds: ['operation-pending-document'] })
+    expect(task.status()).toMatchObject({
+      phase: 'blocked', pendingOperationIds: ['operation-pending-document'],
+      recoverableSteps: ['status', 'resume', 'rebind', 'recover', 'complete'],
+    })
   })
 })

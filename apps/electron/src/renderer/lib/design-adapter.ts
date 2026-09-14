@@ -8,6 +8,7 @@ import {
   parseCanvasRunWorkflowResult,
   parseCanvasWorkflowRun,
   parseCanvasWorkflowRunPage,
+  parseCanvasOrchestrationRecord,
   parseCanvasWorkspaceSnapshot,
 } from '@proma/shared'
 import type {
@@ -49,6 +50,8 @@ import type {
   CanvasWorkflowRunListInput,
   CanvasWorkflowRunPage,
   CanvasWorkflowRunTarget,
+  CanvasOrchestrationChangedEvent,
+  CanvasOrchestrationRecord,
   CanvasWebviewSnapshot,
   CanvasWebviewTarget,
   CanvasWebviewPreviewSnapshot,
@@ -190,6 +193,13 @@ export interface DesignAdapter extends CanvasMediaPreloadApi,
     target: CanvasTarget,
     listener: (event: CanvasChangeEvent) => void,
   ) => ReturnType<DesignPreloadApi['onCanvasChanged']>
+  /** 轻量读取当前画布的持久编排记录。 */
+  getCanvasOrchestration: (input: CanvasTarget) => Promise<CanvasOrchestrationRecord | null>
+  /** 只向监听器传递当前项目与 Canvas 的独立编排变化。 */
+  onCanvasOrchestrationChanged: (
+    target: CanvasTarget,
+    listener: (event: CanvasOrchestrationChangedEvent) => void,
+  ) => ReturnType<DesignPreloadApi['onCanvasOrchestrationChanged']>
   /** 分页读取当前普通 Agent 的工作流历史。 */
   listCanvasWorkflowRuns: (input: CanvasWorkflowRunListInput) => Promise<CanvasWorkflowRunPage>
   /** 读取当前普通 Agent 拥有的单个工作流运行。 */
@@ -495,6 +505,31 @@ async function loadCanvasWorkflowValue<T>(
   }
 }
 
+/** 读取并严格重建当前画布的可空编排记录。 */
+async function loadCanvasOrchestrationValue(
+  api: PartialDesignApi,
+  input: CanvasTarget,
+): Promise<CanvasOrchestrationRecord | null> {
+  try {
+    const value = await callCanvasApi(
+      () => requireMethod(api, 'getCanvasOrchestration')(input),
+      CANVAS_ADAPTER_FALLBACKS.workflow,
+    )
+    if (value === null) return null
+    const record = parseCanvasOrchestrationRecord(value)
+    if (record.projectId !== input.projectId || record.canvasId !== input.canvasId) {
+      throw new Error('CANVAS_ORCHESTRATION_TARGET_MISMATCH')
+    }
+    return record
+  } catch (error) {
+    if (error instanceof CanvasPublicOperationError) throw error
+    throw new CanvasPublicOperationError(
+      CANVAS_ADAPTER_FALLBACKS.workflow.code,
+      CANVAS_ADAPTER_FALLBACKS.workflow.message,
+    )
+  }
+}
+
 /** 创建负责 Canvas 安全解包与 legacy Design 原样适配的 renderer adapter。 */
 export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
   /** 只合并相同精确目标的在途正文读取，settle 后立即清理。 */
@@ -759,6 +794,13 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
       new Set([target.canvasId]),
       listener,
     ),
+    getCanvasOrchestration: (input) => loadCanvasOrchestrationValue(api, input),
+    onCanvasOrchestrationChanged: (target, listener) => {
+      const release = requireMethod(api, 'onCanvasOrchestrationChanged')((event) => {
+        if (event.projectId === target.projectId && event.canvasId === target.canvasId) listener(event)
+      })
+      return makeIdempotentAdapterRelease(release)
+    },
     listCanvasWorkflowRuns: (input) => loadCanvasWorkflowValue(
       () => requireMethod(api, 'listCanvasWorkflowRuns')(input), parseCanvasWorkflowRunPage,
     ),

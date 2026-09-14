@@ -21,6 +21,38 @@ function createRecordingIpc() {
 }
 
 describe('Design preload', () => {
+  test('Given 编排读取与变化事件 When 经过 Preload Then 只传公开目标并拒绝未知事件字段', async () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    const received: unknown[] = []
+    const release = api.onCanvasOrchestrationChanged((event) => received.push(event))
+
+    await api.getCanvasOrchestration({ projectId: 'project-1', canvasId: 'canvas-1', credential: 'secret' } as never)
+    const change = { projectId: 'project-1', canvasId: 'canvas-1', revision: 3 }
+    recorded.added[0]?.listener({} as IpcRendererEvent, change)
+    recorded.added[0]?.listener({} as IpcRendererEvent, { ...change, internalPath: '/tmp/private' })
+    release()
+    release()
+
+    expect(recorded.invokes).toEqual([{
+      channel: DESIGN_IPC_CHANNELS.GET_CANVAS_ORCHESTRATION,
+      args: [{ projectId: 'project-1', canvasId: 'canvas-1' }],
+    }])
+    expect(received).toEqual([change])
+    expect(recorded.added[0]?.channel).toBe(DESIGN_IPC_CHANNELS.CANVAS_ORCHESTRATION_CHANGED)
+    expect(recorded.removed).toHaveLength(1)
+  })
+
+  test('Given 编排变化消费者抛错 When 事件合法 Then 不吞掉消费者异常', () => {
+    const recorded = createRecordingIpc()
+    const api = createDesignPreloadApi(recorded.ipc)
+    api.onCanvasOrchestrationChanged(() => { throw new Error('consumer failed') })
+
+    expect(() => recorded.added[0]?.listener({} as IpcRendererEvent, {
+      projectId: 'project-1', canvasId: 'canvas-1', revision: 1,
+    })).toThrow('consumer failed')
+  })
+
   test('Given 工作流历史 API When 调用 Then 只向固定通道发送 session 绑定的公开字段', async () => {
     const recorded = createRecordingIpc()
     const api = createDesignPreloadApi(recorded.ipc)

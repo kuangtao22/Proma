@@ -8,6 +8,7 @@ import type {
   CanvasImageModuleSnapshot,
   CanvasImageModuleChangedEvent,
   CanvasWorkflowRun,
+  CanvasOrchestrationRecord,
   DesignJobRecord,
   SaveDesignMutationsInput,
 } from '@proma/shared'
@@ -39,6 +40,58 @@ function createWorkflowRun(): CanvasWorkflowRun {
 }
 
 describe('Design renderer adapter', () => {
+  test('Given 编排 Preload 合同 When 读取与订阅 Then 严格重建记录并按当前画布过滤事件', async () => {
+    const record = {
+      schemaVersion: 1, id: 'orchestration-1', revision: 2,
+      projectId: 'project-1', canvasId: 'canvas-1', ownerSessionId: 'session-1',
+      request: { requestId: 'request-1', goal: '完成 UI', intent: 'design', constraints: [], referenceNodeIds: [], deliverables: [] },
+      coordinatorNodeId: null, coordinatorSessionId: null, status: 'planning', steps: [],
+      summary: '规划中', runStartedAt: null, createdAt: 1, updatedAt: 1,
+    } satisfies CanvasOrchestrationRecord
+    let listener: ((event: { projectId: string; canvasId: string; revision: number }) => void) | undefined
+    const received: unknown[] = []
+    let releases = 0
+    const adapter = createDesignAdapter({
+      getCanvasOrchestration: async () => ({ ok: true, value: record }),
+      onCanvasOrchestrationChanged: (nextListener) => {
+        listener = nextListener
+        return () => { releases += 1 }
+      },
+    })
+
+    expect(await adapter.getCanvasOrchestration(record)).toEqual(record)
+    expect(await adapter.getCanvasOrchestration(record)).not.toBe(record)
+    const release = adapter.onCanvasOrchestrationChanged(record, (event) => received.push(event))
+    listener?.({ projectId: 'project-2', canvasId: 'canvas-1', revision: 3 })
+    listener?.({ projectId: 'project-1', canvasId: 'canvas-1', revision: 3 })
+    release()
+    release()
+
+    expect(received).toEqual([{ projectId: 'project-1', canvasId: 'canvas-1', revision: 3 }])
+    expect(releases).toBe(1)
+  })
+
+  test('Given 编排返回夹带未知字段 When Renderer adapter 接收 Then 转为固定公开错误', async () => {
+    const adapter = createDesignAdapter({
+      getCanvasOrchestration: async () => ({
+        ok: true,
+        value: {
+          schemaVersion: 1, id: 'orchestration-1', revision: 1,
+          projectId: 'project-1', canvasId: 'canvas-1', ownerSessionId: 'session-1',
+          request: { requestId: 'request-1', goal: '完成 UI', intent: 'design', constraints: [], referenceNodeIds: [], deliverables: [] },
+          coordinatorNodeId: null, coordinatorSessionId: null, status: 'planning', steps: [],
+          summary: '规划中', runStartedAt: null, createdAt: 1, updatedAt: 1,
+          internalPath: '/Users/private/orchestration.json',
+        } as never,
+      }),
+    })
+
+    await expect(adapter.getCanvasOrchestration({ projectId: 'project-1', canvasId: 'canvas-1' }))
+      .rejects.toMatchObject({
+        code: 'CANVAS_WORKFLOW_FAILED', message: '工作流运行暂时无法处理，请重试。',
+      })
+  })
+
   test('Given 新旧媒体 bridge When 经 renderer 读取来源与准备 Then 只走独立只读通道且不回退 LOAD', async () => {
     /** 捕获实际 preload 通道，避免把可能默认采用的 LOAD 当作只读配置。 */
     const calls: Array<{ channel: string; input: unknown }> = []

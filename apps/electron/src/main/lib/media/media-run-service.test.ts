@@ -62,6 +62,8 @@ function harness(options: HarnessOptions = {}) {
     ] } }, 1)
   configuration.saveProfile({ id: 'preset', name: '图片', connectionId: 'gpu', workflowId: 'wf', workflowRevision: 1, mediaKind: 'image', projectId: 'project-a', enabled: true }, 2)
   const calls = { upload: 0, submit: 0, download: 0, register: 0, cancel: 0 }
+  /** 记录服务在各阶段申请的授权语义，避免取消复用新执行权限。 */
+  const authorizations: string[] = []
   /** 远端 input/output 文件的按路径内容。 */
   const remoteFiles = new Map<string, Uint8Array>()
   /** 上传请求的关键参数，用于验证恢复沿用原计划。 */
@@ -126,7 +128,7 @@ function harness(options: HarnessOptions = {}) {
     configuration,
     assertOutputSupport: options.assertOutputSupport,
     getRunsDirectory: (projectId: string) => join(rootDirectory, projectId, 'runs'),
-    authorize: (_projectId: string, _operation: string) => undefined,
+    authorize: (_projectId: string, operation: string) => { authorizations.push(operation) },
     readAsset: async () => imageBytes,
     registerOutput: async (_projectId: string, operationId: string) => {
       calls.register += 1
@@ -136,7 +138,7 @@ function harness(options: HarnessOptions = {}) {
     createClient: () => client,
   }
   const create = () => new MediaRunService(dependencies)
-  return { create, calls, configuration, uploadRequests, viewRequests, registeredOperations,
+  return { create, calls, authorizations, configuration, uploadRequests, viewRequests, registeredOperations,
     getRecordedPrompt: () => structuredClone(recordedPrompt),
     setUnknown: () => { unknownSubmission = true }, setUploadFailureMode: (value: UploadFailureMode) => { uploadFailureMode = value },
     setAcceptedNodeErrors: (value: JsonObject) => { acceptedNodeErrors = structuredClone(value) },
@@ -172,6 +174,17 @@ beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'proma-media-run-')) }
 afterEach(() => { rmSync(directory, { recursive: true, force: true }) })
 
 describe('媒体运行完整链路', () => {
+  test('Given 真实画布编排媒体来源 When 准备后重新读取 Then 保留固定画布身份且不接受缺失节点的来源', async () => {
+    const fixture = harness()
+    const actor = { sessionId: 'coordinator', runStartedAt: 10, mode: 'canvas-orchestrator' as const, canvasId: 'canvas', nodeId: 'agent' }
+    const prepared = await fixture.create().prepare(input(), { actor })
+    expect(fixture.create().getOrigin('project-a', prepared.id)).toEqual({ actor })
+    expect(fixture.calls.submit).toBe(0)
+    const invalid = await fixture.create().prepare({ ...input(), operationId: 'invalid-origin' }, {
+      actor: { ...actor, nodeId: undefined },
+    })
+    expect(() => fixture.create().getOrigin('project-a', invalid.id)).toThrow('MEDIA_RUN_INVALID')
+  })
   test('Given 远端 Loader 文件枚举 When 新素材尚未上传 Then 可准备并用实际回执填充且只提交一次', async () => {
     /** 模拟真实 ComfyUI 的文件列表，不使用 STRING 简化 Loader 合同。 */
     const fixture = harness({ resourceEnum: true })
@@ -480,8 +493,10 @@ describe('媒体运行完整链路', () => {
   test('Given 尚未提交的准备 When 用户取消 Then 保留取消事实且后续不提交', async () => {
     const fixture = harness()
     const prepared = await fixture.create().prepare(input())
+    fixture.authorizations.length = 0
     const cancelled = await fixture.create().cancel('project-a', prepared.id)
     expect(cancelled.phase).toBe('cancelled')
+    expect(fixture.authorizations).toEqual(['cancel', 'cancel'])
     expect((await fixture.create().advance('project-a', prepared.id, cancelled.revision)).phase).toBe('cancelled')
     expect(fixture.calls.submit).toBe(0)
   })

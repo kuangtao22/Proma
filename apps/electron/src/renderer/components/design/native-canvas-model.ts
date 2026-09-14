@@ -1,10 +1,16 @@
 import {
   applyCanvasMutations,
+  CANVAS_IMAGE_NODE_MAX_HEIGHT,
+  CANVAS_IMAGE_NODE_WIDTH,
+  CANVAS_IMAGE_NODE_HEADER_HEIGHT,
+  CANVAS_IMAGE_PREVIEW_MIN_HEIGHT,
+  CANVAS_IMAGE_PREVIEW_MAX_HEIGHT,
   CANVAS_UNBOUND_PORT,
   createCanvasBoundEdge,
   createCanvasLayoutSpatialIndex,
   findCompactCanvasSlot,
   resolveCanvasEdgeBinding,
+  resolveCanvasImageNodeHeight,
 } from '@proma/shared'
 import type {
   CanvasLayoutRect,
@@ -41,7 +47,7 @@ const CANVAS_EDGE_RELATION_LABELS: Readonly<Record<CanvasEdgeRelation, string>> 
 }
 
 /** 首版原生 Canvas 节点固定宽度，避免状态变化引发重排。 */
-export const NATIVE_CANVAS_NODE_WIDTH = 288
+export const NATIVE_CANVAS_NODE_WIDTH = CANVAS_IMAGE_NODE_WIDTH
 /** 首版原生 Canvas 节点固定高度。 */
 export const NATIVE_CANVAS_NODE_HEIGHT = 144
 /** 网页 WebView 卡片固定宽度。 */
@@ -53,11 +59,11 @@ export const NATIVE_CANVAS_WEBVIEW_MOBILE_WIDTH = 232
 /** 手机 WebView 卡片固定高度。 */
 export const NATIVE_CANVAS_WEBVIEW_MOBILE_HEIGHT = 578
 /** 生图卡片标题栏固定高度，预览比例只改变内容区。 */
-export const NATIVE_CANVAS_NODE_HEADER_HEIGHT = 48
+export const NATIVE_CANVAS_NODE_HEADER_HEIGHT = CANVAS_IMAGE_NODE_HEADER_HEIGHT
 /** 极宽图片仍保留可辨识的最小预览高度。 */
-export const NATIVE_CANVAS_IMAGE_PREVIEW_MIN_HEIGHT = 96
+export const NATIVE_CANVAS_IMAGE_PREVIEW_MIN_HEIGHT = CANVAS_IMAGE_PREVIEW_MIN_HEIGHT
 /** 极长图片限制预览高度，避免单个节点占满画布。 */
-export const NATIVE_CANVAS_IMAGE_PREVIEW_MAX_HEIGHT = 320
+export const NATIVE_CANVAS_IMAGE_PREVIEW_MAX_HEIGHT = CANVAS_IMAGE_PREVIEW_MAX_HEIGHT
 /** 新增节点之间保留的最小间距，避免边框与选中环相互遮挡。 */
 export const NATIVE_CANVAS_NODE_GAP = 24
 /** 新节点避让只依赖已有节点的持久化位置。 */
@@ -113,13 +119,29 @@ export function resolveNativeCanvasNodeSize(
   return { width: explicitWidth ?? preset.width, height: explicitHeight ?? preset.height }
 }
 
+/**
+ * 解析创建与恢复选址使用的保守碰撞尺寸。
+ * @param node 持久节点或带显式投影尺寸的候选节点。
+ * @returns 图片预览未知时预留最大合法高度；显式高度与其它类型保持原尺寸。
+ */
+function resolveNativeCanvasPlacementNodeSize(
+  node: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'>,
+): NativeCanvasNodeSize {
+  const size = resolveNativeCanvasNodeSize(node)
+  /** Renderer 已知的有限正高度优先，避免保守占位覆盖真实投影几何。 */
+  const hasExplicitHeight = Number.isFinite(node.nodeHeight) && (node.nodeHeight ?? 0) > 0
+  return node.kind === 'image' && !hasExplicitHeight
+    ? { ...size, height: CANVAS_IMAGE_NODE_MAX_HEIGHT }
+    : size
+}
+
 /** 将 Renderer 已知节点转换为共享布局矩形。 */
 function toNativeCanvasLayoutRects(
   nodes: ReadonlyArray<NativeCanvasPositionedNode>,
 ): CanvasLayoutRect[] {
   return nodes.map((node, index) => {
     /** 动态图片和 WebView 尺寸只在此处解析一次。 */
-    const size = resolveNativeCanvasNodeSize(node)
+    const size = resolveNativeCanvasPlacementNodeSize(node)
     /** 无 ID 的旧调用使用稳定数组序号，仅用于本次内存碰撞查询。 */
     const id = 'id' in node && typeof node.id === 'string' ? node.id : `node-${index}`
     return { id, ...node.position, ...size }
@@ -147,7 +169,7 @@ export function findNativeCanvasGlobalAppendPosition(
   /** 一次线性扫描得到全局最右边界，独立于当前 viewport。 */
   let maxRight = Number.NEGATIVE_INFINITY
   for (const node of nodes) {
-    const nodeSize = resolveNativeCanvasNodeSize(node)
+    const nodeSize = resolveNativeCanvasPlacementNodeSize(node)
     maxRight = Math.max(maxRight, node.position.x + nodeSize.width)
   }
   /** 顶部新增始终固定在全局最右侧的新列。 */
@@ -171,12 +193,12 @@ export function findNativeCanvasGlobalAppendPosition(
 export function overlapsNativeCanvasNodes(
   candidate: DesignPoint,
   nodes: ReadonlyArray<NativeCanvasPositionedNode>,
-  candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset'> = {},
+  candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'> = {},
 ): boolean {
   /** 候选尺寸与既有节点尺寸共同决定真实矩形是否侵入最小间距。 */
-  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  const candidateSize = resolveNativeCanvasPlacementNodeSize(candidateNode)
   return nodes.some((node) => {
-    const nodeSize = resolveNativeCanvasNodeSize(node)
+    const nodeSize = resolveNativeCanvasPlacementNodeSize(node)
     return candidate.x < node.position.x + nodeSize.width + NATIVE_CANVAS_NODE_GAP
       && candidate.x + candidateSize.width + NATIVE_CANVAS_NODE_GAP > node.position.x
       && candidate.y < node.position.y + nodeSize.height + NATIVE_CANVAS_NODE_GAP
@@ -301,6 +323,27 @@ export type NativeCanvasFlowNode =
   | NativeCanvasDocumentFlowNode
   | NativeCanvasWebviewFlowNode
 
+/** 根据采用素材与独立运行阶段生成音视频卡片的静态素材摘要。 */
+function projectCanvasMediaCardStatus(
+  kind: 'audio' | 'video',
+  mediaProgress: MediaRunProgressProjection | undefined,
+): { statusLabel: string; summary: string } {
+  /** 已采用只证明素材可用；生成阶段描述当前或最近的新任务，不提升为验收结论。 */
+  if (mediaProgress?.hasAdoptedOutput) {
+    if (mediaProgress.phase === 'pending') return { statusLabel: '已有素材', summary: '已有可用素材' }
+    if (mediaProgress.phase === 'prepared') return { statusLabel: '已有素材', summary: '已有素材，新版本等待执行' }
+    if (mediaProgress.phase === 'failed') return { statusLabel: '已有素材', summary: '已有素材，新版本生成失败' }
+    if (mediaProgress.phase === 'cancelled') return { statusLabel: '已有素材', summary: '已有素材，新版本已取消' }
+    if (mediaProgress.phase === 'succeeded') return { statusLabel: '已有素材', summary: '已有素材，新版本生成完成' }
+    return { statusLabel: '已有素材', summary: '已有素材，正在生成新版本' }
+  }
+  const succeeded = mediaProgress?.phase === 'succeeded'
+  return {
+    statusLabel: succeeded ? '已有结果' : '待创作',
+    summary: succeeded ? '已有生成结果' : kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
+  }
+}
+
 /**
  * 只更新单个节点的运行时展示字段，保留 XYFlow 已附加的局部状态。
  * @param flowNode 当前 XYFlow 节点，可能包含拖动和测量字段。
@@ -348,13 +391,11 @@ export function patchNativeCanvasFlowNodeRuntimeState(
     data.statusLabel = statusLabel
     data.summary = summary
   } else if ((canvasNode.kind === 'audio' || canvasNode.kind === 'video') && flowNode.type === 'canvasMedia') {
-    /** 音视频节点只在成功阶段展示已有结果，其余阶段继续显示待创作。 */
+    /** 音视频素材事实与新生成阶段分别投影，运行失败不会抹掉旧素材。 */
     changed = changed || data.mediaProgress !== mediaProgress
     if (mediaProgress) data.mediaProgress = mediaProgress
     else delete data.mediaProgress
-    const succeeded = mediaProgress?.phase === 'succeeded'
-    const statusLabel = succeeded ? '已有结果' : '待创作'
-    const summary = succeeded ? '已有生成结果' : canvasNode.kind === 'audio' ? '尚未生成音频' : '尚未生成视频'
+    const { statusLabel, summary } = projectCanvasMediaCardStatus(canvasNode.kind, mediaProgress)
     changed = changed || data.statusLabel !== statusLabel || data.summary !== summary
     data.statusLabel = statusLabel
     data.summary = summary
@@ -370,19 +411,7 @@ export function patchNativeCanvasFlowNodeRuntimeState(
 export function resolveNativeCanvasImageNodeHeight(
   preview?: Pick<CanvasImagePreview, 'width' | 'height'>,
 ): number {
-  if (!preview
-    || !Number.isFinite(preview.width)
-    || !Number.isFinite(preview.height)
-    || preview.width <= 0
-    || preview.height <= 0) return NATIVE_CANVAS_NODE_HEIGHT
-  /** 按固定节点宽度换算的原始预览高度。 */
-  const proportionalHeight = NATIVE_CANVAS_NODE_WIDTH * preview.height / preview.width
-  /** 受限预览高度同时避免极宽图不可见和极长图撑乱画布。 */
-  const previewHeight = Math.min(
-    NATIVE_CANVAS_IMAGE_PREVIEW_MAX_HEIGHT,
-    Math.max(NATIVE_CANVAS_IMAGE_PREVIEW_MIN_HEIGHT, proportionalHeight),
-  )
-  return NATIVE_CANVAS_NODE_HEADER_HEIGHT + previewHeight
+  return resolveCanvasImageNodeHeight(preview)
 }
 
 /**
@@ -419,7 +448,7 @@ export function findAvailableNativeCanvasNodePosition(
   candidateNode: Pick<NativeCanvasPositionedNode, 'kind' | 'devicePreset' | 'nodeWidth' | 'nodeHeight'> = {},
 ): DesignPoint {
   /** 候选真实尺寸决定其左上角如何围绕视口中心布局。 */
-  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  const candidateSize = resolveNativeCanvasPlacementNodeSize(candidateNode)
   /** 视口中心转换为候选左上角锚点，避免不同类型视觉中心偏移。 */
   const anchor = {
     x: visibleCenter.x - candidateSize.width / 2,
@@ -451,13 +480,13 @@ export function findAvailableNativeCanvasChildPosition(
   const source = nodes.find((node) => node.id === sourceNodeId)
   if (!source) throw new Error('Canvas 扩展源节点不存在')
   /** 扩展默认从源节点正右侧开始。 */
-  const sourceSize = resolveNativeCanvasNodeSize(source)
+  const sourceSize = resolveNativeCanvasPlacementNodeSize(source)
   const start = {
     x: source.position.x + sourceSize.width + NATIVE_CANVAS_NODE_GAP,
     y: source.position.y,
   }
   /** 目标类型的真实尺寸参与同源兄弟槽位避让。 */
-  const candidateSize = resolveNativeCanvasNodeSize(candidateNode)
+  const candidateSize = resolveNativeCanvasPlacementNodeSize(candidateNode)
   return findCompactCanvasSlot(
     createCanvasLayoutSpatialIndex(toNativeCanvasLayoutRects(nodes), NATIVE_CANVAS_NODE_GAP),
     {
@@ -606,6 +635,8 @@ export function toNativeCanvasFlowNodes(
       }
     }
     if (node.kind === 'audio' || node.kind === 'video') {
+      /** 完整投影与增量 patch 共享同一素材和运行状态语义。 */
+      const mediaCardStatus = projectCanvasMediaCardStatus(node.kind, mediaProgress)
       return {
         ...base,
         type: 'canvasMedia',
@@ -615,10 +646,8 @@ export function toNativeCanvasFlowNodes(
           title: node.title,
           mediaModuleId: node.mediaModuleId,
           activityState,
-          statusLabel: mediaProgress?.phase === 'succeeded' ? '已有结果' : '待创作',
-          summary: mediaProgress?.phase === 'succeeded'
-            ? '已有生成结果'
-            : node.kind === 'audio' ? '尚未生成音频' : '尚未生成视频',
+          statusLabel: mediaCardStatus.statusLabel,
+          summary: mediaCardStatus.summary,
           ...(mediaProgress ? { mediaProgress } : {}),
           canOpenWorkbench: true,
           onOpenWorkbench: options.onWorkbenchNodeChange,

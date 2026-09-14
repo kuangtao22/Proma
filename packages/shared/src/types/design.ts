@@ -638,6 +638,8 @@ export type DesignChangeEvent = {
 
 /** Design 专用 IPC 通道，避免与会话和文件预览通道混用。 */
 export const DESIGN_IPC_CHANNELS = {
+  GET_CANVAS_ORCHESTRATION: 'design:get-canvas-orchestration',
+  CANVAS_ORCHESTRATION_CHANGED: 'design:canvas-orchestration-changed',
   LIST_CANVAS_SESSIONS: 'design:list-canvas-sessions',
   ENSURE_LEGACY_CANVAS_SESSION: 'design:ensure-legacy-canvas-session',
   CREATE_CANVAS_SESSION: 'design:create-canvas-session',

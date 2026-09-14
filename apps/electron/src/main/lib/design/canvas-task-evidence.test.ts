@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { describe, expect, test } from 'bun:test'
 import type { CanvasNode } from '@proma/shared'
 import type { CanvasToolProviderDependencies } from './canvas-tool-provider'
-import { createCanvasTaskEvidence, resolveCanvasTaskEvidence } from './canvas-task-evidence'
+import { createCanvasTaskEvidence, resolveCanvasTaskBaseline, resolveCanvasTaskEvidence } from './canvas-task-evidence'
 
 const documentNode: Extract<CanvasNode, { kind: 'document' }> = {
   id: 'doc-1', kind: 'document', title: '文档', position: { x: 0, y: 0 },
@@ -31,6 +31,8 @@ const videoNode: Extract<CanvasNode, { kind: 'video' }> = {
 
 /** 创建只包含证据复验所需边界的依赖，测试不访问磁盘或网络。 */
 function createDependencies() {
+  /** 正文与版本独立控制，零版本并不代表空内容。 */
+  let textContent: string | undefined
   let agentContent = 'Agent 正式输出'
   let thumbnailBytes = Buffer.from('thumbnail-v1')
   let includeMediaAsset = true
@@ -41,7 +43,7 @@ function createDependencies() {
   const dependencies = {
     textArtifacts: {
       read: async (target: { kind: 'document' | 'webview' }) => ({
-        content: target.kind === 'document' ? '# 正式文档' : '<main>正式原型</main>',
+        content: textContent ?? (target.kind === 'document' ? '# 正式文档' : '<main>正式原型</main>'),
       }),
     },
     agentConfigs: { load: async () => ({ revision: 4 }) },
@@ -64,6 +66,7 @@ function createDependencies() {
   } as unknown as CanvasToolProviderDependencies
   return {
     dependencies,
+    setTextContent: (value: string) => { textContent = value },
     setAgentContent: (value: string) => { agentContent = value },
     setThumbnailBytes: (value: string) => { thumbnailBytes = Buffer.from(value) },
     removeMediaAsset: () => { includeMediaAsset = false },
@@ -74,7 +77,8 @@ function createDependencies() {
 describe('Canvas 任务证据复验', () => {
   test('Given 已提交文档与 WebView When 复验证据 Then 绑定当前正文版本且空占位不签发', async () => {
     const fixture = createDependencies()
-    for (const node of [documentNode, webviewNode]) {
+    for (const node of [documentNode, webviewNode,
+      { ...documentNode, contentRevision: 0 }, { ...webviewNode, contentRevision: 0 }]) {
       const proof = createCanvasTaskEvidence('canvas-1', node, 'content', null)
       const result = await resolveCanvasTaskEvidence(fixture.dependencies, 'project-1', node, proof)
       const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
@@ -85,12 +89,40 @@ describe('Canvas 任务证据复验', () => {
     }
 
     const emptyNode = { ...documentNode, contentRevision: 0 }
+    fixture.setTextContent('  \n')
     await expect(resolveCanvasTaskEvidence(
       fixture.dependencies,
       'project-1',
       emptyNode,
       createCanvasTaskEvidence('canvas-1', emptyNode, 'content', null),
     )).resolves.toBeUndefined()
+  })
+
+  test('Given 初始正文与空骨架 When 取得启动基线 Then 只为真实空内容签发 absent', async () => {
+    /** 初始 HTML 的空白格式不同也仍是未填充的默认原型。 */
+    const emptyHtml = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>未命名原型</title></head><body></body></html>'
+    for (const base of [documentNode, webviewNode]) {
+      /** 固定零版本节点，正文事实由读取服务返回。 */
+      const node = { ...base, contentRevision: 0 }
+      const fixture = createDependencies()
+      const proof = createCanvasTaskEvidence('canvas-1', node, 'content', null)
+      const existing = await resolveCanvasTaskBaseline(fixture.dependencies, 'project-1', node, proof)
+      expect(existing).toHaveProperty('identity')
+      expect(existing).not.toHaveProperty('absent')
+      for (const content of node.kind === 'document' ? ['', ' \n '] : ['', ' \n ', emptyHtml]) {
+        fixture.setTextContent(content)
+        expect(await resolveCanvasTaskBaseline(fixture.dependencies, 'project-1', node, proof)).toMatchObject({ absent: true })
+        expect(await resolveCanvasTaskEvidence(fixture.dependencies, 'project-1', node, proof)).toBeUndefined()
+      }
+    }
+  })
+
+  test('Given 初始正文读取失败 When 请求启动基线 Then 不把损坏或缺失降级成空草稿', async () => {
+    const fixture = createDependencies()
+    const node = { ...documentNode, contentRevision: 0 }
+    fixture.dependencies.textArtifacts.read = async () => { throw new Error('CANVAS_CONTENT_NOT_FOUND') }
+    await expect(resolveCanvasTaskBaseline(fixture.dependencies, 'project-1', node,
+      createCanvasTaskEvidence('canvas-1', node, 'content', null))).rejects.toThrow('CANVAS_CONTENT_NOT_FOUND')
   })
 
   test('Given Agent 正式输出与配置 When 内容或 revision 变化 Then 对应证据身份独立变化', async () => {

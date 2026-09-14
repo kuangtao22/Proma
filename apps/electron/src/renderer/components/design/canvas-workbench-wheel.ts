@@ -51,6 +51,7 @@ export function bindCanvasWorkbenchWheel(
 ): () => void {
   /** 转发到同一张画布的既有 XYFlow 手势入口，复用范围限制及视口提交时序。 */
   const renderer = section.closest('.react-flow__renderer')
+    ?? section.closest('[data-native-canvas-workspace]')?.querySelector('.react-flow__renderer')
   if (!renderer) return () => undefined
 
   /** 使用非 passive 原生捕获监听器，可取消页面缩放并覆盖所属 Portal 的滚动锁。 */

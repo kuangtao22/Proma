@@ -100,3 +100,11 @@ export {
   type CanvasLayoutSpatialIndex,
   type FindCompactCanvasSlotInput,
 } from './canvas-layout'
+export {
+  CANVAS_IMAGE_NODE_WIDTH,
+  CANVAS_IMAGE_NODE_HEADER_HEIGHT,
+  CANVAS_IMAGE_PREVIEW_MIN_HEIGHT,
+  CANVAS_IMAGE_PREVIEW_MAX_HEIGHT,
+  CANVAS_IMAGE_NODE_MAX_HEIGHT,
+  resolveCanvasImageNodeHeight,
+} from './canvas-node-size'

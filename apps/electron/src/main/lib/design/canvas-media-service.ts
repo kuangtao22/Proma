@@ -282,6 +282,8 @@ export interface CanvasMediaResolvedInputs {
 
 /** Host-only 运行约束用于绑定 workflow 预检事实和调用生命周期。 */
 export interface CanvasMediaRunOptions {
+  /** 完整准备通过后、交给远端监督器之前的 Host 预算与身份复核。 */
+  beforeStart?: () => void
   expectedInputHashes?: Record<string, string>
   signal?: AbortSignal
   /** Host 工作流预先创建的 prepared run；必须与 preparedActor 成对提供。 */
@@ -650,6 +652,7 @@ export class CanvasMediaService {
     if (!isTerminal(run)) {
       await this.dependencies.authorizeTarget(input, 'run')
       options.signal?.throwIfAborted()
+      options.beforeStart?.()
       run = this.dependencies.supervisor.start(input.projectId, run.id, run.revision)
     }
     if (run.phase === 'succeeded') {

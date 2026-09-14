@@ -9,6 +9,7 @@ import {
   createCanvasArtifactCreationService,
   type CanvasArtifactCreationDependencies,
 } from './canvas-artifact-creation'
+import { CanvasArtifactPreflightError } from './canvas-artifact-preflight'
 
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 
@@ -22,6 +23,9 @@ function createFixture(options: {
   conflictOnce?: boolean
   conflictAlways?: boolean
   commitBeforeError?: boolean
+  batchError?: Error
+  loadError?: Error
+  validationError?: Error
 } = {}) {
   let document: CanvasDocument = {
     ...createEmptyCanvasDocument(target.projectId, target.canvasId, 1),
@@ -55,7 +59,16 @@ function createFixture(options: {
     return { ...document, nodes, edges, revision }
   }
   const dependencies: CanvasArtifactCreationDependencies = {
-    documents: { load: () => ({ document: structuredClone(document), writable: true, nodeIssues: [] }) },
+    documents: {
+      load: () => {
+        if (options.loadError) throw options.loadError
+        return { document: structuredClone(document), writable: true, nodeIssues: [] }
+      },
+      validateBatchOperations: (_target, _expectedRevision, operations) => {
+        if (options.validationError) throw options.validationError
+        return structuredClone(operations) as CanvasMutation[]
+      },
+    },
     content: {
       prepareArtifactContent: async (_target, input) => { prepared.push(structuredClone(input)) },
       discardPreparedContent: async (_target, input, rollbackId) => {
@@ -65,6 +78,7 @@ function createFixture(options: {
     batch: {
       execute: async (input) => {
         batches.push(structuredClone(input))
+        if (options.batchError) throw options.batchError
         const shouldConflict = options.conflictAlways || (options.conflictOnce && batches.length === 1)
         if (shouldConflict) {
           document = { ...document, revision: document.revision + 1 }
@@ -88,6 +102,44 @@ function createFixture(options: {
 }
 
 describe('Canvas Agent 产物原子创建服务', () => {
+  test('Given 图片预览尚未加载 When 在其下方创建文档或Agent Then 避让预览最大显示高度而非空卡高度', async () => {
+    /** 同时覆盖普通产物和专业 Agent 的两条创建入口。 */
+    for (const kind of ['document', 'agent'] as const) {
+      const fixture = createFixture()
+      const image = await fixture.service.create({
+        ...target, baseRevision: 3, artifactType: 'image', title: '累计关键帧', content: '',
+        adoptedAssetId: 'existing-image', position: { x: 800, y: 0 },
+        source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: `image-${kind}` },
+      })
+      /** y=168 对空卡合法，却会覆盖最高 368 的图片预览。 */
+      const input = { ...target, baseRevision: image.revision, title: '下游设计', position: { x: 800, y: 168 },
+        source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: `child-${kind}` } }
+      const created = kind === 'agent'
+        ? await fixture.service.createAgent(input)
+        : await fixture.service.create({ ...input, artifactType: 'document', content: '# 设计' })
+      const node = fixture.getDocument().nodes.find(candidate => candidate.id === created.nodeId)!
+      const overlaps = node.position.x < 800 + 288 + 24 && node.position.x + 288 + 24 > 800
+        && node.position.y < 368 + 24 && node.position.y + 144 + 24 > 0
+      expect(overlaps).toBe(false)
+    }
+  })
+
+  test('Given 已有文档 When 请求在其上方创建带预览图片 Then 按候选最大高度避让而不移动原文档', async () => {
+    const fixture = createFixture()
+    /** 图片底部若按空卡计算会遗漏对下方需求文档的遮挡。 */
+    const result = await fixture.service.create({
+      ...target, baseRevision: 3, artifactType: 'image', title: '参考图', content: '',
+      position: { x: 40, y: -150 }, adoptedAssetId: 'existing-image',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'image-above-doc' },
+    })
+    const document = fixture.getDocument()
+    const image = document.nodes.find(node => node.id === result.nodeId)!
+    const overlaps = image.position.x < 40 + 288 + 24 && image.position.x + 288 + 24 > 40
+      && image.position.y < 60 + 144 + 24 && image.position.y + 368 + 24 > 60
+    expect(overlaps).toBe(false)
+    expect(document.nodes[0]!.position).toEqual({ x: 40, y: 60 })
+  })
+
   test('Given 创建已提交但调用方丢失回执 When 按原来源重放 Then 对账同一节点且不重复写入', async () => {
     const fixture = createFixture()
     const input = {
@@ -199,11 +251,127 @@ describe('Canvas Agent 产物原子创建服务', () => {
       source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-invalid-relation' },
     }
 
-    await expect(fixture.service.create({ ...base, sourceNodeId: 'requirements-1' }))
-      .rejects.toThrow('CANVAS_ARTIFACT_RELATION_REQUIRED')
+    expect(() => fixture.service.validateCreate({ ...base, sourceNodeId: 'requirements-1' }))
+      .toThrow(expect.objectContaining({
+        name: 'CanvasArtifactPreflightError',
+        code: 'CANVAS_ARTIFACT_RELATION_REQUIRED',
+        message: 'CANVAS_ARTIFACT_RELATION_REQUIRED',
+      }))
+    expect(() => fixture.service.validateCreate({ ...base, relation: 'association' }))
+      .toThrow(expect.objectContaining({
+        name: 'CanvasArtifactPreflightError',
+        code: 'CANVAS_ARTIFACT_RELATION_UNEXPECTED',
+        message: 'CANVAS_ARTIFACT_RELATION_UNEXPECTED',
+      }))
     await expect(fixture.service.create({ ...base, relation: 'association' }))
-      .rejects.toThrow('CANVAS_ARTIFACT_RELATION_UNEXPECTED')
+      .rejects.toMatchObject({
+        name: 'CanvasArtifactPreflightError',
+        code: 'CANVAS_ARTIFACT_RELATION_UNEXPECTED',
+      })
     expect(fixture.prepared).toHaveLength(0)
+    expect(fixture.batches).toHaveLength(0)
+  })
+
+  test('Given batch 抛出与输入错误同名的普通异常 When 创建失败 Then 不伪装为事务前预检拒绝', async () => {
+    const fixture = createFixture({ batchError: new Error('CANVAS_ARTIFACT_RELATION_UNEXPECTED') })
+
+    const error = await fixture.service.create({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'document',
+      title: '说明',
+      content: '# 说明',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-batch-error' },
+    }).catch((cause: unknown) => cause)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(CanvasArtifactPreflightError)
+    expect(fixture.prepared).toHaveLength(1)
+    expect(fixture.batches).toHaveLength(1)
+  })
+
+  test('Given 权威图读取失败 When 预检 Then 保留未知读取错误而不标记为输入拒绝', () => {
+    const fixture = createFixture({ loadError: new Error('CANVAS_DOCUMENT_READ_FAILED') })
+
+    expect(() => fixture.service.validateCreate({
+      ...target,
+      baseRevision: 3,
+      artifactType: 'document',
+      title: '说明',
+      content: '# 说明',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-read-error' },
+    })).toThrow(expect.objectContaining({
+      name: 'Error',
+      message: 'CANVAS_DOCUMENT_READ_FAILED',
+    }))
+  })
+
+  test('Given Agent 关系参数不配对 When 创建 Agent Then 第一次 batch 前返回确定预检拒绝', async () => {
+    const fixture = createFixture()
+
+    await expect(fixture.service.createAgent({
+      ...target,
+      baseRevision: 3,
+      title: '执行 Agent',
+      relation: 'depends-on',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-agent-invalid' },
+    })).rejects.toMatchObject({
+      name: 'CanvasArtifactPreflightError',
+      code: 'CANVAS_ARTIFACT_RELATION_UNEXPECTED',
+    })
+    expect(fixture.batches).toHaveLength(0)
+  })
+
+  test('Given 来源节点不存在或初始 revision 过期 When 预检 Then 保留对应稳定拒绝码', () => {
+    const fixture = createFixture()
+    /** 两个输入分别覆盖权威来源与权威 revision 校验。 */
+    const base = {
+      ...target,
+      baseRevision: 3,
+      artifactType: 'document' as const,
+      title: '说明',
+      content: '# 说明',
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-preflight-authority' },
+    }
+
+    expect(() => fixture.service.validateCreate({
+      ...base,
+      sourceNodeId: 'missing-source',
+      relation: 'reference',
+    })).toThrow(expect.objectContaining({
+      name: 'CanvasArtifactPreflightError',
+      code: 'CANVAS_ARTIFACT_SOURCE_NODE_NOT_FOUND',
+    }))
+    expect(() => fixture.service.validateCreate({ ...base, baseRevision: 2 }))
+      .toThrow(expect.objectContaining({
+        name: 'CanvasArtifactPreflightError',
+        code: 'CANVAS_REVISION_CONFLICT',
+      }))
+  })
+
+  test('Given 纯 mutation 预检错误带诊断详情 When 校验 Then 提取 allowlist 稳定码并保留原 cause', () => {
+    const validationError = new Error('CANVAS_MUTATION_INVALID: title 超出限制')
+    const fixture = createFixture({ validationError })
+
+    const error = (() => {
+      try {
+        fixture.service.validateCreate({
+          ...target,
+          baseRevision: 3,
+          artifactType: 'document',
+          title: '说明',
+          content: '# 说明',
+          source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'tool-detailed-preflight' },
+        })
+      } catch (cause) {
+        return cause
+      }
+      return null
+    })()
+
+    expect(error).toBeInstanceOf(CanvasArtifactPreflightError)
+    expect(error).toMatchObject({ code: 'CANVAS_MUTATION_INVALID' })
+    expect((error as Error).cause).toBe(validationError)
   })
 
   test('Given Agent 明确创建手机 WebView When 提交产物 Then 节点持久化 mobile 且内容仍只准备一次', async () => {

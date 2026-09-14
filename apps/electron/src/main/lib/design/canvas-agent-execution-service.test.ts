@@ -135,7 +135,8 @@ function createFixture(options: {
       options.inspectRunOutsidePrepare?.(prepareHeld)
       activeRun = { sessionId: input.sessionId, startedAt: input.startedAt! }
       options.inspectHeadlessExtensions?.(extensions)
-      expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
+      if (runContexts.at(-1)?.canvasAgentMode === 'canvas-orchestrator') expect(extensions?.allowedToolNames).toContain('canvas_run_nodes')
+      else expect(extensions?.allowedToolNames).not.toContain('canvas_run_nodes')
       if (options.runError) callbacks.onError(options.runError)
       await options.runGate
       callbacks.onComplete(undefined, options.invalidTerminal === 'missing' ? undefined : {
@@ -172,10 +173,46 @@ function createFixture(options: {
     },
     now: () => 100,
   }
-  return { service: createCanvasAgentExecutionService(dependencies), calls, runContexts }
+  return { service: createCanvasAgentExecutionService(dependencies), calls, runContexts, dependencies }
 }
 
 describe('Canvas Agent 统一执行服务', () => {
+  test('Given Host 签发编排运行 When 通过校验 Then 保留真实来源与受限工具并提交正式输出', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.validateOrchestrationAccess = input => {
+      expect(input).toMatchObject({ target, parentSessionId: 'owner', orchestrationId: 'delegation', startedAt: 60 })
+      fixture.calls.push('orchestration-access')
+    }
+    const result = await fixture.service.execute({ mode: 'canvas-orchestrator', target, parentSessionId: 'owner',
+      orchestrationId: 'delegation', expectedGraphRevision: 7, instruction: '规划UI流程', userMessageUuid: 'coordinator', startedAt: 60 })
+    expect(result.status).toBe('completed')
+    expect(fixture.runContexts[0]).toMatchObject({ canvasAgentMode: 'canvas-orchestrator', canvasOrchestrationId: 'delegation' })
+    expect(fixture.calls.indexOf('orchestration-access')).toBeLessThan(fixture.calls.indexOf('reserve'))
+    expect(fixture.calls).toContain('headless:design:owner:external')
+  })
+
+  test('Given Host 专业分支 When 启动 Then 逐次验证分派凭据且不把编排父身份当成普通会话', async () => {
+    const fixture = createFixture()
+    fixture.dependencies.validateOrchestrationBranch = input => {
+      expect(input).toMatchObject({ target, parentSessionId: 'coordinator', orchestrationId: 'delegation', stepId: 'script',
+        startedAt: 61, userMessageUuid: 'script-attempt' })
+    }
+    await fixture.service.execute({ mode: 'parent-orchestrated', target, parentSessionId: 'coordinator',
+      orchestration: { id: 'delegation', stepId: 'script' }, expectedGraphRevision: 7,
+      instruction: '完成脚本', userMessageUuid: 'script-attempt', startedAt: 61 })
+    expect(fixture.runContexts[0]).toMatchObject({ canvasAgentMode: 'parent-orchestrated', canvasOrchestrationId: 'delegation',
+      canvasOrchestrationStepId: 'script', canvasOrchestrationParentSessionId: 'coordinator',
+      canvasOrchestrationUserMessageUuid: 'script-attempt', runStartedAt: 61 })
+  })
+  test('Given 未签发编排身份 When 尝试以编排者启动 Then 在 reserve 和模型调用前拒绝', async () => {
+    /** 缺失可信验证器时不能通过 mode 字符串获取调度能力。 */
+    const fixture = createFixture()
+    await expect(fixture.service.execute({
+      mode: 'canvas-orchestrator', target, parentSessionId: 'parent-1', orchestrationId: 'orchestration-1',
+      expectedGraphRevision: 7, instruction: '组织设计', userMessageUuid: 'orchestration-anchor', startedAt: 70,
+    } as unknown as Parameters<typeof fixture.service.execute>[0])).rejects.toThrow('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+    expect(fixture.calls).not.toContain('reserve')
+  })
   test('Given Renderer 手动运行 When 成功完成 Then 复用可信生命周期并提交正式输出', async () => {
     const fixture = createFixture()
     await fixture.service.execute({

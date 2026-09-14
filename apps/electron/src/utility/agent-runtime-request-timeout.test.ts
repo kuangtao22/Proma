@@ -10,6 +10,10 @@ import { ParentRequestRegistry } from './agent-runtime-parent-request-registry'
 const DESIGN_IMAGE_TOOL = 'mcp__nano_banana__generate_image'
 
 describe('Agent utility 主进程请求超时', () => {
+  test.each(['canvas_delegate', 'canvas_dispatch', 'canvas_resume_orchestration'])('Given %s 等待真实子任务 When 解析RPC期限 Then 跟随取消和运行生命周期', toolName => {
+    expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL, { toolName })).toBeUndefined()
+    expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_EVALUATE_COMPLETION, { toolName })).toBe(120_000)
+  })
   test('Given Design 图片工具可能长时间生成 When 解析超时 Then 使用独立长时限', () => {
     expect(getParentRequestTimeoutMs(AGENT_RUNTIME_METHODS.CAPABILITY_CUSTOM_TOOL, {
       toolName: DESIGN_IMAGE_TOOL,

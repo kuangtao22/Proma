@@ -53,6 +53,11 @@ export function createCanvasWorkflowResumeScheduler(dependencies: CanvasWorkflow
       }).catch((error: unknown) => {
         if (disposed || timers.get(key) !== timer) return
         try { dependencies.onError(error) } catch { /* 诊断异常不得丢失唯一期限唤醒。 */ }
+        /** 另一套编排的持久所有权不是瞬时失败，等待明确处理而不后台反复争抢。 */
+        if (error instanceof Error && error.message === 'CANVAS_ORCHESTRATION_OWNS_EXECUTION') {
+          timers.delete(key)
+          return
+        }
         scheduleAttempt(input, Math.min(attempt + 1, 7))
       })
     }, attempt === 0 ? Math.max(0, Math.min(2_147_483_647, input.resumeAt - now())) : Math.min(60_000, 1000 * 2 ** (attempt - 1)))
