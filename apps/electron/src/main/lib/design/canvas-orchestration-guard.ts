@@ -1,4 +1,5 @@
 import { CANVAS_READ_ONLY_TOOL_NAMES } from './canvas-agent-tool-policy'
+import { getCanvasOrchestrationPendingDecision } from '@proma/shared'
 import type { CanvasOrchestrationService, CanvasOrchestrationBranchAccess } from './canvas-orchestration-service'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
 import type { CanvasDocument } from '@proma/shared'
@@ -30,13 +31,29 @@ export function canvasOrchestrationBranch(context: CanvasToolRunContext): Canvas
 
 /** 每次工具执行 fresh-read 委托和专业范围；手动改图仍由既有 CAS 与产物版本检查保护。 */
 export function createCanvasOrchestrationGuard(service: CanvasOrchestrationService, context: CanvasToolRunContext, loadCanvas?: () => CanvasDocument) {
-  return (toolName: string, params: Record<string, unknown>): void => {
+  return (toolName: string, params: Record<string, unknown>): (() => void) | undefined => {
     /** 任务合同的内存协议不是业务图写入，执行期间可查询、交付和记录阻塞。 */
     const readOnly = CANVAS_READ_ONLY_TOOL_NAMES.has(toolName) || mediaReads.has(toolName)
+    /** 待决策时不能先结算底层交付合同，否则回答后无法恢复原任务。 */
+    const completesTask = toolName === 'canvas_task' && params.action === 'complete'
+    /** 报告、等待/受阻结束和取消是待决策期间的可恢复出口。 */
+    const pendingProtocol = readOnly || delegationTools.has(toolName)
+      || toolName === 'canvas_report_orchestration' || toolName === 'canvas_finish_orchestration'
     const canvasId = context.canvasAgentTarget?.canvasId ?? (typeof params.canvasId === 'string' ? params.canvasId : undefined)
     if (!context.canvasOrchestrationId) {
       /** 停止存量运行是解除双重占用的出口，实际所有者和显式取消意图仍由原工具验证。 */
-      if (!canvasId || readOnly || delegationTools.has(toolName) || toolName === 'canvas_cancel_workflow') return
+      if (!canvasId) return
+      if (readOnly) {
+        if (completesTask) {
+          const record = service.get({ projectId: context.projectId, canvasId })
+          if (record && getCanvasOrchestrationPendingDecision(record)) throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+          if (record && record.status !== 'completed' && record.status !== 'cancelled') {
+            return service.acquireWriteLease(record)
+          }
+        }
+        return
+      }
+      if (delegationTools.has(toolName) || toolName === 'canvas_cancel_workflow') return
       const record = service.get({ projectId: context.projectId, canvasId })
       if (record && record.status !== 'completed' && record.status !== 'cancelled') throw new Error('CANVAS_ORCHESTRATION_OWNS_WRITES')
       return
@@ -46,6 +63,9 @@ export function createCanvasOrchestrationGuard(service: CanvasOrchestrationServi
     if (context.canvasAgentMode === 'canvas-orchestrator') {
       const record = service.assertActor({ projectId: context.projectId, canvasId, sessionId: context.sessionId,
         orchestrationId: context.canvasOrchestrationId, runStartedAt: context.runStartedAt })
+      if (getCanvasOrchestrationPendingDecision(record) && (!pendingProtocol || completesTask)) {
+        throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      }
       /** 旧整图入口可递归运行未登记的 Agent；编排必须通过受管步骤分派。 */
       if (['canvas_run_workflow', 'canvas_resume_workflow', 'media_execute_run'].includes(toolName)) {
         throw new Error('CANVAS_ORCHESTRATION_USE_MANAGED_EXECUTION')
@@ -57,10 +77,18 @@ export function createCanvasOrchestrationGuard(service: CanvasOrchestrationServi
       if (record.request.intent === 'review' && toolName === 'canvas_create_artifact' && params.artifactType !== 'document') {
         throw new Error('CANVAS_ORCHESTRATION_REVIEW_ONLY')
       }
-      return
+      /** 报告自身必须在无其它写占位时原子提交；只读和内存任务协议不占用业务写生命周期。 */
+      return (readOnly && !completesTask) || toolName === 'canvas_report_orchestration'
+        ? undefined
+        : service.acquireWriteLease(record)
     }
     const { record, step } = service.assertBranch(canvasOrchestrationBranch(context))
-    if (readOnly) return
+    if (getCanvasOrchestrationPendingDecision(record) && (!pendingProtocol || completesTask)) {
+      throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+    }
+    if (readOnly && !completesTask) return
+    /** 底层任务完成会异步复验并结算交付，必须和上层报告发布互斥。 */
+    if (completesTask) return service.acquireWriteLease(record)
     if (!specialistWrites.has(toolName)) throw new Error('CANVAS_ORCHESTRATION_SPECIALIST_ONLY')
     if (record.request.intent === 'review'
       && (toolName !== 'canvas_create_artifact' || params.artifactType !== 'document')) throw new Error('CANVAS_ORCHESTRATION_REVIEW_ONLY')
@@ -70,7 +98,7 @@ export function createCanvasOrchestrationGuard(service: CanvasOrchestrationServi
     const writable = new Set(step.outputNodeIds)
     if (creationTools.has(toolName)) {
       if (typeof params.sourceNodeId === 'string' && !readable.has(params.sourceNodeId)) throw new Error('CANVAS_ORCHESTRATION_NODE_SCOPE')
-      return
+      return service.acquireWriteLease(record)
     }
     if (typeof params.nodeId === 'string' && !writable.has(params.nodeId)) throw new Error('CANVAS_ORCHESTRATION_NODE_SCOPE')
     if (toolName === 'canvas_apply_changes') {
@@ -89,5 +117,6 @@ export function createCanvasOrchestrationGuard(service: CanvasOrchestrationServi
         })
       })) throw new Error('CANVAS_ORCHESTRATION_NODE_SCOPE')
     }
+    return service.acquireWriteLease(record)
   }
 }

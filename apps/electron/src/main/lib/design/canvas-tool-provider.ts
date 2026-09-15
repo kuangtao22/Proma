@@ -71,7 +71,7 @@ import type { CanvasOrchestrationService } from './canvas-orchestration-service'
 import { createCanvasOrchestrationTools } from './canvas-orchestration-tools'
 import { canvasOrchestrationBranch, createCanvasOrchestrationGuard } from './canvas-orchestration-guard'
 import { canvasOrchestrationRequirements, assertCanvasOrchestrationRequirements, isCanvasOrchestrationContractComplete } from './canvas-orchestration-contract'
-import { buildCanvasOrchestrationGuidance } from './canvas-orchestration-guidance'
+import { buildCanvasOrchestrationGuidance, CANVAS_PROFESSIONAL_DESIGN_GUIDANCE } from './canvas-orchestration-guidance'
 import { createCanvasTaskMediaReview, type CanvasTaskMediaTarget } from './canvas-task-media-review'
 import type { createMediaDeliveryInspectionService } from '../media/media-delivery-inspection-service'
 import { createCanvasTaskEvidence, resolveCanvasTaskBaseline, resolveCanvasTaskEvidence } from './canvas-task-evidence'
@@ -2881,28 +2881,36 @@ export function createCanvasToolRun(
     ...tool,
     execute: async (...args: Parameters<ToolDefinition['execute']>) => {
       const params = args[1] as Record<string, unknown>
-      orchestrationGuard?.(tool.name, params)
-      /** 独立媒体工具不因同项目有画布而自动被认作画布任务。 */
-      const participates = !tool.name.startsWith('media_') || taskEngaged || Boolean(context.canvasAgentTarget)
-      if (dependencies.taskStore && participates && requiresCanvasTask(tool.name, params)) {
-        dependencies.access.authorizeRead(context)
-        const canvasId = typeof params.canvasId === 'string' ? params.canvasId : task.status().canvasId
-        if (canvasId) assertReadAccess(canvasId, args[2])
-        let status = task.status()
-        if (!taskEngaged || !status.canvasId || status.canvasId !== canvasId) {
-          throw new Error('CANVAS_TASK_START_REQUIRED: 请先用 canvas_task status 查看原任务；已有任务用 resume，首次执行用 start 登记交付，再继续本操作。')
-        }
-        if (status.phase !== 'working') {
-          throw new Error('CANVAS_TASK_RECOVERY_REQUIRED: 请先用 canvas_task recover 复验并恢复原任务；不能覆盖合同或重复生成。')
-        }
-        if (status.pendingOperationIds.length > 0) {
-          status = reconcilePendingCreatedOperations()
+      /** canvas_task 后续动作可省略 canvasId；门禁从已绑定任务读取可信目标，但不改模型原参数。 */
+      const guardParams = tool.name === 'canvas_task' && typeof params.canvasId !== 'string'
+        ? { ...params, canvasId: task.status().canvasId }
+        : params
+      const releaseOrchestrationWrite = orchestrationGuard?.(tool.name, guardParams)
+      try {
+        /** 独立媒体工具不因同项目有画布而自动被认作画布任务。 */
+        const participates = !tool.name.startsWith('media_') || taskEngaged || Boolean(context.canvasAgentTarget)
+        if (dependencies.taskStore && participates && requiresCanvasTask(tool.name, params)) {
+          dependencies.access.authorizeRead(context)
+          const canvasId = typeof params.canvasId === 'string' ? params.canvasId : task.status().canvasId
+          if (canvasId) assertReadAccess(canvasId, args[2])
+          let status = task.status()
+          if (!taskEngaged || !status.canvasId || status.canvasId !== canvasId) {
+            throw new Error('CANVAS_TASK_START_REQUIRED: 请先用 canvas_task status 查看原任务；已有任务用 resume，首次执行用 start 登记交付，再继续本操作。')
+          }
+          if (status.phase !== 'working') {
+            throw new Error('CANVAS_TASK_RECOVERY_REQUIRED: 请先用 canvas_task recover 复验并恢复原任务；不能覆盖合同或重复生成。')
+          }
           if (status.pendingOperationIds.length > 0) {
-            throw new Error('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED: 已有创建操作结果尚未确认，请先恢复原回执，不能继续产生新的写入副作用。')
+            status = reconcilePendingCreatedOperations()
+            if (status.pendingOperationIds.length > 0) {
+              throw new Error('CANVAS_TASK_OPERATION_RECONCILIATION_REQUIRED: 已有创建操作结果尚未确认，请先恢复原回执，不能继续产生新的写入副作用。')
+            }
           }
         }
+        return await tool.execute(...args)
+      } finally {
+        releaseOrchestrationWrite?.()
       }
-      return tool.execute(...args)
     },
   }))
   /** 能力发现和返回的实际工具名单共享同一运行模式结果。 */
@@ -2979,6 +2987,7 @@ export function createCanvasToolRun(
       ? task.evaluate(signal) : Promise.resolve({ action: 'complete' }),
     systemPromptAppend: `## 画布工具
 ${dependencies.orchestration ? buildCanvasOrchestrationGuidance(context) : ''}
+${CANVAS_PROFESSIONAL_DESIGN_GUIDANCE}
 请基于完整用户语义、项目上下文和工具 schema 自主决定是否读取、创建、修改或运行画布，不要按“首页”或“设计”等关键词硬编码。
 
 跨专业任务采用持久委托时，由画布编排 Agent 维护下述交付合同，普通 Agent 不重复启动同一合同。直接执行画布任务时先用 canvas_task status 查询；存在未完成任务就按 taskId resume，首次执行才用 canvas_task start 在写入前登记真实交付要求，并按可用能力自主读取、配置、执行、验证和修复。response 仅适用于文本本身就是用户交付，不能用它代替要求的节点或真实生成结果。canvas_read 返回 content/configuration/adopted 证据，canvas_inspect_images 返回真实图像检查的 inspection 证据；用 evidenceId 完成全部要求后调用 canvas_task complete。配置已保存不表示可运行，媒体采用不表示质量通过。音视频 metadataOnly 与 WebView 源码不能代替内容或交互检查，缺少能力时 canvas_task block 报告具体原因。完成前 Host 会复验产物版本；有合法下一步的未完成任务在原会话和预算内继续，不能重建运行或降低交付要求来绕过核验。普通能力咨询和无需画布产物的问答不必登记任务。任务要求新增产物时，保留源输入，读取新产物作为完成证据。

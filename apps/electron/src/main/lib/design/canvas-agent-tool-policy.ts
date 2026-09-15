@@ -87,6 +87,7 @@ const PARENT_ORCHESTRATED_TOOL_NAMES: ReadonlySet<string> = new Set([
 const ORCHESTRATOR_TOOL_NAMES: ReadonlySet<string> = new Set([
   ...[...RENDERER_MANUAL_TOOL_NAMES].filter(name => !['canvas_resume_workflow', 'canvas_retry_task', 'media_execute_run'].includes(name)),
   'canvas_update_plan', 'canvas_dispatch', 'canvas_review_step', 'canvas_finish_orchestration', 'canvas_get_orchestration',
+  'canvas_report_orchestration',
 ])
 
 /** 返回可信模式对应的固定正向集合，未知工具默认拒绝。 */

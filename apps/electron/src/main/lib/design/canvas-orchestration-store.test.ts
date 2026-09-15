@@ -262,7 +262,7 @@ describe('Canvas 编排记录存储', () => {
     const target = { projectId: fixture.projectId, canvasId: fixture.canvasId }
     const created = fixture.store.create({
       ...orchestrationRecord('request-follow-up'),
-      followUps: [{ id: 'correction-1', instruction: '重新读取正式正文', status: 'pending', createdAt: 10 }],
+      followUps: [{ id: 'correction-1', instruction: '重新读取正式正文', decisionId: 'decision-1', status: 'pending', createdAt: 10 }],
     })
 
     expect(() => fixture.store.save(target, created.revision, {
@@ -272,6 +272,15 @@ describe('Canvas 编排记录存储', () => {
       ...created, revision: created.revision + 1,
       followUps: [{ ...created.followUps![0]!, instruction: '偷换要求' }], updatedAt: 20,
     })).toThrow('CANVAS_ORCHESTRATION_FOLLOW_UP_REGRESSION')
+    // 已登记答案关联必须保留，不能删除或挪到另一个问题上。
+    for (const decisionId of [undefined, 'decision-2']) {
+      // 构造字段真正缺失的旧格式，避免以 undefined 触发解析层拒绝而漏测存储约束。
+      const { decisionId: _previousDecisionId, ...previousAnswer } = created.followUps![0]!
+      expect(() => fixture.store.save(target, created.revision, {
+        ...created, revision: created.revision + 1,
+        followUps: [{ ...previousAnswer, ...(decisionId ? { decisionId } : {}) }], updatedAt: 20,
+      })).toThrow('CANVAS_ORCHESTRATION_FOLLOW_UP_REGRESSION')
+    }
     const started = fixture.store.save(target, created.revision, {
       ...created, revision: created.revision + 1,
       followUps: [{ ...created.followUps![0]!, status: 'started', startedAt: 20, userMessageUuid: 'a'.repeat(64) }],

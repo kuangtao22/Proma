@@ -34,10 +34,52 @@ export interface CanvasOrchestrationFollowUp {
   id: string
   instruction: string
   supersedesId?: string
+  decisionId?: string
   status: 'pending' | 'started' | 'delivered' | 'failed' | 'abandoned'
   createdAt: number
   startedAt?: number
   userMessageUuid?: string
+}
+
+/** 一次需求校正对当前专业步骤的影响说明。 */
+export interface CanvasOrchestrationImpact {
+  followUpId: string
+  affectedStepIds: string[]
+  retainedStepIds: string[]
+  explanation: string
+  additionalWork: string
+  runningWork: string
+}
+
+/** 关键决策中的一个有界选项。 */
+export interface CanvasOrchestrationDecisionOption {
+  id: string
+  label: string
+  impact: string
+}
+
+/** 需要普通聊天 Agent 交给用户处理的一项关键决策。 */
+export interface CanvasOrchestrationDecision {
+  id: string
+  question: string
+  options: CanvasOrchestrationDecisionOption[]
+  recommendedOptionId: string
+  reason: string
+}
+
+/** 画布编排者提交给 Host 的业务报告。 */
+export interface CanvasOrchestrationReportInput {
+  summary: string
+  nextStep: string
+  impact?: CanvasOrchestrationImpact
+  decision?: CanvasOrchestrationDecision
+}
+
+/** Host 补充版本与时间证据后的持久业务报告。 */
+export interface CanvasOrchestrationReport extends CanvasOrchestrationReportInput {
+  reportedAt: number
+  basedOnRevision: number
+  stale: boolean
 }
 
 /** 单个 Canvas 当前编排委托的可信持久记录。 */
@@ -65,6 +107,27 @@ export interface CanvasOrchestrationRecord {
     mediaReservations?: Array<{ operationId: string; count: number }>
   }
   followUps?: CanvasOrchestrationFollowUp[]
+  report?: CanvasOrchestrationReport
+}
+
+/** 面向聊天和画布界面的有界业务进度投影。 */
+export interface CanvasOrchestrationProgress {
+  stepCounts: {
+    total: number
+    planned: number
+    running: number
+    needsReview: number
+    completed: number
+    blocked: number
+  }
+  currentSteps: {
+    items: Array<Pick<CanvasOrchestrationStep, 'id' | 'title' | 'status'>>
+    total: number
+    omitted: number
+  }
+  nextStep: string
+  report: CanvasOrchestrationReport | null
+  pendingDecision: CanvasOrchestrationDecision | null
 }
 
 /** 通知 Renderer 按 revision 增量读取编排记录的轻量事件。 */
@@ -146,6 +209,102 @@ function parseNodeVersions(
   return versions
 }
 
+/** 严格解析一次影响评估，并拒绝重复或互相冲突的步骤引用。 */
+function parseOrchestrationImpact(value: unknown): CanvasOrchestrationImpact {
+  const fields = [
+    'followUpId', 'affectedStepIds', 'retainedStepIds', 'explanation', 'additionalWork', 'runningWork',
+  ] as const
+  if (!hasExactKeys(value, fields) || !isOrchestrationId(value.followUpId)
+    || !isBoundedText(value.explanation, 1_024)
+    || !isBoundedText(value.additionalWork, 1_024)
+    || !isBoundedText(value.runningWork, 1_024)) {
+    throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+  }
+  const affectedStepIds = parseIdList(value.affectedStepIds, 64, 'CANVAS_ORCHESTRATION_REPORT_INVALID')
+  const retainedStepIds = parseIdList(value.retainedStepIds, 64, 'CANVAS_ORCHESTRATION_REPORT_INVALID')
+  if (affectedStepIds.some(stepId => retainedStepIds.includes(stepId))) {
+    throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+  }
+  return {
+    followUpId: value.followUpId,
+    affectedStepIds,
+    retainedStepIds,
+    explanation: value.explanation,
+    additionalWork: value.additionalWork,
+    runningWork: value.runningWork,
+  }
+}
+
+/** 严格解析关键决策，并保证推荐项真实存在于选项中。 */
+function parseOrchestrationDecision(value: unknown): CanvasOrchestrationDecision {
+  const fields = ['id', 'question', 'options', 'recommendedOptionId', 'reason'] as const
+  if (!hasExactKeys(value, fields) || !isOrchestrationId(value.id)
+    || !isBoundedText(value.question, 1_024) || !isOrchestrationId(value.recommendedOptionId)
+    || !isBoundedText(value.reason, 1_024)
+    || !Array.isArray(value.options) || value.options.length < 2 || value.options.length > 4) {
+    throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+  }
+  const options = value.options.map((item): CanvasOrchestrationDecisionOption => {
+    if (!hasExactKeys(item, ['id', 'label', 'impact']) || !isOrchestrationId(item.id)
+      || !isBoundedText(item.label, 120) || !isBoundedText(item.impact, 1_024)) {
+      throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+    }
+    return { id: item.id, label: item.label, impact: item.impact }
+  })
+  if (new Set(options.map(option => option.id)).size !== options.length
+    || !options.some(option => option.id === value.recommendedOptionId)) {
+    throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+  }
+  return {
+    id: value.id,
+    question: value.question,
+    options,
+    recommendedOptionId: value.recommendedOptionId,
+    reason: value.reason,
+  }
+}
+
+/** 严格解析画布编排者提交的有界业务报告。 */
+export function parseCanvasOrchestrationReportInput(value: unknown): CanvasOrchestrationReportInput {
+  if (!hasContractKeys(value, ['summary', 'nextStep'], ['impact', 'decision'])
+    || !isBoundedText(value.summary, 1_024)
+    || !isBoundedText(value.nextStep, 1_024)) {
+    throw new Error('CANVAS_ORCHESTRATION_REPORT_INVALID')
+  }
+  const report: CanvasOrchestrationReportInput = { summary: value.summary, nextStep: value.nextStep }
+  if (Object.hasOwn(value, 'impact')) report.impact = parseOrchestrationImpact(value.impact)
+  if (Object.hasOwn(value, 'decision')) report.decision = parseOrchestrationDecision(value.decision)
+  return report
+}
+
+/** 严格解析 Host 已补充持久证据的完整报告。 */
+function parseOrchestrationReport(value: unknown): CanvasOrchestrationReport {
+  const requiredFields = ['summary', 'nextStep', 'reportedAt', 'basedOnRevision', 'stale'] as const
+  if (!hasContractKeys(value, requiredFields, ['impact', 'decision'])
+    || !Number.isSafeInteger(value.reportedAt) || Number(value.reportedAt) < 0
+    || !Number.isSafeInteger(value.basedOnRevision) || Number(value.basedOnRevision) < 1
+    || typeof value.stale !== 'boolean') {
+    throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
+  }
+  let input: CanvasOrchestrationReportInput
+  try {
+    input = parseCanvasOrchestrationReportInput({
+      summary: value.summary,
+      nextStep: value.nextStep,
+      ...(Object.hasOwn(value, 'impact') ? { impact: value.impact } : {}),
+      ...(Object.hasOwn(value, 'decision') ? { decision: value.decision } : {}),
+    })
+  } catch {
+    throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
+  }
+  return {
+    ...input,
+    reportedAt: Number(value.reportedAt),
+    basedOnRevision: Number(value.basedOnRevision),
+    stale: value.stale,
+  }
+}
+
 /** 严格解析 Host 维护的 Agent 与媒体运行预算。 */
 function parseBudget(value: unknown): NonNullable<CanvasOrchestrationRecord['budget']> {
   const requiredFields = ['maxAgentRuns', 'agentRunsUsed', 'maxMediaRuns', 'mediaRunsUsed'] as const
@@ -188,25 +347,29 @@ function parseBudget(value: unknown): NonNullable<CanvasOrchestrationRecord['bud
 function parseFollowUps(value: unknown, recordCreatedAt: number, recordUpdatedAt: number): CanvasOrchestrationFollowUp[] {
   if (!Array.isArray(value) || value.length > 32) throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
   const followUps = value.map((item): CanvasOrchestrationFollowUp => {
-    if (!hasContractKeys(item, ['id', 'instruction', 'status', 'createdAt'], ['supersedesId', 'startedAt', 'userMessageUuid'])
+    if (!hasContractKeys(item, ['id', 'instruction', 'status', 'createdAt'], ['supersedesId', 'decisionId', 'startedAt', 'userMessageUuid'])
       || !isOrchestrationId(item.id) || !isBoundedText(item.instruction, 4_096)
       || (Object.hasOwn(item, 'supersedesId') && !isOrchestrationId(item.supersedesId))
+      || (Object.hasOwn(item, 'decisionId') && !isOrchestrationId(item.decisionId))
       || !orchestrationFollowUpStatuses.includes(item.status as CanvasOrchestrationFollowUp['status'])
       || !Number.isSafeInteger(item.createdAt) || Number(item.createdAt) < recordCreatedAt
       || Number(item.createdAt) > recordUpdatedAt) throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
     const hasStartedAt = Object.hasOwn(item, 'startedAt')
     const hasMessageUuid = Object.hasOwn(item, 'userMessageUuid')
     const supersedesId = typeof item.supersedesId === 'string' ? item.supersedesId : undefined
+    const decisionId = typeof item.decisionId === 'string' ? item.decisionId : undefined
     if (item.status === 'pending') {
       if (hasStartedAt || hasMessageUuid) throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
       return { id: item.id, instruction: item.instruction, status: item.status as CanvasOrchestrationFollowUp['status'],
-        createdAt: Number(item.createdAt), ...(supersedesId ? { supersedesId } : {}) }
+        createdAt: Number(item.createdAt), ...(supersedesId ? { supersedesId } : {}),
+        ...(decisionId ? { decisionId } : {}) }
     }
     if (!hasStartedAt || !hasMessageUuid || !Number.isSafeInteger(item.startedAt)
       || Number(item.startedAt) < Number(item.createdAt) || Number(item.startedAt) > recordUpdatedAt
       || !isOrchestrationId(item.userMessageUuid)) throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
     return { id: item.id, instruction: item.instruction, status: item.status as CanvasOrchestrationFollowUp['status'],
       createdAt: Number(item.createdAt), ...(supersedesId ? { supersedesId } : {}),
+      ...(decisionId ? { decisionId } : {}),
       startedAt: Number(item.startedAt), userMessageUuid: item.userMessageUuid }
   })
   if (new Set(followUps.map(item => item.id)).size !== followUps.length) {
@@ -359,7 +522,7 @@ export function parseCanvasOrchestrationRecord(value: unknown): CanvasOrchestrat
     'coordinatorNodeId', 'coordinatorSessionId', 'status', 'steps', 'summary', 'runStartedAt',
     'createdAt', 'updatedAt',
   ] as const
-  if (!hasContractKeys(value, requiredFields, ['budget', 'followUps']) || value.schemaVersion !== 1
+  if (!hasContractKeys(value, requiredFields, ['budget', 'followUps', 'report']) || value.schemaVersion !== 1
     || !isOrchestrationId(value.id) || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
     || !isOrchestrationId(value.projectId) || !isOrchestrationId(value.canvasId)
     || !isOrchestrationId(value.ownerSessionId)
@@ -377,9 +540,11 @@ export function parseCanvasOrchestrationRecord(value: unknown): CanvasOrchestrat
   }
   let request: CanvasOrchestrationRequest
   let steps: CanvasOrchestrationStep[]
+  let report: CanvasOrchestrationReport | undefined
   try {
     request = parseCanvasOrchestrationRequest(value.request)
     steps = value.steps.map(parseCanvasOrchestrationStep)
+    if (Object.hasOwn(value, 'report')) report = parseOrchestrationReport(value.report)
   } catch {
     throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
   }
@@ -403,7 +568,9 @@ export function parseCanvasOrchestrationRecord(value: unknown): CanvasOrchestrat
         || step.inputVersions?.some(version => !validInputIds.has(version.nodeId))
         || step.outputVersions?.some(version => !step.outputNodeIds.includes(version.nodeId))
     })
-    || hasDependencyCycle(steps)) {
+    || hasDependencyCycle(steps)
+    || (report !== undefined && (report.reportedAt < Number(value.createdAt)
+      || report.reportedAt > Number(value.updatedAt) || report.basedOnRevision > Number(value.revision)))) {
     throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
   }
   const record: CanvasOrchestrationRecord = {
@@ -427,6 +594,16 @@ export function parseCanvasOrchestrationRecord(value: unknown): CanvasOrchestrat
   if (Object.hasOwn(value, 'followUps')) {
     record.followUps = parseFollowUps(value.followUps, record.createdAt, record.updatedAt)
   }
+  if (report !== undefined) {
+    if (!report.stale && report.impact !== undefined) {
+      const latestFollowUpId = record.followUps?.at(-1)?.id
+      const referencedStepIds = [...report.impact.affectedStepIds, ...report.impact.retainedStepIds]
+      if (report.impact.followUpId !== latestFollowUpId || referencedStepIds.some(stepId => !stepIds.has(stepId))) {
+        throw new Error('CANVAS_ORCHESTRATION_RECORD_INVALID')
+      }
+    }
+    record.report = report
+  }
   if (new TextEncoder().encode(JSON.stringify(record, null, 2)).byteLength > maximumRecordBytes) {
     throw new Error('CANVAS_ORCHESTRATION_RECORD_SIZE_LIMIT')
   }
@@ -436,6 +613,61 @@ export function parseCanvasOrchestrationRecord(value: unknown): CanvasOrchestrat
 /** 判断记录状态是否已经停止后续编排。 */
 export function isCanvasOrchestrationTerminal(status: CanvasOrchestrationRecord['status']): boolean {
   return status === 'completed' || status === 'cancelled'
+}
+
+/** 派生当前尚未回答的关键决策；失败或放弃的回答仍视为已经登记。 */
+export function getCanvasOrchestrationPendingDecision(
+  record: CanvasOrchestrationRecord,
+): CanvasOrchestrationDecision | null {
+  if (isCanvasOrchestrationTerminal(record.status) || !record.report?.decision) return null
+  const decision = record.report.decision
+  return record.followUps?.some(followUp => followUp.decisionId === decision.id) ? null : decision
+}
+
+/** 将完整步骤压缩为可稳定展示的有界业务进度，不读取画布或外部状态。 */
+export function getCanvasOrchestrationProgress(record: CanvasOrchestrationRecord): CanvasOrchestrationProgress {
+  const stepCounts: CanvasOrchestrationProgress['stepCounts'] = {
+    total: record.steps.length,
+    planned: record.steps.filter(step => step.status === 'planned').length,
+    running: record.steps.filter(step => step.status === 'running').length,
+    needsReview: record.steps.filter(step => step.status === 'needs-review').length,
+    completed: record.steps.filter(step => step.status === 'completed').length,
+    blocked: record.steps.filter(step => step.status === 'blocked').length,
+  }
+  const activeStatuses: CanvasOrchestrationStep['status'][] = ['blocked', 'running', 'needs-review', 'planned']
+  const activeSteps = activeStatuses.flatMap(status => record.steps.filter(step => step.status === status))
+  const visibleCandidates = activeSteps.length > 0
+    ? activeSteps
+    : record.steps.filter(step => step.status === 'completed')
+  const items = visibleCandidates.slice(0, 8).map(({ id, title, status }) => ({ id, title, status }))
+  const pendingDecision = getCanvasOrchestrationPendingDecision(record)
+  let nextStep = record.report?.nextStep ?? ''
+  if (record.status === 'completed') {
+    nextStep = '编排已完成。'
+  } else if (record.status === 'cancelled') {
+    nextStep = '编排已取消。'
+  } else if (pendingDecision) {
+    nextStep = '等待用户决策。'
+  } else if (record.report?.stale) {
+    nextStep = '编排报告已过期，需要画布 Agent 更新影响评估。'
+  } else if (!record.report) {
+    const firstCurrentStep = visibleCandidates[0]
+    if (firstCurrentStep?.status === 'blocked') nextStep = `处理阻塞步骤：${firstCurrentStep.title}`
+    else if (firstCurrentStep?.status === 'running') nextStep = `继续执行：${firstCurrentStep.title}`
+    else if (firstCurrentStep?.status === 'needs-review') nextStep = `等待评审：${firstCurrentStep.title}`
+    else if (firstCurrentStep?.status === 'planned') nextStep = `下一步：${firstCurrentStep.title}`
+  }
+  return {
+    stepCounts,
+    currentSteps: {
+      items,
+      total: visibleCandidates.length,
+      omitted: visibleCandidates.length - items.length,
+    },
+    nextStep,
+    report: record.report ?? null,
+    pendingDecision,
+  }
 }
 
 /** 严格解析编排记录变化事件。 */

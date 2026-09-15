@@ -33,6 +33,7 @@ import { AttachmentPreviewItem } from '@/components/chat/AttachmentPreviewItem'
 import { QuotedSelectionChip } from '@/components/diff/QuotedSelectionChip'
 import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
 import { CanvasNodeReferenceChips } from '@/components/ai-elements/message'
+import { AgentCanvasOrchestrationFeedback } from './AgentCanvasOrchestrationFeedback'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
 import type { ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import {
@@ -3153,6 +3154,21 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           embedded ? 'max-w-none' : 'max-w-[min(72rem,100%)] mx-auto',
         )}>
         {/* 消息区域 */}
+        {currentWorkspaceId && <AgentCanvasOrchestrationFeedback
+          key={JSON.stringify([currentWorkspaceId, sessionId])}
+          projectId={currentWorkspaceId}
+          sessionId={sessionId}
+          disabled={streaming || backgroundWaiting || isStopping || isLegacyTranscript || !messagesLoaded || !hasAvailableModel || !agentChannelId || queuedMessages.length > 0}
+          canvasTitles={canvasSessionsByProject.get(currentWorkspaceId) ?? []}
+          onSend={async (text) => {
+            // 复用已存在的纯文本提交协议，不读取或清空 composer 草稿、附件与引用。
+            if (messagesRefreshingRef.current || store.get(agentStreamingStatesAtom).get(sessionId)?.running) return false
+            const message = createAgentQueuedMessage(text, crypto.randomUUID(), Date.now(), null, {
+              additionalDirectories: Array.from(createBaseAdditionalDirectories()),
+            })
+            return await sendPlainTextAgentMessage(message) === 'submitted'
+          }}
+        />}
         <AgentMessages
           sessionId={sessionId}
           sessionModelId={agentModelId || undefined}

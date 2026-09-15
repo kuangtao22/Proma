@@ -49,6 +49,8 @@ function createService(calls: Array<{ method: string; args: unknown[] }>): Canva
   const step = { id: 'step-1', title: '设计', role: '设计师', instruction: '完成设计', dependsOn: [],
     inputNodeIds: [], outputNodeIds: [], agentNodeId: 'agent-1', criteria: [], status: 'running' as const, note: '' }
   return {
+    /** 测试替身不产生实际写入，占位释放保持与生产服务合同一致。 */
+    acquireWriteLease: () => () => undefined,
     get: (target) => { calls.push({ method: 'get', args: [target] }); return record },
     delegate: async (...args) => { calls.push({ method: 'delegate', args }); return record },
     resume: async (...args) => { calls.push({ method: 'resume', args }); return record },
@@ -61,6 +63,7 @@ function createService(calls: Array<{ method: string; args: unknown[] }>): Canva
     registerOutput: async (...args) => { calls.push({ method: 'registerOutput', args }); return record },
     reviewStep: async (...args) => { calls.push({ method: 'reviewStep', args }); return record },
     finish: async (...args) => { calls.push({ method: 'finish', args }); return record },
+    report: (...args) => { calls.push({ method: 'report', args }); return record },
     reserveMedia: (...args) => { calls.push({ method: 'reserveMedia', args }); return record },
   }
 }
@@ -96,7 +99,7 @@ describe('Canvas 编排工具角色边界', () => {
       access: { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never), runWrite: (_context, effect) => effect() },
     }, actorContext)
     expect(tools.map(tool => tool.name)).toEqual([
-      'canvas_update_plan', 'canvas_dispatch', 'canvas_review_step', 'canvas_finish_orchestration', 'canvas_get_orchestration',
+      'canvas_update_plan', 'canvas_dispatch', 'canvas_review_step', 'canvas_report_orchestration', 'canvas_finish_orchestration', 'canvas_get_orchestration',
     ])
   })
 
@@ -109,6 +112,15 @@ describe('Canvas 编排工具角色边界', () => {
       expect(tools).toEqual([])
     }
   })
+})
+
+test('Given 另一个已关联会话 When 读取原owner委托 Then 不泄露报告和决策内容', async () => {
+  /** 关联允许访问画布，不等于可以读取另一会话的业务委托。 */
+  const tools = createCanvasOrchestrationTools({ service: createService([]),
+    access: { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never), runWrite: (_context, effect) => effect() },
+  }, { ...ownerContext, sessionId: 'different-owner' })
+  await expect(executeTool(tools, 'canvas_get_orchestration', { canvasId: 'canvas-1' }))
+    .rejects.toThrow('CANVAS_ORCHESTRATION_OWNER_MISMATCH')
 })
 
 test('Given 普通 Agent 委托 When 执行 Then 从上下文构造 owner 并透传取消信号', async () => {
@@ -135,7 +147,9 @@ test('Given 普通 Agent 委托 When 执行 Then 从上下文构造 owner 并透
     stepCounts: { total: 0, planned: 0, running: 0, needsReview: 0, completed: 0, blocked: 0 },
     nextAction: 'update-plan',
   }
-  expect(result).toEqual({ content: [{ type: 'text', text: JSON.stringify(details) }], details })
+  expect(result.details).toMatchObject(details)
+  expect(result.details).toHaveProperty('progress')
+  expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(result.details) }])
 })
 
 test('Given 合法大计划 When 分页读取 Then 概要标明省略且步骤正文保持完整', async () => {
@@ -291,4 +305,58 @@ test('Given 编排上下文缺少可信身份 When 创建工具 Then fail closed
   ]) {
     expect(() => createCanvasOrchestrationTools(dependencies, context)).toThrow('CANVAS_ORCHESTRATION_ACCESS_DENIED')
   }
+})
+
+test('Given 编排者汇报进度 When 执行报告工具 Then 固定身份和CAS送达且禁止伪造Host字段', async () => {
+  /** 工具替身只观察边界，报告持久化在服务测试中验证。 */
+  const calls: Array<{ method: string; args: unknown[] }> = []
+  /** 复用正式工具与写权限入口，不让报告内容赋予角色权限。 */
+  const dependencies: CanvasOrchestrationToolDependencies = { service: createService(calls),
+    access: { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never), runWrite: (_context, effect) => effect() } }
+  /** 初始交接可在没有步骤时报告需求理解，不要求产生空卡片。 */
+  const report = { summary: '已理解需要可操作原型，准备信息结构与交互设计', nextStep: '先整理核心用户路径',
+    decision: { id: 'direction', question: '优先哪种布局？',
+      options: [{ id: 'compact', label: '紧凑布局', impact: '信息密度较高' }, { id: 'spacious', label: '舒展布局', impact: '页面较长' }],
+      recommendedOptionId: 'compact', reason: '适合当前桌面使用目标' } }
+  /** 只允许当前编排运行发表协作报告。 */
+  const tools = createCanvasOrchestrationTools(dependencies, actorContext)
+  await executeTool(tools, 'canvas_report_orchestration', { expectedRevision: 1, report })
+  expect(calls[0]).toEqual({ method: 'report', args: [{ projectId: 'project-1', canvasId: 'canvas-1',
+    sessionId: 'coordinator-session', orchestrationId: 'orchestration-1', runStartedAt: 20 }, 1, report] })
+  for (const invalid of [{ ...report, stale: false }, { ...report, reportedAt: 20 }, { ...report, basedOnRevision: 1 },
+    { ...report, decision: { ...report.decision, resolved: true } }]) {
+    await expect(executeTool(tools, 'canvas_report_orchestration', { expectedRevision: 1, report: invalid }))
+      .rejects.toThrow('CANVAS_ORCHESTRATION_INPUT_INVALID')
+  }
+  expect(calls).toHaveLength(1)
+  await expect(executeTool(createCanvasOrchestrationTools(dependencies, { ...actorContext, permissionCeiling: 'plan' }),
+    'canvas_report_orchestration', { expectedRevision: 1, report })).rejects.toThrow('CANVAS_EXECUTE_INTENT_REQUIRED')
+})
+
+test('Given owner回答待决策项 When 恢复同一委托 Then 透传decisionId和用户原文', async () => {
+  /** 服务接受的来源身份必须由工具上下文重建。 */
+  const calls: Array<{ method: string; args: unknown[] }> = []
+  /** 回答复用现有恢复工具，不新增一个可绕过会话归属的写入口。 */
+  const tools = createCanvasOrchestrationTools({ service: createService(calls),
+    access: { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never), runWrite: (_context, effect) => effect() } }, ownerContext)
+  await executeTool(tools, 'canvas_resume_orchestration', { canvasId: 'canvas-1', orchestrationId: 'orchestration-1',
+    followUp: { id: 'answer-1', expectedRevision: 1, decisionId: 'direction', instruction: '选择紧凑布局，保留原有主题' } })
+  expect(calls[0]?.args[2]).toEqual({ id: 'answer-1', expectedRevision: 1, decisionId: 'direction', instruction: '选择紧凑布局，保留原有主题' })
+})
+
+test('Given 等待业务决策 When 普通聊天查询概要 Then 返回阶段事实和问题且不建议直接分派', async () => {
+  /** 用真实投影测试问题优先级，不由UI猜测summary里是否有问号。 */
+  const service = createService([])
+  service.get = () => createRecord({ status: 'waiting', report: {
+    summary: '需要确认布局方向', nextStep: '等待用户选择', reportedAt: 10, basedOnRevision: 1, stale: false,
+    decision: { id: 'direction', question: '选择哪个方向？', recommendedOptionId: 'a', reason: '桌面更适合',
+      options: [{ id: 'a', label: '紧凑', impact: '信息集中' }, { id: 'b', label: '舒展', impact: '页面较长' }] },
+  } })
+  /** 普通Agent获取的是有界阶段数据，完整专业指令仍按需分页读取。 */
+  const tools = createCanvasOrchestrationTools({ service,
+    access: { authorizeRead: () => undefined, requireLinkedCanvas: () => ({} as never), runWrite: (_context, effect) => effect() } }, ownerContext)
+  const result = await executeTool(tools, 'canvas_get_orchestration', { canvasId: 'canvas-1' })
+  expect(result.details).toMatchObject({ nextAction: 'answer-decision', progress: {
+    stepCounts: { total: 0, completed: 0 }, pendingDecision: { id: 'direction' }, report: { stale: false },
+  } })
 })

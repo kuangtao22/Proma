@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { parseCanvasOrchestrationRequest, parseCanvasOrchestrationRecord } from '@proma/shared'
-import type { CanvasAgentTarget, CanvasDocument, CanvasOrchestrationFollowUp, CanvasOrchestrationRecord, CanvasOrchestrationRequest, CanvasOrchestrationStep, CanvasTarget } from '@proma/shared'
+import { getCanvasOrchestrationPendingDecision, parseCanvasOrchestrationReportInput, parseCanvasOrchestrationRequest, parseCanvasOrchestrationRecord } from '@proma/shared'
+import type { CanvasAgentTarget, CanvasDocument, CanvasOrchestrationFollowUp, CanvasOrchestrationRecord, CanvasOrchestrationReportInput, CanvasOrchestrationRequest, CanvasOrchestrationStep, CanvasTarget } from '@proma/shared'
 import type { CanvasAgentExecutionResult } from './canvas-agent-execution-service'
 import type { CanvasExecutionOwnership } from './canvas-execution-ownership'
 
@@ -23,6 +23,7 @@ export interface CanvasOrchestrationFollowUpInput {
   expectedRevision: number
   instruction: string
   supersedesId?: string
+  decisionId?: string
 }
 /** 委托服务只复用现有存储、节点与运行能力。 */
 export interface CanvasOrchestrationServiceDependencies {
@@ -80,6 +81,10 @@ function definition(step: CanvasOrchestrationStep): string {
 export function createCanvasOrchestrationService(dependencies: CanvasOrchestrationServiceDependencies) {
   /** 进程内只保存活动调用与取消信号，持久事实始终从 Store 读取。 */
   const active = new Map<string, { controller: AbortController; promise: Promise<CanvasOrchestrationRecord> }>()
+  /** 活动调用只在新 runStartedAt 落盘后绑定可写 actor，防止旧代次借用新 active 窗口。 */
+  const activeRunStartedAt = new Map<string, number>()
+  /** 记录已经通过编排门禁但尚未结束的异步写，决策只能在这些写全部 settled 后发布。 */
+  const activeWriteCounts = new Map<string, number>()
   /** 仅当前进程内正在执行的专业 child 拥有分支 token；重启后旧回调自然失效。 */
   const branches = new Map<string, CanvasOrchestrationBranchAccess>()
   /** child 启动时间保持单调，不能误用 coordinator 的 runStartedAt。 */
@@ -88,6 +93,19 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
   const now = dependencies.now ?? Date.now
   /** 以画布隔离活动运行，防止第二个委托同时接管结构。 */
   const key = (target: CanvasTarget): string => JSON.stringify([target.projectId, target.canvasId])
+  /** 获取幂等的进程内写占位；只协调报告时序，不替代持久 Store CAS。 */
+  const acquireWriteLease = (target: CanvasTarget): (() => void) => {
+    const targetKey = key(target)
+    activeWriteCounts.set(targetKey, (activeWriteCounts.get(targetKey) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (activeWriteCounts.get(targetKey) ?? 1) - 1
+      if (remaining <= 0) activeWriteCounts.delete(targetKey)
+      else activeWriteCounts.set(targetKey, remaining)
+    }
+  }
   /** 专业分支身份包含 child 节点和自身运行时间。 */
   const branchKey = (access: CanvasOrchestrationBranchAccess): string => JSON.stringify([
     access.target.projectId, access.target.canvasId, access.target.nodeId, access.parentSessionId,
@@ -126,8 +144,12 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     dependencies.authorizeOwner({ ...actor, sessionId: record.ownerSessionId })
     if (record.id !== actor.orchestrationId || record.coordinatorSessionId !== actor.sessionId
       || record.runStartedAt !== actor.runStartedAt || terminal(record)
-      || !active.has(key(record))) throw new Error('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+      || activeRunStartedAt.get(key(record)) !== actor.runStartedAt) throw new Error('CANVAS_ORCHESTRATION_ACCESS_DENIED')
     return record
+  }
+  /** 用户决策未回答时暂停所有会改变业务进度的服务写入。 */
+  const assertDecisionResolved = (record: CanvasOrchestrationRecord): void => {
+    if (getCanvasOrchestrationPendingDecision(record)) throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
   }
   /** 真实节点身份按有限列表获取，避免缓存媒体字节。 */
   const identities = async (target: CanvasTarget, nodeIds: string[]) => Promise.all(
@@ -331,7 +353,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     const step = record.steps.find(candidate => candidate.id === access.stepId)
     const node = dependencies.loadCanvas(record).nodes.find(candidate => candidate.id === access.target.nodeId)
     if (record.id !== access.orchestrationId || record.coordinatorSessionId !== access.parentSessionId
-      || terminal(record) || !active.has(key(record)) || !step || step.status !== 'running'
+      || terminal(record) || activeRunStartedAt.get(key(record)) !== record.runStartedAt || !step || step.status !== 'running'
       || step.agentNodeId !== access.target.nodeId || node?.kind !== 'agent') {
       throw new Error('CANVAS_ORCHESTRATION_BRANCH_ACCESS_DENIED')
     }
@@ -445,6 +467,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
       record = save(record, { status: 'running', runStartedAt, budget: { ...budget, agentRunsUsed: budget.agentRunsUsed + 1 },
         ...(pendingFollowUp ? { followUps: record.followUps!.map(item => item.id === pendingFollowUp.id
           ? { ...item, status: 'started' as const, startedAt: runStartedAt, userMessageUuid } : item) } : {}) })
+      activeRunStartedAt.set(key(record), runStartedAt)
       try {
         const result = await dependencies.executeCoordinator(record, controller.signal)
         const latest = ownerRecord(owner)
@@ -476,7 +499,10 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
       }
     }).finally(() => {
       signal?.removeEventListener('abort', abort)
-      if (active.get(key(owner))?.controller === controller) active.delete(key(owner))
+      if (active.get(key(owner))?.controller === controller) {
+        active.delete(key(owner))
+        activeRunStartedAt.delete(key(owner))
+      }
     })
     active.set(key(owner), { controller, promise })
     return promise
@@ -539,10 +565,12 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
       const executionSignal = isAbortSignal(followUpOrSignal) ? followUpOrSignal : signal
       let record = ownerRecord(owner)
       if (record.id !== orchestrationId) throw new Error('CANVAS_ORCHESTRATION_OWNER_MISMATCH')
+      const pendingDecision = getCanvasOrchestrationPendingDecision(record)
       if (followUp) {
         const replay = record.followUps?.find(item => item.id === followUp.id)
         if (replay) {
-          if (replay.instruction !== followUp.instruction || replay.supersedesId !== followUp.supersedesId) {
+          if (replay.instruction !== followUp.instruction || replay.supersedesId !== followUp.supersedesId
+            || replay.decisionId !== followUp.decisionId) {
             throw new Error('CANVAS_ORCHESTRATION_FOLLOW_UP_CONFLICT')
           }
           if (replay.status === 'delivered' || replay.status === 'failed' || replay.status === 'abandoned' || terminal(record)) {
@@ -551,6 +579,16 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
           return launch(owner, executionSignal)
         }
         if (terminal(record)) throw new Error('CANVAS_ORCHESTRATION_TERMINAL')
+        if (followUp.decisionId !== undefined) {
+          if (record.followUps?.some(item => item.decisionId === followUp.decisionId)) {
+            throw new Error('CANVAS_ORCHESTRATION_DECISION_ANSWERED')
+          }
+          if (!pendingDecision || pendingDecision.id !== followUp.decisionId) {
+            throw new Error('CANVAS_ORCHESTRATION_DECISION_UNKNOWN')
+          }
+        } else if (pendingDecision) {
+          throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+        }
         if (active.has(key(owner))) throw new Error('CANVAS_ORCHESTRATION_ACTIVE')
         const unresolved = record.followUps?.find(item => item.status === 'pending' || item.status === 'started')
         if (unresolved?.status === 'pending') throw new Error('CANVAS_ORCHESTRATION_FOLLOW_UP_PENDING')
@@ -562,6 +600,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
         }
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(followUp.id)
           || (followUp.supersedesId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(followUp.supersedesId))
+          || (followUp.decisionId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(followUp.decisionId))
           || !followUp.instruction.trim() || followUp.instruction.length > 4_096) {
           throw new Error('CANVAS_ORCHESTRATION_FOLLOW_UP_INVALID')
         }
@@ -581,10 +620,14 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
           ? { ...item, status: 'abandoned' as const } : item)
         record = save(record, { followUps: [...settled, {
           id: followUp.id, instruction: followUp.instruction, ...(followUp.supersedesId ? { supersedesId: followUp.supersedesId } : {}),
+          ...(followUp.decisionId ? { decisionId: followUp.decisionId } : {}),
           status: 'pending', createdAt,
-        }] })
+        }], ...(record.report ? { report: { ...record.report, stale: true } } : {}) })
       }
       if (terminal(record)) return Promise.resolve(record)
+      if (!followUp && getCanvasOrchestrationPendingDecision(record)) {
+        throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      }
       if (!followUp && record.followUps?.at(-1)?.status === 'failed') {
         throw new Error('CANVAS_ORCHESTRATION_FOLLOW_UP_RETRY_REQUIRED')
       }
@@ -603,10 +646,42 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     assertActor: actorRecord,
     /** Agent execution 启动临界区复验专业 child 的可信分支身份。 */
     assertBranch,
+    /** Provider 在异步业务工具开始后持有占位，确保期间不能发布新的待决策报告。 */
+    acquireWriteLease,
+    /** 只有当前编排运行可以基于精确 revision 发布有界业务报告。 */
+    report(actor: CanvasOrchestrationActor, expectedRevision: number, input: CanvasOrchestrationReportInput) {
+      const record = actorRecord(actor)
+      if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+      const report = parseCanvasOrchestrationReportInput(input)
+      const pendingDecision = getCanvasOrchestrationPendingDecision(record)
+      if (pendingDecision && JSON.stringify(report.decision) !== JSON.stringify(pendingDecision)) {
+        throw new Error('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      }
+      if (report.decision && !pendingDecision) {
+        if (record.followUps?.some(item => item.decisionId === report.decision!.id)) {
+          throw new Error('CANVAS_ORCHESTRATION_DECISION_ANSWERED')
+        }
+        if (record.steps.some(step => step.status === 'running')) {
+          throw new Error('CANVAS_ORCHESTRATION_STEP_RUNNING')
+        }
+      }
+      if (report.impact) {
+        const latestFollowUp = record.followUps?.at(-1)
+        const stepIds = new Set(record.steps.map(step => step.id))
+        if (latestFollowUp?.id !== report.impact.followUpId
+          || [...report.impact.affectedStepIds, ...report.impact.retainedStepIds].some(stepId => !stepIds.has(stepId))) {
+          throw new Error('CANVAS_ORCHESTRATION_REPORT_IMPACT_INVALID')
+        }
+      }
+      /** 运行步骤保留更具体诊断；其它在途写统一阻止报告抢先建立等待状态。 */
+      if ((activeWriteCounts.get(key(record)) ?? 0) > 0) throw new Error('CANVAS_ORCHESTRATION_WRITE_ACTIVE')
+      return save(record, { report: { ...report, reportedAt: now(), basedOnRevision: record.revision, stale: false } })
+    },
     /** 只接受计划字段；状态与证据由 Host 保留或失效，模型不能在计划更新中伪造完成。 */
     async updatePlan(actor: CanvasOrchestrationActor, expectedRevision: number, draft: CanvasOrchestrationStep[]) {
       const record = actorRecord(actor)
       if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+      assertDecisionResolved(record)
       const previous = new Map(record.steps.map(step => [step.id, step]))
       const steps = draft.map(step => {
         const old = previous.get(step.id)
@@ -629,92 +704,104 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
         }
       }
       validateNodes(record, steps)
-      return save(record, { steps })
+      const planChanged = steps.length !== record.steps.length
+        || steps.some((step, index) => definition(step) !== definition(record.steps[index]!))
+      return save(record, { steps, ...(planChanged && record.report ? { report: { ...record.report, stale: true } } : {}) })
     },
     /** 按已登记步骤分派专业工作，执行成功只进入待评审。 */
     async dispatch(actor: CanvasOrchestrationActor, expectedRevision: number, stepId: string) {
       let record = actorRecord(actor)
       if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
-      let step = record.steps.find(step => step.id === stepId)
-      if (!step) throw new Error('CANVAS_ORCHESTRATION_STEP_NOT_FOUND')
-      if (step.status === 'running') return record
-      if (step.status === 'needs-review' || step.status === 'completed') {
-        if (!await versionsMatch(record, step.inputVersions, effectiveInputNodeIds(record, step))) {
-          return invalidateStepAndDownstream(record, step.id, 'blocked', '输入版本已改变，已有产物需重新核对。')
+      assertDecisionResolved(record)
+      const releaseWriteLease = acquireWriteLease(record)
+      try {
+        let step = record.steps.find(step => step.id === stepId)
+        if (!step) throw new Error('CANVAS_ORCHESTRATION_STEP_NOT_FOUND')
+        if (step.status === 'running') return record
+        if (step.status === 'needs-review' || step.status === 'completed') {
+          if (!await versionsMatch(record, step.inputVersions, effectiveInputNodeIds(record, step))) {
+            return invalidateStepAndDownstream(record, step.id, 'blocked', '输入版本已改变，已有产物需重新核对。')
+          }
+          if (!await versionsMatch(record, step.outputVersions, step.outputNodeIds)) {
+            return invalidateStepAndDownstream(record, step.id, 'needs-review', '产物版本已改变，需要重新评审。')
+          }
+          return record
         }
-        if (!await versionsMatch(record, step.outputVersions, step.outputNodeIds)) {
-          return invalidateStepAndDownstream(record, step.id, 'needs-review', '产物版本已改变，需要重新评审。')
-        }
-        return record
-      }
-      /** 直接上游用于冻结本步输入，完整祖先用于版本准入。 */
-      const upstream = record.steps.filter(candidate => step!.dependsOn.includes(candidate.id))
-      /** 当前分支的可达祖先，不包含无关计划步骤。 */
-      const ancestors = dependencyAncestors(record, step)
-      if (ancestors.some(candidate => candidate.status !== 'completed')) throw new Error('CANVAS_ORCHESTRATION_DEPENDENCY_PENDING')
-      record = ensureBudget(record)
-      const budget = record.budget!
-      if (budget.agentRunsUsed >= budget.maxAgentRuns || (step.attempts ?? 0) >= 3) throw new Error('CANVAS_ORCHESTRATION_BUDGET_EXHAUSTED')
-      const inputNodeIds = [...new Set([...step.inputNodeIds, ...upstream.flatMap(candidate => candidate.outputNodeIds)])]
-      const inputVersions = await identities(record, inputNodeIds)
-      record = actorRecord(actor)
-      if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
-      await assertDependencyVersions(actor, record, ancestors)
-      if (!step.agentNodeId) {
-        const target = await dependencies.createAgent(record, step)
+        /** 直接上游用于冻结本步输入，完整祖先用于版本准入。 */
+        const upstream = record.steps.filter(candidate => step!.dependsOn.includes(candidate.id))
+        /** 当前分支的可达祖先，不包含无关计划步骤。 */
+        const ancestors = dependencyAncestors(record, step)
+        if (ancestors.some(candidate => candidate.status !== 'completed')) throw new Error('CANVAS_ORCHESTRATION_DEPENDENCY_PENDING')
+        record = ensureBudget(record)
+        const budget = record.budget!
+        if (budget.agentRunsUsed >= budget.maxAgentRuns || (step.attempts ?? 0) >= 3) throw new Error('CANVAS_ORCHESTRATION_BUDGET_EXHAUSTED')
+        const inputNodeIds = [...new Set([...step.inputNodeIds, ...upstream.flatMap(candidate => candidate.outputNodeIds)])]
+        const inputVersions = await identities(record, inputNodeIds)
         record = actorRecord(actor)
         if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
-        /** Agent 创建是异步副作用窗口，返回后再次复验再决定是否扣额和执行。 */
         await assertDependencyVersions(actor, record, ancestors)
-        const assigned = { ...step, agentNodeId: target.nodeId }
-        validateNodes(record, record.steps.map(candidate => candidate.id === stepId ? assigned : candidate))
-        step = assigned
-      }
-      /** 同一步骤跨重启重试也必须获得新代次，防止复用旧消息锚点。 */
-      const persistedBranchStartedAt = Math.max(0, ...record.steps.map(candidate => candidate.execution?.startedAt ?? 0))
-      lastBranchStartedAt = Math.max(now(), lastBranchStartedAt + 1, persistedBranchStartedAt + 1, (record.runStartedAt ?? 0) + 1)
-      const userMessageUuid = createHash('sha256').update(`${record.id}:${step.id}:${lastBranchStartedAt}`).digest('hex')
-      const running = { ...step, status: 'running' as const, inputVersions, attempts: (step.attempts ?? 0) + 1, note: '',
-        execution: { startedAt: lastBranchStartedAt, userMessageUuid } }
-      record = save(record, { steps: record.steps.map(candidate => candidate.id === stepId ? running : candidate),
-        budget: { ...record.budget!, agentRunsUsed: record.budget!.agentRunsUsed + 1 } })
-      const controller = active.get(key(record))!.controller
-      const access: CanvasOrchestrationBranchAccess = {
-        target: { projectId: record.projectId, canvasId: record.canvasId, nodeId: running.agentNodeId! },
-        parentSessionId: record.coordinatorSessionId!,
-        orchestrationId: record.id,
-        stepId,
-        startedAt: lastBranchStartedAt,
-        userMessageUuid,
-      }
-      branches.set(branchKey(access), access)
-      try {
-        const result = await dependencies.executeSpecialist(record, running, controller.signal, access)
-        const latest = dependencies.store.get(actor)
-        if (!latest) throw new Error('CANVAS_ORCHESTRATION_NOT_FOUND')
-        if (terminal(latest) || latest.id !== record.id || latest.runStartedAt !== actor.runStartedAt) return latest
-        actorRecord(actor)
-        const current = latest.steps.find(candidate => candidate.id === stepId)
-        if (!current || current.status !== 'running' || current.attempts !== running.attempts) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
-        const validInputs = await versionsMatch(latest, inputVersions, effectiveInputNodeIds(latest, current))
-        const outputNodeIds = [...new Set([...current.outputNodeIds, ...(result.status === 'completed' ? [running.agentNodeId!] : [])])]
-        const outputVersions = result.status === 'completed' && validInputs ? await identities(latest, outputNodeIds) : undefined
-        const fresh = actorRecord(actor)
-        if (fresh.revision !== latest.revision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
-        return save(fresh, { steps: fresh.steps.map(candidate => candidate.id === stepId ? { ...current,
-          status: result.status === 'completed' && validInputs ? 'needs-review' : 'blocked', outputNodeIds,
-          ...(outputVersions ? { outputVersions } : {}),
-          note: !validInputs ? '输入版本已改变，需复核本次结果。' : result.status === 'completed' ? '专业产物已交付，等待编排者评审。' : result.failure?.message ?? '专业运行未完成。',
-        } : candidate) })
-      } catch (error) {
-        const latest = dependencies.store.get(actor)
-        if (latest && terminal(latest)) return latest
-        if (latest && latest.id === actor.orchestrationId && latest.runStartedAt === actor.runStartedAt) {
-          save(latest, { steps: latest.steps.map(candidate => candidate.id === stepId ? { ...candidate, status: 'blocked', note: '专业运行中断，请先核对已有产物再决定是否继续。' } : candidate) })
+        /** 依赖复验包含异步读取；进入节点创建副作用前重新确认运行代次、revision 与决策状态。 */
+        record = actorRecord(actor)
+        if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+        assertDecisionResolved(record)
+        if (!step.agentNodeId) {
+          const target = await dependencies.createAgent(record, step)
+          record = actorRecord(actor)
+          if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+          /** Agent 创建是异步副作用窗口，返回后再次复验再决定是否扣额和执行。 */
+          await assertDependencyVersions(actor, record, ancestors)
+          const assigned = { ...step, agentNodeId: target.nodeId }
+          validateNodes(record, record.steps.map(candidate => candidate.id === stepId ? assigned : candidate))
+          step = assigned
         }
-        throw error
+        /** 同一步骤跨重启重试也必须获得新代次，防止复用旧消息锚点。 */
+        const persistedBranchStartedAt = Math.max(0, ...record.steps.map(candidate => candidate.execution?.startedAt ?? 0))
+        lastBranchStartedAt = Math.max(now(), lastBranchStartedAt + 1, persistedBranchStartedAt + 1, (record.runStartedAt ?? 0) + 1)
+        const userMessageUuid = createHash('sha256').update(`${record.id}:${step.id}:${lastBranchStartedAt}`).digest('hex')
+        const running = { ...step, status: 'running' as const, inputVersions, attempts: (step.attempts ?? 0) + 1, note: '',
+          execution: { startedAt: lastBranchStartedAt, userMessageUuid } }
+        record = save(record, { steps: record.steps.map(candidate => candidate.id === stepId ? running : candidate),
+          budget: { ...record.budget!, agentRunsUsed: record.budget!.agentRunsUsed + 1 } })
+        const controller = active.get(key(record))!.controller
+        const access: CanvasOrchestrationBranchAccess = {
+          target: { projectId: record.projectId, canvasId: record.canvasId, nodeId: running.agentNodeId! },
+          parentSessionId: record.coordinatorSessionId!,
+          orchestrationId: record.id,
+          stepId,
+          startedAt: lastBranchStartedAt,
+          userMessageUuid,
+        }
+        branches.set(branchKey(access), access)
+        try {
+          const result = await dependencies.executeSpecialist(record, running, controller.signal, access)
+          const latest = dependencies.store.get(actor)
+          if (!latest) throw new Error('CANVAS_ORCHESTRATION_NOT_FOUND')
+          if (terminal(latest) || latest.id !== record.id || latest.runStartedAt !== actor.runStartedAt) return latest
+          actorRecord(actor)
+          const current = latest.steps.find(candidate => candidate.id === stepId)
+          if (!current || current.status !== 'running' || current.attempts !== running.attempts) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+          const validInputs = await versionsMatch(latest, inputVersions, effectiveInputNodeIds(latest, current))
+          const outputNodeIds = [...new Set([...current.outputNodeIds, ...(result.status === 'completed' ? [running.agentNodeId!] : [])])]
+          const outputVersions = result.status === 'completed' && validInputs ? await identities(latest, outputNodeIds) : undefined
+          const fresh = actorRecord(actor)
+          if (fresh.revision !== latest.revision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+          return save(fresh, { steps: fresh.steps.map(candidate => candidate.id === stepId ? { ...current,
+            status: result.status === 'completed' && validInputs ? 'needs-review' : 'blocked', outputNodeIds,
+            ...(outputVersions ? { outputVersions } : {}),
+            note: !validInputs ? '输入版本已改变，需复核本次结果。' : result.status === 'completed' ? '专业产物已交付，等待编排者评审。' : result.failure?.message ?? '专业运行未完成。',
+          } : candidate) })
+        } catch (error) {
+          const latest = dependencies.store.get(actor)
+          if (latest && terminal(latest)) return latest
+          if (latest && latest.id === actor.orchestrationId && latest.runStartedAt === actor.runStartedAt) {
+            save(latest, { steps: latest.steps.map(candidate => candidate.id === stepId ? { ...candidate, status: 'blocked', note: '专业运行中断，请先核对已有产物再决定是否继续。' } : candidate) })
+          }
+          throw error
+        } finally {
+          branches.delete(branchKey(access))
+        }
       } finally {
-        branches.delete(branchKey(access))
+        releaseWriteLease()
       }
     },
     /** 可信工具创建成功后把真实节点及版本自动登记到当前专业步骤。 */
@@ -722,6 +809,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
       if (typeof sourceToolCallId !== 'string' || sourceToolCallId.length < 1 || sourceToolCallId.length > 256
         || /[\0\r\n]/.test(sourceToolCallId)) throw new Error('CANVAS_ORCHESTRATION_OUTPUT_SOURCE_INVALID')
       const initial = assertBranch(access)
+      assertDecisionResolved(initial.record)
       const node = dependencies.loadCanvas(initial.record).nodes.find(candidate => candidate.id === nodeId)
       if (!node) throw new Error('CANVAS_ORCHESTRATION_NODE_MISSING')
       if (initial.record.request.intent === 'review'
@@ -744,6 +832,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     async reviewStep(actor: CanvasOrchestrationActor, expectedRevision: number, stepId: string, passed: boolean, note: string) {
       const record = actorRecord(actor)
       if (record.revision !== expectedRevision) throw new Error('CANVAS_ORCHESTRATION_CONFLICT')
+      assertDecisionResolved(record)
       const step = record.steps.find(candidate => candidate.id === stepId)
       if (!step || step.status === 'running' || !step.outputNodeIds.length) throw new Error('CANVAS_ORCHESTRATION_REVIEW_NOT_READY')
       const inputVersions = await identities(record, effectiveInputNodeIds(record, step))
@@ -764,6 +853,7 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     /** 完成必须同时满足计划与真实交付合同；等待和受阻保持可恢复。 */
     async finish(actor: CanvasOrchestrationActor, status: 'completed' | 'waiting' | 'blocked', summary: string) {
       const record = actorRecord(actor)
+      if (status === 'completed') assertDecisionResolved(record)
       if (status === 'completed') {
         if (record.steps.some(step => step.status !== 'completed')) throw new Error('CANVAS_ORCHESTRATION_DELIVERY_INCOMPLETE')
         await assertStepVersions(actor, record)
@@ -780,18 +870,20 @@ export function createCanvasOrchestrationService(dependencies: CanvasOrchestrati
     /** 媒体启动前预留预算，未知提交结果不会退回额度后重复外发。 */
     reserveMedia(actor: CanvasOrchestrationActor, count: number, operationId?: string) {
       let record = actorRecord(actor)
-      record = ensureBudget(record)
-      const budget = record.budget!
       if (operationId !== undefined) {
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(operationId)) {
           throw new Error('CANVAS_ORCHESTRATION_MEDIA_RESERVATION_INVALID')
         }
-        const existing = budget.mediaReservations?.find(reservation => reservation.operationId === operationId)
+        /** 已落盘操作的查询式重放不改变额度，待决策时仍可安全对账。 */
+        const existing = record.budget?.mediaReservations?.find(reservation => reservation.operationId === operationId)
         if (existing) {
           if (existing.count !== count) throw new Error('CANVAS_ORCHESTRATION_MEDIA_RESERVATION_CONFLICT')
           return record
         }
       }
+      assertDecisionResolved(record)
+      record = ensureBudget(record)
+      const budget = record.budget!
       if (!Number.isSafeInteger(count) || count < 1 || budget.mediaRunsUsed + count > budget.maxMediaRuns) throw new Error('CANVAS_ORCHESTRATION_MEDIA_BUDGET_EXHAUSTED')
       return save(record, { budget: {
         ...budget,

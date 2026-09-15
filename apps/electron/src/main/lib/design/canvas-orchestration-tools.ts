@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { CanvasOrchestrationRecord, CanvasOrchestrationRequest, CanvasOrchestrationStep } from '@proma/shared'
+import { getCanvasOrchestrationPendingDecision, getCanvasOrchestrationProgress } from '@proma/shared'
 import { Type } from 'typebox'
 import type { Static, TSchema } from 'typebox'
 import { Value } from 'typebox/value'
@@ -64,6 +65,7 @@ const resumeSchema = Type.Object({
     expectedRevision: Type.Integer({ minimum: 1 }),
     instruction: Type.String({ minLength: 1, maxLength: 4_096 }),
     supersedesId: Type.Optional(stableId),
+    decisionId: Type.Optional(stableId),
   }, { additionalProperties: false })),
 }, { additionalProperties: false })
 /** 编排者读取固定目标时不需要也不允许传入画布或任务身份。 */
@@ -79,6 +81,33 @@ const dispatchSchema = Type.Object({ expectedRevision: Type.Integer({ minimum: 1
 const reviewStepSchema = Type.Object({
   expectedRevision: Type.Integer({ minimum: 1 }), stepId: stableId, passed: Type.Boolean(),
   note: Type.String({ minLength: 1, maxLength: 16_384 }),
+}, { additionalProperties: false })
+/** 协作报告仅接受有界业务描述，时间、陈旧标记和执行身份由 Host 维护。 */
+const reportText = Type.String({ minLength: 1, maxLength: 1_024 })
+/** 原需求校正的影响由编排者解释，不能冒充自动算出的精确成本。 */
+const reportSchema = Type.Object({
+  expectedRevision: Type.Integer({ minimum: 1 }),
+  report: Type.Object({
+    summary: reportText,
+    nextStep: reportText,
+    impact: Type.Optional(Type.Object({
+      followUpId: stableId,
+      affectedStepIds: Type.Array(stableId, { maxItems: 64, uniqueItems: true }),
+      retainedStepIds: Type.Array(stableId, { maxItems: 64, uniqueItems: true }),
+      explanation: reportText,
+      additionalWork: reportText,
+      runningWork: reportText,
+    }, { additionalProperties: false })),
+    decision: Type.Optional(Type.Object({
+      id: stableId,
+      question: reportText,
+      options: Type.Array(Type.Object({
+        id: stableId, label: Type.String({ minLength: 1, maxLength: 120 }), impact: reportText,
+      }, { additionalProperties: false }), { minItems: 2, maxItems: 4 }),
+      recommendedOptionId: stableId,
+      reason: reportText,
+    }, { additionalProperties: false })),
+  }, { additionalProperties: false }),
 }, { additionalProperties: false })
 /** 编排结束只声明任务状态和摘要，真实交付证据仍由服务复验。 */
 const finishSchema = Type.Object({
@@ -135,6 +164,7 @@ function createActor(context: CanvasToolRunContext): CanvasOrchestrationActor {
 /** 从当前状态派生模型可执行的下一步提示，不替代服务的真实状态机。 */
 function nextAction(record: CanvasOrchestrationRecord): string {
   if (record.status === 'completed' || record.status === 'cancelled') return 'none'
+  if (getCanvasOrchestrationPendingDecision(record)) return 'answer-decision'
   const followUp = record.followUps?.at(-1)
   if (followUp?.status === 'pending') return 'resume-follow-up'
   if (followUp?.status === 'started') return 'inspect-follow-up-run'
@@ -162,6 +192,7 @@ function mutationSummary(record: CanvasOrchestrationRecord) {
       blocked: record.steps.filter(step => step.status === 'blocked').length,
     },
     nextAction: nextAction(record),
+    progress: getCanvasOrchestrationProgress(record),
     ...(followUp ? { followUp: { id: followUp.id, status: followUp.status } } : {}),
   }
 }
@@ -189,6 +220,7 @@ function readProjection(
         followUps: record.followUps?.length ?? 0,
       },
       nextAction: nextAction(record),
+      progress: getCanvasOrchestrationProgress(record),
       omittedSections: ['constraints', 'deliverables', 'steps', 'followUps'] as const,
     }
   }
@@ -264,7 +296,12 @@ export function createCanvasOrchestrationTools(
         async (input, identity, signal) => mutationSummary(await dependencies.service.delegate(identity as CanvasOrchestrationOwner, input.request as CanvasOrchestrationRequest, signal))),
       define('canvas_get_orchestration', '查看画布编排', '读取当前画布的权威编排状态、专业步骤与交付摘要，不启动新的执行。',
         canvasTargetSchema, false, canvasId, owner,
-        (input, identity) => readProjection(dependencies.service.get(identity), input)),
+        (input, identity) => {
+          // 画布关联不转移委托所有权，普通会话只能读取自己委托的报告和答复。
+          const record = dependencies.service.get(identity)
+          if (record && record.ownerSessionId !== identity.sessionId) throw new Error('CANVAS_ORCHESTRATION_OWNER_MISMATCH')
+          return readProjection(record, input)
+        }),
       define('canvas_resume_orchestration', '继续画布编排', '沿原编排任务和已有产物继续；用户要求发生校正时用 followUp 传递稳定ID、当前revision和完整校正，不修改原始委托。最近校正为 failed 时必须用新 followUp ID 重试；started 结果不明时仅在确认原执行停止后用 supersedesId 显式替代。',
         resumeSchema, true, canvasId, owner,
         async (input, identity, signal) => mutationSummary(await dependencies.service.resume(identity as CanvasOrchestrationOwner,
@@ -290,6 +327,9 @@ export function createCanvasOrchestrationTools(
     define('canvas_review_step', '评审专业步骤', '按真实节点版本复核一个专业交付，记录通过或退回结论。',
       reviewStepSchema, true, actorCanvasId, actor,
       async (input, identity) => mutationSummary(await dependencies.service.reviewStep(identity as CanvasOrchestrationActor, input.expectedRevision, input.stepId, input.passed, input.note))),
+    define('canvas_report_orchestration', '汇报协作进展', '保存当前业务进度、后续校正的影响评估或需用户决定的问题；待决策时暂停新的制作写入，普通会话通过原followUp回答。报告不代表最终交付完成。',
+      reportSchema, true, actorCanvasId, actor,
+      (input, identity) => mutationSummary(dependencies.service.report(identity as CanvasOrchestrationActor, input.expectedRevision, input.report))),
     define('canvas_finish_orchestration', '结束画布编排', '声明完成、等待或受阻；完成仍需 Host 验证全部步骤和真实交付合同。',
       finishSchema, true, actorCanvasId, actor,
       async (input, identity) => mutationSummary(await dependencies.service.finish(identity as CanvasOrchestrationActor, input.status, input.summary))),

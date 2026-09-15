@@ -161,7 +161,9 @@ function hasValidFollowUpProgression(
         && previous.status === 'started' && after[index]?.status === 'abandoned')))
     && before.every((item, index) => {
       const next = after[index]
+      // 答案只能关联原问题；迁移、恢复或普通保存都不能改写已登记的决策身份。
       if (!next || next.id !== item.id || next.instruction !== item.instruction || next.supersedesId !== item.supersedesId
+        || next.decisionId !== item.decisionId
         || next.createdAt !== item.createdAt) return false
       if (item.status === 'pending') return next.status === 'pending'
         ? next.startedAt === undefined && next.userMessageUuid === undefined

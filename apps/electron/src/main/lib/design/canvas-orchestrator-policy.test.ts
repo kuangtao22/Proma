@@ -9,6 +9,7 @@ describe('画布编排角色能力', () => {
     expect(isCanvasAgentToolAllowed(mode, 'canvas_dispatch')).toBe(true)
     expect(isCanvasAgentToolAllowed(mode, 'canvas_finish_orchestration')).toBe(true)
     expect(isCanvasAgentToolAllowed(mode, 'canvas_get_orchestration')).toBe(true)
+    expect(isCanvasAgentToolAllowed(mode, 'canvas_report_orchestration')).toBe(true)
     expect(isCanvasAgentToolAllowed(mode, 'canvas_create_agent')).toBe(false)
     expect(isCanvasAgentToolAllowed(mode, 'canvas_run_agent')).toBe(false)
     expect(isCanvasAgentToolAllowed(mode, 'canvas_delegate')).toBe(false)
@@ -18,6 +19,7 @@ describe('画布编排角色能力', () => {
     for (const mode of ['parent-orchestrated', 'renderer-manual'] as const) {
       expect(isCanvasAgentToolAllowed(mode, 'canvas_dispatch')).toBe(false)
       expect(isCanvasAgentToolAllowed(mode, 'canvas_update_plan')).toBe(false)
+      expect(isCanvasAgentToolAllowed(mode, 'canvas_report_orchestration')).toBe(false)
       expect(isCanvasAgentToolAllowed(mode, 'canvas_delegate')).toBe(false)
     }
     expect(isCanvasAgentToolAllowed('parent-orchestrated', 'canvas_run_nodes')).toBe(false)

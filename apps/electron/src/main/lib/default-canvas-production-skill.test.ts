@@ -38,12 +38,33 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.36"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.38"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
   expect(skill).toContain('普通代码')
   expect(skill).toContain('不要强行转入画布')
+})
+
+test('Given 人物与空间相关制作 When 加载默认 Skill Then 专业设计合同可达且镜头引用与实际验收分开', () => {
+  /** 检查真实分发入口，避免专业参考只存在于仓库而不进入 Agent 的读取路径。 */
+  const skill = readCanvasProductionSkill()
+  /** 两份参考分别承载总流程和专业交接细则。 */
+  const review = readFileSync(join(canvasProductionSkillPath, '../references/production-review.md'), 'utf8')
+  expect(skill).toContain('references/professional-design.md')
+  expect(review).toContain('professional-design.md')
+  /** 参考不存在时保留明确的合同断言，不用读文件异常代替失败原因。 */
+  const path = join(canvasProductionSkillPath, '../references/professional-design.md')
+  expect(existsSync(path)).toBe(true)
+  /** 静态合同仅验证送达与边界，不证明真实模型已完成专业设计或完整观看。 */
+  const professional = readFileSync(path, 'utf8')
+  for (const rule of ['美术指导', '服装与造型', '场景设计', '道具设计', '动作指导', '表演指导',
+    '适用性', '不适用', '合并负责', '独立分派', 'inputNodeIds', 'dependsOn', 'outputNodeIds',
+    '同一文档只归一个步骤', '动作段', '起始状态', '结束状态', '左右手', '接触', '允许变化',
+    '实际视频', '首尾帧', '未验证', '小红书', '漫剧', '电影', '纯产品', 'UI',
+    'sampled', 'full', '不因缺少新模板重建', '不能把待生成资产作为设计完成的前置条件']) {
+    expect(professional).toContain(rule)
+  }
 })
 
 test('Given 活动编排收到用户校正 When 读取 Skill Then 沿原委托传递校正且正确复读初始正文', () => {
@@ -52,6 +73,14 @@ test('Given 活动编排收到用户校正 When 读取 Skill Then 沿原委托�
     '`followUp.id`', '`expectedRevision`', '`supersedesId`', '不能改写原 request', '不能再次 `canvas_delegate`',
     '`revision=0` 是真实初始版本', '`contentState`', '`canvas_read`', '历史数组为空不能单独证明正文丢失',
   ]) expect(skill).toContain(rule)
+})
+
+test('Given 聊天与画布协作 When 读取Skill Then 明确报告影响与回传用户决策并保留真实验收边界', () => {
+  /** 默认规则必须使新增工具成为完整交接循环的一部分。 */
+  const skill = readCanvasProductionSkill()
+  for (const rule of ['canvas_report_orchestration', 'progress', 'pendingDecision', 'decisionId',
+    'affectedStepIds', 'retainedStepIds', 'runningWork', 'stale', '用户原文',
+    '不能把推荐选项当作用户答案', '阶段完成不等于成片完成']) expect(skill).toContain(rule)
 })
 
 test('Given 新画布缺少默认服务器 When 读取生产指引 Then 区分唯一可用连接与真正需要用户选择的阻塞', () => {

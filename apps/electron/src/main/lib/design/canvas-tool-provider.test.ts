@@ -28,6 +28,79 @@ import { canvasOrchestrationRequirements } from './canvas-orchestration-contract
 const target = { projectId: 'project-1', canvasId: 'canvas-1' }
 const reference: CanvasNodeReference = { ...target, nodeId: 'doc-1', nodeType: 'document', nodeRevision: 3, title: '需求' }
 
+test('Given 编排异步写工具已通过门禁 When 工具成功或失败 Then Provider在完整Promise生命周期后释放写占位', async () => {
+  const fixture = createFixture()
+  const record = { schemaVersion: 1, ...target, id: 'orchestration-write-lease', revision: 1,
+    ownerSessionId: 'owner', coordinatorSessionId: fixture.context.sessionId, coordinatorNodeId: 'agent-1',
+    request: { requestId: 'write-lease', goal: '验证写生命周期', intent: 'design', constraints: [], referenceNodeIds: [],
+      deliverables: [{ id: 'result', title: '结果', kind: 'document', criteria: ['可核对'] }] },
+    steps: [], status: 'running', summary: '', createdAt: 1, updatedAt: 1, runStartedAt: 99 } as CanvasOrchestrationRecord
+  let finishUpdate!: (value: CanvasOrchestrationRecord) => void
+  let updateResult = new Promise<CanvasOrchestrationRecord>(resolve => { finishUpdate = resolve })
+  let releases = 0
+  let activeWrites = 0
+  fixture.dependencies.orchestration = {
+    get: () => record,
+    assertActor: () => record,
+    acquireWriteLease: () => {
+      activeWrites += 1
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        activeWrites -= 1
+        releases += 1
+      }
+    },
+    report: () => {
+      if (activeWrites > 0) throw new Error('CANVAS_ORCHESTRATION_WRITE_ACTIVE')
+      return record
+    },
+    updatePlan: () => updateResult,
+  } as unknown as CanvasOrchestrationService
+  const context: CanvasToolRunContext = { ...fixture.context, runStartedAt: 99,
+    canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'canvas-orchestrator',
+    canvasOrchestrationId: record.id }
+  const updating = executeTool(createCanvasToolRun(fixture.dependencies, context).piCustomTools,
+    'canvas_update_plan', { expectedRevision: 1, steps: [] })
+  await Promise.resolve()
+  expect(releases).toBe(0)
+  finishUpdate(record)
+  await updating
+  expect(releases).toBe(1)
+
+  let failUpdate!: (error: Error) => void
+  updateResult = new Promise<CanvasOrchestrationRecord>((_resolve, reject) => { failUpdate = reject })
+  const failing = executeTool(createCanvasToolRun(fixture.dependencies, context).piCustomTools,
+    'canvas_update_plan', { expectedRevision: 1, steps: [] })
+  await Promise.resolve()
+  expect(releases).toBe(1)
+  failUpdate(new Error('WRITE_FAILED'))
+  await expect(failing).rejects.toThrow('CANVAS_ORCHESTRATION_FAILED')
+  expect(releases).toBe(2)
+
+  /** 普通聊天 owner 也可能结算既有底层任务，期间必须与同画布编排报告互斥。 */
+  const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+  await executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: target.canvasId, requirements: [
+    { id: 'report', description: '需求正文', nodeId: 'doc-1', nodeKind: 'document', validation: 'content' },
+  ] })
+  const read = await executeTool(run.piCustomTools, 'canvas_read', { canvasId: target.canvasId, nodeIds: ['doc-1'] })
+  const details = read.details as { nodes: Array<{ evidence: Array<{ evidenceId: string; validation: string }> }> }
+  const evidenceId = details.nodes[0]!.evidence.find(item => item.validation === 'content')!.evidenceId
+  const completing = executeTool(run.piCustomTools, 'canvas_task', {
+    action: 'complete', submissions: [{ id: 'report', evidenceId }],
+  })
+  const actor = { ...target, sessionId: fixture.context.sessionId, orchestrationId: record.id, runStartedAt: 99 }
+  expect(() => fixture.dependencies.orchestration!.report(actor, record.revision, {
+    summary: '不应抢先发布', nextStep: '等待底层完成',
+  })).toThrow('CANVAS_ORCHESTRATION_WRITE_ACTIVE')
+  await completing
+  expect(activeWrites).toBe(0)
+  expect(() => fixture.dependencies.orchestration!.report(actor, record.revision, {
+    summary: '底层已完成', nextStep: '继续编排',
+  })).not.toThrow()
+})
+
 test('Given 真实持久编排合同 When 试图降级目标或复用无关旧产物 Then 拒绝且只接受已评审的同版输出', async () => {
   /** 两层持久事实分别保存计划归属和真实交付证据，读正文后才可验收。 */
   const fixture = createFixture({ documentContent: '完整的信息架构和交互状态设计' })
@@ -40,11 +113,16 @@ test('Given 真实持久编排合同 When 试图降级目标或复用无关旧�
       request: { requestId: 'ui-design', goal: '完成UI设计', intent: 'design', constraints: [], referenceNodeIds: [],
         deliverables: [{ id: 'structure', title: '结构与状态设计', kind: 'document', criteria: ['包含异常状态'] }] },
       steps: [], status: 'running', summary: '', createdAt: 1, updatedAt: 1, runStartedAt: 99 }
-    fixture.dependencies.orchestration = { get: () => structuredClone(record), assertActor: () => record } as unknown as CanvasOrchestrationService
+    fixture.dependencies.orchestration = {
+      get: () => structuredClone(record),
+      assertActor: () => record,
+      acquireWriteLease: () => () => undefined,
+    } as unknown as CanvasOrchestrationService
     const context: CanvasToolRunContext = { ...fixture.context, canvasAgentTarget: { ...target, nodeId: 'agent-1' },
       canvasAgentMode: 'canvas-orchestrator', canvasOrchestrationId: record.id }
     const run = createCanvasToolRun(fixture.dependencies, context)
     expect(run.allowedToolNames).toContain('canvas_dispatch')
+    expect(run.allowedToolNames).toContain('canvas_report_orchestration')
     expect(run.allowedToolNames).not.toContain('canvas_run_agent')
     expect(run.allowedToolNames).not.toContain('canvas_run_workflow')
     await expect(executeTool(run.piCustomTools, 'canvas_task', { action: 'start', canvasId: target.canvasId,
@@ -727,6 +805,35 @@ test('Given 未加载专业 Skill 的画布运行 When 创建工具上下文 The
     expect(run.systemPromptAppend).toContain('创建或运行导演还必须符合本轮工具能力；permissionCeiling=plan 时只读取现有方案并给出规划建议')
   }
   expect(load).not.toHaveBeenCalled()
+})
+
+test('Given 未加载制作 Skill 的各类 Agent When 装配画布工具 Then 收到专业交接规则且不触发生产', () => {
+  /** 真实工具装配覆盖旧单项入口、只读上限和新的持久委托两种运行身份。 */
+  const fixture = createFixture()
+  /** 只观察装配阶段，不能因为增加专业规则就扫图或执行专业分支。 */
+  const load = spyOn(fixture.dependencies.documents, 'load')
+  /** 专业职责不应改变运行角色、工具授权或写操作边界。 */
+  const contexts: CanvasToolRunContext[] = [fixture.context, { ...fixture.context, permissionCeiling: 'plan' },
+    ...(['renderer-manual', 'parent-orchestrated', 'canvas-orchestrator'] as const).map(canvasAgentMode => ({
+      ...fixture.context, canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode,
+    })),
+    { ...fixture.context, canvasAgentTarget: { ...target, nodeId: 'agent-1' }, canvasAgentMode: 'parent-orchestrated',
+      canvasOrchestrationId: 'orchestration-1', canvasOrchestrationStepId: 'action' },
+  ]
+  for (const context of contexts) {
+    /** 必须检查真正发给模型的系统补充，而非只测试孤立字符串构造函数。 */
+    const run = createCanvasToolRun(fixture.dependencies, context)
+    for (const rule of ['专业设计与连续性', '适用性', '服装与造型', '场景设计', '动作指导', '表演指导',
+      '合并负责', '独立分派', '真实节点与版本', '动作段', '起始状态', '结束状态',
+      '专业名称不授予工具权限', '首尾帧不能证明', '未验证', 'references/professional-design.md']) {
+      expect(run.systemPromptAppend).toContain(rule)
+    }
+    expect(run.systemPromptAppend.split('## 专业设计与连续性')).toHaveLength(2)
+  }
+  expect(load).not.toHaveBeenCalled()
+  expect(fixture.agentExecutionInputs).toEqual([])
+  expect(fixture.runInputs).toEqual([])
+  expect(fixture.batchInputs).toEqual([])
 })
 
 test('Given Canvas 正文交付 When 只声明完成未读取 Then 拒绝，读取真实版本后可完成', async () => {

@@ -79,6 +79,14 @@ function step(id: string, dependsOn: string[] = []): CanvasOrchestrationStep {
     agentNodeId: null, criteria: ['有正常和异常路径'], status: 'planned', note: '' }
 }
 
+/** 创建可持久的单选决策，便于复用同一问题验证重放。 */
+function decision(id = 'decision-1') {
+  return { id, question: '请选择视觉方向', options: [
+    { id: 'minimal', label: '简约', impact: '更快完成，画面元素更少' },
+    { id: 'cinematic', label: '电影感', impact: '需增加灯光与场景设计' },
+  ], recommendedOptionId: 'minimal', reason: '当前发布时间较紧' }
+}
+
 describe('画布持久委托与专业分派', () => {
   test.each(['missing-input', 'missing-output', 'incomplete-input', 'incomplete-output'] as const)(
     'Given 已完成祖先的%s版本证据缺失 When 分派下游 Then 不把未知基线当通过且零新增执行', async scenario => {
@@ -1042,6 +1050,329 @@ describe('画布持久委托与专业分派', () => {
       expect(f.getRecord().steps.map(item => [item.id, item.status])).toEqual([
         ['script', 'needs-review'], ['storyboard', 'planned'],
       ])
+      return { status: 'completed' }
+    }
+
+    await f.service.delegate(f.owner, f.request)
+  })
+
+  test('Given 编排者发布进度 When 角色、revision或影响步骤不合法 Then 拒绝覆盖权威报告', async () => {
+    const f = fixture()
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('script'), step('shot')])
+      const reported = f.service.report(actor, planned.revision, {
+        summary: '脚本规划完成', nextStep: '等待用户选择视觉方向', decision: decision(),
+      })
+      expect(reported.report).toMatchObject({ reportedAt: expect.any(Number), basedOnRevision: planned.revision, stale: false })
+      expect(() => f.service.report(actor, planned.revision, {
+        summary: '过期写入', nextStep: '不应落盘', decision: decision(),
+      })).toThrow('CANVAS_ORCHESTRATION_CONFLICT')
+      expect(() => f.service.report({ ...actor, sessionId: f.owner.sessionId }, reported.revision, {
+        summary: '普通会话伪造', nextStep: '不应落盘', decision: decision(),
+      })).toThrow('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+      expect(() => f.service.report(actor, reported.revision, {
+        summary: '更换问题', nextStep: '不应落盘', decision: { ...decision(), question: '换一个问题' },
+      })).toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      expect(() => f.service.report(actor, reported.revision, {
+        summary: '删除问题', nextStep: '不应落盘',
+      })).toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      return { status: 'completed' }
+    }
+
+    const result = await f.service.delegate(f.owner, f.request)
+    expect(result.report?.decision).toEqual(decision())
+  })
+
+  test('Given 新一轮恢复正在异步对账 When 上一轮actor迟到写报告 Then 不能借用新active运行身份', async () => {
+    const f = fixture()
+    let previousActor: Parameters<typeof f.service.report>[0] | undefined
+    f.dependencies.executeCoordinator = async record => {
+      previousActor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      return { status: 'completed' }
+    }
+    const initial = await f.service.delegate(f.owner, f.request)
+    const coordinatorNodeId = initial.coordinatorNodeId!
+    const identity = await f.dependencies.readNodeIdentity(initial, coordinatorNodeId)
+    f.setRecord({ ...initial, revision: initial.revision + 1, steps: [{ ...step('existing'), status: 'completed',
+      outputNodeIds: [coordinatorNodeId], inputVersions: [], outputVersions: [{ nodeId: coordinatorNodeId, identity }] }],
+      updatedAt: initial.updatedAt + 1 })
+    const beforeResume = f.getRecord()
+    const reconciliationStarted = deferred<void>()
+    const continueReconciliation = deferred<string>()
+    f.dependencies.readNodeIdentity = async () => {
+      reconciliationStarted.resolve()
+      return continueReconciliation.promise
+    }
+    f.dependencies.executeCoordinator = async () => ({ status: 'completed' })
+
+    const resuming = f.service.resume(f.owner, initial.id, {
+      id: 'resume-with-delay', expectedRevision: beforeResume.revision, instruction: '继续核对已有产物',
+    })
+    await reconciliationStarted.promise
+    let lateError: unknown
+    try {
+      f.service.report(previousActor!, f.getRecord().revision, { summary: '迟到报告', nextStep: '不应写入' })
+    } catch (error) {
+      lateError = error
+    }
+    continueReconciliation.resolve(identity)
+    await resuming.catch(() => undefined)
+
+    expect(lateError).toBeInstanceOf(Error)
+    expect((lateError as Error).message).toBe('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+  })
+
+  test('Given 分派完成最终依赖复验后让出执行权 When 并发报告决策 Then 报告等待写入结束且不产生冲突孤儿Agent', async () => {
+    const f = fixture()
+    f.document.nodes.push({
+      id: 'approved-output', kind: 'document', title: '已验收产物', position: { x: 0, y: 0 },
+      documentId: 'approved-document', contentRevision: 1,
+    })
+    const approvedIdentity = await f.dependencies.readNodeIdentity(f.owner, 'approved-output')
+    let reportError: unknown
+    let dispatched: CanvasOrchestrationRecord | undefined
+    let callbackCompleted = false
+    let actorChecks = 0
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('approved'), step('delivery', ['approved'])])
+      f.setRecord({
+        ...planned,
+        steps: [
+          { ...planned.steps[0]!, status: 'completed', outputNodeIds: ['approved-output'],
+            inputVersions: [], outputVersions: [{ nodeId: 'approved-output', identity: approvedIdentity }] },
+          planned.steps[1]!,
+        ],
+      })
+      /** 第四次 actor 复验位于最后一个祖先版本检查之后，此处排队可稳定插入 createAgent 前的 await 缝隙。 */
+      f.dependencies.authorizeOwner = () => {
+        actorChecks += 1
+        if (actorChecks !== 4) return
+        queueMicrotask(() => {
+          try {
+            f.service.report(actor, f.getRecord().revision, {
+              summary: '需要用户决策', nextStep: '等待回答', decision: decision(),
+            })
+          } catch (error) {
+            reportError = error
+          }
+        })
+      }
+
+      dispatched = await f.service.dispatch(actor, planned.revision, 'delivery')
+      callbackCompleted = true
+      return { status: 'completed' }
+    }
+
+    await f.service.delegate(f.owner, f.request)
+    expect(callbackCompleted).toBe(true)
+    expect(reportError).toBeInstanceOf(Error)
+    expect((reportError as Error).message).toBe('CANVAS_ORCHESTRATION_WRITE_ACTIVE')
+    expect(f.calls.filter(call => call === 'create:expert-delivery')).toHaveLength(1)
+    expect(dispatched?.steps[1]?.status).toBe('needs-review')
+  })
+
+  test('Given 分派完成最终依赖复验后用户取消 When 即将创建专业节点 Then 重新读取权威状态且零新增Agent', async () => {
+    const f = fixture()
+    f.document.nodes.push({
+      id: 'approved-output', kind: 'document', title: '已验收产物', position: { x: 0, y: 0 },
+      documentId: 'approved-document', contentRevision: 1,
+    })
+    const approvedIdentity = await f.dependencies.readNodeIdentity(f.owner, 'approved-output')
+    let dispatchError: unknown
+    let callbackCompleted = false
+    let actorChecks = 0
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('approved'), step('delivery', ['approved'])])
+      f.setRecord({
+        ...planned,
+        steps: [
+          { ...planned.steps[0]!, status: 'completed', outputNodeIds: ['approved-output'],
+            inputVersions: [], outputVersions: [{ nodeId: 'approved-output', identity: approvedIdentity }] },
+          planned.steps[1]!,
+        ],
+      })
+      /** 最终依赖检查已读完旧状态后取消，验证 createAgent 前的 fresh actor 复验。 */
+      f.dependencies.authorizeOwner = () => {
+        actorChecks += 1
+        if (actorChecks === 4) queueMicrotask(() => f.service.cancel(f.owner, record.id))
+      }
+      try {
+        await f.service.dispatch(actor, planned.revision, 'delivery')
+      } catch (error) {
+        dispatchError = error
+      }
+      callbackCompleted = true
+      return { status: 'completed' }
+    }
+
+    const result = await f.service.delegate(f.owner, f.request)
+    expect(callbackCompleted).toBe(true)
+    expect(dispatchError).toBeInstanceOf(Error)
+    expect((dispatchError as Error).message).toBe('CANVAS_ORCHESTRATION_ACCESS_DENIED')
+    expect(f.calls.filter(call => call === 'create:expert-delivery')).toHaveLength(0)
+    expect(result.status).toBe('cancelled')
+  })
+
+  test('Given 最新校正已送达 When 报告影响范围 Then 只接受该校正和真实互斥步骤', async () => {
+    const f = fixture()
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      if (!record.steps.length) {
+        await f.service.updatePlan(actor, record.revision, [step('script'), step('shot')])
+        return { status: 'completed' }
+      }
+      const impact = { followUpId: 'change-1', affectedStepIds: ['script'], retainedStepIds: ['shot'],
+        explanation: '文案变更影响脚本', additionalWork: '重新评审脚本', runningWork: '当前无在运行专业步骤' }
+      const reported = f.service.report(actor, record.revision, { summary: '已评估变更', nextStep: '重新评审脚本', impact })
+      expect(reported.report?.impact).toEqual(impact)
+      expect(() => f.service.report(actor, reported.revision, { summary: '非法引用', nextStep: '拒绝',
+        impact: { ...impact, followUpId: 'older-change' } })).toThrow('CANVAS_ORCHESTRATION_REPORT_IMPACT_INVALID')
+      expect(() => f.service.report(actor, reported.revision, { summary: '未知步骤', nextStep: '拒绝',
+        impact: { ...impact, affectedStepIds: ['missing'] } })).toThrow('CANVAS_ORCHESTRATION_REPORT_IMPACT_INVALID')
+      expect(() => f.service.report(actor, reported.revision, { summary: '重叠步骤', nextStep: '拒绝',
+        impact: { ...impact, retainedStepIds: ['script'] } })).toThrow('CANVAS_ORCHESTRATION_REPORT_INVALID')
+      return { status: 'completed' }
+    }
+    const initial = await f.service.delegate(f.owner, f.request)
+
+    await f.service.resume(f.owner, initial.id, {
+      id: 'change-1', expectedRevision: initial.revision, instruction: '把主文案改为新版',
+    })
+  })
+
+  test('Given 存在待回答决策 When 编排者尝试推进业务 Then 计划分派媒体与完成均不写入', async () => {
+    const f = fixture()
+    f.request.intent = 'produce'
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('script')])
+      const reserved = f.service.reserveMedia(actor, 1, 'existing-media')
+      const reported = f.service.report(actor, reserved.revision, {
+        summary: '需要用户决策', nextStep: '等待回答', decision: decision(),
+      })
+      const budget = reported.budget
+      await expect(f.service.updatePlan(actor, reported.revision, [step('script'), step('shot')]))
+        .rejects.toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      await expect(f.service.dispatch(actor, reported.revision, 'script'))
+        .rejects.toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      expect(() => f.service.reserveMedia(actor, 1, 'pending-media'))
+        .toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      const replay = f.service.reserveMedia(actor, 1, 'existing-media')
+      expect(replay.revision).toBe(reported.revision)
+      await expect(f.service.finish(actor, 'completed', '不应完成'))
+        .rejects.toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+      expect(f.getRecord().revision).toBe(reported.revision)
+      expect(f.getRecord().budget).toEqual(budget)
+      await f.service.finish(actor, 'waiting', '等待用户回答')
+      return { status: 'completed' }
+    }
+
+    const result = await f.service.delegate(f.owner, f.request)
+    expect(result.status).toBe('waiting')
+  })
+
+  test('Given 专业步骤正在运行 When 编排者发布新决策 Then 拒绝让在途产物带着未决条件继续', async () => {
+    const f = fixture()
+    let actor: Parameters<typeof f.service.report>[0] | undefined
+    f.dependencies.executeSpecialist = async () => {
+      expect(() => f.service.report(actor!, f.getRecord().revision, {
+        summary: '专业步骤在运行', nextStep: '不应在此时等待新决策', decision: decision(),
+      })).toThrow('CANVAS_ORCHESTRATION_STEP_RUNNING')
+      return { status: 'cancelled' }
+    }
+    f.dependencies.executeCoordinator = async record => {
+      actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('script')])
+      await f.service.dispatch(actor, planned.revision, 'script')
+      return { status: 'completed' }
+    }
+
+    await f.service.delegate(f.owner, f.request)
+  })
+
+  test('Given 画布正等待用户决策 When owner恢复 Then 只有匹配decisionId的原文回答解锁且精确重放', async () => {
+    const f = fixture()
+    let runs = 0
+    f.dependencies.executeCoordinator = async record => {
+      runs += 1
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      if (runs === 1) {
+        f.service.report(actor, record.revision, {
+          summary: '需要用户决策', nextStep: '等待回答', decision: decision(),
+        })
+      } else {
+        expect(record.followUps?.at(-1)).toMatchObject({
+          id: 'answer-1', decisionId: 'decision-1', instruction: '我选择简约方向', status: 'started',
+        })
+      }
+      return { status: 'completed' }
+    }
+    const initial = await f.service.delegate(f.owner, f.request)
+    const before = f.getRecord()
+
+    expect(() => f.service.resume(f.owner, initial.id)).toThrow('CANVAS_ORCHESTRATION_DECISION_PENDING')
+    expect(() => f.service.resume(f.owner, initial.id, {
+      id: 'unknown-answer', expectedRevision: initial.revision, instruction: '回答未知问题', decisionId: 'missing-decision',
+    })).toThrow('CANVAS_ORCHESTRATION_DECISION_UNKNOWN')
+    expect(f.getRecord()).toEqual(before)
+    const answer = { id: 'answer-1', expectedRevision: initial.revision, instruction: '我选择简约方向', decisionId: 'decision-1' }
+    const delivered = await f.service.resume(f.owner, initial.id, answer)
+    const replay = await f.service.resume(f.owner, initial.id, answer)
+    expect(replay.revision).toBe(delivered.revision)
+    expect(replay.budget?.agentRunsUsed).toBe(delivered.budget?.agentRunsUsed)
+    expect(() => f.service.resume(f.owner, initial.id, { ...answer, decisionId: 'other-decision' }))
+      .toThrow('CANVAS_ORCHESTRATION_FOLLOW_UP_CONFLICT')
+    expect(() => f.service.resume(f.owner, initial.id, {
+      id: 'answer-2', expectedRevision: delivered.revision, instruction: '再次回答', decisionId: 'decision-1',
+    })).toThrow('CANVAS_ORCHESTRATION_DECISION_ANSWERED')
+    expect(runs).toBe(2)
+  })
+
+  test('Given 决策回答执行失败 When 用新校正ID重试 Then 沿用已登记答案且每次执行只扣一次', async () => {
+    const f = fixture()
+    let runs = 0
+    f.dependencies.executeCoordinator = async record => {
+      runs += 1
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      if (runs === 1) {
+        f.service.report(actor, record.revision, {
+          summary: '需要用户决策', nextStep: '等待回答', decision: decision(),
+        })
+        return { status: 'completed' }
+      }
+      return runs === 2 ? { status: 'errored' } : { status: 'completed' }
+    }
+    const initial = await f.service.delegate(f.owner, f.request)
+    const failed = await f.service.resume(f.owner, initial.id, {
+      id: 'answer-failed', expectedRevision: initial.revision, instruction: '我选择简约方向', decisionId: 'decision-1',
+    })
+    const afterFailureBudget = failed.budget!.agentRunsUsed
+    const replay = await f.service.resume(f.owner, initial.id, {
+      id: 'answer-failed', expectedRevision: initial.revision, instruction: '我选择简约方向', decisionId: 'decision-1',
+    })
+    expect(replay.budget?.agentRunsUsed).toBe(afterFailureBudget)
+    expect(() => f.service.resume(f.owner, initial.id)).toThrow('CANVAS_ORCHESTRATION_FOLLOW_UP_RETRY_REQUIRED')
+    const recovered = await f.service.resume(f.owner, initial.id, {
+      id: 'answer-retry', expectedRevision: failed.revision, instruction: '沿用已登记的简约方向继续处理',
+    })
+    expect(recovered.budget?.agentRunsUsed).toBe(afterFailureBudget + 1)
+    expect(runs).toBe(3)
+  })
+
+  test('Given 旧报告存在 When 计划定义真实变化 Then 标记报告过期但不新增任务状态', async () => {
+    const f = fixture()
+    f.dependencies.executeCoordinator = async record => {
+      const actor = { ...f.owner, sessionId: record.coordinatorSessionId!, orchestrationId: record.id, runStartedAt: record.runStartedAt! }
+      const planned = await f.service.updatePlan(actor, record.revision, [step('script')])
+      const reported = f.service.report(actor, planned.revision, { summary: '脚本阶段完成', nextStep: '开始分镜' })
+      const unchanged = await f.service.updatePlan(actor, reported.revision, [step('script')])
+      expect(unchanged.report?.stale).toBe(false)
+      const changed = await f.service.updatePlan(actor, unchanged.revision, [{ ...step('script'), instruction: '按新约束改写脚本' }])
+      expect(changed.report).toMatchObject({ stale: true, summary: '脚本阶段完成' })
+      expect(changed.status).toBe('running')
       return { status: 'completed' }
     }
 

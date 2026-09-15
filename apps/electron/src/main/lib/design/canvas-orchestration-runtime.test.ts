@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createEmptyCanvasDocument } from '@proma/shared'
+import { createEmptyCanvasDocument, getCanvasOrchestrationPendingDecision } from '@proma/shared'
 import type { CanvasOrchestrationRecord, CanvasOrchestrationStep, SDKMessage } from '@proma/shared'
 import { createCanvasOrchestrationStore } from './canvas-orchestration-store'
 import { canvasOrchestratorContext, createCanvasOrchestrationRuntime, readCanvasOrchestrationNodeIdentity, recoverCanvasOrchestrationSpecialist } from './canvas-orchestration-runtime'
@@ -16,6 +16,7 @@ import { createCanvasTaskStore } from './canvas-task-store'
 import { createCanvasToolRun } from './canvas-tool-provider'
 import type { CanvasToolProviderDependencies, CanvasToolRun } from './canvas-tool-provider'
 import { canvasOrchestrationRequirements } from './canvas-orchestration-contract'
+import { createCanvasOrchestrationTools } from './canvas-orchestration-tools'
 
 /** 隔离落盘夹具：计划使用真实 Store，模型与内容提供者是可观察边界，不连接用户数据或远端。 */
 function fixture() {
@@ -70,7 +71,14 @@ function fixture() {
         const access = { target: request.target, parentSessionId: request.parentSessionId, startedAt: request.startedAt,
           orchestrationId: request.orchestration!.id, stepId: request.orchestration!.stepId, userMessageUuid: request.userMessageUuid }
         service.assertBranch(access)
-        expect(request.reviewScope?.mode ?? 'none').toBe(access.stepId === 'first' ? 'none' : 'nodes')
+        /** 按真实计划核对送达范围，兼容单链与多个专业成果汇合，不依赖测试步骤名称。 */
+        const record = store.get(target)!
+        /** 本次受管专业步骤及其直接输入和依赖成果。 */
+        const step = record.steps.find(candidate => candidate.id === access.stepId)!
+        /** 审核范围必须完整携带实际依赖，避免只比较是否存在一个 scope。 */
+        const expectedInputs = [...new Set([...step.inputNodeIds,
+          ...record.steps.filter(candidate => step.dependsOn.includes(candidate.id)).flatMap(candidate => candidate.outputNodeIds)])]
+        expect(request.reviewScope).toEqual(expectedInputs.length ? { mode: 'nodes', nodeIds: expectedInputs } : undefined)
         bodies.set(node.id, request.instruction)
         node.outputPointer = { messageUuid: request.userMessageUuid, completedAt: request.startedAt,
           contentSha256: createHash('sha256').update(request.instruction).digest('hex') }
@@ -267,6 +275,88 @@ describe('真实编排生产组合边界', () => {
     },
   )
 
+  test.each(['unchanged', 'costume', 'scene', 'action'] as const)(
+    'Given 服装场景动作汇入镜头且%s When 实际分派与复验 Then 传递完整设计或阻断失效分支且不扣额', async changed => {
+      /** 使用真实 Store、版本解析和执行组合；专业正文受控，不发起模型或媒体请求。 */
+      const harness = fixture()
+      try {
+        harness.document.nodes.push({ id: 'brief', kind: 'document', title: '开包取物脚本', documentId: 'brief-content',
+          contentRevision: 1, position: { x: 0, y: 0 } })
+        harness.bodies.set('brief', '人物在桌前开包取物；左手稳包，右手取出产品，连续切镜展示。')
+        harness.coordinate(async record => {
+          /** 使用本轮协调者的真实身份维护受管计划。 */
+          const context = canvasOrchestratorContext(record)
+          /** Actor 只在当前委托运行内有效。 */
+          const actor = { ...harness.target, sessionId: context.sessionId, orchestrationId: record.id, runStartedAt: context.runStartedAt }
+          /** 三项可独立评审的设计，随后汇入一个镜头，独立片尾仅依赖原始需求。 */
+          const definitions = [
+            { id: 'costume', role: '服装与造型', instruction: '确定袖口和配饰，避免遮挡取物；记录造型固定项', criteria: ['服装身份一致且允许右手取物'] },
+            { id: 'scene', role: '场景与道具', instruction: '明确桌面、包与产品位置、开口朝向及光线', criteria: ['空间尺度和产品状态可核对'] },
+            { id: 'action', role: '动作与表演', instruction: '动作段 A1：左手稳包，右手开包取物；视线由包转产品，结束展示', criteria: ['起止状态、接触和左右手连续'] },
+            { id: 'shot', role: '镜头设计', instruction: 'S1-S2 引用服装、场景、动作的真实版本，保持 A1 的持有者和产品朝向', criteria: ['三项设计一致且切镜动作连续'] },
+            { id: 'end-card', role: '片尾文案', instruction: '依据原需求写独立片尾文字', criteria: ['文字符合原目标'] },
+          ]
+          /** 分派采用现有开放步骤合同，不新增专业枚举或自造产物字段。 */
+          let current = await harness.service.updatePlan(actor, record.revision, definitions.map(definition => ({
+            ...definition, title: definition.role, dependsOn: definition.id === 'shot' ? ['costume', 'scene', 'action'] : [],
+            inputNodeIds: ['brief'], outputNodeIds: [], agentNodeId: null, status: 'planned', note: '',
+          })))
+          for (const id of ['costume', 'scene', 'action']) {
+            current = await harness.service.dispatch(actor, current.revision, id)
+            /** 未验收的任意一项设计都不能用其它专业通过来替代。 */
+            const beforeCalls = [...harness.calls]
+            await expect(harness.service.dispatch(actor, current.revision, 'shot')).rejects.toThrow('CANVAS_ORCHESTRATION_DEPENDENCY_PENDING')
+            expect(harness.calls).toEqual(beforeCalls)
+            current = await harness.service.reviewStep(actor, current.revision, id, true, '已复读设计与脚本，符合本项验收')
+          }
+          /** 版本基线与运行预算须在试图启动镜头前冻结。 */
+          const beforeBudget = current.budget!.agentRunsUsed
+          /** 三项真实正式产物会通过依赖送达镜头。 */
+          const designNodes = current.steps.filter(step => ['costume', 'scene', 'action'].includes(step.id)).flatMap(step => step.outputNodeIds)
+          if (changed !== 'unchanged') {
+            /** 模拟某专业正式设计修订，保留原节点身份和其它专业成果。 */
+            const changedStep = current.steps.find(step => step.id === changed)!
+            /** 正式输出版本改变必须被真实证据解析检测到。 */
+            const node = harness.document.nodes.find(node => node.id === changedStep.agentNodeId)
+            if (node?.kind !== 'agent' || !node.outputPointer) throw new Error('TEST_DESIGN_MISSING')
+            node.outputPointer = { ...node.outputPointer, messageUuid: 'revised-design', contentSha256: 'b'.repeat(64) }
+            harness.bodies.set(node.id, '设计已修订，原镜头输入需重新核对')
+            /** 阻断不能创建/运行镜头 Agent，也不能消耗执行预算。 */
+            const beforeRuns = harness.calls.filter(call => call.startsWith('run:') || call.startsWith('create:'))
+            await expect(harness.service.dispatch(actor, current.revision, 'shot')).rejects.toThrow('CANVAS_ORCHESTRATION_EVIDENCE_STALE')
+            current = harness.store.get(harness.target)!
+            expect(current.budget!.agentRunsUsed).toBe(beforeBudget)
+            expect(harness.calls.filter(call => call.startsWith('run:') || call.startsWith('create:'))).toEqual(beforeRuns)
+            expect(current.steps.find(step => step.id === changed)?.status).toBe('needs-review')
+            expect(current.steps.filter(step => ['costume', 'scene', 'action'].includes(step.id) && step.id !== changed)
+              .every(step => step.status === 'completed')).toBe(true)
+          } else {
+            current = await harness.service.dispatch(actor, current.revision, 'shot')
+            /** 检查 Host 冻结的输入确实包含原脚本和全部设计，正文也实际带有任务与验收要求。 */
+            const shot = current.steps.find(step => step.id === 'shot')!
+            expect(shot.inputVersions?.map(version => version.nodeId)).toEqual(['brief', ...designNodes])
+            expect(harness.bodies.get(shot.agentNodeId!)).toContain('三项设计一致且切镜动作连续')
+            for (const nodeId of designNodes) expect(harness.bodies.get(shot.agentNodeId!)).toContain(nodeId)
+            current = await harness.service.reviewStep(actor, current.revision, 'shot', true, '已按三项设计核对镜头')
+            /** 精确重放已完成镜头不得重建或重复扣额。 */
+            const completedBudget = current.budget!.agentRunsUsed
+            current = await harness.service.dispatch(actor, current.revision, 'shot')
+            expect(current.budget!.agentRunsUsed).toBe(completedBudget)
+          }
+          current = await harness.service.dispatch(actor, current.revision, 'end-card')
+          expect(current.steps.find(step => step.id === 'end-card')?.status).toBe('needs-review')
+          expect(current.budget!.mediaRunsUsed).toBe(0)
+        })
+        await harness.service.delegate({ ...harness.target, sessionId: 'owner' }, {
+          requestId: 'professional-design', goal: '设计开包宣传镜头', intent: 'design', constraints: [], referenceNodeIds: ['brief'],
+          deliverables: [{ id: 'shots', kind: 'agent', title: '镜头方案', criteria: ['服装场景动作一致'] }],
+        })
+        /** 读取落盘后的状态，确保回调真实完成而非被协调层错误处理吞掉。 */
+        expect(harness.store.get(harness.target)?.steps.find(step => step.id === 'end-card')?.status).toBe('needs-review')
+      } finally { harness.cleanup() }
+    },
+  )
+
   test('Given 普通会话向原委托提交校正 When 恢复执行 Then coordinator收到校正文且沿用稳定消息身份', async () => {
     const harness = fixture()
     try {
@@ -294,6 +384,69 @@ describe('真实编排生产组合边界', () => {
       expect(result.followUps?.[0]?.status).toBe('delivered')
     } finally { harness.cleanup() }
   })
+
+  test.each(['completed', 'errored'] as const)(
+    'Given 真实工具已发布关键问题 When 用户答复后执行%s Then 同一委托落盘保留答案且重放不重跑', async outcome => {
+      /** 使用真实工具、Runtime 和文件 Store，仅模型执行结果由隔离夹具控制。 */
+      const harness = fixture()
+      try {
+        /** 原用户是唯一决策答复者，所有恢复均复用当前画布和委托身份。 */
+        const owner = { ...harness.target, sessionId: 'owner' }
+        harness.coordinate(async record => {
+          /** 编排者工具按生产身份创建，不能通过普通聊天身份发布问题。 */
+          const actorTools = createCanvasOrchestrationTools({ service: harness.service, access: harness.dependencies.access },
+            canvasOrchestratorContext(record))
+          /** 发布与结束均经工具校验后进入生产服务并落盘。 */
+          const reportTool = actorTools.find(tool => tool.name === 'canvas_report_orchestration')!
+          await reportTool.execute('report-question', { expectedRevision: record.revision, report: {
+            summary: '脚本方向需要确认', nextStep: '等待选择后继续镜头设计', decision: {
+              id: 'visual-direction', question: '采用哪种视觉方向？',
+              options: [{ id: 'minimal', label: '简约', impact: '复用当前场景' }, { id: 'rich', label: '丰富', impact: '增加场景设计' }],
+              recommendedOptionId: 'minimal', reason: '符合现有素材和时长',
+            },
+          } }, new AbortController().signal, undefined, {} as never)
+          await actorTools.find(tool => tool.name === 'canvas_finish_orchestration')!.execute('wait-answer', {
+            status: 'waiting', summary: '等待用户选择视觉方向',
+          }, new AbortController().signal, undefined, {} as never)
+        })
+        /** 首次运行只提出问题；检查落盘以免执行层吞掉回调断言。 */
+        const waiting = await harness.service.delegate(owner, {
+          requestId: 'decision-runtime', goal: '完成专业设计', intent: 'design', constraints: [], referenceNodeIds: [],
+          deliverables: [{ id: 'design', kind: 'agent', title: '专业设计', criteria: ['有可核对产物'] }],
+        })
+        expect(waiting.status).toBe('waiting')
+        expect(getCanvasOrchestrationPendingDecision(harness.store.get(harness.target)!)?.id).toBe('visual-direction')
+        /** 可观察执行边界记录真实送达文本与身份，不调用模型。 */
+        const resumed: Array<{ instruction: string; orchestrationId: string }> = []
+        harness.dependencies.execution.execute = async execution => {
+          if (execution.mode !== 'canvas-orchestrator') throw new Error('UNEXPECTED_SPECIALIST')
+          resumed.push({ instruction: execution.instruction, orchestrationId: execution.orchestrationId })
+          return { status: outcome }
+        }
+        /** 普通聊天只通过生产 resume 工具登记原文，不直接写 Store。 */
+        const ownerTools = createCanvasOrchestrationTools({ service: harness.service, access: harness.dependencies.access }, {
+          projectId: owner.projectId, sessionId: owner.sessionId, permissionCeiling: 'execute', runStartedAt: 1, explicitReferences: [],
+        })
+        const resumeTool = ownerTools.find(tool => tool.name === 'canvas_resume_orchestration')!
+        const answer = { canvasId: waiting.canvasId, orchestrationId: waiting.id,
+          followUp: { id: 'answer-visual', expectedRevision: waiting.revision, instruction: '我选择简约，保留原来的场景。', decisionId: 'visual-direction' } }
+        await resumeTool.execute('answer-question', answer, new AbortController().signal, undefined, {} as never)
+        /** 重新读取磁盘后的记录，覆盖真实序列化和答案关联的保存路径。 */
+        const saved = harness.store.get(harness.target)!
+        expect(saved.id).toBe(waiting.id)
+        expect(saved.followUps?.[0]).toMatchObject({ decisionId: 'visual-direction', instruction: answer.followUp.instruction,
+          status: outcome === 'completed' ? 'delivered' : 'failed' })
+        expect(saved.report?.stale).toBe(true)
+        expect(getCanvasOrchestrationPendingDecision(saved)).toBeNull()
+        expect(resumed).toHaveLength(1)
+        expect(resumed[0]?.instruction).toContain(answer.followUp.instruction)
+        expect(resumed[0]?.orchestrationId).toBe(waiting.id)
+        await resumeTool.execute('replay-answer', answer, new AbortController().signal, undefined, {} as never)
+        expect(resumed).toHaveLength(1)
+        expect(harness.store.get(harness.target)?.budget).toEqual(saved.budget)
+      } finally { harness.cleanup() }
+    },
+  )
 
   test('Given 正式设计已存在 When 只平移或修改正文 Then 布局不失效而真实版本会失效', async () => {
     const harness = fixture()
