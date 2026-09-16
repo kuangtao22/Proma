@@ -60,6 +60,7 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
   resolveTest: (result: AudioGenerationTestResult) => void
   deferCancellation: () => void
   resolveCancellations: () => void
+  resolveCancellation: (requestId: string) => void
 } {
   let settings = initial
   /** 按 requestId 保存并发测试，允许精确模拟旧响应迟到。 */
@@ -68,7 +69,7 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
   const tests: AudioGenerationTestInput[] = []
   const cancellations: string[] = []
   let deferCancellation = false
-  let pendingCancellationResolvers: Array<() => void> = []
+  const pendingCancellationResolvers = new Map<string, Array<() => void>>()
   return {
     replacements,
     tests,
@@ -78,8 +79,12 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
     deferCancellation: () => { deferCancellation = true },
     resolveCancellations: () => {
       deferCancellation = false
-      const resolvers = pendingCancellationResolvers
-      pendingCancellationResolvers = []
+      for (const resolvers of pendingCancellationResolvers.values()) for (const resolve of resolvers) resolve()
+      pendingCancellationResolvers.clear()
+    },
+    resolveCancellation: (requestId) => {
+      const resolvers = pendingCancellationResolvers.get(requestId) ?? []
+      pendingCancellationResolvers.delete(requestId)
       for (const resolve of resolvers) resolve()
     },
     getSettings: async () => settings,
@@ -105,7 +110,9 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
     },
     cancelTest: async (requestId) => {
       cancellations.push(requestId)
-      if (deferCancellation) await new Promise<void>((resolve) => pendingCancellationResolvers.push(resolve))
+      if (deferCancellation) await new Promise<void>((resolve) => {
+        pendingCancellationResolvers.set(requestId, [...pendingCancellationResolvers.get(requestId) ?? [], resolve])
+      })
     },
   }
 }
@@ -179,7 +186,7 @@ describe('AudioGenerationSettings', () => {
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'MiniMax Speech')).toHaveLength(1)
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'private/path')).toHaveLength(0)
     const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, loadError: null, actionError: null, query: '', draft: null,
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', draft: null,
       deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
@@ -200,7 +207,7 @@ describe('AudioGenerationSettings', () => {
   test('Given 表单切换供应商 When 渲染 Then MiniMax 显示 Group ID、小米不渲染且密码框不回填旧 Key', () => {
     const settings = createSettings()
     const common = {
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
@@ -543,6 +550,82 @@ describe('AudioGenerationSettings', () => {
     } finally { act(() => host.unmount()); host.restore() }
   })
 
+  test('Given active 测试后多次修改身份且取消失败 When 再测试 Then pending request 未清除前绝不启动新测试', async () => {
+    const api = createApi()
+    let cancelAttempts = 0
+    api.cancelTest = async (requestId) => {
+      api.cancellations.push(requestId)
+      cancelAttempts += 1
+      if (cancelAttempts < 3) throw new Error(`private cancel ${cancelAttempts}`)
+    }
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    let first: Promise<void> = Promise.resolve()
+    let retry: Promise<void> = Promise.resolve()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      const profile = requireController(controller).settings!.catalog.profiles[0]!
+      act(() => requireController(controller).startEdit(profile))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'draft-key' }))
+      act(() => { first = requireController(controller).testProfile() })
+      const firstRequestId = api.tests[0]!.requestId
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, baseUrl: 'https://changed.example.com' }))
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, modelId: 'changed-model' }))
+      await act(async () => { await requireController(controller).testProfile() })
+      expect(api.tests).toHaveLength(1)
+      expect(api.cancellations.every((requestId) => requestId === firstRequestId)).toBeTrue()
+      expect(requireController(controller).testStates[profile.id]?.message).toContain('取消上一次测试失败')
+
+      await act(async () => {
+        retry = requireController(controller).testProfile()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(cancelAttempts).toBe(3)
+      expect(api.tests).toHaveLength(2)
+      const retryInput = api.tests[1]!
+      api.resolveTest({ requestId: retryInput.requestId, state: 'success', message: 'success' })
+      await act(async () => { await retry })
+      api.resolveTest({ requestId: firstRequestId, state: 'cancelled', message: 'late' })
+      await act(async () => { await first })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 同 ID 关闭重开形成 ABA When 新旧取消依次完成 Then 旧 continuation 不得启动或覆盖新测试', async () => {
+    const api = createApi()
+    api.deferCancellation()
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    let a1: Promise<void> = Promise.resolve()
+    let a2: Promise<void> = Promise.resolve()
+    let b1: Promise<void> = Promise.resolve()
+    let b2: Promise<void> = Promise.resolve()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      const profile = requireController(controller).settings!.catalog.profiles[0]!
+      act(() => requireController(controller).startEdit(profile))
+      act(() => { a1 = requireController(controller).testProfile() })
+      const a1RequestId = api.tests[0]!.requestId
+      act(() => { a2 = requireController(controller).testProfile() })
+      act(() => requireController(controller).closeDraft())
+      act(() => requireController(controller).startEdit(profile))
+      act(() => { b1 = requireController(controller).testProfile() })
+      await act(async () => { api.resolveCancellation(a1RequestId); await Promise.resolve(); await Promise.resolve() })
+      expect(api.tests).toHaveLength(2)
+      const b1RequestId = api.tests[1]!.requestId
+      act(() => { b2 = requireController(controller).testProfile() })
+      await act(async () => { api.resolveCancellation(b1RequestId); await Promise.resolve(); await Promise.resolve() })
+      expect(api.tests).toHaveLength(3)
+      const b2RequestId = api.tests[2]!.requestId
+      api.resolveTest({ requestId: a1RequestId, state: 'success', message: 'late-a1' })
+      api.resolveTest({ requestId: b1RequestId, state: 'success', message: 'late-b1' })
+      api.resolveTest({ requestId: b2RequestId, state: 'success', message: 'b2' })
+      await act(async () => { await Promise.all([a1, a2, b1, b2]) })
+      expect(requireController(controller).testStates[profile.id]).toMatchObject({ requestId: b2RequestId, state: 'success' })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
   test('Given 已完成草稿测试 When API Key 改变 Then 清除旧结论并使用新的凭据代次', async () => {
     const api = createApi()
     let controller: AudioGenerationController | null = null
@@ -589,6 +672,49 @@ describe('AudioGenerationSettings', () => {
     } finally { act(() => host.unmount()); host.restore() }
   })
 
+  test('Given 在途测试 When 写入结果未知且权威 GET 失败 Then reload gate 立即取消并永久丢弃迟到成功', async () => {
+    const api = createApi()
+    const originalGet = api.getSettings
+    let failGet = false
+    api.getSettings = async () => {
+      if (failGet) throw new Error('private reload failure')
+      return await originalGet()
+    }
+    api.replaceCatalog = async (request) => {
+      api.replacements.push(request)
+      throw new Error('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')
+    }
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    let pending: Promise<void> = Promise.resolve()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      const profile = requireController(controller).settings!.catalog.profiles[0]!
+      act(() => { pending = requireController(controller).testProfile(profile) })
+      const requestId = api.tests[0]!.requestId
+      failGet = true
+      await act(async () => { await requireController(controller).toggleEnabled(profile, false) })
+      expect((requireController(controller) as AudioGenerationController & { needsReload: boolean }).needsReload).toBeTrue()
+      expect(api.cancellations).toContain(requestId)
+      expect(requireController(controller).testStates[profile.id]).toBeUndefined()
+      api.resolveTest({ requestId, state: 'success', message: 'late-success' })
+      await act(async () => { await pending })
+      expect(requireController(controller).testStates[profile.id]).toBeUndefined()
+      await act(async () => { await requireController(controller).testProfile(profile) })
+      expect(api.tests).toHaveLength(1)
+
+      api.setSettings(createSettings(8))
+      failGet = false
+      await act(async () => { await requireController(controller).load() })
+      let next: Promise<void> = Promise.resolve()
+      act(() => { next = requireController(controller).testProfile(requireController(controller).settings!.catalog.profiles[0]!) })
+      expect(api.tests).toHaveLength(2)
+      api.resolveTest({ requestId: api.tests[1]!.requestId, state: 'success', message: 'new-success' })
+      await act(async () => { await next })
+      expect(requireController(controller).testStates[profile.id]?.state).toBe('success')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
   test('Given MediaSettings 选择音频分支 When 创建生产元素 Then 真实挂载独立音频配置页并透传插槽', () => {
     const expectedModule = mediaSettingsModule as unknown as {
       createMediaSettingsAudioGenerationElement: (props: { navigation: React.ReactNode; headerContent: React.ReactNode; children: React.ReactNode }) => React.ReactElement
@@ -610,6 +736,7 @@ describe('AudioGenerationSettings', () => {
       }
       const observable = requireController(controller) as AudioGenerationController & { generationEntryCount: number }
       expect(observable.generationEntryCount).toBe(0)
+      expect((observable as typeof observable & { pendingCancellationCount: number }).pendingCancellationCount).toBe(0)
     } finally { act(() => host.unmount()); host.restore() }
   })
 

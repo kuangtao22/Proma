@@ -48,6 +48,14 @@ interface AudioGenerationActiveTest {
   requestId?: string
 }
 
+/** 已离开 active 生命周期、但仍必须确认取消完成的请求。 */
+interface AudioGenerationPendingCancellation {
+  identity: string
+  requestId: string
+  status: 'cancelling' | 'failed'
+  promise?: Promise<boolean>
+}
+
 /** Controller 依赖的最小 IPC 边界，测试与真实 Electron 共用。 */
 export interface AudioGenerationSettingsApi {
   getSettings: () => Promise<AudioGenerationSettingsResult>
@@ -68,6 +76,7 @@ export interface AudioGenerationController {
   saving: boolean
   needsReload: boolean
   generationEntryCount: number
+  pendingCancellationCount: number
   loadError: string | null
   actionError: string | null
   query: string
@@ -287,6 +296,10 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   const testGenerationsRef = React.useRef(new Map<string, AudioGenerationTestGeneration>())
   /** 每个 identity 正在等待取消或已发起的当前操作。 */
   const activeTestsRef = React.useRef(new Map<string, AudioGenerationActiveTest>())
+  /** 已失效请求的取消所有权按 requestId 独立保留，失败后仍可重试。 */
+  const pendingCancellationsRef = React.useRef(new Map<string, AudioGenerationPendingCancellation>())
+  /** 组件生命周期内全局单调 token，Map 清理和同 ID 重开均不会复用旧值。 */
+  const nextOperationTokenRef = React.useRef(0)
   /** 加载代次与挂载状态共同阻止卸载后 setState。 */
   const loadRevisionRef = React.useRef(0)
   const mountedRef = React.useRef(true)
@@ -298,30 +311,119 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     return testGenerationsRef.current.get(identity) ?? { testGeneration: 0, credentialGeneration: 0 }
   }, [])
 
+  /** 签发组件生命周期内唯一操作 token，并按需推进凭据代次。 */
+  const issueOperationToken = React.useCallback((identity: string, credentialChanged = false): AudioGenerationTestGeneration => {
+    const currentGeneration = getTestGeneration(identity)
+    nextOperationTokenRef.current += 1
+    const nextGeneration = {
+      testGeneration: nextOperationTokenRef.current,
+      credentialGeneration: currentGeneration.credentialGeneration + (credentialChanged ? 1 : 0),
+    }
+    testGenerationsRef.current.set(identity, nextGeneration)
+    return nextGeneration
+  }, [getTestGeneration])
+
+  /** 同步发布完整测试状态快照，避免同一事件循环中的 ref 落后于 React 提交。 */
+  const publishTestStates = React.useCallback((next: Record<string, AudioGenerationTestViewState>): void => {
+    testStatesRef.current = next
+    if (mountedRef.current) setTestStates(next)
+  }, [])
+
+  /** 清理已无活动、取消任务和展示状态的 identity 跟踪项。 */
+  const cleanupIdentityTracking = React.useCallback((identity: string): void => {
+    const hasPendingCancellation = [...pendingCancellationsRef.current.values()]
+      .some((pending) => pending.identity === identity)
+    if (!activeTestsRef.current.has(identity)
+      && !hasPendingCancellation
+      && !Object.hasOwn(testStatesRef.current, identity)) {
+      testGenerationsRef.current.delete(identity)
+    }
+  }, [])
+
+  /** 清除指定 identity 的展示状态，不触碰请求或凭据。 */
+  const clearIdentityTestState = React.useCallback((identity: string): void => {
+    if (!Object.hasOwn(testStatesRef.current, identity)) return
+    const next = { ...testStatesRef.current }
+    delete next[identity]
+    publishTestStates(next)
+  }, [publishTestStates])
+
+  /** 执行或复用一次精确取消；失败时保留 requestId 供后续重试。 */
+  const requestPendingCancellation = React.useCallback((requestId: string): Promise<boolean> => {
+    const pending = pendingCancellationsRef.current.get(requestId)
+    if (!pending) return Promise.resolve(true)
+    if (pending.status === 'cancelling' && pending.promise) return pending.promise
+    let cancellation: Promise<void>
+    try {
+      cancellation = api.cancelTest(requestId)
+    } catch (error) {
+      cancellation = Promise.reject(error)
+    }
+    const promise = cancellation
+      .then(() => {
+        const current = pendingCancellationsRef.current.get(requestId)
+        if (current?.promise === promise) {
+          pendingCancellationsRef.current.delete(requestId)
+          cleanupIdentityTracking(current.identity)
+        }
+        return true
+      }, () => {
+        const current = pendingCancellationsRef.current.get(requestId)
+        if (current?.promise === promise) {
+          pendingCancellationsRef.current.set(requestId, {
+            identity: current.identity,
+            requestId,
+            status: 'failed',
+          })
+        }
+        return false
+      })
+    pendingCancellationsRef.current.set(requestId, {
+      identity: pending.identity,
+      requestId,
+      status: 'cancelling',
+      promise,
+    })
+    return promise
+  }, [api, cleanupIdentityTracking])
+
+  /** 将 active request 转交 pending cancellation，并立即开始安全取消。 */
+  const queuePendingCancellation = React.useCallback((identity: string, requestId: string): void => {
+    const existing = pendingCancellationsRef.current.get(requestId)
+    if (!existing) {
+      pendingCancellationsRef.current.set(requestId, { identity, requestId, status: 'failed' })
+    }
+    void requestPendingCancellation(requestId)
+  }, [requestPendingCancellation])
+
+  /** 确认同 identity 的全部旧请求均已取消；任一失败都阻止新测试。 */
+  const ensureIdentityCancellations = React.useCallback((identity: string): Promise<boolean> => {
+    const pending = [...pendingCancellationsRef.current.values()]
+      .filter((item) => item.identity === identity)
+    if (pending.length === 0) return Promise.resolve(true)
+    if (pending.length === 1) return requestPendingCancellation(pending[0]!.requestId)
+    return Promise.all(pending.map((item) => requestPendingCancellation(item.requestId)))
+      .then((results) => results.every(Boolean))
+  }, [requestPendingCancellation])
+
   /** 使 identity 的等待/在途/展示测试同步失效，再异步尝试取消请求。 */
   const invalidateIdentityTest = React.useCallback((identity: string, credentialChanged = false, terminal = false): void => {
     const storedGeneration = testGenerationsRef.current.get(identity)
     const activeTest = activeTestsRef.current.get(identity)
     const hasViewState = Object.hasOwn(testStatesRef.current, identity)
+    const hasPendingCancellation = [...pendingCancellationsRef.current.values()]
+      .some((pending) => pending.identity === identity)
     /** 未测试且无等待操作的草稿不创建无意义 Map 条目。 */
-    if (!storedGeneration && !activeTest && !hasViewState) return
-    const currentGeneration = storedGeneration ?? { testGeneration: 0, credentialGeneration: 0 }
-    testGenerationsRef.current.set(identity, {
-      testGeneration: currentGeneration.testGeneration + 1,
-      credentialGeneration: currentGeneration.credentialGeneration + (credentialChanged ? 1 : 0),
-    })
+    if (!storedGeneration && !activeTest && !hasViewState && !hasPendingCancellation) return
+    issueOperationToken(identity, credentialChanged)
     activeTestsRef.current.delete(identity)
-    if (activeTest?.requestId) void api.cancelTest(activeTest.requestId).catch(() => undefined)
-    if (mountedRef.current) setTestStates((current) => {
-      /** 删除旧测试状态，避免身份改变后沿用旧成功结论。 */
-      if (!Object.hasOwn(current, identity)) return current
-      const next = { ...current }
-      delete next[identity]
-      return next
-    })
-    /** 终结 identity 后默认 generation=0 仍与所有已启动代次不同，可安全释放历史项。 */
-    if (terminal) testGenerationsRef.current.delete(identity)
-  }, [api, getTestGeneration])
+    if (activeTest?.requestId) queuePendingCancellation(identity, activeTest.requestId)
+    for (const pending of pendingCancellationsRef.current.values()) {
+      if (pending.identity === identity) void requestPendingCancellation(pending.requestId)
+    }
+    clearIdentityTestState(identity)
+    if (terminal) cleanupIdentityTracking(identity)
+  }, [cleanupIdentityTracking, clearIdentityTestState, issueOperationToken, queuePendingCancellation, requestPendingCancellation])
 
   /** 权威 catalog 换代或卸载时批量失效测试，只提交一次展示状态清理。 */
   const invalidateAllTests = React.useCallback((terminal = false): void => {
@@ -330,20 +432,33 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       ...testGenerationsRef.current.keys(),
       ...activeTestsRef.current.keys(),
       ...Object.keys(testStatesRef.current),
+      ...[...pendingCancellationsRef.current.values()].map((pending) => pending.identity),
     ])
     for (const identity of identities) {
-      const currentGeneration = getTestGeneration(identity)
-      testGenerationsRef.current.set(identity, {
-        ...currentGeneration,
-        testGeneration: currentGeneration.testGeneration + 1,
-      })
+      issueOperationToken(identity)
       const activeTest = activeTestsRef.current.get(identity)
       activeTestsRef.current.delete(identity)
-      if (activeTest?.requestId) void api.cancelTest(activeTest.requestId).catch(() => undefined)
+      if (activeTest?.requestId) queuePendingCancellation(identity, activeTest.requestId)
+      for (const pending of pendingCancellationsRef.current.values()) {
+        if (pending.identity === identity) void requestPendingCancellation(pending.requestId)
+      }
     }
-    if (terminal) testGenerationsRef.current.clear()
-    if (mountedRef.current) setTestStates({})
-  }, [api, getTestGeneration])
+    publishTestStates({})
+    if (terminal) {
+      activeTestsRef.current.clear()
+      pendingCancellationsRef.current.clear()
+      testGenerationsRef.current.clear()
+      return
+    }
+    for (const identity of identities) cleanupIdentityTracking(identity)
+  }, [cleanupIdentityTracking, issueOperationToken, publishTestStates, queuePendingCancellation, requestPendingCancellation])
+
+  /** 在权威回读前同步关闭写入和测试入口，并使全部旧结果永久失效。 */
+  const enterReloadGate = React.useCallback((): void => {
+    needsReloadRef.current = true
+    if (mountedRef.current) setNeedsReload(true)
+    invalidateAllTests()
+  }, [invalidateAllTests])
 
   /** 接管主进程权威设置；revision 变化会使旧测试结论全部失效。 */
   const acceptSettings = React.useCallback((next: AudioGenerationSettingsResult): void => {
@@ -426,8 +541,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (message.includes('AUDIO_GENERATION_CONFIG_CONFLICT') || message.includes('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')) {
-        needsReloadRef.current = true
-        if (mountedRef.current) setNeedsReload(true)
+        enterReloadGate()
         const reloaded = await load()
         if (mountedRef.current) {
           setActionError(reloaded
@@ -445,7 +559,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [acceptSettings, api, load, saving])
+  }, [acceptSettings, api, enterReloadGate, load, saving])
 
   /** 为未修改条目构造 preserve 更新。 */
   const preserveEntries = React.useCallback((profiles: readonly AudioGenerationPublicProfile[]): ReplaceAudioGenerationCatalogRequest['profiles'] => profiles.map((profile) => ({
@@ -598,6 +712,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
 
   /** 判断测试绑定仍对应当前代次、目录 revision 和非秘密配置身份。 */
   const isTestBindingCurrent = React.useCallback((identity: string, binding: Omit<AudioGenerationTestViewState, 'requestId' | 'state' | 'message'>): boolean => {
+    if (needsReloadRef.current) return false
     if (!mountedRef.current || settingsRef.current?.catalog.revision !== binding.catalogRevision) return false
     const generation = getTestGeneration(identity)
     if (generation.testGeneration !== binding.testGeneration
@@ -618,37 +733,35 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     if (!identity || !currentSettings) return
     /** 新测试先同步取得唯一代次，后续用户动作可立即使其失效。 */
     const previousGeneration = getTestGeneration(identity)
-    const testGeneration = previousGeneration.testGeneration + 1
+    const nextGeneration = issueOperationToken(identity)
+    const testGeneration = nextGeneration.testGeneration
     const binding = {
       catalogRevision: currentSettings.catalog.revision,
       profileFingerprint: profileIdentity(profile ?? targetDraft!),
       credentialGeneration: previousGeneration.credentialGeneration,
       testGeneration,
     }
-    testGenerationsRef.current.set(identity, { ...previousGeneration, testGeneration })
     /** 在等待旧 cancel 前登记无 requestId 的启动操作，返回/修改可同步注销。 */
     const previousTest = activeTestsRef.current.get(identity)
     activeTestsRef.current.set(identity, { testGeneration })
-    setTestStates((current) => {
-      if (!Object.hasOwn(current, identity)) return current
-      const next = { ...current }
-      delete next[identity]
-      return next
-    })
-    if (previousTest?.requestId) {
-      try {
-        await api.cancelTest(previousTest.requestId)
-      } catch {
-        /** generation 已使旧结果失效，但保留旧 requestId 供下一次重试取消。 */
+    clearIdentityTestState(identity)
+    if (previousTest?.requestId) queuePendingCancellation(identity, previousTest.requestId)
+    const hasPendingCancellation = [...pendingCancellationsRef.current.values()]
+      .some((pending) => pending.identity === identity)
+    if (hasPendingCancellation) {
+      const cancellationsCompleted = await ensureIdentityCancellations(identity)
+      if (!cancellationsCompleted) {
         if (activeTestsRef.current.get(identity)?.testGeneration !== testGeneration
           || !isTestBindingCurrent(identity, binding)) return
-        activeTestsRef.current.set(identity, { testGeneration, requestId: previousTest.requestId })
-        setTestStates((current) => ({
-          ...current,
+        const failedRequestId = [...pendingCancellationsRef.current.values()]
+          .find((pending) => pending.identity === identity)?.requestId
+        if (!failedRequestId) return
+        publishTestStates({
+          ...testStatesRef.current,
           [identity]: {
-            requestId: previousTest.requestId!, state: 'failed', message: '取消上一次测试失败，请重试。', ...binding,
+            requestId: failedRequestId, state: 'failed', message: '取消上一次测试失败，请重试。', ...binding,
           },
-        }))
+        })
         return
       }
     }
@@ -686,34 +799,35 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       activeTestsRef.current.delete(identity)
       return
     }
-    setTestStates((current) => ({
-      ...current,
+    publishTestStates({
+      ...testStatesRef.current,
       [identity]: { requestId, state: 'loading', message: TEST_STATE_LABELS.loading, ...binding },
-    }))
+    })
     try {
       const result = await api.test(input)
       const activeTest = activeTestsRef.current.get(identity)
       if (activeTest?.requestId !== result.requestId || activeTest.testGeneration !== testGeneration
         || !isTestBindingCurrent(identity, binding)) return
       activeTestsRef.current.delete(identity)
-      setTestStates((current) => ({
-        ...current,
+      publishTestStates({
+        ...testStatesRef.current,
         [identity]: { requestId: result.requestId, state: result.state, message: TEST_STATE_LABELS[result.state], ...binding },
-      }))
+      })
     } catch {
       const activeTest = activeTestsRef.current.get(identity)
       if (activeTest?.requestId !== requestId || activeTest.testGeneration !== testGeneration
         || !isTestBindingCurrent(identity, binding)) return
       activeTestsRef.current.delete(identity)
-      setTestStates((current) => ({
-        ...current,
+      publishTestStates({
+        ...testStatesRef.current,
         [identity]: { requestId, state: 'failed', message: TEST_STATE_LABELS.failed, ...binding },
-      }))
+      })
     }
-  }, [api, ensureCatalogReady, getTestGeneration, isTestBindingCurrent])
+  }, [api, clearIdentityTestState, ensureCatalogReady, ensureIdentityCancellations, getTestGeneration, isTestBindingCurrent, issueOperationToken, publishTestStates, queuePendingCancellation])
 
   return {
     settings, loading, saving, needsReload, generationEntryCount: testGenerationsRef.current.size,
+    pendingCancellationCount: pendingCancellationsRef.current.size,
     loadError, actionError, query, draft, deleteId, testStates,
     visibleProfiles: filterAudioGenerationProfiles(settings?.catalog.profiles ?? [], query),
     setQuery, load, startCreate, startEdit, startCopy, startMigration, updateDraft, closeDraft, saveDraft,
