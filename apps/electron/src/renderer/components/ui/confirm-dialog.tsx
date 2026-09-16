@@ -19,6 +19,8 @@ interface ConfirmDialogProps {
   cancelLabel?: string
   loadingLabel?: string
   onConfirm: () => void | Promise<void>
+  /** false 时阻止 Radix 自动关闭，由父组件在确认成功后更新 open。 */
+  closeOnConfirm?: boolean
   loading?: boolean
   variant?: 'destructive' | 'default'
   children?: React.ReactNode
@@ -33,6 +35,7 @@ export function ConfirmDialog({
   cancelLabel = '取消',
   loadingLabel,
   onConfirm,
+  closeOnConfirm = true,
   loading = false,
   variant = 'destructive',
   children,
@@ -51,7 +54,10 @@ export function ConfirmDialog({
         <AlertDialogFooter>
           <AlertDialogCancel disabled={loading}>{cancelLabel}</AlertDialogCancel>
           <AlertDialogAction
-            onClick={onConfirm}
+            onClick={(event) => {
+              if (!closeOnConfirm) event.preventDefault()
+              void onConfirm()
+            }}
             disabled={loading}
             className={variant === 'destructive' ? 'bg-destructive text-white hover:bg-destructive/90' : undefined}
           >

@@ -427,10 +427,13 @@ export function useMediaApiModelCatalogController({
       return
     }
     const nextVisibleProfiles = visibleProfiles.filter((profile) => profile.id !== deleteId)
-    if (await saveVisibleProfiles(nextVisibleProfiles)) {
+    const saved = await saveVisibleProfiles(nextVisibleProfiles)
+    if (saved) {
       setDeleteId(null)
       setDeleteBaseline(null)
       setActionError(null)
+    } else {
+      setActionError(`删除未完成，请检查${fixedMediaKind ? '生图模型' : '媒体模型'}错误后重试。`)
     }
   }
 
@@ -591,7 +594,7 @@ export function MediaApiModelCatalogView({
           </>
         )}
       </SettingsCard>
-      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title={copy.deleteTitle} description={actionError ?? '删除后，引用该稳定模型 ID 的画布范围需要重新选择。'} confirmLabel="删除" loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
+      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title={copy.deleteTitle} description={actionError ?? '删除后，引用该稳定模型 ID 的画布范围需要重新选择。'} confirmLabel="删除" closeOnConfirm={false} loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>
   )
 }

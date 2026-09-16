@@ -229,6 +229,7 @@ describe('MediaApiModelSettings', () => {
       await act(async () => { await controller?.confirmDelete() })
       expectHiddenProfilesPreserved(saves.at(-1)!, entries)
       expect(saves.at(-1)?.some((profile) => profile.id === 'image-1')).toBeFalse()
+      expect(requireCatalogController(controller).deleteId).toBeNull()
     } finally {
       act(() => { host.unmount() })
       host.restore()
@@ -326,6 +327,26 @@ describe('MediaApiModelSettings', () => {
       expect(saves).toHaveLength(0)
       expect(requireCatalogController(controller).actionError).toContain('已被其他窗口删除')
       expect(requireCatalogController(controller).deleteId).toBe('image-1')
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 删除保存失败 When 确认 Then 保留删除目标等待重试', async () => {
+    const entries = createMixedEntries()
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    try {
+      act(() => {
+        host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={() => false} onController={onController} />)
+      })
+      act(() => { controller?.requestDelete('image-1') })
+      await act(async () => { await controller?.confirmDelete() })
+      expect(requireCatalogController(controller).deleteId).toBe('image-1')
+      expect(requireCatalogController(controller).actionError).toContain('删除未完成')
+      expect(requireCatalogController(controller).actionError).toContain('重试')
     } finally {
       act(() => { host.unmount() })
       host.restore()
