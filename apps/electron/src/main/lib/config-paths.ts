@@ -162,6 +162,11 @@ export function getImageGenerationModelsPath(): string {
   return join(getConfigDir(), 'image-generation-models.json')
 }
 
+/** 返回独立音频生成供应商目录文件，不创建或读取其中的凭据。 */
+export function getAudioGenerationProfilesPath(): string {
+  return join(getConfigDir(), 'audio-generation-profiles.json')
+}
+
 /**
  * 获取用户授权的 Markdown Vault 配置路径。
  * 内容仅保存 Vault 根目录与用户授予的能力，不保存笔记正文或索引。
