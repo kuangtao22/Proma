@@ -1,4 +1,10 @@
 import type { MediaWorkflowDefinition } from './media-workflow'
+import type {
+  AudioGenerationSettingsResult,
+  AudioGenerationTestInput,
+  AudioGenerationTestResult,
+  ReplaceAudioGenerationCatalogRequest,
+} from './audio-generation'
 
 /** 媒体产物类别，音乐归属 audio。 */
 export type MediaKind = 'image' | 'video' | 'audio'
@@ -352,6 +358,10 @@ export const MEDIA_IPC_CHANNELS = {
   ARCHIVE_CONFIGURATION: 'media:archive-configuration', READ_REMOTE_WORKFLOW: 'media:read-remote-workflow',
   READ_REMOTE_ASSET: 'media:read-remote-asset', IMPORT_LOCAL_ASSET: 'media:import-local-asset',
   LIST_ASSETS: 'media:list-assets', READ_ASSET_THUMBNAIL: 'media:read-asset-thumbnail',
+  GET_AUDIO_GENERATION_SETTINGS: 'media:get-audio-generation-settings',
+  REPLACE_AUDIO_GENERATION_CATALOG: 'media:replace-audio-generation-catalog',
+  TEST_AUDIO_GENERATION: 'media:test-audio-generation',
+  CANCEL_AUDIO_GENERATION_TEST: 'media:cancel-audio-generation-test',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
@@ -373,6 +383,14 @@ export interface MediaPreloadApi {
   mediaListAssets(projectId: string): Promise<MediaAssetRecord[]>
   /** 读取完整引用对应的受管图片缩略图，不回退到原图。 */
   mediaReadAssetThumbnail(projectId: string, asset: MediaAssetRef): Promise<{ bytes: Uint8Array; contentType: string }>
+  /** 读取独立音频目录及非破坏旧配置摘要。 */
+  mediaGetAudioGenerationSettings(): Promise<AudioGenerationSettingsResult>
+  /** 以 catalog revision 完整替换独立音频配置。 */
+  mediaReplaceAudioGenerationCatalog(input: ReplaceAudioGenerationCatalogRequest): Promise<AudioGenerationSettingsResult>
+  /** 测试草稿或已保存音频配置，结果只包含脱敏中文消息。 */
+  mediaTestAudioGeneration(input: AudioGenerationTestInput): Promise<AudioGenerationTestResult>
+  /** 取消当前窗口发起的指定音频测试。 */
+  mediaCancelAudioGenerationTest(requestId: string): Promise<void>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>
   mediaGetJobRun(projectId: string, jobId: string): Promise<MediaRunSnapshot | null>
   mediaWatchProject(projectId: string): Promise<void>
