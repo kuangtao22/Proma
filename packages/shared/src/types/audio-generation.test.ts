@@ -68,6 +68,20 @@ describe('独立音频生成 Shared 合同', () => {
     }
   })
 
+  test('Given Base URL 含原始 ASCII 控制字符 When 解析 Then 拒绝 parser 隐式清洗', () => {
+    for (const baseUrl of [
+      'https://exa\tmple.com/v1',
+      'https://example.com/\r/v1',
+      'https://example.com/\n/v1',
+    ]) {
+      expect(() => parseAudioGenerationProfile(createXiaomiProfile({ baseUrl })))
+        .toThrow('AUDIO_GENERATION_URL_INVALID')
+    }
+    expect(parseAudioGenerationProfile(createXiaomiProfile({
+      baseUrl: 'https://example.com/v1/%0A/%3F/%23/',
+    })).baseUrl).toBe('https://example.com/v1/%0A/%3F/%23')
+  })
+
   test('Given 供应商字段错配或未知字段 When 解析 Then 使用稳定配置错误码拒绝', () => {
     expect(() => parseAudioGenerationProfile(createXiaomiProfile({ groupId: 'forbidden' })))
       .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
@@ -84,6 +98,25 @@ describe('独立音频生成 Shared 合同', () => {
     }
     expect(() => parseAudioGenerationProfile(createXiaomiProfile({ name: '名'.repeat(129) })))
       .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+  })
+
+  test('Given 超长空白包裹短文本 When 解析受限文本 Then 按原始长度拒绝', () => {
+    /** 超过所有短文本上限、但 trim 后只剩一个字符的攻击输入。 */
+    const paddedShortText = `${' '.repeat(10_000)}值`
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile({ name: paddedShortText })))
+      .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationProfile(createMiniMaxProfile({ groupId: paddedShortText })))
+      .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseReplaceAudioGenerationCatalogRequest({
+      expectedRevision: 0,
+      profiles: [{
+        profile: createXiaomiProfile(),
+        credentialUpdate: { mode: 'replace', apiKey: paddedShortText },
+      }],
+    })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationTestResult({
+      requestId: 'request-1', state: 'success', message: `${' '.repeat(10_000)}音频生成服务连接测试成功`,
+    })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
   })
 
   test('Given provider union When 读取公开描述 Then 顺序、显示名和专属字段精确', () => {
@@ -143,14 +176,28 @@ describe('独立音频生成 Shared 合同', () => {
 
   test('Given 测试结果与取消 envelope When 严格解析 Then 只接受固定状态和中文消息', () => {
     expect(parseAudioGenerationTestResult({
-      requestId: 'request-1', state: 'unavailable', message: '小米 TTS 暂不支持连接测试',
-    })).toEqual({ requestId: 'request-1', state: 'unavailable', message: '小米 TTS 暂不支持连接测试' })
+      requestId: 'request-1', state: 'unavailable', message: '小米 TTS 尚缺少已验证的官方测试接口',
+    })).toEqual({ requestId: 'request-1', state: 'unavailable', message: '小米 TTS 尚缺少已验证的官方测试接口' })
+    expect(parseAudioGenerationTestResult({
+      requestId: 'request-2', state: 'success', message: '音频生成服务连接测试成功',
+    })).toEqual({ requestId: 'request-2', state: 'success', message: '音频生成服务连接测试成功' })
     expect(parseAudioGenerationTestCancelInput({ requestId: 'request-1' })).toEqual({ requestId: 'request-1' })
     expect(() => parseAudioGenerationTestResult({
       requestId: 'request-1', state: 'unknown', message: '未知状态',
     })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
     expect(() => parseAudioGenerationTestResult({
       requestId: 'request-1', state: 'failed', message: 'Bearer secret-key',
+    })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    for (const message of [
+      '测试失败：sk-live-secret-value',
+      '测试失败：api_key=secret-value',
+      '测试失败：/Users/example/.proma/config.json',
+    ]) {
+      expect(() => parseAudioGenerationTestResult({ requestId: 'request-1', state: 'failed', message }))
+        .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    expect(() => parseAudioGenerationTestResult({
+      requestId: 'request-1', state: 'success', message: '音频生成服务连接测试失败',
     })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
   })
 

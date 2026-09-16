@@ -95,18 +95,45 @@ export interface AudioGenerationTestCancelInput {
   requestId: string
 }
 
-/** 供应商可见名称及专属表单字段。 */
-export interface AudioGenerationProviderDescriptor {
-  provider: AudioGenerationProvider
-  label: string
-  specificFields: readonly 'groupId'[]
+/** 每个供应商固定的显示名和专属字段合同。 */
+interface AudioGenerationProviderDescriptorDefinition {
+  xiaomi: { label: '小米 TTS'; specificFields: readonly [] }
+  minimax: { label: 'MiniMax Speech'; specificFields: readonly ['groupId'] }
 }
 
-/** 设置页唯一可信的供应商描述，顺序同时定义界面展示顺序。 */
+/** 供应商可见名称及专属表单字段的完整判别联合。 */
+export type AudioGenerationProviderDescriptor = {
+  [Provider in AudioGenerationProvider]: {
+    provider: Provider
+  } & AudioGenerationProviderDescriptorDefinition[Provider]
+}[AudioGenerationProvider]
+
+/** 按供应商键约束的完整描述映射，新增 provider 时必须同步声明。 */
+const AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER = {
+  xiaomi: { provider: 'xiaomi', label: '小米 TTS', specificFields: [] },
+  minimax: { provider: 'minimax', label: 'MiniMax Speech', specificFields: ['groupId'] },
+} as const satisfies {
+  [Provider in AudioGenerationProvider]: {
+    provider: Provider
+  } & AudioGenerationProviderDescriptorDefinition[Provider]
+}
+
+/** 设置页唯一可信的供应商描述，固定按小米、MiniMax 顺序展示。 */
 export const AUDIO_GENERATION_PROVIDER_DESCRIPTORS = [
-  { provider: 'xiaomi', label: '小米 TTS', specificFields: [] },
-  { provider: 'minimax', label: 'MiniMax Speech', specificFields: ['groupId'] },
+  AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER.xiaomi,
+  AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER.minimax,
 ] as const satisfies readonly AudioGenerationProviderDescriptor[]
+
+/** 测试结果允许公开的固定中文文案，禁止拼接上游正文或本地路径。 */
+export const AUDIO_GENERATION_TEST_MESSAGES = {
+  success: '音频生成服务连接测试成功',
+  failed: '音频生成服务连接测试失败',
+  cancelled: '音频生成服务连接测试已取消',
+  unavailable: {
+    xiaomi: '小米 TTS 尚缺少已验证的官方测试接口',
+    minimax: 'MiniMax Speech 尚缺少已验证的官方测试接口',
+  },
+} as const
 
 /** 单个目录允许保存的配置数量上限。 */
 export const AUDIO_GENERATION_PROFILE_LIMIT = 128
@@ -158,7 +185,9 @@ function parseStableId(value: unknown): string {
 
 /** 清洗必填短文本，并按固定上限拒绝异常输入。 */
 function parseRequiredText(value: unknown, maxLength: number): string {
-  if (typeof value !== 'string') throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  if (typeof value !== 'string' || value.length > maxLength) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
   /** 去除用户表单输入两端空白后的稳定文本。 */
   const trimmed = value.trim()
   if (!trimmed || trimmed.length > maxLength) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
@@ -168,7 +197,9 @@ function parseRequiredText(value: unknown, maxLength: number): string {
 /** 清洗可选短文本；已声明但为空时归一为缺省。 */
 function parseOptionalText(value: unknown, maxLength: number): string | undefined {
   if (value === undefined) return undefined
-  if (typeof value !== 'string') throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  if (typeof value !== 'string' || value.length > maxLength) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
   /** 去除表单输入两端空白后的可选文本。 */
   const trimmed = value.trim()
   if (!trimmed) return undefined
@@ -179,6 +210,9 @@ function parseOptionalText(value: unknown, maxLength: number): string | undefine
 /** 解析安全 Base URL，并移除重复尾斜杠形成稳定表示。 */
 function parseBaseUrl(value: unknown): string {
   if (typeof value !== 'string') throw new Error('AUDIO_GENERATION_URL_INVALID')
+  if (value.length > AUDIO_GENERATION_URL_MAX_LENGTH || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error('AUDIO_GENERATION_URL_INVALID')
+  }
   /** 清除用户输入两端空白，避免 URL parser 隐式容错产生歧义。 */
   const trimmed = value.trim()
   if (!trimmed || trimmed.length > AUDIO_GENERATION_URL_MAX_LENGTH) {
@@ -340,7 +374,7 @@ export function parseAudioGenerationSettingsResult(value: unknown): AudioGenerat
   /** 可选的旧目录读取警告，只接受有界中文公开消息。 */
   const legacyWarning = value.legacyWarning === undefined
     ? undefined
-    : parsePublicMessage(value.legacyWarning)
+    : parseLegacyWarning(value.legacyWarning)
   return {
     catalog: { schemaVersion: 1, revision: value.catalog.revision, profiles },
     legacyAudioProfiles,
@@ -353,12 +387,28 @@ function isTestState(value: unknown): value is AudioGenerationTestState {
   return value === 'success' || value === 'failed' || value === 'cancelled' || value === 'unavailable'
 }
 
-/** 解析经过 Main 归一化的中文消息，并拒绝明显的凭据或完整 URL 回显。 */
-function parsePublicMessage(value: unknown): string {
-  /** 清洗并限制后的候选公开消息。 */
+/** 解析旧目录读取警告，并拒绝明显的凭据或完整 URL 回显。 */
+function parseLegacyWarning(value: unknown): string {
+  /** 清洗并限制后的旧目录公开警告。 */
   const message = parseRequiredText(value, AUDIO_GENERATION_MESSAGE_MAX_LENGTH)
   if (!/[\u3400-\u9fff]/u.test(message)
     || /https?:\/\/|bearer\s+\S+|authorization\s*[:=]|secret[-_]/iu.test(message)) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  return message
+}
+
+/** 按测试状态解析唯一允许公开的固定消息。 */
+function parsePublicMessage(state: AudioGenerationTestState, value: unknown): string {
+  /** 已执行原始长度限制和空白清洗的候选测试消息。 */
+  const message = parseRequiredText(value, AUDIO_GENERATION_MESSAGE_MAX_LENGTH)
+  if (state === 'unavailable') {
+    /** 首批两个供应商各自允许的暂不可用固定消息。 */
+    const unavailableMessages: readonly string[] = Object.values(AUDIO_GENERATION_TEST_MESSAGES.unavailable)
+    if (!unavailableMessages.includes(message)) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    return message
+  }
+  if (message !== AUDIO_GENERATION_TEST_MESSAGES[state]) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
   return message
@@ -393,7 +443,7 @@ export function parseAudioGenerationTestResult(value: unknown): AudioGenerationT
   return {
     requestId: parseStableId(value.requestId),
     state: value.state,
-    message: parsePublicMessage(value.message),
+    message: parsePublicMessage(value.state, value.message),
   }
 }
 
