@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import * as React from 'react'
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ImageGenerationChannelOption, MediaApiModelCatalogEntry } from '@proma/shared'
 import {
@@ -6,10 +9,14 @@ import {
   changeMediaApiModelProtocol,
   createMediaApiModelProfile,
   filterMediaApiModelEntries,
+  getMediaApiModelCopy,
   MediaApiModelCatalogView,
   mergeFixedMediaApiModelProfiles,
   setMediaApiModelEnabled,
   validateMediaApiModelDraft,
+  useMediaApiModelCatalogController,
+  type MediaApiModelCatalogController,
+  type MediaApiModelCatalogControllerOptions,
 } from './MediaApiModelSettings'
 
 /** 测试使用的现有渠道公开选项，不包含秘密。 */
@@ -19,6 +26,79 @@ const channels: ImageGenerationChannelOption[] = [{
   available: true,
   models: [{ id: 'gpt-image-2', name: 'GPT Image 2' }],
 }]
+
+interface MinimalEventTarget {
+  addEventListener: () => void
+  removeEventListener: () => void
+}
+
+/** 创建仅执行 catalog controller Hook 的最小 React 宿主。 */
+function createControllerRoot(): {
+  render: (node: React.ReactElement) => void
+  unmount: () => void
+  restore: () => void
+} {
+  const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
+  class FakeHtmlIFrameElement {}
+  const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement }
+  const fakeDocument = {
+    ...eventTarget, nodeType: 9, defaultView: fakeWindow, activeElement: null, body: null,
+    documentElement: { namespaceURI: 'http://www.w3.org/1999/xhtml' },
+  }
+  const container = {
+    ...eventTarget, nodeType: 1, tagName: 'DIV', namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: fakeDocument,
+  }
+  const globals = globalThis as unknown as { window?: unknown; document?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean }
+  const previousWindow = globals.window
+  const previousDocument = globals.document
+  const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT
+  globals.window = fakeWindow
+  globals.document = fakeDocument
+  globals.IS_REACT_ACT_ENVIRONMENT = true
+  const root = createRoot(container as unknown as Element)
+  return {
+    render: (node) => { root.render(node) },
+    unmount: () => { root.unmount() },
+    restore: () => {
+      globals.window = previousWindow
+      globals.document = previousDocument
+      globals.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment
+    },
+  }
+}
+
+/** 暴露生产目录 controller，测试可触发与组件相同的保存处理器。 */
+function CatalogControllerProbe({
+  onController,
+  ...options
+}: MediaApiModelCatalogControllerOptions & {
+  onController: (controller: MediaApiModelCatalogController) => void
+}): null {
+  const controller = useMediaApiModelCatalogController(options)
+  React.useEffect(() => onController(controller), [controller, onController])
+  return null
+}
+
+/** 创建 fixed catalog 测试使用的三类目录。 */
+function createMixedEntries(audioName = '旧语音'): MediaApiModelCatalogEntry[] {
+  return [
+    { profile: { ...changeMediaApiModelKind(createMediaApiModelProfile('audio-1', 2), 'audio'), name: audioName, channelId: 'channel-1', modelId: 'speech-2.6', extension: { source: audioName } } as MediaApiModelCatalogEntry['profile'], support: { state: 'configuration-only', reason: '待迁移' } },
+    { profile: { ...createMediaApiModelProfile('image-1', 1), name: '图片模型', channelId: 'channel-1', modelId: 'gpt-image-2' }, support: { state: 'supported', adapterId: 'openai-images' } },
+    { profile: { ...changeMediaApiModelKind(createMediaApiModelProfile('video-1', 3), 'video'), name: '旧视频', channelId: 'channel-1', modelId: 'video-01', extension: { source: 'video' } } as MediaApiModelCatalogEntry['profile'], support: { state: 'configuration-only', reason: '待迁移' } },
+  ]
+}
+
+/** 断言保存结果完整保留传入 hidden 条目的身份、扩展字段和相对顺序。 */
+function expectHiddenProfilesPreserved(
+  profiles: readonly MediaApiModelCatalogEntry['profile'][],
+  entries: readonly MediaApiModelCatalogEntry[],
+): void {
+  const hidden = entries.filter((entry) => entry.profile.mediaKind !== 'image').map((entry) => entry.profile)
+  const savedHidden = profiles.filter((profile) => profile.mediaKind !== 'image')
+  expect(savedHidden).toEqual(hidden)
+  expect(savedHidden[0]).toBe(hidden[0])
+  expect(savedHidden[1]).toBe(hidden[1])
+}
 
 describe('MediaApiModelSettings', () => {
   test('Given 用户新增音频或视频模型 When 切换类型与协议 Then 使用协议精确能力且不保留旧模型 ID', () => {
@@ -80,6 +160,96 @@ describe('MediaApiModelSettings', () => {
     expect(html).toContain('生图模型')
     expect(html).toContain('添加生图模型')
     expect(createMediaApiModelProfile('new-image', 4, 'image').mediaKind).toBe('image')
+  })
+
+  test('Given fixed 与 nonfixed 状态 When 展示空结果、删除确认或兜底错误 Then 使用各自准确文案', () => {
+    expect(getMediaApiModelCopy('image')).toMatchObject({
+      empty: '尚未配置生图模型', noMatches: '没有匹配的生图模型', deleteTitle: '删除生图模型？',
+      loadError: '生图模型读取失败', saveError: '生图模型保存失败',
+    })
+    expect(getMediaApiModelCopy(undefined)).toMatchObject({
+      empty: '尚未配置 API 媒体模型', noMatches: '没有匹配的媒体模型', deleteTitle: '删除 API 媒体模型？',
+      loadError: '媒体模型读取失败', saveError: '媒体模型保存失败',
+    })
+    const fixedLoading = renderToStaticMarkup(<MediaApiModelCatalogView fixedMediaKind="image" entries={[]} channelOptions={channels} loading saving={false} onSaveProfiles={() => true} />)
+    const genericLoading = renderToStaticMarkup(<MediaApiModelCatalogView entries={[]} channelOptions={channels} loading saving={false} onSaveProfiles={() => true} />)
+    expect(fixedLoading).toContain('正在读取生图模型')
+    expect(fixedLoading).not.toContain('媒体模型')
+    expect(genericLoading).toContain('正在读取媒体模型')
+  })
+
+  test('Given fixed catalog When 实际触发新增编辑复制删除和启停 Then 每次保存都原样保留 hidden 条目', async () => {
+    let entries = createMixedEntries()
+    /** 记录生产 controller 交给 IPC 边界的完整目录。 */
+    const saves: Array<MediaApiModelCatalogEntry['profile'][]> = []
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    const onSaveProfiles = async (profiles: MediaApiModelCatalogEntry['profile'][]): Promise<boolean> => {
+      saves.push(profiles)
+      return true
+    }
+    const renderController = (): void => {
+      host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={onSaveProfiles} onController={onController} />)
+    }
+
+    try {
+      act(renderController)
+      act(() => { controller?.startCreate() })
+      act(() => { controller?.updateDraft({ ...controller.draft!, name: '新增图片', channelId: 'channel-1', modelId: 'gpt-image-2' }) })
+      await act(async () => { await controller?.saveDraft() })
+      expectHiddenProfilesPreserved(saves.at(-1)!, entries)
+      expect(saves.at(-1)?.filter((profile) => profile.mediaKind === 'image').some((profile) => profile.name === '新增图片')).toBeTrue()
+
+      act(() => { controller?.startEdit(entries[1]!.profile) })
+      act(() => { controller?.updateDraft({ ...controller.draft!, name: '编辑图片' }) })
+      await act(async () => { await controller?.saveDraft() })
+      expectHiddenProfilesPreserved(saves.at(-1)!, entries)
+      expect(saves.at(-1)?.find((profile) => profile.id === 'image-1')?.name).toBe('编辑图片')
+
+      act(() => { controller?.startCopy(entries[1]!.profile) })
+      await act(async () => { await controller?.saveDraft() })
+      expectHiddenProfilesPreserved(saves.at(-1)!, entries)
+      expect(saves.at(-1)?.filter((profile) => profile.mediaKind === 'image')).toHaveLength(2)
+
+      await act(async () => { await controller?.toggleEnabled(entries[1]!.profile, false) })
+      expectHiddenProfilesPreserved(saves.at(-1)!, entries)
+      expect(saves.at(-1)?.find((profile) => profile.id === 'image-1')?.enabled).toBeFalse()
+
+      act(() => { controller?.requestDelete('image-1') })
+      await act(async () => { await controller?.confirmDelete() })
+      expectHiddenProfilesPreserved(saves.at(-1)!, entries)
+      expect(saves.at(-1)?.some((profile) => profile.id === 'image-1')).toBeFalse()
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given fixed 草稿已打开 When entries 外部刷新后保存 Then 使用最新 hidden catalog', async () => {
+    let entries = createMixedEntries('旧语音')
+    /** 保存记录用于确认不会回写旧 hidden 快照。 */
+    const saves: Array<MediaApiModelCatalogEntry['profile'][]> = []
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    const renderController = (): void => {
+      host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={(profiles) => { saves.push(profiles); return true }} onController={onController} />)
+    }
+
+    try {
+      act(renderController)
+      act(() => { controller?.startEdit(entries[1]!.profile) })
+      entries = createMixedEntries('刷新后语音')
+      act(renderController)
+      act(() => { controller?.updateDraft({ ...controller.draft!, name: '刷新后保存图片' }) })
+      await act(async () => { await controller?.saveDraft() })
+      expectHiddenProfilesPreserved(saves[0]!, entries)
+      expect(saves[0]?.[0]?.name).toBe('刷新后语音')
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
   })
 
   test('Given fixed image 编辑新增删除或启停 When 合并保存 Then hidden 音视频保持原对象和顺序', () => {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { MediaAuthorizationMode, MediaRemoteDescriptor, MediaRemoteWorkflow, MediaResourcePage, MediaResourceQuery, MediaWorkflowDefinition, MediaWorkflowVersion } from '@proma/shared'
 import * as mediaSettingsModule from './MediaSettings'
@@ -52,6 +53,7 @@ interface ExpectedMediaSettingsModule {
   MediaSettingsTabsView: (props: {
     activeTab: 'image-models' | 'audio-generation' | 'connections' | 'workflows'
     onTabChange: (tab: 'image-models' | 'audio-generation' | 'connections' | 'workflows') => void
+    focusActiveTab?: boolean
   }) => React.ReactElement
   MediaAuthorizationControl: (props: {
     mode?: MediaAuthorizationMode
@@ -413,6 +415,29 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(DEFAULT_MEDIA_SETTINGS_TAB).toBe('image-models')
     expect(resolveMediaSettingsTabForFocus('connections', 'image-models')).toBe('image-models')
     expect(resolveMediaSettingsTabForFocus('audio-generation', null)).toBe('audio-generation')
+  })
+
+  test('Given 四分区导航 When 逐个触发真实 Tabs 回调 Then 回传稳定值并只聚焦活动页签', () => {
+    const { MEDIA_SETTINGS_TABS, MediaSettingsTabsView } = getExpectedModule()
+    /** 收集组件真实 onValueChange 绑定回传的分区值。 */
+    const changes: Array<(typeof MEDIA_SETTINGS_TABS)[number]['value']> = []
+    const view = MediaSettingsTabsView({ activeTab: 'audio-generation', focusActiveTab: true, onTabChange: (tab) => { changes.push(tab) } })
+    /** 根节点就是生产 Radix Tabs，直接触发其真实值转换回调。 */
+    const tabs = view as React.ReactElement<{ onValueChange: (value: string) => void; children: React.ReactNode }>
+    for (const tab of MEDIA_SETTINGS_TABS) tabs.props.onValueChange(tab.value)
+    expect(changes).toEqual(['image-models', 'audio-generation', 'connections', 'workflows'])
+
+    /** 列表和 trigger 均来自组件真实输出，不复刻单独映射函数。 */
+    const list = React.Children.only(tabs.props.children) as React.ReactElement<{ className: string; children: React.ReactNode }>
+    const triggers = React.Children.toArray(list.props.children).filter(React.isValidElement) as Array<React.ReactElement<{ value: string; autoFocus: boolean }>>
+    expect(list.props.className).toContain('flex-wrap')
+    expect(list.props.className).toContain('h-auto')
+    expect(triggers.map((trigger) => trigger.props.value)).toEqual(changes)
+    expect(triggers.filter((trigger) => trigger.props.autoFocus).map((trigger) => trigger.props.value)).toEqual(['audio-generation'])
+
+    const html = renderToStaticMarkup(view)
+    expect((html.match(/role="tab"/g) ?? []).length).toBe(4)
+    expect(html).toContain('role="tablist"')
   })
 
   test('Given 授权模式缺失或已设为自动 When 渲染全局控件 Then 默认每次确认并准确说明授权范围', () => {

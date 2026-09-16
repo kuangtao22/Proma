@@ -40,6 +40,35 @@ export interface MediaApiModelCatalogViewProps extends MediaApiModelSettingsProp
   onSaveProfiles: (profiles: MediaApiModelProfile[]) => boolean | Promise<boolean>
 }
 
+/** 目录 controller 使用的权威输入，组件与无 DOM 行为测试共用。 */
+export interface MediaApiModelCatalogControllerOptions {
+  entries: MediaApiModelCatalogEntry[]
+  channelOptions: ImageGenerationChannelOption[]
+  saving: boolean
+  fixedMediaKind?: 'image'
+  onSaveProfiles: (profiles: MediaApiModelProfile[]) => boolean | Promise<boolean>
+}
+
+/** 目录单条动作的生产 controller。 */
+export interface MediaApiModelCatalogController {
+  profiles: MediaApiModelProfile[]
+  visibleProfiles: MediaApiModelProfile[]
+  draft: MediaApiModelProfile | null
+  deleteId: string | null
+  existing: boolean
+  draftError: string | null
+  startCreate: () => void
+  startEdit: (profile: MediaApiModelProfile) => void
+  startCopy: (profile: MediaApiModelProfile) => void
+  updateDraft: (profile: MediaApiModelProfile) => void
+  closeDraft: () => void
+  saveDraft: () => Promise<void>
+  toggleEnabled: (profile: MediaApiModelProfile, enabled: boolean) => Promise<void>
+  requestDelete: (profileId: string) => void
+  closeDelete: () => void
+  confirmDelete: () => Promise<void>
+}
+
 /** 媒体类型中文标签。 */
 const MEDIA_KIND_LABELS: Readonly<Record<MediaApiModelKind, string>> = {
   image: '图片',
@@ -65,6 +94,38 @@ const CAPABILITY_LABELS: Readonly<Record<MediaApiModelCapability, string>> = {
   'text-to-speech': '文本转语音',
   'voice-cloning': '声音克隆',
   'text-to-music': '文本转音乐',
+}
+
+/** 返回 fixed 与统一目录各自使用的用户可见文案。 */
+export function getMediaApiModelCopy(fixedMediaKind?: 'image'): {
+  title: string
+  addTitle: string
+  editTitle: string
+  loading: string
+  empty: string
+  noMatches: string
+  deleteTitle: string
+  loadError: string
+  saveError: string
+} {
+  if (fixedMediaKind === 'image') {
+    return {
+      title: '生图模型', addTitle: '添加生图模型', editTitle: '编辑生图模型',
+      loading: '正在读取生图模型...', empty: '尚未配置生图模型', noMatches: '没有匹配的生图模型',
+      deleteTitle: '删除生图模型？', loadError: '生图模型读取失败', saveError: '生图模型保存失败',
+    }
+  }
+  return {
+    title: '媒体模型', addTitle: '添加媒体模型', editTitle: '编辑媒体模型',
+    loading: '正在读取媒体模型...', empty: '尚未配置 API 媒体模型', noMatches: '没有匹配的媒体模型',
+    deleteTitle: '删除 API 媒体模型？', loadError: '媒体模型读取失败', saveError: '媒体模型保存失败',
+  }
+}
+
+/** fixed 生图页将上游通用错误中的旧目录称呼归一为当前分区文案。 */
+function formatMediaApiModelMessage(message: string, fixedMediaKind?: 'image'): string {
+  if (fixedMediaKind !== 'image') return message
+  return message.replaceAll('API 媒体模型', '生图模型').replaceAll('媒体模型', '生图模型')
 }
 
 /** 返回媒体类型的首个协议描述。 */
@@ -207,56 +268,65 @@ export function mergeFixedMediaApiModelProfiles(
   return merged
 }
 
-/** 图片、音频和视频 API 模型的已保存目录与单条编辑器。 */
-export function MediaApiModelCatalogView({
+/** 管理目录真实增删改复制与启停保存，所有 fixed 写入均合并当前 props 的完整目录。 */
+export function useMediaApiModelCatalogController({
   entries,
   channelOptions,
   saving,
-  loading = false,
-  onSaveProfiles,
-  navigation,
-  headerContent,
-  children,
   fixedMediaKind,
-}: MediaApiModelCatalogViewProps): React.ReactElement {
+  onSaveProfiles,
+}: MediaApiModelCatalogControllerOptions): MediaApiModelCatalogController {
   /** 当前单条编辑草稿。 */
   const [draft, setDraft] = React.useState<MediaApiModelProfile | null>(null)
   /** 待删除的稳定模型 ID。 */
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
-  /** 列表本地搜索词，不影响持久化目录。 */
-  const [query, setQuery] = React.useState('')
-  /** 列表本地媒体类型筛选。 */
-  const [mediaKindFilter, setMediaKindFilter] = React.useState<MediaApiModelKind | 'all'>('all')
-  /** 权威 profile 列表。 */
+  /** 每次渲染都从最新 entries 派生完整目录，避免保留隐藏快照。 */
   const profiles = entries.map((entry) => entry.profile)
   /** fixed 模式只允许操作所属媒体类型。 */
   const visibleProfiles = fixedMediaKind
     ? profiles.filter((profile) => profile.mediaKind === fixedMediaKind)
     : profiles
-  /** fixed 模式在搜索前排除旧音频和视频目录。 */
-  const visibleEntries = fixedMediaKind
-    ? entries.filter((entry) => entry.profile.mediaKind === fixedMediaKind)
-    : entries
-  /** 应用本地搜索和媒体类型筛选后的目录条目。 */
-  const filteredEntries = filterMediaApiModelEntries(visibleEntries, channelOptions, query, fixedMediaKind ?? mediaKindFilter)
-  /** 草稿是否对应已有条目。 */
+  /** 草稿是否仍对应当前权威目录的可见条目。 */
   const existing = draft ? visibleProfiles.some((profile) => profile.id === draft.id) : false
   /** 草稿可操作错误。 */
-  const draftError = draft ? validateMediaApiModelDraft(draft, channelOptions) : null
-  /** 当前协议允许的能力。 */
-  const protocolCapabilities = draft
-    ? MEDIA_API_MODEL_PROTOCOLS.find((item) => item.protocol === draft.protocol)?.capabilities ?? []
-    : []
-  /** OpenAI Images 当前渠道提供的真实模型。 */
-  const channelModels = draft?.protocol === 'openai-images'
-    ? channelOptions.find((item) => item.channelId === draft.channelId)?.models ?? []
-    : []
-  /** fixed 生图页使用专属标题，非 fixed 调用方保留统一媒体目录文案。 */
-  const pageTitle = draft
-    ? existing
-      ? fixedMediaKind ? '编辑生图模型' : '编辑媒体模型'
-      : fixedMediaKind ? '添加生图模型' : '添加媒体模型'
-    : fixedMediaKind ? '生图模型' : '媒体模型'
+  const rawDraftError = draft ? validateMediaApiModelDraft(draft, channelOptions) : null
+  /** fixed 页不得向用户泄露旧统一目录称呼。 */
+  const draftError = rawDraftError ? formatMediaApiModelMessage(rawDraftError, fixedMediaKind) : null
+
+  /** 把可见子集保存为完整目录，fixed 模式保留最新 hidden 条目。 */
+  const saveVisibleProfiles = async (nextVisibleProfiles: MediaApiModelProfile[]): Promise<boolean> => {
+    /** 非 fixed 目录本身就是完整目录。 */
+    const nextProfiles = fixedMediaKind
+      ? mergeFixedMediaApiModelProfiles(profiles, fixedMediaKind, nextVisibleProfiles)
+      : nextVisibleProfiles
+    return onSaveProfiles(nextProfiles)
+  }
+
+  /** 新建草稿固定使用当前分区媒体类型。 */
+  const startCreate = (): void => {
+    setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now(), fixedMediaKind ?? 'image'))
+  }
+
+  /** 编辑只接受当前视图可见条目，并复制能力数组避免修改权威对象。 */
+  const startEdit = (profile: MediaApiModelProfile): void => {
+    if (fixedMediaKind && profile.mediaKind !== fixedMediaKind) return
+    setDraft({ ...profile, capabilities: [...profile.capabilities] })
+  }
+
+  /** 复制可见条目时生成独立身份，不复用旧任务引用。 */
+  const startCopy = (profile: MediaApiModelProfile): void => {
+    if (fixedMediaKind && profile.mediaKind !== fixedMediaKind) return
+    /** 复制操作使用同一时间作为创建与更新时间。 */
+    const now = Date.now()
+    setDraft({ ...profile, id: globalThis.crypto.randomUUID(), name: `${profile.name} 副本`, createdAt: now, updatedAt: now })
+  }
+
+  /** 更新草稿时强制维持 fixed 媒体类型。 */
+  const updateDraft = (profile: MediaApiModelProfile): void => {
+    setDraft(fixedMediaKind && profile.mediaKind !== fixedMediaKind
+      ? changeMediaApiModelKind(profile, fixedMediaKind)
+      : profile)
+  }
 
   /** 保存当前草稿并保留其它稳定条目。 */
   const saveDraft = async (): Promise<void> => {
@@ -273,50 +343,109 @@ export function MediaApiModelCatalogView({
     const nextVisibleProfiles = existing
       ? visibleProfiles.map((profile) => profile.id === normalized.id ? normalized : profile)
       : [...visibleProfiles, normalized]
-    /** fixed 模式每次基于当前完整目录合并，避免覆盖外部刷新后的隐藏条目。 */
-    const nextProfiles = fixedMediaKind
-      ? mergeFixedMediaApiModelProfiles(profiles, fixedMediaKind, nextVisibleProfiles)
-      : nextVisibleProfiles
-    if (await onSaveProfiles(nextProfiles)) setDraft(null)
+    if (await saveVisibleProfiles(nextVisibleProfiles)) setDraft(null)
   }
+
+  /** 从列表快捷切换启用状态，并通过现有完整目录 CAS 保存。 */
+  const toggleEnabled = async (profile: MediaApiModelProfile, enabled: boolean): Promise<void> => {
+    if (saving || profile.enabled === enabled || (fixedMediaKind && profile.mediaKind !== fixedMediaKind)) return
+    /** 只替换目标稳定 ID，保留其它可见模型及其顺序。 */
+    const nextVisibleProfiles = setMediaApiModelEnabled(visibleProfiles, profile.id, enabled, Date.now())
+    await saveVisibleProfiles(nextVisibleProfiles)
+  }
+
+  /** 删除入口只接受当前可见条目。 */
+  const requestDelete = (profileId: string): void => {
+    if (visibleProfiles.some((profile) => profile.id === profileId)) setDeleteId(profileId)
+  }
+
+  /** 确认删除后从可见子集移除，并合并最新完整目录。 */
+  const confirmDelete = async (): Promise<void> => {
+    if (!deleteId || saving) return
+    const nextVisibleProfiles = visibleProfiles.filter((profile) => profile.id !== deleteId)
+    if (await saveVisibleProfiles(nextVisibleProfiles)) setDeleteId(null)
+  }
+
+  return {
+    profiles,
+    visibleProfiles,
+    draft,
+    deleteId,
+    existing,
+    draftError,
+    startCreate,
+    startEdit,
+    startCopy,
+    updateDraft,
+    closeDraft: () => setDraft(null),
+    saveDraft,
+    toggleEnabled,
+    requestDelete,
+    closeDelete: () => setDeleteId(null),
+    confirmDelete,
+  }
+}
+
+/** 图片、音频和视频 API 模型的已保存目录与单条编辑器。 */
+export function MediaApiModelCatalogView({
+  entries,
+  channelOptions,
+  saving,
+  loading = false,
+  onSaveProfiles,
+  navigation,
+  headerContent,
+  children,
+  fixedMediaKind,
+}: MediaApiModelCatalogViewProps): React.ReactElement {
+  /** 列表本地搜索词，不影响持久化目录。 */
+  const [query, setQuery] = React.useState('')
+  /** 列表本地媒体类型筛选。 */
+  const [mediaKindFilter, setMediaKindFilter] = React.useState<MediaApiModelKind | 'all'>('all')
+  /** 生产 controller 提供真实增删改复制与保存路径。 */
+  const controller = useMediaApiModelCatalogController({ entries, channelOptions, saving, fixedMediaKind, onSaveProfiles })
+  const { draft, deleteId, existing, draftError } = controller
+  /** fixed 模式在搜索前排除旧音频和视频目录。 */
+  const visibleEntries = fixedMediaKind
+    ? entries.filter((entry) => entry.profile.mediaKind === fixedMediaKind)
+    : entries
+  /** 应用本地搜索和媒体类型筛选后的目录条目。 */
+  const filteredEntries = filterMediaApiModelEntries(visibleEntries, channelOptions, query, fixedMediaKind ?? mediaKindFilter)
+  /** 当前协议允许的能力。 */
+  const protocolCapabilities = draft
+    ? MEDIA_API_MODEL_PROTOCOLS.find((item) => item.protocol === draft.protocol)?.capabilities ?? []
+    : []
+  /** OpenAI Images 当前渠道提供的真实模型。 */
+  const channelModels = draft?.protocol === 'openai-images'
+    ? channelOptions.find((item) => item.channelId === draft.channelId)?.models ?? []
+    : []
+  /** fixed 生图页使用专属文案，非 fixed 调用方保留统一媒体目录文案。 */
+  const copy = getMediaApiModelCopy(fixedMediaKind)
+  /** 当前列表或编辑状态对应的页面标题。 */
+  const pageTitle = draft
+    ? existing
+      ? copy.editTitle
+      : copy.addTitle
+    : copy.title
 
   /** 切换能力勾选状态。 */
   const toggleCapability = (capability: MediaApiModelCapability, checked: boolean): void => {
     if (!draft) return
     /** 更新后仍保持协议声明顺序的能力列表。 */
     const capabilities = protocolCapabilities.filter((item) => item === capability ? checked : draft.capabilities.includes(item))
-    setDraft({ ...draft, capabilities })
-  }
-
-  /** 复制条目时生成独立身份，不复用旧任务引用。 */
-  const copyProfile = (profile: MediaApiModelProfile): void => {
-    /** 复制操作使用同一时间作为创建与更新时间。 */
-    const now = Date.now()
-    setDraft({ ...profile, id: globalThis.crypto.randomUUID(), name: `${profile.name} 副本`, createdAt: now, updatedAt: now })
-  }
-
-  /** 从列表快捷切换启用状态，并通过现有完整目录 CAS 保存。 */
-  const toggleProfileEnabled = async (profile: MediaApiModelProfile, enabled: boolean): Promise<void> => {
-    if (saving || profile.enabled === enabled) return
-    /** 只替换目标稳定 ID，保留其它媒体模型及其顺序。 */
-    const nextVisibleProfiles = setMediaApiModelEnabled(visibleProfiles, profile.id, enabled, Date.now())
-    /** fixed 模式的快捷开关不得改写隐藏媒体类型。 */
-    const nextProfiles = fixedMediaKind
-      ? mergeFixedMediaApiModelProfiles(profiles, fixedMediaKind, nextVisibleProfiles)
-      : nextVisibleProfiles
-    await onSaveProfiles(nextProfiles)
+    controller.updateDraft({ ...draft, capabilities })
   }
 
   return (
     <MediaSettingsPage
       title={pageTitle}
-      onBack={draft ? () => setDraft(null) : undefined}
+      onBack={draft ? controller.closeDraft : undefined}
       busy={saving}
       headerContent={headerContent}
       action={
-        <Button type="button" size="sm" disabled={loading || saving || draft !== null} onClick={() => setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now(), fixedMediaKind ?? 'image'))}>
+        <Button type="button" size="sm" disabled={loading || saving || draft !== null} onClick={controller.startCreate}>
           <Plus size={16} />
-          <span>{fixedMediaKind ? '添加生图模型' : '添加 API 模型'}</span>
+          <span>{fixedMediaKind ? copy.addTitle : '添加 API 模型'}</span>
         </Button>
       }
     >
@@ -338,25 +467,25 @@ export function MediaApiModelCatalogView({
       {children}
       <SettingsCard divided>
         {loading ? (
-          <div className="px-4 py-8 text-center text-xs text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />{fixedMediaKind ? '正在读取生图模型...' : '正在读取媒体模型...'}</div>
+          <div className="px-4 py-8 text-center text-xs text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />{copy.loading}</div>
         ) : draft ? (
           <div className="space-y-4 p-4">
             {draftError && <p role="alert" className="text-xs text-destructive">{draftError}</p>}
             <div className="grid gap-3 sm:grid-cols-2">
-              <label className="space-y-1 text-xs font-medium">名称<Input value={draft.name} disabled={saving} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
-              {!fixedMediaKind && <label className="space-y-1 text-xs font-medium">媒体类型<Select value={draft.mediaKind} disabled={saving} onValueChange={(mediaKind: MediaApiModelKind) => setDraft(changeMediaApiModelKind(draft, mediaKind))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{(['image', 'audio', 'video'] as const).map((kind) => <SelectItem key={kind} value={kind}>{MEDIA_KIND_LABELS[kind]}</SelectItem>)}</SelectContent></Select></label>}
-              <label className="space-y-1 text-xs font-medium">协议<Select value={draft.protocol} disabled={saving} onValueChange={(protocol: MediaApiModelProtocol) => setDraft(changeMediaApiModelProtocol(draft, protocol))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MEDIA_API_MODEL_PROTOCOLS.filter((item) => item.mediaKind === draft.mediaKind).map((item) => <SelectItem key={item.protocol} value={item.protocol}>{PROTOCOL_LABELS[item.protocol]}</SelectItem>)}</SelectContent></Select></label>
-              <label className="space-y-1 text-xs font-medium">模型配置<Select value={draft.channelId || undefined} disabled={saving} onValueChange={(channelId) => setDraft({ ...draft, channelId, ...(draft.protocol === 'openai-images' ? { modelId: '' } : {}) })}><SelectTrigger><SelectValue placeholder="选择凭据所属配置" /></SelectTrigger><SelectContent>{channelOptions.map((channel) => <SelectItem key={channel.channelId} value={channel.channelId}>{channel.name}</SelectItem>)}</SelectContent></Select></label>
-              {draft.protocol === 'openai-images' ? <label className="space-y-1 text-xs font-medium">模型<Select value={draft.modelId || undefined} disabled={saving || !draft.channelId} onValueChange={(modelId) => setDraft({ ...draft, modelId })}><SelectTrigger><SelectValue placeholder="选择图片模型" /></SelectTrigger><SelectContent>{channelModels.map((model) => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent></Select></label> : <label className="space-y-1 text-xs font-medium">模型 ID<Input value={draft.modelId} disabled={saving} onChange={(event) => setDraft({ ...draft, modelId: event.target.value })} /></label>}
+              <label className="space-y-1 text-xs font-medium">名称<Input value={draft.name} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, name: event.target.value })} /></label>
+              {!fixedMediaKind && <label className="space-y-1 text-xs font-medium">媒体类型<Select value={draft.mediaKind} disabled={saving} onValueChange={(mediaKind: MediaApiModelKind) => controller.updateDraft(changeMediaApiModelKind(draft, mediaKind))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{(['image', 'audio', 'video'] as const).map((kind) => <SelectItem key={kind} value={kind}>{MEDIA_KIND_LABELS[kind]}</SelectItem>)}</SelectContent></Select></label>}
+              <label className="space-y-1 text-xs font-medium">协议<Select value={draft.protocol} disabled={saving} onValueChange={(protocol: MediaApiModelProtocol) => controller.updateDraft(changeMediaApiModelProtocol(draft, protocol))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MEDIA_API_MODEL_PROTOCOLS.filter((item) => item.mediaKind === draft.mediaKind).map((item) => <SelectItem key={item.protocol} value={item.protocol}>{PROTOCOL_LABELS[item.protocol]}</SelectItem>)}</SelectContent></Select></label>
+              <label className="space-y-1 text-xs font-medium">模型配置<Select value={draft.channelId || undefined} disabled={saving} onValueChange={(channelId) => controller.updateDraft({ ...draft, channelId, ...(draft.protocol === 'openai-images' ? { modelId: '' } : {}) })}><SelectTrigger><SelectValue placeholder="选择凭据所属配置" /></SelectTrigger><SelectContent>{channelOptions.map((channel) => <SelectItem key={channel.channelId} value={channel.channelId}>{channel.name}</SelectItem>)}</SelectContent></Select></label>
+              {draft.protocol === 'openai-images' ? <label className="space-y-1 text-xs font-medium">模型<Select value={draft.modelId || undefined} disabled={saving || !draft.channelId} onValueChange={(modelId) => controller.updateDraft({ ...draft, modelId })}><SelectTrigger><SelectValue placeholder="选择图片模型" /></SelectTrigger><SelectContent>{channelModels.map((model) => <SelectItem key={model.id} value={model.id}>{model.name}</SelectItem>)}</SelectContent></Select></label> : <label className="space-y-1 text-xs font-medium">模型 ID<Input value={draft.modelId} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, modelId: event.target.value })} /></label>}
               <div className="space-y-2 text-xs font-medium"><span>能力</span><div className="flex flex-wrap gap-x-4 gap-y-2">{protocolCapabilities.map((capability) => <label key={capability} className="flex items-center gap-2 font-normal"><input type="checkbox" checked={draft.capabilities.includes(capability)} disabled={saving} onChange={(event) => toggleCapability(capability, event.target.checked)} />{CAPABILITY_LABELS[capability]}</label>)}</div></div>
-              <label className="flex items-center gap-2 self-end pb-2 text-xs"><Switch checked={draft.enabled} disabled={saving} onCheckedChange={(enabled) => setDraft({ ...draft, enabled })} />启用模型</label>
+              <label className="flex items-center gap-2 self-end pb-2 text-xs"><Switch checked={draft.enabled} disabled={saving} onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })} />启用模型</label>
             </div>
-            <div className="flex flex-wrap justify-end gap-2 border-t border-border/60 pt-3"><Button type="button" size="sm" variant="outline" disabled={saving} onClick={() => setDraft(null)}>取消</Button><Button type="button" size="sm" disabled={saving || draftError !== null} onClick={() => void saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : <Save />}保存模型</Button></div>
+            <div className="flex flex-wrap justify-end gap-2 border-t border-border/60 pt-3"><Button type="button" size="sm" variant="outline" disabled={saving} onClick={controller.closeDraft}>取消</Button><Button type="button" size="sm" disabled={saving || draftError !== null} onClick={() => void controller.saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : <Save />}保存模型</Button></div>
           </div>
         ) : (
           <>
             {filteredEntries.length === 0 ? (
-              <div className="px-4 py-8 text-center text-xs text-muted-foreground">{visibleEntries.length === 0 ? fixedMediaKind ? '尚未配置生图模型' : '尚未配置 API 媒体模型' : '没有匹配的媒体模型'}</div>
+              <div className="px-4 py-8 text-center text-xs text-muted-foreground">{visibleEntries.length === 0 ? copy.empty : copy.noMatches}</div>
             ) : filteredEntries.map(({ profile, channelName, support }) => {
               /** 兼容旧目录结果，优先显示主进程派生的渠道名称。 */
               const visibleChannelName = channelName
@@ -370,29 +499,23 @@ export function MediaApiModelCatalogView({
                     <span className="block truncate text-xs text-muted-foreground">渠道：{visibleChannelName}</span>
                   </span>
                   <span className="shrink-0 text-xs text-muted-foreground" title={support.state === 'supported' ? support.adapterId : support.reason}>{support.state === 'supported' ? '可执行' : support.state === 'configuration-only' ? '待适配' : '不可用'}</span>
-                  <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground"><Switch checked={profile.enabled} disabled={saving} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void toggleProfileEnabled(profile, enabled)} />启用</label>
-                  <div className="flex items-center gap-1"><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={saving} onClick={() => copyProfile(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => setDraft({ ...profile, capabilities: [...profile.capabilities] })}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={saving} onClick={() => setDeleteId(profile.id)}><Trash2 /></Button></div>
+                  <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground"><Switch checked={profile.enabled} disabled={saving} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} />启用</label>
+                  <div className="flex items-center gap-1"><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={saving} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={saving} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div>
                 </div>
               )
             })}
           </>
         )}
       </SettingsCard>
-      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) setDeleteId(null) }} title="删除 API 媒体模型？" description="删除后，引用该稳定模型 ID 的画布范围需要重新选择。" confirmLabel="删除" loading={saving} variant="destructive" onConfirm={async () => {
-        if (!deleteId) return
-        /** fixed 模式只从可见子集删除，再与最新完整目录合并。 */
-        const nextVisibleProfiles = visibleProfiles.filter((profile) => profile.id !== deleteId)
-        const nextProfiles = fixedMediaKind
-          ? mergeFixedMediaApiModelProfiles(profiles, fixedMediaKind, nextVisibleProfiles)
-          : nextVisibleProfiles
-        if (await onSaveProfiles(nextProfiles)) setDeleteId(null)
-      }} />
+      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title={copy.deleteTitle} description="删除后，引用该稳定模型 ID 的画布范围需要重新选择。" confirmLabel="删除" loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>
   )
 }
 
 /** 从主进程统一目录加载并保存 API 媒体模型。 */
 export function MediaApiModelSettings({ fixedMediaKind, navigation, headerContent, children }: MediaApiModelSettingsProps): React.ReactElement {
+  /** fixed 与统一目录使用各自准确的读取、保存兜底文案。 */
+  const copy = React.useMemo(() => getMediaApiModelCopy(fixedMediaKind), [fixedMediaKind])
   /** 当前权威 API 媒体模型目录。 */
   const [catalog, setCatalog] = React.useState<MediaApiModelCatalogResult | null>(null)
   /** 渠道公开摘要只用于选择稳定 channelId，不包含秘密。 */
@@ -423,11 +546,14 @@ export function MediaApiModelSettings({ fixedMediaKind, navigation, headerConten
       setCatalog(nextCatalog)
       setChannelOptions(imageCatalog.channelOptions)
     } catch (loadError) {
-      if (requestRevision === requestRevisionRef.current) setError(loadError instanceof Error ? loadError.message : '媒体模型读取失败')
+      if (requestRevision === requestRevisionRef.current) {
+        const message = loadError instanceof Error ? loadError.message : copy.loadError
+        setError(formatMediaApiModelMessage(message, fixedMediaKind))
+      }
     } finally {
       if (requestRevision === requestRevisionRef.current) setLoading(false)
     }
-  }, [])
+  }, [copy.loadError, fixedMediaKind])
 
   React.useEffect(() => {
     void load()
@@ -451,7 +577,8 @@ export function MediaApiModelSettings({ fixedMediaKind, navigation, headerConten
       setCatalog(result)
       return true
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '媒体模型保存失败')
+      const message = saveError instanceof Error ? saveError.message : copy.saveError
+      setError(formatMediaApiModelMessage(message, fixedMediaKind))
       return false
     } finally {
       setSaving(false)
