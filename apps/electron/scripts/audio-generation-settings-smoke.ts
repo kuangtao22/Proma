@@ -115,14 +115,12 @@ async function verifyTabsAndFocus(window: BrowserWindow): Promise<void> {
   const text = await window.webContents.executeJavaScript('document.body.textContent ?? ""') as string
   assert.equal(text.includes('媒体模型'), false, '页面仍显示旧“媒体模型”文案')
   assert.equal(text.includes('服务连接'), false, '页面仍显示旧“服务连接”文案')
-  /** Chromium 只有在真实窗口获得焦点后才会把 native Arrow 事件交给 Radix。 */
-  window.show()
-  window.focus()
-  window.webContents.focus()
-  await waitFor(window, 'document.hasFocus()', 'Electron Renderer 未获得键盘焦点')
+  /** 使用项目已验证的 CDP 导航键通道，避免受宿主桌面前台应用影响。 */
   await window.webContents.executeJavaScript(`document.querySelector('[role="tab"][data-state="active"]')?.focus()`)
-  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Right' })
-  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Right' })
+  if (!window.webContents.debugger.isAttached()) window.webContents.debugger.attach('1.3')
+  const keyEvent = { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 }
+  await window.webContents.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...keyEvent })
+  await window.webContents.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...keyEvent })
   await waitFor(window, `window.__audioGenerationSmoke.getSnapshot().currentTab === 'audio-generation'`, 'ArrowRight 未切换到音频生成')
   await waitFor(window, `document.activeElement?.getAttribute('role') === 'tab' && document.activeElement?.textContent?.trim() === '音频生成'`, '活动页签未获得焦点')
   await window.webContents.executeJavaScript('window.__audioGenerationSmoke.rerender()')
@@ -311,6 +309,7 @@ async function runElectronSmoke(): Promise<void> {
     assert.deepEqual(rendererErrors, [], `Renderer 控制台出现错误：${rendererErrors.join('\n')}`)
     console.log('[音频设置 smoke] PASS：双 viewport、深浅主题、键盘、供应商字段、凭据、迟到结果、冲突弹窗与布局全部通过')
   } finally {
+    if (window.webContents.debugger.isAttached()) window.webContents.debugger.detach()
     window.destroy()
     await rm(userDataPath, { recursive: true, force: true })
   }
