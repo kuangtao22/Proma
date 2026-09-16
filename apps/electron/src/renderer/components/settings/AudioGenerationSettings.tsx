@@ -66,6 +66,8 @@ export interface AudioGenerationController {
   settings: AudioGenerationSettingsResult | null
   loading: boolean
   saving: boolean
+  needsReload: boolean
+  generationEntryCount: number
   loadError: string | null
   actionError: string | null
   query: string
@@ -74,7 +76,7 @@ export interface AudioGenerationController {
   testStates: Readonly<Record<string, AudioGenerationTestViewState>>
   visibleProfiles: AudioGenerationPublicProfile[]
   setQuery: (query: string) => void
-  load: () => Promise<void>
+  load: () => Promise<boolean>
   startCreate: () => void
   startEdit: (profile: AudioGenerationPublicProfile) => void
   startCopy: (profile: AudioGenerationPublicProfile) => void
@@ -211,20 +213,20 @@ function profileToDraft(profile: AudioGenerationPublicProfile): AudioGenerationD
 }
 
 /** 将草稿收敛为 shared 严格配置，确保小米不会提交 Group ID。 */
-function draftToProfile(draft: AudioGenerationDraft, now: number): AudioGenerationProfile {
+function draftToProfile(draft: AudioGenerationDraft): AudioGenerationProfile {
   /** 判别联合确保只提交当前供应商允许的字段。 */
   const candidate: AudioGenerationProfile = draft.provider === 'minimax'
     ? {
         id: draft.id, name: draft.name, provider: 'minimax', baseUrl: draft.baseUrl,
         modelId: draft.modelId, voiceId: draft.voiceId, enabled: draft.enabled,
-        createdAt: draft.createdAt, updatedAt: now,
+        createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.groupId?.trim() ? { groupId: draft.groupId.trim() } : {}),
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
     : {
         id: draft.id, name: draft.name, provider: 'xiaomi', baseUrl: draft.baseUrl,
         modelId: draft.modelId, voiceId: draft.voiceId, enabled: draft.enabled,
-        createdAt: draft.createdAt, updatedAt: now,
+        createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
   return parseAudioGenerationProfile(candidate)
@@ -265,6 +267,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   const [settings, setSettings] = React.useState<AudioGenerationSettingsResult | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
+  const [needsReload, setNeedsReload] = React.useState(false)
   const [loadError, setLoadError] = React.useState<string | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)
   const [query, setQuery] = React.useState('')
@@ -287,6 +290,8 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   /** 加载代次与挂载状态共同阻止卸载后 setState。 */
   const loadRevisionRef = React.useRef(0)
   const mountedRef = React.useRef(true)
+  /** 写入结果未知后的同步门禁，避免 React 提交前仍使用旧 revision。 */
+  const needsReloadRef = React.useRef(false)
 
   /** 读取指定 identity 的当前数字代次。 */
   const getTestGeneration = React.useCallback((identity: string): AudioGenerationTestGeneration => {
@@ -294,13 +299,17 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   }, [])
 
   /** 使 identity 的等待/在途/展示测试同步失效，再异步尝试取消请求。 */
-  const invalidateIdentityTest = React.useCallback((identity: string, credentialChanged = false): void => {
-    const currentGeneration = getTestGeneration(identity)
+  const invalidateIdentityTest = React.useCallback((identity: string, credentialChanged = false, terminal = false): void => {
+    const storedGeneration = testGenerationsRef.current.get(identity)
+    const activeTest = activeTestsRef.current.get(identity)
+    const hasViewState = Object.hasOwn(testStatesRef.current, identity)
+    /** 未测试且无等待操作的草稿不创建无意义 Map 条目。 */
+    if (!storedGeneration && !activeTest && !hasViewState) return
+    const currentGeneration = storedGeneration ?? { testGeneration: 0, credentialGeneration: 0 }
     testGenerationsRef.current.set(identity, {
       testGeneration: currentGeneration.testGeneration + 1,
       credentialGeneration: currentGeneration.credentialGeneration + (credentialChanged ? 1 : 0),
     })
-    const activeTest = activeTestsRef.current.get(identity)
     activeTestsRef.current.delete(identity)
     if (activeTest?.requestId) void api.cancelTest(activeTest.requestId).catch(() => undefined)
     if (mountedRef.current) setTestStates((current) => {
@@ -310,19 +319,31 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       delete next[identity]
       return next
     })
+    /** 终结 identity 后默认 generation=0 仍与所有已启动代次不同，可安全释放历史项。 */
+    if (terminal) testGenerationsRef.current.delete(identity)
   }, [api, getTestGeneration])
 
-  /** 权威 catalog 换代或卸载时让所有等待与在途测试同步失效。 */
-  const invalidateAllTests = React.useCallback((): void => {
+  /** 权威 catalog 换代或卸载时批量失效测试，只提交一次展示状态清理。 */
+  const invalidateAllTests = React.useCallback((terminal = false): void => {
     /** generation、活动请求和已展示状态的 identity 并集。 */
     const identities = new Set([
       ...testGenerationsRef.current.keys(),
       ...activeTestsRef.current.keys(),
       ...Object.keys(testStatesRef.current),
     ])
-    for (const identity of identities) invalidateIdentityTest(identity)
+    for (const identity of identities) {
+      const currentGeneration = getTestGeneration(identity)
+      testGenerationsRef.current.set(identity, {
+        ...currentGeneration,
+        testGeneration: currentGeneration.testGeneration + 1,
+      })
+      const activeTest = activeTestsRef.current.get(identity)
+      activeTestsRef.current.delete(identity)
+      if (activeTest?.requestId) void api.cancelTest(activeTest.requestId).catch(() => undefined)
+    }
+    if (terminal) testGenerationsRef.current.clear()
     if (mountedRef.current) setTestStates({})
-  }, [invalidateIdentityTest])
+  }, [api, getTestGeneration])
 
   /** 接管主进程权威设置；revision 变化会使旧测试结论全部失效。 */
   const acceptSettings = React.useCallback((next: AudioGenerationSettingsResult): void => {
@@ -339,17 +360,28 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   }, [])
 
   /** 从主进程读取权威目录，迟到结果与卸载均无副作用。 */
-  const load = React.useCallback(async (): Promise<void> => {
+  const load = React.useCallback(async (): Promise<boolean> => {
     const revision = loadRevisionRef.current + 1
     loadRevisionRef.current = revision
     setLoading(true)
     setLoadError(null)
     try {
       const next = await api.getSettings()
-      if (!mountedRef.current || revision !== loadRevisionRef.current) return
+      if (!mountedRef.current || revision !== loadRevisionRef.current) return false
       acceptSettings(next)
+      needsReloadRef.current = false
+      setNeedsReload(false)
+      setActionError(null)
+      return true
     } catch {
-      if (mountedRef.current && revision === loadRevisionRef.current) setLoadError('音频配置读取失败，请重试。')
+      if (mountedRef.current && revision === loadRevisionRef.current) {
+        const message = needsReloadRef.current
+          ? '配置状态未知，重新加载失败，请先重试加载。'
+          : '音频配置读取失败，请重试。'
+        setLoadError(message)
+        if (needsReloadRef.current) setActionError(message)
+      }
+      return false
     } finally {
       if (mountedRef.current && revision === loadRevisionRef.current) setLoading(false)
     }
@@ -361,18 +393,25 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     return () => {
       mountedRef.current = false
       loadRevisionRef.current += 1
-      for (const identity of activeTestsRef.current.keys()) invalidateIdentityTest(identity)
+      invalidateAllTests(true)
     }
-  }, [invalidateIdentityTest, load])
+  }, [invalidateAllTests, load])
 
   /** 清除明文草稿并返回列表。 */
   const closeDraft = React.useCallback((): void => {
     const currentDraft = draftRef.current
-    if (currentDraft) invalidateIdentityTest(currentDraft.id)
+    if (currentDraft) invalidateIdentityTest(currentDraft.id, false, true)
     publishDraft(null)
     editBaselineRef.current = null
     setActionError(null)
   }, [invalidateIdentityTest, publishDraft])
+
+  /** 写入结果未知时阻止继续使用旧 revision，直到显式 GET 成功。 */
+  const ensureCatalogReady = React.useCallback((): boolean => {
+    if (!needsReloadRef.current) return true
+    setActionError('配置状态未知，重新加载失败，请先重试加载。')
+    return false
+  }, [])
 
   /** 用完整目录执行一次 CAS，并接管返回的权威结果。 */
   const replace = React.useCallback(async (request: ReplaceAudioGenerationCatalogRequest): Promise<boolean> => {
@@ -387,62 +426,72 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       if (message.includes('AUDIO_GENERATION_CONFIG_CONFLICT') || message.includes('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')) {
-        loadRevisionRef.current += 1
-        try {
-          const authoritative = await api.getSettings()
-          if (mountedRef.current) acceptSettings(authoritative)
-        } catch {
-          // 原始写入状态不明确时仍保留稳定提示，不追加新的异常正文。
+        needsReloadRef.current = true
+        if (mountedRef.current) setNeedsReload(true)
+        const reloaded = await load()
+        if (mountedRef.current) {
+          setActionError(reloaded
+            ? formatAudioGenerationError(error)
+            : '配置状态未知，重新加载失败，请先重试加载。')
+          if (!reloaded) {
+            setDeleteId(null)
+            deleteBaselineRef.current = null
+          }
         }
+        return false
       }
       if (mountedRef.current) setActionError(formatAudioGenerationError(error))
       return false
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [acceptSettings, api, saving])
+  }, [acceptSettings, api, load, saving])
 
   /** 为未修改条目构造 preserve 更新。 */
   const preserveEntries = React.useCallback((profiles: readonly AudioGenerationPublicProfile[]): ReplaceAudioGenerationCatalogRequest['profiles'] => profiles.map((profile) => ({
-    profile: draftToProfile(profileToDraft(profile), profile.updatedAt),
+    profile: draftToProfile(profileToDraft(profile)),
     credentialUpdate: { mode: 'preserve' },
   })), [])
 
   /** 打开空的小米配置草稿。 */
   const startCreate = React.useCallback((): void => {
+    if (!ensureCatalogReady()) return
     const currentDraft = draftRef.current
-    if (currentDraft) invalidateIdentityTest(currentDraft.id)
+    if (currentDraft) invalidateIdentityTest(currentDraft.id, false, true)
     const now = Date.now()
     editBaselineRef.current = null
     setActionError(null)
     publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: '', modelId: '', voiceId: '', enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
-  }, [invalidateIdentityTest, publishDraft])
+  }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 编辑已保存配置但不读取旧 Key。 */
   const startEdit = React.useCallback((profile: AudioGenerationPublicProfile): void => {
+    if (!ensureCatalogReady()) return
     const currentDraft = draftRef.current
-    if (currentDraft) invalidateIdentityTest(currentDraft.id)
+    if (currentDraft) invalidateIdentityTest(currentDraft.id, false, true)
     editBaselineRef.current = { id: profile.id, fingerprint: profileFingerprint(profile), identity: profileIdentity(profile) }
     setActionError(null)
     publishDraft(profileToDraft(profile))
-  }, [invalidateIdentityTest, publishDraft])
+  }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 复制时生成新 ID 并强制重新填写 Key。 */
   const startCopy = React.useCallback((profile: AudioGenerationPublicProfile): void => {
+    if (!ensureCatalogReady()) return
     const currentDraft = draftRef.current
-    if (currentDraft && currentDraft.id !== profile.id) invalidateIdentityTest(currentDraft.id)
-    invalidateIdentityTest(profile.id)
+    if (currentDraft && currentDraft.id !== profile.id) invalidateIdentityTest(currentDraft.id, false, true)
+    invalidateIdentityTest(profile.id, false, true)
     editBaselineRef.current = null
     setActionError(null)
     publishDraft(copyAudioGenerationProfile(profile, createAudioGenerationId(), Date.now()))
-  }, [invalidateIdentityTest, publishDraft])
+  }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 从旧 MiniMax 摘要创建非破坏迁移草稿。 */
   const startMigration = React.useCallback((profileId: string): void => {
+    if (!ensureCatalogReady()) return
     const legacy = settingsRef.current?.legacyAudioProfiles.find((profile) => profile.id === profileId)
     if (!legacy) return
     const currentDraft = draftRef.current
-    if (currentDraft) invalidateIdentityTest(currentDraft.id)
+    if (currentDraft) invalidateIdentityTest(currentDraft.id, false, true)
     const now = Date.now()
     editBaselineRef.current = null
     setActionError(null)
@@ -451,7 +500,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       voiceId: '', groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
       legacyMediaProfileId: legacy.id, apiKey: '', credentialConfigured: false,
     })
-  }, [invalidateIdentityTest, publishDraft])
+  }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 更新草稿；身份变化立即使旧测试失效。 */
   const updateDraft = React.useCallback((next: AudioGenerationDraft): void => {
@@ -467,7 +516,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
 
   /** 保存新增、复制、迁移或编辑草稿。 */
   const saveDraft = React.useCallback(async (): Promise<void> => {
-    if (!settings || !draft || saving) return
+    if (!settings || !draft || saving || !ensureCatalogReady()) return
     try {
       const existingIndex = settings.catalog.profiles.findIndex((profile) => profile.id === draft.id)
       const baseline = editBaselineRef.current
@@ -479,14 +528,14 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
         setActionError('配置 ID 已被其他窗口占用，请重新添加。')
         return
       }
-      const profile = draftToProfile(draft, Date.now())
+      const profile = draftToProfile(draft)
       const entries = preserveEntries(settings.catalog.profiles)
       const credentialUpdate = createCredentialUpdate(draft.apiKey, draft.credentialConfigured)
       if (existingIndex >= 0) entries[existingIndex] = { profile, credentialUpdate }
       else entries.push({ profile, credentialUpdate })
       const saved = await replace({ expectedRevision: settings.catalog.revision, profiles: entries })
       if (saved && mountedRef.current) {
-        invalidateIdentityTest(draft.id)
+        invalidateIdentityTest(draft.id, false, true)
         publishDraft(null)
         editBaselineRef.current = null
       }
@@ -497,11 +546,11 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
         : '请完整填写有效的名称、服务地址、模型 ID 和音色 ID。'
       if (mountedRef.current) setActionError(message)
     }
-  }, [draft, invalidateIdentityTest, preserveEntries, publishDraft, replace, saving, settings])
+  }, [draft, ensureCatalogReady, invalidateIdentityTest, preserveEntries, publishDraft, replace, saving, settings])
 
   /** 快捷启停仍完整替换目录，所有凭据保持不变。 */
   const toggleEnabled = React.useCallback(async (profile: AudioGenerationPublicProfile, enabled: boolean): Promise<void> => {
-    if (!settings || saving) return
+    if (!settings || saving || !ensureCatalogReady()) return
     const entries = preserveEntries(settings.catalog.profiles)
     const index = settings.catalog.profiles.findIndex((item) => item.id === profile.id)
     if (index < 0 || profileFingerprint(settings.catalog.profiles[index]!) !== profileFingerprint(profile)) {
@@ -510,17 +559,18 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     }
     entries[index] = { profile: { ...entries[index]!.profile, enabled, updatedAt: Date.now() }, credentialUpdate: { mode: 'preserve' } }
     await replace({ expectedRevision: settings.catalog.revision, profiles: entries })
-  }, [preserveEntries, replace, saving, settings])
+  }, [ensureCatalogReady, preserveEntries, replace, saving, settings])
 
   /** 打开受控删除确认并记录目标快照。 */
   const requestDelete = React.useCallback((profileId: string): void => {
+    if (!ensureCatalogReady()) return
     const profile = settings?.catalog.profiles.find((item) => item.id === profileId)
     if (!profile) return
-    invalidateIdentityTest(profileId)
+    invalidateIdentityTest(profileId, false, true)
     deleteBaselineRef.current = { id: profileId, fingerprint: profileFingerprint(profile) }
     setActionError(null)
     setDeleteId(profileId)
-  }, [invalidateIdentityTest, settings])
+  }, [ensureCatalogReady, invalidateIdentityTest, settings])
 
   /** 关闭删除确认并清理局部错误。 */
   const closeDelete = React.useCallback((): void => {
@@ -532,8 +582,8 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
 
   /** 删除目标成功后才关闭确认框，失败保留错误供用户重试。 */
   const confirmDelete = React.useCallback(async (): Promise<void> => {
-    if (!settings || !deleteId || saving) return
-    invalidateIdentityTest(deleteId)
+    if (!settings || !deleteId || saving || !ensureCatalogReady()) return
+    invalidateIdentityTest(deleteId, false, true)
     const baseline = deleteBaselineRef.current
     const current = settings.catalog.profiles.find((profile) => profile.id === deleteId)
     if (!current) { setActionError('目标已被其他窗口删除，请重新加载。'); return }
@@ -544,7 +594,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       setDeleteId(null)
       deleteBaselineRef.current = null
     }
-  }, [deleteId, invalidateIdentityTest, preserveEntries, replace, saving, settings])
+  }, [deleteId, ensureCatalogReady, invalidateIdentityTest, preserveEntries, replace, saving, settings])
 
   /** 判断测试绑定仍对应当前代次、目录 revision 和非秘密配置身份。 */
   const isTestBindingCurrent = React.useCallback((identity: string, binding: Omit<AudioGenerationTestViewState, 'requestId' | 'state' | 'message'>): boolean => {
@@ -561,6 +611,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
 
   /** 测试当前草稿或已保存配置，每个 await 前后都复核 generation 与权威身份。 */
   const testProfile = React.useCallback(async (profile?: AudioGenerationPublicProfile): Promise<void> => {
+    if (!ensureCatalogReady()) return
     const targetDraft = profile ? null : draftRef.current
     const identity = profile?.id ?? targetDraft?.id
     const currentSettings = settingsRef.current
@@ -585,7 +636,21 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       return next
     })
     if (previousTest?.requestId) {
-      try { await api.cancelTest(previousTest.requestId) } catch { /* 取消失败不展示原异常，仍由 generation 隔离旧结果。 */ }
+      try {
+        await api.cancelTest(previousTest.requestId)
+      } catch {
+        /** generation 已使旧结果失效，但保留旧 requestId 供下一次重试取消。 */
+        if (activeTestsRef.current.get(identity)?.testGeneration !== testGeneration
+          || !isTestBindingCurrent(identity, binding)) return
+        activeTestsRef.current.set(identity, { testGeneration, requestId: previousTest.requestId })
+        setTestStates((current) => ({
+          ...current,
+          [identity]: {
+            requestId: previousTest.requestId!, state: 'failed', message: '取消上一次测试失败，请重试。', ...binding,
+          },
+        }))
+        return
+      }
     }
     if (activeTestsRef.current.get(identity)?.testGeneration !== testGeneration
       || !isTestBindingCurrent(identity, binding)) return
@@ -602,7 +667,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
         if (!currentDraft || currentDraft.id !== identity || profileIdentity(currentDraft) !== binding.profileFingerprint) return
         const apiKey = currentDraft.apiKey.trim()
         const baseline = editBaselineRef.current
-        if (apiKey) input = { kind: 'draft', requestId, profile: draftToProfile(currentDraft, Date.now()), apiKey }
+        if (apiKey) input = { kind: 'draft', requestId, profile: draftToProfile(currentDraft), apiKey }
         else if (baseline && baseline.identity === profileIdentity(currentDraft) && currentDraft.credentialConfigured) {
           input = { kind: 'saved', profileId: currentDraft.id, requestId }
         } else {
@@ -645,10 +710,11 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
         [identity]: { requestId, state: 'failed', message: TEST_STATE_LABELS.failed, ...binding },
       }))
     }
-  }, [api, getTestGeneration, isTestBindingCurrent])
+  }, [api, ensureCatalogReady, getTestGeneration, isTestBindingCurrent])
 
   return {
-    settings, loading, saving, loadError, actionError, query, draft, deleteId, testStates,
+    settings, loading, saving, needsReload, generationEntryCount: testGenerationsRef.current.size,
+    loadError, actionError, query, draft, deleteId, testStates,
     visibleProfiles: filterAudioGenerationProfiles(settings?.catalog.profiles ?? [], query),
     setQuery, load, startCreate, startEdit, startCopy, startMigration, updateDraft, closeDraft, saveDraft,
     toggleEnabled, requestDelete, closeDelete, confirmDelete, testProfile,
@@ -662,7 +728,9 @@ function FormField({ id, label, children }: { id: string; label: string; childre
 
 /** 音频目录、动态表单与旧配置迁移的纯视图。 */
 export function AudioGenerationCatalogView({ controller, navigation, headerContent, children }: AudioGenerationCatalogViewProps): React.ReactElement {
-  const { settings, loading, saving, loadError, actionError, query, draft, deleteId, visibleProfiles, testStates } = controller
+  const { settings, loading, saving, needsReload, loadError, actionError, query, draft, deleteId, visibleProfiles, testStates } = controller
+  /** reload 门禁与保存互斥共用控件禁用态。 */
+  const actionDisabled = saving || needsReload
   const legacyReferences = new Set(settings?.catalog.profiles.map((profile) => profile.legacyMediaProfileId).filter((id): id is string => Boolean(id)) ?? [])
   const deleteTarget = settings?.catalog.profiles.find((profile) => profile.id === deleteId)
 
@@ -672,21 +740,22 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
       <MediaSettingsPage title={editTitle(draft, settings)} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
         <SettingsCard divided={false} className="p-4">
           <div className="grid gap-4 sm:grid-cols-2">
-            <FormField id="audio-name" label="名称"><Input id="audio-name" value={draft.name} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, name: event.target.value })} /></FormField>
-            <FormField id="audio-provider" label="供应商"><Select value={draft.provider} disabled={saving} onValueChange={(provider: AudioGenerationProvider) => controller.updateDraft(changeAudioGenerationProvider(draft, provider))}><SelectTrigger id="audio-provider" aria-label="供应商"><SelectValue /></SelectTrigger><SelectContent>{AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => <SelectItem key={descriptor.provider} value={descriptor.provider}>{descriptor.label}</SelectItem>)}</SelectContent></Select></FormField>
-            <FormField id="audio-base-url" label="服务地址"><Input id="audio-base-url" value={draft.baseUrl} disabled={saving} placeholder="https://..." onChange={(event) => controller.updateDraft({ ...draft, baseUrl: event.target.value })} /></FormField>
-            <FormField id="audio-api-key" label="API Key"><Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={saving} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} /></FormField>
-            <FormField id="audio-model-id" label="模型 ID"><Input id="audio-model-id" value={draft.modelId} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, modelId: event.target.value })} /></FormField>
-            <FormField id="audio-voice-id" label="音色 ID"><Input id="audio-voice-id" value={draft.voiceId} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, voiceId: event.target.value })} /></FormField>
-            {draft.provider === 'minimax' && <FormField id="audio-group-id" label="Group ID（可选）"><Input id="audio-group-id" value={draft.groupId ?? ''} disabled={saving} onChange={(event) => controller.updateDraft({ ...draft, groupId: event.target.value })} /></FormField>}
-            <label className="flex items-center gap-2 self-end text-sm text-muted-foreground"><Switch checked={draft.enabled} disabled={saving} aria-label="启用音频配置" onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })} />启用</label>
+            <FormField id="audio-name" label="名称"><Input id="audio-name" value={draft.name} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, name: event.target.value })} /></FormField>
+            <FormField id="audio-provider" label="供应商"><Select value={draft.provider} disabled={actionDisabled} onValueChange={(provider: AudioGenerationProvider) => controller.updateDraft(changeAudioGenerationProvider(draft, provider))}><SelectTrigger id="audio-provider" aria-label="供应商"><SelectValue /></SelectTrigger><SelectContent>{AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => <SelectItem key={descriptor.provider} value={descriptor.provider}>{descriptor.label}</SelectItem>)}</SelectContent></Select></FormField>
+            <FormField id="audio-base-url" label="服务地址"><Input id="audio-base-url" value={draft.baseUrl} disabled={actionDisabled} placeholder="https://..." onChange={(event) => controller.updateDraft({ ...draft, baseUrl: event.target.value })} /></FormField>
+            <FormField id="audio-api-key" label="API Key"><Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={actionDisabled} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} /></FormField>
+            <FormField id="audio-model-id" label="模型 ID"><Input id="audio-model-id" value={draft.modelId} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, modelId: event.target.value })} /></FormField>
+            <FormField id="audio-voice-id" label="音色 ID"><Input id="audio-voice-id" value={draft.voiceId} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, voiceId: event.target.value })} /></FormField>
+            {draft.provider === 'minimax' && <FormField id="audio-group-id" label="Group ID（可选）"><Input id="audio-group-id" value={draft.groupId ?? ''} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, groupId: event.target.value })} /></FormField>}
+            <label className="flex items-center gap-2 self-end text-sm text-muted-foreground"><Switch checked={draft.enabled} disabled={actionDisabled} aria-label="启用音频配置" onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })} />启用</label>
           </div>
           {actionError && <p role="alert" className="mt-4 text-sm text-destructive">{actionError}</p>}
+          {loadError && <div role="alert" className="mt-4 flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{loadError}</span><Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void controller.load()}>重新加载</Button></div>}
           {testState && <p className="mt-4 text-xs text-muted-foreground" role="status">{testState.message}</p>}
           <div className="mt-5 flex flex-wrap justify-end gap-2">
-            <Button type="button" variant="outline" disabled={saving} onClick={() => void controller.testProfile()}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}测试连接</Button>
+            <Button type="button" variant="outline" disabled={actionDisabled} onClick={() => void controller.testProfile()}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}测试连接</Button>
             <Button type="button" variant="outline" disabled={saving} onClick={controller.closeDraft}>取消</Button>
-            <Button type="button" disabled={saving} onClick={() => void controller.saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : null}保存</Button>
+            <Button type="button" disabled={actionDisabled} onClick={() => void controller.saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : null}保存</Button>
           </div>
         </SettingsCard>
       </MediaSettingsPage>
@@ -694,7 +763,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
   }
 
   return (
-    <MediaSettingsPage title="音频生成" action={<Button type="button" size="sm" disabled={loading || saving} onClick={controller.startCreate}><Plus />添加音频配置</Button>} headerContent={headerContent}>
+    <MediaSettingsPage title="音频生成" action={<Button type="button" size="sm" disabled={loading || actionDisabled} onClick={controller.startCreate}><Plus />添加音频配置</Button>} headerContent={headerContent}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         {navigation}
         <div className="relative w-64 max-w-full"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-9" aria-label="搜索音频配置" placeholder="搜索名称、供应商、模型或音色" value={query} onChange={(event) => controller.setQuery(event.target.value)} /></div>
@@ -706,7 +775,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
       {settings && settings.legacyAudioProfiles.length > 0 && <SettingsCard>
         {settings.legacyAudioProfiles.map((legacy) => {
           const migrated = legacyReferences.has(legacy.id)
-          return <SettingsRow key={legacy.id} label={legacy.name} description={`旧配置，需要重新填写独立凭据 · ${legacy.modelId}`}><Button type="button" size="sm" variant="outline" disabled={saving || migrated} onClick={() => controller.startMigration(legacy.id)}>{migrated ? '已迁移' : `迁移 ${legacy.name}`}</Button></SettingsRow>
+          return <SettingsRow key={legacy.id} label={legacy.name} description={`旧配置，需要重新填写独立凭据 · ${legacy.modelId}`}><Button type="button" size="sm" variant="outline" disabled={actionDisabled || migrated} onClick={() => controller.startMigration(legacy.id)}>{migrated ? '已迁移' : `迁移 ${legacy.name}`}</Button></SettingsRow>
         })}
       </SettingsCard>}
       {loading && !settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取音频配置...</div></SettingsCard>
@@ -714,7 +783,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           : settings && visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的音频配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => {
                 const testState = testStates[profile.id]
-                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {profile.modelId} · {profile.voiceId}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={saving} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={saving} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={saving} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={saving} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
+                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {profile.modelId} · {profile.voiceId}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
               })}</SettingsCard>}
       <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title="删除音频配置？" description={actionError ?? (deleteTarget ? `删除 ${deleteTarget.name} 后，后续音频任务将不能再使用该配置。` : '')} confirmLabel="删除" closeOnConfirm={false} loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>

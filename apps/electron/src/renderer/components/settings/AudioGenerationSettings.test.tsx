@@ -179,9 +179,9 @@ describe('AudioGenerationSettings', () => {
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'MiniMax Speech')).toHaveLength(1)
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'private/path')).toHaveLength(0)
     const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
-      settings, loading: false, saving: false, loadError: null, actionError: null, query: '', draft: null,
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, loadError: null, actionError: null, query: '', draft: null,
       deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
-      setQuery: () => undefined, load: async () => undefined, startCreate: () => undefined, startEdit: () => undefined,
+      setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
       closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined,
@@ -200,8 +200,8 @@ describe('AudioGenerationSettings', () => {
   test('Given 表单切换供应商 When 渲染 Then MiniMax 显示 Group ID、小米不渲染且密码框不回填旧 Key', () => {
     const settings = createSettings()
     const common = {
-      settings, loading: false, saving: false, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
-      setQuery: () => undefined, load: async () => undefined, startCreate: () => undefined, startEdit: () => undefined,
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
       closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined,
@@ -287,6 +287,54 @@ describe('AudioGenerationSettings', () => {
       expect(getCalls).toBe(initialGets + 1)
       expect(requireController(controller).actionError).toContain('写入结果未知')
     } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given CAS 结果需回读但 GET 失败 When 后续操作 Then 保持锁定直到显式重试成功', async () => {
+    for (const code of ['AUDIO_GENERATION_CONFIG_CONFLICT', 'AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN'] as const) {
+      const api = createApi()
+      const originalGet = api.getSettings
+      const originalReplace = api.replaceCatalog
+      let failGet = false
+      api.getSettings = async () => {
+        if (failGet) throw new Error('private reload detail')
+        return await originalGet()
+      }
+      api.replaceCatalog = async (request) => {
+        api.replacements.push(request)
+        throw new Error(code)
+      }
+      let controller: AudioGenerationController | null = null
+      const host = createControllerRoot()
+      try {
+        await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+        const profile = requireController(controller).settings!.catalog.profiles[0]!
+        act(() => requireController(controller).startEdit(profile))
+        act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, name: '本地待确认修改' }))
+        failGet = true
+        await act(async () => { await requireController(controller).saveDraft() })
+        expect(api.replacements).toHaveLength(1)
+        expect((requireController(controller) as AudioGenerationController & { needsReload: boolean }).needsReload).toBeTrue()
+        expect(requireController(controller).actionError).toContain('配置状态未知')
+        expect(requireController(controller).actionError).toContain('重新加载失败')
+        expect(requireController(controller).actionError).not.toContain('private')
+        await act(async () => { await requireController(controller).saveDraft() })
+        await act(async () => { await requireController(controller).toggleEnabled(profile, false) })
+        await act(async () => { await requireController(controller).testProfile(profile) })
+        expect(api.replacements).toHaveLength(1)
+        expect(api.tests).toHaveLength(0)
+
+        api.setSettings(createSettings(9))
+        failGet = false
+        let reloadSucceeded = false
+        await act(async () => { reloadSucceeded = await requireController(controller).load() })
+        expect(reloadSucceeded).toBeTrue()
+        expect((requireController(controller) as AudioGenerationController & { needsReload: boolean }).needsReload).toBeFalse()
+        expect(requireController(controller).settings?.catalog.revision).toBe(9)
+        api.replaceCatalog = originalReplace
+        await act(async () => { await requireController(controller).toggleEnabled(requireController(controller).settings!.catalog.profiles[0]!, false) })
+        expect(api.replacements).toHaveLength(2)
+      } finally { act(() => host.unmount()); host.restore() }
+    }
   })
 
   test('Given 首次读取失败 When 重试成功 Then 清除错误并展示权威空目录', async () => {
@@ -449,6 +497,52 @@ describe('AudioGenerationSettings', () => {
     }
   })
 
+  test('Given 第二次草稿测试取消旧请求失败 When 重试取消成功 Then 失败时不发新请求且草稿身份时间稳定', async () => {
+    const api = createApi()
+    let cancelAttempts = 0
+    api.cancelTest = async (requestId) => {
+      api.cancellations.push(requestId)
+      cancelAttempts += 1
+      if (cancelAttempts === 1) throw new Error('private cancel detail')
+    }
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    let first: Promise<void> = Promise.resolve()
+    let third: Promise<void> = Promise.resolve()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      const profile = requireController(controller).settings!.catalog.profiles[0]!
+      act(() => requireController(controller).startEdit(profile))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'first-key' }))
+      const stableUpdatedAt = requireController(controller).draft!.updatedAt
+      act(() => { first = requireController(controller).testProfile() })
+      const firstInput = api.tests[0]
+      expect(firstInput?.kind).toBe('draft')
+      if (firstInput?.kind !== 'draft') throw new Error('首个测试输入错误')
+      expect(firstInput.profile.updatedAt).toBe(stableUpdatedAt)
+
+      await act(async () => { await requireController(controller).testProfile() })
+      expect(api.tests).toHaveLength(1)
+      expect(requireController(controller).testStates[profile.id]?.message).toContain('取消上一次测试失败')
+      expect(requireController(controller).testStates[profile.id]?.message).not.toContain('private')
+
+      await act(async () => {
+        third = requireController(controller).testProfile()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(api.tests).toHaveLength(2)
+      const retryInput = api.tests[1]
+      if (retryInput?.kind !== 'draft') throw new Error('重试测试输入错误')
+      expect(retryInput.profile).toEqual(firstInput.profile)
+      expect(cancelAttempts).toBe(2)
+      api.resolveTest({ requestId: retryInput.requestId, state: 'success', message: 'success' })
+      await act(async () => { await third })
+      api.resolveTest({ requestId: firstInput.requestId, state: 'cancelled', message: 'late' })
+      await act(async () => { await first })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
   test('Given 已完成草稿测试 When API Key 改变 Then 清除旧结论并使用新的凭据代次', async () => {
     const api = createApi()
     let controller: AudioGenerationController | null = null
@@ -502,6 +596,21 @@ describe('AudioGenerationSettings', () => {
     const element = expectedModule.createMediaSettingsAudioGenerationElement({ navigation: 'nav', headerContent: 'header', children: 'notice' })
     expect(element.type).toBe(AudioGenerationSettings)
     expect(element.props).toMatchObject({ navigation: 'nav', headerContent: 'header', children: 'notice' })
+  })
+
+  test('Given 多个从未测试的新草稿 When 反复创建并返回 Then generation Map 不保留无效 identity', async () => {
+    const api = createApi()
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      for (let index = 0; index < 20; index += 1) {
+        act(() => requireController(controller).startCreate())
+        act(() => requireController(controller).closeDraft())
+      }
+      const observable = requireController(controller) as AudioGenerationController & { generationEntryCount: number }
+      expect(observable.generationEntryCount).toBe(0)
+    } finally { act(() => host.unmount()); host.restore() }
   })
 
   test('Given 同一配置连续测试 When 第二次启动、身份修改和卸载 Then 取消旧请求且迟到结果不覆盖新状态', async () => {
