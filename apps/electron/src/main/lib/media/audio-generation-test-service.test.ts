@@ -380,6 +380,161 @@ describe('独立音频供应商测试服务', () => {
     })
   })
 
+  test('Given tester 永不完成 When 达到服务 deadline Then abort 并及时返回固定 failed', async () => {
+    const run = deferred<Awaited<ReturnType<AudioGenerationProviderTester['test']>>>()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    let receivedSignal: AbortSignal | undefined
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      timeoutMs: 10,
+      testers: { xiaomi: { test: async (_input, signal) => {
+        receivedSignal = signal
+        return run.promise
+      } } },
+    })
+    try {
+      expect(await service.test(7, draftInput('timeout-request'))).toEqual({
+        requestId: 'timeout-request',
+        state: 'failed',
+        message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+      })
+      expect(receivedSignal?.aborted).toBeTrue()
+      expect(service.activeTestCount).toBe(0)
+      run.reject(new Error('Bearer late-secret'))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  test('Given 非法 deadline When 构造服务 Then fail closed 拒绝', () => {
+    for (const timeoutMs of [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      1.5,
+      2_147_483_648,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      expect(() => new AudioGenerationTestService({ store: storeFixture(), timeoutMs }))
+        .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+  })
+
+  test('Given owner 已有 16 个不同配置 When 替换已有身份并新增第 17 个 Then 替换可用且新身份被限流', async () => {
+    const never = new Promise<never>(() => {})
+    const store = storeFixture()
+    let testerCalls = 0
+    const service = new AudioGenerationTestService({
+      store,
+      testers: { xiaomi: { test: async () => {
+        testerCalls += 1
+        return never
+      } } },
+    })
+    const pending = Array.from({ length: 16 }, (_unused, index) => service.test(
+      7,
+      draftInput(`request-${index}`, 'xiaomi', 'key', { id: `profile-${index}` }),
+    ))
+    expect(service.activeTestCount).toBe(16)
+
+    /** 身份索引应直接替换 profile-0 并同步释放一个名额。 */
+    const replacement = service.test(
+      7,
+      draftInput('replacement', 'xiaomi', 'new-key', { id: 'profile-0' }),
+    )
+    expect((await pending[0]!).state).toBe('cancelled')
+    expect(service.activeTestCount).toBe(16)
+    expect(testerCalls).toBe(17)
+
+    expect(await service.test(
+      7,
+      { kind: 'saved', requestId: 'overflow', profileId: 'saved-overflow' },
+    )).toEqual({
+      requestId: 'overflow',
+      state: 'failed',
+      message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+    })
+    expect(testerCalls).toBe(17)
+    expect(store.readCalls).toBe(0)
+    expect(store.resolveCalls).toBe(0)
+    service.dispose()
+    expect((await replacement).state).toBe('cancelled')
+    expect((await Promise.all(pending.slice(1))).every(result => result.state === 'cancelled')).toBeTrue()
+    expect(service.activeTestCount).toBe(0)
+  })
+
+  test('Given 全局已有 64 个活动测试 When 第 65 个开始 Then tester 前固定失败', async () => {
+    const never = new Promise<never>(() => {})
+    let testerCalls = 0
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      testers: { xiaomi: { test: async () => {
+        testerCalls += 1
+        return never
+      } } },
+    })
+    const pending = Array.from({ length: 64 }, (_unused, index) => service.test(
+      Math.floor(index / 16) + 1,
+      draftInput(`global-request-${index}`, 'xiaomi', 'key', { id: `global-profile-${index}` }),
+    ))
+    expect(service.activeTestCount).toBe(64)
+    expect(await service.test(
+      99,
+      draftInput('global-overflow', 'xiaomi', 'key', { id: 'global-overflow-profile' }),
+    )).toEqual({
+      requestId: 'global-overflow',
+      state: 'failed',
+      message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+    })
+    expect(testerCalls).toBe(64)
+    service.dispose()
+    expect((await Promise.all(pending)).every(result => result.state === 'cancelled')).toBeTrue()
+    expect(service.activeTestCount).toBe(0)
+  })
+
+  test('Given 活动测试完成或取消 When 再启动 Then 已释放 owner 与全局名额', async () => {
+    const firstRun = deferred<Awaited<ReturnType<AudioGenerationProviderTester['test']>>>()
+    let testerCalls = 0
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      testers: { xiaomi: { test: async () => {
+        testerCalls += 1
+        return testerCalls === 1
+          ? firstRun.promise
+          : { state: 'success', message: AUDIO_GENERATION_TEST_MESSAGES.success }
+      } } },
+    })
+    const cancelled = service.test(7, draftInput('slot-cancelled'))
+    service.cancel(7, 'slot-cancelled')
+    expect((await cancelled).state).toBe('cancelled')
+    expect(service.activeTestCount).toBe(0)
+    expect((await service.test(7, draftInput('slot-success', 'xiaomi', 'key', { id: 'slot-success' }))).state)
+      .toBe('success')
+    expect(service.activeTestCount).toBe(0)
+    expect(testerCalls).toBe(2)
+    firstRun.resolve({ state: 'success', message: AUDIO_GENERATION_TEST_MESSAGES.success })
+  })
+
+  test('Given 小米 adapter 返回 MiniMax unavailable 文案 When 校验 Then 固定失败且保留原 requestId', async () => {
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      testers: { xiaomi: { test: async () => ({
+        state: 'unavailable',
+        message: AUDIO_GENERATION_TEST_MESSAGES.unavailable.minimax,
+      }) } },
+    })
+    expect(await service.test(7, draftInput('provider-bound'))).toEqual({
+      requestId: 'provider-bound',
+      state: 'failed',
+      message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+    })
+  })
+
   test('Given 非法输入 When 测试 Then 在调用 Store 或 tester 前拒绝', async () => {
     const store = storeFixture()
     let testerCalls = 0
