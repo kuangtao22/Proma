@@ -78,7 +78,9 @@ const AUDIO_GENERATION_STABLE_ERROR_CODES = new Set([
 
 /** 只保留已知稳定码，未知底层异常统一替换，避免路径、Key 或上游正文泄漏。 */
 function throwStableAudioError(error: unknown, fallbackCode: string): never {
-  if (error instanceof Error && AUDIO_GENERATION_STABLE_ERROR_CODES.has(error.message)) throw error
+  if (error instanceof Error && AUDIO_GENERATION_STABLE_ERROR_CODES.has(error.message)) {
+    throw new Error(error.message)
+  }
   throw new Error(fallbackCode)
 }
 

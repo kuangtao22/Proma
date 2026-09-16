@@ -546,11 +546,13 @@ describe('独立音频生成 IPC', () => {
   test('Given 底层异常或提交结果未知 When 音频 IPC 收口 Then 不泄露 cause 且保留 outcome unknown', async () => {
     const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
     let preserveOutcomeUnknown = true
+    const outcomeUnknownError = new Error('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN', {
+      cause: new Error('Authorization: Bearer secret-key /Users/private'),
+    })
     const registration = registerMediaIpcHandlers(createMediaOptions(handlers, createService({
       replace: () => {
-        throw new Error(preserveOutcomeUnknown
-          ? 'AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN'
-          : 'Authorization: Bearer secret-key /Users/private')
+        if (preserveOutcomeUnknown) throw outcomeUnknownError
+        throw new Error('Authorization: Bearer secret-key /Users/private')
       },
       test: async () => { throw new Error('Authorization: Bearer secret-key /Users/private') },
     })))
@@ -560,8 +562,18 @@ describe('独立音频生成 IPC', () => {
       profiles: [{ profile: createAudioProfile(), credentialUpdate: { mode: 'replace', apiKey: 'secret-key' } }],
     }
     try {
-      expect(() => handlers.get(MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG)!(event, request))
-        .toThrow('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')
+      let sanitizedError: unknown
+      try {
+        handlers.get(MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG)!(event, request)
+      } catch (error) {
+        sanitizedError = error
+      }
+      expect(sanitizedError).toBeInstanceOf(Error)
+      expect(sanitizedError).not.toBe(outcomeUnknownError)
+      expect((sanitizedError as Error).message).toBe('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')
+      expect((sanitizedError as Error & { cause?: unknown }).cause).toBeUndefined()
+      expect(String(sanitizedError)).not.toContain('secret-key')
+      expect(String(sanitizedError)).not.toContain('/Users/private')
       preserveOutcomeUnknown = false
       expect(() => handlers.get(MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG)!(event, request))
         .toThrow('AUDIO_GENERATION_CONFIG_WRITE_FAILED')
