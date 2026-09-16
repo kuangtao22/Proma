@@ -451,7 +451,10 @@ import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
 import { MediaConfigStore } from './lib/media/media-config-store'
 import { MediaResourceService } from './lib/media/media-resource-service'
 import { MediaResourceSnapshotStore } from './lib/media/media-resource-snapshot-store'
-import { registerMediaIpcHandlers } from './lib/media/media-ipc'
+import { createAudioGenerationIpcService, registerMediaIpcHandlers } from './lib/media/media-ipc'
+import type { AudioGenerationIpcService } from './lib/media/media-ipc'
+import { AudioGenerationConfigStore } from './lib/media/audio-generation-config-store'
+import { AudioGenerationTestService } from './lib/media/audio-generation-test-service'
 import { MediaRunService } from './lib/media/media-run-service'
 import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
 import { MediaDesignAssets } from './lib/media/media-design-assets'
@@ -499,7 +502,7 @@ import { resolvePathAgainstAgentCwd } from './lib/agent-file-path'
 import { getLocalProjectRootStatusSync } from './lib/project-root-health'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, resolveAttachmentPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, getAudioGenerationProfilesPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -663,10 +666,39 @@ let designImageModelServices: DesignImageModelServices | undefined
 let mediaConfiguration: MediaConfigStore | undefined
 /** 所有 UI、普通 Agent 与 Canvas 共享一个任务服务实例。 */
 let mediaRunService: MediaRunService | undefined
+/** 独立音频目录延迟到 IPC 装配阶段创建，避免模块加载阶段触碰文件系统。 */
+let audioGenerationStore: AudioGenerationConfigStore | undefined
+/** 所有设置窗口共享一个按 owner 隔离的音频测试服务。 */
+let audioGenerationTests: AudioGenerationTestService | undefined
+/** Media IPC 共享的独立音频组合服务，旧目录只读投影不建立第二写入口。 */
+let audioGenerationIpcService: AudioGenerationIpcService | undefined
 
 /** 返回运行配置唯一实例，避免旧生图目录和媒体设置产生独立写入口。 */
 function getMediaConfiguration(): MediaConfigStore {
   return mediaConfiguration ??= new MediaConfigStore(getConfigDir(), safeStorage)
+}
+
+/** 返回进程级唯一音频配置 Store，凭据只在 Main 内由 safeStorage 处理。 */
+function getAudioGenerationStore(): AudioGenerationConfigStore {
+  return audioGenerationStore ??= new AudioGenerationConfigStore({
+    configPath: getAudioGenerationProfilesPath(),
+    secureStorage: safeStorage,
+    platform: process.platform,
+  })
+}
+
+/** 返回与唯一 Store 绑定的测试服务，避免窗口间共享明文或取消状态。 */
+function getAudioGenerationTests(): AudioGenerationTestService {
+  return audioGenerationTests ??= new AudioGenerationTestService({ store: getAudioGenerationStore() })
+}
+
+/** 返回进程级唯一音频 IPC 服务，旧统一媒体目录始终只读。 */
+function getAudioGenerationIpcService(): AudioGenerationIpcService {
+  return audioGenerationIpcService ??= createAudioGenerationIpcService({
+    store: getAudioGenerationStore(),
+    tests: getAudioGenerationTests(),
+    listLegacyCatalog: () => getDesignImageModelServices().imageModels.listMediaApiCatalog(),
+  })
 }
 
 /** 获取 Design IPC 与后续任务流程共享的生图模型服务实例。 */
@@ -2057,6 +2089,7 @@ export function registerIpcHandlers(): void {
     assertProject: (projectId) => { if (!getAgentWorkspace(projectId)) throw new Error('MEDIA_PROJECT_NOT_AUTHORIZED') },
     configuration: getMediaConfiguration(),
     resources: mediaResources,
+    audioGeneration: getAudioGenerationIpcService(),
     onBackgroundError: (message, error) => console.error(message, error),
     listAssets: (projectId) => mediaAssets.list(projectId),
     readAssetThumbnail: async (projectId, asset) => mediaAssetThumbnails.read(projectId, asset),
@@ -2627,7 +2660,10 @@ export function registerIpcHandlers(): void {
   mediaRunService = mediaRuns
   const mediaSupervisor = new MediaRunSupervisor({ runs: mediaRuns,
     onError: () => { console.warn('[媒体任务] 远端对账暂未完成，保留原运行身份') } })
-  app.once('before-quit', () => { mediaSupervisor.dispose(); mediaIpc.dispose() })
+  app.once('before-quit', () => {
+    mediaSupervisor.dispose()
+    mediaIpc.dispose()
+  })
   /** 直接入边解析器只读取已提交 Agent JSONL、图片配置和受管正文。 */
   const canvasImageInputResolver = createCanvasImageInputResolver({
     canvasStore: canvasDocumentStore,
