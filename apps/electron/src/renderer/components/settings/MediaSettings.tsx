@@ -160,6 +160,13 @@ export interface MediaSettingsProps {
   onOpenWorkflowInCanvas?: (target: MediaWorkflowCanvasTarget) => void
 }
 
+/** 创建音频分区的生产元素，供父设置页与无 DOM 挂载测试共用。 */
+export function createMediaSettingsAudioGenerationElement(
+  props: React.ComponentProps<typeof AudioGenerationSettings>,
+): React.ReactElement {
+  return <AudioGenerationSettings {...props} />
+}
+
 /** 判断未知值是否为普通对象。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -1437,7 +1444,7 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
     <div className="min-w-0 max-w-full space-y-6">
       {activeTab === 'image-models' && <MediaApiModelSettings fixedMediaKind="image" navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
 
-      {activeTab === 'audio-generation' && <AudioGenerationSettings navigation={navigation} headerContent={authorizationControl}>{notices}</AudioGenerationSettings>}
+      {activeTab === 'audio-generation' && createMediaSettingsAudioGenerationElement({ navigation, headerContent: authorizationControl, children: notices })}
 
       {activeTab === 'connections' && (
         <div className="space-y-8">
