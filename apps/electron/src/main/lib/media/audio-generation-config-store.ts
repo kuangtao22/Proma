@@ -1,4 +1,5 @@
-import { lstatSync, readFileSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs'
+import type { Stats } from 'node:fs'
 import type {
   AudioGenerationProfile,
   AudioGenerationPublicCatalog,
@@ -11,7 +12,16 @@ import {
   parseAudioGenerationProfile,
   parseReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
-import { writeJsonFileAtomicSecure } from '../safe-file'
+import type {
+  AtomicDestinationExpectation,
+  AtomicFileState,
+} from '../safe-file'
+import {
+  AtomicDestinationConflictError,
+  AtomicWritePostCommitError,
+  readAtomicFileState,
+  writeJsonFileAtomicSecure,
+} from '../safe-file'
 import { acquireMediaFileLock } from './media-file-lock'
 
 /** 独立音频目录允许占用的最大 JSON 字节数。 */
@@ -37,6 +47,12 @@ export interface AudioGenerationConfigStoreOptions {
   secureStorage: AudioGenerationSecureStorage
   /** 生成更新时间的可替换时钟。 */
   now?: () => number
+  /** 当前运行平台；生产默认使用 Node 进程平台。 */
+  platform?: NodeJS.Platform
+  /** 读取字节完成后、状态复验前调用，仅供竞态回归测试。 */
+  beforeReadFinish?: () => void
+  /** 写入调用前执行，仅供目标置换竞态回归测试。 */
+  beforeCommit?: () => void
 }
 
 /** 单条配置在磁盘中的严格结构，只包含公开配置和密文。 */
@@ -50,6 +66,12 @@ interface PersistedAudioGenerationCatalog {
   schemaVersion: 1
   revision: number
   profiles: PersistedAudioGenerationProfile[]
+}
+
+/** 单次严格读取同时返回目录和后续写入必须匹配的文件状态。 */
+interface PersistedAudioGenerationRead {
+  catalog: PersistedAudioGenerationCatalog
+  expectedDestination: AtomicDestinationExpectation
 }
 
 /** 判断未知值是否为非数组对象。 */
@@ -131,6 +153,31 @@ function isMissingFileError(error: unknown): boolean {
     && (error as NodeJS.ErrnoException).code === 'ENOENT'
 }
 
+/** 从已打开文件描述符状态投影安全原子写使用的完整状态。 */
+function toAtomicFileState(stats: Stats): AtomicFileState {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  }
+}
+
+/** 比较读取前后或路径当前状态是否仍是同一份完整文件。 */
+function isSameAtomicFileState(left: AtomicFileState, right: AtomicFileState): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+}
+
+/** 当前平台可取得 UID 时要求配置文件属于当前用户。 */
+function isOwnedByCurrentUser(uid: number): boolean {
+  return typeof process.getuid !== 'function' || uid === process.getuid()
+}
+
 /** 独立音频生成配置 Store，负责严格读取、CAS 与凭据加解密。 */
 export class AudioGenerationConfigStore {
   /** 配置文件完整路径。 */
@@ -139,17 +186,26 @@ export class AudioGenerationConfigStore {
   private readonly secureStorage: AudioGenerationSecureStorage
   /** 单调业务时钟由调用方保证，Store 复验不会回退现有时间。 */
   private readonly now: () => number
+  /** 用于限定 safeStorage backend 探测的平台。 */
+  private readonly platform: NodeJS.Platform
+  /** 读取完成后的窄竞态测试钩子。 */
+  private readonly beforeReadFinish?: () => void
+  /** 安全原子提交前的窄竞态测试钩子。 */
+  private readonly beforeCommit?: () => void
 
   /** 创建绑定单一配置文件的 Store。 */
   constructor(options: AudioGenerationConfigStoreOptions) {
     this.configPath = options.configPath
     this.secureStorage = options.secureStorage
     this.now = options.now ?? Date.now
+    this.platform = options.platform ?? process.platform
+    this.beforeReadFinish = options.beforeReadFinish
+    this.beforeCommit = options.beforeCommit
   }
 
   /** 返回严格解析的公开目录；首次缺失返回 revision 0。 */
   readPublic(): AudioGenerationPublicCatalog {
-    return toPublicCatalog(this.readPersisted())
+    return toPublicCatalog(this.readPersisted().catalog)
   }
 
   /**
@@ -161,7 +217,9 @@ export class AudioGenerationConfigStore {
     const request = parseReplaceAudioGenerationCatalogRequest(input)
     return this.withLock(() => {
       /** 锁内读取的当前目录是本次 CAS 唯一基线。 */
-      const current = this.readPersisted()
+      const currentRead = this.readPersisted()
+      /** 严格读取后的目录内容。 */
+      const current = currentRead.catalog
       if (current.revision !== request.expectedRevision) {
         throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
       }
@@ -199,7 +257,21 @@ export class AudioGenerationConfigStore {
         profiles,
       }
       this.assertSerializedSize(next)
-      writeJsonFileAtomicSecure(this.configPath, next)
+      this.beforeCommit?.()
+      try {
+        writeJsonFileAtomicSecure(this.configPath, next, {
+          expectedDestination: currentRead.expectedDestination,
+        })
+      } catch (error) {
+        if (error instanceof AtomicWritePostCommitError) {
+          throw new Error('AUDIO_GENERATION_CONFIG_WRITE_FAILED')
+        }
+        if (error instanceof AtomicDestinationConflictError
+          || !this.matchesExpectedDestination(currentRead.expectedDestination)) {
+          throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
+        }
+        throw new Error('AUDIO_GENERATION_CONFIG_WRITE_FAILED')
+      }
       return toPublicCatalog(next)
     })
   }
@@ -207,7 +279,7 @@ export class AudioGenerationConfigStore {
   /** 按稳定 ID 解密单个 API Key，仅供主进程连接测试使用。 */
   resolveApiKey(profileId: string): string {
     /** 严格读取仍不解密其它条目。 */
-    const item = this.readPersisted().profiles.find((candidate) => candidate.profile.id === profileId)
+    const item = this.readPersisted().catalog.profiles.find((candidate) => candidate.profile.id === profileId)
     if (!item) throw new Error('AUDIO_GENERATION_PROFILE_NOT_FOUND')
     this.assertSecureStorage()
     try {
@@ -226,23 +298,67 @@ export class AudioGenerationConfigStore {
   }
 
   /** 严格读取主文件；存在但损坏时不回退空目录或自动覆盖。 */
-  private readPersisted(): PersistedAudioGenerationCatalog {
+  private readPersisted(): PersistedAudioGenerationRead {
+    /** 打开的描述符在 finally 中唯一关闭。 */
+    let descriptor: number | null = null
     try {
-      /** lstat 阻止配置路径通过符号链接指向非受管文件。 */
-      const stats = lstatSync(this.configPath)
-      if (!stats.isFile()) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
-      if (stats.size > AUDIO_GENERATION_CONFIG_MAX_BYTES) {
+      /** O_NOFOLLOW 让读取直接绑定普通文件，不经由路径符号链接。 */
+      descriptor = openSync(
+        this.configPath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+      )
+      /** 读取前绑定文件描述符指向的完整状态。 */
+      const beforeStats = fstatSync(descriptor)
+      if (!beforeStats.isFile() || !isOwnedByCurrentUser(beforeStats.uid)) {
+        throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+      }
+      if (beforeStats.size > AUDIO_GENERATION_CONFIG_MAX_BYTES) {
         throw new Error('AUDIO_GENERATION_CONFIG_SIZE_LIMIT')
       }
-      /** 文件大小已受限后再一次性读取和解析 JSON。 */
-      const contents = readFileSync(this.configPath, 'utf8')
-      return parsePersistedCatalog(JSON.parse(contents) as unknown)
-    } catch (error) {
-      if (isMissingFileError(error)) {
-        return { schemaVersion: 1, revision: 0, profiles: [] }
+      /** 初始大小最多 1 MiB，因此实际读取不会超过目录资源上限。 */
+      const bytes = Buffer.alloc(beforeStats.size)
+      /** 已从同一描述符读取的字节数。 */
+      let offset = 0
+      while (offset < bytes.length) {
+        /** 使用显式位置读取，避免共享文件偏移影响结果。 */
+        const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset)
+        if (count === 0) break
+        offset += count
       }
+      this.beforeReadFinish?.()
+      /** 读取后再次核对同一描述符，阻止原地截断或改写。 */
+      const afterState = toAtomicFileState(fstatSync(descriptor))
+      /** 读取前用于解析和后续提交 CAS 的固定状态。 */
+      const beforeState = toAtomicFileState(beforeStats)
+      if (offset !== bytes.length || !isSameAtomicFileState(beforeState, afterState)) {
+        throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
+      }
+      /** 复验路径仍指向刚读取的文件，阻止 rename 置换后返回旧快照。 */
+      const currentPathState = readAtomicFileState(this.configPath)
+      if (currentPathState === null || !isSameAtomicFileState(beforeState, currentPathState)) {
+        throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
+      }
+      /** 状态全部稳定后才解析固定长度的 UTF-8 JSON。 */
+      const catalog = parsePersistedCatalog(JSON.parse(bytes.toString('utf8')) as unknown)
+      return {
+        catalog,
+        expectedDestination: { kind: 'state', state: beforeState },
+      }
+    } catch (error) {
+      if (isMissingFileError(error) && descriptor === null) {
+        return {
+          catalog: { schemaVersion: 1, revision: 0, profiles: [] },
+          expectedDestination: { kind: 'missing' },
+        }
+      }
+      if (isMissingFileError(error)) throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
       if (error instanceof Error && error.message === 'AUDIO_GENERATION_CONFIG_SIZE_LIMIT') throw error
-      throw new Error('AUDIO_GENERATION_CONFIG_INVALID', { cause: error })
+      if (error instanceof Error && error.message === 'AUDIO_GENERATION_CONFIG_CONFLICT') throw error
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    } finally {
+      if (descriptor !== null) {
+        try { closeSync(descriptor) } catch { /* 对外只保留稳定业务错误。 */ }
+      }
     }
   }
 
@@ -275,8 +391,11 @@ export class AudioGenerationConfigStore {
   /** fail-closed 检查系统安全存储，明确拒绝 basic_text 降级。 */
   private assertSecureStorage(): void {
     try {
-      if (this.secureStorage.isEncryptionAvailable()
-        && this.secureStorage.getSelectedStorageBackend() !== 'basic_text') return
+      if (!this.secureStorage.isEncryptionAvailable()) {
+        throw new Error('unavailable')
+      }
+      if (this.platform !== 'linux') return
+      if (this.secureStorage.getSelectedStorageBackend() !== 'basic_text') return
     } catch {
       // 后端探测异常不得向上泄露系统错误或触发明文降级。
     }
@@ -299,6 +418,18 @@ export class AudioGenerationConfigStore {
     const bytes = Buffer.byteLength(JSON.stringify(catalog, null, 2), 'utf8')
     if (bytes > AUDIO_GENERATION_CONFIG_MAX_BYTES) {
       throw new Error('AUDIO_GENERATION_CONFIG_SIZE_LIMIT')
+    }
+  }
+
+  /** 判断失败后的目标是否仍匹配读取期状态，用于识别未类型化的路径置换。 */
+  private matchesExpectedDestination(expected: AtomicDestinationExpectation): boolean {
+    try {
+      /** 当前路径状态由 safe-file 的同一安全读取边界提供。 */
+      const current = readAtomicFileState(this.configPath)
+      if (expected.kind === 'missing') return current === null
+      return current !== null && isSameAtomicFileState(expected.state, current)
+    } catch {
+      return false
     }
   }
 }

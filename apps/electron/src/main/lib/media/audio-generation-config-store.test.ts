@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type {
@@ -34,9 +43,13 @@ function createSecureStorage(
 function createStore(
   secureStorage = createSecureStorage(),
   now: () => number = () => 100,
+  options: Pick<
+    AudioGenerationConfigStoreOptions,
+    'platform' | 'beforeCommit' | 'beforeReadFinish'
+  > = {},
 ): AudioGenerationConfigStore {
-  const options: AudioGenerationConfigStoreOptions = { configPath, secureStorage, now }
-  return new AudioGenerationConfigStore(options)
+  const storeOptions: AudioGenerationConfigStoreOptions = { configPath, secureStorage, now, ...options }
+  return new AudioGenerationConfigStore(storeOptions)
 }
 
 /** 构造合法的小米 TTS 配置，可按测试需要覆盖字段。 */
@@ -119,10 +132,23 @@ describe('独立音频生成配置存储', () => {
       createSecureStorage({ isEncryptionAvailable: () => false }),
       createSecureStorage({ getSelectedStorageBackend: () => 'basic_text' }),
     ]) {
-      expect(() => createStore(secureStorage).replace(firstRequest())).toThrow(
+      expect(() => createStore(secureStorage, () => 100, { platform: 'linux' }).replace(firstRequest())).toThrow(
         'AUDIO_GENERATION_SECURE_STORAGE_UNAVAILABLE',
       )
       expect(existsSync(configPath)).toBeFalse()
+    }
+  })
+
+  test('Given macOS 或 Windows safeStorage 可用 When 保存并解密 Then 不调用 Linux-only backend', () => {
+    for (const platform of ['darwin', 'win32'] as const) {
+      const secureStorage = createSecureStorage({
+        getSelectedStorageBackend: () => { throw new Error('非 Linux 不应调用 backend') },
+      })
+      const store = createStore(secureStorage, () => 100, { platform })
+
+      expect(store.replace(firstRequest()).revision).toBe(1)
+      expect(store.resolveApiKey('xiaomi-main')).toBe('secret-key')
+      rmSync(configPath)
     }
   })
 
@@ -251,6 +277,76 @@ describe('独立音频生成配置存储', () => {
       writeFileSync(configPath, contents, { mode: 0o600 })
       expect(() => createStore().readPublic()).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
     }
+  })
+
+  test('Given 配置路径是符号链接 When 读取 Then 不跟随到外部文件', () => {
+    const externalPath = join(directory, 'external.json')
+    writeFileSync(externalPath, JSON.stringify({ schemaVersion: 1, revision: 0, profiles: [] }))
+    symlinkSync(externalPath, configPath)
+
+    expect(() => createStore().readPublic()).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+  })
+
+  test('Given revision 读取后配置路径被置换 When 提交 Then 拒绝覆盖且保留外部内容', () => {
+    createStore().replace(firstRequest())
+    const externalContents = JSON.stringify({ external: 'replacement' })
+    const replacementPath = join(directory, 'replacement.json')
+    const store = createStore(createSecureStorage(), () => 200, {
+      beforeCommit: () => {
+        writeFileSync(replacementPath, externalContents, { mode: 0o600 })
+        renameSync(replacementPath, configPath)
+      },
+    })
+
+    expect(() => store.replace({
+      expectedRevision: 1,
+      profiles: [{ profile: xiaomiProfile(), credentialUpdate: { mode: 'preserve' } }],
+    })).toThrow('AUDIO_GENERATION_CONFIG_CONFLICT')
+    expect(readFileSync(configPath, 'utf8')).toBe(externalContents)
+  })
+
+  test('Given revision 读取后同 inode 被原地改写 When 提交 Then 拒绝覆盖且保留外部内容', () => {
+    createStore().replace(firstRequest())
+    const externalContents = JSON.stringify({ external: 'same-inode-change-with-different-size' })
+    const store = createStore(createSecureStorage(), () => 200, {
+      beforeCommit: () => { writeFileSync(configPath, externalContents, { mode: 0o600 }) },
+    })
+
+    expect(() => store.replace({
+      expectedRevision: 1,
+      profiles: [{ profile: xiaomiProfile(), credentialUpdate: { mode: 'preserve' } }],
+    })).toThrow('AUDIO_GENERATION_CONFIG_CONFLICT')
+    expect(readFileSync(configPath, 'utf8')).toBe(externalContents)
+  })
+
+  test('Given revision 读取后目标被换成符号链接 When 提交 Then 返回冲突且不跟随链接', () => {
+    createStore().replace(firstRequest())
+    const externalPath = join(directory, 'external-target.json')
+    const externalContents = JSON.stringify({ external: 'symlink-target' })
+    writeFileSync(externalPath, externalContents, { mode: 0o600 })
+    const store = createStore(createSecureStorage(), () => 200, {
+      beforeCommit: () => {
+        rmSync(configPath)
+        symlinkSync(externalPath, configPath)
+      },
+    })
+
+    expect(() => store.replace({
+      expectedRevision: 1,
+      profiles: [{ profile: xiaomiProfile(), credentialUpdate: { mode: 'preserve' } }],
+    })).toThrow('AUDIO_GENERATION_CONFIG_CONFLICT')
+    expect(readFileSync(externalPath, 'utf8')).toBe(externalContents)
+  })
+
+  test('Given 文件描述符读取期间同 inode 改写 When 读取 Then 返回冲突且不暴露底层错误', () => {
+    createStore().replace(firstRequest())
+    const externalContents = JSON.stringify({ external: 'read-race-with-different-size' })
+    const store = createStore(createSecureStorage(), () => 200, {
+      beforeReadFinish: () => { writeFileSync(configPath, externalContents, { mode: 0o600 }) },
+    })
+
+    expect(() => store.readPublic()).toThrow('AUDIO_GENERATION_CONFIG_CONFLICT')
+    expect(readFileSync(configPath, 'utf8')).toBe(externalContents)
   })
 
   test('Given 文件或加密结果超过 1 MiB When 读取或保存 Then 拒绝且不提交新目录', () => {
