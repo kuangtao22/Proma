@@ -124,6 +124,24 @@ describe('Canvas Agent 产物原子创建服务', () => {
     }
   })
 
+  test('Given 视频尺寸尚未加载 When 在其下方创建文档 Then 避让视频最大显示高度', async () => {
+    const fixture = createFixture()
+    /** 创建阶段没有视频元数据，必须预留和图片相同的 368 最大卡片高度。 */
+    const video = await fixture.service.create({
+      ...target, baseRevision: 3, artifactType: 'video', title: '主片', content: '', position: { x: 800, y: 0 },
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'video-before-doc' },
+    })
+    const created = await fixture.service.create({
+      ...target, baseRevision: video.revision, artifactType: 'document', title: '下游设计', content: '# 设计',
+      position: { x: 800, y: 168 },
+      source: { sessionId: 'session-1', runStartedAt: 99, toolCallId: 'doc-after-video' },
+    })
+    const node = fixture.getDocument().nodes.find((candidate) => candidate.id === created.nodeId)!
+    const overlaps = node.position.x < 800 + 288 + 24 && node.position.x + 288 + 24 > 800
+      && node.position.y < 368 + 24 && node.position.y + 144 + 24 > 0
+    expect(overlaps).toBe(false)
+  })
+
   test('Given 已有文档 When 请求在其上方创建带预览图片 Then 按候选最大高度避让而不移动原文档', async () => {
     const fixture = createFixture()
     /** 图片底部若按空卡计算会遗漏对下方需求文档的遮挡。 */

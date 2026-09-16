@@ -8,7 +8,7 @@ describe('Canvas 宿主异步动作', () => {
   test('Given 所有用户失败提示 When 检查合同 Then 都是固定中文且不含底层详情', () => {
     const messages = Object.values(CANVAS_WORKSPACE_FAILURE_MESSAGES)
 
-    expect(messages).toContain('设置默认画布失败')
+    expect(messages).not.toContain('设置默认画布失败')
     expect(messages).toContain('恢复画布失败')
     expect(messages.join('')).not.toContain('IPC')
     expect(messages.join('')).not.toContain('/private/')

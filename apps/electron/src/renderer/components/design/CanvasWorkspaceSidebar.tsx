@@ -8,7 +8,6 @@ import {
   MoreHorizontal,
   PanelLeftClose,
   Plus,
-  Star,
   Trash2,
   Workflow,
 } from 'lucide-react'
@@ -28,7 +27,7 @@ import { cn } from '@/lib/utils'
 /** 画布抽屉内互斥异步动作的稳定身份。 */
 export type CanvasSidebarPendingAction =
   | 'create:new'
-  | `${'open' | 'default' | 'archive' | 'restore'}:${string}`
+  | `${'open' | 'archive' | 'restore'}:${string}`
 
 export interface RunCanvasSidebarNavigationActionOptions {
   /** 当前导航动作的稳定身份。 */
@@ -48,8 +47,6 @@ export interface CanvasWorkspaceSidebarProps {
   currentCanvasId: string | null
   /** 当前项目的完整画布索引。 */
   sessions: readonly CanvasSessionMeta[]
-  /** 当前 Agent 绑定的默认画布 ID。 */
-  defaultCanvasId?: string
   /** 当前 Agent 按画布隔离的活动代次。 */
   activityStates: ReadonlyMap<string, AgentCanvasActivityState>
   /** 控制当前 Pane 内的抽屉开关。 */
@@ -58,8 +55,6 @@ export interface CanvasWorkspaceSidebarProps {
   onCreateCanvas: () => Promise<boolean>
   /** 打开未归档画布，或恢复并打开归档画布。 */
   onOpenCanvas: (session: CanvasSessionMeta) => Promise<boolean>
-  /** 把指定未归档画布设为默认。 */
-  onSetDefaultCanvas: (session: CanvasSessionMeta) => Promise<boolean>
   /** 归档或恢复指定画布。 */
   onToggleArchiveCanvas: (session: CanvasSessionMeta) => Promise<boolean>
   /** 交给宿主打开共用的永久删除确认。 */
@@ -73,16 +68,12 @@ interface CanvasSidebarSessionRowProps {
   session: CanvasSessionMeta
   /** 当前 Pane 是否正在展示该画布。 */
   current: boolean
-  /** 该画布是否为当前 Agent 默认画布。 */
-  isDefault: boolean
   /** 该画布是否存在未读活动。 */
   unread: boolean
   /** 抽屉当前互斥动作。 */
   pendingAction: CanvasSidebarPendingAction | null
   /** 点击画布主体时打开或恢复。 */
   onOpen: (session: CanvasSessionMeta) => void
-  /** 把当前行设为默认。 */
-  onSetDefault: (session: CanvasSessionMeta) => void
   /** 归档或恢复当前行。 */
   onToggleArchive: (session: CanvasSessionMeta) => void
   /** 请求永久删除当前行。 */
@@ -126,11 +117,9 @@ export async function runCanvasSidebarNavigationAction({
 function CanvasSidebarSessionRow({
   session,
   current,
-  isDefault,
   unread,
   pendingAction,
   onOpen,
-  onSetDefault,
   onToggleArchive,
   onRequestDelete,
 }: CanvasSidebarSessionRowProps): React.ReactElement {
@@ -152,7 +141,6 @@ function CanvasSidebarSessionRow({
       >
         <Workflow className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="min-w-0 flex-1 truncate">{session.title}</span>
-        {isDefault ? <Star className="size-3.5 shrink-0 fill-current" aria-label="默认画布" /> : null}
         {unread ? <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-label="有新版本" /> : null}
       </button>
       <DropdownMenu>
@@ -174,12 +162,6 @@ function CanvasSidebarSessionRow({
           <TooltipContent side="right">管理画布</TooltipContent>
         </Tooltip>
         <DropdownMenuContent side="right" align="start" className="z-[220] min-w-40">
-          {!session.archived && !isDefault ? (
-            <DropdownMenuItem onSelect={() => onSetDefault(session)}>
-              <Star className="size-3.5" aria-hidden="true" />
-              设为默认
-            </DropdownMenuItem>
-          ) : null}
           <DropdownMenuItem onSelect={() => onToggleArchive(session)}>
             {session.archived
               ? <ArchiveRestore className="size-3.5" aria-hidden="true" />
@@ -206,12 +188,10 @@ export function CanvasWorkspaceSidebar({
   open,
   currentCanvasId,
   sessions,
-  defaultCanvasId,
   activityStates,
   onOpenChange,
   onCreateCanvas,
   onOpenCanvas,
-  onSetDefaultCanvas,
   onToggleArchiveCanvas,
   onRequestDeleteCanvas,
   onUnexpectedError = (context, error) => {
@@ -267,11 +247,6 @@ export function CanvasWorkspaceSidebar({
       .finally(() => setPendingAction(null))
   }, [onUnexpectedError])
 
-  /** 把指定未归档画布设为默认。 */
-  const handleSetDefault = React.useCallback((session: CanvasSessionMeta): void => {
-    runManagementAction(`default:${session.id}`, '设置默认画布', () => onSetDefaultCanvas(session))
-  }, [onSetDefaultCanvas, runManagementAction])
-
   /** 归档或恢复指定画布；当前项回退由 SidePanel 宿主处理。 */
   const handleToggleArchive = React.useCallback((session: CanvasSessionMeta): void => {
     runManagementAction(
@@ -294,11 +269,9 @@ export function CanvasWorkspaceSidebar({
         key={session.id}
         session={session}
         current={session.id === currentCanvasId}
-        isDefault={session.id === defaultCanvasId}
         unread={unread}
         pendingAction={pendingAction}
         onOpen={handleOpen}
-        onSetDefault={handleSetDefault}
         onToggleArchive={handleToggleArchive}
         onRequestDelete={onRequestDeleteCanvas}
       />

@@ -9,6 +9,7 @@ import {
   createArrangeCanvasNodesMutation as arrangeWithEngine,
   createMoveCanvasNodesMutation,
   createNativeCanvasNodeSizeMap,
+  stabilizeNativeCanvasVideoNodeHeightMap,
   createNativeCanvasUserEdge,
   confirmNativeCanvasEdge,
   createViewportCanvasMutation,
@@ -225,6 +226,136 @@ describe('原生 Canvas 纯投影', () => {
       statusLabel: '已有素材', summary: '已有可用素材',
       mediaProgress: { phase: 'pending', hasAdoptedOutput: true },
     })
+  })
+
+  test('Given 视频节点已有正式采用目标和预览能力 When 完整投影与运行态切换 Then 保留稳定能力并替换采用目标', () => {
+    const document = createDocument()
+    document.nodes.push({
+      id: 'media-1', kind: 'video', title: '媒体', position: { x: 0, y: 0 }, mediaModuleId: 'media-module',
+    })
+    const adoptedVideo = {
+      projectId: document.projectId,
+      canvasId: document.canvasId,
+      nodeId: 'media-1',
+      mediaModuleId: 'media-module',
+      mediaKind: 'video' as const,
+      candidateId: 'candidate-1',
+      outputKey: 'video',
+      outputOrder: 0,
+    }
+    const readCanvasVideoPreview = async () => { throw new Error('测试不读取预览') }
+    const releaseCanvasVideoPreview = async () => undefined
+    const flowNode = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [], runningSessionIds: new Set(), canCreateChild: false,
+      onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+      mediaProgressByNodeId: new Map([['media-1', {
+        phase: 'pending', phaseLabel: '已有素材', hasAdoptedOutput: true, adoptedVideo,
+      }]]),
+      readCanvasVideoPreview,
+      releaseCanvasVideoPreview,
+    }).find((node) => node.id === 'media-1')!
+
+    expect(flowNode.data).toMatchObject({
+      mediaProgress: { adoptedVideo },
+      readCanvasVideoPreview,
+      releaseCanvasVideoPreview,
+    })
+
+    const canvasNode = document.nodes.find((node) => node.id === 'media-1')!
+    const nextAdoptedVideo = { ...adoptedVideo, candidateId: 'candidate-2' }
+    const patched = patchNativeCanvasFlowNodeRuntimeState(flowNode, canvasNode, {
+      nodeIssues: [], runningSessionIds: new Set(),
+      mediaProgressByNodeId: new Map([['media-1', {
+        phase: 'pending', phaseLabel: '已有素材', hasAdoptedOutput: true, adoptedVideo: nextAdoptedVideo,
+      }]]),
+    })
+    expect(patched.data.mediaProgress?.adoptedVideo).toEqual(nextAdoptedVideo)
+    expect(patched.data.readCanvasVideoPreview).toBe(readCanvasVideoPreview)
+    expect(patched.data.releaseCanvasVideoPreview).toBe(releaseCanvasVideoPreview)
+  })
+
+  test('Given 视频采用尺寸在运行时切换和移除 When 增量投影 Then 卡片高度与端口中点同步更新', () => {
+    /** 带输入输出边的视频节点用于同时验证两侧 Handle 的几何。 */
+    const document = createDocument()
+    document.nodes.push({
+      id: 'media-1', kind: 'video', title: '媒体', position: { x: 300, y: 0 }, mediaModuleId: 'media-module',
+    })
+    document.edges.push(
+      { id: 'edge-video-in', sourceNodeId: 'doc-1', sourcePort: 'output', targetNodeId: 'media-1', targetPort: 'input', relation: 'depends-on' },
+      { id: 'edge-video-out', sourceNodeId: 'media-1', sourcePort: 'output', targetNodeId: 'web-1', targetPort: 'input', relation: 'derives' },
+    )
+    /** 横屏采用目标按 288 宽等比得到 162 预览高度，加标题共 210。 */
+    const landscapeProgress = {
+      phase: 'pending' as const,
+      phaseLabel: '已有素材',
+      hasAdoptedOutput: true,
+      adoptedVideo: {
+        projectId: document.projectId, canvasId: document.canvasId, nodeId: 'media-1', mediaModuleId: 'media-module',
+        mediaKind: 'video' as const, candidateId: 'candidate-1', outputKey: 'video', outputOrder: 0,
+      },
+      adoptedVideoDimensions: { width: 320, height: 180 },
+    }
+    const flowNode = toNativeCanvasFlowNodes(document, {
+      nodeIssues: [], runningSessionIds: new Set(), canCreateChild: false,
+      onCreateChild: () => undefined, onWorkbenchNodeChange: () => undefined,
+      mediaProgressByNodeId: new Map([['media-1', landscapeProgress]]),
+    }).find((node) => node.id === 'media-1')!
+    expect(flowNode).toMatchObject({ height: 210, data: { nodeHeight: 210 } })
+    expect(flowNode.handles?.map((handle) => handle.y)).toEqual([105, 105])
+
+    /** 竖屏比例命中 320 预览上限，加标题共 368。 */
+    const portraitProgress = {
+      ...landscapeProgress,
+      adoptedVideo: { ...landscapeProgress.adoptedVideo, candidateId: 'candidate-2' },
+      adoptedVideoDimensions: { width: 180, height: 320 },
+    }
+    const canvasNode = document.nodes.find((node) => node.id === 'media-1')!
+    const measuredFlowNode = { ...flowNode, measured: { width: 288, height: 210 } }
+    const portrait = patchNativeCanvasFlowNodeRuntimeState(measuredFlowNode, canvasNode, {
+      nodeIssues: [], runningSessionIds: new Set(),
+      mediaProgressByNodeId: new Map([['media-1', portraitProgress]]),
+    })
+    expect(portrait).toMatchObject({ height: 368, data: { nodeHeight: 368 } })
+    expect(portrait.measured?.height).toBe(368)
+    expect(portrait.handles?.map((handle) => handle.y)).toEqual([184, 184])
+
+    /** 移除正式采用后恢复普通空卡，不保留旧尺寸。 */
+    const cleared = patchNativeCanvasFlowNodeRuntimeState(portrait, canvasNode, {
+      nodeIssues: [], runningSessionIds: new Set(), mediaProgressByNodeId: new Map(),
+    })
+    expect(cleared.height).toBe(NATIVE_CANVAS_NODE_HEIGHT)
+    expect(cleared.measured?.height).toBe(NATIVE_CANVAS_NODE_HEIGHT)
+    expect(cleared.data).not.toHaveProperty('nodeHeight')
+    expect(cleared.handles?.map((handle) => handle.y)).toEqual([72, 72])
+  })
+
+  test('Given 视频进度和采用身份重复变化 When 尺寸事实不变 Then 复用高度索引且仅在比例变化时替换', () => {
+    /** 初始横屏采用用于建立稳定的几何索引。 */
+    const createProgress = (candidateId: string, width: number, height: number) => new Map([['video-1', {
+      phase: 'running' as const,
+      phaseLabel: '生成中',
+      hasAdoptedOutput: true,
+      adoptedVideo: {
+        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'video-1', mediaModuleId: 'media-1',
+        mediaKind: 'video' as const, candidateId, outputKey: 'video', outputOrder: 0,
+      },
+      adoptedVideoDimensions: { width, height },
+    }]])
+    const landscape = stabilizeNativeCanvasVideoNodeHeightMap(new Map(), createProgress('candidate-1', 320, 180))
+    /** 普通进度与采用身份变化不改变宽高，必须保留同一引用以跳过全图几何计算。 */
+    const sameGeometry = stabilizeNativeCanvasVideoNodeHeightMap(
+      landscape,
+      createProgress('candidate-2', 640, 360),
+    )
+    const portrait = stabilizeNativeCanvasVideoNodeHeightMap(
+      sameGeometry,
+      createProgress('candidate-3', 180, 320),
+    )
+
+    expect(sameGeometry).toBe(landscape)
+    expect(portrait).not.toBe(landscape)
+    expect(landscape.get('video-1')).toBe(210)
+    expect(portrait.get('video-1')).toBe(368)
   })
 
   test.each([

@@ -38,12 +38,21 @@ test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数�
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.38"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.39"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
   expect(skill).toContain('普通代码')
   expect(skill).toContain('不要强行转入画布')
+})
+
+test('Given 用户要求连接当前镜头 When 读取制作规则 Then 核对画布与真实素材而不把换图归因于绑定故障', () => {
+  /** 保证默认分发指引覆盖本轮真实误用，不把模型遵守率当作测试结论。 */
+  const skill = readCanvasProductionSkill()
+  for (const rule of ['activeCanvasId', '不能把旧默认画布当成用户当前看到的画布', 'canvas-output',
+    '固定素材不跟随连线', '补连线不等于重新生成', '两次运行的实际输入', 'hash', '不能据此断言绑定解析错误']) {
+    expect(skill).toContain(rule)
+  }
 })
 
 test('Given 人物与空间相关制作 When 加载默认 Skill Then 专业设计合同可达且镜头引用与实际验收分开', () => {

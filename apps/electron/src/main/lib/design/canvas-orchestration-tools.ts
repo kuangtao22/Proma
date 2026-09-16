@@ -4,6 +4,7 @@ import { getCanvasOrchestrationPendingDecision, getCanvasOrchestrationProgress }
 import { Type } from 'typebox'
 import type { Static, TSchema } from 'typebox'
 import { Value } from 'typebox/value'
+import type { CanvasToolNavigationResult } from '@proma/shared'
 import type { CanvasOrchestrationActor, CanvasOrchestrationFollowUpInput, CanvasOrchestrationOwner, CanvasOrchestrationService } from './canvas-orchestration-service'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
@@ -258,7 +259,7 @@ export function createCanvasOrchestrationTools(
     handler: OrchestrationHandler<Static<Schema>>,
   ): ToolDefinition => ({
     name, label, description, parameters,
-    execute: async (_toolCallId, rawParams, signal) => {
+    execute: async (toolCallId, rawParams, signal) => {
       if (!Value.Check(parameters, rawParams)) throw new Error('CANVAS_ORCHESTRATION_INPUT_INVALID')
       const input = rawParams as Static<Schema>
       const executionContext = getExecutionContext()
@@ -277,9 +278,21 @@ export function createCanvasOrchestrationTools(
           ? await dependencies.access.runWrite(executionContext, () => handler(input, identity, signal))
           : await handler(input, identity, signal)
         validateAccess()
-        const text = JSON.stringify(details)
+        /** 编排记录写入定位到固定画布；具体产物工具会另行返回节点级回执。 */
+        const navigation: CanvasToolNavigationResult | undefined = mutates ? {
+          status: 'changed', projectId: executionContext.projectId, canvasId,
+          nodeIds: [], deletedNodeIds: [], action: 'orchestration', sourceToolCallId: toolCallId,
+          ...(() => {
+            const ownerSessionId = executionContext.resolveCanvasNavigationOwnerSessionId?.()
+            return ownerSessionId ? { ownerSessionId } : {}
+          })(),
+        } : undefined
+        const output = navigation && details && typeof details === 'object' && !Array.isArray(details)
+          ? { ...details, navigation }
+          : details
+        const text = JSON.stringify(output)
         if (Buffer.byteLength(text, 'utf8') > 512 * 1024) throw new Error('CANVAS_ORCHESTRATION_RESPONSE_TOO_LARGE')
-        return { content: [{ type: 'text' as const, text }], details }
+        return { content: [{ type: 'text' as const, text }], details: output }
       } catch (error) {
         throw publicError(error)
       }

@@ -400,6 +400,7 @@ describe('Design renderer adapter', () => {
     const adapter = createDesignAdapter({
       listAgentCanvasBindings: async (input) => { received.push(input); return { ok: true, value: [binding] } },
       linkAgentCanvas: async (input) => { received.push(input); return { ok: true, value: binding } },
+      markAgentCanvasActive: async (input) => { received.push(input); return { ok: true, value: binding } },
       unlinkAgentCanvas: async (input) => { received.push(input); return { ok: true, value: null } },
       setDefaultAgentCanvas: async (input) => { received.push(input); return { ok: true, value: binding } },
       clearAgentCanvasBindings: async (input) => { received.push(input); return { ok: true, value: undefined } },
@@ -411,10 +412,11 @@ describe('Design renderer adapter', () => {
 
     expect(await adapter.listAgentCanvasBindings(listInput)).toEqual([binding])
     expect(await adapter.linkAgentCanvas(linkInput)).toBe(binding)
+    expect(await adapter.markAgentCanvasActive(target)).toBe(binding)
     expect(await adapter.unlinkAgentCanvas(target)).toBeNull()
     expect(await adapter.setDefaultAgentCanvas(target)).toBe(binding)
     await expect(adapter.clearAgentCanvasBindings(clearInput)).resolves.toBeUndefined()
-    expect(received).toEqual([listInput, linkInput, target, target, clearInput])
+    expect(received).toEqual([listInput, linkInput, target, target, target, clearInput])
   })
 
   test('Given 关联安全错误、缺失 API 或 rejection When adapter 调用 Then 只抛固定公开错误', async () => {

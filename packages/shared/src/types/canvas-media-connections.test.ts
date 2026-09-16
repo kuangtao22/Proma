@@ -53,6 +53,19 @@ describe('媒体输入连接检查', () => {
     expect(result.missingEdges[0]?.sourcePort).toBe('document.markdown')
     expect(result.bindings[1]?.errorCode).toBeNull()
   })
+  test('Given 固定首尾帧与无关图边 When 检查 Then 明确固定输入且不冒充跟随节点', () => {
+    /** 图上有依赖也不能把固定素材解释为该依赖的实际输入。 */
+    const document = graph([{ id: 'visual', sourceNodeId: 'image', targetNodeId: 'video', sourcePort: 'image.asset', targetPort: 'context.image', relation: 'depends-on' }])
+    const result = inspectCanvasMediaInputConnections(document, target, [
+      { key: 'first', kind: 'image', source: { type: 'literal', value: { assetId: 'fixed', revision: 1, hash: 'a'.repeat(64), mediaKind: 'image' } } },
+      inputs[1]!,
+    ])
+    expect(result.connected).toBe(true)
+    expect(result.bindings[0]).toMatchObject({ sourceType: 'literal', sourceNodeId: null })
+    expect(result.bindings[0]?.message).toContain('不跟随画布连线')
+    expect(result.bindings[1]).toMatchObject({ sourceType: 'canvas-output', sourceNodeId: 'image' })
+    expect(result.missingEdges).toEqual([])
+  })
   test('Given 目标身份被替换或来自其它画布 When 检查 Then 拒绝过期目标', () => {
     expect(() => inspectCanvasMediaInputConnections(graph(), { ...target, mediaModuleId: 'replaced' }, inputs)).toThrow('CANVAS_MEDIA_TARGET_INVALID')
     expect(() => inspectCanvasMediaInputConnections(graph(), { ...target, canvasId: 'other' }, inputs)).toThrow('CANVAS_MEDIA_TARGET_INVALID')

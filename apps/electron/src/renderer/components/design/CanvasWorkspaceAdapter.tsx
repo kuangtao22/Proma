@@ -42,7 +42,6 @@ export interface CanvasWorkspaceTabDescriptor {
   id: AgentSidePanelTab
   canvasId: string
   title: string
-  isDefault: boolean
   isRecent: boolean
   activityRevision: number
   seenActivityRevision: number
@@ -66,7 +65,6 @@ export function buildCanvasWorkspaceTabs(
       id: getCanvasWorkspaceTab(canvasId),
       canvasId,
       title: session?.title ?? '画布已删除',
-      isDefault: binding.defaultCanvasId === canvasId,
       isRecent: binding.lastActiveCanvasId === canvasId,
       activityRevision: activityStates.get(canvasId)?.activityRevision ?? 0,
       seenActivityRevision: activityStates.get(canvasId)?.seenActivityRevision ?? 0,
@@ -104,12 +102,12 @@ export async function unlinkAgentCanvasForSession(
 
 /** 更新单个 Agent 的最近 Canvas，不改变默认项或右侧焦点。 */
 export async function markAgentCanvasActive(
-  adapter: Pick<DesignAdapter, 'linkAgentCanvas'>,
+  adapter: Pick<DesignAdapter, 'markAgentCanvasActive'>,
   projectId: string,
   sessionId: string,
   canvasId: string,
 ): Promise<AgentCanvasBinding> {
-  return adapter.linkAgentCanvas({ projectId, sessionId, canvasId, makeDefault: false })
+  return adapter.markAgentCanvasActive({ projectId, sessionId, canvasId })
 }
 
 export interface ReconcileMissingCanvasInput {
@@ -246,7 +244,7 @@ export function useAgentCanvasWorkspaceRegistry(
     if (await link(canvasId, makeDefault)) onOpenTab(getCanvasWorkspaceTab(canvasId), pane)
   }, [link, onOpenTab])
 
-  /** 复用关联合同更新最近画布，不改变右侧工作区焦点。 */
+  /** 通过独立活动合同更新最近画布，不改变关联、默认项或右侧工作区焦点。 */
   const markActive = React.useCallback(async (canvasId: string): Promise<void> => {
     if (!projectId) return
     try {
@@ -354,8 +352,6 @@ export interface CanvasWorkspaceAdapterProps {
   onUnlink: (canvasId: string) => Promise<void>
   /** 当前项目的完整画布索引。 */
   sessions?: readonly CanvasSessionMeta[]
-  /** 当前 Agent 绑定的默认画布 ID。 */
-  defaultCanvasId?: string
   /** 当前 Agent 按画布隔离的活动代次。 */
   activityStates?: ReadonlyMap<string, AgentCanvasActivityState>
   /** 新建并打开画布，返回是否成功。 */
@@ -364,8 +360,6 @@ export interface CanvasWorkspaceAdapterProps {
   onOpenCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
   /** 修改画布标题，返回是否成功。 */
   onRenameCanvas?: (session: CanvasSessionMeta, title: string) => Promise<boolean>
-  /** 把指定未归档画布设为默认。 */
-  onSetDefaultCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
   /** 归档或恢复指定画布。 */
   onToggleArchiveCanvas?: (session: CanvasSessionMeta) => Promise<boolean>
   /** 请求宿主打开共用的永久删除确认。 */
@@ -389,8 +383,6 @@ export interface CanvasWorkspaceAdapterProps {
 export interface CanvasWorkspaceLauncherProps {
   /** 当前项目的完整画布索引。 */
   sessions: readonly CanvasSessionMeta[]
-  /** 当前 Agent 绑定的默认画布 ID。 */
-  defaultCanvasId?: string
   /** 当前 Agent 按画布隔离的活动代次。 */
   activityStates: ReadonlyMap<string, AgentCanvasActivityState>
   /** registry 是否仍在加载。 */
@@ -403,8 +395,6 @@ export interface CanvasWorkspaceLauncherProps {
   onCreateCanvas: () => Promise<boolean>
   /** 打开或恢复指定画布。 */
   onOpenCanvas: (session: CanvasSessionMeta) => Promise<boolean>
-  /** 设置当前 Agent 默认画布。 */
-  onSetDefaultCanvas: (session: CanvasSessionMeta) => Promise<boolean>
   /** 归档或恢复指定画布。 */
   onToggleArchiveCanvas: (session: CanvasSessionMeta) => Promise<boolean>
   /** 请求宿主打开永久删除确认。 */
@@ -414,14 +404,12 @@ export interface CanvasWorkspaceLauncherProps {
 /** 零关联或只剩归档项时保留可达的 Canvas Pane 壳层。 */
 export function CanvasWorkspaceLauncher({
   sessions,
-  defaultCanvasId,
   activityStates,
   loading,
   error,
   paneActive,
   onCreateCanvas,
   onOpenCanvas,
-  onSetDefaultCanvas,
   onToggleArchiveCanvas,
   onRequestDeleteCanvas,
 }: CanvasWorkspaceLauncherProps): React.ReactElement {
@@ -478,12 +466,10 @@ export function CanvasWorkspaceLauncher({
           open={sidebarOpen}
           currentCanvasId={null}
           sessions={sessions}
-          defaultCanvasId={defaultCanvasId}
           activityStates={activityStates}
           onOpenChange={setSidebarOpen}
           onCreateCanvas={onCreateCanvas}
           onOpenCanvas={onOpenCanvas}
-          onSetDefaultCanvas={onSetDefaultCanvas}
           onToggleArchiveCanvas={onToggleArchiveCanvas}
           onRequestDeleteCanvas={onRequestDeleteCanvas}
         />
@@ -543,12 +529,10 @@ export function CanvasWorkspaceAdapter({
   error = null,
   onUnlink,
   sessions = session ? [session] : [],
-  defaultCanvasId,
   activityStates = new Map(),
   onCreateCanvas = async () => false,
   onOpenCanvas = async () => false,
   onRenameCanvas = async () => false,
-  onSetDefaultCanvas = async () => false,
   onToggleArchiveCanvas = async () => false,
   onRequestDeleteCanvas = () => undefined,
   paneActive = true,
@@ -792,12 +776,10 @@ export function CanvasWorkspaceAdapter({
           open={sidebarOpen}
           currentCanvasId={canvasId}
           sessions={sessions}
-          defaultCanvasId={defaultCanvasId}
           activityStates={activityStates}
           onOpenChange={setSidebarOpen}
           onCreateCanvas={onCreateCanvas}
           onOpenCanvas={onOpenCanvas}
-          onSetDefaultCanvas={onSetDefaultCanvas}
           onToggleArchiveCanvas={onToggleArchiveCanvas}
           onRequestDeleteCanvas={onRequestDeleteCanvas}
         />

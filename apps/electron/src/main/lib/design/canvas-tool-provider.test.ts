@@ -7,7 +7,7 @@ import { Value } from 'typebox/value'
 import { validateToolArguments } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentCanvasBinding, CanvasDocument, CanvasImageCandidateBatch, CanvasMutation, CanvasNodeReference, CanvasRunNodesBatchSummary, CanvasSessionMeta, DesignJobRecord } from '@proma/shared'
-import { createEmptyCanvasDocument } from '@proma/shared'
+import { applyCanvasMutations, createEmptyCanvasDocument } from '@proma/shared'
 import {
   CANVAS_TOOL_NAMES,
   createCanvasToolRun,
@@ -1398,7 +1398,10 @@ function createFixture(options: {
         document = { ...document, revision: 4 }
         throw new Error('CANVAS_REVISION_CONFLICT')
       }
-      document = { ...document, revision: input.baseRevision + 1 }
+      document = {
+        ...applyCanvasMutations(document, input.operations as unknown as CanvasMutation[]),
+        revision: input.baseRevision + 1,
+      }
       return { document, operationId: `operation-${batchInputs.length}` }
     } },
     imageRuns: {
@@ -1595,7 +1598,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
       operations: {
         adoptVersion: async (_input: unknown, execution: { operationId: string }) => {
           operationIds.push(execution.operationId)
-          return { adopted: true }
+          return { adopted: true, revision: 4 }
         },
       },
     }
@@ -1604,12 +1607,16 @@ describe('普通 Agent Canvas Tool Provider', () => {
       canvasId: 'canvas-1', nodeId: 'image-1', expectedCanvasRevision: 3,
       expectedVersion: 4, version: { kind: 'image', jobId: 'job-1' }, intent: 'explicit',
     }
-    await executeTool(run.piCustomTools, 'canvas_adopt_version', input, 'call-1')
+    const adopted = await executeTool(run.piCustomTools, 'canvas_adopt_version', input, 'call-1')
     await executeTool(run.piCustomTools, 'canvas_adopt_version', input, 'call-1')
     await executeTool(run.piCustomTools, 'canvas_adopt_version', input, 'call-2')
     expect(operationIds[0]).toBe(operationIds[1])
     expect(operationIds[0]).not.toBe(operationIds[2])
     expect(operationIds[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/)
+    expect(adopted.details).toMatchObject({ navigation: {
+      status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['image-1'],
+      deletedNodeIds: [], action: 'update', revision: 4, operationId: operationIds[0], sourceToolCallId: 'call-1',
+    } })
   })
 
   test('Given 候选批次采用已装配 When 按运行模式构造工具 Then 仅普通 execute Agent 可调用', async () => {
@@ -1621,17 +1628,21 @@ describe('普通 Agent Canvas Tool Provider', () => {
       operations: {
         adoptCandidateBatch: async (input: unknown, execution: { operationId: string }) => {
           received.push({ input, operationId: execution.operationId })
-          return { status: 'adopted', adoptedNodeIds: ['image-1'], keptNodeIds: [] }
+          return { status: 'adopted', adoption: { adoptedNodeIds: ['image-1'], keptNodeIds: [] } }
         },
       },
     }
     const ordinary = createCanvasToolRun(dependencies, fixture.context)
     const params = { canvasId: 'canvas-1', batchId: 'batch-1', mode: 'succeeded', intent: 'explicit' }
-    await executeTool(ordinary.piCustomTools, 'canvas_adopt_candidate_batch', params, 'call-1')
+    const adopted = await executeTool(ordinary.piCustomTools, 'canvas_adopt_candidate_batch', params, 'call-1')
     expect(received[0]?.input).toEqual({
       projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1', mode: 'succeeded',
     })
     expect(received[0]?.operationId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(adopted.details).toMatchObject({ navigation: {
+      status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['image-1'],
+      deletedNodeIds: [], action: 'update', operationId: received[0]?.operationId, sourceToolCallId: 'call-1',
+    } })
 
     const manual = createCanvasToolRun(dependencies, {
       ...fixture.context,
@@ -1753,8 +1764,11 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })).rejects.toThrow()
     const result = await executeTool(run.piCustomTools, 'canvas_adopt_image_candidates', {
       canvasId: 'canvas-1', batchId: 'batch-1', candidateHash: details.candidateHash, mode: 'all',
-    })
-    expect(result.details).toMatchObject({ status: 'adopted', adoptedNodeIds: ['image-1'] })
+    }, 'tool-adopt-image')
+    expect(result.details).toMatchObject({ status: 'adopted', adoptedNodeIds: ['image-1'], navigation: {
+      status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['image-1'],
+      deletedNodeIds: [], action: 'update', revision: 3, sourceToolCallId: 'tool-adopt-image',
+    } })
     expect(adoptedHashes).toEqual([details.candidateHash])
     const plan = createCanvasToolRun(fixture.dependencies, { ...fixture.context, permissionCeiling: 'plan' })
     await expect(executeTool(plan.piCustomTools, 'canvas_adopt_image_candidates', {
@@ -1827,6 +1841,44 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(result.details).toMatchObject({ defaultCanvasId: 'canvas-1', activeCanvasId: 'canvas-2' })
     expect(JSON.stringify(result.details)).toContain('doc-1')
     expect(fixture.getListCalls()).toBe(0)
+  })
+
+  test('Given 本轮已读取活动画布 When 界面自动切换画布 Then 后续上下文仍指向运行开始目标', async () => {
+    const fixture = createFixture()
+    let activeCanvasId = 'canvas-2'
+    fixture.dependencies.access.getBinding = () => ({
+      projectId: 'project-1', sessionId: 'session-1', linkedCanvasIds: ['canvas-1', 'canvas-2'],
+      defaultCanvasId: 'canvas-1', lastActiveCanvasId: activeCanvasId, updatedAt: 1,
+    })
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const before = await executeTool(run.piCustomTools, 'canvas_get_context', {})
+    activeCanvasId = 'canvas-1'
+    const after = await executeTool(run.piCustomTools, 'canvas_get_context', {})
+
+    expect(before.details).toMatchObject({ activeCanvasId: 'canvas-2' })
+    expect(after.details).toMatchObject({ activeCanvasId: 'canvas-2' })
+  })
+
+  test('Given 本轮活动画布已固定 When 原画布解绑且界面切到另一画布 Then 不回退到新活动画布', async () => {
+    const fixture = createFixture()
+    let binding = {
+      projectId: 'project-1', sessionId: 'session-1', linkedCanvasIds: ['canvas-1', 'canvas-2'],
+      defaultCanvasId: 'canvas-1', lastActiveCanvasId: 'canvas-2', updatedAt: 1,
+    }
+    fixture.dependencies.access.getBinding = () => binding
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const before = await executeTool(run.piCustomTools, 'canvas_get_context', {})
+    binding = {
+      ...binding, linkedCanvasIds: ['canvas-1'], lastActiveCanvasId: 'canvas-1', updatedAt: 2,
+    }
+    const after = await executeTool(run.piCustomTools, 'canvas_get_context', {})
+    const status = await executeTool(run.piCustomTools, 'canvas_task', { action: 'status' })
+
+    expect(before.details).toMatchObject({ activeCanvasId: 'canvas-2' })
+    expect(after.details).toMatchObject({ activeCanvasId: null })
+    expect(status.details).not.toHaveProperty('canvasId', 'canvas-1')
   })
 
   test('Given 已关联画布含多种节点 When 分页枚举图片 Then 只返回图片摘要且不泄露素材身份', async () => {
@@ -2490,9 +2542,12 @@ describe('普通 Agent Canvas Tool Provider', () => {
       agentSessionId: 'attempted-session-takeover',
     }, 'tool-agent-config-1')
 
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       canvasId: 'canvas-1', nodeId: 'agent-1', graphRevision: 3, configRevision: 5,
       instruction: '只负责分镜', skillNames: ['research'], channelId: 'channel-1', modelId: 'model-1',
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeIds: ['agent-1'], deletedNodeIds: [], action: 'update', revision: 3,
+        sourceToolCallId: 'tool-agent-config-1' },
     })
     expect(fixture.agentConfigUpdateInputs).toEqual([{
       projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'agent-1',
@@ -2540,12 +2595,15 @@ describe('普通 Agent Canvas Tool Provider', () => {
     }, 'tool-agent-run-1', controller.signal)
 
     expect(Object.keys(result.details as Record<string, unknown>).sort()).toEqual([
-      'downstreamNodeIds', 'nodeId', 'nodeTitle', 'outputPointer', 'outputSummary', 'status',
+      'downstreamNodeIds', 'navigation', 'nodeId', 'nodeTitle', 'outputPointer', 'outputSummary', 'status',
     ])
     expect(result.details).toMatchObject({
       nodeId: 'agent-1', status: 'completed',
       outputPointer: { messageUuid: '33333333-3333-4333-8333-333333333333' },
       downstreamNodeIds: ['doc-1', 'image-1'],
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeIds: ['agent-1'], deletedNodeIds: [], action: 'update', revision: 3,
+        sourceToolCallId: 'tool-agent-run-1' },
     })
     expect((result.details as { outputSummary: string }).outputSummary.length).toBeLessThanOrEqual(4_096)
     expect(fixture.agentExecutionInputs).toEqual([{
@@ -3173,13 +3231,19 @@ describe('普通 Agent Canvas Tool Provider', () => {
     })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
 
-    await executeTool(run.piCustomTools, 'canvas_adopt_media_candidate', {
+    const adopted = await executeTool(run.piCustomTools, 'canvas_adopt_media_candidate', {
       canvasId: 'canvas-1', nodeId: 'audio-1', expectedConfigRevision: 2,
       candidateId: 'candidate-1', selectedKeys: ['primary'],
-    })
-    await executeTool(run.piCustomTools, 'canvas_cancel_media_run', {
+    }, 'tool-adopt-media')
+    const cancelled = await executeTool(run.piCustomTools, 'canvas_cancel_media_run', {
       canvasId: 'canvas-1', nodeId: 'audio-1', runId: 'run-audio-1', cancelIntent: 'explicit',
     })
+
+    expect(adopted.details).toMatchObject({ navigation: {
+      status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['audio-1'],
+      deletedNodeIds: [], action: 'update', revision: 3, sourceToolCallId: 'tool-adopt-media',
+    } })
+    expect(cancelled.details).not.toHaveProperty('navigation')
 
     expect(fixture.canvasMediaInputs.filter((entry) => ['adopt', 'cancel'].includes(entry.operation)))
       .toEqual([
@@ -3201,7 +3265,7 @@ describe('普通 Agent Canvas Tool Provider', () => {
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
     const result = await executeTool(run.piCustomTools, 'canvas_attach_media_run', {
       canvasId: 'canvas-1', nodeId: 'video-1', expectedConfigRevision: 2, runId: 'independent-run-1',
-    })
+    }, 'attach-run-call')
 
     expect(fixture.canvasMediaInputs.at(-1)).toEqual({
       operation: 'attach',
@@ -3210,7 +3274,9 @@ describe('普通 Agent Canvas Tool Provider', () => {
         actor: { sessionId: 'session-1', runStartedAt: 99, mode: 'project-agent' },
       },
     })
-    expect(result.details).toMatchObject({ candidateId: 'candidate:independent-run-1', runId: 'independent-run-1', adopted: false })
+    expect(result.details).toMatchObject({ candidateId: 'candidate:independent-run-1', runId: 'independent-run-1', adopted: false,
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['video-1'],
+        deletedNodeIds: [], action: 'update', revision: 3, sourceToolCallId: 'attach-run-call' } })
     expect(JSON.stringify(result.details)).not.toContain('attached-asset')
 
     const parent = createCanvasToolRun(fixture.dependencies, {
@@ -3250,7 +3316,11 @@ describe('普通 Agent Canvas Tool Provider', () => {
     expect(calls[0]).toEqual({ input: { ...target, nodeId: 'video-1', mediaModuleId: 'media-video-1',
       mediaKind: 'video', expectedConfigRevision: 2, operationId: expect.any(String), outputs: params.outputs },
     actor: { sessionId: 'session-1', runStartedAt: 99, mode: 'project-agent' } })
-    expect(result.details).toMatchObject({ candidateId: 'candidate:local-receipt', sourceKind: 'local-import', adopted: false })
+    expect(result.details).toMatchObject({ candidateId: 'candidate:local-receipt', sourceKind: 'local-import', adopted: false,
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: ['video-1'],
+        deletedNodeIds: [], action: 'update', revision: 3,
+        operationId: (calls[0] as { input: { operationId: string } }).input.operationId,
+        sourceToolCallId: 'local-attach-call' } })
     expect(JSON.stringify(result.details)).not.toContain('local-asset')
     expect(fixture.runInputs).toEqual([])
     expect(fixture.canvasMediaInputs).toEqual([])
@@ -3768,15 +3838,51 @@ describe('普通 Agent Canvas Tool Provider', () => {
     await expect(executeTool(run.piCustomTools, 'canvas_apply_changes', args)).rejects.toThrow('CANVAS_DESTRUCTIVE_INTENT_REQUIRED')
     const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', { ...args, destructiveIntent: 'explicit' }, 'task-tool-1')
     expect(fixture.batchInputs).toHaveLength(1)
-    expect(result.details).toMatchObject({ revision: 4, operationId: 'operation-1', sourceToolCallId: 'task-tool-1' })
+    expect(result.details).toMatchObject({ revision: 4, operationId: 'operation-1', sourceToolCallId: 'task-tool-1',
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: [],
+        deletedNodeIds: ['doc-1'], action: 'delete', revision: 4,
+        operationId: 'operation-1', sourceToolCallId: 'task-tool-1' } })
+  })
+
+  test('Given 批量修改节点与连线 When apply成功 Then 回执只包含提交后可定位节点', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3,
+      operations: [
+        { type: 'move-nodes', positions: [{ nodeId: 'image-1', position: { x: 220, y: 120 } }] },
+        { type: 'remove-edges', edgeIds: ['edge-1'] },
+      ],
+      destructiveIntent: 'explicit',
+    }, 'task-tool-batch')
+
+    expect(result.details).toMatchObject({ navigation: {
+      status: 'changed', nodeIds: ['image-1', 'doc-1'], deletedNodeIds: [], action: 'batch',
+      revision: 4, sourceToolCallId: 'task-tool-batch',
+    } })
+  })
+
+  test('Given 只修改视口 When apply成功 Then 不伪装成业务节点修改', async () => {
+    const fixture = createFixture()
+    const run = createCanvasToolRun(fixture.dependencies, fixture.context)
+
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', {
+      canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'set-viewport', viewport: { x: 10, y: 20, zoom: 0.8 } }],
+    }, 'task-tool-viewport')
+
+    expect(result.details).not.toHaveProperty('navigation')
   })
 
   test('Given 首次 revision 冲突 When apply Then 权威重读后只重试一次', async () => {
     const fixture = createFixture({ conflictOnce: true })
     const run = createCanvasToolRun(fixture.dependencies, fixture.context)
-    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3, operations: [{ type: 'set-viewport', viewport: { x: 1, y: 2, zoom: 1 } }] }, 'task-tool-conflict')
+    const result = await executeTool(run.piCustomTools, 'canvas_apply_changes', { canvasId: 'canvas-1', baseRevision: 3,
+      operations: [{ type: 'move-nodes', positions: [{ nodeId: 'image-1', position: { x: 1, y: 2 } }] }] }, 'task-tool-conflict')
     expect(fixture.batchInputs.map((input) => input.baseRevision)).toEqual([3, 4])
-    expect(result.details).toMatchObject({ revision: 5, sourceToolCallId: 'task-tool-conflict-retry' })
+    expect(result.details).toMatchObject({ revision: 5, sourceToolCallId: 'task-tool-conflict-retry',
+      navigation: { sourceToolCallId: 'task-tool-conflict', nodeIds: ['image-1'] } })
   })
 
   test('Given 审核后用户修改了节点 When 按旧基线删除或覆盖 Then 抛出冲突且不自动换基线提交', async () => {
@@ -3931,12 +4037,15 @@ describe('普通 Agent Canvas Tool Provider', () => {
       sourceNodeId: 'doc-1',
     }, 'tool-artifact-1')
 
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       canvasId: 'canvas-1',
       nodeId: 'artifact-created',
       revision: 4,
       artifactType: 'webview',
       sourceToolCallId: 'tool-artifact-1',
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeIds: ['artifact-created'], deletedNodeIds: [], action: 'create', revision: 4,
+        sourceToolCallId: 'tool-artifact-1' },
     })
     expect(fixture.artifactInputs).toEqual([expect.objectContaining({
       projectId: 'project-1',
@@ -3955,9 +4064,12 @@ describe('普通 Agent Canvas Tool Provider', () => {
       sourceNodeId: 'doc-1', relation: 'depends-on',
     }, 'tool-agent-1')
 
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       canvasId: 'canvas-1', nodeId: 'agent-created', revision: 4,
       sourceToolCallId: 'tool-agent-1',
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeIds: ['agent-created'], deletedNodeIds: [], action: 'create', revision: 4,
+        sourceToolCallId: 'tool-agent-1' },
     })
     expect(JSON.stringify(result.details)).not.toContain('sessionId')
     expect(fixture.agentArtifactInputs).toEqual([expect.objectContaining({
@@ -3977,9 +4089,12 @@ describe('普通 Agent Canvas Tool Provider', () => {
       sourceNodeId: 'doc-1', relation: 'reference',
     }, 'tool-import-1')
 
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       canvasId: 'canvas-1', nodeId: 'image-imported', revision: 4,
       artifactType: 'image', sourceToolCallId: 'tool-import-1',
+      navigation: { status: 'changed', projectId: 'project-1', canvasId: 'canvas-1',
+        nodeIds: ['image-imported'], deletedNodeIds: [], action: 'create', revision: 4,
+        sourceToolCallId: 'tool-import-1' },
     })
     expect(JSON.stringify(result.details)).not.toContain('assetId')
     expect(fixture.importedImageInputs).toEqual([expect.objectContaining({

@@ -28,6 +28,7 @@ import type {
   CanvasNodeIssue,
   DesignPoint,
   DesignViewport,
+  CanvasMediaPreloadApi,
 } from '@proma/shared'
 import { Position } from '@xyflow/react'
 import type { Edge, Node, NodeHandle } from '@xyflow/react'
@@ -130,7 +131,7 @@ function resolveNativeCanvasPlacementNodeSize(
   const size = resolveNativeCanvasNodeSize(node)
   /** Renderer 已知的有限正高度优先，避免保守占位覆盖真实投影几何。 */
   const hasExplicitHeight = Number.isFinite(node.nodeHeight) && (node.nodeHeight ?? 0) > 0
-  return node.kind === 'image' && !hasExplicitHeight
+  return (node.kind === 'image' || node.kind === 'video') && !hasExplicitHeight
     ? { ...size, height: CANVAS_IMAGE_NODE_MAX_HEIGHT }
     : size
 }
@@ -222,6 +223,10 @@ export interface NativeCanvasProjectionOptions {
   onCreateChild: (nodeId: string, kind: CanvasNodeKind) => void
   onReferenceNode?: (nodeId: string) => void
   onWorkbenchNodeChange: (nodeId: string) => void
+  /** 视频折叠卡片通过稳定桥按需读取当前正式采用版本。 */
+  readCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReadPreview']
+  /** 视频折叠卡片卸载或切换时释放对应媒体授权。 */
+  releaseCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReleasePreview']
   /** WebView 折叠卡片只加载主进程生成的静态预览。 */
   loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
   /** 设备预设仍在保存中的 WebView 节点不得提前请求新设备预览。 */
@@ -302,6 +307,8 @@ export interface NativeCanvasContentNodeData extends CanvasNodeCardData {
   webviewPreviewTarget?: CanvasWebviewPreviewTarget
   webviewPreviewRequestReady?: boolean
   loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  readCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReadPreview']
+  releaseCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReleasePreview']
   onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
 }
 
@@ -399,6 +406,30 @@ export function patchNativeCanvasFlowNodeRuntimeState(
     changed = changed || data.statusLabel !== statusLabel || data.summary !== summary
     data.statusLabel = statusLabel
     data.summary = summary
+    if (canvasNode.kind === 'video') {
+      /** 正式采用存在时按可信尺寸显示；移除采用立即恢复固定空卡。 */
+      const nodeHeight = resolveNativeCanvasVideoNodeHeight(mediaProgress)
+      const hasAdoptedVideo = Boolean(mediaProgress?.adoptedVideo)
+      const measuredHeightChanged = flowNode.measured?.height !== undefined
+        && flowNode.measured.height !== nodeHeight
+      changed = changed || flowNode.height !== nodeHeight
+        || measuredHeightChanged
+        || (hasAdoptedVideo ? data.nodeHeight !== nodeHeight : Object.hasOwn(data, 'nodeHeight'))
+      if (hasAdoptedVideo) data.nodeHeight = nodeHeight
+      else delete data.nodeHeight
+      /** 输入输出 Handle 始终位于新卡片垂直中点，避免运行态切换后连线悬空。 */
+      const nextHandles = flowNode.handles?.map((handle) => handle.y === nodeHeight / 2
+        ? handle
+        : { ...handle, y: nodeHeight / 2 })
+      if (nextHandles?.some((handle, index) => handle !== flowNode.handles?.[index])) changed = true
+      if (changed) return {
+        ...flowNode,
+        height: nodeHeight,
+        ...(flowNode.measured ? { measured: { ...flowNode.measured, height: nodeHeight } } : {}),
+        handles: nextHandles,
+        data,
+      } as NativeCanvasFlowNode
+    }
   }
   return changed ? { ...flowNode, data } as NativeCanvasFlowNode : flowNode
 }
@@ -415,14 +446,64 @@ export function resolveNativeCanvasImageNodeHeight(
 }
 
 /**
+ * 根据当前正式采用视频的可信尺寸计算卡片高度。
+ * @param progress LOAD 投影的采用身份与两项尺寸，不读取候选或完整资产。
+ * @returns 未采用时为固定空卡；已采用时复用图片同宽等比和高度边界。
+ */
+export function resolveNativeCanvasVideoNodeHeight(
+  progress?: MediaRunProgressProjection,
+): number {
+  return progress?.adoptedVideo
+    ? resolveCanvasImageNodeHeight(progress.adoptedVideoDimensions)
+    : NATIVE_CANVAS_NODE_HEIGHT
+}
+
+/**
+ * 判断媒体宽高是否足以作为卡片比例事实。
+ * @param dimensions LOAD 返回的轻量宽高元数据。
+ * @returns 宽高均为有限正数时返回 true。
+ */
+export function hasTrustedNativeCanvasMediaDimensions(
+  dimensions?: { width: number; height: number },
+): dimensions is { width: number; height: number } {
+  return Boolean(dimensions
+    && Number.isFinite(dimensions.width)
+    && dimensions.width > 0
+    && Number.isFinite(dimensions.height)
+    && dimensions.height > 0)
+}
+
+/**
+ * 仅投影会改变卡片几何的可信视频高度，并在事实未变时复用旧索引。
+ * @param previous 上一轮稳定高度索引。
+ * @param mediaProgressByNodeId 当前 AV 模块进度；候选身份和普通阶段不会进入索引。
+ * @returns 尺寸事实相同则返回 previous，否则返回新的高度索引。
+ */
+export function stabilizeNativeCanvasVideoNodeHeightMap(
+  previous: ReadonlyMap<string, number>,
+  mediaProgressByNodeId?: ReadonlyMap<string, MediaRunProgressProjection>,
+): ReadonlyMap<string, number> {
+  const next = new Map<string, number>()
+  for (const [nodeId, progress] of mediaProgressByNodeId ?? []) {
+    if (!progress.adoptedVideo || !hasTrustedNativeCanvasMediaDimensions(progress.adoptedVideoDimensions)) continue
+    next.set(nodeId, resolveNativeCanvasVideoNodeHeight(progress))
+  }
+  if (next.size === previous.size
+    && [...next].every(([nodeId, height]) => previous.get(nodeId) === height)) return previous
+  return next
+}
+
+/**
  * 建立与当前 Renderer 卡片投影一致的节点尺寸索引。
  * @param document 当前权威 Canvas 文档。
  * @param imagePreviews 工作区加载得到的已采用图片预览索引。
+ * @param videoNodeHeightsById 已稳定的可信采用视频高度索引。
  * @returns 按节点 ID 索引的当前视觉宽高，仅用于 Renderer 内存几何计算。
  */
 export function createNativeCanvasNodeSizeMap(
   document: CanvasDocument,
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>,
+  videoNodeHeightsById?: ReadonlyMap<string, number>,
 ): ReadonlyMap<string, NativeCanvasNodeSize> {
   return new Map(document.nodes.map((node) => {
     /** 只有已采用素材且预览索引命中时，生图节点才使用动态比例。 */
@@ -430,9 +511,12 @@ export function createNativeCanvasNodeSizeMap(
       ? imagePreviews?.get(node.adoptedAssetId)
       : undefined
     const baseSize = resolveNativeCanvasNodeSize(node)
-    return [node.id, node.kind === 'image'
-      ? { ...baseSize, height: resolveNativeCanvasImageNodeHeight(preview) }
-      : baseSize] as const
+    const height = node.kind === 'image'
+      ? resolveNativeCanvasImageNodeHeight(preview)
+      : node.kind === 'video'
+        ? videoNodeHeightsById?.get(node.id) ?? baseSize.height
+        : baseSize.height
+    return [node.id, { ...baseSize, height }] as const
   }))
 }
 
@@ -506,7 +590,11 @@ export function toNativeCanvasFlowNodes(
   /** 节点问题先建索引，避免大画布逐节点线性扫描全部问题。 */
   const unavailableNodeIds = new Set(options.nodeIssues.map((issue) => issue.nodeId))
   /** 节点本体、静态 Handle 与整理布局共享同一套视觉尺寸规则。 */
-  const nodeSizeById = createNativeCanvasNodeSizeMap(document, options.imagePreviews)
+  const videoNodeHeightsById = stabilizeNativeCanvasVideoNodeHeightMap(
+    new Map(),
+    options.mediaProgressByNodeId,
+  )
+  const nodeSizeById = createNativeCanvasNodeSizeMap(document, options.imagePreviews, videoNodeHeightsById)
   /** 仅为真实边涉及的节点建立端口索引，避免无边大画布节点承担 handle 成本。 */
   const handlesByNodeId = new Map<string, NodeHandle[]>()
   /** 向节点追加一次静态端口；相同方向与 ID 的端口只保留一个。 */
@@ -649,6 +737,15 @@ export function toNativeCanvasFlowNodes(
           statusLabel: mediaCardStatus.statusLabel,
           summary: mediaCardStatus.summary,
           ...(mediaProgress ? { mediaProgress } : {}),
+          ...(node.kind === 'video' && mediaProgress?.adoptedVideo
+            ? { nodeHeight: nodeSize.height }
+            : {}),
+          ...(node.kind === 'video' && options.readCanvasVideoPreview
+            ? { readCanvasVideoPreview: options.readCanvasVideoPreview }
+            : {}),
+          ...(node.kind === 'video' && options.releaseCanvasVideoPreview
+            ? { releaseCanvasVideoPreview: options.releaseCanvasVideoPreview }
+            : {}),
           canOpenWorkbench: true,
           onOpenWorkbench: options.onWorkbenchNodeChange,
           canCreateChild: options.canCreateChild,

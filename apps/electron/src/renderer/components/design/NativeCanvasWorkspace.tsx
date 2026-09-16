@@ -67,6 +67,9 @@ import {
   createInitialAgentCanvasViewState,
   initializeAgentCanvasViewStateAtom,
   removeAgentCanvasViewStateAtom,
+  interruptAgentCanvasNavigationAtom,
+  agentCanvasFocusRequestsAtom,
+  clearAgentCanvasFocusAtom,
   resolveAgentCanvasWorkbenchSize,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
@@ -141,7 +144,7 @@ import type {
 } from './NativeCanvasWorkflowRunDialog'
 import { NativeCanvasToolbar } from './NativeCanvasToolbar'
 import { NativeCanvasNodeNavigator } from './NativeCanvasNodeNavigator'
-import { createNativeCanvasNodeFocusUpdate } from './native-canvas-navigation'
+import { createNativeCanvasNodeFocusUpdate, createNativeCanvasChangedNodesFocusUpdate } from './native-canvas-navigation'
 import { CanvasMediaModelPicker } from './CanvasMediaModelPicker'
 import { useCanvasMediaNodeProgress, useMediaRunProgress } from './use-media-run-progress'
 import type { MediaRunProgressProjection } from './use-media-run-progress'
@@ -157,10 +160,12 @@ import {
   createNativeCanvasNodeSizeMap,
   findAvailableNativeCanvasChildPosition,
   findAvailableNativeCanvasNodePosition,
+  hasTrustedNativeCanvasMediaDimensions,
   isNativeCanvasPositionMutation,
   replayNativeCanvasPositionMutations,
   resolveNativeCanvasNodeSize,
   resolveNativeCanvasImageNodeHeight,
+  stabilizeNativeCanvasVideoNodeHeightMap,
 } from './native-canvas-model'
 import {
   createNativeCanvasArrangeCommand,
@@ -686,6 +691,7 @@ export function findNativeCanvasAgentNodeCreationPosition(
 export function listVisibleNativeCanvasNodeIds(
   document: CanvasDocument,
   surfaceBounds: NativeCanvasSurfaceBounds,
+  nodeSizesById?: ReadonlyMap<string, { width: number; height: number }>,
 ): string[] {
   const { viewport } = document
   if (!Number.isFinite(surfaceBounds.width) || !Number.isFinite(surfaceBounds.height)
@@ -699,7 +705,8 @@ export function listVisibleNativeCanvasNodeIds(
     bottom: (surfaceBounds.height - viewport.y) / viewport.zoom,
   }
   return document.nodes.filter((node) => {
-    const size = resolveNativeCanvasNodeSize(node)
+    /** 调用方已知动态媒体尺寸时优先使用，缺省保持旧固定几何。 */
+    const size = nodeSizesById?.get(node.id) ?? resolveNativeCanvasNodeSize(node)
     return node.position.x + size.width >= bounds.left
       && node.position.x <= bounds.right
       && node.position.y + size.height >= bounds.top
@@ -2715,6 +2722,9 @@ export function NativeCanvasWorkspace({
   const viewStateKey = createAgentCanvasViewKey(sessionId, target.projectId, target.canvasId)
   const states = useAtomValue(nativeCanvasStatesAtom)
   const viewStates = useAtomValue(agentCanvasViewStatesAtom)
+  /** 外部修改的定位意图仅在本视图权威 LOAD 后处理。 */
+  const focusRequest = useAtomValue(agentCanvasFocusRequestsAtom).get(viewStateKey)
+  const clearFocusRequest = useSetAtom(clearAgentCanvasFocusAtom)
   const updateNativeCanvasState = useSetAtom(updateNativeCanvasStateAtom)
   const updateCanvasOrchestrationState = useSetAtom(updateCanvasOrchestrationStateAtom)
   const removeCanvasOrchestrationState = useSetAtom(removeCanvasOrchestrationStateAtom)
@@ -3042,6 +3052,28 @@ export function NativeCanvasWorkspace({
     ...imageMediaProgressByNodeId,
     ...canvasMediaProgressByNodeId,
   ]), [canvasMediaProgressByNodeId, imageMediaProgressByNodeId])
+  /** 只跟踪可信采用视频的视觉高度；阶段、候选身份或同尺寸采用切换均复用旧引用。 */
+  const canvasVideoNodeHeightsByIdRef = React.useRef<ReadonlyMap<string, number>>(new Map())
+  const canvasVideoNodeHeightsById = React.useMemo(() => stabilizeNativeCanvasVideoNodeHeightMap(
+    canvasVideoNodeHeightsByIdRef.current,
+    canvasMediaProgressByNodeId,
+  ), [canvasMediaProgressByNodeId])
+  canvasVideoNodeHeightsByIdRef.current = canvasVideoNodeHeightsById
+  /** 导航、可见区、整理和新增避让共用卡片当前视觉尺寸。 */
+  const canvasNodeSizesById = React.useMemo(() => state.snapshot
+    ? createNativeCanvasNodeSizeMap(
+        state.snapshot.document,
+        imagePreviews,
+        canvasVideoNodeHeightsById,
+      )
+    : new Map<string, { width: number; height: number }>(), [
+      canvasVideoNodeHeightsById,
+      imagePreviews,
+      state.snapshot?.document.nodes,
+    ])
+  /** 命令控制器保持稳定，通过 ref 读取最新媒体尺寸。 */
+  const canvasNodeSizesByIdRef = React.useRef(canvasNodeSizesById)
+  canvasNodeSizesByIdRef.current = canvasNodeSizesById
   /** 四类卡片统一消费按 nodeId 聚合的结构化活动态。 */
   const nodeActivityStates = React.useMemo(() => state.snapshot
     ? createNativeCanvasNodeActivityStates(
@@ -3062,8 +3094,8 @@ export function NativeCanvasWorkspace({
     : new Set<string>(), [projectCanvasJobs, state.snapshot])
   /** 当前可见范围只依赖轻量节点几何，不读取工作台正文。 */
   const visibleNodeIds = React.useMemo(() => viewDocument
-    ? listVisibleNativeCanvasNodeIds(viewDocument, canvasSurfaceSize)
-    : [], [canvasSurfaceSize, viewDocument])
+    ? listVisibleNativeCanvasNodeIds(viewDocument, canvasSurfaceSize, canvasNodeSizesById)
+    : [], [canvasNodeSizesById, canvasSurfaceSize, viewDocument])
   /** 只收集设备预设保存中的 WebView 节点，普通移动与其它节点保存不阻断静态预览。 */
   const pendingWebviewDeviceNodeIds = React.useMemo(() => new Set(
     [...state.inFlightMutations, ...state.pendingMutations]
@@ -3127,6 +3159,28 @@ export function NativeCanvasWorkspace({
     updateAgentCanvasViewState,
     viewStateKey,
   ])
+
+  React.useEffect(() => {
+    if (!focusRequest || !state.snapshot) return
+    if (focusRequest.revision !== undefined && state.snapshot.document.revision < focusRequest.revision) return
+    /** 隐藏 Pane 等待真实尺寸，不能把未测量视口误当作已完成导航。 */
+    const surface = canvasSurfaceRef.current?.getBoundingClientRect()
+    if (!surface || surface.width <= 0 || surface.height <= 0) return
+    const current = store.get(agentCanvasViewStatesAtom).get(viewStateKey)
+    if (!current) return
+    clearFocusRequest(viewStateKey)
+    if (current.workbenchDraft?.dirty) return
+    const focus = createNativeCanvasChangedNodesFocusUpdate(
+      state.snapshot.document.nodes, focusRequest.nodeIds, canvasNodeSizesById, current.viewport, surface,
+    )
+    updateAgentCanvasViewState({ key: viewStateKey, update: {
+      ...focus,
+      ...(focus.selectedNodeIds.length === 1 && focus.selectedNodeId
+        ? createAgentCanvasWorkbenchChangeUpdate(current, focus.selectedNodeId)
+        : createClosedAgentCanvasWorkbenchUpdate()),
+    } })
+  }, [focusRequest, state.snapshot, canvasSurfaceSize, canvasNodeSizesById, clearFocusRequest,
+    store, updateAgentCanvasViewState, viewStateKey])
 
   /** 登记提交器并返回身份安全的释放函数，迟到 cleanup 不删除新实例。 */
   const registerWorkbenchDraftCommitter = React.useCallback<RegisterNativeCanvasWorkbenchDraftCommitter>((committer) => {
@@ -3268,12 +3322,27 @@ export function NativeCanvasWorkspace({
         const viewport = store.get(agentCanvasViewStatesAtom).get(viewStateKey)?.viewport
         const document = sharedDocument && viewport ? { ...sharedDocument, viewport } : sharedDocument
         if (!document) throw new Error('Canvas 尚未加载完成')
+        /** 最新动态尺寸只装饰内存定位输入，不写入 Canvas 文档。 */
+        const positionedNodes = document.nodes.map((node) => {
+          const size = canvasNodeSizesByIdRef.current.get(node.id)
+          /** 图片和视频只有已取得可信比例时才覆盖保守最大高度。 */
+          const hasTrustedDynamicSize = node.kind === 'image'
+            ? Boolean(node.adoptedAssetId && hasTrustedNativeCanvasMediaDimensions(
+                latest?.snapshot?.imagePreviews?.find((preview) => preview.assetId === node.adoptedAssetId),
+              ))
+            : node.kind === 'video'
+              ? canvasVideoNodeHeightsByIdRef.current.has(node.id)
+              : true
+          return size && hasTrustedDynamicSize
+            ? { ...node, nodeWidth: size.width, nodeHeight: size.height }
+            : node
+        })
         if (sourceNodeId) {
-          return findAvailableNativeCanvasChildPosition(sourceNodeId, document.nodes, { kind })
+          return findAvailableNativeCanvasChildPosition(sourceNodeId, positionedNodes, { kind })
         }
         const bounds = canvasSurfaceRef.current?.getBoundingClientRect()
         return findNativeCanvasAgentNodeCreationPosition(
-          document,
+          { ...document, nodes: positionedNodes },
           { width: bounds?.width ?? 0, height: bounds?.height ?? 0 },
           { kind },
         )
@@ -3912,17 +3981,13 @@ export function NativeCanvasWorkspace({
     const node = snapshot?.document.nodes.find((item) => item.id === nodeId)
     if (!snapshot || !node) return
     /** 复用图片预览与设备预设的真实几何，且只计算目标节点。 */
-    const size = resolveNativeCanvasNodeSize(node)
-    if (node.kind === 'image') {
-      size.height = resolveNativeCanvasImageNodeHeight(node.adoptedAssetId
-        ? snapshot.imagePreviews?.find((preview) => preview.assetId === node.adoptedAssetId)
-        : undefined)
-    }
+    /** 导航与 Graph 共用当前动态媒体尺寸，避免竖视频仍按空卡居中。 */
+    const size = canvasNodeSizesById.get(node.id) ?? resolveNativeCanvasNodeSize(node)
     /** 直接测量覆盖展开、缩放窗口后的最新边界；未挂载时保留现有视口。 */
     const surface = canvasSurfaceRef.current?.getBoundingClientRect() ?? { width: 0, height: 0 }
     updateAgentCanvasViewState({ key: viewStateKey,
       update: (current) => createNativeCanvasNodeFocusUpdate(node, size, current.viewport, surface) })
-  }, [stateKey, store, updateAgentCanvasViewState, viewStateKey])
+  }, [canvasNodeSizesById, stateKey, store, updateAgentCanvasViewState, viewStateKey])
 
   /** 聚焦第一个问题节点并打开局部恢复面板。 */
   const focusFirstIssue = React.useCallback((): void => {
@@ -4053,10 +4118,6 @@ export function NativeCanvasWorkspace({
     const current = store.get(nativeCanvasStatesAtom).get(stateKey)
     const document = current?.snapshot?.document
     if (!document) return
-    const currentImagePreviews = new Map(
-      (current.snapshot?.imagePreviews ?? []).map((preview) => [preview.assetId, preview]),
-    )
-    const canvasNodeSizesById = createNativeCanvasNodeSizeMap(document, currentImagePreviews)
     const blockedNodeIds = new Set([...nodeActivityStatesRef.current]
       .filter(([, activity]) => activity === 'running' || activity === 'waiting-approval')
       .map(([nodeId]) => nodeId))
@@ -4065,7 +4126,7 @@ export function NativeCanvasWorkspace({
     void arrangeCommand.execute({
       scopeNodeIds,
       blockedNodeIds,
-      nodeSizesById: canvasNodeSizesById,
+      nodeSizesById: canvasNodeSizesByIdRef.current,
     }).then((result) => {
       if (!arrangeMountedRef.current || currentWorkspaceKeyRef.current !== operationViewStateKey) return
       if (result === 'stale') {
@@ -4328,6 +4389,8 @@ export function NativeCanvasWorkspace({
             <div
               ref={canvasSurfaceRef}
               data-native-canvas-surface
+              onPointerDownCapture={() => store.set(interruptAgentCanvasNavigationAtom, { sessionId, key: viewStateKey })}
+              onWheelCapture={() => store.set(interruptAgentCanvasNavigationAtom, { sessionId, key: viewStateKey })}
               className="relative h-full min-w-0"
             >
               <NativeCanvasToolbar
@@ -4398,6 +4461,8 @@ export function NativeCanvasWorkspace({
                 nodeActivityStates={nodeActivityStates}
                 imageCandidateNodeIds={imageCandidateNodeIds}
                 mediaProgressByNodeId={mediaProgressByNodeId}
+                readCanvasVideoPreview={adapter.canvasMediaReadPreview}
+                releaseCanvasVideoPreview={adapter.canvasMediaReleasePreview}
                 imagePreviews={imagePreviews}
                 loadCanvasWebviewPreview={adapter.loadCanvasWebviewPreview}
                 pendingWebviewDeviceNodeIds={pendingWebviewDeviceNodeIds}

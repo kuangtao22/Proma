@@ -173,7 +173,6 @@ import {
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
   selectPersistedCanvasWorkspaceRestore,
-  setAgentDefaultCanvas,
 } from './canvas-workspace-actions'
 import type { PendingCanvasDelete } from './canvas-workspace-actions'
 
@@ -1437,7 +1436,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         }
         await canvasRegistry.linkAndOpen(
           visibleCanvas.id,
-          canvasRegistry.binding?.defaultCanvasId === undefined,
+          false,
           pane,
         )
       },
@@ -1462,24 +1461,29 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     return result !== null
   }, [canvasRegistry.bindingReady, canvasRegistry.createAndOpen, reportCanvasActionError, showCanvasActionError])
 
-  /** 从顶部入口打开默认或首个未归档画布；空项目复用现有创建流程。 */
+  /** 从顶部入口恢复最近画布；没有有效记录时展示画布列表或空状态。 */
   const handleOpenInitialCanvas = React.useCallback(async (
     pane: RightWorkspacePane | null,
   ): Promise<boolean> => {
     if (!canvasRegistry.metadataReady || !canvasRegistry.bindingReady) return false
     return canvasWorkspaceEntryController.open({
       sessions: canvasRegistry.sessions,
-      defaultCanvasId: canvasRegistry.binding?.defaultCanvasId,
+      linkedCanvasIds: canvasRegistry.binding?.linkedCanvasIds ?? [],
+      lastActiveCanvasId: canvasRegistry.binding?.lastActiveCanvasId,
       openCanvas: (canvas) => handleOpenCanvas(canvas, pane),
-      createCanvas: () => handleCreateCanvas(pane),
+      openLauncher: async () => {
+        handleCanvasWorkspaceTabChange('canvas', pane)
+        return true
+      },
     })
   }, [
-    canvasRegistry.binding?.defaultCanvasId,
+    canvasRegistry.binding?.lastActiveCanvasId,
+    canvasRegistry.binding?.linkedCanvasIds,
     canvasRegistry.bindingReady,
     canvasRegistry.metadataReady,
     canvasRegistry.sessions,
     canvasWorkspaceEntryController,
-    handleCreateCanvas,
+    handleCanvasWorkspaceTabChange,
     handleOpenCanvas,
   ])
 
@@ -1503,23 +1507,6 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     })
     return result !== null
   }, [reportCanvasActionError, showCanvasActionError, upsertCanvasSession])
-
-  const handleSetDefaultCanvas = React.useCallback(async (canvas: CanvasSessionMeta): Promise<boolean> => {
-    if (!canvasRegistry.bindingReady) return false
-    const result = await runCanvasWorkspaceAction({
-      action: () => setAgentDefaultCanvas({
-        binding: canvasRegistry.binding,
-        canvasId: canvas.id,
-        link: canvasRegistry.link,
-        setDefault: canvasRegistry.setDefault,
-      }),
-      failureMessage: CANVAS_WORKSPACE_FAILURE_MESSAGES.setDefault,
-      logContext: '设置默认画布',
-      onErrorMessage: showCanvasActionError,
-      onLogError: reportCanvasActionError,
-    })
-    return result !== null
-  }, [canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.link, canvasRegistry.setDefault, reportCanvasActionError, showCanvasActionError])
 
   const handleToggleArchiveCanvas = React.useCallback(async (
     canvas: CanvasSessionMeta,
@@ -1554,7 +1541,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     const nextSessions = canvasRegistry.sessions.map((item) => item.id === updated.id ? updated : item)
     const fallback = selectCanvasAfterArchive({
       archivedCanvasId: canvas.id,
-      defaultCanvasId: canvasRegistry.binding?.defaultCanvasId,
+      lastActiveCanvasId: canvasRegistry.binding?.lastActiveCanvasId,
       linkedCanvasIds: canvasRegistry.binding?.linkedCanvasIds ?? [],
       sessions: nextSessions,
     })
@@ -1571,7 +1558,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     })
     return fallbackResult !== null
   }, [
-    canvasRegistry.binding?.defaultCanvasId,
+    canvasRegistry.binding?.lastActiveCanvasId,
     canvasRegistry.binding?.linkedCanvasIds,
     canvasRegistry.linkAndOpen,
     canvasRegistry.sessions,
@@ -1622,18 +1609,23 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   }, [deletingCanvas, focusedWorkspaceTab, forgetOpenedCanvasWorkspaceTab, pendingDeleteCanvas, removeCanvasSession, reportCanvasActionError, returnToPreviousTabAfterClose, showCanvasActionError])
 
   React.useEffect(() => {
-    if (!activeCanvasId || !canvasRegistry.bindingReady) return
+    if (!isOpen || !activeCanvasId || !canvasRegistry.bindingReady) return
     if (!canvasRegistry.binding?.linkedCanvasIds.includes(activeCanvasId)) {
       returnToPreviousTabAfterClose(focusedWorkspaceTab)
       return
     }
+    /** 切换焦点或关闭侧栏后，旧请求不得在新视图上显示错误。 */
+    let disposed = false
     if (canvasRegistry.binding.lastActiveCanvasId !== activeCanvasId) {
       void canvasRegistry.markActive(activeCanvasId).catch((error: unknown) => {
+        if (disposed) return
         console.error('[SidePanel] 更新最近画布失败:', error)
+        showCanvasActionError('当前画布同步失败，请重新选择目标画布后再发送消息。')
       })
     }
     canvasRegistry.markActivitySeen(activeCanvasId)
-  }, [activeCanvasId, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.markActive, canvasRegistry.markActivitySeen, focusedWorkspaceTab, returnToPreviousTabAfterClose])
+    return () => { disposed = true }
+  }, [activeCanvasId, canvasRegistry.binding, canvasRegistry.bindingReady, canvasRegistry.markActive, canvasRegistry.markActivitySeen, focusedWorkspaceTab, isOpen, returnToPreviousTabAfterClose, showCanvasActionError])
 
   // Agent/浏览器等外部事件仍只更新兼容 activeTab；分屏时把新目标落到当前焦点 Pane。
   React.useEffect(() => {
@@ -2069,14 +2061,12 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       return (
         <CanvasWorkspaceLauncher
           sessions={canvasRegistry.sessions}
-          defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
           activityStates={canvasRegistry.canvasActivityStates}
           loading={canvasRegistry.loading}
           error={canvasRegistry.error}
           paneActive={paneActive}
           onCreateCanvas={() => handleCreateCanvas(pane)}
           onOpenCanvas={(canvas) => handleOpenCanvas(canvas, pane)}
-          onSetDefaultCanvas={handleSetDefaultCanvas}
           onToggleArchiveCanvas={(canvas) => handleToggleArchiveCanvas(canvas, pane, null)}
           onRequestDeleteCanvas={handleRequestDeleteCanvas}
         />
@@ -2097,12 +2087,10 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
             error={canvasRegistry.error}
             onUnlink={canvasRegistry.unlink}
             sessions={canvasRegistry.sessions}
-            defaultCanvasId={canvasRegistry.binding?.defaultCanvasId}
             activityStates={canvasRegistry.canvasActivityStates}
             onCreateCanvas={() => handleCreateCanvas(pane)}
             onOpenCanvas={(canvas) => handleOpenCanvas(canvas, pane)}
             onRenameCanvas={handleRenameCanvas}
-            onSetDefaultCanvas={handleSetDefaultCanvas}
             onToggleArchiveCanvas={(canvas) => handleToggleArchiveCanvas(canvas, pane, paneCanvasId)}
             onRequestDeleteCanvas={handleRequestDeleteCanvas}
             paneActive={paneActive}

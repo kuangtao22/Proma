@@ -12,6 +12,7 @@ import {
   currentAgentSessionIdAtom,
   getCanvasWorkspaceTab,
 } from '@/atoms/agent-atoms'
+import { agentCanvasChangeNoticesAtom } from '@/lib/agent-canvas-change-navigation'
 import { activeTabIdAtom } from '@/atoms/tab-atoms'
 import {
   agentCanvasActivityStatesAtom,
@@ -21,7 +22,7 @@ import {
 } from '@/atoms/agent-canvas-atoms'
 import {
   startGlobalAgentCanvasActivityConsumer,
-  startGlobalAgentCanvasArtifactConsumer,
+  startGlobalAgentCanvasChangeConsumer,
 } from './useGlobalAgentListeners'
 
 /** 等待异步 bindings 权威读取和 atom 提交完成。 */
@@ -77,7 +78,7 @@ describe('全局普通 Agent Canvas activity consumer', () => {
     consumer.dispose()
   })
 
-  test('Given 后台 Agent 创建画布产物 When 成功工具结果到达 Then 仅记录待定位节点且不自动打开画布', () => {
+  test('Given 后台 Agent 创建画布产物 When 成功工具结果到达 Then 仅记录修改摘要且不自动打开画布', async () => {
     const store = createStore()
     store.set(activeTabIdAtom, 'foreground-tab')
     store.set(currentAgentSessionIdAtom, 'agent-foreground')
@@ -86,7 +87,11 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       { id: 'agent-background', title: '后台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
     ])
     store.set(agentSidePanelOpenAtomFamily('agent-background'), false)
-    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const consumer = startGlobalAgentCanvasChangeConsumer(store, {
+      listBindings: async () => [{ projectId: 'project-1', sessionId: 'agent-background', linkedCanvasIds: ['canvas-1', 'canvas-import'], updatedAt: 1 }],
+    })
+    store.set(agentSidePanelOpenAtomFamily('agent-background'), false)
+    store.set(agentSidePanelOpenAtomFamily('agent-1'), false)
     const viewKey = createAgentCanvasViewKey('agent-background', 'project-1', 'canvas-1')
     store.set(initializeAgentCanvasViewStateAtom, {
       key: viewKey,
@@ -109,19 +114,20 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       isError: false,
     })
 
+    await flushActivity()
     expect(store.get(agentSidePanelOpenAtomFamily('agent-background'))).toBe(false)
     expect(store.get(agentDiffPanelTabAtom).has('agent-background')).toBe(false)
     expect(store.get(agentCanvasViewStatesAtom).get(viewKey)).toMatchObject({
-      selectedNodeId: 'node-1',
-      selectedNodeIds: ['node-1'],
-      expandedNodeId: 'node-1',
+      selectedNodeId: null,
+      selectedNodeIds: [],
+      expandedNodeId: null,
     })
     expect(store.get(activeTabIdAtom)).toBe('foreground-tab')
     expect(store.get(currentAgentSessionIdAtom)).toBe('agent-foreground')
     consumer.dispose()
   })
 
-  test('Given 后台 Agent 导入图片且任务登记待对账 When 成功结果到达 Then 定位已创建节点且不抢当前焦点', () => {
+  test('Given 后台 Agent 导入图片且任务登记待对账 When 成功结果到达 Then 保留查看入口且不抢当前焦点', async () => {
     const store = createStore()
     store.set(activeTabIdAtom, 'foreground-tab')
     store.set(currentAgentSessionIdAtom, 'agent-foreground')
@@ -129,7 +135,11 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       { id: 'agent-foreground', title: '前台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
       { id: 'agent-background', title: '后台', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
     ])
-    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const consumer = startGlobalAgentCanvasChangeConsumer(store, {
+      listBindings: async () => [{ projectId: 'project-1', sessionId: 'agent-background', linkedCanvasIds: ['canvas-1', 'canvas-import'], updatedAt: 1 }],
+    })
+    store.set(agentSidePanelOpenAtomFamily('agent-background'), false)
+    store.set(agentSidePanelOpenAtomFamily('agent-1'), false)
     const viewKey = createAgentCanvasViewKey('agent-background', 'project-1', 'canvas-import')
     store.set(initializeAgentCanvasViewStateAtom, {
       key: viewKey,
@@ -155,11 +165,9 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       }),
     })
 
-    expect(store.get(agentCanvasViewStatesAtom).get(viewKey)).toMatchObject({
-      selectedNodeId: 'image-1',
-      selectedNodeIds: ['image-1'],
-      expandedNodeId: 'image-1',
-    })
+    await flushActivity()
+    expect(store.get(agentCanvasChangeNoticesAtom).get(viewKey)?.nodeIds).toEqual(['image-1'])
+    expect(store.get(agentCanvasViewStatesAtom).get(viewKey)?.selectedNodeId).toBeNull()
     expect(store.get(activeTabIdAtom)).toBe('foreground-tab')
     expect(store.get(currentAgentSessionIdAtom)).toBe('agent-foreground')
     consumer.dispose()
@@ -171,7 +179,11 @@ describe('全局普通 Agent Canvas activity consumer', () => {
       { id: 'agent-1', title: 'Agent 1', workspaceId: 'project-1', createdAt: 1, updatedAt: 1 },
     ])
     store.set(agentSidePanelOpenAtomFamily('agent-1'), false)
-    const consumer = startGlobalAgentCanvasArtifactConsumer(store)
+    const consumer = startGlobalAgentCanvasChangeConsumer(store, {
+      listBindings: async () => [{ projectId: 'project-1', sessionId: 'agent-background', linkedCanvasIds: ['canvas-1', 'canvas-import'], updatedAt: 1 }],
+    })
+    store.set(agentSidePanelOpenAtomFamily('agent-background'), false)
+    store.set(agentSidePanelOpenAtomFamily('agent-1'), false)
     const validResult = JSON.stringify({
       canvasId: 'canvas-1', nodeId: 'node-1', revision: 4, artifactType: 'image',
     })

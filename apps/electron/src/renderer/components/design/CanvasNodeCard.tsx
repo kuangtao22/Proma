@@ -164,7 +164,7 @@ export function CanvasNodeCard({
   const showPreview = kind === 'image' && Boolean(previewUrl) && !previewFailed
   /** 投影给出的尺寸是卡片、碰撞和 Handle 共同使用的几何事实。 */
   const resolvedWidth = nodeWidth ?? 288
-  /** 生图比例高度和 WebView 设备高度统一从投影读取。 */
+  /** 图片/视频比例高度和 WebView 设备高度统一从投影读取。 */
   const resolvedHeight = nodeHeight ?? 144
   /** 默认节点保留原 Tailwind 固定类，动态节点改用精确内联尺寸。 */
   const hasDynamicWidth = resolvedWidth !== 288

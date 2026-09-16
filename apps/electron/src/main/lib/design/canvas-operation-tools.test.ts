@@ -150,6 +150,32 @@ describe('Canvas 操作工具', () => {
     expect(received).toHaveLength(1)
   })
 
+  test('Given 采用恢复和重建成功 When 返回可信修改回执 Then 定位实际节点并保留Host签发owner', async () => {
+    const navigationContext: CanvasToolRunContext = {
+      ...context,
+      resolveCanvasNavigationOwnerSessionId: () => 'owner-session',
+    }
+    const tools = createCanvasOperationTools({
+      adoptVersion: async () => ({ adopted: true, revision: 3 }),
+      adoptCandidateBatch: async () => ({ adoption: { adoptedNodeIds: ['image-1', 'image-2'] }, continued: false }),
+      restoreNode: async () => ({ nodeId: 'restored-1', revision: 5 }),
+      rebuildAgent: async () => ({ rebuilt: true, revision: 6 }),
+    }, navigationContext, {
+      authorizeRead: () => undefined,
+      requireLinkedCanvas: () => ({}) as never,
+    }, () => 'operation-1')
+
+    const adopted = await executeOperation(tools, 'canvas_adopt_version', createValidInputs().canvas_adopt_version!)
+    const batch = await executeOperation(tools, 'canvas_adopt_candidate_batch', createValidInputs().canvas_adopt_candidate_batch!)
+    const restored = await executeOperation(tools, 'canvas_restore_node', createValidInputs().canvas_restore_node!)
+    const rebuilt = await executeOperation(tools, 'canvas_rebuild_agent', createValidInputs().canvas_rebuild_agent!)
+
+    expect(adopted.details).toMatchObject({ navigation: { nodeIds: ['node-1'], revision: 3, ownerSessionId: 'owner-session' } })
+    expect(batch.details).toMatchObject({ navigation: { nodeIds: ['image-1', 'image-2'], ownerSessionId: 'owner-session' } })
+    expect(restored.details).toMatchObject({ navigation: { nodeIds: ['restored-1'], revision: 5, ownerSessionId: 'owner-session' } })
+    expect(rebuilt.details).toMatchObject({ navigation: { nodeIds: ['node-1'], revision: 6, ownerSessionId: 'owner-session' } })
+  })
+
   test('Given 分页游标已绑定列表作用域和内容 When 跨节点复用或历史变化 Then 明确失效', () => {
     const first = paginateCanvasOperationRecords([{ id: 'a' }, { id: 'b' }], 'project-1/canvas-1/node-1/versions', { limit: 1 })
     expect(first.entries).toEqual([{ id: 'a' }])

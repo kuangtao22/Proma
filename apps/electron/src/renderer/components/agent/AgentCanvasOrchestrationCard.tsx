@@ -8,6 +8,10 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 const STATUS_LABELS = {
   planned: '待开始', running: '运行中', 'needs-review': '待评审', completed: '已完成', blocked: '已阻塞',
 }
+/** 编排终态使用业务语言，避免用户把取消或阻塞误认为仍在执行。 */
+const RECORD_STATUS_LABELS: Record<CanvasOrchestrationRecord['status'], string> = {
+  planning: '规划中', running: '进行中', waiting: '等待中', blocked: '已阻塞', completed: '已完成', cancelled: '已取消',
+}
 
 /** 卡片仅展示与回传选择，权限、最新问题及防重复检查由父级发送入口负责。 */
 export interface AgentCanvasOrchestrationCardProps {
@@ -37,8 +41,8 @@ export function AgentCanvasOrchestrationCard({ record, progress, canvasTitle, on
       <CollapsibleTrigger asChild>
         <Button type="button" variant="ghost" className="h-auto w-full justify-start gap-2 whitespace-normal p-2.5 text-left">
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-xs text-muted-foreground">{canvasTitle} · {counts.completed}/{counts.total} 个阶段已评审完成</span>
-            <span className="block line-clamp-1" title={record.request.goal}>{record.request.goal}</span>
+            <span className="block truncate text-xs text-muted-foreground">{canvasTitle} · {RECORD_STATUS_LABELS[record.status]} · {counts.completed}/{counts.total} 个阶段已评审完成</span>
+            <span className="line-clamp-1 min-w-0 break-words [overflow-wrap:anywhere]" title={record.request.goal}>{record.request.goal}</span>
             <span className="block text-xs text-primary">{decisionSent ? '答复已发送，等待处理' : decision ? '需要你的决定' : progress.nextStep}</span>
           </span>
           <ChevronDown className={`size-4 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden="true" />

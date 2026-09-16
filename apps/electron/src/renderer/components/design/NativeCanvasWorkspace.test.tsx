@@ -52,6 +52,10 @@ import {
   designProjectStatesAtom,
 } from '@/atoms/design-atoms'
 import { CanvasPublicOperationError } from '@/lib/design-adapter'
+import {
+  createNativeCanvasNodeSizeMap,
+  stabilizeNativeCanvasVideoNodeHeightMap,
+} from './native-canvas-model'
 /** Workspace 单测不验证模型品牌资源，避免 Bun 直接解析 Vite 位图导入。 */
 mock.module('@/lib/model-logo', () => ({
   DefaultLogo: 'model-logo.png',
@@ -414,6 +418,29 @@ describe('Agent Canvas 共享图与独立视图', () => {
     expect(listVisibleNativeCanvasNodeIds(document, { width: 800, height: 600 })).toEqual(['agent-1'])
     document.viewport = { x: -500, y: 0, zoom: 1 }
     expect(listVisibleNativeCanvasNodeIds(document, { width: 800, height: 600 })).toEqual(['web-1'])
+  })
+
+  test('Given 竖屏采用视频延伸到视口内 When 计算可见节点 Then 使用媒体投影高度而非固定空卡', () => {
+    /** 节点顶端在视口外，但 368 高卡片底部仍与视口相交。 */
+    const document = createEmptyCanvasDocument('project-1', 'canvas-1', 100)
+    document.nodes = [{
+      id: 'video-1', kind: 'video', title: '竖屏视频', mediaModuleId: 'media-1', position: { x: 0, y: -300 },
+    }]
+    const progress = new Map([['video-1', {
+      phase: 'pending' as const, phaseLabel: '已有素材', hasAdoptedOutput: true,
+      adoptedVideo: {
+        projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'video-1', mediaModuleId: 'media-1',
+        mediaKind: 'video' as const, candidateId: 'candidate-1', outputKey: 'video', outputOrder: 0,
+      },
+      adoptedVideoDimensions: { width: 180, height: 320 },
+    }]])
+    const sizes = createNativeCanvasNodeSizeMap(
+      document,
+      undefined,
+      stabilizeNativeCanvasVideoNodeHeightMap(new Map(), progress),
+    )
+
+    expect(listVisibleNativeCanvasNodeIds(document, { width: 800, height: 600 }, sizes)).toEqual(['video-1'])
   })
 
   test('Given 整理保存失败 When 提交原子位置批次 Then 不接管任何新位置', async () => {

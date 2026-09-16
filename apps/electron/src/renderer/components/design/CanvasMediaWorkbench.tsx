@@ -869,6 +869,8 @@ export function CanvasMediaWorkflowForm({
   return (
     <section className="canvas-media-form-container space-y-3" aria-label="工作流输入">
       <h3 className="text-sm font-medium">输入</h3>
+      {inputs.some(input => input.sourceType === 'literal' && ['image', 'video', 'audio'].includes(input.kind))
+        ? <p className="text-xs text-muted-foreground">固定素材不跟随画布连线；如需跟随上游修改，请选择节点输出。已有素材可复用，无需为补连线重新生成。</p> : null}
       {importError ? <p role="alert" className="text-xs text-destructive">{importError}</p> : null}
       {inputs.length === 0 ? <p className="text-xs text-muted-foreground">当前工作流没有输入。</p> : basic.map(({ input, index }) => renderInput(input, index))}
       {connectionState && !connectionState.connected ? <div role="status" className="space-y-1 text-xs text-amber-600">
@@ -1263,12 +1265,12 @@ export function CanvasMediaWorkbench({
                         <div className="flex flex-wrap items-center gap-1">
                           <Button size="sm" variant={selected ? 'secondary' : 'ghost'} aria-pressed={selected} disabled={busy} onClick={() => void openPreview(exact, true)}><Eye />预览</Button>
                           <Button size="sm" variant="ghost" disabled={busy} onClick={() => void execute(() => adapter.canvasMediaExportOutput(exact), { refresh: false })}><Download />导出</Button>
-                          {initiallySelected ? <span className="text-muted-foreground">当前默认</span> : null}
+                          {initiallySelected ? <span className="text-muted-foreground">已默认采用</span> : null}
                           <Button size="sm" variant={adopted ? 'secondary' : 'outline'} className="h-auto min-h-8 max-w-full whitespace-normal break-all" disabled={!writable || busy || (adopted && !initiallySelected)} onClick={() => void execute(async () => {
                             previewAutoloadGuardRef.current.markManual(previewTargetIdentity)
                             await adapter.canvasMediaAdopt({ ...stableTarget, expectedConfigRevision: snapshot.config.revision, candidateId: candidate.id, selectedKeys })
                             await openPreview(exact, false)
-                          })}><Check />{initiallySelected ? '确认采用' : adopted ? '已采用' : output.bundle ? `采用 ${output.bundle} 组` : '采用'}</Button>
+                          })}><Check />{initiallySelected ? '确认此版本' : adopted ? '已采用' : output.bundle ? `采用 ${output.bundle} 组` : '采用'}</Button>
                         </div>
                       </div>
                     })}
@@ -1288,7 +1290,9 @@ export function CanvasMediaWorkbench({
               <section aria-label="媒体准备阶段" className="space-y-2 rounded-md border border-border p-3 text-xs">
                 <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
                   <span>已建卡</span>
-                  <span>{connectionState?.connected ? '输入已接通' : '输入待接通'}</span>
+                  <span>{connectionState?.connected
+                    ? inputs.some(input => input.sourceType === 'canvas-output') ? '节点输入已连接' : '使用固定输入'
+                    : '输入待接通'}</span>
                   <span>{preparationStatus ? preparationStatus.workflowBound ? '工作流已绑定' : '工作流待绑定' : '工作流待检查'}</span>
                   <span>{loadGuardRef.current.isDirty() ? '配置待保存' : preparationStatus?.ready && connectionState?.connected ? '可运行' : '运行条件待满足'}</span>
                 </div>

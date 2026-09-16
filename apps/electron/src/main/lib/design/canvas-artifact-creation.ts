@@ -118,7 +118,7 @@ const ARTIFACT_LAYOUT_GAP = 24
 const ARTIFACT_REQUESTED_POSITION_MARGIN = 1_600
 /** 常规 Agent、文档和无预览图片节点的折叠尺寸。 */
 const ARTIFACT_DEFAULT_SIZE: CanvasLayoutSize = { width: 288, height: 144 }
-/** 创建阶段不读取图片文件，预留与 Renderer 同源的最大预览尺寸。 */
+/** 创建阶段不读取图片或视频文件，预留与 Renderer 同源的最大预览尺寸。 */
 const ARTIFACT_IMAGE_SIZE: CanvasLayoutSize = { width: CANVAS_IMAGE_NODE_WIDTH, height: CANVAS_IMAGE_NODE_MAX_HEIGHT }
 /** 桌面 WebView 折叠卡片的稳定预览尺寸。 */
 const ARTIFACT_WEBVIEW_DESKTOP_SIZE: CanvasLayoutSize = { width: 384, height: 316 }
@@ -173,7 +173,7 @@ function createArtifactIdentity(input: Pick<CanvasArtifactCreationInput, 'projec
 function resolveArtifactNodeSize(
   node: Pick<CanvasNode, 'kind'> & Partial<Pick<Extract<CanvasNode, { kind: 'webview' }>, 'devicePreset'>>,
 ): CanvasLayoutSize {
-  if (node.kind === 'image') return ARTIFACT_IMAGE_SIZE
+  if (node.kind === 'image' || node.kind === 'video') return ARTIFACT_IMAGE_SIZE
   if (node.kind !== 'webview') return ARTIFACT_DEFAULT_SIZE
   return node.devicePreset === 'mobile'
     ? ARTIFACT_WEBVIEW_MOBILE_SIZE

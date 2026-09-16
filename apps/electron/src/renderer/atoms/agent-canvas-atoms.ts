@@ -365,6 +365,47 @@ export function createClosedAgentCanvasWorkbenchUpdate(): Partial<AgentCanvasVie
 /** 所有 Agent Canvas 会话视图按完整三元身份隔离的状态。 */
 export const agentCanvasViewStatesAtom = atom<Map<string, AgentCanvasViewState>>(new Map())
 
+/** 外部修改回执的定位意图；等权威图版本与可见表面就绪后仅消费一次。 */
+export interface AgentCanvasFocusRequest {
+  /** 目标现存节点，空数组表示只打开所属画布。 */
+  nodeIds: string[]
+  /** 回执对应图版本，用于等待创建节点的 LOAD。 */
+  revision?: number
+}
+
+/** 与会话视图使用相同三元键，避免多个聊天或分屏串图。 */
+export const agentCanvasFocusRequestsAtom = atom<Map<string, AgentCanvasFocusRequest>>(new Map())
+
+/** 一轮内用户已操作画布时暂停自动定位；只在首次交互写入，不随滚轮频率更新。 */
+export const agentCanvasNavigationInterruptedSessionsAtom = atom<Set<string>>(new Set<string>())
+
+/** 用户手势取消等待中的定位，并保留本轮手动浏览优先权。 */
+export const interruptAgentCanvasNavigationAtom = atom(null, (get, set, input: { sessionId: string; key: string }): void => {
+  set(clearAgentCanvasFocusAtom, input.key)
+  const previous = get(agentCanvasNavigationInterruptedSessionsAtom)
+  if (previous.has(input.sessionId)) return
+  const next = new Set(previous).add(input.sessionId)
+  while (next.size > 128) next.delete(next.values().next().value!)
+  set(agentCanvasNavigationInterruptedSessionsAtom, next)
+})
+
+/** 只保存显式导航意图，不提前把尚未 LOAD 的节点写入选区。 */
+export const requestAgentCanvasFocusAtom = atom(null, (get, set, input: AgentCanvasFocusRequest & { key: string }): void => {
+  const next = new Map(get(agentCanvasFocusRequestsAtom))
+  next.set(input.key, { nodeIds: [...new Set(input.nodeIds)], revision: input.revision })
+  while (next.size > 64) next.delete(next.keys().next().value!)
+  set(agentCanvasFocusRequestsAtom, next)
+})
+
+/** 完成或用户交互时清除意图，后续刷新不再回跳。 */
+export const clearAgentCanvasFocusAtom = atom(null, (get, set, key: string): void => {
+  const previous = get(agentCanvasFocusRequestsAtom)
+  if (!previous.has(key)) return
+  const next = new Map(previous)
+  next.delete(key)
+  set(agentCanvasFocusRequestsAtom, next)
+})
+
 /** 权威文档尚未 LOAD 时暂存的最新节点导航意图。 */
 const pendingAgentCanvasViewNavigationAtom = atom<Map<string, string>>(new Map())
 
@@ -489,6 +530,7 @@ export const removeAgentCanvasViewStateAtom = atom(
   null,
   (get, set, key: string): void => {
     /** 两张 Map 分别判断，LOAD 前真实卸载也必须清除待导航意图。 */
+    set(clearAgentCanvasFocusAtom, key)
     const states = get(agentCanvasViewStatesAtom)
     if (states.has(key)) {
       const nextStates = new Map(states)

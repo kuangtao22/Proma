@@ -1,4 +1,4 @@
-import type { AgentCanvasBinding, CanvasSessionMeta } from '@proma/shared'
+import type { CanvasSessionMeta } from '@proma/shared'
 import {
   placeRightWorkspaceSplitTab,
   selectRightWorkspaceSplitTab,
@@ -41,34 +41,14 @@ export async function runCanvasWorkspaceAction<T>({
   }
 }
 
-export interface SetAgentDefaultCanvasInput {
-  /** 当前 Agent 的权威 Canvas 关联；null 表示尚未建立关联。 */
-  binding: AgentCanvasBinding | null
-  /** 用户选择的新默认画布。 */
-  canvasId: string
-  /** 为未关联画布建立关联并可同时设为默认。 */
-  link: (canvasId: string, makeDefault: boolean) => Promise<unknown>
-  /** 更新已关联画布的默认标记。 */
-  setDefault: (canvasId: string) => Promise<unknown>
-}
-
-/** 未关联画布先建立默认关联，已关联画布复用轻量默认更新。 */
-export async function setAgentDefaultCanvas(input: SetAgentDefaultCanvasInput): Promise<void> {
-  if (!input.binding?.linkedCanvasIds.includes(input.canvasId)) {
-    await input.link(input.canvasId, true)
-    return
-  }
-  await input.setDefault(input.canvasId)
-}
-
-/** 选择首次打开目标：有效默认画布优先，否则使用第一个未归档画布。 */
+/** 选择首次打开目标：只恢复当前会话仍有效的最近关联画布。 */
 export function selectInitialCanvasWorkspaceSession(
   sessions: readonly CanvasSessionMeta[],
-  defaultCanvasId?: string,
+  linkedCanvasIds: readonly string[],
+  lastActiveCanvasId?: string,
 ): CanvasSessionMeta | null {
-  return sessions.find((session) => !session.archived && session.id === defaultCanvasId)
-    ?? sessions.find((session) => !session.archived)
-    ?? null
+  if (!lastActiveCanvasId || !linkedCanvasIds.includes(lastActiveCanvasId)) return null
+  return sessions.find((session) => !session.archived && session.id === lastActiveCanvasId) ?? null
 }
 
 export interface SelectPersistedCanvasWorkspaceRestoreInput {
@@ -106,12 +86,14 @@ export function selectPersistedCanvasWorkspaceRestore(
 export interface OpenCanvasWorkspaceEntryInput {
   /** 当前项目的完整画布列表。 */
   sessions: readonly CanvasSessionMeta[]
-  /** 当前 Agent 的默认画布 ID。 */
-  defaultCanvasId?: string
+  /** 当前 Agent 的画布关联。 */
+  linkedCanvasIds: readonly string[]
+  /** 当前 Agent 最近查看的画布 ID。 */
+  lastActiveCanvasId?: string
   /** 打开并按需关联已有画布。 */
   openCanvas: (session: CanvasSessionMeta) => Promise<boolean>
-  /** 创建、关联并打开新画布。 */
-  createCanvas: () => Promise<boolean>
+  /** 没有可恢复目标时打开画布列表或空状态。 */
+  openLauncher: () => Promise<boolean>
 }
 
 export interface CanvasWorkspaceEntryController {
@@ -119,17 +101,21 @@ export interface CanvasWorkspaceEntryController {
   open: (input: OpenCanvasWorkspaceEntryInput) => Promise<boolean>
 }
 
-/** 创建按入口实例隔离的单飞控制器，避免重复点击创建多个画布。 */
+/** 创建按入口实例隔离的单飞控制器，避免重复点击并发打开不同视图。 */
 export function createCanvasWorkspaceEntryController(): CanvasWorkspaceEntryController {
-  /** 当前仍在执行的打开或创建任务。 */
+  /** 当前仍在执行的画布恢复或列表打开任务。 */
   let inFlight: Promise<boolean> | null = null
   return {
     open: (input) => {
       if (inFlight) return inFlight
-      /** 本次点击应直接打开的已有画布；null 表示需要创建。 */
-      const target = selectInitialCanvasWorkspaceSession(input.sessions, input.defaultCanvasId)
+      /** 本次点击应直接恢复的最近画布；null 表示进入列表或空状态。 */
+      const target = selectInitialCanvasWorkspaceSession(
+        input.sessions,
+        input.linkedCanvasIds,
+        input.lastActiveCanvasId,
+      )
       /** 所有并发调用共享同一个任务，直到本次动作收口。 */
-      const task = target ? input.openCanvas(target) : input.createCanvas()
+      const task = target ? input.openCanvas(target) : input.openLauncher()
       inFlight = task
       /** 仅清理由当前任务持有的锁，避免未来任务被旧回调误清。 */
       const clear = (): void => {
@@ -209,8 +195,8 @@ export async function runCanvasDeleteAction({
 export interface SelectCanvasAfterArchiveInput {
   /** 本次刚被归档的画布 ID。 */
   archivedCanvasId: string
-  /** 当前 Agent 的默认画布 ID。 */
-  defaultCanvasId?: string
+  /** 当前 Agent 最近查看的画布 ID。 */
+  lastActiveCanvasId?: string
   /** 当前 Agent 的画布关联顺序。 */
   linkedCanvasIds: readonly string[]
   /** 已包含本次归档结果的项目画布索引。 */
@@ -223,9 +209,9 @@ export function selectCanvasAfterArchive(input: SelectCanvasAfterArchiveInput): 
   const available = new Map(input.sessions
     .filter((session) => !session.archived && session.id !== input.archivedCanvasId)
     .map((session) => [session.id, session]))
-  if (input.defaultCanvasId) {
-    const defaultCanvas = available.get(input.defaultCanvasId)
-    if (defaultCanvas) return defaultCanvas
+  if (input.lastActiveCanvasId && input.linkedCanvasIds.includes(input.lastActiveCanvasId)) {
+    const recentCanvas = available.get(input.lastActiveCanvasId)
+    if (recentCanvas) return recentCanvas
   }
   for (const canvasId of input.linkedCanvasIds) {
     const canvas = available.get(canvasId)
@@ -310,7 +296,6 @@ export const CANVAS_WORKSPACE_FAILURE_MESSAGES = {
   open: '打开画布失败',
   create: '新建画布失败',
   rename: '重命名画布失败',
-  setDefault: '设置默认画布失败',
   archive: '归档画布失败',
   restore: '恢复画布失败',
   delete: '删除画布失败',

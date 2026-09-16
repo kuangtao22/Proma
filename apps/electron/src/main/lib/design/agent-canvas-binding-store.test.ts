@@ -183,6 +183,28 @@ describe('AgentCanvasBindingStore', () => {
     })).toThrow('AGENT_CANVAS_BINDING_NOT_FOUND')
   })
 
+  test('Given 已关联多个画布 When 标记当前活动画布 Then 只更新最近活动且重复调用不写盘', () => {
+    const { store, writes } = createHarness(null, [10, 20, 30])
+    store.link(linkInput('session-1', 'canvas-a'))
+    store.link(linkInput('session-1', 'canvas-b'))
+
+    const changed = store.markActiveWithChange({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-b',
+    })
+    const repeated = store.markActiveWithChange({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-b',
+    })
+
+    expect(changed).toMatchObject({ changed: true, after: {
+      defaultCanvasId: 'canvas-a', linkedCanvasIds: ['canvas-a', 'canvas-b'], lastActiveCanvasId: 'canvas-b',
+    } })
+    expect(repeated.changed).toBe(false)
+    expect(writes).toHaveLength(3)
+    expect(() => store.markActiveWithChange({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-missing',
+    })).toThrow('AGENT_CANVAS_BINDING_NOT_FOUND')
+  })
+
   test('Given 多项目共享画布 ID When 清理项目画布 Then 仅修改目标项目并维护替代项', () => {
     const { store } = createHarness(null, [10, 20, 30, 40])
     store.link(linkInput('session-a', 'canvas-shared', false, 'project-1'))

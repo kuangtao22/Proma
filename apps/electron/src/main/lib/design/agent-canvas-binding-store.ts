@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import type {
   AgentCanvasBinding,
   LinkAgentCanvasInput,
+  MarkAgentCanvasActiveInput,
   SetDefaultAgentCanvasInput,
   UnlinkAgentCanvasInput,
 } from '@proma/shared'
@@ -9,6 +10,7 @@ import {
   parseAgentCanvasBinding,
   parseClearAgentCanvasBindingsInput,
   parseLinkAgentCanvasInput,
+  parseMarkAgentCanvasActiveInput,
   parseListAgentCanvasBindingsInput,
   parseSetDefaultAgentCanvasInput,
   parseUnlinkAgentCanvasInput,
@@ -217,6 +219,38 @@ export class AgentCanvasBindingStore {
     else bindings[index] = updated
     this.persist(bindings, snapshot)
     return { before, after: copyBinding(updated), changed: true }
+  }
+
+  /** 接收已关联画布身份，返回更新后的绑定副本，不改变默认项或关联顺序。 */
+  markActive(rawInput: MarkAgentCanvasActiveInput): AgentCanvasBinding {
+    return this.markActiveWithChange(rawInput).after!
+  }
+
+  /** 在同一 fresh snapshot 内更新最近活动项并返回提交前后事实。 */
+  markActiveWithChange(rawInput: MarkAgentCanvasActiveInput): AgentCanvasBindingMutationResult {
+    /** 严格校验项目、会话与画布的稳定身份。 */
+    const input = parseMarkAgentCanvasActiveInput(rawInput)
+    /** 使用本次磁盘快照与 CAS 依据，避免覆盖其他身份的新关联。 */
+    const { snapshot, bindings } = this.prepareMutation()
+    /** 只定位当前会话已有记录，不隐式创建关联。 */
+    const index = findBindingIndex(bindings, input.projectId, input.sessionId)
+    /** 校验目标已关联，并保留更新前的完整绑定事实。 */
+    const existing = index < 0 ? null : bindings[index]!
+    if (!existing?.linkedCanvasIds.includes(input.canvasId)) {
+      throw new Error('AGENT_CANVAS_BINDING_NOT_FOUND')
+    }
+    if (existing.lastActiveCanvasId === input.canvasId) {
+      return { before: copyBinding(existing), after: copyBinding(existing), changed: false }
+    }
+    /** 只变更活动身份与业务时间，默认项和关联顺序沿用原值。 */
+    const updated: AgentCanvasBinding = {
+      ...copyBinding(existing),
+      lastActiveCanvasId: input.canvasId,
+      updatedAt: this.now(),
+    }
+    bindings[index] = updated
+    this.persist(bindings, snapshot)
+    return { before: copyBinding(existing), after: copyBinding(updated), changed: true }
   }
 
   /**

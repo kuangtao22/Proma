@@ -1,3 +1,4 @@
+import { captureCanvasToolInitialContext } from './canvas-tool-initial-context'
 import { randomUUID } from 'node:crypto'
 import {
   CANVAS_IPC_CHANNELS,
@@ -1650,7 +1651,7 @@ export function registerCanvasDocumentIpcHandlers(
           mediaTools: options.mediaTools,
           mediaInspection: options.mediaInspection,
           ...(options.orchestration ? { orchestration: options.orchestration } : {}),
-        }, context),
+        }, captureCanvasToolInitialContext(toolAccess, context)),
         documents: options.store,
         agentConfigs: options.agent.configs,
         agentExecution: options.agent.execution,

@@ -1,6 +1,6 @@
 import type { ImageContent, TextContent } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import type { CanvasImageCandidateBatch, CanvasTarget } from '@proma/shared'
+import type { CanvasImageCandidateBatch, CanvasTarget, CanvasToolNavigationResult } from '@proma/shared'
 import { Type } from 'typebox'
 import type { TSchema } from 'typebox'
 import { createCanvasImageCandidateHash } from './canvas-image-candidate-batch-service'
@@ -110,7 +110,7 @@ export function createCanvasImageCandidateTools(
         candidateHash: Type.String({ pattern: '^[a-f0-9]{64}$' }),
         mode: Type.Union([Type.Literal('all'), Type.Literal('succeeded')]),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         const target = { projectId: context.projectId, canvasId: params.canvasId }
         authorize(target)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
@@ -120,7 +120,18 @@ export function createCanvasImageCandidateTools(
           authorize(target, batch)
           const adopted = await candidates.adopt({ ...target, batchId: params.batchId, mode: params.mode },
             params.candidateHash, () => { authorize(target, batch) })
-          const details = summarizeBatch(adopted)
+          /** 采用只定位确实切换成功的节点，保留项不是本次修改。 */
+          const adoptedNodeIds = adopted.adoption?.adoptedNodeIds ?? []
+          const navigation: CanvasToolNavigationResult = {
+            status: 'changed', projectId: context.projectId, canvasId: params.canvasId,
+            nodeIds: [...new Set(adoptedNodeIds)], deletedNodeIds: [], action: 'update',
+            revision: authorize(target, adopted), sourceToolCallId: toolCallId,
+            ...(() => {
+              const ownerSessionId = context.resolveCanvasNavigationOwnerSessionId?.()
+              return ownerSessionId ? { ownerSessionId } : {}
+            })(),
+          }
+          const details = { ...summarizeBatch(adopted), navigation }
           return { content: [{ type: 'text', text: JSON.stringify(details) }], details }
         })
       },

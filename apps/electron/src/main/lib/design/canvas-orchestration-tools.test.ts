@@ -148,6 +148,10 @@ test('Given 普通 Agent 委托 When 执行 Then 从上下文构造 owner 并透
     nextAction: 'update-plan',
   }
   expect(result.details).toMatchObject(details)
+  expect(result.details).toMatchObject({ navigation: {
+    status: 'changed', projectId: 'project-1', canvasId: 'canvas-1', nodeIds: [],
+    deletedNodeIds: [], action: 'orchestration', sourceToolCallId: 'call-1',
+  } })
   expect(result.details).toHaveProperty('progress')
   expect(result.content).toEqual([{ type: 'text', text: JSON.stringify(result.details) }])
 })
@@ -171,6 +175,7 @@ test('Given 合法大计划 When 分页读取 Then 概要标明省略且步骤�
   const overview = await executeTool(tools, 'canvas_get_orchestration', { canvasId: 'canvas-1' })
   expect(overview.details).toMatchObject({ counts: { steps: 2, followUps: 0 },
     omittedSections: ['constraints', 'deliverables', 'steps', 'followUps'] })
+  expect(overview.details).not.toHaveProperty('navigation')
   const page = await executeTool(tools, 'canvas_get_orchestration', {
     canvasId: 'canvas-1', section: 'steps', offset: 0, limit: 1,
   })

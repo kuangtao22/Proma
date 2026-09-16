@@ -8,7 +8,7 @@ import {
   createInitialAgentCanvasViewState,
   updateAgentCanvasViewStateAtom,
 } from '@/atoms/agent-canvas-atoms'
-import { buildNativeCanvasNavigationItems, createNativeCanvasNodeFocusUpdate } from './native-canvas-navigation'
+import { buildNativeCanvasNavigationItems, createNativeCanvasNodeFocusUpdate, createNativeCanvasChangedNodesFocusUpdate } from './native-canvas-navigation'
 
 /** 构造只包含导航所需数据的文档节点。 */
 function documentNode(id: string, title = id): CanvasNode {
@@ -82,5 +82,27 @@ describe('画布节点导航', () => {
     expect(store.get(agentCanvasViewStatesAtom).get(key)?.expandedNodeId).toBe('draft-node')
     expect(store.get(agentCanvasViewStatesAtom).get(otherKey)).toBe(view)
     expect(document).toEqual(original)
+  })
+})
+
+
+describe('画布修改批量定位', () => {
+  test('Given 两个远处节点与已删除节点 When 定位修改 Then 包围现存节点且剔除删除节点', () => {
+    const nodes = [
+      { id: 'a', position: { x: 6000, y: -3000 } },
+      { id: 'b', position: { x: 6400, y: -2600 } },
+    ]
+    const sizes = new Map([['a', { width: 288, height: 210 }], ['b', { width: 288, height: 368 }]])
+    const update = createNativeCanvasChangedNodesFocusUpdate(nodes, ['a', 'b', 'deleted'], sizes,
+      { x: 0, y: 0, zoom: 0.1 }, { width: 900, height: 800 })
+    expect(update.selectedNodeIds).toEqual(['a', 'b'])
+    expect(6000 * update.viewport.zoom + update.viewport.x).toBeGreaterThan(0)
+    expect((6400 + 288) * update.viewport.zoom + update.viewport.x).toBeLessThan(900)
+    expect((-2600 + 368) * update.viewport.zoom + update.viewport.y).toBeLessThan(800)
+  })
+  test('Given 回执目标已全部删除 When 定位 Then 保持原视口且清除选区', () => {
+    const viewport = { x: 10, y: 20, zoom: 0.5 }
+    expect(createNativeCanvasChangedNodesFocusUpdate([], ['deleted'], new Map(), viewport, { width: 900, height: 600 }))
+      .toEqual({ viewport, selectedNodeId: null, selectedNodeIds: [] })
   })
 })

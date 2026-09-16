@@ -6,6 +6,7 @@ import { Value } from 'typebox/value'
 import { CANVAS_WORKFLOW_MAX_DURATION_EXTENSION_MS, CANVAS_WORKFLOW_MAX_MEDIA_RUN_EXTENSION,
   CANVAS_WORKFLOW_RUN_NODE_LIMIT, parseAdoptCanvasImageCandidateBatchInput } from '@proma/shared'
 import type { AdoptCanvasImageCandidateBatchInput } from '@proma/shared'
+import type { CanvasToolNavigationResult } from '@proma/shared'
 import type { CanvasToolRunContext } from './canvas-tool-provider'
 import type { CanvasToolAccessFacade } from './canvas-tool-access-facade'
 
@@ -223,10 +224,36 @@ export function createCanvasOperationTools(
             && typeof params.nodeId === 'string') {
             executionContext.onImageJobsCreated?.(params.canvasId, [{ nodeId: params.nodeId, jobId: details.replacementJobId }])
           }
+          /** 采用版本是已完成的节点修改；取消、重试和工作流推进仍不冒充内容变更导航。 */
+          const adoption = details.adoption
+          const adoptedNodeIds = name === 'canvas_adopt_candidate_batch' && adoption && typeof adoption === 'object'
+            && !Array.isArray(adoption) && 'adoptedNodeIds' in adoption && Array.isArray(adoption.adoptedNodeIds)
+            ? adoption.adoptedNodeIds.filter((nodeId): nodeId is string => typeof nodeId === 'string')
+            : []
+          const navigationNodeIds = name === 'canvas_adopt_version' && typeof params.nodeId === 'string'
+            ? [params.nodeId]
+            : name === 'canvas_restore_node' && typeof details.nodeId === 'string'
+              ? [details.nodeId]
+              : name === 'canvas_rebuild_agent' && typeof params.nodeId === 'string'
+                ? [params.nodeId]
+                : adoptedNodeIds
+          const navigation: CanvasToolNavigationResult | undefined = navigationNodeIds.length > 0
+            ? {
+                status: 'changed', projectId: context.projectId, canvasId: params.canvasId,
+                nodeIds: navigationNodeIds, deletedNodeIds: [], action: 'update',
+                ...(typeof details.revision === 'number' ? { revision: details.revision } : {}),
+                operationId: createOperationId(toolCallId), sourceToolCallId: toolCallId,
+                ...(() => {
+                  const ownerSessionId = context.resolveCanvasNavigationOwnerSessionId?.()
+                  return ownerSessionId ? { ownerSessionId } : {}
+                })(),
+              }
+            : undefined
+          const output = navigation ? { ...details, navigation } : details
           /** 响应总预算是最后一道防线；各业务服务应在读取时限制正文和日志。 */
-          const text = JSON.stringify(details)
+          const text = JSON.stringify(output)
           if (Buffer.byteLength(text, 'utf8') > 64 * 1024) throw new Error('CANVAS_OPERATION_RESPONSE_TOO_LARGE')
-          return { content: [{ type: 'text' as const, text }], details }
+          return { content: [{ type: 'text' as const, text }], details: output }
         } catch (error) {
           /** 未知底层错误不得把磁盘路径、渠道凭据或原始异常带进模型上下文。 */
           const code = error instanceof Error && /^(CANVAS|AGENT_SESSION|DESIGN)_[A-Z0-9_]+$/.test(error.message)

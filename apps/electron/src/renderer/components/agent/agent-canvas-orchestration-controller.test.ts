@@ -58,6 +58,10 @@ function fixture() {
     emitBinding: (value: AgentCanvasBinding | null = bindings[0] ?? null) => bindingListener?.({
       projectId: 'project-1', sessionId: 'session-1', cause: value ? 'linked' : 'session-cleared', binding: value,
     }),
+    /** 活动画布事件仅改变最近焦点，关联集合与专业报告保持原身份。 */
+    emitActive: () => bindingListener?.({
+      projectId: 'project-1', sessionId: 'session-1', cause: 'active-changed', binding: bindings[0] ?? null,
+    }),
     listCalls: () => listCalls,
     recordCalls: () => recordCalls,
     bindingReleases: () => bindingReleases,
@@ -65,6 +69,21 @@ function fixture() {
 }
 
 describe('普通聊天与多画布编排同步', () => {
+  test('Given 已加载协作卡 When 连续切换活动画布 Then 不重复读关联索引或专业报告', async () => {
+    /** 独立控制器统计真实读取调用，不连接实际项目。 */
+    const f = fixture()
+    await f.controller.load()
+    /** 切换前的最小读取基线。 */
+    const listCalls = f.listCalls()
+    const recordCalls = f.recordCalls()
+    for (let index = 0; index < 20; index += 1) f.emitActive()
+    await f.controller.whenIdle()
+    expect(f.listCalls()).toBe(listCalls)
+    expect(f.recordCalls()).toBe(recordCalls)
+    expect(f.controller.getSnapshot().canvases.map(item => item.canvasId)).toEqual(['canvas-a'])
+    f.controller.dispose()
+  })
+
   test('Given 会话关联多个画布 When 加载 Then 保留全部关联且只展示当前owner记录', async () => {
     const f = fixture()
     f.setBindings([binding(['canvas-a', 'canvas-b', 'canvas-c'])])

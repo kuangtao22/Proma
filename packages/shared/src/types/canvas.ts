@@ -52,6 +52,8 @@ export const CANVAS_IPC_CHANNELS = {
   STOP_AGENT: 'canvas:stop-agent',
   LIST_AGENT_BINDINGS: 'canvas:list-agent-bindings',
   LINK_AGENT_CANVAS: 'canvas:link-agent-canvas',
+  /** 仅更新已有关联的最近活动画布，不改变默认画布。 */
+  MARK_AGENT_CANVAS_ACTIVE: 'canvas:mark-agent-canvas-active',
   UNLINK_AGENT_CANVAS: 'canvas:unlink-agent-canvas',
   SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
   CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',
@@ -909,6 +911,7 @@ export interface AgentCanvasBinding {
 /** Agent-Canvas 关联变更的稳定公开原因。 */
 export type AgentCanvasBindingChangeCause =
   | 'linked'
+  | 'active-changed'
   | 'unlinked'
   | 'default-changed'
   | 'session-cleared'
@@ -1029,6 +1032,14 @@ export interface LinkAgentCanvasInput extends CanvasTarget {
 
 /** 建立关联后返回规范化的公开记录。 */
 export type LinkAgentCanvasResult = AgentCanvasBinding
+
+/** 标记普通 Agent 当前可见 Canvas 的输入；目标必须已经关联。 */
+export interface MarkAgentCanvasActiveInput extends CanvasTarget {
+  sessionId: string
+}
+
+/** 更新最近活动 Canvas 后返回规范化的公开记录。 */
+export type MarkAgentCanvasActiveResult = AgentCanvasBinding
 
 /** 解除 Agent 与 Canvas 关联的输入。 */
 export interface UnlinkAgentCanvasInput extends CanvasTarget {
@@ -3134,6 +3145,7 @@ export function parseAgentCanvasBindingChangeEvent(value: unknown): AgentCanvasB
 /** 判断值是否为允许跨 IPC 广播的关联变更原因。 */
 function isAgentCanvasBindingChangeCause(value: unknown): value is AgentCanvasBindingChangeCause {
   return value === 'linked'
+    || value === 'active-changed'
     || value === 'unlinked'
     || value === 'default-changed'
     || value === 'session-cleared'
@@ -3361,6 +3373,16 @@ export function parseLinkAgentCanvasResult(value: unknown): LinkAgentCanvasResul
 /** 严格解析解除 Agent-Canvas 关联的输入。 */
 export function parseUnlinkAgentCanvasInput(value: unknown): UnlinkAgentCanvasInput {
   return parseAgentCanvasTarget(value, 'UNLINK_AGENT_CANVAS_INPUT_INVALID')
+}
+
+/** 严格解析标记当前活动 Canvas 的输入。 */
+export function parseMarkAgentCanvasActiveInput(value: unknown): MarkAgentCanvasActiveInput {
+  return parseAgentCanvasTarget(value, 'MARK_AGENT_CANVAS_ACTIVE_INPUT_INVALID')
+}
+
+/** 严格解析标记当前活动 Canvas 的输出。 */
+export function parseMarkAgentCanvasActiveResult(value: unknown): MarkAgentCanvasActiveResult {
+  return parseAgentCanvasBinding(value)
 }
 
 /** 严格解析解除 Agent-Canvas 关联的输出。 */

@@ -5,6 +5,7 @@ import type {
   CanvasDocument,
   CanvasImagePreview,
   CanvasLayoutRect,
+  CanvasMediaPreloadApi,
   CanvasMutation,
   CanvasNode,
   CanvasNodeActivityState,
@@ -36,6 +37,7 @@ import type {
 } from '@xyflow/react'
 import { CanvasAgentNode } from './CanvasAgentNode'
 import { CanvasNodeCard } from './CanvasNodeCard'
+import { CanvasVideoNodePreview } from './CanvasVideoNodePreview'
 import {
   CanvasWebviewDeviceMenu,
   CanvasWebviewPreview,
@@ -47,6 +49,7 @@ import {
   createViewportCanvasMutation,
   resolveNativeCanvasImageNodeHeight,
   resolveNativeCanvasNodeSize,
+  resolveNativeCanvasVideoNodeHeight,
   patchNativeCanvasFlowNodeRuntimeState,
   toNativeCanvasFlowEdges,
   toNativeCanvasFlowNodes,
@@ -70,9 +73,25 @@ function NativeCanvasImageNode({ data, selected }: NodeProps<NativeCanvasImageFl
   return <CanvasNodeCard {...data} selected={selected} />
 }
 
-/** 渲染通用音视频折叠节点，重媒体只在工作台按需读取。 */
+/** 渲染通用音视频折叠节点；视频只为当前正式采用版本按可见性读取预览。 */
 function NativeCanvasMediaNode({ data, selected }: NodeProps<NativeCanvasMediaFlowNode>): React.ReactElement {
-  return <CanvasNodeCard {...data} selected={selected} />
+  /** 只有正式采用目标与成对预览能力齐备时才挂载视频读取生命周期。 */
+  const preview = data.kind === 'video'
+    && data.mediaProgress?.adoptedVideo
+    && data.readCanvasVideoPreview
+    && data.releaseCanvasVideoPreview
+    ? (
+        <CanvasVideoNodePreview
+          target={data.mediaProgress.adoptedVideo}
+          readPreview={data.readCanvasVideoPreview}
+          releasePreview={data.releaseCanvasVideoPreview}
+          title={data.title}
+          statusLabel={data.statusLabel}
+          mediaProgress={data.mediaProgress}
+        />
+      )
+    : null
+  return <CanvasNodeCard {...data} selected={selected}>{preview}</CanvasNodeCard>
 }
 
 /** 渲染文档折叠节点，不读取 Markdown 正文。 */
@@ -157,6 +176,8 @@ export interface NativeCanvasProjectionCallbackTargets {
   onReferenceNode?: (nodeId: string) => void
   onWorkbenchNodeChange?: (nodeId: string) => void
   loadCanvasWebviewPreview?: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  readCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReadPreview']
+  releaseCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReleasePreview']
   onWebviewDevicePresetChange?: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
 }
 
@@ -167,6 +188,8 @@ export interface NativeCanvasProjectionCallbackBridge {
   onReferenceNode: (nodeId: string) => void
   onWorkbenchNodeChange: (nodeId: string) => void
   loadCanvasWebviewPreview: (target: CanvasWebviewPreviewTarget) => Promise<CanvasWebviewPreviewSnapshot>
+  readCanvasVideoPreview: CanvasMediaPreloadApi['canvasMediaReadPreview']
+  releaseCanvasVideoPreview: CanvasMediaPreloadApi['canvasMediaReleasePreview']
   onWebviewDevicePresetChange: (nodeId: string, devicePreset: CanvasWebviewDevicePreset) => void
 }
 
@@ -178,6 +201,25 @@ export interface NativeCanvasProjectionCallbackBridge {
 export function createNativeCanvasProjectionCallbackBridge(
   initialTargets: NativeCanvasProjectionCallbackTargets,
 ): NativeCanvasProjectionCallbackBridge {
+  /** 每个已读取 lease 固定归还给申请时的 Adapter，避免热切换后错放或泄漏。 */
+  const videoLeaseReleaseOwners = new Map<string, CanvasMediaPreloadApi['canvasMediaReleasePreview']>()
+  /** 目标与 lease 共同标识所有者，隔离不同项目、画布和媒体模块可能重复的 lease ID。 */
+  const createVideoLeaseOwnerKey = (target: {
+    projectId: string
+    canvasId: string
+    nodeId: string
+    mediaModuleId: string
+    mediaKind: 'audio' | 'video'
+    mediaLeaseId: string
+  }): string => [
+    target.projectId,
+    target.canvasId,
+    target.nodeId,
+    target.mediaModuleId,
+    target.mediaKind,
+    target.mediaLeaseId,
+  ].join('\u0000')
+  /** 最新命令实现供尚未开始的新请求使用。 */
   let targets = initialTargets
   return {
     update: (nextTargets) => { targets = nextTargets },
@@ -188,6 +230,24 @@ export function createNativeCanvasProjectionCallbackBridge(
       const loadPreview = targets.loadCanvasWebviewPreview
       if (!loadPreview) return Promise.reject(new Error('Canvas WebView 预览能力不可用'))
       return loadPreview(target)
+    },
+    readCanvasVideoPreview: (target) => {
+      const readPreview = targets.readCanvasVideoPreview
+      /** read 与 release 必须成对捕获，读取完成后才能安全登记 lease 所有者。 */
+      const releasePreview = targets.releaseCanvasVideoPreview
+      if (!readPreview || !releasePreview) return Promise.reject(new Error('Canvas 视频预览能力不可用'))
+      return readPreview(target).then((preview) => {
+        videoLeaseReleaseOwners.set(createVideoLeaseOwnerKey({ ...target, mediaLeaseId: preview.mediaLeaseId }), releasePreview)
+        return preview
+      })
+    },
+    releaseCanvasVideoPreview: (target) => {
+      /** 已登记 lease 优先使用原 Adapter；未登记输入兼容当前 Adapter 的既有释放调用。 */
+      const ownerKey = createVideoLeaseOwnerKey(target)
+      const releasePreview = videoLeaseReleaseOwners.get(ownerKey) ?? targets.releaseCanvasVideoPreview
+      if (!releasePreview) return Promise.reject(new Error('Canvas 视频预览释放能力不可用'))
+      videoLeaseReleaseOwners.delete(ownerKey)
+      return releasePreview(target)
     },
     onWebviewDevicePresetChange: (nodeId, devicePreset) => {
       targets.onWebviewDevicePresetChange?.(nodeId, devicePreset)
@@ -493,6 +553,10 @@ export interface NativeCanvasGraphProps {
   imageCandidateNodeIds?: ReadonlySet<string>
   /** 按媒体节点 ID 聚合的 Comfy 运行阶段与当前节点采样计数。 */
   mediaProgressByNodeId?: ReadonlyMap<string, MediaRunProgressProjection>
+  /** 视频卡片按需读取已正式采用版本的临时预览授权。 */
+  readCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReadPreview']
+  /** 视频版本切换或卡片卸载时释放临时预览授权。 */
+  releaseCanvasVideoPreview?: CanvasMediaPreloadApi['canvasMediaReleasePreview']
   /** Canvas 工作区一次加载得到的素材缩略图索引。 */
   imagePreviews?: ReadonlyMap<string, CanvasImagePreview>
   /** WebView 卡片仅请求受管静态 WebP，不在折叠态加载 HTML。 */
@@ -610,6 +674,8 @@ export function NativeCanvasGraph({
   nodeActivityStates = EMPTY_NODE_ACTIVITY_STATES,
   imageCandidateNodeIds = EMPTY_IMAGE_CANDIDATE_NODE_IDS,
   mediaProgressByNodeId,
+  readCanvasVideoPreview,
+  releaseCanvasVideoPreview,
   imagePreviews,
   loadCanvasWebviewPreview,
   pendingWebviewDeviceNodeIds,
@@ -661,6 +727,8 @@ export function NativeCanvasGraph({
       onReferenceNode,
       onWorkbenchNodeChange,
       loadCanvasWebviewPreview,
+      readCanvasVideoPreview,
+      releaseCanvasVideoPreview,
       onWebviewDevicePresetChange,
     })
   }
@@ -670,6 +738,8 @@ export function NativeCanvasGraph({
     onReferenceNode,
     onWorkbenchNodeChange,
     loadCanvasWebviewPreview,
+    readCanvasVideoPreview,
+    releaseCanvasVideoPreview,
     onWebviewDevicePresetChange,
   })
   /** 可选能力保持原有 presence 合同；存在时使用桥接后的稳定函数。 */
@@ -679,6 +749,12 @@ export function NativeCanvasGraph({
     : undefined
   const webviewDevicePresetChange = onWebviewDevicePresetChange
     ? projectionCallbackBridge.onWebviewDevicePresetChange
+    : undefined
+  const videoPreviewReader = readCanvasVideoPreview
+    ? projectionCallbackBridge.readCanvasVideoPreview
+    : undefined
+  const videoPreviewReleaser = releaseCanvasVideoPreview
+    ? projectionCallbackBridge.releaseCanvasVideoPreview
     : undefined
   const workbenchNodeChange = projectionCallbackBridge.onWorkbenchNodeChange
   /** 首帧纯投影只创建一次，并作为后续三方合并的权威比较基线。 */
@@ -692,6 +768,8 @@ export function NativeCanvasGraph({
       mediaProgressByNodeId,
       imagePreviews,
       loadCanvasWebviewPreview: webviewPreviewLoader,
+      readCanvasVideoPreview: videoPreviewReader,
+      releaseCanvasVideoPreview: videoPreviewReleaser,
       pendingWebviewDeviceNodeIds,
       onWebviewDevicePresetChange: webviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
@@ -723,6 +801,8 @@ export function NativeCanvasGraph({
     canCreateChild,
     writable,
     selectedNodeIdSet: controlledSelectedNodeIdSet,
+    readCanvasVideoPreviewEnabled: Boolean(readCanvasVideoPreview),
+    releaseCanvasVideoPreviewEnabled: Boolean(releaseCanvasVideoPreview),
   })
   /** 上一次运行态输入，用于求出真正受影响的节点 ID 集合。 */
   const runtimeProjectionInputsRef = React.useRef({
@@ -784,6 +864,8 @@ export function NativeCanvasGraph({
       && previousStaticInputs.canCreateChild === canCreateChild
       && previousStaticInputs.writable === writable
       && previousStaticInputs.selectedNodeIdSet === controlledSelectedNodeIdSet
+      && previousStaticInputs.readCanvasVideoPreviewEnabled === Boolean(readCanvasVideoPreview)
+      && previousStaticInputs.releaseCanvasVideoPreviewEnabled === Boolean(releaseCanvasVideoPreview)
     const runtimeInputsChanged = previousRuntimeInputs.runningSessionIds !== runningSessionIds
       || previousRuntimeInputs.nodeActivityStates !== nodeActivityStates
       || previousRuntimeInputs.mediaProgressByNodeId !== mediaProgressByNodeId
@@ -862,6 +944,8 @@ export function NativeCanvasGraph({
         canCreateChild,
         writable,
         selectedNodeIdSet: controlledSelectedNodeIdSet,
+        readCanvasVideoPreviewEnabled: Boolean(readCanvasVideoPreview),
+        releaseCanvasVideoPreviewEnabled: Boolean(releaseCanvasVideoPreview),
       }
       runtimeProjectionInputsRef.current = { runningSessionIds, nodeActivityStates, mediaProgressByNodeId }
       return
@@ -876,6 +960,8 @@ export function NativeCanvasGraph({
       mediaProgressByNodeId,
       imagePreviews,
       loadCanvasWebviewPreview: webviewPreviewLoader,
+      readCanvasVideoPreview: videoPreviewReader,
+      releaseCanvasVideoPreview: videoPreviewReleaser,
       pendingWebviewDeviceNodeIds,
       onWebviewDevicePresetChange: webviewDevicePresetChange,
       canCreateChild: writable && canCreateChild,
@@ -910,9 +996,11 @@ export function NativeCanvasGraph({
       canCreateChild,
       writable,
       selectedNodeIdSet: controlledSelectedNodeIdSet,
+      readCanvasVideoPreviewEnabled: Boolean(readCanvasVideoPreview),
+      releaseCanvasVideoPreviewEnabled: Boolean(releaseCanvasVideoPreview),
     }
     runtimeProjectionInputsRef.current = { runningSessionIds, nodeActivityStates, mediaProgressByNodeId }
-  }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateNodeIds, imagePreviews, mediaProgressByNodeId, nodeActivityStates, nodeIssues, pendingWebviewDeviceNodeIds, referenceNode, runningSessionIds, webviewDevicePresetChange, webviewPreviewLoader, workbenchNodeChange, writable, projectionCallbackBridge])
+  }, [canCreateChild, controlledSelectedNodeIdSet, document, imageCandidateNodeIds, imagePreviews, mediaProgressByNodeId, nodeActivityStates, nodeIssues, pendingWebviewDeviceNodeIds, readCanvasVideoPreview, referenceNode, releaseCanvasVideoPreview, runningSessionIds, videoPreviewReader, videoPreviewReleaser, webviewDevicePresetChange, webviewPreviewLoader, workbenchNodeChange, writable, projectionCallbackBridge])
 
   React.useEffect(() => {
     /** Jotai 视图回显与用户显式定位共用 document prop，必须按本地提交身份区分。 */
@@ -1121,8 +1209,10 @@ export function NativeCanvasGraph({
       ? { ...size, height: resolveNativeCanvasImageNodeHeight(
           workbenchNode.adoptedAssetId ? imagePreviews?.get(workbenchNode.adoptedAssetId) : undefined,
         ) }
+      : workbenchNode.kind === 'video'
+        ? { ...size, height: resolveNativeCanvasVideoNodeHeight(mediaProgressByNodeId?.get(workbenchNode.id)) }
       : size
-  }, [workbenchNode, imagePreviews])
+  }, [workbenchNode, imagePreviews, mediaProgressByNodeId])
   /** 节点身份变化才重建详情，普通拖动与视口变化保留正文组件。 */
   const workbench = workbenchNode && workbenchSize && renderWorkbench
     ? <NativeCanvasWorkbenchGeometry

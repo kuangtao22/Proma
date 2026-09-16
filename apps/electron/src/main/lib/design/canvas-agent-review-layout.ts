@@ -1,4 +1,6 @@
 import {
+  CANVAS_IMAGE_NODE_WIDTH,
+  CANVAS_IMAGE_NODE_MAX_HEIGHT,
   createCanvasLayoutSpatialIndex,
   findCompactCanvasSlot,
 } from '@proma/shared'
@@ -10,10 +12,10 @@ import type {
   DesignPoint,
 } from '@proma/shared'
 
-/** 普通 Agent 和媒体节点的稳定卡片尺寸。 */
+/** 普通 Agent 和无预览节点的稳定卡片尺寸。 */
 const STANDARD_NODE_SIZE: CanvasLayoutSize = { width: 288, height: 144 }
-/** 已采用图片缺少预览比例元数据时，按 Renderer 允许的最大高度保守避让。 */
-const ADOPTED_IMAGE_MAX_NODE_SIZE: CanvasLayoutSize = { width: 288, height: 368 }
+/** 已采用图片与视频缺少预览比例元数据时，按 Renderer 允许的最大高度保守避让。 */
+const MEDIA_PREVIEW_MAX_NODE_SIZE: CanvasLayoutSize = { width: CANVAS_IMAGE_NODE_WIDTH, height: CANVAS_IMAGE_NODE_MAX_HEIGHT }
 /** 桌面 WebView 的稳定卡片尺寸。 */
 const DESKTOP_WEBVIEW_SIZE: CanvasLayoutSize = { width: 384, height: 316 }
 /** 手机 WebView 的稳定卡片尺寸。 */
@@ -29,7 +31,7 @@ const MAX_REVIEW_TARGETS = 128
  * 入参为已持久化 Canvas 节点，返回值与 Renderer 固定卡片尺寸一致。
  */
 function resolveCanvasNodeSize(node: CanvasNode): CanvasLayoutSize {
-  if (node.kind === 'image' && node.adoptedAssetId !== undefined) return ADOPTED_IMAGE_MAX_NODE_SIZE
+  if (node.kind === 'video' || (node.kind === 'image' && node.adoptedAssetId !== undefined)) return MEDIA_PREVIEW_MAX_NODE_SIZE
   if (node.kind !== 'webview') return STANDARD_NODE_SIZE
   return node.devicePreset === 'mobile' ? MOBILE_WEBVIEW_SIZE : DESKTOP_WEBVIEW_SIZE
 }

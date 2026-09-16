@@ -22,6 +22,8 @@ import type {
   CanvasRunWorkflowResult,
   SaveCanvasImageModuleInput,
   CanvasTarget,
+  CanvasToolNavigationAction,
+  CanvasToolNavigationResult,
   CanvasWorkspaceSnapshot,
   CanvasWorkflowRun,
   DesignJobRecord,
@@ -544,6 +546,10 @@ export interface CanvasToolRunContext {
   runStartedAt: number
   explicitReferences: CanvasNodeReference[]
   permissionCeiling: CanvasToolPermissionCeiling
+  /** 已授权运行在创建工具前捕获的活动画布；缺省时保持懒读取兼容独立调用。 */
+  initialCanvasId?: string | null
+  /** 成功写入后由 Host 懒复验并签发修改摘要归属，不接受模型参数。 */
+  resolveCanvasNavigationOwnerSessionId?: () => string | undefined
   /** 仅交互式 Renderer 运行绑定保存窗口；后台运行缺省后禁止隐式弹窗。 */
   dialogOwnerWebContentsId?: number
   /** Canvas 内部 Agent 只能访问自身所属画布，不能管理普通 Agent 的画布关联。 */
@@ -671,6 +677,81 @@ function toolResult(details: Record<string, unknown>, compact = false): AgentToo
   /** canvas_read 使用紧凑文本以复用同一预算口径，其它短响应保留格式化可读性。 */
   const text = compact ? JSON.stringify(details) : JSON.stringify(details, null, 2)
   return { content: [{ type: 'text', text }], details }
+}
+
+/** 从主进程可信写入事实构造统一导航回执，不参与下一次工具的目标选择。 */
+function createCanvasToolNavigation(
+  context: CanvasToolRunContext,
+  canvasId: string,
+  nodeIds: readonly string[],
+  action: CanvasToolNavigationAction,
+  options: {
+    deletedNodeIds?: readonly string[]
+    revision?: number
+    operationId?: string
+    sourceToolCallId?: string
+  } = {},
+): CanvasToolNavigationResult {
+  return {
+    status: 'changed',
+    projectId: context.projectId,
+    canvasId,
+    nodeIds: [...new Set(nodeIds)],
+    deletedNodeIds: [...new Set(options.deletedNodeIds ?? [])],
+    action,
+    ...(options.revision === undefined ? {} : { revision: options.revision }),
+    ...(options.operationId ? { operationId: options.operationId } : {}),
+    ...(options.sourceToolCallId ? { sourceToolCallId: options.sourceToolCallId } : {}),
+    ...(() => {
+      const ownerSessionId = context.resolveCanvasNavigationOwnerSessionId?.()
+      return ownerSessionId ? { ownerSessionId } : {}
+    })(),
+  }
+}
+
+/** 从结构事务前后快照提取仍可定位节点与已删除节点；纯视口变化不产生导航。 */
+function createMutationNavigation(
+  context: CanvasToolRunContext,
+  before: CanvasDocument,
+  after: CanvasDocument,
+  operations: readonly CanvasMutation[],
+  operationId: string,
+  sourceToolCallId: string,
+): CanvasToolNavigationResult | undefined {
+  /** 旧边用于解析 remove-edges 的真实端点，不能相信调用方另传节点。 */
+  const oldEdgesById = new Map(before.edges.map((edge) => [edge.id, edge]))
+  /** 所有受影响节点先按操作归集，再按提交后是否存在拆分。 */
+  const affectedNodeIds = new Set<string>()
+  const requestedDeletedNodeIds = new Set<string>()
+  for (const operation of operations) {
+    if (operation.type === 'move-nodes') operation.positions.forEach((position) => affectedNodeIds.add(position.nodeId))
+    else if (operation.type === 'upsert-nodes') operation.nodes.forEach((node) => affectedNodeIds.add(node.id))
+    else if (operation.type === 'remove-nodes') operation.nodeIds.forEach((nodeId) => requestedDeletedNodeIds.add(nodeId))
+    else if (operation.type === 'upsert-edges') operation.edges.forEach((edge) => {
+      affectedNodeIds.add(edge.sourceNodeId)
+      affectedNodeIds.add(edge.targetNodeId)
+    })
+    else if (operation.type === 'remove-edges') operation.edgeIds.forEach((edgeId) => {
+      const edge = oldEdgesById.get(edgeId)
+      if (!edge) return
+      affectedNodeIds.add(edge.sourceNodeId)
+      affectedNodeIds.add(edge.targetNodeId)
+    })
+    else if (operation.type === 'set-webview-device-preset') affectedNodeIds.add(operation.nodeId)
+  }
+  const survivingNodeIds = new Set(after.nodes.map((node) => node.id))
+  const nodeIds = [...affectedNodeIds].filter((nodeId) => survivingNodeIds.has(nodeId))
+  const deletedNodeIds = [...requestedDeletedNodeIds].filter((nodeId) => !survivingNodeIds.has(nodeId))
+  if (nodeIds.length === 0 && deletedNodeIds.length === 0) return undefined
+  const action: CanvasToolNavigationAction = deletedNodeIds.length > 0 && nodeIds.length === 0
+    ? 'delete'
+    : operations.length > 1 || nodeIds.length + deletedNodeIds.length > 1 ? 'batch' : 'update'
+  return createCanvasToolNavigation(context, after.canvasId, nodeIds, action, {
+    deletedNodeIds,
+    revision: after.revision,
+    operationId,
+    sourceToolCallId,
+  })
 }
 
 /** 保留 TypeBox schema 对 execute 参数的静态推断。 */
@@ -841,6 +922,14 @@ export function createCanvasToolRun(
 ): CanvasToolRun {
   /** 本轮访问上下文始终 fresh-read binding，不缓存扩大后的权限。 */
   const getContext = (): AgentCanvasBinding | null => dependencies.access.getBinding(context)
+  /** 上层可在授权后固定活动目标；独立调用缺省时仍于首次读取懒初始化。 */
+  let runStartCanvasId: string | null | undefined = context.initialCanvasId
+  /** 固定目标解绑后明确失效，不能把同一轮后续调用静默导向另一张画布。 */
+  const resolveRunCanvasId = (binding: AgentCanvasBinding | null): string | null => {
+    if (runStartCanvasId === undefined) runStartCanvasId = binding?.lastActiveCanvasId ?? binding?.defaultCanvasId ?? null
+    if (!runStartCanvasId) return null
+    return binding?.linkedCanvasIds.includes(runStartCanvasId) ? runStartCanvasId : null
+  }
 
   /** 每次异步读取后复核停止和当前授权，不能把撤权降级为某个节点读取失败。 */
   const assertReadAccess = (canvasId: string, signal?: AbortSignal): void => {
@@ -928,6 +1017,29 @@ export function createCanvasToolRun(
   /** 只有可信编排者绑定最终合同；专业步骤保持各自的局部交付。 */
   const orchestrationRecord = context.canvasAgentMode === 'canvas-orchestrator' && context.canvasAgentTarget
     ? dependencies.orchestration?.get(context.canvasAgentTarget) : null
+  /** 仅持久编排记录和真实 Agent 节点共同证明归属时，给后台摘要签发普通聊天 owner。 */
+  const resolveNavigationOwnerSessionId = (): string | undefined => {
+    if (!context.canvasAgentMode || !context.canvasAgentTarget || !context.canvasOrchestrationId || !dependencies.orchestration) return undefined
+    const record = dependencies.orchestration.get(context.canvasAgentTarget)
+    if (!record || record.id !== context.canvasOrchestrationId || record.projectId !== context.projectId
+      || record.canvasId !== context.canvasAgentTarget.canvasId) return undefined
+    if (context.canvasAgentMode === 'canvas-orchestrator') {
+      return record.coordinatorSessionId === context.sessionId && record.runStartedAt === context.runStartedAt
+        ? record.ownerSessionId
+        : undefined
+    }
+    if (context.canvasAgentMode !== 'parent-orchestrated' || record.coordinatorSessionId !== context.canvasOrchestrationParentSessionId) return undefined
+    const step = record.steps.find(candidate => candidate.id === context.canvasOrchestrationStepId
+      && candidate.agentNodeId === context.canvasAgentTarget!.nodeId)
+    const node = dependencies.documents.load(record).document.nodes.find(candidate => candidate.id === context.canvasAgentTarget!.nodeId)
+    return step && node?.kind === 'agent' && node.agentSessionId === context.sessionId
+      ? record.ownerSessionId
+      : undefined
+  }
+  /** 子工具只持有懒复验入口，Provider 构造阶段不读取编排 Store 或画布文档。 */
+  const toolContext: CanvasToolRunContext = context.canvasAgentMode && context.canvasOrchestrationId
+    ? { ...context, resolveCanvasNavigationOwnerSessionId: resolveNavigationOwnerSessionId }
+    : context
   const taskOptions = {
     ...(orchestrationRecord ? { taskId: orchestrationRecord.id } : {}),
     required: (context.canvasAgentMode === 'parent-orchestrated' || context.canvasAgentMode === 'canvas-orchestrator') && context.permissionCeiling === 'execute',
@@ -974,11 +1086,11 @@ export function createCanvasToolRun(
     /** 预算回调只来自真实编排服务；图片运行器在全部预检后调用。 */
     const executionContext: CanvasToolRunContext = context.canvasAgentMode === 'canvas-orchestrator'
       && context.canvasAgentTarget && context.canvasOrchestrationId && dependencies.orchestration
-      ? { ...context, reserveMediaRuns: (operationId, count) => {
+      ? { ...toolContext, reserveMediaRuns: (operationId, count) => {
         dependencies.orchestration!.reserveMedia({ projectId: context.projectId, canvasId: context.canvasAgentTarget!.canvasId,
           sessionId: context.sessionId, orchestrationId: context.canvasOrchestrationId!, runStartedAt: context.runStartedAt }, count,
         createHash('sha256').update(JSON.stringify([context.runStartedAt, operationId])).digest('hex'))
-      } } : context
+      } } : toolContext
     if (started.phase !== 'working') return executionContext
     return { ...executionContext, onImageJobsCreated: (canvasId, jobs) => {
       if (task === executionTask && canvasId === started.canvasId && executionTask.status().phase === 'working') {
@@ -1191,7 +1303,7 @@ export function createCanvasToolRun(
         if (registeredCanvasId) assertReadAccess(registeredCanvasId, signal)
         /** 只读状态查询不使本轮咨询继承旧任务的完成责任。 */
         if (params.action === 'status' && !registeredCanvasId && dependencies.taskStore) {
-          const canvasId = params.canvasId ?? getContext()?.lastActiveCanvasId ?? getContext()?.defaultCanvasId
+          const canvasId = params.canvasId ?? resolveRunCanvasId(getContext())
           const stored = canvasId ? readStoredTask(canvasId) : null
           return toolResult(stored ? { ...projectCanvasTaskStatus(stored.state),
             resumable: true, nextAction: { tool: 'canvas_task', action: 'resume', canvasId, taskId: stored.state.taskId },
@@ -1270,22 +1382,23 @@ export function createCanvasToolRun(
       execute: async () => {
         dependencies.access.authorizeRead(context)
         const binding = getContext()
+        const activeCanvasId = resolveRunCanvasId(binding)
         return toolResult({
           projectId: context.projectId,
           ...(orchestrationRecord ? { orchestration: { id: orchestrationRecord.id,
             taskId: orchestrationRecord.id, requiredDeliverables: canvasOrchestrationRequirements(orchestrationRecord) } } : {}),
           linkedCanvasIds: binding?.linkedCanvasIds ?? [],
           defaultCanvasId: binding?.defaultCanvasId ?? null,
-          activeCanvasId: binding?.lastActiveCanvasId ?? null,
+          activeCanvasId,
           explicitReferences: context.explicitReferences.map((reference) => ({
             canvasId: reference.canvasId, nodeId: reference.nodeId, nodeType: reference.nodeType,
             nodeRevision: reference.nodeRevision, title: reference.title,
           })),
           permissionCeiling: context.permissionCeiling,
           task: task.status(),
-          ...(dependencies.taskStore && (binding?.lastActiveCanvasId ?? binding?.defaultCanvasId) ? {
+          ...(dependencies.taskStore && activeCanvasId ? {
             resumableTask: (() => {
-              const stored = readStoredTask((binding!.lastActiveCanvasId ?? binding!.defaultCanvasId)!)
+              const stored = readStoredTask(activeCanvasId)
               return stored ? { taskId: stored.state.taskId, canvasId: stored.state.canvasId,
                 phase: stored.state.phase, requirements: stored.state.requirements,
                 blockingReason: stored.state.blockingReason } : null
@@ -1794,6 +1907,9 @@ export function createCanvasToolRun(
           dependencies.access.requireLinkedCanvas(context, params.canvasId)
           const target = { projectId: context.projectId, canvasId: params.canvasId }
           const rawOperations = structuredClone(params.operations)
+          /** 保留最终实际提交的规范化操作和对应旧图，用于生成精确节点导航。 */
+          let committedOperations: CanvasMutation[] = []
+          let committedBaseDocument: CanvasDocument | null = null
           const execute = (baseRevision: number, sourceToolCallId: string): Promise<CanvasBatchOperationResult> => {
             const operations = dependencies.documents.validateBatchOperations(target, baseRevision, rawOperations)
             /** 媒体候选范围由用户导航选择，普通生成工具不能扩大或改写该范围。 */
@@ -1817,6 +1933,8 @@ export function createCanvasToolRun(
               sourceRunStartedAt: context.runStartedAt,
               sourceToolCallId,
             })
+            committedOperations = operations
+            committedBaseDocument = document
             return dependencies.batch.execute(envelope)
           }
           let sourceToolCallId = toolCallId
@@ -1829,7 +1947,11 @@ export function createCanvasToolRun(
             sourceToolCallId = createRetrySourceToolCallId(toolCallId)
             result = await execute(dependencies.documents.load(target).document.revision, sourceToolCallId)
           }
-          return toolResult({ canvasId: params.canvasId, revision: result.document.revision, operationId: result.operationId, sourceToolCallId })
+          const navigation = committedBaseDocument
+            ? createMutationNavigation(toolContext, committedBaseDocument, result.document, committedOperations, result.operationId, toolCallId)
+            : undefined
+          return toolResult({ canvasId: params.canvasId, revision: result.document.revision, operationId: result.operationId, sourceToolCallId,
+            ...(navigation ? { navigation } : {}) })
         })
       },
     }),
@@ -1874,6 +1996,9 @@ export function createCanvasToolRun(
             nodeId: result.nodeId,
             revision: result.revision,
             sourceToolCallId: result.sourceToolCallId,
+            navigation: createCanvasToolNavigation(toolContext, result.canvasId, [result.nodeId], 'create', {
+              revision: result.revision, sourceToolCallId: toolCallId,
+            }),
             ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
           })
         })
@@ -1925,6 +2050,9 @@ export function createCanvasToolRun(
             revision: result.revision,
             artifactType: 'image',
             sourceToolCallId: result.sourceToolCallId,
+            navigation: createCanvasToolNavigation(toolContext, result.canvasId, [result.nodeId], 'create', {
+              revision: result.revision, sourceToolCallId: toolCallId,
+            }),
             ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
@@ -1979,6 +2107,9 @@ export function createCanvasToolRun(
             revision: result.revision,
             artifactType: params.artifactType,
             sourceToolCallId: result.sourceToolCallId,
+            navigation: createCanvasToolNavigation(toolContext, result.canvasId, [result.nodeId], 'create', {
+              revision: result.revision, sourceToolCallId: toolCallId,
+            }),
             ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
@@ -2024,6 +2155,9 @@ export function createCanvasToolRun(
             mediaKind: params.mediaKind,
             configRevision: 0,
             requiresConfiguration: true,
+            navigation: createCanvasToolNavigation(toolContext, result.canvasId, [result.nodeId], 'create', {
+              revision: result.revision, sourceToolCallId: toolCallId,
+            }),
             ...(result.taskRegistration ? { taskRegistration: result.taskRegistration } : {}),
             ...await registerCreatedSuccessor(result),
           })
@@ -2055,12 +2189,14 @@ export function createCanvasToolRun(
           if (node.kind === 'document' || node.kind === 'webview') {
             /** 文本类别对应的稳定内容 ID。 */
             const contentId = node.kind === 'document' ? node.documentId : node.prototypeId
+            /** 同一身份同时进入正文事务和导航去重，不从正文 revision 冒充图版本。 */
+            const operationId = createArtifactOperationId(context, toolCallId)
             const result = await dependencies.textArtifacts.update({
               ...target,
               nodeId: node.id,
               kind: node.kind,
               contentId,
-              operationId: createArtifactOperationId(context, toolCallId),
+              operationId,
               expectedCanvasRevision: params.baseRevision,
               expectedContentRevision: params.expectedContentRevision,
               content: params.content,
@@ -2075,6 +2211,9 @@ export function createCanvasToolRun(
               kind: node.kind,
               revision: result.snapshot.document.revision,
               contentRevision: result.artifact.target.contentRevision,
+              navigation: createCanvasToolNavigation(toolContext, params.canvasId, [node.id], 'update', {
+                revision: result.snapshot.document.revision, operationId, sourceToolCallId: toolCallId,
+              }),
             })
           }
           if (node.kind === 'image') {
@@ -2101,6 +2240,9 @@ export function createCanvasToolRun(
               revision: document.revision,
               contentRevision: config.revision,
               requiresRun: true,
+              navigation: createCanvasToolNavigation(toolContext, params.canvasId, [node.id], 'update', {
+                revision: document.revision, sourceToolCallId: toolCallId,
+              }),
             })
           }
           throw new Error('CANVAS_ARTIFACT_TYPE_UNSUPPORTED')
@@ -2159,7 +2301,7 @@ export function createCanvasToolRun(
           Type.Literal('auto'), Type.Literal('project'), Type.Literal('none'),
         ])),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
@@ -2232,6 +2374,9 @@ export function createCanvasToolRun(
             revision: document.revision,
             configRevision: config.revision,
             requiresRun: true,
+            navigation: createCanvasToolNavigation(toolContext, params.canvasId, [node.id], 'update', {
+              revision: document.revision, sourceToolCallId: toolCallId,
+            }),
           })
         })
       },
@@ -2256,7 +2401,7 @@ export function createCanvasToolRun(
         inputs: Type.Optional(Type.Array(CANVAS_MEDIA_INPUT_SCHEMA, { maxItems: 128 })),
         outputs: Type.Optional(Type.Array(CANVAS_MEDIA_OUTPUT_SCHEMA, { maxItems: 128 })),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
@@ -2305,6 +2450,9 @@ export function createCanvasToolRun(
             configRevision: config.revision,
             connectionStatus,
             requiresRun: true,
+            navigation: createCanvasToolNavigation(toolContext, params.canvasId, [params.nodeId], 'update', {
+              revision: responseRevision, sourceToolCallId: toolCallId,
+            }),
           })
         })
       },
@@ -2375,7 +2523,7 @@ export function createCanvasToolRun(
         expectedConfigRevision: Type.Integer({ minimum: 0 }),
         runId: Type.String({ minLength: 1, maxLength: 128 }),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         if (context.canvasAgentMode) throw new Error('CANVAS_MEDIA_ATTACH_PROJECT_AGENT_REQUIRED')
@@ -2406,6 +2554,9 @@ export function createCanvasToolRun(
               role: output.role,
               order: output.order,
             })),
+            navigation: createCanvasToolNavigation(toolContext, params.canvasId, [params.nodeId], 'update', {
+              revision: document.revision, sourceToolCallId: toolCallId,
+            }),
             adopted: false,
           })
         })
@@ -2445,7 +2596,7 @@ export function createCanvasToolRun(
         candidateId: Type.String({ minLength: 1, maxLength: 128 }),
         selectedKeys: Type.Array(Type.String({ minLength: 1, maxLength: 256 }), { minItems: 1, maxItems: 128 }),
       }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
@@ -2466,6 +2617,9 @@ export function createCanvasToolRun(
             mediaKind: mediaTarget.mediaKind,
             configRevision: config.revision,
             adoptedOutputKeys: config.adoptedOutputs.map((output) => output.key),
+            navigation: createCanvasToolNavigation(toolContext, params.canvasId, [params.nodeId], 'update', {
+              revision: document.revision, sourceToolCallId: toolCallId,
+            }),
           })
         })
       },
@@ -2487,7 +2641,7 @@ export function createCanvasToolRun(
           modelId: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()])),
         }, { additionalProperties: false }),
       }, { additionalProperties: false }),
-      execute: async (_toolCallId, params) => {
+      execute: async (toolCallId, params) => {
         dependencies.access.authorizeRead(context)
         if (context.permissionCeiling === 'plan') throw new Error('CANVAS_EXECUTE_INTENT_REQUIRED')
         return dependencies.access.runWrite(context, async () => {
@@ -2518,6 +2672,9 @@ export function createCanvasToolRun(
             skillNames: config.skillNames,
             channelId: config.channelId,
             modelId: config.modelId,
+            navigation: createCanvasToolNavigation(toolContext, config.canvasId, [config.nodeId], 'update', {
+              revision: params.expectedGraphRevision, sourceToolCallId: toolCallId,
+            }),
           })
         })
       },
@@ -2619,6 +2776,8 @@ export function createCanvasToolRun(
         /** 正式 pointer 对应的权威正文只用于生成有界摘要，不回查任意末条消息。 */
         const output = await dependencies.agentOutputs.readAtPointer(agentTarget, result.output.pointer)
         assertReadAccess(params.canvasId, signal)
+        /** Agent 正式输出提交后读取当前图版本，导航不能拿启动基线冒充完成版本。 */
+        const completedRevision = dependencies.documents.load(target).document.revision
         return toolResult({
           nodeId: node.id,
           nodeTitle: node.title,
@@ -2626,6 +2785,9 @@ export function createCanvasToolRun(
           outputPointer: result.output.pointer,
           downstreamNodeIds: result.output.downstreamNodeIds,
           outputSummary: truncateUtf8(output, MAX_AGENT_RUN_OUTPUT_SUMMARY_BYTES),
+          navigation: createCanvasToolNavigation(toolContext, params.canvasId, [node.id], 'update', {
+            revision: completedRevision, sourceToolCallId: toolCallId,
+          }),
           ...(result.reviewCoverage ? { reviewCoverage: result.reviewCoverage } : {}),
         })
       },
@@ -2796,12 +2958,12 @@ export function createCanvasToolRun(
 
   /** 仅向模型开放已完成生产装配的新操作；缺少处理器时不宣告对应能力。 */
   const operationTools = createCanvasOperationTools(
-    dependencies.operations ?? {}, context, dependencies.access,
+    dependencies.operations ?? {}, toolContext, dependencies.access,
     (toolCallId) => createArtifactOperationId(context, toolCallId),
     taskExecutionContext,
   )
   tools.push(...operationTools)
-  tools.push(...createCanvasImageCandidateTools(dependencies, context, prepareInspectionThumbnail))
+  tools.push(...createCanvasImageCandidateTools(dependencies, toolContext, prepareInspectionThumbnail))
 
   if (dependencies.canvasMedia.attachImportedAssets) tools.push(defineCanvasTool({
     name: 'canvas_attach_media_assets', label: '回填本地媒体产物',
@@ -2847,6 +3009,9 @@ export function createCanvasToolRun(
             key: output.key, mediaKind: output.mediaKind, role: output.role, order: output.order,
           })),
           adopted: false,
+          navigation: createCanvasToolNavigation(toolContext, params.canvasId, [params.nodeId], 'update', {
+            revision: document.revision, operationId, sourceToolCallId: toolCallId,
+          }),
         })
       })
     },
@@ -2854,7 +3019,7 @@ export function createCanvasToolRun(
   /** Canvas Agent 的可信模式只缩减能力；普通 Agent 继续保留既有工具与审批。 */
   const mediaRun = dependencies.mediaTools?.(context)
   if (mediaRun) tools.push(...mediaRun.piCustomTools)
-  if (dependencies.orchestration) tools.push(...createCanvasOrchestrationTools({ service: dependencies.orchestration, access: dependencies.access }, context))
+  if (dependencies.orchestration) tools.push(...createCanvasOrchestrationTools({ service: dependencies.orchestration, access: dependencies.access }, toolContext))
   if (dependencies.mediaInspection) {
     const inspection = dependencies.mediaInspection
     tools.push(...createCanvasTaskMediaReview({

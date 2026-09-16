@@ -598,7 +598,6 @@ describe('Agent 右侧 Canvas 适配器', () => {
         paneActive
         onCreateCanvas={async () => true}
         onOpenCanvas={async () => true}
-        onSetDefaultCanvas={async () => true}
         onToggleArchiveCanvas={async () => true}
         onRequestDeleteCanvas={() => undefined}
       />,
@@ -663,7 +662,6 @@ describe('Agent 右侧 Canvas 适配器', () => {
       onCreateCanvas: async () => true,
       onOpenCanvas: async () => true,
       onRenameCanvas: async () => true,
-      onSetDefaultCanvas: async () => true,
       onToggleArchiveCanvas: async () => true,
       onRequestDeleteCanvas: () => undefined,
     })

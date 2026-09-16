@@ -45,7 +45,7 @@ async function clickButton(window: BrowserWindow, label: string, scope = workben
 /** 切换 fixture 模式并等待新工作台完成 LOAD。 */
 async function setMode(window: BrowserWindow, mode: 'normal' | 'readonly' | 'empty' | 'error' | 'preview-error'): Promise<void> {
   await window.webContents.executeJavaScript(`window.__mediaWorkbenchLayoutSmoke.setMode(${JSON.stringify(mode)})`)
-  await waitFor(window, `document.querySelector(${JSON.stringify(workbench)}) || document.body.textContent.includes('隔离加载失败')`, `模式 ${mode} 未挂载`)
+  await waitFor(window, `document.querySelector(${JSON.stringify(workbench)}) || document.body.textContent.includes('媒体模块加载失败。')`, `模式 ${mode} 未挂载`)
   if (mode !== 'error') await waitFor(window, `!document.body.textContent.includes('加载媒体模块')`, `模式 ${mode} 未完成加载`)
 }
 /** 验证桌面左右布局、独立滚动、媒体预览和全部业务按钮参数。 */
@@ -65,9 +65,9 @@ async function verifyWide(window: BrowserWindow): Promise<void> {
   ], '空选择应按创建时间自动预览首份视频主输出')
   assert.equal(await window.webContents.executeJavaScript(`(() => {
     const pane = document.querySelector(${JSON.stringify(previewSection)});
-    const confirm = [...pane.querySelectorAll('button')].find((button) => button.textContent.trim() === '确认采用');
-    return pane.textContent.includes('当前默认') && confirm && !confirm.disabled;
-  })()`), true, '自动首选应标记为当前默认，并保留显式确认采用入口')
+    const confirm = [...pane.querySelectorAll('button')].find((button) => button.textContent.trim() === '确认此版本');
+    return pane.textContent.includes('已默认采用') && confirm && !confirm.disabled;
+  })()`), true, '自动首选应明确显示已默认采用，并保留显式确认版本入口')
 
   await window.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(configSection)} + ' details')?.setAttribute('open', '')`)
   const stableRects = await window.webContents.executeJavaScript(`(() => {
@@ -86,7 +86,13 @@ async function verifyWide(window: BrowserWindow): Promise<void> {
   })()`), true, '配置滚动改变了左栏或主操作 footer 的位置')
 
   await clickButton(window, '预览', previewSection, 0)
-  await waitFor(window, `document.querySelector(${JSON.stringify(`${previewSection} video`)})?.readyState >= 2`, '视频候选没有加载真实媒体帧')
+  // 先确认 React 已切到新 lease，再等待可解码帧，避免误用旧视频的 readyState。
+  await waitFor(window, `(() => {
+    const video = document.querySelector(${JSON.stringify(`${previewSection} video`)});
+    const urls = [...window.__mediaWorkbenchLayoutSmoke.previewUrls.values()];
+    return window.__mediaWorkbenchLayoutSmoke.previewCalls.length >= 2
+      && video?.src === urls.at(-1) && video.readyState >= 2 && video.videoWidth > 0;
+  })()`, '视频候选没有加载真实媒体帧')
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(`${previewSection} video`)}).videoWidth > 0`), true, '视频候选没有可解码画面')
   await window.webContents.executeJavaScript(`(() => {
     const video = document.querySelector(${JSON.stringify(`${previewSection} video`)});
@@ -162,14 +168,14 @@ async function verifyStates(window: BrowserWindow): Promise<void> {
   assert.equal(await window.webContents.executeJavaScript(`document.querySelectorAll(${JSON.stringify(`${previewSection} button`)}).length`), 0, '空候选仍显示候选操作')
   const previewCallsBeforeFailure = await window.webContents.executeJavaScript('window.__mediaWorkbenchLayoutSmoke.previewCalls.length')
   await setMode(window, 'preview-error')
-  await waitFor(window, `document.querySelector(${JSON.stringify(`${previewSection} [role=alert]`)})?.textContent.includes('隔离预览读取失败')`, '默认预览读取错误没有显示')
+  await waitFor(window, `document.querySelector(${JSON.stringify(`${previewSection} [role=alert]`)})?.textContent.includes('视频预览加载失败，请重试。')`, '默认预览读取错误没有显示')
   await new Promise<void>((resolve) => setTimeout(resolve, 200))
   assert.equal(await window.webContents.executeJavaScript('window.__mediaWorkbenchLayoutSmoke.previewCalls.length'), previewCallsBeforeFailure + 1, '默认预览失败后发生了无限自动重试')
   await clickButton(window, '预览', previewSection, 0)
   await waitFor(window, `document.querySelector(${JSON.stringify(`${previewSection} video`)})?.readyState >= 2`, '用户手动重试没有恢复视频预览')
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector(${JSON.stringify(`${previewSection} [role=alert]`)}) === null`), true, '手动重试成功后仍残留预览错误')
   await setMode(window, 'error')
-  await waitFor(window, `document.body.textContent.includes('隔离加载失败') && [...document.querySelectorAll('button')].some((button) => button.textContent.trim() === '重试')`, 'LOAD 错误或重试入口不可见')
+  await waitFor(window, `document.body.textContent.includes('媒体模块加载失败。') && [...document.querySelectorAll('button')].some((button) => button.textContent.trim() === '重试')`, 'LOAD 错误或重试入口不可见')
 }
 
 /** 验证窄容器采用上下布局、内容无横向溢出且两区仍可滚动访问。 */
@@ -216,7 +222,7 @@ async function verifyNarrow(window: BrowserWindow): Promise<void> {
   })()`), true, '430x320 工作台的主操作或上下区域不可见')
   await window.webContents.executeJavaScript('window.__mediaWorkbenchLayoutSmoke.failNextSave = true')
   await clickButton(window, '保存', operationFooter)
-  await waitFor(window, `document.querySelector(${JSON.stringify(`${operationFooter} [role=alert]`)})?.textContent.includes('保存失败')`, '保存失败没有显示在固定操作区')
+  await waitFor(window, `document.querySelector(${JSON.stringify(`${operationFooter} [role=alert]`)})?.textContent.includes('媒体操作失败。')`, '保存失败的公开提示没有显示在固定操作区')
   const errorGeometry = await window.webContents.executeJavaScript(`(() => {
     const shell = document.querySelector('[data-smoke-shell]').getBoundingClientRect();
     const footer = document.querySelector(${JSON.stringify(operationFooter)}).getBoundingClientRect();

@@ -5,6 +5,8 @@ import type { CanvasMediaInputBinding, CanvasMediaTarget } from './canvas-media'
 /** 单个输入的连接事实；连通不表示上游已有可消费产物。 */
 export interface CanvasMediaInputConnection {
   inputKey: string
+  /** 固定值与跟随节点输出分别表达，连线存在不能替代实际输入绑定。 */
+  sourceType: CanvasMediaInputBinding['source']['type']
   sourceNodeId: string | null
   errorCode: string | null
   message: string
@@ -114,7 +116,11 @@ function inspectIndexedConnections(
   /** 同来源的首尾帧槽位可共用一条类型化依赖。 */
   const planned = new Map<string, Omit<CanvasEdge, 'id'>>()
   const bindings = inputs.map((input): CanvasMediaInputConnection => {
-    if (input.source.type === 'literal') return { inputKey: input.key, sourceNodeId: null, errorCode: null, message: '' }
+    if (input.source.type === 'literal') return {
+      inputKey: input.key, sourceType: 'literal', sourceNodeId: null, errorCode: null,
+      message: ['image', 'video', 'audio'].includes(input.kind)
+        ? '使用固定素材，不跟随画布连线；修改上游节点不会更新此输入。' : '使用直接填写的值。',
+    }
     const source = nodes.get(input.source.nodeId)
     const isAv = source?.kind === 'audio' || source?.kind === 'video'
     let errorCode: string | null = !source ? 'CANVAS_MEDIA_SOURCE_NODE_MISSING'
@@ -132,7 +138,7 @@ function inspectIndexedConnections(
         planned.set(JSON.stringify([edge.sourceNodeId, edge.sourcePort, edge.targetNodeId, edge.targetPort]), edge)
       }
     }
-    return { inputKey: input.key, sourceNodeId: input.source.nodeId, errorCode,
+    return { inputKey: input.key, sourceType: 'canvas-output', sourceNodeId: input.source.nodeId, errorCode,
       message: errorCode ? getCanvasMediaInputErrorMessage(errorCode) : '' }
   })
   return { connected: bindings.every((binding) => binding.errorCode === null), bindings, missingEdges: [...planned.values()] }

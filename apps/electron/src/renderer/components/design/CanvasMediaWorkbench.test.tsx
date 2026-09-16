@@ -455,6 +455,16 @@ describe('CanvasMediaWorkbench', () => {
     expect(html).toContain('待选择素材。')
   })
 
+  test('Given 固定图片输入 When 渲染工作流表单 Then 明示不跟随上游且不要求重新生成', () => {
+    /** 使用既有模板与真实输入草稿，不伪造图关系。 */
+    const drafts = createCanvasMediaWorkflowDraft(createWorkflow())
+    const html = renderToStaticMarkup(<CanvasMediaWorkflowForm
+      inputs={drafts} assets={[]} writable busy={false} onInputChange={() => undefined}
+    />)
+    expect(html).toContain('固定素材不跟随画布连线')
+    expect(html).toContain('选择节点输出')
+  })
+
   test('Given 草稿已修改且后台模块事件返回 When LOAD 完成 Then 刷新快照但不覆盖草稿', () => {
     const guard = new CanvasMediaDraftLoadGuard()
     const initial = guard.begin()

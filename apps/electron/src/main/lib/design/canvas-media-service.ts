@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import type {
   AdoptCanvasMediaCandidateInput,
   AttachCanvasMediaImportedAssetsInput,
@@ -492,7 +493,7 @@ export class CanvasMediaService {
       ready: workflowBound && inputsReady && issues.length === 0, issues }
   }
 
-  /** 保存配置时只推进独立 config revision，并保留仍匹配的正式输出。 */
+  /** 仅配置实际变化时推进独立 config revision，并保留仍匹配的正式输出。 */
   async save(input: SaveCanvasMediaModuleInput): Promise<CanvasMediaModuleConfig> {
     await this.dependencies.authorizeTarget(input, 'write')
     await this.flushPendingAdoption(input)
@@ -502,6 +503,23 @@ export class CanvasMediaService {
       binding.key === adopted.key && binding.mediaKind === adopted.mediaKind
         && binding.role === adopted.role && binding.order === adopted.order && binding.bundle === adopted.bundle
     )))
+    /** 旧配置缺失可选字段与显式 null 语义相同；重复保存不得让在途运行失去来源版本。 */
+    const unchanged = isDeepStrictEqual({
+      profile: state.config.profile,
+      workflow: state.config.workflow ?? null,
+      preparation: state.config.preparation ?? null,
+      inputs: state.config.inputs,
+      outputs: state.config.outputs,
+      adoptedOutputs: state.config.adoptedOutputs,
+    }, {
+      profile: input.profile,
+      workflow: input.workflow ?? null,
+      preparation: input.preparation ?? null,
+      inputs: input.inputs,
+      outputs: input.outputs,
+      adoptedOutputs,
+    })
+    if (unchanged) return structuredClone(state.config)
     const config: CanvasMediaModuleConfig = {
       ...state.config,
       revision: state.config.revision + 1,

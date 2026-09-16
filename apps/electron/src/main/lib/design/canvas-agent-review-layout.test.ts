@@ -67,10 +67,11 @@ describe('Canvas Agent 审核布局', () => {
     expect(position.x + 288 + 24).toBeLessThanOrEqual(600)
   })
 
-  test('Given 已采用的纵向参考图占据首选槽位 When 定位审核 Agent Then 避开其最大预览高度', () => {
+  test.each(['image', 'video'] as const)('Given 纵向%s素材占据首选槽位 When 定位审核 Agent Then 避开其最大预览高度', (kind) => {
     const document = createDocument([
       agent('reviewer', { x: 1_000, y: 900 }),
-      image('reference', { x: 288, y: 200 }, 'asset-portrait'),
+      kind === 'image' ? image('reference', { x: 288, y: 200 }, 'asset-portrait')
+        : { id: 'reference', kind: 'video', title: '竖屏视频', mediaModuleId: 'video-reference', position: { x: 288, y: 200 } },
       image('shot-a', { x: 600, y: 200 }),
     ])
 
@@ -93,6 +94,15 @@ describe('Canvas Agent 审核布局', () => {
     ])
 
     expect(resolveCanvasAgentReviewPosition(document, 'reviewer', ['shot-a'])).toEqual({ x: 288, y: 200 })
+  })
+
+  test('Given 审核 Agent 已在竖视频下半部左侧 When 重复定位 Then 依据完整预览范围保留原坐标', () => {
+    /** 主进程不读取媒体，以最大预览高度判断合法邻接范围。 */
+    const document = createDocument([
+      agent('reviewer', { x: 288, y: 500 }),
+      { id: 'shot-a', kind: 'video', title: '竖屏镜头', mediaModuleId: 'video-shot', position: { x: 600, y: 200 } },
+    ])
+    expect(resolveCanvasAgentReviewPosition(document, 'reviewer', ['shot-a'])).toEqual({ x: 288, y: 500 })
   })
 
   test('Given 无效 Agent 或目标集合 When 定位 Then 严格拒绝未知、自引用、重复与越界输入', () => {

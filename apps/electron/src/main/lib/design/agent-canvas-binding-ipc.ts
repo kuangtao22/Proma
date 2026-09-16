@@ -5,6 +5,8 @@ import {
   parseClearAgentCanvasBindingsResult,
   parseLinkAgentCanvasInput,
   parseLinkAgentCanvasResult,
+  parseMarkAgentCanvasActiveInput,
+  parseMarkAgentCanvasActiveResult,
   parseListAgentCanvasBindingsInput,
   parseListAgentCanvasBindingsResult,
   parseSetDefaultAgentCanvasInput,
@@ -39,6 +41,7 @@ export interface RegisterAgentCanvasBindingIpcOptions {
   store: Pick<AgentCanvasBindingStore,
     | 'listByProject'
     | 'linkWithChange'
+    | 'markActiveWithChange'
     | 'unlinkWithChange'
     | 'setDefaultWithChange'
     | 'clearSessionWithChanges'
@@ -248,13 +251,16 @@ function listValidAgentCanvasBindingsReadOnly(
   })
 }
 
-/** 注册五个 Agent-Canvas invoke handler。 */
+/** 注册六个 Agent-Canvas invoke handler。 */
 export function registerAgentCanvasBindingIpcHandlers(
   options: RegisterAgentCanvasBindingIpcOptions,
 ): AgentCanvasBindingIpcRegistration {
+  /** 活动画布请求按会话记录接收代次，防止旧异步授权晚回后覆盖较新的可见画布。 */
+  const activeRequestTokens = new Map<string, symbol>()
   const channels = [
     CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS,
     CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS,
+    CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE,
     CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS,
     CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS,
     CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS,
@@ -313,6 +319,50 @@ export function registerAgentCanvasBindingIpcHandlers(
         broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'unlinked', binding })
       }
       return binding
+    },
+  ))
+
+  options.ipcMain.handle(CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, (event, value) => invokeSafely(
+    MUTATION_FAILURE,
+    async () => {
+      /** 规范化调用目标，拒绝不合法的跨进程身份。 */
+      const input = parseMarkAgentCanvasActiveInput(value)
+      /** 同一项目、会话的并发切换共用请求顺序，其他会话独立。 */
+      const requestKey = JSON.stringify([input.projectId, input.sessionId])
+      /** 唯一令牌在释放后也不会复用，避免迟到请求误认新一轮操作。 */
+      const requestToken = Symbol(requestKey)
+      activeRequestTokens.set(requestKey, requestToken)
+      try {
+        await options.assertSenderProjectAccess(event.sender, input.projectId)
+        requireWritableProject(input.projectId, options)
+        if (activeRequestTokens.get(requestKey) !== requestToken) {
+          requireProjectAgent(input.sessionId, input.projectId, options)
+          /** 迟到请求也必须验证目标存在且未归档，不能跳过原权限边界。 */
+          const canvas = requireProjectCanvas(input.canvasId, input.projectId, options)
+          if (canvas.archived) throw new Error('Canvas 会话已归档')
+          /** 返回已提交现状供调用方核对，不让旧选择回写覆盖新选择。 */
+          const current = options.store.listByProject(input.projectId)
+            .find((binding) => binding.sessionId === input.sessionId)
+          if (!current?.linkedCanvasIds.includes(input.canvasId)) throw new Error('AGENT_CANVAS_BINDING_NOT_FOUND')
+          return parseMarkAgentCanvasActiveResult(current)
+        }
+        /** 权限完成后在项目写守卫内同步校验并提交，保持原子生命周期。 */
+        const mutation = options.runProjectMutation(input.projectId, () => {
+          requireProjectAgent(input.sessionId, input.projectId, options)
+          /** 归档画布须先显式恢复后才能成为活动目标。 */
+          const canvas = requireProjectCanvas(input.canvasId, input.projectId, options)
+          if (canvas.archived) throw new Error('Canvas 会话已归档')
+          return options.store.markActiveWithChange(input)
+        })
+        /** 广播与返回都使用同一次提交的公开绑定。 */
+        const binding = parseMarkAgentCanvasActiveResult(mutation.after)
+        if (mutation.changed) {
+          broadcastChange(options, { projectId: input.projectId, sessionId: input.sessionId, cause: 'active-changed', binding })
+        }
+        return binding
+      } finally {
+        if (activeRequestTokens.get(requestKey) === requestToken) activeRequestTokens.delete(requestKey)
+      }
     },
   ))
 

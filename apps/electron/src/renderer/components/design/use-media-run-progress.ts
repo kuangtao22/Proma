@@ -9,6 +9,7 @@ import type {
   MediaRunEvent,
   MediaRunPhase,
   MediaRunSnapshot,
+  ReadCanvasMediaOutputPreviewInput,
 } from '@proma/shared'
 
 /** Renderer 对单个媒体运行的轻量展示投影，不包含 Canvas revision。 */
@@ -17,6 +18,10 @@ export interface MediaRunProgressProjection {
   phaseLabel: string
   /** 已采用输出只表示卡片已有可用素材，不等同于人工或视觉验收通过。 */
   hasAdoptedOutput?: boolean
+  /** 视频卡片只读取当前正式采用的主视频，不从候选历史回退。 */
+  adoptedVideo?: ReadCanvasMediaOutputPreviewInput
+  /** 已采用视频的可信像素尺寸；仅用于卡片比例，不持有媒体或资产列表。 */
+  adoptedVideoDimensions?: { width: number; height: number }
   /** Comfy 只提供当前节点采样计数，不能解释为整体任务百分比。 */
   nodeProgressLabel?: string
   /** 折叠卡片仅汇总本地配置与连接事实，不宣称已完成运行前校验。 */
@@ -112,6 +117,8 @@ export function createCanvasMediaNodeProgressController(
   let runsByNodeId = new Map<string, MediaRunSnapshot[]>()
   /** 配置诊断独立于运行历史，即使尚未创建 run 也能在原卡片展示。 */
   const configurationByNodeId = new Map<string, CanvasMediaModuleSnapshot['config']>()
+  /** 每次模块加载只提取已采用视频的两个尺寸数字，运行进度不重复扫描资产。 */
+  const adoptedVideoDimensionsByNodeId = new Map<string, { width: number; height: number }>()
   /** 图变化只重算连接事实，不重复读取模块或素材。 */
   let currentDocument: CanvasDocument | undefined
   /** 同一代图共享索引，模块或运行事件不重复扫描全部节点与边。 */
@@ -147,6 +154,20 @@ export function createCanvasMediaNodeProgressController(
       const run = selectCanvasMediaNodeRun(runs)
       /** 配置摘要只来自已有模块 LOAD，不为卡片状态额外请求服务器。 */
       const configuration = configurationByNodeId.get(nodeId)
+      /** 精确目标与 adoptedOutputs 共同构成预览定位，候选历史不参与卡片素材选择。 */
+      const target = targetsByNodeId.get(nodeId)
+      const adoptedPrimaryVideo = target?.mediaKind === 'video'
+        ? configuration?.adoptedOutputs.find((output) => output.mediaKind === 'video' && output.role === 'primary')
+        : undefined
+      /** 预览 API 需要候选与有序输出身份，不暴露或复制资产路径。 */
+      const adoptedVideo: ReadCanvasMediaOutputPreviewInput | undefined = target && adoptedPrimaryVideo
+        ? {
+            ...target,
+            candidateId: adoptedPrimaryVideo.candidateId,
+            outputKey: adoptedPrimaryVideo.key,
+            outputOrder: adoptedPrimaryVideo.order,
+          }
+        : undefined
       /** adoptedOutputs 是素材事实；它与当前是否存在远端生成任务相互独立。 */
       const hasAdoptedOutput = (configuration?.adoptedOutputs.length ?? 0) > 0
       if (run && isActiveMediaRun(run)) progress.set(nodeId, projectMediaRunProgress(run))
@@ -165,9 +186,15 @@ export function createCanvasMediaNodeProgressController(
       else progress.set(nodeId, { phase: 'pending', phaseLabel: configuration?.profile || configuration?.workflow ? '参数待检查' : '待配置' })
       /** 素材标记附加在运行投影上，使新任务失败时仍保留旧素材可用事实。 */
       if (hasAdoptedOutput) progress.set(nodeId, { ...progress.get(nodeId)!, hasAdoptedOutput: true })
+      if (adoptedVideo) {
+        /** 尺寸与采用配置来自同一代模块 LOAD，避免用旧视频比例展示新候选。 */
+        const dimensions = adoptedVideoDimensionsByNodeId.get(nodeId)
+        progress.set(nodeId, { ...progress.get(nodeId)!, adoptedVideo,
+          ...(dimensions ? { adoptedVideoDimensions: dimensions } : {}),
+        })
+      }
       if (configuration && inspectConnections) {
         /** 只有精确目标仍属于当前图，才向顶部汇总可恢复准备状态。 */
-        const target = targetsByNodeId.get(nodeId)
         const projection = progress.get(nodeId)
         if (target && projection) {
           try {
@@ -207,6 +234,17 @@ export function createCanvasMediaNodeProgressController(
           || createCanvasMediaTargetKey(snapshot.target) !== targetKey) return
         runsByNodeId.set(target.nodeId, snapshot.runs)
         configurationByNodeId.set(target.nodeId, snapshot.config)
+        /** 正式采用身份匹配完整资产引用，不从未采用候选或仅同名资产猜测比例。 */
+        const adopted = target.mediaKind === 'video'
+          ? snapshot.config.adoptedOutputs.find((output) => output.mediaKind === 'video' && output.role === 'primary')
+          : undefined
+        /** 复用 LOAD 已返回的元数据，不额外申请视频预览或保留整个资产目录。 */
+        const asset = adopted ? snapshot.assets.find((item) => item.id === adopted.asset.assetId
+          && item.revision === adopted.asset.revision && item.hash === adopted.asset.hash && item.mediaKind === 'video') : undefined
+        if (asset?.mediaKind === 'video' && Number.isFinite(asset.metadata.width) && asset.metadata.width > 0
+          && Number.isFinite(asset.metadata.height) && asset.metadata.height > 0) {
+          adoptedVideoDimensionsByNodeId.set(target.nodeId, { width: asset.metadata.width, height: asset.metadata.height })
+        } else adoptedVideoDimensionsByNodeId.delete(target.nodeId)
         publish()
       } catch {
         /** 卡片进度属于增强信息；读取失败保留现有节点状态。 */
@@ -302,6 +340,7 @@ export function createCanvasMediaNodeProgressController(
         if (!next || createCanvasMediaTargetKey(next) !== createCanvasMediaTargetKey(previous)) {
           runsByNodeId.delete(nodeId)
           configurationByNodeId.delete(nodeId)
+          adoptedVideoDimensionsByNodeId.delete(nodeId)
           requestGenerations.set(createCanvasMediaTargetKey(previous), (
             requestGenerations.get(createCanvasMediaTargetKey(previous)) ?? 0
           ) + 1)
@@ -325,6 +364,7 @@ export function createCanvasMediaNodeProgressController(
       targetsByNodeId.clear()
       runsByNodeId.clear()
       configurationByNodeId.clear()
+      adoptedVideoDimensionsByNodeId.clear()
       publish()
       pending = Promise.all([
         pending.catch(() => undefined),

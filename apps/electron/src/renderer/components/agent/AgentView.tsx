@@ -13,6 +13,7 @@
  * 布局：AgentHeader | AgentMessages | AgentInput + 可选 FileBrowser 侧面板
  */
 
+import { AgentCanvasChangeNotice } from './AgentCanvasChangeNotice'
 import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
@@ -62,6 +63,8 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
+import { designAdapter } from '@/lib/design-adapter'
+import { readVisibleAgentCanvasId, synchronizeVisibleAgentCanvas } from '@/lib/agent-canvas-active-context'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import { supportsChannelPlanQuota } from '@/lib/channel-plan-quota'
@@ -1119,6 +1122,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     setCanvasNodeReferences((current) => removeSentCanvasNodeReferences(current, sent))
   }, [setCanvasNodeReferences])
 
+  /** 发送前把当前焦点画布提交到主进程；读取Jotai实时状态，不使用旧默认或render闭包。 */
+  const synchronizeCanvasBeforeSend = React.useCallback(async (): Promise<void> => {
+    if (!currentWorkspaceId) return
+    await synchronizeVisibleAgentCanvas(
+      () => readVisibleAgentCanvasId(store, sessionId),
+      canvasId => designAdapter.markAgentCanvasActive({ projectId: currentWorkspaceId, sessionId, canvasId }),
+    )
+  }, [currentWorkspaceId, sessionId, store])
+
   const sendPlainTextAgentMessage = React.useCallback(async (
     message: AgentQueuedMessage,
   ): Promise<AgentMessageSubmissionOutcome> => {
@@ -1127,6 +1139,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       : ''
     const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
     if (!agentChannelId || !hasAvailableModel) return 'skipped'
+    await synchronizeCanvasBeforeSend()
     const mediaAttachments = getMediaAttachments(message.attachments)
 
     return submitQueuedMessagePayload(payload, async (submittedPayload) => {
@@ -1189,6 +1202,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     setAgentStreamErrors,
     setQueuedMessages,
     streaming,
+    synchronizeCanvasBeforeSend,
   ])
 
   // 消息首次加载状态直接由同步缓存决定；缓存命中时首个 render 就显示历史，IPC 只做后台校准。
@@ -2132,6 +2146,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       })
       return
     }
+    try {
+      await synchronizeCanvasBeforeSend()
+    } catch (error) {
+      console.error('[AgentView] 同步当前画布失败:', error)
+      toast.error('当前画布同步失败，消息尚未发送', { description: '请重新选择目标画布后重试，草稿和引用已保留。' })
+      return
+    }
     const additionalDirectoriesForRun = createBaseAdditionalDirectories()
 
     if (streaming) {
@@ -2428,7 +2449,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         ))
         toast.error('消息发送失败', { description: getErrorMessage(error) })
       })
-  }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, rollbackOptimisticPersistedMessage, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, isLegacyTranscript, isStopping])
+  }, [clearSentCanvasNodeReferences, createBaseAdditionalDirectories, preparePendingFilesForSend, restoreFailedInputContent, restoreQueuedAttachmentsToPending, rollbackOptimisticPersistedMessage, sessionId, agentChannelId, agentModelId, agentChannelProvider, currentWorkspaceId, streaming, backgroundWaiting, suggestion, hasAvailableModel, store, consumeQuotedSelection, currentQuotedSelection, setStreamingStates, setAgentStreamErrors, setPromptSuggestions, setInputContent, setInputHtmlContent, setLiveMessagesMap, permissionMode, messagesLoaded, setQueuedMessages, setQuotedSelectionMap, sendPlainTextAgentMessage, synchronizeCanvasBeforeSend, isLegacyTranscript, isStopping])
 
   /** 停止生成。异常流未发出终态时，允许再次下发幂等的 abort 请求。 */
   const handleStop = React.useCallback((): void => {
@@ -3153,6 +3174,13 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           'flex min-h-0 flex-1 w-full flex-col overflow-hidden',
           embedded ? 'max-w-none' : 'max-w-[min(72rem,100%)] mx-auto',
         )}>
+        {/* 修改摘要独立于消息正文，后台变化在回到本聊天后可查看。 */}
+        {!embedded && currentWorkspaceId && <AgentCanvasChangeNotice
+          key={JSON.stringify([sessionId, currentWorkspaceId])}
+          sessionId={sessionId}
+          projectId={currentWorkspaceId}
+          canvasTitles={canvasSessionsByProject.get(currentWorkspaceId) ?? []}
+        />}
         {/* 消息区域 */}
         {currentWorkspaceId && <AgentCanvasOrchestrationFeedback
           key={JSON.stringify([currentWorkspaceId, sessionId])}

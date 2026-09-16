@@ -46,6 +46,8 @@ import {
   parseClearAgentCanvasBindingsResult,
   parseLinkAgentCanvasInput,
   parseLinkAgentCanvasResult,
+  parseMarkAgentCanvasActiveInput,
+  parseMarkAgentCanvasActiveResult,
   parseListAgentCanvasBindingsInput,
   parseListAgentCanvasBindingsResult,
   parseSetDefaultAgentCanvasInput,
@@ -766,6 +768,11 @@ describe('Canvas 图共享合同', () => {
     }).makeDefault).toBe(false)
     expect(parseUnlinkAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
       .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(parseMarkAgentCanvasActiveInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
+      .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
+    expect(() => parseMarkAgentCanvasActiveInput({
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', extra: true,
+    })).toThrow('MARK_AGENT_CANVAS_ACTIVE_INPUT_INVALID')
     expect(parseSetDefaultAgentCanvasInput({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }))
       .toEqual({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' })
     expect(parseClearAgentCanvasBindingsInput({
@@ -798,6 +805,7 @@ describe('Canvas 图共享合同', () => {
     }
 
     expect(parseLinkAgentCanvasResult(binding).linkedCanvasIds).toEqual(['canvas-1'])
+    expect(parseMarkAgentCanvasActiveResult(binding).linkedCanvasIds).toEqual(['canvas-1'])
     expect(parseUnlinkAgentCanvasResult(null)).toBeNull()
     expect(parseListAgentCanvasBindingsResult([binding])).toEqual([{
       ...binding,
@@ -1623,6 +1631,7 @@ describe('Canvas 图共享合同', () => {
       STOP_AGENT: 'canvas:stop-agent',
       LIST_AGENT_BINDINGS: 'canvas:list-agent-bindings',
       LINK_AGENT_CANVAS: 'canvas:link-agent-canvas',
+      MARK_AGENT_CANVAS_ACTIVE: 'canvas:mark-agent-canvas-active',
       UNLINK_AGENT_CANVAS: 'canvas:unlink-agent-canvas',
       SET_DEFAULT_AGENT_CANVAS: 'canvas:set-default-agent-canvas',
       CLEAR_AGENT_BINDINGS: 'canvas:clear-agent-bindings',

@@ -19,7 +19,6 @@ import {
   selectInitialCanvasWorkspaceSession,
   selectCanvasWorkspaceTabForPane,
   selectCanvasAfterArchive,
-  setAgentDefaultCanvas,
 } from './canvas-workspace-actions'
 
 /** 创建指定 Agent 的稳定 binding。 */
@@ -64,7 +63,7 @@ describe('Agent 右侧画布动态标签', () => {
     expect(windowControlsSource).toContain('z-[100]')
   })
 
-  test('Given 多个关联 Canvas When 组装标签 Then 保持 linked 顺序和默认最近语义', () => {
+  test('Given 多个关联 Canvas When 组装标签 Then 保持 linked 顺序且只暴露最近语义', () => {
     const binding: AgentCanvasBinding = {
       ...createBinding('agent-1'),
       defaultCanvasId: 'canvas-2',
@@ -77,8 +76,12 @@ describe('Agent 右侧画布动态标签', () => {
     ]
 
     expect(buildCanvasWorkspaceTabs(binding, sessions)).toEqual([
-      expect.objectContaining({ id: 'canvas:canvas-2', title: '品牌方案', isDefault: true, isRecent: false }),
-      expect.objectContaining({ id: 'canvas:canvas-1', title: '首页方案', isDefault: false, isRecent: true }),
+      expect.not.objectContaining({ isDefault: expect.anything() }),
+      expect.not.objectContaining({ isDefault: expect.anything() }),
+    ])
+    expect(buildCanvasWorkspaceTabs(binding, sessions)).toEqual([
+      expect.objectContaining({ id: 'canvas:canvas-2', title: '品牌方案', isRecent: false }),
+      expect.objectContaining({ id: 'canvas:canvas-1', title: '首页方案', isRecent: true }),
     ])
   })
 
@@ -98,9 +101,9 @@ describe('Agent 右侧画布动态标签', () => {
 
   test('Given 两个 Agent 共享同一 Canvas When 更新最近语义 Then binding 与视图身份互不串线', async () => {
     const inputs: string[] = []
-    const adapter: Pick<DesignAdapter, 'linkAgentCanvas'> = {
-      linkAgentCanvas: async (input) => {
-        inputs.push(`${input.sessionId}:${input.canvasId}:${String(input.makeDefault)}`)
+    const adapter: Pick<DesignAdapter, 'markAgentCanvasActive'> = {
+      markAgentCanvasActive: async (input) => {
+        inputs.push(`${input.sessionId}:${input.canvasId}`)
         return createBinding(input.sessionId, input.canvasId)
       },
     }
@@ -111,8 +114,8 @@ describe('Agent 右侧画布动态标签', () => {
     ])
 
     expect(inputs).toEqual([
-      'agent-1:canvas-1:false',
-      'agent-2:canvas-1:false',
+      'agent-1:canvas-1',
+      'agent-2:canvas-1',
     ])
     expect(createAgentCanvasViewKey('agent-1', 'project-1', 'canvas-1'))
       .not.toBe(createAgentCanvasViewKey('agent-2', 'project-1', 'canvas-1'))
@@ -183,7 +186,7 @@ describe('Agent 右侧画布动态标签', () => {
     expect(lifecycle.isOperationCurrent(operation!)).toBe(false)
   })
 
-  test('Given 当前画布被归档 When 选择回退 Then 默认优先、关联顺序次之、无可用返回 null', () => {
+  test('Given 当前画布被归档 When 选择回退 Then 最近有效关联优先、关联顺序次之、无可用返回 null', () => {
     /** 构造可用于回退的未归档画布。 */
     const sessions: CanvasSessionMeta[] = [
       { id: 'default', projectId: 'project-1', title: '默认', archived: false, createdAt: 1, updatedAt: 1 },
@@ -192,12 +195,18 @@ describe('Agent 右侧画布动态标签', () => {
 
     expect(selectCanvasAfterArchive({
       archivedCanvasId: 'current',
-      defaultCanvasId: 'default',
+      lastActiveCanvasId: 'recent',
       linkedCanvasIds: ['current', 'recent', 'default'],
       sessions,
-    })?.id).toBe('default')
+    })?.id).toBe('recent')
     expect(selectCanvasAfterArchive({
       archivedCanvasId: 'current',
+      linkedCanvasIds: ['current', 'recent'],
+      sessions,
+    })?.id).toBe('recent')
+    expect(selectCanvasAfterArchive({
+      archivedCanvasId: 'current',
+      lastActiveCanvasId: 'default',
       linkedCanvasIds: ['current', 'recent'],
       sessions,
     })?.id).toBe('recent')
@@ -206,18 +215,6 @@ describe('Agent 右侧画布动态标签', () => {
       linkedCanvasIds: ['current'],
       sessions: [],
     })).toBeNull()
-  })
-
-  test('Given 未关联项目画布 When 设为默认 Then 先建立默认关联而不是调用仅限已关联项的 setter', async () => {
-    const calls: string[] = []
-    await setAgentDefaultCanvas({
-      binding: createBinding('agent-1', 'canvas-linked'),
-      canvasId: 'canvas-unlinked',
-      link: async (canvasId, makeDefault) => { calls.push(`link:${canvasId}:${String(makeDefault)}`) },
-      setDefault: async (canvasId) => { calls.push(`default:${canvasId}`) },
-    })
-
-    expect(calls).toEqual(['link:canvas-unlinked:true'])
   })
 
   test('Given Canvas IPC 在途期间焦点变化 When 指定原 Pane 打开标签 Then 使用最新 split 且只更新目标 Pane', async () => {
@@ -250,7 +247,9 @@ describe('Agent 右侧画布动态标签', () => {
     expect(source).toContain('handleOpenInitialCanvas')
     expect(source).toContain('canvasRegistry.metadataReady')
     expect(source).toContain('openCanvas: (canvas) => handleOpenCanvas(canvas, pane)')
-    expect(source).toContain('createCanvas: () => handleCreateCanvas(pane)')
+    expect(source).toContain("handleCanvasWorkspaceTabChange('canvas', pane)")
+    expect(source).toContain('openLauncher: async () =>')
+    expect(source).not.toContain('createCanvas: () => handleCreateCanvas(pane)')
     expect(source).not.toContain('selectCanvasWorkspaceEntryTab')
     expect(source).toContain('openCanvasDisabled={!currentWorkspaceId || !canvasRegistry.metadataReady || !canvasRegistry.bindingReady}')
     expect(source).toContain('if (!split || !canvasRegistry.bindingReady) return')
@@ -258,30 +257,40 @@ describe('Agent 右侧画布动态标签', () => {
     expect(source).not.toContain('agentCanvasWorkspaceOpenTabsAtom')
   })
 
-  test('Given 默认、首项和归档画布 When 选择首次打开目标 Then 默认优先且只考虑未归档画布', () => {
+  test('Given 最近画布仍是有效关联 When 选择首次打开目标 Then 只恢复该最近画布', () => {
     const sessions = [
       createCanvasSession('canvas-first'),
-      createCanvasSession('canvas-default'),
+      createCanvasSession('canvas-recent'),
       createCanvasSession('canvas-archived', true),
     ]
 
-    expect(selectInitialCanvasWorkspaceSession(sessions, 'canvas-default')?.id).toBe('canvas-default')
-    expect(selectInitialCanvasWorkspaceSession(sessions, 'canvas-missing')?.id).toBe('canvas-first')
+    expect(selectInitialCanvasWorkspaceSession(
+      sessions,
+      ['canvas-first', 'canvas-recent'],
+      'canvas-recent',
+    )?.id).toBe('canvas-recent')
+    expect(selectInitialCanvasWorkspaceSession(
+      sessions,
+      ['canvas-first'],
+      'canvas-recent',
+    )).toBeNull()
     expect(selectInitialCanvasWorkspaceSession(
       [createCanvasSession('canvas-archived', true)],
+      ['canvas-archived'],
       'canvas-archived',
     )).toBeNull()
   })
 
-  test('Given 项目没有可用画布 When 首次打开被快速触发两次 Then 只创建一次并共享结果', async () => {
-    let createCalls = 0
+  test('Given 没有可恢复的最近画布 When 首次打开被快速触发两次 Then 只打开一次列表且不创建画布', async () => {
+    let launcherCalls = 0
     const controller = createCanvasWorkspaceEntryController()
     const input = {
       sessions: [],
-      defaultCanvasId: undefined,
+      linkedCanvasIds: [],
+      lastActiveCanvasId: undefined,
       openCanvas: async (): Promise<boolean> => false,
-      createCanvas: async (): Promise<boolean> => {
-        createCalls += 1
+      openLauncher: async (): Promise<boolean> => {
+        launcherCalls += 1
         await Promise.resolve()
         return true
       },
@@ -292,7 +301,7 @@ describe('Agent 右侧画布动态标签', () => {
 
     expect(first).toBe(second)
     expect(await first).toBe(true)
-    expect(createCalls).toBe(1)
+    expect(launcherCalls).toBe(1)
   })
 
   test('Given 上次正在查看的 Canvas 仍有效 When registry 就绪且用户未切换 Then 恢复该标签', () => {

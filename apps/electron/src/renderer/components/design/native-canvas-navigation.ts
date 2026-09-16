@@ -84,3 +84,35 @@ export function createNativeCanvasNodeFocusUpdate(
     zoom,
   } }
 }
+
+/**
+ * 将已确认改动的现存节点整体居中；删除节点不会残留选区。
+ * @param nodes 最新权威图中的节点，缺失目标按已删除处理。
+ * @param nodeIds 回执中的目标集合。
+ * @param sizes 卡片真实几何，与图片和视频显示比例一致。
+ * @param viewport 当前会话视口。
+ * @param surface 当前可见区域。
+ * @returns 仅包含会话几何和选区的补丁，空目标不改变视口。
+ */
+export function createNativeCanvasChangedNodesFocusUpdate(
+  nodes: readonly Pick<CanvasNode, 'id' | 'position'>[],
+  nodeIds: readonly string[],
+  sizes: ReadonlyMap<string, { width: number; height: number }>,
+  viewport: DesignViewport,
+  surface: { width: number; height: number },
+): { viewport: DesignViewport; selectedNodeId: string | null; selectedNodeIds: string[] } {
+  /** 只在消费定位请求时扫描一次节点，不进入进度或视口热路径。 */
+  const wanted = new Set(nodeIds)
+  const selected = nodes.filter(node => wanted.has(node.id))
+  if (!selected.length) return { viewport, selectedNodeId: null, selectedNodeIds: [] }
+  /** 统一包围盒同时兼容单节点、离散节点与负坐标。 */
+  const left = Math.min(...selected.map(node => node.position.x))
+  const top = Math.min(...selected.map(node => node.position.y))
+  const right = Math.max(...selected.map(node => node.position.x + (sizes.get(node.id)?.width ?? 288)))
+  const bottom = Math.max(...selected.map(node => node.position.y + (sizes.get(node.id)?.height ?? 144)))
+  const focus = createNativeCanvasNodeFocusUpdate(
+    { id: selected[0]!.id, position: { x: left, y: top } },
+    { width: right - left, height: bottom - top }, viewport, surface,
+  )
+  return { ...focus, selectedNodeIds: selected.map(node => node.id) }
+}

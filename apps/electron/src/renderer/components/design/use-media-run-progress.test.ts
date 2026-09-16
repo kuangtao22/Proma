@@ -282,6 +282,93 @@ describe('Canvas AV 节点进度控制器', () => {
   })
 
   test.each([
+    [1920, 1080, 'a', { width: 1920, height: 1080 }],
+    [1080, 1920, 'a', { width: 1080, height: 1920 }],
+    [0, 1080, 'a', undefined],
+    [1920, Number.NaN, 'a', undefined],
+    [1920, 1080, 'b', undefined],
+  ])('Given 已采用视频元数据 %s×%s/hash=%s When 加载模块 Then 只投影精确素材的有效尺寸', async (width, height, hash, expected) => {
+    /** 模块目标及合法采用配置，用资产 hash 验证旧尺寸不能串入新版本。 */
+    const target = mediaTarget()
+    const snapshot = mediaSnapshot(target, [])
+    addAdoptedLocalOutput(snapshot)
+    snapshot.assets = [{ id: 'asset-local', revision: 1, hash: String(hash).repeat(64), filename: 'test.webm',
+      byteSize: 1, mediaType: 'video/webm', createdAt: 1, mediaKind: 'video',
+      metadata: { width: Number(width), height: Number(height), durationMs: 1000, fps: 24, codec: 'vp8', hasAudio: false } }]
+    /** 控制器公开投影是卡片与几何共享的事实。 */
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({
+      projectId: target.projectId, canvasMediaLoad: async () => structuredClone(snapshot),
+      onCanvasMediaChanged: () => () => undefined, onMediaRunChanged: () => () => undefined,
+      acquireProjectWatch: async () => undefined, releaseProjectWatch: async () => undefined,
+      onChange: (progress) => projections.push(progress),
+    })
+    controller.setTargets([target])
+    controller.start()
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideoDimensions).toEqual(expected)
+    controller.dispose()
+  })
+
+  test('Given 视频正式采用版本切换或移除 When 模块事件刷新 Then 卡片只投影当前 adopted 主视频且不回退候选', async () => {
+    const target = mediaTarget()
+    let snapshot = mediaSnapshot(target, [])
+    addAdoptedLocalOutput(snapshot)
+    snapshot.assets = [{ id: 'asset-local', revision: 1, hash: 'a'.repeat(64), filename: 'test.webm',
+      byteSize: 1, mediaType: 'video/webm', createdAt: 1, mediaKind: 'video',
+      metadata: { width: 1920, height: 1080, durationMs: 1000, fps: 24, codec: 'vp8', hasAudio: false } }]
+    const moduleListener: { current?: (event: CanvasMediaModuleChangedEvent) => void } = {}
+    const projections: Array<ReadonlyMap<string, ReturnType<typeof projectMediaRunProgress>>> = []
+    const controller = createCanvasMediaNodeProgressController({
+      projectId: target.projectId,
+      canvasMediaLoad: async () => structuredClone(snapshot),
+      onCanvasMediaChanged: (listener) => { moduleListener.current = listener; return () => undefined },
+      onMediaRunChanged: () => () => undefined,
+      acquireProjectWatch: async () => undefined,
+      releaseProjectWatch: async () => undefined,
+      onChange: (progress) => projections.push(new Map(progress)),
+    })
+
+    controller.setTargets([target])
+    controller.start()
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideo).toEqual({
+      ...target,
+      candidateId: 'candidate-local',
+      outputKey: 'video',
+      outputOrder: 0,
+    })
+
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideoDimensions).toEqual({ width: 1920, height: 1080 })
+
+    snapshot = structuredClone(snapshot)
+    snapshot.config.adoptedOutputs[0] = {
+      ...snapshot.config.adoptedOutputs[0]!,
+      candidateId: 'candidate-new',
+      runId: 'run-new',
+      asset: { assetId: 'asset-new', revision: 1, hash: 'b'.repeat(64), mediaKind: 'video' },
+    }
+    moduleListener.current?.({ target, revision: 2 })
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideo?.candidateId).toBe('candidate-new')
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideoDimensions).toBeUndefined()
+    snapshot.assets = [{ ...snapshot.assets[0]!, id: 'asset-new', hash: 'b'.repeat(64), mediaKind: 'video',
+      metadata: { width: 1080, height: 1920, durationMs: 1000, fps: 24, codec: 'vp8', hasAudio: false } }]
+    moduleListener.current?.({ target, revision: 3 })
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)?.adoptedVideoDimensions).toEqual({ width: 1080, height: 1920 })
+
+    snapshot = structuredClone(snapshot)
+    snapshot.config.adoptedOutputs = []
+    moduleListener.current?.({ target, revision: 3 })
+    await controller.whenIdle()
+    expect(projections.at(-1)?.get(target.nodeId)).not.toHaveProperty('adoptedVideo')
+    expect(projections.at(-1)?.get(target.nodeId)).not.toHaveProperty('adoptedVideoDimensions')
+    expect(snapshot.candidates).not.toHaveLength(0)
+    controller.dispose()
+  })
+
+  test.each([
     ['running', '运行中'],
     ['failed', '生成失败'],
   ] as const)('Given 已有采用素材且新生成%s When 投影模块 Then 同时保留素材事实与运行阶段', async (phase, phaseLabel) => {

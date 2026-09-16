@@ -334,6 +334,7 @@ describe('Design preload', () => {
       [() => api.stopCanvasAgent({ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }), CANVAS_IPC_CHANNELS.STOP_AGENT, [{ projectId: 'p1', canvasId: 'canvas-1', nodeId: 'node-1' }]],
       [() => api.listAgentCanvasBindings({ projectId: 'p1' }), CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, [{ projectId: 'p1' }]],
       [() => api.linkAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }), CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }]],
+      [() => api.markAgentCanvasActive({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
       [() => api.unlinkAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
       [() => api.setDefaultAgentCanvas({ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }), CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, [{ projectId: 'p1', sessionId: 'session-1', canvasId: 'canvas-1' }]],
       [() => api.clearAgentCanvasBindings({ projectId: 'p1', target: 'session', sessionId: 'session-1' }), CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, [{ projectId: 'p1', target: 'session', sessionId: 'session-1' }]],

@@ -140,6 +140,8 @@ export function createAgentCanvasOrchestrationController(
     { projectId: dependencies.projectId, sessionId: dependencies.sessionId },
     (event) => {
       if (disposed || event.projectId !== dependencies.projectId || event.sessionId !== dependencies.sessionId) return
+      // 焦点更新不改变关联集合，避免每次切图触发全列表对账和读取。
+      if (event.cause === 'active-changed') return
       void refreshBindings()
     },
   )

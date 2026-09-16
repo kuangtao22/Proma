@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createEmptyCanvasDocument } from '@proma/shared'
-import type { CanvasMutation } from '@proma/shared'
+import type { CanvasMediaOutputPreview, CanvasMutation } from '@proma/shared'
 import { ReactFlow } from '@xyflow/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
@@ -247,6 +247,55 @@ describe('原生 Canvas 大画布性能预算', () => {
     expect(await callbackBridge.loadCanvasWebviewPreview(target)).toMatchObject({ previewUrl: 'latest' })
     callbackBridge.onWebviewDevicePresetChange('webview-1', 'mobile')
     expect(calls).toEqual(['mobile'])
+  })
+
+  test('Given 视频预览读取在途 When Adapter 被替换或移除后读取才完成 Then 原 Adapter 仍释放自己的 lease', async () => {
+    const target = {
+      projectId: 'project-1', canvasId: 'canvas-1', nodeId: 'video-1', mediaModuleId: 'media-1',
+      mediaKind: 'video' as const, candidateId: 'candidate-1', outputKey: 'video', outputOrder: 0,
+    }
+    let resolvePreview!: (preview: CanvasMediaOutputPreview) => void
+    const releases: string[] = []
+    const callbackBridge = createNativeCanvasProjectionCallbackBridge({
+      onCreateChild: () => undefined,
+      readCanvasVideoPreview: () => new Promise((resolve) => { resolvePreview = resolve }),
+      releaseCanvasVideoPreview: async () => { releases.push('old') },
+    })
+    const stableReader = callbackBridge.readCanvasVideoPreview
+    const stableReleaser = callbackBridge.releaseCanvasVideoPreview
+    const reading = callbackBridge.readCanvasVideoPreview(target)
+
+    callbackBridge.update({
+      onCreateChild: () => undefined,
+      readCanvasVideoPreview: async () => { throw new Error('不应重新读取') },
+      releaseCanvasVideoPreview: async () => { releases.push('new') },
+    })
+    callbackBridge.update({ onCreateChild: () => undefined })
+    resolvePreview({
+      candidateId: target.candidateId,
+      outputKey: target.outputKey,
+      outputOrder: target.outputOrder,
+      asset: {
+        id: 'video-asset', revision: 1, hash: 'a'.repeat(64), filename: 'video.mp4',
+        byteSize: 1, mediaType: 'video/mp4', mediaKind: 'video', createdAt: 1,
+        metadata: { width: 10, height: 10, durationMs: 10, fps: 24, codec: 'h264', hasAudio: true },
+      },
+      mediaLeaseId: 'lease-1',
+      mediaUrl: 'proma-media://lease-1/output',
+    })
+    await reading
+    await callbackBridge.releaseCanvasVideoPreview({
+      projectId: target.projectId,
+      canvasId: target.canvasId,
+      nodeId: target.nodeId,
+      mediaModuleId: target.mediaModuleId,
+      mediaKind: target.mediaKind,
+      mediaLeaseId: 'lease-1',
+    })
+
+    expect(callbackBridge.readCanvasVideoPreview).toBe(stableReader)
+    expect(callbackBridge.releaseCanvasVideoPreview).toBe(stableReleaser)
+    expect(releases).toEqual(['old'])
   })
 
   test('Given 1,024 个多环密集节点 When 查找落点 Then 保持固定尺寸与间距', () => {

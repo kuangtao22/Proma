@@ -4608,7 +4608,8 @@ describe('原生 Canvas 文档 IPC', () => {
       const run = getCanvasToolProviderRuntime()!.createRun({ projectId: 'project-1', sessionId: 'agent-session-1', runStartedAt: 99, explicitReferences: [], permissionCeiling: 'execute' })
       const tool = run.piCustomTools.find((candidate) => candidate.name === 'canvas_adopt_candidate_batch')!
       const result = await tool.execute('adopt-batch-1', { canvasId: 'canvas-1', batchId: 'batch-1', mode: 'all', intent: 'explicit' } as never, undefined as never, undefined as never, undefined as never)
-      expect(result.details).toMatchObject({ status: 'adopted', continued: false, adoption: { adoptedNodeIds: [imageTargetA.nodeId] } })
+      expect(result.details).toMatchObject({ status: 'adopted', continued: false, adoption: { adoptedNodeIds: [imageTargetA.nodeId] },
+        navigation: { status: 'changed', canvasId: 'canvas-1', nodeIds: [imageTargetA.nodeId], sourceToolCallId: 'adopt-batch-1' } })
       expect(context.imageCalls).toContainEqual({ type: 'candidate-adopt', value: { projectId: 'project-1', canvasId: 'canvas-1', batchId: 'batch-1', mode: 'all' } })
     } finally { context.registration.dispose() }
   })

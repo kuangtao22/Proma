@@ -104,6 +104,14 @@ function createStore() {
       existing.updatedAt = 12
       return copy(existing)
     },
+    markActive: (input: { projectId: string; sessionId: string; canvasId: string }) => {
+      const existing = bindings.find((binding) => binding.projectId === input.projectId && binding.sessionId === input.sessionId)
+      if (!existing?.linkedCanvasIds.includes(input.canvasId)) throw new Error('not found')
+      if (existing.lastActiveCanvasId === input.canvasId) return copy(existing)
+      existing.lastActiveCanvasId = input.canvasId
+      existing.updatedAt = 12
+      return copy(existing)
+    },
     clearSession: (projectId: string, sessionId: string) => {
       bindings = bindings.filter((binding) => binding.projectId !== projectId || binding.sessionId !== sessionId)
     },
@@ -170,6 +178,11 @@ function createStore() {
     setDefaultWithChange: (input: Parameters<typeof store.setDefault>[0]) => {
       const before = store.listByProject(input.projectId).find((binding) => binding.sessionId === input.sessionId) ?? null
       const after = store.setDefault(input)
+      return { before, after, changed: JSON.stringify(before) !== JSON.stringify(after) }
+    },
+    markActiveWithChange: (input: Parameters<typeof store.markActive>[0]) => {
+      const before = store.listByProject(input.projectId).find((binding) => binding.sessionId === input.sessionId) ?? null
+      const after = store.markActive(input)
       return { before, after, changed: JSON.stringify(before) !== JSON.stringify(after) }
     },
     clearSessionWithChanges: (projectId: string, sessionId: string) => {
@@ -425,6 +438,7 @@ describe('Agent-画布关联 IPC', () => {
       store: {
         listByProject: () => [stale],
         linkWithChange: () => ({ before: null, after: stale, changed: true }),
+        markActiveWithChange: () => ({ before: stale, after: stale, changed: false }),
         unlinkWithChange: () => ({ before: stale, after: stale, changed: false }),
         setDefaultWithChange: () => ({ before: stale, after: stale, changed: false }),
         clearSessionWithChanges: () => { throw new Error('/private/store-path') },
@@ -495,7 +509,7 @@ describe('Agent-画布关联 IPC', () => {
     }
   })
 
-  test('Given 授权普通 Agent 与同项目 Canvas When 五类 invoke Then 严格返回并广播变化，dispose 幂等解除', async () => {
+  test('Given 授权普通 Agent 与同项目 Canvas When 六类 invoke Then 严格返回并广播变化，dispose 幂等解除', async () => {
     const handlers = new Map<string, TestHandler>()
     const removed: string[] = []
     const events: AgentCanvasBindingChangeEvent[] = []
@@ -519,6 +533,7 @@ describe('Agent-画布关联 IPC', () => {
     expect(registration.channels).toEqual([
       CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS,
       CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS,
+      CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE,
       CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS,
       CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS,
       CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS,
@@ -526,16 +541,94 @@ describe('Agent-画布关联 IPC', () => {
     expect((await invoke<AgentCanvasBinding[]>(handlers, CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, sender, { projectId: 'project-1' }))).toEqual({ ok: true, value: [] })
     expect((await invoke<AgentCanvasBinding>(handlers, CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'legacy-design', makeDefault: false })).ok).toBe(true)
     await invoke(handlers, CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2', makeDefault: false })
+    expect((await invoke<AgentCanvasBinding>(handlers, CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, sender, {
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2',
+    }))).toMatchObject({ ok: true, value: { defaultCanvasId: 'legacy-design', lastActiveCanvasId: 'canvas-2', linkedCanvasIds: ['legacy-design', 'canvas-2'] } })
+    await invoke(handlers, CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, sender, {
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2',
+    })
     expect((await invoke<AgentCanvasBinding>(handlers, CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-2' }))).toMatchObject({ ok: true, value: { defaultCanvasId: 'canvas-2' } })
     expect((await invoke<AgentCanvasBinding | null>(handlers, CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, sender, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'legacy-design' }))).toMatchObject({ ok: true, value: { linkedCanvasIds: ['canvas-2'] } })
     expect(await invoke<void>(handlers, CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, sender, { projectId: 'project-1', target: 'session', sessionId: 'session-1' })).toEqual({ ok: true, value: undefined })
-    expect(events.map((event) => event.cause)).toEqual(['linked', 'linked', 'default-changed', 'unlinked', 'session-cleared'])
+    expect(events.map((event) => event.cause)).toEqual(['linked', 'linked', 'active-changed', 'default-changed', 'unlinked', 'session-cleared'])
     expect(events.at(-1)).toEqual({ projectId: 'project-1', sessionId: 'session-1', cause: 'session-cleared', binding: null })
 
     registration.dispose()
     registration.dispose()
     expect(handlers.size).toBe(0)
-    expect(removed.slice(-5)).toEqual(registration.channels)
+    expect(removed.slice(-6)).toEqual(registration.channels)
+  })
+
+  test.each(['unauthorized', 'destroyed', 'foreign-session', 'internal-session', 'archived-canvas', 'foreign-canvas', 'unlinked', 'read-only'])(
+    'Given 活动画布请求边界 %s When 标记 Then 拒绝且已有绑定与广播不变', async (scenario) => {
+      /** 独立 handler 与绑定状态，预先关联目标以免把权限拒绝误测成未关联。 */
+      const handlers = new Map<string, TestHandler>()
+      const store = createStore()
+      store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-a', makeDefault: false })
+      store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-b', makeDefault: false })
+      /** 记录调用前绑定及所有广播，验证失败没有副作用。 */
+      const before = structuredClone(store.listByProject('project-1'))
+      const events: AgentCanvasBindingChangeEvent[] = []
+      registerAgentCanvasBindingIpcHandlers({
+        ...createProjectMutationDependencies(),
+        ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+        store,
+        getAgentSession: () => createAgentSession('session-1', scenario === 'foreign-session'
+          ? { workspaceId: 'project-2' } : scenario === 'internal-session' ? { sourceAutomationId: 'automation-1' } : {}),
+        listCanvasSessions: () => [createCanvasSession('canvas-a'), createCanvasSession('canvas-missing'), {
+          ...createCanvasSession('canvas-b'), archived: scenario === 'archived-canvas',
+          projectId: scenario === 'foreign-canvas' ? 'project-2' : 'project-1',
+        }],
+        getProjectReadOnlyReason: () => scenario === 'read-only' ? '项目只读' : undefined,
+        assertSenderProjectAccess: (sender) => {
+          if (scenario === 'unauthorized' || sender.isDestroyed()) throw new Error('测试拒绝访问')
+        },
+        broadcast: (event) => events.push(event),
+      })
+      /** 每种拒绝场景都尝试从 A 切到 B，合法场景本应实际改变最近身份。 */
+      const result = await invoke(handlers, CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, createSender(1, scenario === 'destroyed'), {
+        projectId: 'project-1', sessionId: 'session-1', canvasId: scenario === 'unlinked' ? 'canvas-missing' : 'canvas-b',
+      })
+      expect(result.ok).toBe(false)
+      expect(store.listByProject('project-1')).toEqual(before)
+      expect(events).toEqual([])
+    },
+  )
+
+  test('Given 旧活动画布请求授权较晚返回 When 新请求已提交 Then 旧请求只返回当前绑定且不覆盖或广播', async () => {
+    const handlers = new Map<string, TestHandler>()
+    const events: AgentCanvasBindingChangeEvent[] = []
+    const store = createStore()
+    store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-a', makeDefault: false })
+    store.link({ projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-b', makeDefault: false })
+    const firstAuthorization = Promise.withResolvers<void>()
+    let authorizationCalls = 0
+    registerAgentCanvasBindingIpcHandlers({
+      ...createProjectMutationDependencies(),
+      ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => handlers.delete(channel) },
+      store,
+      getAgentSession: () => createAgentSession('session-1'),
+      listCanvasSessions: () => [createCanvasSession('canvas-a'), createCanvasSession('canvas-b')],
+      assertSenderProjectAccess: async () => {
+        authorizationCalls += 1
+        if (authorizationCalls === 1) await firstAuthorization.promise
+      },
+      broadcast: (event) => events.push(event),
+    })
+    const oldRequest = invoke<AgentCanvasBinding>(handlers, CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, createSender(1), {
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-a',
+    })
+    await Promise.resolve()
+    const latest = await invoke<AgentCanvasBinding>(handlers, CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, createSender(1), {
+      projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-b',
+    })
+    firstAuthorization.resolve()
+    const stale = await oldRequest
+
+    expect(latest).toMatchObject({ ok: true, value: { lastActiveCanvasId: 'canvas-b' } })
+    expect(stale).toMatchObject({ ok: true, value: { lastActiveCanvasId: 'canvas-b' } })
+    expect(store.listByProject('project-1')[0]).toMatchObject({ defaultCanvasId: 'canvas-a', lastActiveCanvasId: 'canvas-b' })
+    expect(events.map((event) => event.cause)).toEqual(['active-changed'])
   })
 
   test('Given canvas clear 影响多个身份 When 清理 Then 按写前写后差异广播每个受影响 Agent', async () => {
@@ -635,7 +728,7 @@ describe('Agent-画布关联 IPC', () => {
     }
   })
 
-  test('Given 项目写守卫拒绝 When 调用五个 handler Then legacy、Store 与广播均零副作用', async () => {
+  test('Given 项目写守卫拒绝 When 调用六个 handler Then legacy、Store 与广播均零副作用', async () => {
     const handlers = new Map<string, TestHandler>()
     const effects: string[] = []
     const store = createStore()
@@ -663,6 +756,7 @@ describe('Agent-画布关联 IPC', () => {
     const calls: Array<[string, unknown]> = [
       [CANVAS_IPC_CHANNELS.LIST_AGENT_BINDINGS, { projectId: 'project-1' }],
       [CANVAS_IPC_CHANNELS.LINK_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1', makeDefault: false }],
+      [CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }],
       [CANVAS_IPC_CHANNELS.UNLINK_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }],
       [CANVAS_IPC_CHANNELS.SET_DEFAULT_AGENT_CANVAS, { projectId: 'project-1', sessionId: 'session-1', canvasId: 'canvas-1' }],
       [CANVAS_IPC_CHANNELS.CLEAR_AGENT_BINDINGS, { projectId: 'project-1', target: 'session', sessionId: 'session-1' }],
@@ -670,7 +764,7 @@ describe('Agent-画布关联 IPC', () => {
     for (const [channel, input] of calls) {
       expect((await invoke(handlers, channel, sender, input)).ok).toBe(false)
     }
-    expect(effects).toEqual(['guard', 'guard', 'guard', 'guard', 'guard'])
+    expect(effects).toEqual(['guard', 'guard', 'guard', 'guard', 'guard', 'guard'])
   })
 
   test('Given 删除 helper 的项目守卫拒绝 When 清理 Then best-effort 返回且 Store 与广播零调用', () => {

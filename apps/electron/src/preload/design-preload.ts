@@ -57,6 +57,8 @@ import type {
   CanvasWebviewPreviewTarget,
   LinkAgentCanvasInput,
   LinkAgentCanvasResult,
+  MarkAgentCanvasActiveInput,
+  MarkAgentCanvasActiveResult,
   ListAgentCanvasBindingsInput,
   ListAgentCanvasBindingsResult,
   CanvasAgentNodeCreationResult,
@@ -218,6 +220,8 @@ export interface DesignPreloadApi {
   listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<CanvasInvokeResult<ListAgentCanvasBindingsResult>>
   /** 建立普通 Agent 与项目 Canvas 的关联。 */
   linkAgentCanvas: (input: LinkAgentCanvasInput) => Promise<CanvasInvokeResult<LinkAgentCanvasResult>>
+  /** 标记已关联 Canvas 为当前活动项。 */
+  markAgentCanvasActive: (input: MarkAgentCanvasActiveInput) => Promise<CanvasInvokeResult<MarkAgentCanvasActiveResult>>
   /** 解除普通 Agent 与项目 Canvas 的关联。 */
   unlinkAgentCanvas: (input: UnlinkAgentCanvasInput) => Promise<CanvasInvokeResult<UnlinkAgentCanvasResult>>
   /** 切换普通 Agent 的默认 Canvas。 */
@@ -837,6 +841,12 @@ export function createDesignPreloadApi(ipc: DesignPreloadIpc): DesignPreloadApi 
         canvasId: input.canvasId,
         makeDefault: input.makeDefault,
       },
+      CANVAS_PRELOAD_FALLBACKS.binding,
+    ),
+    markAgentCanvasActive: (input) => invokeCanvasSafely(
+      ipc,
+      CANVAS_IPC_CHANNELS.MARK_AGENT_CANVAS_ACTIVE,
+      { projectId: input.projectId, sessionId: input.sessionId, canvasId: input.canvasId },
       CANVAS_PRELOAD_FALLBACKS.binding,
     ),
     unlinkAgentCanvas: (input) => invokeCanvasSafely(

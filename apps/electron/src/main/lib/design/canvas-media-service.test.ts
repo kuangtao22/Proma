@@ -581,6 +581,90 @@ describe('Canvas 通用媒体服务', () => {
     }
   })
 
+  test('Given 后台视频生成中且配置语义未变化 When 重复保存后运行完成 Then 真实 Store 保持版本并默认采用视频', async () => {
+    /** 隔离真实文件 Store，覆盖解析、版本和原子持久化链路。 */
+    const persistent = createPersistentStore(createStore().current())
+    try {
+      /** 模拟后台任务从运行中变为成功，不调用媒体服务。 */
+      const currentRun = run('running')
+      /** 生产业务服务仍使用真实 Store，仅替换外部运行边界。 */
+      const service = createService(persistent.store, currentRun)
+      await service.run({ ...target, expectedConfigRevision: 2, operationId: 'background-noop-save' }, origin)
+      /** 对照外层版本，确认重复保存没有发生持久化写入。 */
+      const beforeSave = await persistent.store.load(target)
+
+      /** 缺失字段与显式 null 视为同一份配置。 */
+      const saved = await service.save({
+        ...target,
+        expectedConfigRevision: 2,
+        profile: { profileId: 'profile-1', profileRevision: 3 },
+        workflow: null,
+        preparation: null,
+        inputs: config().inputs,
+        outputs: config().outputs,
+      })
+      expect(saved.revision).toBe(2)
+      /** 回读磁盘确认配置与内部状态版本都保持不变。 */
+      const afterSave = await persistent.store.load(target)
+      expect(afterSave.revision).toBe(beforeSave.revision)
+      expect(afterSave.config).toEqual(saved)
+
+      Object.assign(currentRun, run('succeeded'))
+      await service.refreshCompleted(target)
+      /** 后台完成后直接检查正式采用，不依赖打开详情触发补选。 */
+      const completed = await persistent.store.load(target)
+      expect(completed.operations[0]?.sourceConfigRevision).toBe(2)
+      expect(completed.candidates[0]?.sourceConfigRevision).toBe(2)
+      expect(completed.config.adoptedOutputs[0]).toMatchObject({
+        key: 'video',
+        selectionOrigin: 'initial',
+      })
+    } finally {
+      persistent.cleanup()
+    }
+  })
+
+  test('Given 后台视频生成中 When 用户实际修改提示词后运行完成 Then 推进配置版本且不采用旧结果', async () => {
+    /** 新配置与旧运行使用同一真实 Store，验证版本隔离。 */
+    const persistent = createPersistentStore(createStore().current())
+    try {
+      /** 可控运行快照保留启动时的来源版本。 */
+      const currentRun = run('running')
+      /** 采用与保存经过生产服务入口。 */
+      const service = createService(persistent.store, currentRun)
+      await service.run({ ...target, expectedConfigRevision: 2, operationId: 'background-changed-save' }, origin)
+
+      /** 修改实际生成输入，不能被识别为重复保存。 */
+      const changedInputs = structuredClone(config().inputs)
+      changedInputs[0] = {
+        key: 'prompt',
+        kind: 'text',
+        source: { type: 'literal', value: '改为雨夜追逐镜头' },
+      }
+      /** 保存后应产生新的配置版本。 */
+      const saved = await service.save({
+        ...target,
+        expectedConfigRevision: 2,
+        profile: { profileId: 'profile-1', profileRevision: 3 },
+        inputs: changedInputs,
+        outputs: config().outputs,
+      })
+      expect(saved.revision).toBe(3)
+
+      Object.assign(currentRun, run('succeeded'))
+      await service.refreshCompleted(target)
+      /** 旧候选可保留，但不能自动成为新要求的默认视频。 */
+      const completed = await persistent.store.load(target)
+      expect(completed.operations[0]?.sourceConfigRevision).toBe(2)
+      expect(completed.candidates[0]?.sourceConfigRevision).toBe(2)
+      expect(completed.config.revision).toBe(3)
+      expect(completed.config.inputs).toEqual(changedInputs)
+      expect(completed.config.adoptedOutputs).toEqual([])
+    } finally {
+      persistent.cleanup()
+    }
+  })
+
   test('Given 工作流仍缺少必填输入 When 启动运行 Then 抛出可定位错误并持久化待配置状态', async () => {
     const savedConfig = {
       ...config(),

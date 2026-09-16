@@ -58,6 +58,8 @@ import type {
   CanvasWebviewPreviewTarget,
   LinkAgentCanvasInput,
   LinkAgentCanvasResult,
+  MarkAgentCanvasActiveInput,
+  MarkAgentCanvasActiveResult,
   ListAgentCanvasBindingsInput,
   ListAgentCanvasBindingsResult,
   CreateCanvasSessionInput,
@@ -223,6 +225,8 @@ export interface DesignAdapter extends CanvasMediaPreloadApi,
   listAgentCanvasBindings: (input: ListAgentCanvasBindingsInput) => Promise<ListAgentCanvasBindingsResult>
   /** 建立普通 Agent 与 Canvas 关联。 */
   linkAgentCanvas: (input: LinkAgentCanvasInput) => Promise<LinkAgentCanvasResult>
+  /** 标记已关联 Canvas 为当前活动项，不改变默认画布。 */
+  markAgentCanvasActive: (input: MarkAgentCanvasActiveInput) => Promise<MarkAgentCanvasActiveResult>
   /** 解除普通 Agent 与 Canvas 关联。 */
   unlinkAgentCanvas: (input: UnlinkAgentCanvasInput) => Promise<UnlinkAgentCanvasResult>
   /** 设置普通 Agent 默认 Canvas。 */
@@ -844,6 +848,10 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     ),
     linkAgentCanvas: (input) => callCanvasApi(
       () => requireMethod(api, 'linkAgentCanvas')(input),
+      CANVAS_ADAPTER_FALLBACKS.binding,
+    ),
+    markAgentCanvasActive: (input) => callCanvasApi(
+      () => requireMethod(api, 'markAgentCanvasActive')(input),
       CANVAS_ADAPTER_FALLBACKS.binding,
     ),
     unlinkAgentCanvas: (input) => callCanvasApi(

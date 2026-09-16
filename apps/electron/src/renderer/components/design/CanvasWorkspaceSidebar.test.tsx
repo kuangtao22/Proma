@@ -78,12 +78,10 @@ describe('Canvas 工作区画布抽屉', () => {
     const props = {
       currentCanvasId: current.id,
       sessions: [current, secondary, archived],
-      defaultCanvasId: secondary.id,
       activityStates: new Map([[secondary.id, { activityRevision: 2, seenActivityRevision: 1 }]]),
       onOpenChange: () => undefined,
       onCreateCanvas: async () => true,
       onOpenCanvas: async () => true,
-      onSetDefaultCanvas: async () => true,
       onToggleArchiveCanvas: async () => true,
       onRequestDeleteCanvas: () => undefined,
     }
@@ -97,7 +95,8 @@ describe('Canvas 工作区画布抽屉', () => {
     expect(html).toContain('新建画布')
     expect(html).toContain('canvas-current')
     expect(html).toContain('aria-current="page"')
-    expect(html).toContain('aria-label="默认画布"')
+    expect(html).not.toContain('默认画布')
+    expect(html).not.toContain('设为默认')
     expect(html).toContain('aria-label="有新版本"')
     expect(html).toContain('已归档 1')
     expect(html).not.toContain('canvas-archived</span>')
