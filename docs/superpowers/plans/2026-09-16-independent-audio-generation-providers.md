@@ -605,11 +605,11 @@ git commit -m "新增音频供应商独立配置界面"
 - Create: `apps/electron/scripts/audio-generation-settings-smoke.ts`
 - Modify: `apps/electron/package.json`
 
-- [ ] **Step 1: 写隔离 Renderer fixture**
+- [x] **Step 1: 写隔离 Renderer fixture**
 
 fixture 注入内存 `window.electronAPI`，包含一条小米配置、一条 MiniMax 配置和一条旧 `minimax-speech` 摘要；测试调用返回可控 deferred Promise，以复现迟到 requestId。Renderer 暴露只读观察值：当前 tab、公开 DOM 是否含 secret、cancel 调用、replace payload 和当前测试状态。
 
-- [ ] **Step 2: 写真实 Electron 失败断言**
+- [x] **Step 2: 写真实 Electron 失败断言**
 
 ```ts
 for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768 }]) {
@@ -625,13 +625,13 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 768
 }
 ```
 
-- [ ] **Step 3: 运行 smoke 并修复实际交互问题**
+- [x] **Step 3: 运行 smoke 并修复实际交互问题**
 
 Run: `bun run --cwd apps/electron test:audio-generation-settings-smoke`
 
 Expected: PASS；两个 viewport、两种主题、键盘切换、供应商字段、复制凭据、迟到结果和旧迁移提示全部通过。
 
-- [ ] **Step 4: 运行定向 BDD 回归**
+- [x] **Step 4: 运行定向 BDD 回归**
 
 Run:
 
@@ -650,7 +650,7 @@ bun test --isolate \
 
 Expected: PASS，0 fail。
 
-- [ ] **Step 5: 运行类型检查和 Electron 构建**
+- [x] **Step 5: 运行类型检查和 Electron 构建**
 
 Run: `bun run typecheck`
 
@@ -660,7 +660,7 @@ Run: `bun run electron:build`
 
 Expected: main、preload、renderer 构建 exit 0。
 
-- [ ] **Step 6: 检查 diff、秘密与未授权范围**
+- [x] **Step 6: 检查 diff、秘密与未授权范围**
 
 Run: `git diff --check`
 
@@ -672,7 +672,7 @@ Expected: 只有测试 fixture 中的明确假秘密；生产源码与日志没�
 
 确认未修改 Canvas 媒体执行器、Agent 工具、默认 Skills、README、release notes 或版本号。
 
-- [ ] **Step 7: 提交 Electron 验收与计划状态**
+- [x] **Step 7: 提交 Electron 验收与计划状态**
 
 ```bash
 git add apps/electron/scripts/audio-generation-settings-smoke.html apps/electron/scripts/audio-generation-settings-smoke-renderer.tsx apps/electron/scripts/audio-generation-settings-smoke.ts apps/electron/package.json docs/superpowers/plans/2026-09-16-independent-audio-generation-providers.md

@@ -56,7 +56,8 @@
     "dist:linux": "bun run package:prepare && bun run builder --linux",
     "dist:visual": "bun run scripts/dist.ts",
     "dist:fast": "bun run scripts/dist.ts --current-arch --dmg",
-    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose"
+    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose",
+    "test:audio-generation-settings-smoke": "bun run scripts/audio-generation-settings-smoke.ts"
   },
   "dependencies": {
     "@codemirror/language": "^6.12.4",
