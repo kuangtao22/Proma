@@ -61,6 +61,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { AudioGenerationSettings } from './AudioGenerationSettings'
 import { MediaApiModelSettings } from './MediaApiModelSettings'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsRow } from './primitives'
@@ -1436,12 +1437,7 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
     <div className="min-w-0 max-w-full space-y-6">
       {activeTab === 'image-models' && <MediaApiModelSettings fixedMediaKind="image" navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
 
-      {activeTab === 'audio-generation' && (
-        <MediaSettingsPage title="音频生成" headerContent={authorizationControl}>
-          <div className="flex min-w-0 flex-wrap items-center gap-3">{navigation}</div>
-          {notices}
-        </MediaSettingsPage>
-      )}
+      {activeTab === 'audio-generation' && <AudioGenerationSettings navigation={navigation} headerContent={authorizationControl}>{notices}</AudioGenerationSettings>}
 
       {activeTab === 'connections' && (
         <div className="space-y-8">
