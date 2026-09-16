@@ -9,6 +9,7 @@ import {
   changeMediaApiModelProtocol,
   createMediaApiModelProfile,
   filterMediaApiModelEntries,
+  formatMediaApiModelMessage,
   getMediaApiModelCopy,
   MediaApiModelCatalogView,
   mergeFixedMediaApiModelProfiles,
@@ -77,6 +78,12 @@ function CatalogControllerProbe({
   const controller = useMediaApiModelCatalogController(options)
   React.useEffect(() => onController(controller), [controller, onController])
   return null
+}
+
+/** 确保 React effect 已发布 controller，并帮助 TypeScript 跨闭包读取最新实例。 */
+function requireCatalogController(controller: MediaApiModelCatalogController | null): MediaApiModelCatalogController {
+  if (!controller) throw new Error('测试 controller 尚未初始化')
+  return controller
 }
 
 /** 创建 fixed catalog 测试使用的三类目录。 */
@@ -176,6 +183,8 @@ describe('MediaApiModelSettings', () => {
     expect(fixedLoading).toContain('正在读取生图模型')
     expect(fixedLoading).not.toContain('媒体模型')
     expect(genericLoading).toContain('正在读取媒体模型')
+    expect(formatMediaApiModelMessage('媒体 API 模型读取失败', 'image')).toBe('生图模型读取失败')
+    expect(formatMediaApiModelMessage('媒体 API 模型读取失败', undefined)).toBe('媒体 API 模型读取失败')
   })
 
   test('Given fixed catalog When 实际触发新增编辑复制删除和启停 Then 每次保存都原样保留 hidden 条目', async () => {
@@ -246,6 +255,116 @@ describe('MediaApiModelSettings', () => {
       await act(async () => { await controller?.saveDraft() })
       expectHiddenProfilesPreserved(saves[0]!, entries)
       expect(saves[0]?.[0]?.name).toBe('刷新后语音')
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 编辑目标被其他窗口修改或删除 When 保存草稿 Then 阻止覆盖或复活并提示重新打开', async () => {
+    let entries = createMixedEntries()
+    /** 冲突路径不得到达保存边界。 */
+    const saves: Array<MediaApiModelCatalogEntry['profile'][]> = []
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    const renderController = (): void => {
+      host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={(profiles) => { saves.push(profiles); return true }} onController={onController} />)
+    }
+
+    try {
+      act(renderController)
+      act(() => { controller?.startEdit(entries[1]!.profile) })
+      act(() => { controller?.updateDraft({ ...controller.draft!, name: '本地编辑' }) })
+      entries = createMixedEntries()
+      entries[1] = { ...entries[1]!, profile: { ...entries[1]!.profile, name: '其他窗口修改' } }
+      act(renderController)
+      await act(async () => { await controller?.saveDraft() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('已被其他窗口修改')
+      expect(requireCatalogController(controller).actionError).toContain('重新打开')
+
+      entries = entries.filter((entry) => entry.profile.id !== 'image-1')
+      act(renderController)
+      await act(async () => { await controller?.saveDraft() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('已被其他窗口删除')
+      expect(requireCatalogController(controller).draft?.id).toBe('image-1')
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 删除确认打开后目标被修改或删除 When 确认 Then 阻止删除并保留确认目标', async () => {
+    let entries = createMixedEntries()
+    /** 冲突路径不得调用完整目录保存。 */
+    const saves: Array<MediaApiModelCatalogEntry['profile'][]> = []
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    const renderController = (): void => {
+      host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={(profiles) => { saves.push(profiles); return true }} onController={onController} />)
+    }
+
+    try {
+      act(renderController)
+      act(() => { controller?.requestDelete('image-1') })
+      entries = createMixedEntries()
+      entries[1] = { ...entries[1]!, profile: { ...entries[1]!.profile, modelId: 'other-window-model' } }
+      act(renderController)
+      await act(async () => { await controller?.confirmDelete() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('已被其他窗口修改')
+      expect(requireCatalogController(controller).deleteId).toBe('image-1')
+
+      act(() => { controller?.closeDelete() })
+      act(() => { controller?.requestDelete('image-1') })
+      entries = entries.filter((entry) => entry.profile.id !== 'image-1')
+      act(renderController)
+      await act(async () => { await controller?.confirmDelete() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('已被其他窗口删除')
+      expect(requireCatalogController(controller).deleteId).toBe('image-1')
+    } finally {
+      act(() => { host.unmount() })
+      host.restore()
+    }
+  })
+
+  test('Given 新增或复制草稿 ID 被外部占用 When 保存 Then 阻止重复稳定 ID', async () => {
+    let entries = createMixedEntries()
+    /** 重复 ID 不得到达保存边界。 */
+    const saves: Array<MediaApiModelCatalogEntry['profile'][]> = []
+    let controller: MediaApiModelCatalogController | null = null
+    const host = createControllerRoot()
+    const onController = (nextController: MediaApiModelCatalogController): void => { controller = nextController }
+    const renderController = (): void => {
+      host.render(<CatalogControllerProbe entries={entries} channelOptions={channels} fixedMediaKind="image" saving={false} onSaveProfiles={(profiles) => { saves.push(profiles); return true }} onController={onController} />)
+    }
+    /** 将当前新草稿 ID 注入外部刷新目录，模拟另一窗口抢先占用。 */
+    const occupyDraftId = (): void => {
+      const draft = controller?.draft
+      if (!draft) throw new Error('测试草稿缺失')
+      entries = [...entries, { profile: { ...draft, name: '其他窗口新增', channelId: 'channel-1', modelId: 'gpt-image-2' }, support: { state: 'supported', adapterId: 'openai-images' } }]
+      act(renderController)
+    }
+
+    try {
+      act(renderController)
+      act(() => { controller?.startCreate() })
+      act(() => { controller?.updateDraft({ ...controller.draft!, name: '本地新增', channelId: 'channel-1', modelId: 'gpt-image-2' }) })
+      occupyDraftId()
+      await act(async () => { await controller?.saveDraft() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('ID 已被其他窗口占用')
+
+      act(() => { controller?.closeDraft() })
+      act(() => { controller?.startCopy(entries[1]!.profile) })
+      occupyDraftId()
+      await act(async () => { await controller?.saveDraft() })
+      expect(saves).toHaveLength(0)
+      expect(requireCatalogController(controller).actionError).toContain('ID 已被其他窗口占用')
     } finally {
       act(() => { host.unmount() })
       host.restore()

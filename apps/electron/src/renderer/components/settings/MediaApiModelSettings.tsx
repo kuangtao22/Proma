@@ -57,6 +57,7 @@ export interface MediaApiModelCatalogController {
   deleteId: string | null
   existing: boolean
   draftError: string | null
+  actionError: string | null
   startCreate: () => void
   startEdit: (profile: MediaApiModelProfile) => void
   startCopy: (profile: MediaApiModelProfile) => void
@@ -123,9 +124,26 @@ export function getMediaApiModelCopy(fixedMediaKind?: 'image'): {
 }
 
 /** fixed 生图页将上游通用错误中的旧目录称呼归一为当前分区文案。 */
-function formatMediaApiModelMessage(message: string, fixedMediaKind?: 'image'): string {
+export function formatMediaApiModelMessage(message: string, fixedMediaKind?: 'image'): string {
   if (fixedMediaKind !== 'image') return message
-  return message.replaceAll('API 媒体模型', '生图模型').replaceAll('媒体模型', '生图模型')
+  return message
+    .replaceAll('媒体 API 模型', '生图模型')
+    .replaceAll('API 媒体模型', '生图模型')
+    .replaceAll('媒体模型', '生图模型')
+}
+
+/** 对 Profile 的嵌套字段按键名排序，生成不受对象键顺序影响的稳定指纹。 */
+function stableMediaApiModelStringify(value: unknown): string {
+  if (value === undefined) return 'undefined'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? String(value)
+  if (Array.isArray(value)) return `[${value.map(stableMediaApiModelStringify).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableMediaApiModelStringify(record[key])}`).join(',')}}`
+}
+
+interface MediaApiModelTargetBaseline {
+  id: string
+  fingerprint: string
 }
 
 /** 返回媒体类型的首个协议描述。 */
@@ -278,8 +296,14 @@ export function useMediaApiModelCatalogController({
 }: MediaApiModelCatalogControllerOptions): MediaApiModelCatalogController {
   /** 当前单条编辑草稿。 */
   const [draft, setDraft] = React.useState<MediaApiModelProfile | null>(null)
+  /** 编辑已有条目时记录目标打开瞬间的稳定内容基线。 */
+  const [editBaseline, setEditBaseline] = React.useState<MediaApiModelTargetBaseline | null>(null)
   /** 待删除的稳定模型 ID。 */
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
+  /** 删除确认打开瞬间的目标稳定内容基线。 */
+  const [deleteBaseline, setDeleteBaseline] = React.useState<MediaApiModelTargetBaseline | null>(null)
+  /** 外部刷新冲突与重复 ID 错误。 */
+  const [actionError, setActionError] = React.useState<string | null>(null)
   /** 每次渲染都从最新 entries 派生完整目录，避免保留隐藏快照。 */
   const profiles = entries.map((entry) => entry.profile)
   /** fixed 模式只允许操作所属媒体类型。 */
@@ -287,7 +311,7 @@ export function useMediaApiModelCatalogController({
     ? profiles.filter((profile) => profile.mediaKind === fixedMediaKind)
     : profiles
   /** 草稿是否仍对应当前权威目录的可见条目。 */
-  const existing = draft ? visibleProfiles.some((profile) => profile.id === draft.id) : false
+  const existing = editBaseline !== null
   /** 草稿可操作错误。 */
   const rawDraftError = draft ? validateMediaApiModelDraft(draft, channelOptions) : null
   /** fixed 页不得向用户泄露旧统一目录称呼。 */
@@ -304,12 +328,16 @@ export function useMediaApiModelCatalogController({
 
   /** 新建草稿固定使用当前分区媒体类型。 */
   const startCreate = (): void => {
+    setEditBaseline(null)
+    setActionError(null)
     setDraft(createMediaApiModelProfile(globalThis.crypto.randomUUID(), Date.now(), fixedMediaKind ?? 'image'))
   }
 
   /** 编辑只接受当前视图可见条目，并复制能力数组避免修改权威对象。 */
   const startEdit = (profile: MediaApiModelProfile): void => {
     if (fixedMediaKind && profile.mediaKind !== fixedMediaKind) return
+    setEditBaseline({ id: profile.id, fingerprint: stableMediaApiModelStringify(profile) })
+    setActionError(null)
     setDraft({ ...profile, capabilities: [...profile.capabilities] })
   }
 
@@ -318,6 +346,8 @@ export function useMediaApiModelCatalogController({
     if (fixedMediaKind && profile.mediaKind !== fixedMediaKind) return
     /** 复制操作使用同一时间作为创建与更新时间。 */
     const now = Date.now()
+    setEditBaseline(null)
+    setActionError(null)
     setDraft({ ...profile, id: globalThis.crypto.randomUUID(), name: `${profile.name} 副本`, createdAt: now, updatedAt: now })
   }
 
@@ -331,6 +361,21 @@ export function useMediaApiModelCatalogController({
   /** 保存当前草稿并保留其它稳定条目。 */
   const saveDraft = async (): Promise<void> => {
     if (!draft || draftError || saving) return
+    /** 编辑目标必须仍存在且与打开草稿时完全一致。 */
+    if (editBaseline) {
+      const currentTarget = profiles.find((profile) => profile.id === editBaseline.id)
+      if (!currentTarget) {
+        setActionError(`该${fixedMediaKind ? '生图模型' : '媒体模型'}已被其他窗口删除，请关闭草稿后重新打开或刷新目录。`)
+        return
+      }
+      if (stableMediaApiModelStringify(currentTarget) !== editBaseline.fingerprint) {
+        setActionError(`该${fixedMediaKind ? '生图模型' : '媒体模型'}已被其他窗口修改，请关闭草稿后重新打开或刷新目录。`)
+        return
+      }
+    } else if (profiles.some((profile) => profile.id === draft.id)) {
+      setActionError('模型 ID 已被其他窗口占用，请重新新增或复制。')
+      return
+    }
     /** 去除用户可编辑文本两端空白后的配置。 */
     const normalized = parseMediaApiModelProfile({
       ...draft,
@@ -343,27 +388,64 @@ export function useMediaApiModelCatalogController({
     const nextVisibleProfiles = existing
       ? visibleProfiles.map((profile) => profile.id === normalized.id ? normalized : profile)
       : [...visibleProfiles, normalized]
-    if (await saveVisibleProfiles(nextVisibleProfiles)) setDraft(null)
+    if (await saveVisibleProfiles(nextVisibleProfiles)) {
+      setDraft(null)
+      setEditBaseline(null)
+      setActionError(null)
+    }
   }
 
   /** 从列表快捷切换启用状态，并通过现有完整目录 CAS 保存。 */
   const toggleEnabled = async (profile: MediaApiModelProfile, enabled: boolean): Promise<void> => {
-    if (saving || profile.enabled === enabled || (fixedMediaKind && profile.mediaKind !== fixedMediaKind)) return
+    /** 以最新 props 中的同 ID 条目为开关基线，不使用点击前的旧对象。 */
+    const currentProfile = visibleProfiles.find((item) => item.id === profile.id)
+    if (saving || !currentProfile || currentProfile.enabled === enabled || (fixedMediaKind && currentProfile.mediaKind !== fixedMediaKind)) return
     /** 只替换目标稳定 ID，保留其它可见模型及其顺序。 */
-    const nextVisibleProfiles = setMediaApiModelEnabled(visibleProfiles, profile.id, enabled, Date.now())
+    const nextVisibleProfiles = setMediaApiModelEnabled(visibleProfiles, currentProfile.id, enabled, Date.now())
     await saveVisibleProfiles(nextVisibleProfiles)
   }
 
   /** 删除入口只接受当前可见条目。 */
   const requestDelete = (profileId: string): void => {
-    if (visibleProfiles.some((profile) => profile.id === profileId)) setDeleteId(profileId)
+    const profile = visibleProfiles.find((item) => item.id === profileId)
+    if (!profile) return
+    setDeleteId(profileId)
+    setDeleteBaseline({ id: profile.id, fingerprint: stableMediaApiModelStringify(profile) })
+    setActionError(null)
   }
 
   /** 确认删除后从可见子集移除，并合并最新完整目录。 */
   const confirmDelete = async (): Promise<void> => {
-    if (!deleteId || saving) return
+    if (!deleteId || !deleteBaseline || saving) return
+    const currentTarget = profiles.find((profile) => profile.id === deleteBaseline.id)
+    if (!currentTarget) {
+      setActionError(`该${fixedMediaKind ? '生图模型' : '媒体模型'}已被其他窗口删除，请关闭确认后重新打开或刷新目录。`)
+      return
+    }
+    if (stableMediaApiModelStringify(currentTarget) !== deleteBaseline.fingerprint) {
+      setActionError(`该${fixedMediaKind ? '生图模型' : '媒体模型'}已被其他窗口修改，请关闭确认后重新打开或刷新目录。`)
+      return
+    }
     const nextVisibleProfiles = visibleProfiles.filter((profile) => profile.id !== deleteId)
-    if (await saveVisibleProfiles(nextVisibleProfiles)) setDeleteId(null)
+    if (await saveVisibleProfiles(nextVisibleProfiles)) {
+      setDeleteId(null)
+      setDeleteBaseline(null)
+      setActionError(null)
+    }
+  }
+
+  /** 关闭草稿时同时释放目标基线和冲突提示。 */
+  const closeDraft = (): void => {
+    setDraft(null)
+    setEditBaseline(null)
+    setActionError(null)
+  }
+
+  /** 关闭删除确认时同时释放目标基线和冲突提示。 */
+  const closeDelete = (): void => {
+    setDeleteId(null)
+    setDeleteBaseline(null)
+    setActionError(null)
   }
 
   return {
@@ -373,15 +455,16 @@ export function useMediaApiModelCatalogController({
     deleteId,
     existing,
     draftError,
+    actionError,
     startCreate,
     startEdit,
     startCopy,
     updateDraft,
-    closeDraft: () => setDraft(null),
+    closeDraft,
     saveDraft,
     toggleEnabled,
     requestDelete,
-    closeDelete: () => setDeleteId(null),
+    closeDelete,
     confirmDelete,
   }
 }
@@ -404,7 +487,7 @@ export function MediaApiModelCatalogView({
   const [mediaKindFilter, setMediaKindFilter] = React.useState<MediaApiModelKind | 'all'>('all')
   /** 生产 controller 提供真实增删改复制与保存路径。 */
   const controller = useMediaApiModelCatalogController({ entries, channelOptions, saving, fixedMediaKind, onSaveProfiles })
-  const { draft, deleteId, existing, draftError } = controller
+  const { draft, deleteId, existing, draftError, actionError } = controller
   /** fixed 模式在搜索前排除旧音频和视频目录。 */
   const visibleEntries = fixedMediaKind
     ? entries.filter((entry) => entry.profile.mediaKind === fixedMediaKind)
@@ -465,6 +548,7 @@ export function MediaApiModelCatalogView({
         )}
       </div>}
       {children}
+      {actionError && !deleteId && <p role="alert" className="mb-3 text-xs text-destructive">{actionError}</p>}
       <SettingsCard divided>
         {loading ? (
           <div className="px-4 py-8 text-center text-xs text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />{copy.loading}</div>
@@ -507,7 +591,7 @@ export function MediaApiModelCatalogView({
           </>
         )}
       </SettingsCard>
-      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title={copy.deleteTitle} description="删除后，引用该稳定模型 ID 的画布范围需要重新选择。" confirmLabel="删除" loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
+      <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title={copy.deleteTitle} description={actionError ?? '删除后，引用该稳定模型 ID 的画布范围需要重新选择。'} confirmLabel="删除" loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>
   )
 }
