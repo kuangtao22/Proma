@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  AUDIO_GENERATION_LEGACY_WARNING,
   AUDIO_GENERATION_PROVIDER_DESCRIPTORS,
   parseAudioGenerationProfile,
   parseAudioGenerationSettingsResult,
@@ -214,15 +215,24 @@ describe('独立音频生成 Shared 合同', () => {
       legacyAudioProfiles: [{
         id: 'legacy-1', name: '旧语音', protocol: 'minimax-speech', modelId: 'speech-01', enabled: false,
       }],
-      legacyWarning: '旧配置暂时无法读取',
+      legacyWarning: AUDIO_GENERATION_LEGACY_WARNING,
     })
     expect(parsed.catalog.profiles[0]).toMatchObject({ credentialConfigured: true, endpointOrigin: 'https://tts.example' })
     expect(parsed.legacyAudioProfiles[0]?.protocol).toBe('minimax-speech')
+    expect(parsed.legacyWarning).toBe(AUDIO_GENERATION_LEGACY_WARNING)
     expect(() => parseAudioGenerationSettingsResult({
       ...parsed,
       legacyAudioProfiles: [{ ...parsed.legacyAudioProfiles[0], protocol: 'minimax-music' }],
     })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
     expect(() => parseAudioGenerationSettingsResult({ ...parsed, secret: 'forbidden' }))
       .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    for (const legacyWarning of [
+      '旧配置读取失败：api_key=secret-value',
+      '旧配置读取失败：sk-live-secret-value',
+      '旧配置读取失败：/Users/example/.proma/media.json',
+    ]) {
+      expect(() => parseAudioGenerationSettingsResult({ ...parsed, legacyWarning }))
+        .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    }
   })
 })

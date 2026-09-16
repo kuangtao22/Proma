@@ -55,11 +55,14 @@ export interface LegacyAudioProfileSummary {
   enabled: boolean
 }
 
+/** 旧音频目录读取失败时唯一允许跨 IPC 公开的脱敏警告。 */
+export const AUDIO_GENERATION_LEGACY_WARNING = '旧音频配置读取失败，暂时无法显示迁移提示' as const
+
 /** 音频设置页一次读取所需的独立目录与旧配置提示。 */
 export interface AudioGenerationSettingsResult {
   catalog: AudioGenerationPublicCatalog
   legacyAudioProfiles: LegacyAudioProfileSummary[]
-  legacyWarning?: string
+  legacyWarning?: typeof AUDIO_GENERATION_LEGACY_WARNING
 }
 
 /** 使用当前未保存表单直接测试的输入，API Key 仅用于本次 IPC。 */
@@ -118,11 +121,10 @@ const AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER = {
   } & AudioGenerationProviderDescriptorDefinition[Provider]
 }
 
-/** 设置页唯一可信的供应商描述，固定按小米、MiniMax 顺序展示。 */
-export const AUDIO_GENERATION_PROVIDER_DESCRIPTORS = [
-  AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER.xiaomi,
-  AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER.minimax,
-] as const satisfies readonly AudioGenerationProviderDescriptor[]
+/** 设置页唯一可信的供应商描述，直接沿用映射插入顺序展示。 */
+export const AUDIO_GENERATION_PROVIDER_DESCRIPTORS: readonly AudioGenerationProviderDescriptor[] = Object.values(
+  AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER,
+)
 
 /** 测试结果允许公开的固定中文文案，禁止拼接上游正文或本地路径。 */
 export const AUDIO_GENERATION_TEST_MESSAGES = {
@@ -371,10 +373,11 @@ export function parseAudioGenerationSettingsResult(value: unknown): AudioGenerat
     || new Set(legacyAudioProfiles.map((profile) => profile.id)).size !== legacyAudioProfiles.length) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
-  /** 可选的旧目录读取警告，只接受有界中文公开消息。 */
-  const legacyWarning = value.legacyWarning === undefined
-    ? undefined
-    : parseLegacyWarning(value.legacyWarning)
+  if (value.legacyWarning !== undefined && value.legacyWarning !== AUDIO_GENERATION_LEGACY_WARNING) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 可选警告统一投影为固定常量，禁止保留任意输入文本。 */
+  const legacyWarning = value.legacyWarning === undefined ? undefined : AUDIO_GENERATION_LEGACY_WARNING
   return {
     catalog: { schemaVersion: 1, revision: value.catalog.revision, profiles },
     legacyAudioProfiles,
@@ -385,17 +388,6 @@ export function parseAudioGenerationSettingsResult(value: unknown): AudioGenerat
 /** 判断测试状态属于固定公开集合。 */
 function isTestState(value: unknown): value is AudioGenerationTestState {
   return value === 'success' || value === 'failed' || value === 'cancelled' || value === 'unavailable'
-}
-
-/** 解析旧目录读取警告，并拒绝明显的凭据或完整 URL 回显。 */
-function parseLegacyWarning(value: unknown): string {
-  /** 清洗并限制后的旧目录公开警告。 */
-  const message = parseRequiredText(value, AUDIO_GENERATION_MESSAGE_MAX_LENGTH)
-  if (!/[\u3400-\u9fff]/u.test(message)
-    || /https?:\/\/|bearer\s+\S+|authorization\s*[:=]|secret[-_]/iu.test(message)) {
-    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
-  }
-  return message
 }
 
 /** 按测试状态解析唯一允许公开的固定消息。 */
