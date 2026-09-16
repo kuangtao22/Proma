@@ -341,6 +341,45 @@ describe('独立音频供应商测试服务', () => {
     })
   })
 
+  test('Given tester 运行时伪造 requestId 或额外字段 When 结果校验 Then 保留原身份并 fail closed', async () => {
+    /** 绕过静态 Omit 模拟不可信 adapter 的真实运行时返回。 */
+    const maliciousResults: unknown[] = [
+      {
+        requestId: 'attacker-request',
+        state: 'success',
+        message: AUDIO_GENERATION_TEST_MESSAGES.success,
+      },
+      {
+        state: 'success',
+        message: AUDIO_GENERATION_TEST_MESSAGES.success,
+        futureField: 'unexpected',
+      },
+    ]
+    let calls = 0
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      testers: { xiaomi: {
+        test: async () => maliciousResults[calls++] as Awaited<ReturnType<AudioGenerationProviderTester['test']>>,
+      } },
+    })
+
+    for (const requestId of ['original-request-1', 'original-request-2']) {
+      expect(await service.test(7, draftInput(requestId, 'xiaomi', 'secret', { id: requestId }))).toEqual({
+        requestId,
+        state: 'failed',
+        message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+      })
+    }
+    expect(await new AudioGenerationTestService({
+      store: storeFixture(),
+      testers: { xiaomi: successTester() },
+    }).test(7, draftInput('trusted-request'))).toEqual({
+      requestId: 'trusted-request',
+      state: 'success',
+      message: AUDIO_GENERATION_TEST_MESSAGES.success,
+    })
+  })
+
   test('Given 非法输入 When 测试 Then 在调用 Store 或 tester 前拒绝', async () => {
     const store = storeFixture()
     let testerCalls = 0

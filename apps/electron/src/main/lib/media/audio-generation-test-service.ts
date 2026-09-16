@@ -92,6 +92,25 @@ function cancelledResult(requestId: string): AudioGenerationTestResult {
   })
 }
 
+/** 严格约束不可信 adapter 的运行时结果，并由服务绑定原始请求身份。 */
+function parseProviderTesterResult(requestId: string, value: unknown): AudioGenerationTestResult {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 包含不可枚举键与 Symbol 的完整自有键集合，避免额外字段旁路。 */
+  const keys = Reflect.ownKeys(value)
+  if (keys.length !== 2 || !keys.includes('state') || !keys.includes('message')) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 只读取已验证存在的受控字段，adapter 无法覆盖 requestId。 */
+  const result = value as { state: unknown; message: unknown }
+  return parseAudioGenerationTestResult({
+    requestId,
+    state: result.state,
+    message: result.message,
+  })
+}
+
 /** 从公开投影显式挑选持久化字段，阻止摘要或未来字段进入 tester。 */
 function rebuildStrictProfile(source: AudioGenerationPublicProfile): AudioGenerationProfile {
   /** 两个供应商共享的严格 Profile 字段。 */
@@ -215,7 +234,7 @@ export class AudioGenerationTestService {
         controller.signal,
       )
       if (active.cancelled) return cancelledResult(input.requestId)
-      return parseAudioGenerationTestResult({ requestId: input.requestId, ...testerResult })
+      return parseProviderTesterResult(input.requestId, testerResult)
     })().catch(() => active.cancelled
       ? cancelledResult(input.requestId)
       : failedResult(input.requestId))
