@@ -53,6 +53,8 @@ export interface AudioGenerationConfigStoreOptions {
   beforeReadFinish?: () => void
   /** 写入调用前执行，仅供目标置换竞态回归测试。 */
   beforeCommit?: () => void
+  /** 替换安全原子 writer，仅供 post-commit 故障回归测试。 */
+  writeConfig?: typeof writeJsonFileAtomicSecure
 }
 
 /** 单条配置在磁盘中的严格结构，只包含公开配置和密文。 */
@@ -192,6 +194,8 @@ export class AudioGenerationConfigStore {
   private readonly beforeReadFinish?: () => void
   /** 安全原子提交前的窄竞态测试钩子。 */
   private readonly beforeCommit?: () => void
+  /** 生产默认直接使用 safe-file 的安全原子 writer。 */
+  private readonly writeConfig: typeof writeJsonFileAtomicSecure
 
   /** 创建绑定单一配置文件的 Store。 */
   constructor(options: AudioGenerationConfigStoreOptions) {
@@ -201,6 +205,7 @@ export class AudioGenerationConfigStore {
     this.platform = options.platform ?? process.platform
     this.beforeReadFinish = options.beforeReadFinish
     this.beforeCommit = options.beforeCommit
+    this.writeConfig = options.writeConfig ?? writeJsonFileAtomicSecure
   }
 
   /** 返回严格解析的公开目录；首次缺失返回 revision 0。 */
@@ -259,15 +264,17 @@ export class AudioGenerationConfigStore {
       this.assertSerializedSize(next)
       this.beforeCommit?.()
       try {
-        writeJsonFileAtomicSecure(this.configPath, next, {
+        this.writeConfig(this.configPath, next, {
           expectedDestination: currentRead.expectedDestination,
         })
       } catch (error) {
-        if (error instanceof AtomicWritePostCommitError) {
-          throw new Error('AUDIO_GENERATION_CONFIG_WRITE_FAILED')
+        if (error instanceof AtomicDestinationConflictError) {
+          throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
         }
-        if (error instanceof AtomicDestinationConflictError
-          || !this.matchesExpectedDestination(currentRead.expectedDestination)) {
+        if (error instanceof AtomicWritePostCommitError) {
+          throw new Error('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')
+        }
+        if (!this.matchesExpectedDestination(currentRead.expectedDestination)) {
           throw new Error('AUDIO_GENERATION_CONFIG_CONFLICT')
         }
         throw new Error('AUDIO_GENERATION_CONFIG_WRITE_FAILED')

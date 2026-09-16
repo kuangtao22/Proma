@@ -15,6 +15,7 @@ import type {
   AudioGenerationProfile,
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
+import { AtomicWritePostCommitError, writeJsonFileAtomicSecure } from '../safe-file'
 import {
   AudioGenerationConfigStore,
   type AudioGenerationConfigStoreOptions,
@@ -45,7 +46,7 @@ function createStore(
   now: () => number = () => 100,
   options: Pick<
     AudioGenerationConfigStoreOptions,
-    'platform' | 'beforeCommit' | 'beforeReadFinish'
+    'platform' | 'beforeCommit' | 'beforeReadFinish' | 'writeConfig'
   > = {},
 ): AudioGenerationConfigStore {
   const storeOptions: AudioGenerationConfigStoreOptions = { configPath, secureStorage, now, ...options }
@@ -336,6 +337,31 @@ describe('独立音频生成配置存储', () => {
       profiles: [{ profile: xiaomiProfile(), credentialUpdate: { mode: 'preserve' } }],
     })).toThrow('AUDIO_GENERATION_CONFIG_CONFLICT')
     expect(readFileSync(externalPath, 'utf8')).toBe(externalContents)
+  })
+
+  test('Given rename 已提交但 durability 失败 When 替换 Then 磁盘已推进且返回结果未知', () => {
+    createStore().replace(firstRequest())
+    const store = createStore(createSecureStorage(), () => 200, {
+      writeConfig: (filePath, data, options) => {
+        writeJsonFileAtomicSecure(filePath, data, options)
+        throw new AtomicWritePostCommitError(
+          'mainDurabilityUncertain',
+          new Error(`不得公开路径或秘密: ${filePath} secret-key`),
+        )
+      },
+    })
+
+    expect(() => store.replace({
+      expectedRevision: 1,
+      profiles: [{
+        profile: { ...xiaomiProfile(), name: '已提交的新名称' },
+        credentialUpdate: { mode: 'preserve' },
+      }],
+    })).toThrow('AUDIO_GENERATION_CONFIG_OUTCOME_UNKNOWN')
+    expect(createStore().readPublic()).toMatchObject({
+      revision: 2,
+      profiles: [{ name: '已提交的新名称', updatedAt: 200 }],
+    })
   })
 
   test('Given 文件描述符读取期间同 inode 改写 When 读取 Then 返回冲突且不暴露底层错误', () => {
