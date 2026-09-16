@@ -4,6 +4,12 @@ import type { MediaAuthorizationMode, MediaRemoteDescriptor, MediaRemoteWorkflow
 import * as mediaSettingsModule from './MediaSettings'
 
 interface ExpectedMediaSettingsModule {
+  MEDIA_SETTINGS_TABS: ReadonlyArray<{ value: 'image-models' | 'audio-generation' | 'connections' | 'workflows'; label: string }>
+  DEFAULT_MEDIA_SETTINGS_TAB: 'image-models'
+  resolveMediaSettingsTabForFocus: (
+    currentTab: 'image-models' | 'audio-generation' | 'connections' | 'workflows',
+    focusedSection: 'image-models' | null,
+  ) => 'image-models' | 'audio-generation' | 'connections' | 'workflows'
   selectLocalMediaWorkflows: (workflows: readonly MediaWorkflowVersion[], archivedIds?: readonly string[]) => MediaWorkflowVersion[]
   formatMediaError: (error: unknown) => string
   buildSaveMediaConnectionInput: (draft: {
@@ -43,7 +49,10 @@ interface ExpectedMediaSettingsModule {
     invalidated: false
   }
   RemoteWorkflowContent: (props: { remote: MediaRemoteWorkflow; onImport: () => void }) => React.ReactElement
-  MediaSettingsTabsView: (props: { activeTab: 'models' | 'connections' | 'workflows'; onTabChange: (tab: 'models' | 'connections' | 'workflows') => void }) => React.ReactElement
+  MediaSettingsTabsView: (props: {
+    activeTab: 'image-models' | 'audio-generation' | 'connections' | 'workflows'
+    onTabChange: (tab: 'image-models' | 'audio-generation' | 'connections' | 'workflows') => void
+  }) => React.ReactElement
   MediaAuthorizationControl: (props: {
     mode?: MediaAuthorizationMode
     saving: boolean
@@ -383,14 +392,27 @@ describe('MediaSettings 已确认交互合同', () => {
     expect(result.error).toBe('远端离线')
   })
 
-  test('Given 媒体设置页 When 渲染 Then 展示三个平级页签且不展示预设页', () => {
-    const { MediaSettingsTabsView } = getExpectedModule()
-    const html = renderToStaticMarkup(<MediaSettingsTabsView activeTab="models" onTabChange={() => undefined} />)
-    expect(html).toContain('媒体模型')
-    expect(html).toContain('服务连接')
-    expect(html).toContain('本地工作流')
+  test('Given 媒体设置 When 渲染一级导航 Then 展示四个确认分区和值', () => {
+    const { MEDIA_SETTINGS_TABS, MediaSettingsTabsView } = getExpectedModule()
+    expect(MEDIA_SETTINGS_TABS).toEqual([
+      { value: 'image-models', label: '生图模型' },
+      { value: 'audio-generation', label: '音频生成' },
+      { value: 'connections', label: '服务链接' },
+      { value: 'workflows', label: '本地工作流' },
+    ])
+    const html = renderToStaticMarkup(<MediaSettingsTabsView activeTab="image-models" onTabChange={() => undefined} />)
+    for (const label of ['生图模型', '音频生成', '服务链接', '本地工作流']) expect(html).toContain(label)
+    expect(html).not.toContain('媒体模型')
+    expect(html).not.toContain('服务连接')
     expect(html).not.toContain('公共工作流')
     expect(html).not.toContain('媒体预设')
+  })
+
+  test('Given 默认进入或旧生图入口聚焦 When 解析当前分区 Then 都落在生图模型', () => {
+    const { DEFAULT_MEDIA_SETTINGS_TAB, resolveMediaSettingsTabForFocus } = getExpectedModule()
+    expect(DEFAULT_MEDIA_SETTINGS_TAB).toBe('image-models')
+    expect(resolveMediaSettingsTabForFocus('connections', 'image-models')).toBe('image-models')
+    expect(resolveMediaSettingsTabForFocus('audio-generation', null)).toBe('audio-generation')
   })
 
   test('Given 授权模式缺失或已设为自动 When 渲染全局控件 Then 默认每次确认并准确说明授权范围', () => {

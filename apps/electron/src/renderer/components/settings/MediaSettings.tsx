@@ -68,8 +68,27 @@ import { SettingsCard, SettingsRow } from './primitives'
 /** Renderer 可读取的工作流文件上限。 */
 export const MEDIA_WORKFLOW_IMPORT_MAX_BYTES = 2 * 1024 * 1024
 
-/** 媒体设置的三个平级页面。 */
-export type MediaSettingsTab = 'models' | 'connections' | 'workflows'
+/** 媒体设置的四个平级页面。 */
+export type MediaSettingsTab = 'image-models' | 'audio-generation' | 'connections' | 'workflows'
+
+/** 媒体设置一级导航的稳定值与用户可见文案。 */
+export const MEDIA_SETTINGS_TABS: ReadonlyArray<{ value: MediaSettingsTab; label: string }> = [
+  { value: 'image-models', label: '生图模型' },
+  { value: 'audio-generation', label: '音频生成' },
+  { value: 'connections', label: '服务链接' },
+  { value: 'workflows', label: '本地工作流' },
+]
+
+/** 媒体设置默认进入生图模型分区。 */
+export const DEFAULT_MEDIA_SETTINGS_TAB: MediaSettingsTab = 'image-models'
+
+/** 将旧生图入口的聚焦意图映射到新的一级分区。 */
+export function resolveMediaSettingsTabForFocus(
+  currentTab: MediaSettingsTab,
+  focusedSection: 'image-models' | null,
+): MediaSettingsTab {
+  return focusedSection === 'image-models' ? 'image-models' : currentTab
+}
 
 /** 连接表单的独立本地草稿。 */
 export interface MediaConnectionDraft {
@@ -567,7 +586,7 @@ function EmptyState({ children }: { children: React.ReactNode }): React.ReactEle
   return <div className="px-4 py-8 text-center text-xs text-muted-foreground">{children}</div>
 }
 
-/** 三个平级设置页签的可测试视图。 */
+/** 四个平级设置页签的可测试视图。 */
 export function MediaSettingsTabsView({
   activeTab,
   onTabChange,
@@ -579,11 +598,13 @@ export function MediaSettingsTabsView({
   focusActiveTab?: boolean
 }): React.ReactElement {
   return (
-    <Tabs value={activeTab} onValueChange={(value) => onTabChange(value as MediaSettingsTab)}>
-      <TabsList aria-label="媒体配置" className="max-w-full">
-        <TabsTrigger value="models" autoFocus={focusActiveTab && activeTab === 'models'}>媒体模型</TabsTrigger>
-        <TabsTrigger value="connections" autoFocus={focusActiveTab && activeTab === 'connections'}>服务连接</TabsTrigger>
-        <TabsTrigger value="workflows" autoFocus={focusActiveTab && activeTab === 'workflows'}>本地工作流</TabsTrigger>
+    <Tabs value={activeTab} className="max-w-full" onValueChange={(value) => onTabChange(value as MediaSettingsTab)}>
+      <TabsList aria-label="媒体配置" className="h-auto min-h-9 max-w-full flex-wrap justify-start">
+        {MEDIA_SETTINGS_TABS.map((tab) => (
+          <TabsTrigger key={tab.value} value={tab.value} autoFocus={focusActiveTab && activeTab === tab.value}>
+            {tab.label}
+          </TabsTrigger>
+        ))}
       </TabsList>
     </Tabs>
   )
@@ -1214,7 +1235,7 @@ export function selectLocalMediaWorkflows(workflows: readonly MediaWorkflowVersi
 
 export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {}): React.ReactElement {
   /** 当前平级页签；草稿位于父级，因此切换不丢失。 */
-  const [activeTab, setActiveTab] = React.useState<MediaSettingsTab>('models')
+  const [activeTab, setActiveTab] = React.useState<MediaSettingsTab>(DEFAULT_MEDIA_SETTINGS_TAB)
   /** 只为用户发起的切页恢复焦点，避免导航随各页标题重挂载后中断键盘操作。 */
   const restoreTabFocusRef = React.useRef(false)
   React.useEffect(() => { restoreTabFocusRef.current = false }, [activeTab])
@@ -1257,7 +1278,7 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
   React.useEffect(() => { void loadSettings() }, [loadSettings])
   React.useEffect(() => {
     if (focusedSection !== 'image-models') return
-    setActiveTab('models')
+    setActiveTab((currentTab) => resolveMediaSettingsTabForFocus(currentTab, focusedSection))
     setFocusedSection(null)
   }, [focusedSection, setFocusedSection])
 
@@ -1413,7 +1434,14 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
 
   return (
     <div className="min-w-0 max-w-full space-y-6">
-      {activeTab === 'models' && <MediaApiModelSettings navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
+      {activeTab === 'image-models' && <MediaApiModelSettings fixedMediaKind="image" navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
+
+      {activeTab === 'audio-generation' && (
+        <MediaSettingsPage title="音频生成" headerContent={authorizationControl}>
+          <div className="flex min-w-0 flex-wrap items-center gap-3">{navigation}</div>
+          {notices}
+        </MediaSettingsPage>
+      )}
 
       {activeTab === 'connections' && (
         <div className="space-y-8">

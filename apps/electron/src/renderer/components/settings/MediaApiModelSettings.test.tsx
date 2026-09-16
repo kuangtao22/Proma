@@ -7,6 +7,7 @@ import {
   createMediaApiModelProfile,
   filterMediaApiModelEntries,
   MediaApiModelCatalogView,
+  mergeFixedMediaApiModelProfiles,
   setMediaApiModelEnabled,
   validateMediaApiModelDraft,
 } from './MediaApiModelSettings'
@@ -61,6 +62,45 @@ describe('MediaApiModelSettings', () => {
     expect(html).toContain('aria-label="停用 图片"')
     expect(html).toContain('添加 API 模型')
     expect(html).toContain('aria-label="编辑 语音"')
+  })
+
+  test('Given 固定生图视图含旧音频和视频 When 渲染 Then 只显示图片且隐藏类型控件', () => {
+    /** 隐藏条目仍交给保存合并逻辑，不进入生图列表。 */
+    const entries: MediaApiModelCatalogEntry[] = [
+      { profile: { ...createMediaApiModelProfile('image-1', 1), name: '图片模型', channelId: 'channel-1', modelId: 'gpt-image-2' }, support: { state: 'supported', adapterId: 'openai-images' } },
+      { profile: { ...changeMediaApiModelKind(createMediaApiModelProfile('audio-1', 2), 'audio'), name: '旧语音', channelId: 'channel-1', modelId: 'speech-2.6' }, support: { state: 'configuration-only', reason: '待迁移' } },
+      { profile: { ...changeMediaApiModelKind(createMediaApiModelProfile('video-1', 3), 'video'), name: '旧视频', channelId: 'channel-1', modelId: 'video-01' }, support: { state: 'configuration-only', reason: '待迁移' } },
+    ]
+    const html = renderToStaticMarkup(<MediaApiModelCatalogView fixedMediaKind="image" entries={entries} channelOptions={channels} saving={false} onSaveProfiles={async () => true} />)
+    expect(html).toContain('图片模型')
+    expect(html).not.toContain('旧语音')
+    expect(html).not.toContain('旧视频')
+    expect(html).not.toContain('aria-label="筛选媒体类型"')
+    expect(html).not.toContain('媒体类型')
+    expect(html).toContain('生图模型')
+    expect(html).toContain('添加生图模型')
+    expect(createMediaApiModelProfile('new-image', 4, 'image').mediaKind).toBe('image')
+  })
+
+  test('Given fixed image 编辑新增删除或启停 When 合并保存 Then hidden 音视频保持原对象和顺序', () => {
+    /** 模拟外部刷新后的完整目录，合并必须以本次传入值为权威基线。 */
+    const hiddenAudio = { ...changeMediaApiModelKind(createMediaApiModelProfile('audio-1', 2), 'audio'), name: '外部更新语音', channelId: 'channel-1', modelId: 'speech-2.6' }
+    const hiddenVideo = { ...changeMediaApiModelKind(createMediaApiModelProfile('video-1', 3), 'video'), name: '旧视频', channelId: 'channel-1', modelId: 'video-01' }
+    const image = { ...createMediaApiModelProfile('image-1', 1), name: '图片', channelId: 'channel-1', modelId: 'gpt-image-2' }
+    const fullCatalog = [hiddenAudio, image, hiddenVideo]
+
+    const updatedImage = { ...image, name: '更新图片', enabled: false }
+    const addedImage = { ...createMediaApiModelProfile('image-2', 4), name: '新增图片', channelId: 'channel-1', modelId: 'gpt-image-2' }
+    const saved = mergeFixedMediaApiModelProfiles(fullCatalog, 'image', [updatedImage, addedImage])
+    expect(saved.map((profile) => profile.id)).toEqual(['audio-1', 'image-1', 'video-1', 'image-2'])
+    expect(saved[0]).toBe(hiddenAudio)
+    expect(saved[2]).toBe(hiddenVideo)
+    expect(saved[1]).toEqual(updatedImage)
+
+    const deleted = mergeFixedMediaApiModelProfiles(fullCatalog, 'image', [])
+    expect(deleted).toEqual([hiddenAudio, hiddenVideo])
+    expect(deleted[0]).toBe(hiddenAudio)
+    expect(deleted[1]).toBe(hiddenVideo)
   })
 
   test('Given 多种媒体模型 When 搜索渠道能力并筛选类型 Then 只保留同时匹配的条目', () => {
