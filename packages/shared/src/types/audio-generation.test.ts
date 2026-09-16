@@ -58,7 +58,9 @@ describe('独立音频生成 Shared 合同', () => {
     for (const baseUrl of [
       'https://token@example.com/v1',
       'https://example.com/v1?token=secret',
+      'https://example.com/v1?',
       'https://example.com/v1#secret',
+      'https://example.com/v1#',
       'ftp://example.com/v1',
     ]) {
       expect(() => parseAudioGenerationProfile(createXiaomiProfile({ baseUrl })))

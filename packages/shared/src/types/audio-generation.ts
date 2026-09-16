@@ -187,7 +187,8 @@ function parseBaseUrl(value: unknown): string {
   try {
     /** 使用标准 URL 解析器验证协议、凭据和可公开部分。 */
     const parsed = new URL(trimmed)
-    if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    if (trimmed.includes('?') || trimmed.includes('#')
+      || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
       || parsed.username || parsed.password || parsed.search || parsed.hash) {
       throw new Error('AUDIO_GENERATION_URL_INVALID')
     }
