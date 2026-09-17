@@ -1021,7 +1021,9 @@ function AudioEnabledModelList({ models, selectedModelId, disabled, onSelect, on
 }
 
 /** 可用模型：拉取结果点选加入上方，底部保留手填一行。 */
-function AudioAvailableModels({ models, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
+function AudioAvailableModels({ provider, models, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
+  /** 当前供应商，用于区分「端点不含语音模型」的说明文案。 */
+  provider: AudioGenerationProvider
   models: readonly AudioGenerationModelEntry[]
   fetchedModels: readonly string[]
   catalogState: 'idle' | 'loading' | 'success' | 'failed'
@@ -1075,7 +1077,9 @@ function AudioAvailableModels({ models, fetchedModels, catalogState, catalogMess
               ? catalogMessage ?? '从供应商获取失败，请检查服务地址与凭据后重试'
               : fetchedModels.length === 0
                 ? catalogState === 'success'
-                  ? '供应商没有返回语音模型，请手动填写模型 ID'
+                  ? provider === 'minimax'
+                    ? 'MiniMax 的模型接口只返回对话模型，语音模型请在控制台复制 ID 后手动填写'
+                    : '供应商没有返回语音模型，请手动填写模型 ID'
                   : '点右上角「从供应商获取」读取该账号可用的模型'
                 : '拉取到的模型都已添加'}
         </div>
@@ -1367,6 +1371,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           action={<FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />}
         >
           <AudioAvailableModels
+            provider={draft.provider}
             models={draft.models}
             fetchedModels={catalogForDraft?.models ?? []}
             catalogState={catalogForDraft?.state ?? 'idle'}
