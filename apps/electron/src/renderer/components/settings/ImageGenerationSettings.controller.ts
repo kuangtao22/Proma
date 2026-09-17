@@ -73,6 +73,28 @@ function createImageGenerationId(): string {
   return `image-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+/** 生图读取的超时时间；主进程未响应时也要给出可见错误而不是一直转圈。 */
+const IMAGE_GENERATION_LOAD_TIMEOUT_MS = 8_000
+
+/**
+ * 给 IPC 调用加超时。
+ * 入参：待等待的 promise 与超时毫秒；返回值：原结果或超时错误。
+ * 典型触发场景是主进程仍是旧构建、通道尚未注册。
+ */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('IMAGE_GENERATION_LOAD_TIMEOUT')), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 /** 把主进程错误翻译成可操作的中文提示，不泄露原始异常正文。 */
 function describeImageError(error: unknown): string {
   const code = error instanceof Error ? error.message : ''
@@ -116,13 +138,19 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const load = React.useCallback(async (): Promise<boolean> => {
     setLoading(true)
     try {
-      const next = await api.getSettings()
+      const next = await withTimeout(api.getSettings(), IMAGE_GENERATION_LOAD_TIMEOUT_MS)
       if (!mountedRef.current) return false
       setSettings(next)
       setLoadError(null)
       return true
-    } catch {
-      if (mountedRef.current) setLoadError('读取生图配置失败，请重试。')
+    } catch (error) {
+      /** 原始异常只进控制台，界面只显示稳定文案；超时单独提示。 */
+      console.error('[生图配置] 读取失败', error)
+      if (mountedRef.current) {
+        setLoadError(error instanceof Error && error.message === 'IMAGE_GENERATION_LOAD_TIMEOUT'
+          ? '读取生图配置超时：主进程可能仍是旧构建，请重启开发实例后重试。'
+          : '读取生图配置失败，请重试。')
+      }
       return false
     } finally {
       if (mountedRef.current) setLoading(false)
