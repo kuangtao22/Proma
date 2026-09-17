@@ -167,6 +167,11 @@ export function getAudioGenerationProfilesPath(): string {
   return join(getConfigDir(), 'audio-generation-profiles.json')
 }
 
+/** 返回独立生图供应商目录文件，与旧统一媒体目录、LLM 渠道互不影响。 */
+export function getImageGenerationProfilesPath(): string {
+  return join(getConfigDir(), 'image-generation-profiles.json')
+}
+
 /**
  * 获取用户授权的 Markdown Vault 配置路径。
  * 内容仅保存 Vault 根目录与用户授予的能力，不保存笔记正文或索引。

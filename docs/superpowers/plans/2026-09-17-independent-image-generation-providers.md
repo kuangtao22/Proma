@@ -69,6 +69,18 @@ interface ImageGenerationProfileBase {
 
 ## 执行边界
 
+## S2 的复用决策（先定再写）
+
+音频 Store（`audio-generation-config-store.ts`）里那套「fd 稳定读取 + 目录级 CAS + O_EXCL 锁 + safeStorage 加解密 +
+结果未知语义 + 1 MiB 上限」是安全关键代码。生图 Store 与它机制完全相同，因此**不复制一份**，改为：
+
+1. 先把音频 Store 的通用机制抽成 `SecureProfileCatalogStore<TProfile>`（构造时注入 `parseProfile` / `parseRequest` /
+   `toPublicCatalog` / 错误码前缀），保持 `AudioGenerationConfigStore` 的公开 API 不变；
+2. 音频现有 400+ 行 Store 测试作为这次抽取的回归网（抽取后必须全绿，语义不得变）；
+3. 生图 Store 只写薄薄一层：注入生图 parser 与错误码，即得到同等的 CAS / 加密 / 原子写语义。
+
+这样以后再加视频、音乐等独立目录时只需再写一个薄封装，符合“方便扩展”的目标。
+
 - 即梦执行器（真正提交 text2image 并落素材）本轮不接，只做配置、登录与连接测试；与音频一样先把“用哪家、哪个模型、什么参数”定义清楚。
 - 不复用渠道凭据，也不改现有统一目录的写入语义；迁移只做提示与新建。
 - 无新增依赖；CLI 调用通过主进程 spawn，路径可配置并做存在性校验。
