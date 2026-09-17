@@ -23,7 +23,12 @@ import type {
   AudioGenerationTestResult,
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
-import {
+import type {
+  AudioGenerationController,
+  AudioGenerationControllerOptions,
+} from './AudioGenerationSettings'
+/** 位图 mock 必须先于组件模块加载，因此这里使用动态导入。 */
+const {
   AudioGenerationSettings,
   AudioGenerationCatalogView,
   buildAudioRequestPreview,
@@ -34,10 +39,8 @@ import {
   filterAudioGenerationProfiles,
   resolveVoiceCapability,
   useAudioGenerationSettingsController,
-  type AudioGenerationController,
-  type AudioGenerationControllerOptions,
-} from './AudioGenerationSettings'
-import * as mediaSettingsModule from './MediaSettings'
+} = await import('./AudioGenerationSettings')
+const mediaSettingsModule = await import('./MediaSettings')
 
 /** 构建不包含任何秘密的权威音频设置快照。 */
 function createSettings(revision = 4): AudioGenerationSettingsResult {
