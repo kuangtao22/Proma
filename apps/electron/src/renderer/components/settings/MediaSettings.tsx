@@ -63,6 +63,7 @@ import { cn } from '@/lib/utils'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { AudioGenerationSettings } from './AudioGenerationSettings'
 import { MediaApiModelSettings } from './MediaApiModelSettings'
+import { ImageGenerationSettings } from './ImageGenerationSettings'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsRow } from './primitives'
 
@@ -1442,7 +1443,8 @@ export function MediaSettings({ onOpenWorkflowInCanvas }: MediaSettingsProps = {
 
   return (
     <div className="min-w-0 max-w-full space-y-6">
-      {activeTab === 'image-models' && <MediaApiModelSettings fixedMediaKind="image" navigation={navigation} headerContent={authorizationControl}>{notices}</MediaApiModelSettings>}
+      {/** 生图走独立供应商配置：与 LLM 渠道、旧统一媒体目录彻底解耦。 */}
+      {activeTab === 'image-models' && <ImageGenerationSettings navigation={navigation} headerContent={authorizationControl}>{notices}</ImageGenerationSettings>}
 
       {activeTab === 'audio-generation' && createMediaSettingsAudioGenerationElement({ navigation, headerContent: authorizationControl, children: notices })}
 
