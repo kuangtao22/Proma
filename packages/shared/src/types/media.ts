@@ -7,6 +7,12 @@ import type {
   AudioGenerationCatalogFetchResult,
   ReplaceAudioGenerationCatalogRequest,
 } from './audio-generation'
+import type {
+  ImageGenerationCatalogFetchInput,
+  ImageGenerationCatalogFetchResult,
+  ImageGenerationSettingsResult,
+  ReplaceImageGenerationCatalogRequest,
+} from './image-generation'
 
 /** 媒体产物类别，音乐归属 audio。 */
 export type MediaKind = 'image' | 'video' | 'audio'
@@ -365,6 +371,9 @@ export const MEDIA_IPC_CHANNELS = {
   TEST_AUDIO_GENERATION: 'media:test-audio-generation',
   CANCEL_AUDIO_GENERATION_TEST: 'media:cancel-audio-generation-test',
   FETCH_AUDIO_GENERATION_CATALOG: 'media:fetch-audio-generation-catalog',
+  GET_IMAGE_GENERATION_SETTINGS: 'media:get-image-generation-settings',
+  REPLACE_IMAGE_GENERATION_CATALOG: 'media:replace-image-generation-catalog',
+  FETCH_IMAGE_GENERATION_CATALOG: 'media:fetch-image-generation-catalog',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
@@ -394,6 +403,12 @@ export interface MediaPreloadApi {
   mediaTestAudioGeneration(input: AudioGenerationTestInput): Promise<AudioGenerationTestResult>
   /** 用已保存或本次草稿凭据从供应商拉取可用模型与音色。 */
   mediaFetchAudioGenerationCatalog(input: AudioGenerationCatalogFetchInput): Promise<AudioGenerationCatalogFetchResult>
+  /** 读取独立生图目录及只读旧配置摘要。 */
+  mediaGetImageGenerationSettings(): Promise<ImageGenerationSettingsResult>
+  /** 以 catalog revision 完整替换独立生图配置。 */
+  mediaReplaceImageGenerationCatalog(input: ReplaceImageGenerationCatalogRequest): Promise<ImageGenerationSettingsResult>
+  /** 从生图供应商拉取可用模型（同时充当连接测试）。 */
+  mediaFetchImageGenerationCatalog(input: ImageGenerationCatalogFetchInput): Promise<ImageGenerationCatalogFetchResult>
   /** 取消当前窗口发起的指定音频测试。 */
   mediaCancelAudioGenerationTest(requestId: string): Promise<void>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>

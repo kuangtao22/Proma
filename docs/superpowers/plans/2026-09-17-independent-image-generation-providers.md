@@ -59,6 +59,10 @@ interface ImageGenerationProfileBase {
 
 ## 切片划分
 
+**执行顺序调整（2026-09-17，用户要求界面优先）**：用户连续两次要求“界面改为音频那种样式”，因此把 S5 → S6 提前到 S4 之前，
+即梦登录面板先在 UI 中占据位置（显示“未登录/点此登录”，按钮在 S4 接通前禁用并给出说明），
+ChatGPT 与 MiniMax 两条线路随 S5/S6 立即可用；S4 完成后再把登录按钮接活。
+
 - **S1 合同**：Shared 类型、strict parser、provider 描述表（字段、默认端、内置模型）、schema 版本与迁移规则。
 - **S2 独立 Store**：`~/.proma/image-generation-profiles.json`，safeStorage 加密、CAS、原子写、v1 迁移。
 - **S3 目录与测试服务**：OpenAI Images（`/v1/models` 过滤图像模型 + 内置兜底）、MiniMax（`/v1/models` 过滤 + 内置图像模型）、即梦（内置 model_version 清单）；连接测试按上面的规则接入。
