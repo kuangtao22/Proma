@@ -136,6 +136,13 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
 
   /** 读取独立目录；失败保持稳定提示而不会清空已有内容。 */
   const load = React.useCallback(async (): Promise<boolean> => {
+    /** preload 未更新时接口根本不存在，这种情况必须给出可操作提示而不是一直等待。 */
+    if (typeof globalThis.window?.electronAPI?.mediaGetImageGenerationSettings !== 'function') {
+      console.error('[生图配置] preload 缺少 mediaGetImageGenerationSettings，需重启开发实例')
+      setLoading(false)
+      setLoadError('preload 未包含生图接口：请重启开发实例（仅刷新窗口不够）。')
+      return false
+    }
     setLoading(true)
     try {
       const next = await withTimeout(api.getSettings(), IMAGE_GENERATION_LOAD_TIMEOUT_MS)
