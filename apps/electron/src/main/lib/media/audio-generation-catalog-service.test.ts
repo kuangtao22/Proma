@@ -113,6 +113,28 @@ describe('音频供应商目录拉取', () => {
     expect(JSON.stringify(result)).not.toContain('/Users/private')
   })
 
+  test('Given 模型接口失败但音色接口成功 When 拉取 Then 仍返回账号音色', async () => {
+    const fetchImpl: AudioGenerationCatalogFetch = async (input) => {
+      const url = input.toString()
+      if (url.endsWith('/models')) return new Response('nope', { status: 500 })
+      return new Response(JSON.stringify({
+        system_voice: { items: [{ voice_id: 'sys-1', voice_name: '系统音色' }] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    const service = new AudioGenerationCatalogService({ store: { resolveApiKey: () => 'saved' }, fetchImpl })
+
+    const result = await service.fetch(createInput({
+      provider: 'minimax',
+      baseUrl: 'https://api.minimax.example/v1',
+      credential: { mode: 'saved', profileId: 'minimax-1' },
+    }))
+
+    /** 两个接口相互独立，音色成功后不应被模型接口失败吞掉。 */
+    expect(result.state).toBe('success')
+    expect(result.models).toEqual([])
+    expect(result.voices).toEqual([{ id: 'sys-1', name: '系统音色', source: 'remote' }])
+  })
+
   test('Given 已保存凭据解析失败或上游超时 When 拉取 Then 都收敛为固定失败结果', async () => {
     const unauthorized = new AudioGenerationCatalogService({
       store: { resolveApiKey: () => { throw new Error('AUDIO_GENERATION_PROFILE_NOT_FOUND') } },

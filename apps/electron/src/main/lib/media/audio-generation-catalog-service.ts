@@ -133,12 +133,33 @@ export class AudioGenerationCatalogService {
   private async collect(input: AudioGenerationCatalogFetchInput, apiKey: string): Promise<AudioGenerationCatalogCollection> {
     /** 归一化后的服务基地址，避免出现双斜杠。 */
     const baseUrl = input.baseUrl.replace(/\/+$/, '')
-    const models = await this.fetchModels(input.provider, baseUrl, apiKey)
-    /** 小米音色是官方内置清单，不需要额外请求；MiniMax 需要按账号拉取。 */
-    const voices = input.provider === 'xiaomi'
-      ? [...AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi.builtinVoices]
-      : await this.fetchMiniMaxVoices(baseUrl, apiKey)
-    return { models, voices }
+    /**
+     * 模型与音色是两个独立接口，一个失败不能吞掉另一个的结果。
+     * 小米音色是官方内置清单，不需要额外请求；MiniMax 需要按账号拉取。
+     */
+    const [modelsOutcome, voicesOutcome] = await Promise.all([
+      AudioGenerationCatalogService.settle(() => this.fetchModels(input.provider, baseUrl, apiKey)),
+      AudioGenerationCatalogService.settle(() => input.provider === 'xiaomi'
+        ? Promise.resolve([...AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi.builtinVoices])
+        : this.fetchMiniMaxVoices(baseUrl, apiKey)),
+    ])
+    /** 两个接口都失败才算整体失败，错误优先取模型接口的分类。 */
+    /** 只有真实上游请求才算探测；小米音色是内置清单，不参与成败判定。 */
+    const upstreamOutcomes = input.provider === 'xiaomi' ? [modelsOutcome] : [modelsOutcome, voicesOutcome]
+    if (upstreamOutcomes.every((outcome) => !outcome.ok)) throw modelsOutcome.error
+    return {
+      models: modelsOutcome.ok ? modelsOutcome.value : [],
+      voices: voicesOutcome.ok ? voicesOutcome.value : [],
+    }
+  }
+
+  /** 把单个探测结果收敛为成功值或错误，避免 Promise.all 提前中断。 */
+  private static async settle<T>(run: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: Error }> {
+    try {
+      return { ok: true, value: await run() }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error : new Error('AUDIO_GENERATION_CATALOG_UPSTREAM_STATUS') }
+    }
   }
 
   /** 读取 OpenAI 兼容的模型列表，并归一化为去重后的稳定顺序。 */

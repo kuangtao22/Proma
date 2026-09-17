@@ -1233,6 +1233,11 @@ function AudioAvailableVoices({ provider, voices, builtinVoices, fetchedVoices, 
           {pendingVoices.length} 个音色未加入，重新添加该模型即可全部带出
         </div>
       )}
+      {capability === 'voice-id' && fetchedVoices.length > 0 && (
+        <p className="border-t border-border/50 px-4 py-2 text-xs text-muted-foreground">
+          已从供应商读取 {fetchedVoices.length} 个账号音色，加入模型时自动带出
+        </p>
+      )}
     </SettingsCard>
   )
 }
