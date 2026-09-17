@@ -455,6 +455,7 @@ import { createAudioGenerationIpcService, registerMediaIpcHandlers } from './lib
 import type { AudioGenerationIpcService } from './lib/media/media-ipc'
 import { AudioGenerationConfigStore } from './lib/media/audio-generation-config-store'
 import { AudioGenerationTestService } from './lib/media/audio-generation-test-service'
+import { AudioGenerationCatalogService } from './lib/media/audio-generation-catalog-service'
 import { MediaRunService } from './lib/media/media-run-service'
 import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
 import { MediaDesignAssets } from './lib/media/media-design-assets'
@@ -670,6 +671,8 @@ let mediaRunService: MediaRunService | undefined
 let audioGenerationStore: AudioGenerationConfigStore | undefined
 /** 所有设置窗口共享一个按 owner 隔离的音频测试服务。 */
 let audioGenerationTests: AudioGenerationTestService | undefined
+/** 进程级唯一的供应商目录拉取服务，凭据只在 Main 内解析。 */
+let audioGenerationCatalog: AudioGenerationCatalogService | undefined
 /** Media IPC 共享的独立音频组合服务，旧目录只读投影不建立第二写入口。 */
 let audioGenerationIpcService: AudioGenerationIpcService | undefined
 
@@ -692,11 +695,17 @@ function getAudioGenerationTests(): AudioGenerationTestService {
   return audioGenerationTests ??= new AudioGenerationTestService({ store: getAudioGenerationStore() })
 }
 
+/** 返回与唯一 Store 绑定的目录拉取服务，草稿凭据只在本进程内存中存在。 */
+function getAudioGenerationCatalog(): AudioGenerationCatalogService {
+  return audioGenerationCatalog ??= new AudioGenerationCatalogService({ store: getAudioGenerationStore() })
+}
+
 /** 返回进程级唯一音频 IPC 服务，旧统一媒体目录始终只读。 */
 function getAudioGenerationIpcService(): AudioGenerationIpcService {
   return audioGenerationIpcService ??= createAudioGenerationIpcService({
     store: getAudioGenerationStore(),
     tests: getAudioGenerationTests(),
+    catalog: getAudioGenerationCatalog(),
     listLegacyCatalog: () => getDesignImageModelServices().imageModels.listMediaApiCatalog(),
   })
 }

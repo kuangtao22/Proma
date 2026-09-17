@@ -3,6 +3,8 @@ import {
   AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_LEGACY_WARNING,
   MEDIA_IPC_CHANNELS,
+  parseAudioGenerationCatalogFetchInput,
+  parseAudioGenerationCatalogFetchResult,
   parseAudioGenerationSettingsResult,
   parseAudioGenerationTestCancelInput,
   parseAudioGenerationTestInput,
@@ -10,6 +12,8 @@ import {
   parseReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
 import type {
+  AudioGenerationCatalogFetchInput,
+  AudioGenerationCatalogFetchResult,
   AudioGenerationPublicCatalog,
   AudioGenerationSettingsResult,
   AudioGenerationTestInput,
@@ -30,6 +34,7 @@ import type {
 } from '@proma/shared'
 import type { AudioGenerationConfigStore } from './audio-generation-config-store'
 import type { AudioGenerationTestService } from './audio-generation-test-service'
+import type { AudioGenerationCatalogService } from './audio-generation-catalog-service'
 import type { MediaConfigStore } from './media-config-store'
 import type { MediaResourceService } from './media-resource-service'
 import { detectMediaFileSignature } from './media-file-probe'
@@ -43,6 +48,8 @@ export interface AudioGenerationIpcService {
   replace(input: ReplaceAudioGenerationCatalogRequest): AudioGenerationSettingsResult
   /** 按渲染窗口隔离运行连接测试。 */
   test(ownerId: number, input: AudioGenerationTestInput): Promise<AudioGenerationTestResult>
+  /** 用已保存或本次草稿凭据从供应商拉取可用模型与音色。 */
+  fetchCatalog(input: AudioGenerationCatalogFetchInput): Promise<AudioGenerationCatalogFetchResult>
   /** 幂等取消当前窗口的指定测试。 */
   cancel(ownerId: number, requestId: string): void
   /** 窗口销毁时释放其全部测试资源。 */
@@ -56,6 +63,7 @@ export interface AudioGenerationIpcServiceOptions {
   store: Pick<AudioGenerationConfigStore, 'readPublic' | 'replace'>
   tests: Pick<AudioGenerationTestService, 'test' | 'cancel' | 'releaseOwner'>
     & Partial<Pick<AudioGenerationTestService, 'dispose'>>
+  catalog: Pick<AudioGenerationCatalogService, 'fetch'>
   listLegacyCatalog(): MediaApiModelCatalogResult
 }
 
@@ -75,6 +83,7 @@ const AUDIO_GENERATION_STABLE_ERROR_CODES = new Set([
   'AUDIO_GENERATION_LEGACY_REFERENCE_INVALID',
   'AUDIO_GENERATION_TEST_CANCEL_FAILED',
   'AUDIO_GENERATION_TEST_FAILED',
+  'AUDIO_GENERATION_CATALOG_FAILED',
 ])
 
 /** 只保留已知稳定码，未知底层异常统一替换，避免路径、Key 或上游正文泄漏。 */
@@ -166,6 +175,7 @@ export function createAudioGenerationIpcService(options: AudioGenerationIpcServi
       legacy ??= readLegacyAudioProfiles(options.listLegacyCatalog)
       return createAudioSettingsResult(catalog, legacy)
     },
+    fetchCatalog: (input) => options.catalog.fetch(input),
     test: (ownerId, input) => options.tests.test(ownerId, input),
     cancel: (ownerId, requestId) => { options.tests.cancel(ownerId, requestId) },
     releaseOwner: (ownerId) => { options.tests.releaseOwner(ownerId) },
@@ -280,6 +290,18 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
       return parseAudioGenerationSettingsResult(options.audioGeneration.replace(input))
     } catch (error) {
       throwStableAudioError(error, 'AUDIO_GENERATION_CONFIG_WRITE_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, async (value, event) => {
+    const input = parseAudioGenerationCatalogFetchInput(value)
+    try {
+      const result = parseAudioGenerationCatalogFetchResult(await options.audioGeneration.fetchCatalog(input))
+      /** 拉取结束后再次核权，销毁或撤权窗口不能收到迟到结果。 */
+      if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
+      return result
+    } catch (error) {
+      if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
+      throwStableAudioError(error, 'AUDIO_GENERATION_CATALOG_FAILED')
     }
   })
   handle(MEDIA_IPC_CHANNELS.TEST_AUDIO_GENERATION, async (value, event) => {

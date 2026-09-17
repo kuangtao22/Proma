@@ -50,12 +50,24 @@ describe('媒体 preload 合同', () => {
     await api.mediaGetAudioGenerationSettings()
     await api.mediaReplaceAudioGenerationCatalog(request)
     await api.mediaTestAudioGeneration(testInput)
+    await api.mediaFetchAudioGenerationCatalog({
+      requestId: 'fetch-1',
+      provider: 'xiaomi',
+      baseUrl: 'https://tts.example/v1',
+      credential: { mode: 'draft', apiKey: 'secret-key' },
+    })
     await api.mediaCancelAudioGenerationTest('request-1')
 
     expect(calls).toEqual([
       { channel: MEDIA_IPC_CHANNELS.GET_AUDIO_GENERATION_SETTINGS, input: undefined },
       { channel: MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG, input: request },
       { channel: MEDIA_IPC_CHANNELS.TEST_AUDIO_GENERATION, input: testInput },
+      { channel: MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, input: {
+        requestId: 'fetch-1',
+        provider: 'xiaomi',
+        baseUrl: 'https://tts.example/v1',
+        credential: { mode: 'draft', apiKey: 'secret-key' },
+      } },
       { channel: MEDIA_IPC_CHANNELS.CANCEL_AUDIO_GENERATION_TEST, input: { requestId: 'request-1' } },
     ])
   })

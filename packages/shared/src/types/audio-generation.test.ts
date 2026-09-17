@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  AUDIO_GENERATION_CATALOG_MESSAGES,
   AUDIO_GENERATION_LEGACY_WARNING,
   AUDIO_GENERATION_PROVIDER_DESCRIPTORS,
+  parseAudioGenerationCatalogFetchInput,
+  parseAudioGenerationCatalogFetchResult,
   parseAudioGenerationProfile,
   parseAudioGenerationSettingsResult,
   parseAudioGenerationTestCancelInput,
@@ -223,6 +226,61 @@ describe('独立音频生成 Shared 合同', () => {
     expect(() => parseAudioGenerationTestResult({
       requestId: 'request-1', state: 'success', message: '音频生成服务连接测试失败',
     })).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+  })
+
+  test('Given 供应商拉取请求 When 解析 Then 凭据二选一且多余字段被拒绝', () => {
+    expect(parseAudioGenerationCatalogFetchInput({
+      requestId: 'fetch-1',
+      provider: 'minimax',
+      baseUrl: 'https://api.minimax.example/v1//',
+      groupId: ' group-1 ',
+      credential: { mode: 'saved', profileId: 'minimax-1' },
+    })).toEqual({
+      requestId: 'fetch-1',
+      provider: 'minimax',
+      baseUrl: 'https://api.minimax.example/v1',
+      groupId: 'group-1',
+      credential: { mode: 'saved', profileId: 'minimax-1' },
+    })
+    expect(parseAudioGenerationCatalogFetchInput({
+      requestId: 'fetch-2',
+      provider: 'xiaomi',
+      baseUrl: 'https://tts.example/v1',
+      credential: { mode: 'draft', apiKey: ' secret-key ' },
+    }).credential).toEqual({ mode: 'draft', apiKey: 'secret-key' })
+    for (const invalid of [
+      { requestId: 'f', provider: 'xiaomi', baseUrl: 'https://tts.example/v1', credential: { mode: 'saved', profileId: 'a', apiKey: 'leak' } },
+      { requestId: 'f', provider: 'unknown', baseUrl: 'https://tts.example/v1', credential: { mode: 'saved', profileId: 'a' } },
+      { requestId: 'f', provider: 'xiaomi', baseUrl: 'https://tts.example/v1', credential: { mode: 'draft', apiKey: '' } },
+      { requestId: 'f', provider: 'xiaomi', baseUrl: 'https://tts.example/v1', credential: { mode: 'saved', profileId: 'a' }, extra: true },
+    ]) {
+      expect(() => parseAudioGenerationCatalogFetchInput(invalid)).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+  })
+
+  test('Given 供应商拉取结果 When 解析 Then 只接受固定文案、去重模型与有界音色', () => {
+    expect(parseAudioGenerationCatalogFetchResult({
+      requestId: 'fetch-1',
+      state: 'success',
+      message: AUDIO_GENERATION_CATALOG_MESSAGES.success,
+      models: ['mimo-v2.5-tts', 'mimo-v2.5'],
+      voices: [{ id: 'mimo_default', name: 'MiMo-默认', source: 'builtin' }],
+    })).toMatchObject({ state: 'success', models: ['mimo-v2.5-tts', 'mimo-v2.5'] })
+    /** 失败结果允许空模型与空音色，便于界面直接展示失败态。 */
+    expect(parseAudioGenerationCatalogFetchResult({
+      requestId: 'fetch-1',
+      state: 'failed',
+      message: AUDIO_GENERATION_CATALOG_MESSAGES.failed,
+      models: [],
+      voices: [],
+    }).state).toBe('failed')
+    for (const invalid of [
+      { requestId: 'f', state: 'success', message: 'upstream said no', models: [], voices: [] },
+      { requestId: 'f', state: 'failed', message: AUDIO_GENERATION_CATALOG_MESSAGES.failed, models: ['dup', 'dup'], voices: [] },
+      { requestId: 'f', state: 'success', message: AUDIO_GENERATION_CATALOG_MESSAGES.success, models: [], voices: [{ id: 'v', source: 'remote', extra: true }] },
+    ]) {
+      expect(() => parseAudioGenerationCatalogFetchResult(invalid)).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    }
   })
 
   test('Given 设置结果 When 解析 Then 公开 Profile 与旧摘要均使用严格字段', () => {

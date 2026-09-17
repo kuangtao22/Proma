@@ -3,6 +3,8 @@ import type {
   AudioGenerationSettingsResult,
   AudioGenerationTestInput,
   AudioGenerationTestResult,
+  AudioGenerationCatalogFetchInput,
+  AudioGenerationCatalogFetchResult,
   ReplaceAudioGenerationCatalogRequest,
 } from './audio-generation'
 
@@ -362,6 +364,7 @@ export const MEDIA_IPC_CHANNELS = {
   REPLACE_AUDIO_GENERATION_CATALOG: 'media:replace-audio-generation-catalog',
   TEST_AUDIO_GENERATION: 'media:test-audio-generation',
   CANCEL_AUDIO_GENERATION_TEST: 'media:cancel-audio-generation-test',
+  FETCH_AUDIO_GENERATION_CATALOG: 'media:fetch-audio-generation-catalog',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
@@ -389,6 +392,8 @@ export interface MediaPreloadApi {
   mediaReplaceAudioGenerationCatalog(input: ReplaceAudioGenerationCatalogRequest): Promise<AudioGenerationSettingsResult>
   /** 测试草稿或已保存音频配置，结果只包含脱敏中文消息。 */
   mediaTestAudioGeneration(input: AudioGenerationTestInput): Promise<AudioGenerationTestResult>
+  /** 用已保存或本次草稿凭据从供应商拉取可用模型与音色。 */
+  mediaFetchAudioGenerationCatalog(input: AudioGenerationCatalogFetchInput): Promise<AudioGenerationCatalogFetchResult>
   /** 取消当前窗口发起的指定音频测试。 */
   mediaCancelAudioGenerationTest(requestId: string): Promise<void>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>

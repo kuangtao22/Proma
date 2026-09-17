@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
-import { AUDIO_GENERATION_LEGACY_WARNING, AUDIO_GENERATION_TEST_MESSAGES, MEDIA_IPC_CHANNELS } from '@proma/shared'
-import type { AudioGenerationPublicCatalog, AudioGenerationSettingsResult, AudioGenerationTestInput, AudioGenerationTestResult, MediaApiModelCatalogEntry, ReplaceAudioGenerationCatalogRequest } from '@proma/shared'
+import { AUDIO_GENERATION_CATALOG_MESSAGES, AUDIO_GENERATION_LEGACY_WARNING, AUDIO_GENERATION_TEST_MESSAGES, MEDIA_IPC_CHANNELS } from '@proma/shared'
+import type { AudioGenerationCatalogFetchInput, AudioGenerationPublicCatalog, AudioGenerationSettingsResult, AudioGenerationTestInput, AudioGenerationTestResult, MediaApiModelCatalogEntry, ReplaceAudioGenerationCatalogRequest } from '@proma/shared'
 import { createAudioGenerationIpcService, registerMediaIpcHandlers as registerProductionMediaIpcHandlers } from './media-ipc'
 import type { AudioGenerationIpcService, MediaIpcOptions } from './media-ipc'
 import { EventEmitter } from 'node:events'
@@ -30,9 +30,13 @@ function createAudioCatalog(profiles: AudioGenerationPublicCatalog['profiles'] =
 }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
+const unusedAudioCatalogFetch = async (): Promise<never> => { throw new Error('unused') }
+
+/** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
 const unusedAudioGenerationService: AudioGenerationIpcService = {
   listSettings: () => ({ catalog: createAudioCatalog(), legacyAudioProfiles: [] }),
   replace: () => ({ catalog: createAudioCatalog(), legacyAudioProfiles: [] }),
+  fetchCatalog: unusedAudioCatalogFetch,
   test: async (_ownerId, input) => ({ requestId: input.requestId, state: 'success', message: AUDIO_GENERATION_TEST_MESSAGES.success }),
   cancel: () => undefined,
   releaseOwner: () => undefined,
@@ -468,6 +472,7 @@ describe('独立音频生成 IPC', () => {
     return {
       listSettings: () => settings,
       replace: () => settings,
+      fetchCatalog: unusedAudioCatalogFetch,
       test: async (_ownerId, input) => ({ requestId: input.requestId, state: 'success', message: AUDIO_GENERATION_TEST_MESSAGES.success }),
       cancel: () => undefined,
       releaseOwner: () => undefined,
@@ -506,10 +511,47 @@ describe('独立音频生成 IPC', () => {
         [MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG, { malformed: true }],
         [MEDIA_IPC_CHANNELS.TEST_AUDIO_GENERATION, { malformed: true }],
         [MEDIA_IPC_CHANNELS.CANCEL_AUDIO_GENERATION_TEST, { malformed: true }],
+        [MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, { malformed: true }],
       ] as const) {
         await expect(Promise.resolve().then(() => handlers.get(channel)!(event, input))).rejects.toThrow('MEDIA_ACCESS_DENIED')
       }
       expect(calls).toBe(0)
+    } finally { registration.dispose() }
+  })
+
+  test('Given 已授权窗口 When 从供应商获取 Then 先解析输入并在返回后重新核权', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    /** 拉取期间撤权，验证迟到结果不会回传给已失效窗口。 */
+    let authorized = true
+    const requests: string[] = []
+    const registration = registerMediaIpcHandlers(createMediaOptions(handlers, createService({
+      fetchCatalog: async (input) => {
+        requests.push(`${input.provider}:${input.requestId}`)
+        authorized = false
+        return {
+          requestId: input.requestId,
+          state: 'success',
+          message: AUDIO_GENERATION_CATALOG_MESSAGES.success,
+          models: ['mimo-v2.5-tts'],
+          voices: [],
+        }
+      },
+    }), () => authorized))
+    const event = { sender: Object.assign(new EventEmitter(), { id: 7 }) } as unknown as IpcMainInvokeEvent
+    const fetchInput: AudioGenerationCatalogFetchInput = {
+      requestId: 'fetch-1',
+      provider: 'xiaomi',
+      baseUrl: 'https://tts.example/v1',
+      credential: { mode: 'draft', apiKey: 'secret-key' },
+    }
+    try {
+      /** 多余字段必须在解析阶段失败，且不触发上游请求。 */
+      await expect(handlers.get(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG)!(event, { ...fetchInput, extra: true }))
+        .rejects.toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+      expect(requests).toEqual([])
+      await expect(handlers.get(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG)!(event, fetchInput))
+        .rejects.toThrow('MEDIA_ACCESS_DENIED')
+      expect(requests).toEqual(['xiaomi:fetch-1'])
     } finally { registration.dispose() }
   })
 
@@ -659,6 +701,7 @@ describe('音频生成 IPC 服务装配', () => {
     const service = createAudioGenerationIpcService({
       store: { readPublic: () => createAudioCatalog(), replace: () => createAudioCatalog() },
       tests: { test: async () => { throw new Error('unused') }, cancel: () => undefined, releaseOwner: () => undefined },
+      catalog: { fetch: unusedAudioCatalogFetch },
       listLegacyCatalog: () => legacyCatalog,
     })
 
@@ -679,6 +722,7 @@ describe('音频生成 IPC 服务装配', () => {
       const service = createAudioGenerationIpcService({
         store: { readPublic: () => catalog, replace: () => catalog },
         tests: { test: async () => { throw new Error('unused') }, cancel: () => undefined, releaseOwner: () => undefined },
+        catalog: { fetch: unusedAudioCatalogFetch },
         listLegacyCatalog,
       })
       expect(service.listSettings()).toEqual({ catalog, legacyAudioProfiles: [], legacyWarning: AUDIO_GENERATION_LEGACY_WARNING })
@@ -691,6 +735,7 @@ describe('音频生成 IPC 服务装配', () => {
     const service = createAudioGenerationIpcService({
       store: { readPublic: () => { throw new Error('private path and key') }, replace: () => createAudioCatalog() },
       tests: { test: async () => { throw new Error('unused') }, cancel: () => undefined, releaseOwner: () => undefined },
+      catalog: { fetch: unusedAudioCatalogFetch },
       listLegacyCatalog: () => { legacyReads += 1; return { revision: 0, entries: [] } },
     })
     expect(() => service.listSettings()).toThrow('AUDIO_GENERATION_CONFIG_READ_FAILED')
@@ -714,6 +759,7 @@ describe('音频生成 IPC 服务装配', () => {
     const keepService = createAudioGenerationIpcService({
       store,
       tests,
+      catalog: { fetch: unusedAudioCatalogFetch },
       listLegacyCatalog: () => { legacyReads += 1; throw new Error('旧目录故障') },
     })
     const preserveRequest: ReplaceAudioGenerationCatalogRequest = {
@@ -727,6 +773,7 @@ describe('音频生成 IPC 服务装配', () => {
     const rejectService = createAudioGenerationIpcService({
       store,
       tests,
+      catalog: { fetch: unusedAudioCatalogFetch },
       listLegacyCatalog: () => ({ revision: 1, entries: [createLegacyEntry()] }),
     })
     const invalidReference: ReplaceAudioGenerationCatalogRequest = {
@@ -741,7 +788,7 @@ describe('音频生成 IPC 服务装配', () => {
       profiles: [{ profile: createAudioProfile({ legacyMediaProfileId: 'legacy-1' }), credentialUpdate: { mode: 'preserve' } }],
     }
     const emptyCurrentStore = { readPublic: () => createAudioCatalog(), replace: store.replace }
-    expect(createAudioGenerationIpcService({ store: emptyCurrentStore, tests, listLegacyCatalog: () => ({ revision: 1, entries: [createLegacyEntry()] }) })
+    expect(createAudioGenerationIpcService({ store: emptyCurrentStore, tests, catalog: { fetch: unusedAudioCatalogFetch }, listLegacyCatalog: () => ({ revision: 1, entries: [createLegacyEntry()] }) })
       .replace(changedToValid).catalog.revision).toBe(1)
     expect(writes).toBe(2)
   })

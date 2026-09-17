@@ -109,6 +109,38 @@ export interface AudioGenerationTestCancelInput {
   requestId: string
 }
 
+/** 拉取可用模型/音色时的凭据来源；二选一，明文只在草稿分支出现。 */
+export type AudioGenerationCatalogCredential =
+  | { mode: 'saved'; profileId: string }
+  | { mode: 'draft'; apiKey: string }
+
+/** 从供应商拉取可用模型与音色的输入。 */
+export interface AudioGenerationCatalogFetchInput {
+  requestId: string
+  provider: AudioGenerationProvider
+  baseUrl: string
+  groupId?: string
+  credential: AudioGenerationCatalogCredential
+}
+
+/** 拉取结果的公开形态，不含上游正文、路径或凭据。 */
+export interface AudioGenerationCatalogFetchResult {
+  requestId: string
+  state: 'success' | 'failed'
+  message: string
+  models: string[]
+  voices: AudioGenerationVoice[]
+}
+
+/** 拉取结果唯一允许公开的固定文案。 */
+export const AUDIO_GENERATION_CATALOG_MESSAGES = {
+  success: '已从供应商获取可用模型与音色',
+  failed: '从供应商获取失败，请检查服务地址与凭据',
+} as const
+
+/** 单次拉取允许返回的模型数量上限。 */
+export const AUDIO_GENERATION_MODEL_LIMIT = 200
+
 /** 每个供应商固定的显示名和专属字段合同。 */
 interface AudioGenerationProviderDescriptorDefinition {
   xiaomi: { label: '小米 TTS'; specificFields: readonly [] }
@@ -301,12 +333,14 @@ function parseBaseUrl(value: unknown): string {
 }
 
 /**
- * 严格解析已启用音色列表。
- * 入参：来自磁盘或 IPC 的未知值；返回值：清洗后的有序音色数组。
- * 空列表、超限、未知字段、非法来源与重复 ID 一律拒绝，避免歧义音色进入执行链。
+ * 解析音色数组，供配置合同与供应商拉取结果共用。
+ * 入参：未知值、是否要求至少一条；返回值：清洗后的有序音色数组。
+ * 超限、未知字段、非法来源与重复 ID 一律拒绝，避免歧义音色进入执行链。
  */
-export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVoice[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > AUDIO_GENERATION_VOICE_LIMIT) {
+function parseVoiceItems(value: unknown, requireAtLeastOne: boolean): AudioGenerationVoice[] {
+  if (!Array.isArray(value)
+    || value.length < (requireAtLeastOne ? 1 : 0)
+    || value.length > AUDIO_GENERATION_VOICE_LIMIT) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
   /** 已出现过的音色 ID，用于拒绝同一配置内的重复音色。 */
@@ -325,6 +359,14 @@ export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVo
     const name = parseOptionalText(item.name, AUDIO_GENERATION_VOICE_NAME_MAX_LENGTH)
     return name === undefined ? { id, source: item.source } : { id, name, source: item.source }
   })
+}
+
+/**
+ * 严格解析已启用音色列表。
+ * 入参：来自磁盘或 IPC 的未知值；返回值：至少一条的已清洗音色数组。
+ */
+export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVoice[] {
+  return parseVoiceItems(value, true)
 }
 
 /** 解析独立音频配置，并严格保留供应商字段差异。 */
@@ -499,6 +541,16 @@ function parsePublicMessage(state: AudioGenerationTestState, value: unknown): st
   return message
 }
 
+/** 严格解析拉取结果消息，只接受与状态对应的固定文案。 */
+function parseCatalogMessage(state: 'success' | 'failed', value: unknown): string {
+  /** 已执行原始长度限制和空白清洗的候选拉取消息。 */
+  const message = parseRequiredText(value, AUDIO_GENERATION_MESSAGE_MAX_LENGTH)
+  if (message !== AUDIO_GENERATION_CATALOG_MESSAGES[state]) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  return message
+}
+
 /** 严格解析草稿或已保存配置的测试请求。 */
 export function parseAudioGenerationTestInput(value: unknown): AudioGenerationTestInput {
   if (!isRecord(value)) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
@@ -538,4 +590,78 @@ export function parseAudioGenerationTestCancelInput(value: unknown): AudioGenera
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
   return { requestId: parseStableId(value.requestId) }
+}
+
+/**
+ * 严格解析从供应商拉取可用模型与音色的输入。
+ * 入参：来自 Renderer 的未知值；返回值：已校验的拉取请求。
+ * 凭据只允许 saved 或 draft 两种互斥形态，任何多余字段都会被拒绝。
+ */
+export function parseAudioGenerationCatalogFetchInput(value: unknown): AudioGenerationCatalogFetchInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['requestId', 'provider', 'baseUrl', 'groupId', 'credential'])
+    || (value.provider !== 'xiaomi' && value.provider !== 'minimax')
+    || !isRecord(value.credential)) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 已清洗的请求 ID 与服务地址。 */
+  const requestId = parseStableId(value.requestId)
+  const baseUrl = parseBaseUrl(value.baseUrl)
+  /** 可选 Group ID 只接受同一标识合同。 */
+  const groupId = parseOptionalText(value.groupId, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH)
+  /** 凭据来源二选一，明文只在 draft 分支短暂存在。 */
+  let credential: AudioGenerationCatalogCredential
+  if (value.credential.mode === 'saved') {
+    if (!hasOnlyKeys(value.credential, ['mode', 'profileId'])) {
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    credential = { mode: 'saved', profileId: parseStableId(value.credential.profileId) }
+  } else if (value.credential.mode === 'draft') {
+    if (!hasOnlyKeys(value.credential, ['mode', 'apiKey'])) {
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    credential = {
+      mode: 'draft',
+      apiKey: parseRequiredText(value.credential.apiKey, AUDIO_GENERATION_API_KEY_MAX_LENGTH),
+    }
+  } else {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  return {
+    requestId,
+    provider: value.provider,
+    baseUrl,
+    ...(groupId === undefined ? {} : { groupId }),
+    credential,
+  }
+}
+
+/**
+ * 严格解析供应商拉取结果。
+ * 入参：主进程返回的未知值；返回值：脱敏后的模型与音色候选。
+ * 只接受固定文案与有界的模型/音色集合，上游正文无法穿过该边界。
+ */
+export function parseAudioGenerationCatalogFetchResult(value: unknown): AudioGenerationCatalogFetchResult {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['requestId', 'state', 'message', 'models', 'voices'])
+    || (value.state !== 'success' && value.state !== 'failed')
+    || !Array.isArray(value.models)
+    || value.models.length > AUDIO_GENERATION_MODEL_LIMIT) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 模型 ID 逐个清洗并拒绝重复。 */
+  const seenModels = new Set<string>()
+  const models = value.models.map((model) => {
+    const id = parseRequiredText(model, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH)
+    if (seenModels.has(id)) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    seenModels.add(id)
+    return id
+  })
+  return {
+    requestId: parseStableId(value.requestId),
+    state: value.state,
+    message: parseCatalogMessage(value.state, value.message),
+    models,
+    voices: parseVoiceItems(value.voices, false),
+  }
 }

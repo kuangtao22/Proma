@@ -20,6 +20,7 @@ export function createMediaPreloadApi(invoke: (channel: string, input?: unknown)
     mediaGetAudioGenerationSettings: () => invoke(MEDIA_IPC_CHANNELS.GET_AUDIO_GENERATION_SETTINGS) as ReturnType<MediaPreloadApi['mediaGetAudioGenerationSettings']>,
     mediaReplaceAudioGenerationCatalog: (input) => invoke(MEDIA_IPC_CHANNELS.REPLACE_AUDIO_GENERATION_CATALOG, input) as ReturnType<MediaPreloadApi['mediaReplaceAudioGenerationCatalog']>,
     mediaTestAudioGeneration: (input) => invoke(MEDIA_IPC_CHANNELS.TEST_AUDIO_GENERATION, input) as ReturnType<MediaPreloadApi['mediaTestAudioGeneration']>,
+    mediaFetchAudioGenerationCatalog: (input) => invoke(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, input) as ReturnType<MediaPreloadApi['mediaFetchAudioGenerationCatalog']>,
     mediaCancelAudioGenerationTest: (requestId) => invoke(MEDIA_IPC_CHANNELS.CANCEL_AUDIO_GENERATION_TEST, { requestId }) as ReturnType<MediaPreloadApi['mediaCancelAudioGenerationTest']>,
     mediaGetRun: (projectId, runId) => invoke(MEDIA_IPC_CHANNELS.GET_RUN, { projectId, runId }) as ReturnType<MediaPreloadApi['mediaGetRun']>,
     mediaGetJobRun: (projectId, jobId) => invoke(MEDIA_IPC_CHANNELS.GET_JOB_RUN, { projectId, jobId }) as ReturnType<MediaPreloadApi['mediaGetJobRun']>,
