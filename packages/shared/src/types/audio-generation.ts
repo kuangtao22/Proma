@@ -403,14 +403,6 @@ function parseVoiceItems(value: unknown, requireAtLeastOne: boolean): AudioGener
 }
 
 /**
- * 严格解析已启用音色列表。
- * 入参：来自磁盘或 IPC 的未知值；返回值：至少一条的已清洗音色数组。
- */
-export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVoice[] {
-  return parseVoiceItems(value, true)
-}
-
-/**
  * 严格解析已启用模型列表。
  * 入参：来自磁盘或 IPC 的未知值；返回值：已清洗的模型数组（至少一条）。
  * 模型的音色允许为空，但模型 ID 在同一配置内必须唯一。

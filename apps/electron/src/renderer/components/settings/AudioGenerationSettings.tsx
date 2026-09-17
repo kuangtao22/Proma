@@ -88,7 +88,7 @@ export function resolveVoiceCapability(provider: AudioGenerationProvider, modelI
  * 入参：供应商；返回值：初始模型数组（可能为空）。
  * 默认模型支持音色 ID 时直接带出官方内置音色，用户无需逐条添加。
  */
-export function initialModelsForProvider(provider: AudioGenerationProvider): AudioGenerationModelEntry[] {
+function initialModelsForProvider(provider: AudioGenerationProvider): AudioGenerationModelEntry[] {
   const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[provider]
   if (!defaults.modelId) return []
   return [{

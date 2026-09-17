@@ -146,7 +146,15 @@ export class AudioGenerationCatalogService {
     /** 两个接口都失败才算整体失败，错误优先取模型接口的分类。 */
     /** 只有真实上游请求才算探测；小米音色是内置清单，不参与成败判定。 */
     const upstreamOutcomes = input.provider === 'xiaomi' ? [modelsOutcome] : [modelsOutcome, voicesOutcome]
-    if (upstreamOutcomes.every((outcome) => !outcome.ok)) throw modelsOutcome.error
+    if (upstreamOutcomes.every((outcome) => !outcome.ok)) {
+      /** 全部失败时优先暴露模型接口的分类错误。 */
+      const failure = !modelsOutcome.ok
+        ? modelsOutcome.error
+        : voicesOutcome.ok
+          ? new Error('AUDIO_GENERATION_CATALOG_UPSTREAM_STATUS')
+          : voicesOutcome.error
+      throw failure
+    }
     return {
       models: modelsOutcome.ok ? modelsOutcome.value : [],
       voices: voicesOutcome.ok ? voicesOutcome.value : [],
