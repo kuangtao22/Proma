@@ -14,13 +14,14 @@ import type {
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
 import { AUDIO_GENERATION_PROVIDER_DEFAULTS, AUDIO_GENERATION_PROVIDER_DESCRIPTORS, parseAudioGenerationProfile } from '@proma/shared'
-import { CheckCircle2, Copy, Download, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2, X } from 'lucide-react'
+import { CheckCircle2, Copy, Download, Loader2, Pencil, Plus, Search, TestTube2, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsInput, SettingsRow, SettingsSection, SettingsSelect, SettingsToggle } from './primitives'
+import { getProviderLogo } from '@/lib/model-logo'
 
 /** 音频编辑草稿只在 Renderer 内短暂持有明文 API Key。 */
 export type AudioGenerationDraft = AudioGenerationProfile & {
@@ -1303,7 +1304,12 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
                 if (value !== 'xiaomi' && value !== 'minimax') return
                 controller.updateDraft(changeAudioGenerationProvider(draft, value))
               }}
-              options={AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => ({ value: descriptor.provider, label: descriptor.label }))}
+              /** 复用渠道配置的供应商 Logo，保持两处视觉一致。 */
+              options={AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => ({
+                value: descriptor.provider,
+                label: descriptor.label,
+                icon: getProviderLogo(descriptor.provider),
+              }))}
             />
             <SettingsInput
               label="供应商名称"
@@ -1421,7 +1427,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           : settings && visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的音频配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => {
                 const testState = testStates[profile.id]
-                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {voiceSummary(profile.models)}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
+                return <SettingsRow key={profile.id} label={profile.name} icon={<img src={getProviderLogo(profile.provider)} alt="" className="size-5 rounded-sm object-contain" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {voiceSummary(profile.models)}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
               })}</SettingsCard>}
       <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title="删除音频配置？" description={actionError ?? (deleteTarget ? `删除 ${deleteTarget.name} 后，后续音频任务将不能再使用该配置。` : '')} confirmLabel="删除" closeOnConfirm={false} loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>

@@ -1,5 +1,16 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
+
 import * as React from 'react'
+/** 单测不验证供应商品牌位图，避免 Bun 直接解析 Vite 位图导入。 */
+mock.module('@/lib/model-logo', () => ({
+  DefaultLogo: 'model-logo.png',
+  PromaLogo: 'proma-logo.png',
+  getChannelLogo: () => 'model-logo.png',
+  getModelLogo: () => 'model-logo.png',
+  getProviderLogo: () => 'model-logo.png',
+  resolveModelDisplayName: (modelId: string) => modelId,
+  resolveModelProvider: () => 'unknown',
+}))
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
