@@ -74,7 +74,7 @@ function createImageGenerationId(): string {
 }
 
 /** 生图读取的超时时间；主进程未响应时也要给出可见错误而不是一直转圈。 */
-const IMAGE_GENERATION_LOAD_TIMEOUT_MS = 8_000
+const IMAGE_GENERATION_LOAD_TIMEOUT_MS = 5_000
 
 /**
  * 给 IPC 调用加超时。
@@ -158,6 +158,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
 
   /** 读取独立目录；失败保持稳定提示而不会清空已有内容。 */
   const load = React.useCallback(async (): Promise<boolean> => {
+    /** 先记录发起时刻：能区分“没发起”与“发起了但主进程没回”两种卡住。 */
+    console.info('[生图配置] 开始读取 settings')
     setLoading(true)
     try {
       const next = await withTimeout(api.getSettings(), IMAGE_GENERATION_LOAD_TIMEOUT_MS)
