@@ -1,10 +1,15 @@
 import { describe, expect, spyOn, test } from 'bun:test'
 import type {
+  AudioGenerationCatalogFetchInput,
   AudioGenerationProfile,
   AudioGenerationPublicCatalog,
   AudioGenerationTestInput,
 } from '@proma/shared'
-import { AUDIO_GENERATION_TEST_MESSAGES } from '@proma/shared'
+import {
+  AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES,
+  AUDIO_GENERATION_CATALOG_MESSAGES,
+  AUDIO_GENERATION_TEST_MESSAGES,
+} from '@proma/shared'
 import {
   AudioGenerationTestService,
   type AudioGenerationProviderTester,
@@ -130,6 +135,63 @@ describe('独立音频供应商测试服务', () => {
     } finally {
       fetchSpy.mockRestore()
     }
+  })
+
+  test('Given 注入目录探测 When 连接测试 Then 用当前凭据探测供应商并映射固定终态', async () => {
+    const probes: Array<{ provider: string; baseUrl: string; credential: unknown }> = []
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      catalog: {
+        fetch: async (value) => {
+          /** 目录探测入口声明为 unknown，测试内按合同断言。 */
+          const input = value as AudioGenerationCatalogFetchInput
+          probes.push({ provider: input.provider, baseUrl: input.baseUrl, credential: input.credential })
+          return {
+            requestId: input.requestId,
+            state: 'success',
+            message: AUDIO_GENERATION_CATALOG_MESSAGES.success,
+            models: ['mimo-v2.5-tts'],
+            voices: [],
+          }
+        },
+      },
+    })
+
+    expect(await service.test(7, draftInput('probe-xiaomi', 'xiaomi', 'current-secret'))).toEqual({
+      requestId: 'probe-xiaomi',
+      state: 'success',
+      message: AUDIO_GENERATION_TEST_MESSAGES.success,
+    })
+    /** 探测使用本次草稿凭据，且只调用不生成音频的能力接口。 */
+    expect(probes).toEqual([{
+      provider: 'xiaomi',
+      baseUrl: 'https://xiaomi.example/v1/audio',
+      credential: { mode: 'draft', apiKey: 'current-secret' },
+    }])
+  })
+
+  test('Given 目录探测失败 When 连接测试 Then 只返回固定失败文案', async () => {
+    const service = new AudioGenerationTestService({
+      store: storeFixture(),
+      catalog: {
+        fetch: async (value) => {
+          const input = value as AudioGenerationCatalogFetchInput
+          return {
+            requestId: input.requestId,
+            state: 'failed' as const,
+            message: AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.unauthorized,
+            models: [],
+            voices: [],
+          }
+        },
+      },
+    })
+
+    expect(await service.test(7, draftInput('probe-fail', 'minimax'))).toEqual({
+      requestId: 'probe-fail',
+      state: 'failed',
+      message: AUDIO_GENERATION_TEST_MESSAGES.failed,
+    })
   })
 
   test('Given 草稿凭据 When 测试 Then 只在 tester 调用栈收到严格配置和当前 Key', async () => {

@@ -12,6 +12,7 @@ import {
   parseAudioGenerationTestInput,
   parseAudioGenerationTestResult,
 } from '@proma/shared'
+import type { AudioGenerationCatalogService } from './audio-generation-catalog-service'
 
 /** 测试器唯一可见的主进程输入；明文凭据不得离开当前调用链。 */
 export interface AudioGenerationResolvedTestInput {
@@ -42,6 +43,8 @@ export interface AudioGenerationTestStore {
 export interface AudioGenerationTestServiceOptions {
   /** 独立音频配置 Store。 */
   store: AudioGenerationTestStore
+  /** 供应商能力探测；注入后连接测试会真实请求供应商，不注入则返回固定不可用。 */
+  catalog?: Pick<AudioGenerationCatalogService, 'fetch'>
   /** 按供应商覆盖默认不可用 adapter，供后续真实合同和测试注入。 */
   testers?: Partial<Record<AudioGenerationProvider, AudioGenerationProviderTester>>
   /** 单次测试 deadline；生产默认 15 秒，测试可注入更短正整数。 */
@@ -85,8 +88,8 @@ const MAX_ACTIVE_TESTS_PER_OWNER = 16
 /** 当前主进程允许并发的连接测试总上限。 */
 const MAX_ACTIVE_TESTS_GLOBAL = 64
 
-/** 首批供应商在缺少已验证官方测试合同时仅返回固定不可用结果。 */
-const DEFAULT_TESTERS: Record<AudioGenerationProvider, AudioGenerationProviderTester> = {
+/** 未注入目录探测能力时的保守兜底：明确告知当前无法验证。 */
+const UNAVAILABLE_TESTERS: Record<AudioGenerationProvider, AudioGenerationProviderTester> = {
   xiaomi: {
     test: async () => ({
       state: 'unavailable',
@@ -99,6 +102,33 @@ const DEFAULT_TESTERS: Record<AudioGenerationProvider, AudioGenerationProviderTe
       message: AUDIO_GENERATION_TEST_MESSAGES.unavailable.minimax,
     }),
   },
+}
+
+/**
+ * 用供应商能力接口验证端点与凭据，不生成任何音频。
+ * 小米读取模型列表，MiniMax 读取账号音色列表；两者都能证明 Base URL 与 API Key 可用。
+ */
+function createCatalogProbeTester(
+  provider: AudioGenerationProvider,
+  catalog: Pick<AudioGenerationCatalogService, 'fetch'>,
+): AudioGenerationProviderTester {
+  return {
+    test: async ({ profile, apiKey }) => {
+      /** 复用目录拉取的超时、体积与脱敏收口，避免第二套请求实现。 */
+      const result = await catalog.fetch({
+        requestId: `probe-${profile.id}`,
+        provider,
+        baseUrl: profile.baseUrl,
+        ...(provider === 'minimax' && profile.provider === 'minimax' && profile.groupId
+          ? { groupId: profile.groupId }
+          : {}),
+        credential: { mode: 'draft', apiKey },
+      })
+      return result.state === 'success'
+        ? { state: 'success', message: AUDIO_GENERATION_TEST_MESSAGES.success }
+        : { state: 'failed', message: AUDIO_GENERATION_TEST_MESSAGES.failed }
+    },
+  }
 }
 
 /** 构造并严格校验唯一允许公开的失败结果。 */
@@ -202,7 +232,14 @@ export class AudioGenerationTestService {
       throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
     }
     this.store = options.store
-    this.testers = { ...DEFAULT_TESTERS, ...options.testers }
+    /** 未提供目录探测能力时保持保守的不可用结果。 */
+    const defaults = options.catalog
+      ? {
+          xiaomi: createCatalogProbeTester('xiaomi', options.catalog),
+          minimax: createCatalogProbeTester('minimax', options.catalog),
+        }
+      : UNAVAILABLE_TESTERS
+    this.testers = { ...defaults, ...options.testers }
     this.timeoutMs = timeoutMs
   }
 

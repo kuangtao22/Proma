@@ -692,7 +692,11 @@ function getAudioGenerationStore(): AudioGenerationConfigStore {
 
 /** 返回与唯一 Store 绑定的测试服务，避免窗口间共享明文或取消状态。 */
 function getAudioGenerationTests(): AudioGenerationTestService {
-  return audioGenerationTests ??= new AudioGenerationTestService({ store: getAudioGenerationStore() })
+  /** 连接测试复用目录探测：小米读模型列表、MiniMax 读音色列表，都不生成音频。 */
+  return audioGenerationTests ??= new AudioGenerationTestService({
+    store: getAudioGenerationStore(),
+    catalog: getAudioGenerationCatalog(),
+  })
 }
 
 /** 返回与唯一 Store 绑定的目录拉取服务，草稿凭据只在本进程内存中存在。 */
