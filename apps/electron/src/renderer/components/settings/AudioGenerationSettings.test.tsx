@@ -4,6 +4,8 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type {
+  AudioGenerationCatalogFetchInput,
+  AudioGenerationCatalogFetchResult,
   AudioGenerationProfile,
   AudioGenerationSettingsResult,
   AudioGenerationTestInput,
@@ -14,10 +16,12 @@ import {
   AudioGenerationSettings,
   AudioGenerationCatalogView,
   buildAudioRequestPreview,
+  catalogIdentity,
   changeAudioGenerationProvider,
   copyAudioGenerationProfile,
   createCredentialUpdate,
   filterAudioGenerationProfiles,
+  resolveVoiceCapability,
   useAudioGenerationSettingsController,
   type AudioGenerationController,
   type AudioGenerationControllerOptions,
@@ -56,6 +60,8 @@ function createSettings(revision = 4): AudioGenerationSettingsResult {
 function createApi(initial = createSettings()): AudioGenerationControllerOptions['api'] & {
   replacements: ReplaceAudioGenerationCatalogRequest[]
   tests: AudioGenerationTestInput[]
+  catalogFetches: AudioGenerationCatalogFetchInput[]
+  setCatalogResult: (result: AudioGenerationCatalogFetchResult) => void
   cancellations: string[]
   setSettings: (settings: AudioGenerationSettingsResult) => void
   resolveTest: (result: AudioGenerationTestResult) => void
@@ -68,13 +74,24 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
   const pendingTests = new Map<string, (result: AudioGenerationTestResult) => void>()
   const replacements: ReplaceAudioGenerationCatalogRequest[] = []
   const tests: AudioGenerationTestInput[] = []
+  /** 记录目录拉取输入并允许用例决定返回值。 */
+  const catalogFetches: AudioGenerationCatalogFetchInput[] = []
   const cancellations: string[] = []
+  let catalogResult: AudioGenerationCatalogFetchResult = {
+    requestId: 'catalog-1',
+    state: 'success',
+    message: '已从供应商获取可用模型与音色',
+    models: [],
+    voices: [],
+  }
   let deferCancellation = false
   const pendingCancellationResolvers = new Map<string, Array<() => void>>()
   return {
     replacements,
     tests,
+    catalogFetches,
     cancellations,
+    setCatalogResult: (next: AudioGenerationCatalogFetchResult) => { catalogResult = next },
     setSettings: (next) => { settings = next },
     resolveTest: (result) => { pendingTests.get(result.requestId)?.(result); pendingTests.delete(result.requestId) },
     deferCancellation: () => { deferCancellation = true },
@@ -108,6 +125,10 @@ function createApi(initial = createSettings()): AudioGenerationControllerOptions
     test: async (input) => {
       tests.push(input)
       return await new Promise<AudioGenerationTestResult>((resolve) => { pendingTests.set(input.requestId, resolve) })
+    },
+    fetchCatalog: async (input) => {
+      catalogFetches.push(input)
+      return { ...catalogResult, requestId: input.requestId }
     },
     cancelTest: async (requestId) => {
       cancellations.push(requestId)
@@ -205,7 +226,7 @@ describe('AudioGenerationSettings', () => {
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
-      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined,
+      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined, catalog: null, fetchCatalog: async () => undefined,
     }} />)
     expect(html).toContain('小米 TTS')
     expect(html).toContain('https://tts.example.com')
@@ -234,7 +255,7 @@ describe('AudioGenerationSettings', () => {
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
-      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined,
+      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined, catalog: null, fetchCatalog: async () => undefined,
     } satisfies Omit<AudioGenerationController, 'draft'>
     const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{ ...common, draft: { ...settings.catalog.profiles[0]!, apiKey: '' } }} />)
     expect(html).toContain('已启用音色')
@@ -245,6 +266,103 @@ describe('AudioGenerationSettings', () => {
     expect(html).toContain('显示名称（可选）')
   })
 
+  test('Given 供应商与模型 When 解析音色能力 Then 小米三种模型语义各不相同', () => {
+    expect(resolveVoiceCapability('xiaomi', 'mimo-v2.5-tts')).toBe('voice-id')
+    expect(resolveVoiceCapability('xiaomi', ' mimo-v2.5-tts-voiceclone ')).toBe('voice-sample')
+    expect(resolveVoiceCapability('xiaomi', 'mimo-v2.5-tts-voicedesign')).toBe('no-voice')
+    expect(resolveVoiceCapability('minimax', 'speech-2.5-hd')).toBe('voice-id')
+  })
+
+  test('Given 已拉取的目录 When 渲染草稿 Then 可用模型可选且复刻模型提示不适用内置音色', () => {
+    const settings = createSettings()
+    const draft = { ...settings.catalog.profiles[0]!, apiKey: '' }
+    const common = {
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
+      startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
+      saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
+      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined, fetchCatalog: async () => undefined,
+    } satisfies Omit<AudioGenerationController, 'draft' | 'catalog'>
+    /** 拉取结果必须绑定同一目录身份才会渲染。 */
+    const identity = catalogIdentity(draft)
+    const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
+      ...common,
+      draft,
+      catalog: {
+        state: 'success',
+        message: '已从供应商获取可用模型与音色',
+        models: ['mimo-v2.5-tts', 'mimo-v2.5-tts-voiceclone'],
+        voices: [{ id: 'remote-1', name: '远端音色', source: 'remote' }],
+        draftIdentity: identity,
+      },
+    }} />)
+    expect(html).toContain('可用模型')
+    expect(html).toContain('从供应商获取')
+    expect(html).toContain('mimo-v2.5-tts-voiceclone')
+    expect(html).toContain('远端音色')
+
+    /** 切到声音复刻模型后，内置音色与手填行都不应出现。 */
+    const cloneHtml = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
+      ...common,
+      draft: { ...draft, modelId: 'mimo-v2.5-tts-voiceclone' },
+      catalog: null,
+    }} />)
+    expect(cloneHtml).toContain('voice` 字段必须传音频样本的 base64')
+    expect(cloneHtml).not.toContain('MiMo-默认')
+  })
+
+  test('Given 草稿填写新 Key When 从供应商获取 Then 用草稿凭据并填充模型与音色', async () => {
+    const api = createApi()
+    api.setCatalogResult({
+      requestId: 'catalog-1',
+      state: 'success',
+      message: '已从供应商获取可用模型与音色',
+      models: ['mimo-v2.5-tts'],
+      voices: [{ id: 'remote-1', name: '远端音色', source: 'remote' }],
+    })
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'draft-key' }))
+      await act(async () => { await requireController(controller).fetchCatalog() })
+
+      expect(api.catalogFetches.at(-1)?.credential).toEqual({ mode: 'draft', apiKey: 'draft-key' })
+      expect(requireController(controller).catalog?.models).toEqual(['mimo-v2.5-tts'])
+      expect(requireController(controller).catalog?.voices).toEqual([{ id: 'remote-1', name: '远端音色', source: 'remote' }])
+
+      /** 已保存配置未填新 Key 时必须改用已保存密文，不能让界面发空凭据。 */
+      act(() => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      expect(api.catalogFetches.at(-1)?.credential).toEqual({ mode: 'saved', profileId: requireController(controller).draft!.id })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 从供应商获取失败 When 返回失败态 Then 只展示固定文案', async () => {
+    const api = createApi()
+    api.setCatalogResult({
+      requestId: 'catalog-1',
+      state: 'failed',
+      message: '从供应商获取失败，请检查服务地址与凭据',
+      models: [],
+      voices: [],
+    })
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      expect(requireController(controller).catalog).toMatchObject({
+        state: 'failed',
+        models: [],
+        voices: [],
+      })
+      expect(requireController(controller).catalog?.message).toBe('从供应商获取失败，请检查服务地址与凭据')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
   test('Given 表单切换供应商 When 渲染 Then MiniMax 显示 Group ID、小米不渲染且密码框不回填旧 Key', () => {
     const settings = createSettings()
     const common = {
@@ -252,7 +370,7 @@ describe('AudioGenerationSettings', () => {
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
-      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined,
+      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined, catalog: null, fetchCatalog: async () => undefined,
     } satisfies Omit<AudioGenerationController, 'draft'>
     const minimax = renderToStaticMarkup(<AudioGenerationCatalogView controller={{ ...common, draft: { ...settings.catalog.profiles[1]!, apiKey: '' } }} />)
     expect(minimax).toContain('Group ID')

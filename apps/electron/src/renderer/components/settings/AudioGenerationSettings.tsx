@@ -1,5 +1,7 @@
 import * as React from 'react'
 import type {
+  AudioGenerationCatalogFetchInput,
+  AudioGenerationCatalogFetchResult,
   AudioGenerationCredentialUpdate,
   AudioGenerationProfile,
   AudioGenerationProvider,
@@ -11,7 +13,7 @@ import type {
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
 import { AUDIO_GENERATION_PROVIDER_DEFAULTS, AUDIO_GENERATION_PROVIDER_DESCRIPTORS, parseAudioGenerationProfile } from '@proma/shared'
-import { CheckCircle2, Copy, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2, X } from 'lucide-react'
+import { CheckCircle2, Copy, Download, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
@@ -34,6 +36,49 @@ export interface AudioGenerationTestViewState {
   profileFingerprint: string
   credentialGeneration: number
   testGeneration: number
+}
+
+/** 单条配置的本地测试代次，不包含 API Key 或其派生值。 */
+/**
+ * 供应商目录拉取的展示状态。
+ * draftIdentity 记录结果所属草稿身份，草稿变化后旧结果不再展示。
+ */
+export interface AudioGenerationCatalogViewState {
+  state: 'loading' | 'success' | 'failed'
+  message?: string
+  models: string[]
+  voices: AudioGenerationVoice[]
+  draftIdentity: string
+}
+
+/** 供应商模型决定 voice 字段语义，用于界面提示与列表可见性。 */
+export type AudioVoiceCapability = 'voice-id' | 'voice-sample' | 'no-voice'
+
+/**
+ * 供应商目录拉取的归属身份。
+ * 入参：当前草稿；返回值：稳定字符串。
+ * 只包含供应商、服务地址、Group ID 与凭据来源，切换模型不应让已拉取的列表失效。
+ */
+export function catalogIdentity(draft: AudioGenerationDraft): string {
+  return JSON.stringify([
+    draft.provider,
+    draft.baseUrl.trim(),
+    draft.provider === 'minimax' ? draft.groupId?.trim() ?? '' : '',
+    draft.id,
+    draft.apiKey.trim() ? 'draft-key' : 'saved-key',
+  ])
+}
+
+/**
+ * 解析当前模型允许的音色输入方式。
+ * 入参：供应商与模型 ID；返回值：音色能力。
+ * 小米三个 TTS 模型的 voice 语义不同，界面必须据此提示而不是一律展示内置音色。
+ */
+export function resolveVoiceCapability(provider: AudioGenerationProvider, modelId: string): AudioVoiceCapability {
+  if (provider !== 'xiaomi') return 'voice-id'
+  if (modelId.trim() === 'mimo-v2.5-tts-voiceclone') return 'voice-sample'
+  if (modelId.trim() === 'mimo-v2.5-tts-voicedesign') return 'no-voice'
+  return 'voice-id'
 }
 
 /** 单条配置的本地测试代次，不包含 API Key 或其派生值。 */
@@ -62,6 +107,7 @@ export interface AudioGenerationSettingsApi {
   replaceCatalog: (request: ReplaceAudioGenerationCatalogRequest) => Promise<AudioGenerationSettingsResult>
   test: (input: AudioGenerationTestInput) => Promise<AudioGenerationTestResult>
   cancelTest: (requestId: string) => Promise<void>
+  fetchCatalog: (input: AudioGenerationCatalogFetchInput) => Promise<AudioGenerationCatalogFetchResult>
 }
 
 /** 音频设置 Controller 的可注入参数。 */
@@ -83,6 +129,7 @@ export interface AudioGenerationController {
   draft: AudioGenerationDraft | null
   deleteId: string | null
   testStates: Readonly<Record<string, AudioGenerationTestViewState>>
+  catalog: AudioGenerationCatalogViewState | null
   visibleProfiles: AudioGenerationPublicProfile[]
   setQuery: (query: string) => void
   load: () => Promise<boolean>
@@ -98,6 +145,7 @@ export interface AudioGenerationController {
   closeDelete: () => void
   confirmDelete: () => Promise<void>
   testProfile: (profile?: AudioGenerationPublicProfile) => Promise<void>
+  fetchCatalog: () => Promise<void>
 }
 
 /** 音频配置页可复用的布局插槽。 */
@@ -286,6 +334,8 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   const [draft, setDraft] = React.useState<AudioGenerationDraft | null>(null)
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
   const [testStates, setTestStates] = React.useState<Record<string, AudioGenerationTestViewState>>({})
+  /** 供应商目录拉取结果只属于当前草稿身份，草稿变化即失效。 */
+  const [catalog, setCatalog] = React.useState<AudioGenerationCatalogViewState | null>(null)
   /** 最新展示状态只用于枚举需失效的 identity，不保存任何凭据。 */
   const testStatesRef = React.useRef<Record<string, AudioGenerationTestViewState>>({})
   testStatesRef.current = testStates
@@ -830,19 +880,78 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     }
   }, [api, clearIdentityTestState, ensureCatalogReady, ensureIdentityCancellations, getTestGeneration, isTestBindingCurrent, issueOperationToken, publishTestStates, queuePendingCancellation])
 
+  /**
+   * 从供应商拉取可用模型与音色。
+   * 结果绑定当前草稿身份：身份变化后旧结果直接丢弃，避免污染新草稿。
+   */
+  const fetchCatalog = React.useCallback(async (): Promise<void> => {
+    const currentDraft = draftRef.current
+    if (!currentDraft) return
+    /** 发起时的草稿身份，用于丢弃迟到结果；切换模型不会使结果失效。 */
+    const identity = catalogIdentity(currentDraft)
+    if (!currentDraft.baseUrl.trim()) {
+      setCatalog({ state: 'failed', message: '请先填写服务地址', models: [], voices: [], draftIdentity: identity })
+      return
+    }
+    /** 本次表单填了新 Key 就用草稿凭据，否则用已保存密文。 */
+    const draftApiKey = currentDraft.apiKey.trim()
+    const credential: AudioGenerationCatalogFetchInput['credential'] = draftApiKey
+      ? { mode: 'draft', apiKey: draftApiKey }
+      : { mode: 'saved', profileId: currentDraft.id }
+    setCatalog({ state: 'loading', models: [], voices: [], draftIdentity: identity })
+    try {
+      const result = await api.fetchCatalog({
+        requestId: createAudioGenerationId(),
+        provider: currentDraft.provider,
+        baseUrl: currentDraft.baseUrl,
+        ...(currentDraft.provider === 'minimax' && currentDraft.groupId?.trim()
+          ? { groupId: currentDraft.groupId.trim() }
+          : {}),
+        credential,
+      })
+      if (!mountedRef.current || catalogIdentity(draftRef.current ?? currentDraft) !== identity) return
+      setCatalog({
+        state: result.state,
+        message: result.message,
+        models: result.models,
+        voices: result.voices,
+        draftIdentity: identity,
+      })
+    } catch {
+      if (!mountedRef.current || catalogIdentity(draftRef.current ?? currentDraft) !== identity) return
+      setCatalog({ state: 'failed', message: '从供应商获取失败，请检查服务地址与凭据', models: [], voices: [], draftIdentity: identity })
+    }
+  }, [api])
+
   return {
     settings, loading, saving, needsReload, generationEntryCount: testGenerationsRef.current.size,
     pendingCancellationCount: pendingCancellationsRef.current.size,
-    loadError, actionError, query, draft, deleteId, testStates,
+    loadError, actionError, query, draft, deleteId, testStates, catalog,
     visibleProfiles: filterAudioGenerationProfiles(settings?.catalog.profiles ?? [], query),
     setQuery, load, startCreate, startEdit, startCopy, startMigration, updateDraft, closeDraft, saveDraft,
-    toggleEnabled, requestDelete, closeDelete, confirmDelete, testProfile,
+    toggleEnabled, requestDelete, closeDelete, confirmDelete, testProfile, fetchCatalog,
   }
 }
 
 /** 紧凑表单字段，确保 label 与原生控件稳定关联。 */
 function FormField({ id, label, children }: { id: string; label: string; children: React.ReactNode }): React.ReactElement {
   return <div className="space-y-1.5"><label htmlFor={id} className="text-sm font-medium text-foreground">{label}</label>{children}</div>
+}
+
+/** 「从供应商获取」按钮；拉取中显示加载态并阻止重复点击。 */
+function FetchCatalogButton({ catalog, disabled, onFetch }: {
+  catalog: AudioGenerationCatalogViewState | null
+  disabled: boolean
+  onFetch: () => Promise<void>
+}): React.ReactElement {
+  /** 拉取中保持按钮可见但不可再次点击。 */
+  const loading = catalog?.state === 'loading'
+  return (
+    <Button variant="outline" size="sm" type="button" className="h-7 text-xs" disabled={disabled || loading} onClick={() => void onFetch()}>
+      {loading ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+      <span>从供应商获取</span>
+    </Button>
+  )
 }
 
 /** 已启用音色列表；悬停可移除，列表为空时给出引导。 */
@@ -886,9 +995,11 @@ function AudioEnabledVoiceList({ voices, disabled, onChange }: {
  * 可用音色：官方内置清单点击即添加，底部保留手填一行。
  * 入参：已启用集合、内置清单、禁用态与集合变更回调；返回值：可用音色视图。
  */
-function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
+function AudioAvailableVoices({ voices, builtinVoices, fetchedVoices, capability, disabled, onChange }: {
   voices: readonly AudioGenerationVoice[]
   builtinVoices: readonly AudioGenerationVoice[]
+  fetchedVoices: readonly AudioGenerationVoice[]
+  capability: AudioVoiceCapability
   disabled: boolean
   onChange: (voices: AudioGenerationVoice[]) => void
 }): React.ReactElement {
@@ -899,7 +1010,10 @@ function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
   const [addError, setAddError] = React.useState('')
   /** 已启用音色按 id 去重，决定内置清单里还剩哪些可添加。 */
   const enabledIds = new Set(voices.map((voice) => voice.id))
-  const availableBuiltins = builtinVoices.filter((voice) => !enabledIds.has(voice.id))
+  /** 内置与供应商拉取结果合并后去重，顺序保持内置优先。 */
+  const candidates = [...builtinVoices, ...fetchedVoices].filter((voice, index, all) =>
+    all.findIndex((entry) => entry.id === voice.id) === index)
+  const availableBuiltins = candidates.filter((voice) => !enabledIds.has(voice.id))
 
   /** 追加一条已启用音色，重复 id 就地拒绝。 */
   const appendVoice = (voice: AudioGenerationVoice): void => {
@@ -913,6 +1027,16 @@ function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
 
   return (
     <SettingsCard divided={false}>
+      {capability === 'voice-sample' && (
+        <div className="px-4 py-3 text-xs text-muted-foreground">
+          当前模型是声音复刻：`voice` 字段必须传音频样本的 base64，内置音色与音色 ID 都不适用，请在上方手填样本标识。
+        </div>
+      )}
+      {capability === 'no-voice' && (
+        <div className="px-4 py-3 text-xs text-muted-foreground">
+          当前模型是音色设计：请求不传 `voice` 字段，音色由文本描述生成，因此这里不需要选择音色。
+        </div>
+      )}
       {availableBuiltins.map((voice) => (
         <div
           key={voice.id}
@@ -929,7 +1053,7 @@ function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
       {builtinVoices.length > 0 && availableBuiltins.length === 0 && (
         <div className="px-4 py-6 text-center text-sm text-muted-foreground">所有内置音色已启用</div>
       )}
-      <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
+      {capability === 'voice-id' && <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
         <Input id="audio-voice-id" aria-label="音色 ID" className="h-8 flex-1 text-sm" placeholder="音色 ID" value={pendingId} disabled={disabled} onChange={(event) => setPendingId(event.target.value)} />
         <Input id="audio-voice-name" aria-label="显示名称（可选）" className="h-8 flex-1 text-sm" placeholder="显示名称（可选）" value={pendingName} disabled={disabled} onChange={(event) => setPendingName(event.target.value)} />
         <Button
@@ -953,7 +1077,7 @@ function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
         >
           <Plus />
         </Button>
-      </div>
+      </div>}
       {addError && <p role="alert" className="px-4 pb-3 text-xs text-destructive">{addError}</p>}
     </SettingsCard>
   )
@@ -989,6 +1113,10 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
     const testState = testStates[draft.id]
     /** 当前供应商的默认端、默认模型与内置音色。 */
     const providerDefaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[draft.provider]
+    /** 当前模型允许的音色输入方式。 */
+    const resolvedVoiceCapability = resolveVoiceCapability(draft.provider, draft.modelId)
+    /** 只展示属于当前草稿身份的拉取结果。 */
+    const catalogForDraft = controller.catalog?.draftIdentity === catalogIdentity(draft) ? controller.catalog : null
     return (
       <MediaSettingsPage title={editTitle(draft, settings)} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
         <SettingsSection title="基本信息">
@@ -1056,10 +1184,45 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           <AudioEnabledVoiceList voices={draft.voices} disabled={actionDisabled} onChange={(voices) => controller.updateDraft({ ...draft, voices })} />
         </SettingsSection>
 
-        <SettingsSection title="可用音色">
+        <SettingsSection
+          title="可用模型"
+          action={<FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />}
+        >
+          <SettingsCard divided={false}>
+            {catalogForDraft?.models.length ? catalogForDraft.models.map((model) => (
+              <div
+                key={model}
+                role="button"
+                tabIndex={0}
+                onClick={() => controller.updateDraft({ ...draft, modelId: model })}
+                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); controller.updateDraft({ ...draft, modelId: model }) } }}
+                className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
+              >
+                {draft.modelId.trim() === model
+                  ? <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
+                  : <Plus size={14} className="shrink-0 text-muted-foreground" />}
+                <span className="flex-1 text-sm text-foreground">{model}</span>
+              </div>
+            )) : (
+              <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                {catalogForDraft?.state === 'loading' ? '正在从供应商获取…' : '点右上角「从供应商获取」读取该账号可用的模型'}
+              </div>
+            )}
+            {catalogForDraft?.state === 'failed' && catalogForDraft.message && (
+              <p role="alert" className="border-t border-border/50 px-4 py-2 text-xs text-destructive">{catalogForDraft.message}</p>
+            )}
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection
+          title="可用音色"
+          action={<FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />}
+        >
           <AudioAvailableVoices
             voices={draft.voices}
-            builtinVoices={providerDefaults.builtinVoices}
+            builtinVoices={resolvedVoiceCapability === 'voice-id' ? providerDefaults.builtinVoices : []}
+            fetchedVoices={resolvedVoiceCapability === 'voice-id' ? catalogForDraft?.voices ?? [] : []}
+            capability={resolvedVoiceCapability}
             disabled={actionDisabled}
             onChange={(voices) => controller.updateDraft({ ...draft, voices })}
           />
@@ -1116,6 +1279,7 @@ export function AudioGenerationSettings(props: AudioGenerationSettingsProps): Re
     replaceCatalog: (request) => window.electronAPI.mediaReplaceAudioGenerationCatalog(request),
     test: (input) => window.electronAPI.mediaTestAudioGeneration(input),
     cancelTest: (requestId) => window.electronAPI.mediaCancelAudioGenerationTest(requestId),
+    fetchCatalog: (input) => window.electronAPI.mediaFetchAudioGenerationCatalog(input),
   }), [])
   const controller = useAudioGenerationSettingsController({ api })
   return <AudioGenerationCatalogView {...props} controller={controller} />

@@ -144,6 +144,7 @@ const fixtureApi: Pick<
   | 'mediaGetAudioGenerationSettings'
   | 'mediaReplaceAudioGenerationCatalog'
   | 'mediaTestAudioGeneration'
+  | 'mediaFetchAudioGenerationCatalog'
   | 'mediaCancelAudioGenerationTest'
 > = {
   mediaGetAudioGenerationSettings: async () => cloneSettings(),
@@ -161,6 +162,14 @@ const fixtureApi: Pick<
   mediaCancelAudioGenerationTest: async (requestId) => {
     cancelCalls.push(requestId)
   },
+  /** 固定回放供应商目录，覆盖模型列表与远端音色两条路径。 */
+  mediaFetchAudioGenerationCatalog: async (input) => ({
+    requestId: input.requestId,
+    state: 'success' as const,
+    message: '已从供应商获取可用模型与音色',
+    models: ['mimo-v2.5-tts', 'mimo-v2.5-tts-voiceclone'],
+    voices: [{ id: 'remote-voice-smoke', name: '远端 smoke 音色', source: 'remote' as const }],
+  }),
 }
 
 Object.assign(window, { electronAPI: fixtureApi })
