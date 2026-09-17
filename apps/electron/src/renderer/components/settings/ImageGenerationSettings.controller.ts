@@ -96,6 +96,23 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 }
 
 /** 把主进程错误翻译成可操作的中文提示，不泄露原始异常正文。 */
+/**
+ * 把读取失败翻译成可操作提示。
+ * 入参：读取阶段的异常；返回值：面向用户的中文文案。
+ * preload 缺失与主进程超时都会给出“重启开发实例”的明确动作。
+ */
+function describeLoadError(error: unknown): string {
+  const code = error instanceof Error ? error.message : ''
+  if (code === 'IMAGE_GENERATION_PRELOAD_MISSING') {
+    return 'preload 未包含生图接口：请重启开发实例（仅刷新窗口不够）。'
+  }
+  if (code === 'IMAGE_GENERATION_LOAD_TIMEOUT') {
+    return '读取生图配置超时：主进程可能仍是旧构建，请重启开发实例后重试。'
+  }
+  return '读取生图配置失败，请重试。'
+}
+
+/** 把主进程错误翻译成可操作的中文提示，不泄露原始异常正文。 */
 function describeImageError(error: unknown): string {
   const code = error instanceof Error ? error.message : ''
   if (code === 'IMAGE_GENERATION_CONFIG_CONFLICT' || code === 'IMAGE_GENERATION_CONFIG_OUTCOME_UNKNOWN') {
@@ -111,7 +128,12 @@ function describeImageError(error: unknown): string {
 /** 只保留不含凭据的公开展示字段用于列表摘要。 */
 export function imageSettingsApiFromWindow(): ImageGenerationSettingsApi {
   return {
-    getSettings: () => window.electronAPI.mediaGetImageGenerationSettings(),
+    getSettings: () => {
+      /** preload 未更新时接口不存在，抛出可识别的稳定错误。 */
+      const call = window.electronAPI?.mediaGetImageGenerationSettings
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call()
+    },
     replaceCatalog: (request) => window.electronAPI.mediaReplaceImageGenerationCatalog(request),
     fetchCatalog: (input) => window.electronAPI.mediaFetchImageGenerationCatalog(input),
   }
@@ -136,13 +158,6 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
 
   /** 读取独立目录；失败保持稳定提示而不会清空已有内容。 */
   const load = React.useCallback(async (): Promise<boolean> => {
-    /** preload 未更新时接口根本不存在，这种情况必须给出可操作提示而不是一直等待。 */
-    if (typeof globalThis.window?.electronAPI?.mediaGetImageGenerationSettings !== 'function') {
-      console.error('[生图配置] preload 缺少 mediaGetImageGenerationSettings，需重启开发实例')
-      setLoading(false)
-      setLoadError('preload 未包含生图接口：请重启开发实例（仅刷新窗口不够）。')
-      return false
-    }
     setLoading(true)
     try {
       const next = await withTimeout(api.getSettings(), IMAGE_GENERATION_LOAD_TIMEOUT_MS)
@@ -154,9 +169,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       /** 原始异常只进控制台，界面只显示稳定文案；超时单独提示。 */
       console.error('[生图配置] 读取失败', error)
       if (mountedRef.current) {
-        setLoadError(error instanceof Error && error.message === 'IMAGE_GENERATION_LOAD_TIMEOUT'
-          ? '读取生图配置超时：主进程可能仍是旧构建，请重启开发实例后重试。'
-          : '读取生图配置失败，请重试。')
+        setLoadError(describeLoadError(error))
       }
       return false
     } finally {
