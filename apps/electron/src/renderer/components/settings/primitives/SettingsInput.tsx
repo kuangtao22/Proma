@@ -11,6 +11,8 @@ import { LABEL_CLASS, DESCRIPTION_CLASS } from './SettingsUIConstants'
 import { cn } from '@/lib/utils'
 
 interface SettingsInputProps {
+  /** 输入框 DOM id（可选，便于测试与标签关联定位） */
+  id?: string
   /** 标签文本（在 SettingsRow 内使用时可省略，由 SettingsRow 提供标签） */
   label?: string
   /** 描述文本（可选） */
@@ -36,6 +38,7 @@ interface SettingsInputProps {
 }
 
 export function SettingsInput({
+  id,
   label,
   description,
   value,
@@ -59,6 +62,7 @@ export function SettingsInput({
         </div>
       )}
       <Input
+        id={id}
         type={type}
         value={value}
         onChange={(e) => onChange(e.target.value)}

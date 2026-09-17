@@ -25,6 +25,8 @@ export interface SelectOption {
 }
 
 interface SettingsSelectProps {
+  /** 触发器 DOM id（可选，便于测试定位） */
+  id?: string
   /** 标签文本 */
   label: string
   /** 描述文本（可选） */
@@ -42,6 +44,7 @@ interface SettingsSelectProps {
 }
 
 export function SettingsSelect({
+  id,
   label,
   description,
   value,
@@ -61,7 +64,7 @@ export function SettingsSelect({
         )}
       </div>
       <Select value={value} onValueChange={onValueChange} disabled={disabled}>
-        <SelectTrigger className="w-full">
+        <SelectTrigger id={id} className="w-full">
           <SelectValue placeholder={placeholder}>
             {selected ? (
               <span className="flex items-center gap-2">

@@ -10,15 +10,14 @@ import type {
   AudioGenerationVoice,
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
-import { AUDIO_GENERATION_PROVIDER_DESCRIPTORS, parseAudioGenerationProfile } from '@proma/shared'
+import { AUDIO_GENERATION_PROVIDER_DEFAULTS, AUDIO_GENERATION_PROVIDER_DESCRIPTORS, parseAudioGenerationProfile } from '@proma/shared'
 import { CheckCircle2, Copy, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { MediaSettingsPage } from './MediaSettingsPage'
-import { SettingsCard, SettingsRow } from './primitives'
+import { SettingsCard, SettingsInput, SettingsRow, SettingsSection, SettingsSelect, SettingsToggle } from './primitives'
 
 /** 音频编辑草稿只在 Renderer 内短暂持有明文 API Key。 */
 export type AudioGenerationDraft = AudioGenerationProfile & {
@@ -141,15 +140,17 @@ export function changeAudioGenerationProvider(
   draft: AudioGenerationDraft,
   provider: AudioGenerationProvider,
 ): AudioGenerationDraft {
+  /** 新供应商的默认端与默认模型，避免用户面对空白地址。 */
+  const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[provider]
   /** 切换后仍可复用的非身份字段。 */
   const common = {
     id: draft.id,
     name: draft.name,
-    baseUrl: draft.baseUrl,
+    baseUrl: defaults.baseUrl,
     enabled: draft.enabled,
     createdAt: draft.createdAt,
     updatedAt: draft.updatedAt,
-    modelId: '',
+    modelId: defaults.modelId,
     voices: [],
     apiKey: '',
     credentialConfigured: false,
@@ -577,7 +578,9 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     const now = Date.now()
     editBaselineRef.current = null
     setActionError(null)
-    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: '', modelId: '', voices: [], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
+    /** 新建配置直接带入小米官方默认端与默认模型。 */
+    const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi
+    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: defaults.baseUrl, modelId: defaults.modelId, voices: [], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 编辑已保存配置但不读取旧 Key。 */
@@ -612,7 +615,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     editBaselineRef.current = null
     setActionError(null)
     publishDraft({
-      id: createAudioGenerationId(), name: legacy.name, provider: 'minimax', baseUrl: '', modelId: legacy.modelId,
+      id: createAudioGenerationId(), name: legacy.name, provider: 'minimax', baseUrl: AUDIO_GENERATION_PROVIDER_DEFAULTS.minimax.baseUrl, modelId: legacy.modelId,
       voices: [], groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
       legacyMediaProfileId: legacy.id, apiKey: '', credentialConfigured: false,
     })
@@ -842,13 +845,50 @@ function FormField({ id, label, children }: { id: string; label: string; childre
   return <div className="space-y-1.5"><label htmlFor={id} className="text-sm font-medium text-foreground">{label}</label>{children}</div>
 }
 
-/**
- * 已启用音色列表与手填添加行。
- * 入参：当前音色集合、禁用态、集合变更回调；返回值：音色编辑视图。
- * 重复音色就地拒绝，保证提交给主进程的集合永远满足 Shared 合同。
- */
-function AudioVoiceEditor({ voices, disabled, onChange }: {
+/** 已启用音色列表；悬停可移除，列表为空时给出引导。 */
+function AudioEnabledVoiceList({ voices, disabled, onChange }: {
   voices: readonly AudioGenerationVoice[]
+  disabled: boolean
+  onChange: (voices: AudioGenerationVoice[]) => void
+}): React.ReactElement {
+  return (
+    <SettingsCard divided={false}>
+      {voices.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted-foreground">还没有启用任何音色，从下方可用音色中选择</div>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {voices.map((voice) => (
+            <div key={voice.id} className="group flex items-center gap-2 px-4 py-2.5">
+              <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
+              <span className="flex-1 text-sm text-foreground">
+                {voice.name ?? voice.id}
+                {voice.name && voice.name !== voice.id ? <span className="ml-1 text-muted-foreground">({voice.id})</span> : null}
+              </span>
+              <button
+                type="button"
+                disabled={disabled}
+                aria-label={`移除音色 ${voice.name ?? voice.id}`}
+                title="移除音色"
+                onClick={() => onChange(voices.filter((entry) => entry.id !== voice.id))}
+                className="p-0.5 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:text-destructive"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </SettingsCard>
+  )
+}
+
+/**
+ * 可用音色：官方内置清单点击即添加，底部保留手填一行。
+ * 入参：已启用集合、内置清单、禁用态与集合变更回调；返回值：可用音色视图。
+ */
+function AudioAvailableVoices({ voices, builtinVoices, disabled, onChange }: {
+  voices: readonly AudioGenerationVoice[]
+  builtinVoices: readonly AudioGenerationVoice[]
   disabled: boolean
   onChange: (voices: AudioGenerationVoice[]) => void
 }): React.ReactElement {
@@ -857,65 +897,65 @@ function AudioVoiceEditor({ voices, disabled, onChange }: {
   const [pendingName, setPendingName] = React.useState('')
   /** 重复或空输入时的就地提示。 */
   const [addError, setAddError] = React.useState('')
+  /** 已启用音色按 id 去重，决定内置清单里还剩哪些可添加。 */
+  const enabledIds = new Set(voices.map((voice) => voice.id))
+  const availableBuiltins = builtinVoices.filter((voice) => !enabledIds.has(voice.id))
 
-  /** 把待添加输入收敛为一条 manual 音色。 */
-  const appendVoice = (): void => {
-    const id = pendingId.trim()
-    if (!id) {
-      setAddError('请输入音色 ID')
-      return
-    }
-    if (voices.some((voice) => voice.id === id)) {
+  /** 追加一条已启用音色，重复 id 就地拒绝。 */
+  const appendVoice = (voice: AudioGenerationVoice): void => {
+    if (enabledIds.has(voice.id)) {
       setAddError('该音色已添加')
       return
     }
-    const name = pendingName.trim()
-    onChange([...voices, name ? { id, name, source: 'manual' } : { id, source: 'manual' }])
-    setPendingId('')
-    setPendingName('')
+    onChange([...voices, voice])
     setAddError('')
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-medium text-foreground">已启用音色</span>
-        <span className="text-xs text-muted-foreground">{voices.length} 个音色</span>
+    <SettingsCard divided={false}>
+      {availableBuiltins.map((voice) => (
+        <div
+          key={voice.id}
+          role="button"
+          tabIndex={0}
+          onClick={() => appendVoice(voice)}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); appendVoice(voice) } }}
+          className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
+        >
+          <Plus size={14} className="shrink-0 text-muted-foreground" />
+          <span className="flex-1 text-sm text-foreground">{voice.name ?? voice.id}</span>
+        </div>
+      ))}
+      {builtinVoices.length > 0 && availableBuiltins.length === 0 && (
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">所有内置音色已启用</div>
+      )}
+      <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
+        <Input id="audio-voice-id" aria-label="音色 ID" className="h-8 flex-1 text-sm" placeholder="音色 ID" value={pendingId} disabled={disabled} onChange={(event) => setPendingId(event.target.value)} />
+        <Input id="audio-voice-name" aria-label="显示名称（可选）" className="h-8 flex-1 text-sm" placeholder="显示名称（可选）" value={pendingName} disabled={disabled} onChange={(event) => setPendingName(event.target.value)} />
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label="添加音色"
+          title="添加音色"
+          disabled={disabled}
+          onClick={() => {
+            const id = pendingId.trim()
+            if (!id) {
+              setAddError('请输入音色 ID')
+              return
+            }
+            const name = pendingName.trim()
+            appendVoice(name ? { id, name, source: 'manual' } : { id, source: 'manual' })
+            setPendingId('')
+            setPendingName('')
+          }}
+        >
+          <Plus />
+        </Button>
       </div>
-      <SettingsCard divided={false}>
-        {voices.length === 0 ? (
-          <div className="px-4 py-6 text-center text-sm text-muted-foreground">还没有添加音色，请在下方添加</div>
-        ) : (
-          <div className="divide-y divide-border/50">
-            {voices.map((voice) => (
-              <div key={voice.id} className="group flex items-center gap-2 px-4 py-2.5">
-                <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
-                <span className="flex-1 text-sm text-foreground">
-                  {voice.name ?? voice.id}
-                  {voice.name && voice.name !== voice.id ? <span className="ml-1 text-muted-foreground">({voice.id})</span> : null}
-                </span>
-                <button
-                  type="button"
-                  disabled={disabled}
-                  aria-label={`移除音色 ${voice.name ?? voice.id}`}
-                  title="移除音色"
-                  onClick={() => onChange(voices.filter((entry) => entry.id !== voice.id))}
-                  className="p-0.5 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:text-destructive"
-                >
-                  <X size={14} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </SettingsCard>
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="min-w-48 flex-1"><FormField id="audio-voice-id" label="音色 ID"><Input id="audio-voice-id" value={pendingId} disabled={disabled} onChange={(event) => setPendingId(event.target.value)} /></FormField></div>
-        <div className="min-w-48 flex-1"><FormField id="audio-voice-name" label="显示名称（可选）"><Input id="audio-voice-name" value={pendingName} disabled={disabled} onChange={(event) => setPendingName(event.target.value)} /></FormField></div>
-        <Button type="button" variant="outline" disabled={disabled} onClick={appendVoice}><Plus />添加音色</Button>
-      </div>
-      {addError && <p role="alert" className="text-sm text-destructive">{addError}</p>}
-    </div>
+      {addError && <p role="alert" className="px-4 pb-3 text-xs text-destructive">{addError}</p>}
+    </SettingsCard>
   )
 }
 
@@ -925,6 +965,16 @@ function voiceSummary(voices: readonly AudioGenerationVoice[]): string {
   if (!first) return '未配置音色'
   const label = first.name ?? first.id
   return voices.length === 1 ? label : `${label} 等 ${voices.length} 个音色`
+}
+
+/**
+ * 生成服务地址预览。
+ * 入参：用户填写的 Base URL 与当前供应商；返回值：真实请求地址预览文本。
+ * 只做展示，不参与请求拼接；末尾斜杠会被归一化，避免出现双斜杠。
+ */
+export function buildAudioRequestPreview(baseUrl: string, provider: AudioGenerationProvider): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '')
+  return `${trimmed}${AUDIO_GENERATION_PROVIDER_DEFAULTS[provider].requestPath}`
 }
 
 /** 音频目录、动态表单与旧配置迁移的纯视图。 */
@@ -937,28 +987,90 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
 
   if (draft) {
     const testState = testStates[draft.id]
+    /** 当前供应商的默认端、默认模型与内置音色。 */
+    const providerDefaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[draft.provider]
     return (
       <MediaSettingsPage title={editTitle(draft, settings)} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
-        <SettingsCard divided={false} className="p-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <FormField id="audio-name" label="名称"><Input id="audio-name" value={draft.name} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, name: event.target.value })} /></FormField>
-            <FormField id="audio-provider" label="供应商"><Select value={draft.provider} disabled={actionDisabled} onValueChange={(provider: AudioGenerationProvider) => controller.updateDraft(changeAudioGenerationProvider(draft, provider))}><SelectTrigger id="audio-provider" aria-label="供应商"><SelectValue /></SelectTrigger><SelectContent>{AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => <SelectItem key={descriptor.provider} value={descriptor.provider}>{descriptor.label}</SelectItem>)}</SelectContent></Select></FormField>
-            <FormField id="audio-base-url" label="服务地址"><Input id="audio-base-url" value={draft.baseUrl} disabled={actionDisabled} placeholder="https://..." onChange={(event) => controller.updateDraft({ ...draft, baseUrl: event.target.value })} /></FormField>
-            <FormField id="audio-api-key" label="API Key"><Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={actionDisabled} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} /></FormField>
-            <FormField id="audio-model-id" label="模型 ID"><Input id="audio-model-id" value={draft.modelId} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, modelId: event.target.value })} /></FormField>
-            <div className="sm:col-span-2"><AudioVoiceEditor voices={draft.voices} disabled={actionDisabled} onChange={(voices) => controller.updateDraft({ ...draft, voices })} /></div>
-            {draft.provider === 'minimax' && <FormField id="audio-group-id" label="Group ID（可选）"><Input id="audio-group-id" value={draft.groupId ?? ''} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, groupId: event.target.value })} /></FormField>}
-            <label className="flex items-center gap-2 self-end text-sm text-muted-foreground"><Switch checked={draft.enabled} disabled={actionDisabled} aria-label="启用音频配置" onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })} />启用</label>
-          </div>
-          {actionError && <p role="alert" className="mt-4 text-sm text-destructive">{actionError}</p>}
-          {loadError && <div role="alert" className="mt-4 flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{loadError}</span><Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void controller.load()}>重新加载</Button></div>}
-          {testState && <p className="mt-4 text-xs text-muted-foreground" role="status">{testState.message}</p>}
-          <div className="mt-5 flex flex-wrap justify-end gap-2">
-            <Button type="button" variant="outline" disabled={actionDisabled} onClick={() => void controller.testProfile()}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}测试连接</Button>
-            <Button type="button" variant="outline" disabled={saving} onClick={controller.closeDraft}>取消</Button>
-            <Button type="button" disabled={actionDisabled} onClick={() => void controller.saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : null}保存</Button>
-          </div>
-        </SettingsCard>
+        <SettingsSection title="基本信息">
+          <SettingsCard>
+            <SettingsSelect
+              id="audio-provider"
+              label="供应商类型"
+              value={draft.provider}
+              disabled={actionDisabled}
+              onValueChange={(value) => {
+                /** 只接受两个已知供应商，未知值直接忽略。 */
+                if (value !== 'xiaomi' && value !== 'minimax') return
+                controller.updateDraft(changeAudioGenerationProvider(draft, value))
+              }}
+              options={AUDIO_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => ({ value: descriptor.provider, label: descriptor.label }))}
+            />
+            <SettingsInput
+              label="供应商名称"
+              value={draft.name}
+              disabled={actionDisabled}
+              placeholder="例如：小米配音"
+              required
+              onChange={(name) => controller.updateDraft({ ...draft, name })}
+            />
+            <SettingsInput
+              id="audio-base-url"
+              label="服务地址"
+              value={draft.baseUrl}
+              disabled={actionDisabled}
+              placeholder={providerDefaults.baseUrl}
+              /** 预览真实请求地址，避免用户把路径写重或写漏。 */
+              description={draft.baseUrl.trim() ? `预览：${buildAudioRequestPreview(draft.baseUrl, draft.provider)}` : undefined}
+              onChange={(baseUrl) => controller.updateDraft({ ...draft, baseUrl })}
+            />
+            <div className="space-y-2 px-4 py-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-foreground">API Key</div>
+                <Button variant="outline" size="sm" type="button" className="h-7 text-xs" disabled={actionDisabled} onClick={() => void controller.testProfile()}>
+                  {testState?.state === 'loading' ? <Loader2 size={12} className="animate-spin" /> : <TestTube2 size={12} />}
+                  <span>测试连接</span>
+                </Button>
+              </div>
+              <Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={actionDisabled} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} />
+            </div>
+            <SettingsInput
+              id="audio-model-id"
+              label="模型 ID"
+              value={draft.modelId}
+              disabled={actionDisabled}
+              placeholder={providerDefaults.modelId || '例如：speech-2.5-hd'}
+              onChange={(modelId) => controller.updateDraft({ ...draft, modelId })}
+            />
+            {draft.provider === 'minimax' && <SettingsInput id="audio-group-id" label="Group ID（可选）" value={draft.groupId ?? ''} disabled={actionDisabled} onChange={(groupId) => controller.updateDraft({ ...draft, groupId })} />}
+            <SettingsToggle
+              label="启用此配置"
+              description="关闭后该配置的音色不会出现在画布与 agent 的可选列表中"
+              checked={draft.enabled}
+              disabled={actionDisabled}
+              onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })}
+            />
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection title="已启用音色" description={draft.voices.length > 0 ? `${draft.voices.length} 个音色` : undefined}>
+          <AudioEnabledVoiceList voices={draft.voices} disabled={actionDisabled} onChange={(voices) => controller.updateDraft({ ...draft, voices })} />
+        </SettingsSection>
+
+        <SettingsSection title="可用音色">
+          <AudioAvailableVoices
+            voices={draft.voices}
+            builtinVoices={providerDefaults.builtinVoices}
+            disabled={actionDisabled}
+            onChange={(voices) => controller.updateDraft({ ...draft, voices })}
+          />
+        </SettingsSection>
+        {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
+        {loadError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{loadError}</span><Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void controller.load()}>重新加载</Button></div>}
+        {testState && <p role="status" className="text-xs text-muted-foreground">{testState.message}</p>}
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button type="button" variant="outline" disabled={saving} onClick={controller.closeDraft}>取消</Button>
+          <Button type="button" disabled={actionDisabled} onClick={() => void controller.saveDraft()}>{saving ? <Loader2 className="animate-spin" /> : null}保存</Button>
+        </div>
       </MediaSettingsPage>
     )
   }

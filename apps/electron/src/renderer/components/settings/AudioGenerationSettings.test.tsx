@@ -13,6 +13,7 @@ import type {
 import {
   AudioGenerationSettings,
   AudioGenerationCatalogView,
+  buildAudioRequestPreview,
   changeAudioGenerationProvider,
   copyAudioGenerationProfile,
   createCredentialUpdate,
@@ -167,11 +168,24 @@ describe('AudioGenerationSettings', () => {
   test('Given 小米与 MiniMax 草稿 When 切换供应商 Then 清空身份与凭据且严格移除不适用字段', () => {
     const original = { ...createSettings().catalog.profiles[1]!, apiKey: 'secret' }
     const xiaomi = changeAudioGenerationProvider(original, 'xiaomi')
-    expect(xiaomi).toMatchObject({ provider: 'xiaomi', modelId: '', voices: [], apiKey: '', credentialConfigured: false })
+    /** 切换供应商必须自动带入该供应商的官方默认端与默认模型。 */
+    expect(xiaomi).toMatchObject({
+      provider: 'xiaomi',
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      modelId: 'mimo-v2.5-tts',
+      voices: [],
+      apiKey: '',
+      credentialConfigured: false,
+    })
     expect('groupId' in xiaomi).toBeFalse()
     expect(xiaomi.legacyMediaProfileId).toBeUndefined()
     const minimax = changeAudioGenerationProvider(xiaomi, 'minimax')
-    expect(minimax).toMatchObject({ provider: 'minimax', groupId: '' })
+    expect(minimax).toMatchObject({ provider: 'minimax', baseUrl: 'https://api.minimax.cn/v1', groupId: '' })
+  })
+
+  test('Given 小米与 MiniMax 服务地址 When 生成预览 Then 归一化斜杠并追加各自请求路径', () => {
+    expect(buildAudioRequestPreview('https://api.xiaomimimo.com/v1/', 'xiaomi')).toBe('https://api.xiaomimimo.com/v1/chat/completions')
+    expect(buildAudioRequestPreview('  https://api.minimax.cn/v1//  ', 'minimax')).toBe('https://api.minimax.cn/v1/t2a_v2')
   })
 
   test('Given 已保存或旧迁移配置 When 复制 Then 使用新身份且不继承凭据和旧引用', () => {

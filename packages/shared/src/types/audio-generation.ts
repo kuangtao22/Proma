@@ -137,6 +137,51 @@ export const AUDIO_GENERATION_PROVIDER_DESCRIPTORS: readonly AudioGenerationProv
   AUDIO_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER,
 )
 
+/** 小米 MiMo 官方文档内置音色；随官方发版人工同步，不参与任何执行分支。 */
+const XIAOMI_BUILTIN_VOICES: readonly AudioGenerationVoice[] = [
+  { id: 'mimo_default', name: 'MiMo-默认', source: 'builtin' },
+  { id: '冰糖', name: '冰糖（中文女声）', source: 'builtin' },
+  { id: '茉莉', name: '茉莉（中文女声）', source: 'builtin' },
+  { id: '苏打', name: '苏打（中文男声）', source: 'builtin' },
+  { id: '白桦', name: '白桦（中文男声）', source: 'builtin' },
+  { id: 'Mia', name: 'Mia（英文女声）', source: 'builtin' },
+  { id: 'Chloe', name: 'Chloe（英文女声）', source: 'builtin' },
+  { id: 'Milo', name: 'Milo（英文男声）', source: 'builtin' },
+  { id: 'Dean', name: 'Dean（英文男声）', source: 'builtin' },
+]
+
+/** 新建或切换供应商时用于自动填入的默认值。 */
+export interface AudioGenerationProviderDefaults {
+  /** 默认服务地址，不含末尾斜杠。 */
+  baseUrl: string
+  /** 默认模型 ID，空串表示留给用户按账号填写。 */
+  modelId: string
+  /** 服务地址预览追加的请求路径。 */
+  requestPath: string
+  /** 官方文档内置音色；空数组表示只能手填或运行时拉取。 */
+  builtinVoices: readonly AudioGenerationVoice[]
+}
+
+/**
+ * 两个供应商的默认服务地址、默认模型与内置音色。
+ * 小米按 MiMo 官方文档：TTS 走 chat/completions 的 audio.voice；
+ * MiniMax 按官方 get_voice/T2A 文档域名，模型 ID 留给用户按账号填写。
+ */
+export const AUDIO_GENERATION_PROVIDER_DEFAULTS: Record<AudioGenerationProvider, AudioGenerationProviderDefaults> = {
+  xiaomi: {
+    baseUrl: 'https://api.xiaomimimo.com/v1',
+    modelId: 'mimo-v2.5-tts',
+    requestPath: '/chat/completions',
+    builtinVoices: XIAOMI_BUILTIN_VOICES,
+  },
+  minimax: {
+    baseUrl: 'https://api.minimax.cn/v1',
+    modelId: '',
+    requestPath: '/t2a_v2',
+    builtinVoices: [],
+  },
+}
+
 /** 测试结果允许公开的固定中文文案，禁止拼接上游正文或本地路径。 */
 export const AUDIO_GENERATION_TEST_MESSAGES = {
   success: '音频生成服务连接测试成功',

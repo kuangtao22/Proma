@@ -143,10 +143,15 @@ async function verifyInitialAudioList(window: BrowserWindow): Promise<void> {
 async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await clickButton(window, '添加音频配置')
   await waitFor(window, `document.querySelector('#audio-provider') && !document.querySelector('#audio-group-id')`, '小米草稿字段不正确')
+  /** 新建小米配置必须自动带入官方默认服务地址与默认模型。 */
+  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-base-url')?.value`), 'https://api.xiaomimimo.com/v1', '小米草稿未自动填入默认服务地址')
+  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-model-id')?.value`), 'mimo-v2.5-tts', '小米草稿未自动填入默认模型')
+  assert.equal(await window.webContents.executeJavaScript(`document.body.textContent?.includes('预览：https://api.xiaomimimo.com/v1/chat/completions')`), true, '服务地址预览未展示真实请求路径')
   await clickSelector(window, '#audio-provider', '供应商选择器不可点击')
   await waitFor(window, `document.querySelector('[role="option"]')`, '供应商选项未打开')
   await clickOption(window, 'MiniMax Speech')
   await waitFor(window, `document.querySelector('#audio-group-id')`, 'MiniMax 未显示 Group ID')
+  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-base-url')?.value`), 'https://api.minimax.cn/v1', 'MiniMax 草稿未自动填入默认服务地址')
   await clickSelector(window, '#audio-provider', '供应商选择器不可再次点击')
   await waitFor(window, `document.querySelector('[role="option"]')`, '小米选项未打开')
   await clickOption(window, '小米 TTS')
@@ -156,7 +161,7 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
 }
 
 /** 验证编辑留空 preserve，以及复制不继承凭据和旧目录引用。 */
-async function verifyCredentialPayloads(window: BrowserWindow): Promise<void> {
+async function verifyCredentialPayloads(window: BrowserWindow, screenshotDir: string, label: string): Promise<void> {
   await clickSelector(window, 'button[aria-label="编辑 小米配音测试"]', '找不到小米编辑入口')
   await waitFor(window, `document.querySelector('#audio-api-key')?.placeholder === '留空以保留已保存凭据'`, '编辑表单未提供留空保留语义')
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-api-key')?.value`), '', '编辑表单回填了 API Key')
@@ -168,6 +173,7 @@ async function verifyCredentialPayloads(window: BrowserWindow): Promise<void> {
       && document.querySelector('#audio-voice-id')
       && !document.querySelector('button[aria-label="音色 ID"]')
   )`), true, '编辑表单未渲染音色列表编辑器')
+  await captureScreenshot(window, join(screenshotDir, `audio-generation-settings-${label}-draft.png`), `${label} 编辑表单`)
   await clickButton(window, '保存')
   await waitFor(window, `window.__audioGenerationSmoke.getSnapshot().replacePayloads.length === 1 && document.body.textContent?.includes('小米配音测试')`, '编辑保存未完成')
   const preserve = (await readSnapshot(window)).replacePayloads[0]
@@ -278,7 +284,7 @@ async function verifyCombination(
   await verifyTabsAndFocus(window)
   await verifyInitialAudioList(window)
   await verifyProviderFields(window)
-  await verifyCredentialPayloads(window)
+  await verifyCredentialPayloads(window, screenshotDir, label)
   await verifyLateResultIgnored(window)
   await verifyDeleteConflict(window)
   await verifyGeometryAndTheme(window, label)
