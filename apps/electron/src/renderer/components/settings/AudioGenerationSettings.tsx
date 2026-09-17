@@ -1073,9 +1073,11 @@ function AudioAvailableModels({ models, fetchedModels, catalogState, catalogMess
             ? '正在从供应商获取…'
             : catalogState === 'failed'
               ? catalogMessage ?? '从供应商获取失败，请检查服务地址与凭据后重试'
-            : fetchedModels.length === 0
-              ? '点右上角「从供应商获取」读取该账号可用的模型'
-              : '拉取到的模型都已添加'}
+              : fetchedModels.length === 0
+                ? catalogState === 'success'
+                  ? '供应商没有返回语音模型，请手动填写模型 ID'
+                  : '点右上角「从供应商获取」读取该账号可用的模型'
+                : '拉取到的模型都已添加'}
         </div>
       )}
       {catalogState === 'failed' && (

@@ -46,14 +46,15 @@ function createInput(overrides: Record<string, unknown> = {}): Record<string, un
 describe('音频供应商目录拉取', () => {
   test('Given 小米草稿凭据 When 拉取 Then 请求 models 并直接返回官方内置音色', async () => {
     const { fetchImpl, requests } = createFetchStub({
-      'https://tts.example/v1/models': { body: { data: [{ id: 'mimo-v2.5-tts' }, { id: 'mimo-v2.5' }] } },
+      'https://tts.example/v1/models': { body: { data: [{ id: 'mimo-v2.5-tts' }, { id: 'mimo-v2.5' }, { id: 'mimo-v2.5-tts-voiceclone' }] } },
     })
     const service = new AudioGenerationCatalogService({ store: { resolveApiKey: () => { throw new Error('unused') } }, fetchImpl })
 
     const result = await service.fetch(createInput())
 
     expect(result.state).toBe('success')
-    expect(result.models).toEqual(['mimo-v2.5-tts', 'mimo-v2.5'])
+    /** 只保留语音模型，对话模型不能出现在音频配置里。 */
+    expect(result.models).toEqual(['mimo-v2.5-tts', 'mimo-v2.5-tts-voiceclone'])
     expect(result.voices.map((voice) => voice.id)).toContain('mimo_default')
     expect(result.voices.every((voice) => voice.source === 'builtin')).toBeTrue()
     expect(requests).toHaveLength(1)
@@ -63,7 +64,7 @@ describe('音频供应商目录拉取', () => {
 
   test('Given MiniMax 已保存凭据 When 拉取 Then 合并系统、克隆与生成音色并去重', async () => {
     const { fetchImpl, requests } = createFetchStub({
-      'https://api.minimax.example/v1/models': { body: { data: [{ id: 'speech-2.5-hd' }, { id: 'speech-2.5-hd' }] } },
+      'https://api.minimax.example/v1/models': { body: { data: [{ id: 'speech-2.5-hd' }, { id: 'speech-2.5-hd' }, { id: 'MiniMax-M2' }] } },
       'https://api.minimax.example/v1/get_voice': {
         body: {
           system_voice: { items: [{ voice_id: 'sys-1', voice_name: '系统音色' }, { voice_id: 'sys-1' }] },

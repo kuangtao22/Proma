@@ -8,6 +8,7 @@
 import type {
   AudioGenerationCatalogFetchInput,
   AudioGenerationCatalogFetchResult,
+  AudioGenerationProvider,
   AudioGenerationVoice,
 } from '@proma/shared'
 import {
@@ -132,7 +133,7 @@ export class AudioGenerationCatalogService {
   private async collect(input: AudioGenerationCatalogFetchInput, apiKey: string): Promise<AudioGenerationCatalogCollection> {
     /** 归一化后的服务基地址，避免出现双斜杠。 */
     const baseUrl = input.baseUrl.replace(/\/+$/, '')
-    const models = await this.fetchModels(baseUrl, apiKey)
+    const models = await this.fetchModels(input.provider, baseUrl, apiKey)
     /** 小米音色是官方内置清单，不需要额外请求；MiniMax 需要按账号拉取。 */
     const voices = input.provider === 'xiaomi'
       ? [...AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi.builtinVoices]
@@ -141,12 +142,12 @@ export class AudioGenerationCatalogService {
   }
 
   /** 读取 OpenAI 兼容的模型列表，并归一化为去重后的稳定顺序。 */
-  private async fetchModels(baseUrl: string, apiKey: string): Promise<string[]> {
+  private async fetchModels(provider: AudioGenerationProvider, baseUrl: string, apiKey: string): Promise<string[]> {
     const payload = await this.requestJson(`${baseUrl}/models`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
     })
-    return AudioGenerationCatalogService.extractModelIds(payload)
+    return AudioGenerationCatalogService.extractModelIds(payload, provider)
   }
 
   /** 读取 MiniMax Voice Management 的音色列表。 */
@@ -191,8 +192,14 @@ export class AudioGenerationCatalogService {
     }
   }
 
-  /** 提取模型 ID，兼容 data/models 数组与纯字符串数组三种形态。 */
-  private static extractModelIds(payload: unknown): string[] {
+  /**
+   * 提取语音合成模型 ID。
+   * 入参：上游响应与供应商；返回值：只包含能做 TTS 的模型 ID。
+   * 两家的 /models 都同时返回对话模型，音频配置里必须过滤，避免选到 LLM：
+   * 小米的语音模型名都带 `tts`（mimo-v2.5-tts 及 voiceclone / voicedesign 变体），
+   * MiniMax 的语音模型名以 `speech-` 开头。
+   */
+  private static extractModelIds(payload: unknown, provider: AudioGenerationProvider): string[] {
     const candidates = Array.isArray(payload)
       ? payload
       : isRecord(payload) && Array.isArray(payload.data)
@@ -212,10 +219,17 @@ export class AudioGenerationCatalogService {
             ? entry.name
             : ''
       const trimmed = id.trim()
-      if (trimmed) seen.add(trimmed)
+      if (trimmed && AudioGenerationCatalogService.isSpeechModel(provider, trimmed)) seen.add(trimmed)
       if (seen.size >= AUDIO_GENERATION_MODEL_LIMIT) break
     }
     return [...seen]
+  }
+
+  /** 判断模型 ID 是否属于该供应商的语音合成族。 */
+  private static isSpeechModel(provider: AudioGenerationProvider, modelId: string): boolean {
+    return provider === 'xiaomi'
+      ? /tts/i.test(modelId)
+      : /^speech[-_]/i.test(modelId)
   }
 
   /** 提取 MiniMax 系统、克隆与生成音色，条目缺少 voice_id 时跳过。 */

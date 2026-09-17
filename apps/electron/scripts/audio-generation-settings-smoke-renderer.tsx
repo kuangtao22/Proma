@@ -165,6 +165,7 @@ const fixtureApi: Pick<
     requestId: input.requestId,
     state: 'success' as const,
     message: '已从供应商获取可用模型与音色',
+    /** 主进程已过滤掉对话模型，这里回放的是语音模型清单。 */
     models: ['mimo-v2.5-tts', 'mimo-v2.5-tts-voiceclone'],
     voices: [{ id: 'remote-voice-smoke', name: '远端 smoke 音色', source: 'remote' as const }],
   }),
