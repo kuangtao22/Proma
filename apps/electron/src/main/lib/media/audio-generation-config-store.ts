@@ -8,7 +8,9 @@ import type {
 } from '@proma/shared'
 import {
   AUDIO_GENERATION_API_KEY_MAX_LENGTH,
+  AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_PROFILE_LIMIT,
+  LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   parseAudioGenerationProfile,
   parseReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
@@ -63,9 +65,9 @@ interface PersistedAudioGenerationProfile {
   encryptedApiKey: string
 }
 
-/** 独立音频配置文件的 v1 持久化结构。 */
+/** 独立音频配置文件的当前持久化结构；读取时仍兼容 v1，写回统一为 v2。 */
 interface PersistedAudioGenerationCatalog {
-  schemaVersion: 1
+  schemaVersion: 2
   revision: number
   profiles: PersistedAudioGenerationProfile[]
 }
@@ -104,30 +106,44 @@ function parseEncryptedApiKey(value: unknown): string {
   return value
 }
 
+/**
+ * 把 v1 的单值 voiceId 迁移成 v2 的音色列表。
+ * 入参：磁盘上的未知 profile 形状；返回值：可交给严格解析器的 v2 形状或原值。
+ * 只做形状转换，校验仍由 parseAudioGenerationProfile 收口。
+ */
+function migrateLegacyAudioProfile(value: unknown): unknown {
+  if (!isRecord(value) || typeof value.voiceId !== 'string') return value
+  const { voiceId, ...rest } = value
+  return { ...rest, voices: [{ id: voiceId, name: voiceId, source: 'manual' }] }
+}
+
 /** 严格解析磁盘目录，不接受未知字段、重复 ID 或非法 Profile。 */
 function parsePersistedCatalog(value: unknown): PersistedAudioGenerationCatalog {
   if (!isRecord(value)
     || !hasOnlyKeys(value, ['schemaVersion', 'revision', 'profiles'])
-    || value.schemaVersion !== 1
+    || (value.schemaVersion !== LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
+      && value.schemaVersion !== AUDIO_GENERATION_CATALOG_SCHEMA_VERSION)
     || !isCatalogRevision(value.revision)
     || !Array.isArray(value.profiles)
     || value.profiles.length > AUDIO_GENERATION_PROFILE_LIMIT) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
+  /** 旧文件只影响本次读取的解释方式，绝不回写用户文件。 */
+  const isLegacySchema = value.schemaVersion === LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
   /** 按文件顺序解析后的持久化条目。 */
   const profiles = value.profiles.map((item): PersistedAudioGenerationProfile => {
     if (!isRecord(item) || !hasOnlyKeys(item, ['profile', 'encryptedApiKey'])) {
       throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
     }
     return {
-      profile: parseAudioGenerationProfile(item.profile),
+      profile: parseAudioGenerationProfile(isLegacySchema ? migrateLegacyAudioProfile(item.profile) : item.profile),
       encryptedApiKey: parseEncryptedApiKey(item.encryptedApiKey),
     }
   })
   /** 用稳定 ID 检测目录内歧义目标。 */
   const profileIds = new Set(profiles.map((item) => item.profile.id))
   if (profileIds.size !== profiles.length) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
-  return { schemaVersion: 1, revision: value.revision, profiles }
+  return { schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION, revision: value.revision, profiles }
 }
 
 /** 把持久化条目转换为不含密文的 Renderer DTO。 */
@@ -142,7 +158,7 @@ function toPublicProfile(item: PersistedAudioGenerationProfile): AudioGeneration
 /** 把完整持久化目录转换为公开目录，不执行任何解密。 */
 function toPublicCatalog(catalog: PersistedAudioGenerationCatalog): AudioGenerationPublicCatalog {
   return {
-    schemaVersion: 1,
+    schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
     revision: catalog.revision,
     profiles: catalog.profiles.map(toPublicProfile),
   }
@@ -257,7 +273,7 @@ export class AudioGenerationConfigStore {
       })
       /** revision 只在完整目录成功提交时推进一次。 */
       const next: PersistedAudioGenerationCatalog = {
-        schemaVersion: 1,
+        schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
         revision: current.revision + 1,
         profiles,
       }
@@ -354,7 +370,7 @@ export class AudioGenerationConfigStore {
     } catch (error) {
       if (isMissingFileError(error) && descriptor === null) {
         return {
-          catalog: { schemaVersion: 1, revision: 0, profiles: [] },
+          catalog: { schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION, revision: 0, profiles: [] },
           expectedDestination: { kind: 'missing' },
         }
       }

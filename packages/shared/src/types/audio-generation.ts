@@ -1,13 +1,24 @@
 /** 首批支持的独立音频生成供应商。 */
 export type AudioGenerationProvider = 'xiaomi' | 'minimax'
 
+/** 音色来源，仅用于界面标注，不参与任何执行分支。 */
+export type AudioGenerationVoiceSource = 'builtin' | 'remote' | 'manual'
+
+/** 单条已启用音色；name 缺失时界面回退显示 id。 */
+export interface AudioGenerationVoice {
+  id: string
+  name?: string
+  source: AudioGenerationVoiceSource
+}
+
 /** 音频生成配置的供应商无关字段。 */
 export interface AudioGenerationProfileBase {
   id: string
   name: string
   baseUrl: string
   modelId: string
-  voiceId: string
+  /** 已启用音色，顺序即用户添加顺序；至少一个且同一配置内不重复。 */
+  voices: AudioGenerationVoice[]
   enabled: boolean
   createdAt: number
   updatedAt: number
@@ -41,7 +52,7 @@ export type AudioGenerationPublicProfile = AudioGenerationProfile & {
 
 /** Renderer 可读取的独立音频目录快照。 */
 export interface AudioGenerationPublicCatalog {
-  schemaVersion: 1
+  schemaVersion: 2
   revision: number
   profiles: AudioGenerationPublicProfile[]
 }
@@ -139,8 +150,16 @@ export const AUDIO_GENERATION_TEST_MESSAGES = {
 
 /** 单个目录允许保存的配置数量上限。 */
 export const AUDIO_GENERATION_PROFILE_LIMIT = 128
+/** 单条配置允许启用的音色数量上限。 */
+export const AUDIO_GENERATION_VOICE_LIMIT = 64
 /** 用户可见名称长度上限。 */
 export const AUDIO_GENERATION_NAME_MAX_LENGTH = 128
+/** 音色显示名称长度上限。 */
+export const AUDIO_GENERATION_VOICE_NAME_MAX_LENGTH = 128
+/** 当前独立音频目录的 schema 版本。 */
+export const AUDIO_GENERATION_CATALOG_SCHEMA_VERSION = 2 as const
+/** 仍需兼容读取的旧目录 schema 版本，读取时把 voiceId 迁移成单条音色。 */
+export const LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION = 1 as const
 /** 模型、音色、供应商专属标识与稳定 ID 的长度上限。 */
 export const AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH = 256
 /** Base URL 的长度上限。 */
@@ -156,8 +175,10 @@ const AUDIO_GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/
 const RESERVED_AUDIO_GENERATION_IDS = new Set(['__proto__', 'constructor', 'prototype'])
 /** 所有供应商共享的配置字段。 */
 const PROFILE_BASE_KEYS = [
-  'id', 'name', 'provider', 'baseUrl', 'modelId', 'voiceId', 'enabled', 'createdAt', 'updatedAt', 'legacyMediaProfileId',
+  'id', 'name', 'provider', 'baseUrl', 'modelId', 'voices', 'enabled', 'createdAt', 'updatedAt', 'legacyMediaProfileId',
 ] as const
+/** 单条音色允许出现的字段。 */
+const VOICE_KEYS = ['id', 'name', 'source'] as const
 /** 公开配置在持久化配置之外增加的字段。 */
 const PUBLIC_PROFILE_KEYS = ['credentialConfigured', 'endpointOrigin'] as const
 
@@ -234,6 +255,33 @@ function parseBaseUrl(value: unknown): string {
   }
 }
 
+/**
+ * 严格解析已启用音色列表。
+ * 入参：来自磁盘或 IPC 的未知值；返回值：清洗后的有序音色数组。
+ * 空列表、超限、未知字段、非法来源与重复 ID 一律拒绝，避免歧义音色进入执行链。
+ */
+export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVoice[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > AUDIO_GENERATION_VOICE_LIMIT) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 已出现过的音色 ID，用于拒绝同一配置内的重复音色。 */
+  const seenIds = new Set<string>()
+  return value.map((item): AudioGenerationVoice => {
+    if (!isRecord(item) || !hasOnlyKeys(item, VOICE_KEYS)) {
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    const id = parseRequiredText(item.id, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH)
+    if (seenIds.has(id)) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    seenIds.add(id)
+    if (item.source !== 'builtin' && item.source !== 'remote' && item.source !== 'manual') {
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    /** 显示名称可选，缺失时由界面回退显示 id。 */
+    const name = parseOptionalText(item.name, AUDIO_GENERATION_VOICE_NAME_MAX_LENGTH)
+    return name === undefined ? { id, source: item.source } : { id, name, source: item.source }
+  })
+}
+
 /** 解析独立音频配置，并严格保留供应商字段差异。 */
 export function parseAudioGenerationProfile(value: unknown): AudioGenerationProfile {
   if (!isRecord(value) || (value.provider !== 'xiaomi' && value.provider !== 'minimax')) {
@@ -254,7 +302,7 @@ export function parseAudioGenerationProfile(value: unknown): AudioGenerationProf
     name: parseRequiredText(value.name, AUDIO_GENERATION_NAME_MAX_LENGTH),
     baseUrl: parseBaseUrl(value.baseUrl),
     modelId: parseRequiredText(value.modelId, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH),
-    voiceId: parseRequiredText(value.voiceId, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH),
+    voices: parseAudioGenerationVoiceList(value.voices),
     enabled: value.enabled,
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,
@@ -356,7 +404,7 @@ export function parseAudioGenerationSettingsResult(value: unknown): AudioGenerat
   if (!isRecord(value) || !hasOnlyKeys(value, ['catalog', 'legacyAudioProfiles', 'legacyWarning'])
     || !isRecord(value.catalog)
     || !hasOnlyKeys(value.catalog, ['schemaVersion', 'revision', 'profiles'])
-    || value.catalog.schemaVersion !== 1
+    || value.catalog.schemaVersion !== AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
     || !isNonNegativeSafeInteger(value.catalog.revision)
     || !Array.isArray(value.catalog.profiles)
     || value.catalog.profiles.length > AUDIO_GENERATION_PROFILE_LIMIT
@@ -379,7 +427,7 @@ export function parseAudioGenerationSettingsResult(value: unknown): AudioGenerat
   /** 可选警告统一投影为固定常量，禁止保留任意输入文本。 */
   const legacyWarning = value.legacyWarning === undefined ? undefined : AUDIO_GENERATION_LEGACY_WARNING
   return {
-    catalog: { schemaVersion: 1, revision: value.catalog.revision, profiles },
+    catalog: { schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION, revision: value.catalog.revision, profiles },
     legacyAudioProfiles,
     ...(legacyWarning === undefined ? {} : { legacyWarning }),
   }

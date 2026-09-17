@@ -160,6 +160,14 @@ async function verifyCredentialPayloads(window: BrowserWindow): Promise<void> {
   await clickSelector(window, 'button[aria-label="编辑 小米配音测试"]', '找不到小米编辑入口')
   await waitFor(window, `document.querySelector('#audio-api-key')?.placeholder === '留空以保留已保存凭据'`, '编辑表单未提供留空保留语义')
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-api-key')?.value`), '', '编辑表单回填了 API Key')
+  /** 编辑表单必须渲染已启用音色列表与手填添加行，而不是旧单值输入框。 */
+  assert.equal(await window.webContents.executeJavaScript(`Boolean(
+    document.body.textContent?.includes('已启用音色')
+      && document.body.textContent?.includes('小米 smoke 音色')
+      && document.querySelector('button[aria-label="移除音色 小米 smoke 音色"]')
+      && document.querySelector('#audio-voice-id')
+      && !document.querySelector('button[aria-label="音色 ID"]')
+  )`), true, '编辑表单未渲染音色列表编辑器')
   await clickButton(window, '保存')
   await waitFor(window, `window.__audioGenerationSmoke.getSnapshot().replacePayloads.length === 1 && document.body.textContent?.includes('小米配音测试')`, '编辑保存未完成')
   const preserve = (await readSnapshot(window)).replacePayloads[0]

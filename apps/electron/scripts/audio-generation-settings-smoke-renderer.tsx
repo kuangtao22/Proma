@@ -56,7 +56,7 @@ const fakeSecret = 'secret-key-audio-smoke'
 /** 固定初始目录同时覆盖小米、MiniMax 与旧目录引用。 */
 const initialSettings: AudioGenerationSettingsResult = {
   catalog: {
-    schemaVersion: 1,
+    schemaVersion: 2,
     revision: 7,
     profiles: [
       {
@@ -66,7 +66,7 @@ const initialSettings: AudioGenerationSettingsResult = {
         baseUrl: 'https://tts-smoke.example.com/v1',
         endpointOrigin: 'https://tts-smoke.example.com',
         modelId: 'xiaomi-tts-smoke',
-        voiceId: 'xiaomi-voice-smoke',
+        voices: [{ id: 'xiaomi-voice-smoke', name: '小米 smoke 音色', source: 'manual' }],
         enabled: true,
         credentialConfigured: true,
         createdAt: 100,
@@ -79,7 +79,7 @@ const initialSettings: AudioGenerationSettingsResult = {
         baseUrl: 'https://minimax-smoke.example.com/v1',
         endpointOrigin: 'https://minimax-smoke.example.com',
         modelId: 'speech-02-hd',
-        voiceId: 'minimax-voice-smoke',
+        voices: [{ id: 'minimax-voice-smoke', name: 'MiniMax smoke 音色', source: 'manual' }],
         groupId: 'group-smoke',
         enabled: true,
         credentialConfigured: true,
@@ -124,7 +124,7 @@ function applyReplaceRequest(request: ReplaceAudioGenerationCatalogRequest): Aud
   settings = {
     ...settings,
     catalog: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       revision: settings.catalog.revision + 1,
       profiles: request.profiles.map(({ profile, credentialUpdate }) => ({
         ...structuredClone(profile),

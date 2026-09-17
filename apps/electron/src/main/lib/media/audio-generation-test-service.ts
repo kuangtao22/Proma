@@ -156,7 +156,7 @@ function rebuildStrictProfile(source: AudioGenerationPublicProfile): AudioGenera
     name: source.name,
     baseUrl: source.baseUrl,
     modelId: source.modelId,
-    voiceId: source.voiceId,
+    voices: source.voices,
     enabled: source.enabled,
     createdAt: source.createdAt,
     updatedAt: source.updatedAt,

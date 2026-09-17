@@ -7,10 +7,11 @@ import type {
   AudioGenerationSettingsResult,
   AudioGenerationTestInput,
   AudioGenerationTestResult,
+  AudioGenerationVoice,
   ReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
 import { AUDIO_GENERATION_PROVIDER_DESCRIPTORS, parseAudioGenerationProfile } from '@proma/shared'
-import { Copy, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2 } from 'lucide-react'
+import { CheckCircle2, Copy, Loader2, Pencil, Plus, Search, TestTube2, Trash2, Volume2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
@@ -149,7 +150,7 @@ export function changeAudioGenerationProvider(
     createdAt: draft.createdAt,
     updatedAt: draft.updatedAt,
     modelId: '',
-    voiceId: '',
+    voices: [],
     apiKey: '',
     credentialConfigured: false,
   }
@@ -170,7 +171,8 @@ export function copyAudioGenerationProfile(
     name: `${profile.name} 副本`,
     baseUrl: profile.baseUrl,
     modelId: profile.modelId,
-    voiceId: profile.voiceId,
+    /** 复制配置保留音色集合，但不继承凭据与旧目录引用。 */
+    voices: profile.voices.map((voice) => ({ ...voice })),
     enabled: profile.enabled,
     createdAt: now,
     updatedAt: now,
@@ -195,7 +197,7 @@ export function filterAudioGenerationProfiles(
     profile.provider,
     PROVIDER_LABELS[profile.provider],
     profile.modelId,
-    profile.voiceId,
+    ...profile.voices.flatMap((voice) => [voice.id, voice.name ?? '']),
     profile.endpointOrigin,
   ].join('\n').toLocaleLowerCase().includes(normalized))
 }
@@ -208,7 +210,7 @@ function profileToDraft(profile: AudioGenerationPublicProfile): AudioGenerationD
     name: profile.name,
     baseUrl: profile.baseUrl,
     modelId: profile.modelId,
-    voiceId: profile.voiceId,
+    voices: profile.voices.map((voice) => ({ ...voice })),
     enabled: profile.enabled,
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
@@ -227,14 +229,14 @@ function draftToProfile(draft: AudioGenerationDraft): AudioGenerationProfile {
   const candidate: AudioGenerationProfile = draft.provider === 'minimax'
     ? {
         id: draft.id, name: draft.name, provider: 'minimax', baseUrl: draft.baseUrl,
-        modelId: draft.modelId, voiceId: draft.voiceId, enabled: draft.enabled,
+        modelId: draft.modelId, voices: draft.voices, enabled: draft.enabled,
         createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.groupId?.trim() ? { groupId: draft.groupId.trim() } : {}),
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
     : {
         id: draft.id, name: draft.name, provider: 'xiaomi', baseUrl: draft.baseUrl,
-        modelId: draft.modelId, voiceId: draft.voiceId, enabled: draft.enabled,
+        modelId: draft.modelId, voices: draft.voices, enabled: draft.enabled,
         createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
@@ -247,7 +249,7 @@ function profileIdentity(profile: AudioGenerationProfile): string {
     profile.provider,
     profile.baseUrl.trim(),
     profile.modelId.trim(),
-    profile.voiceId.trim(),
+    ...profile.voices.map((voice) => [voice.id.trim(), voice.name?.trim() ?? '', voice.source]),
     profile.provider === 'minimax' ? profile.groupId?.trim() ?? '' : '',
   ])
 }
@@ -575,7 +577,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     const now = Date.now()
     editBaselineRef.current = null
     setActionError(null)
-    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: '', modelId: '', voiceId: '', enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
+    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: '', modelId: '', voices: [], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 编辑已保存配置但不读取旧 Key。 */
@@ -611,7 +613,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     setActionError(null)
     publishDraft({
       id: createAudioGenerationId(), name: legacy.name, provider: 'minimax', baseUrl: '', modelId: legacy.modelId,
-      voiceId: '', groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
+      voices: [], groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
       legacyMediaProfileId: legacy.id, apiKey: '', credentialConfigured: false,
     })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
@@ -657,7 +659,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       /** API Key 必填提示可直接操作，其它 schema 错误统一转为稳定表单文案。 */
       const message = error instanceof Error && error.message === '请输入 API Key'
         ? error.message
-        : '请完整填写有效的名称、服务地址、模型 ID 和音色 ID。'
+        : '请完整填写有效的名称、服务地址和模型 ID，并至少添加一个音色。'
       if (mountedRef.current) setActionError(message)
     }
   }, [draft, ensureCatalogReady, invalidateIdentityTest, preserveEntries, publishDraft, replace, saving, settings])
@@ -840,6 +842,91 @@ function FormField({ id, label, children }: { id: string; label: string; childre
   return <div className="space-y-1.5"><label htmlFor={id} className="text-sm font-medium text-foreground">{label}</label>{children}</div>
 }
 
+/**
+ * 已启用音色列表与手填添加行。
+ * 入参：当前音色集合、禁用态、集合变更回调；返回值：音色编辑视图。
+ * 重复音色就地拒绝，保证提交给主进程的集合永远满足 Shared 合同。
+ */
+function AudioVoiceEditor({ voices, disabled, onChange }: {
+  voices: readonly AudioGenerationVoice[]
+  disabled: boolean
+  onChange: (voices: AudioGenerationVoice[]) => void
+}): React.ReactElement {
+  /** 待添加的音色 ID 与可选显示名称。 */
+  const [pendingId, setPendingId] = React.useState('')
+  const [pendingName, setPendingName] = React.useState('')
+  /** 重复或空输入时的就地提示。 */
+  const [addError, setAddError] = React.useState('')
+
+  /** 把待添加输入收敛为一条 manual 音色。 */
+  const appendVoice = (): void => {
+    const id = pendingId.trim()
+    if (!id) {
+      setAddError('请输入音色 ID')
+      return
+    }
+    if (voices.some((voice) => voice.id === id)) {
+      setAddError('该音色已添加')
+      return
+    }
+    const name = pendingName.trim()
+    onChange([...voices, name ? { id, name, source: 'manual' } : { id, source: 'manual' }])
+    setPendingId('')
+    setPendingName('')
+    setAddError('')
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-medium text-foreground">已启用音色</span>
+        <span className="text-xs text-muted-foreground">{voices.length} 个音色</span>
+      </div>
+      <SettingsCard divided={false}>
+        {voices.length === 0 ? (
+          <div className="px-4 py-6 text-center text-sm text-muted-foreground">还没有添加音色，请在下方添加</div>
+        ) : (
+          <div className="divide-y divide-border/50">
+            {voices.map((voice) => (
+              <div key={voice.id} className="group flex items-center gap-2 px-4 py-2.5">
+                <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
+                <span className="flex-1 text-sm text-foreground">
+                  {voice.name ?? voice.id}
+                  {voice.name && voice.name !== voice.id ? <span className="ml-1 text-muted-foreground">({voice.id})</span> : null}
+                </span>
+                <button
+                  type="button"
+                  disabled={disabled}
+                  aria-label={`移除音色 ${voice.name ?? voice.id}`}
+                  title="移除音色"
+                  onClick={() => onChange(voices.filter((entry) => entry.id !== voice.id))}
+                  className="p-0.5 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:text-destructive"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </SettingsCard>
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="min-w-48 flex-1"><FormField id="audio-voice-id" label="音色 ID"><Input id="audio-voice-id" value={pendingId} disabled={disabled} onChange={(event) => setPendingId(event.target.value)} /></FormField></div>
+        <div className="min-w-48 flex-1"><FormField id="audio-voice-name" label="显示名称（可选）"><Input id="audio-voice-name" value={pendingName} disabled={disabled} onChange={(event) => setPendingName(event.target.value)} /></FormField></div>
+        <Button type="button" variant="outline" disabled={disabled} onClick={appendVoice}><Plus />添加音色</Button>
+      </div>
+      {addError && <p role="alert" className="text-sm text-destructive">{addError}</p>}
+    </div>
+  )
+}
+
+/** 列表摘要只显示首个音色与总数，避免长列表撑开行。 */
+function voiceSummary(voices: readonly AudioGenerationVoice[]): string {
+  const [first] = voices
+  if (!first) return '未配置音色'
+  const label = first.name ?? first.id
+  return voices.length === 1 ? label : `${label} 等 ${voices.length} 个音色`
+}
+
 /** 音频目录、动态表单与旧配置迁移的纯视图。 */
 export function AudioGenerationCatalogView({ controller, navigation, headerContent, children }: AudioGenerationCatalogViewProps): React.ReactElement {
   const { settings, loading, saving, needsReload, loadError, actionError, query, draft, deleteId, visibleProfiles, testStates } = controller
@@ -859,7 +946,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
             <FormField id="audio-base-url" label="服务地址"><Input id="audio-base-url" value={draft.baseUrl} disabled={actionDisabled} placeholder="https://..." onChange={(event) => controller.updateDraft({ ...draft, baseUrl: event.target.value })} /></FormField>
             <FormField id="audio-api-key" label="API Key"><Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={actionDisabled} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} /></FormField>
             <FormField id="audio-model-id" label="模型 ID"><Input id="audio-model-id" value={draft.modelId} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, modelId: event.target.value })} /></FormField>
-            <FormField id="audio-voice-id" label="音色 ID"><Input id="audio-voice-id" value={draft.voiceId} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, voiceId: event.target.value })} /></FormField>
+            <div className="sm:col-span-2"><AudioVoiceEditor voices={draft.voices} disabled={actionDisabled} onChange={(voices) => controller.updateDraft({ ...draft, voices })} /></div>
             {draft.provider === 'minimax' && <FormField id="audio-group-id" label="Group ID（可选）"><Input id="audio-group-id" value={draft.groupId ?? ''} disabled={actionDisabled} onChange={(event) => controller.updateDraft({ ...draft, groupId: event.target.value })} /></FormField>}
             <label className="flex items-center gap-2 self-end text-sm text-muted-foreground"><Switch checked={draft.enabled} disabled={actionDisabled} aria-label="启用音频配置" onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })} />启用</label>
           </div>
@@ -897,7 +984,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           : settings && visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的音频配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => {
                 const testState = testStates[profile.id]
-                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {profile.modelId} · {profile.voiceId}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
+                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {profile.modelId} · {voiceSummary(profile.voices)}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
               })}</SettingsCard>}
       <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title="删除音频配置？" description={actionError ?? (deleteTarget ? `删除 ${deleteTarget.name} 后，后续音频任务将不能再使用该配置。` : '')} confirmLabel="删除" closeOnConfirm={false} loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>

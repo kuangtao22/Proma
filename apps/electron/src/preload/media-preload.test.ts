@@ -10,7 +10,7 @@ function createAudioProfile() {
     provider: 'xiaomi' as const,
     baseUrl: 'https://example.com/tts',
     modelId: 'tts-model',
-    voiceId: 'voice-1',
+    voices: [{ id: 'voice-1', name: 'voice-1', source: 'manual' as const }],
     enabled: true,
     createdAt: 1,
     updatedAt: 1,

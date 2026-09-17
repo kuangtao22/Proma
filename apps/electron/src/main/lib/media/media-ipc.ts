@@ -1,5 +1,6 @@
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import {
+  AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_LEGACY_WARNING,
   MEDIA_IPC_CHANNELS,
   parseAudioGenerationSettingsResult,
@@ -100,7 +101,7 @@ function readLegacyAudioProfiles(listLegacyCatalog: () => MediaApiModelCatalogRe
     const catalog = listLegacyCatalog()
     /** Shared 结果 parser 复核字段、ID 与重复项。 */
     const parsed = parseAudioGenerationSettingsResult({
-      catalog: { schemaVersion: 1, revision: 0, profiles: [] },
+      catalog: { schemaVersion: AUDIO_GENERATION_CATALOG_SCHEMA_VERSION, revision: 0, profiles: [] },
       legacyAudioProfiles: catalog.entries
         .filter((entry) => entry.profile.protocol === 'minimax-speech')
         .map((entry) => ({
