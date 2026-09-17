@@ -36,6 +36,9 @@ export interface ImageGenerationCatalogCredentialStore {
   resolveApiKey(profileId: string): string
 }
 
+/** 拉取所需的最小 fetch 调用签名，便于测试注入普通函数。 */
+export type ImageGenerationCatalogFetch = (input: string | URL, init?: RequestInit) => Promise<Response>
+
 /** CLI 调用结果，屏蔽 stdout 内容只保留成败。 */
 export interface ImageGenerationCliResult {
   exitCode: number
@@ -47,7 +50,7 @@ export interface ImageGenerationCatalogServiceOptions {
   /** 凭据来源。 */
   store: ImageGenerationCatalogCredentialStore
   /** 可注入的 fetch 实现，仅用于测试。 */
-  fetchImpl?: typeof fetch
+  fetchImpl?: ImageGenerationCatalogFetch
   /** 可注入的 CLI 执行器，仅用于测试。 */
   runCli?: (args: readonly string[], cliPath: string) => Promise<ImageGenerationCliResult>
   /** 可注入的超时时间，仅用于测试。 */
@@ -57,7 +60,7 @@ export interface ImageGenerationCatalogServiceOptions {
 /** 管理「从供应商获取」，任何失败都收敛为固定文案的 failed 结果。 */
 export class ImageGenerationCatalogService {
   private readonly store: ImageGenerationCatalogCredentialStore
-  private readonly fetchImpl: typeof fetch
+  private readonly fetchImpl: ImageGenerationCatalogFetch
   private readonly runCli: (args: readonly string[], cliPath: string) => Promise<ImageGenerationCliResult>
   private readonly timeoutMs: number
 

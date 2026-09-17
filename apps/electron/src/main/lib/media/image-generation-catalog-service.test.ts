@@ -2,11 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import { IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES } from '@proma/shared'
 import {
   ImageGenerationCatalogService,
+  type ImageGenerationCatalogFetch,
   type ImageGenerationCliResult,
 } from './image-generation-catalog-service'
 
 /** 只回放固定 JSON 的 fetch 替身。 */
-function createFetchStub(body: unknown, status = 200): typeof fetch {
+function createFetchStub(body: unknown, status = 200): ImageGenerationCatalogFetch {
   return async () => new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' },
