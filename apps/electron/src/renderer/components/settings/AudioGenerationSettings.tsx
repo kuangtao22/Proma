@@ -139,8 +139,13 @@ export interface AudioGenerationController {
   loading: boolean
   saving: boolean
   needsReload: boolean
-  generationEntryCount: number
-  pendingCancellationCount: number
+  /** 仅供测试断言的内部簿记；业务代码不得读取，界面也不展示。 */
+  __internal: {
+    /** 仍持有测试代次的身份数量，用于验证 Map 不泄漏。 */
+    generationEntryCount: number
+    /** 已发出取消但尚未确认完成的请求数量。 */
+    pendingCancellationCount: number
+  }
   loadError: string | null
   actionError: string | null
   query: string
@@ -962,8 +967,12 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
   }, [api])
 
   return {
-    settings, loading, saving, needsReload, generationEntryCount: testGenerationsRef.current.size,
-    pendingCancellationCount: pendingCancellationsRef.current.size,
+    settings, loading, saving, needsReload,
+    /** 调试观测口单独收敛，避免混入业务字段。 */
+    __internal: {
+      generationEntryCount: testGenerationsRef.current.size,
+      pendingCancellationCount: pendingCancellationsRef.current.size,
+    },
     loadError, actionError, query, draft, deleteId, testStates, catalog,
     visibleProfiles: filterAudioGenerationProfiles(settings?.catalog.profiles ?? [], query),
     setQuery, load, startCreate, startEdit, startCopy, startMigration, updateDraft, closeDraft, saveDraft,

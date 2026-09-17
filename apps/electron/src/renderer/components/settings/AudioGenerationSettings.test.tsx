@@ -237,7 +237,7 @@ describe('AudioGenerationSettings', () => {
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'MiniMax Speech')).toHaveLength(1)
     expect(filterAudioGenerationProfiles(settings.catalog.profiles, 'private/path')).toHaveLength(0)
     const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', draft: null,
+      settings, loading: false, saving: false, needsReload: false, __internal: { generationEntryCount: 0, pendingCancellationCount: 0 }, loadError: null, actionError: null, query: '', draft: null,
       deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
@@ -268,7 +268,7 @@ describe('AudioGenerationSettings', () => {
   test('Given 含音色的草稿 When 渲染表单 Then 展示已启用音色且不再提供手填音色', () => {
     const settings = createSettings()
     const common = {
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      settings, loading: false, saving: false, needsReload: false, __internal: { generationEntryCount: 0, pendingCancellationCount: 0 }, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
@@ -288,7 +288,7 @@ describe('AudioGenerationSettings', () => {
     const settings = createSettings()
     const minimax = settings.catalog.profiles[1]!
     const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      settings, loading: false, saving: false, needsReload: false, __internal: { generationEntryCount: 0, pendingCancellationCount: 0 }, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
@@ -311,7 +311,7 @@ describe('AudioGenerationSettings', () => {
     const settings = createSettings()
     const draft = { ...settings.catalog.profiles[0]!, apiKey: '' }
     const common = {
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      settings, loading: false, saving: false, needsReload: false, __internal: { generationEntryCount: 0, pendingCancellationCount: 0 }, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
@@ -420,7 +420,7 @@ describe('AudioGenerationSettings', () => {
   test('Given 表单切换供应商 When 渲染 Then MiniMax 显示 Group ID、小米不渲染且密码框不回填旧 Key', () => {
     const settings = createSettings()
     const common = {
-      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      settings, loading: false, saving: false, needsReload: false, __internal: { generationEntryCount: 0, pendingCancellationCount: 0 }, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
       setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
       startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
       saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
@@ -947,9 +947,9 @@ describe('AudioGenerationSettings', () => {
         act(() => requireController(controller).startCreate())
         act(() => requireController(controller).closeDraft())
       }
-      const observable = requireController(controller) as AudioGenerationController & { generationEntryCount: number }
-      expect(observable.generationEntryCount).toBe(0)
-      expect((observable as typeof observable & { pendingCancellationCount: number }).pendingCancellationCount).toBe(0)
+      /** 反复创建与返回后，内部簿记必须完全清空。 */
+      expect(requireController(controller).__internal.generationEntryCount).toBe(0)
+      expect(requireController(controller).__internal.pendingCancellationCount).toBe(0)
     } finally { act(() => host.unmount()); host.restore() }
   })
 
