@@ -211,6 +211,8 @@ export interface AudioGenerationProviderDefaults {
   requestPath: string
   /** 官方文档内置音色；空数组表示只能手填或运行时拉取。 */
   builtinVoices: readonly AudioGenerationVoice[]
+  /** 官方文档内置语音模型；空数组表示只能手填或按端点拉取。 */
+  builtinModels: readonly string[]
 }
 
 /**
@@ -224,12 +226,28 @@ export const AUDIO_GENERATION_PROVIDER_DEFAULTS: Record<AudioGenerationProvider,
     modelId: 'mimo-v2.5-tts',
     requestPath: '/chat/completions',
     builtinVoices: XIAOMI_BUILTIN_VOICES,
+    /** 小米语音模型由 /v1/models 返回，无需内置清单。 */
+    builtinModels: [],
   },
   minimax: {
     baseUrl: 'https://api.minimax.cn/v1',
     modelId: '',
     requestPath: '/t2a_v2',
     builtinVoices: [],
+    /**
+     * MiniMax 的 /v1/models 只登记对话模型，语音模型取自官方 T2A 规范
+     * https://platform.minimaxi.com/docs/api-reference/speech/t2a 的 model 枚举。
+     */
+    builtinModels: [
+      'speech-2.8-hd',
+      'speech-2.8-turbo',
+      'speech-2.6-hd',
+      'speech-2.6-turbo',
+      'speech-02-hd',
+      'speech-02-turbo',
+      'speech-01-hd',
+      'speech-01-turbo',
+    ],
   },
 }
 

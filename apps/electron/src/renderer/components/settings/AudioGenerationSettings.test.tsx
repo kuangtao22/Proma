@@ -281,6 +281,22 @@ describe('AudioGenerationSettings', () => {
     expect(html).toContain('显示名称（可选）')
   })
 
+  test('Given MiniMax 草稿 When 未拉取 Then 可用模型显示官方内置语音模型', () => {
+    const settings = createSettings()
+    const minimax = settings.catalog.profiles[1]!
+    const html = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
+      settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
+      setQuery: () => undefined, load: async () => true, startCreate: () => undefined, startEdit: () => undefined,
+      startCopy: () => undefined, startMigration: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
+      saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
+      closeDelete: () => undefined, confirmDelete: async () => undefined, testProfile: async () => undefined, fetchCatalog: async () => undefined, catalog: null,
+      draft: { ...minimax, apiKey: '' },
+    }} />)
+    /** 官方 T2A 枚举里的模型必须直接可选，不依赖 /v1/models。 */
+    expect(html).toContain('speech-2.8-hd')
+    expect(html).toContain('speech-01-turbo')
+  })
+
   test('Given 供应商与模型 When 解析音色能力 Then 小米三种模型语义各不相同', () => {
     expect(resolveVoiceCapability('xiaomi', 'mimo-v2.5-tts')).toBe('voice-id')
     expect(resolveVoiceCapability('xiaomi', ' mimo-v2.5-tts-voiceclone ')).toBe('voice-sample')

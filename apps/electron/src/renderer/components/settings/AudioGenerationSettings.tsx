@@ -1021,10 +1021,12 @@ function AudioEnabledModelList({ models, selectedModelId, disabled, onSelect, on
 }
 
 /** 可用模型：拉取结果点选加入上方，底部保留手填一行。 */
-function AudioAvailableModels({ provider, models, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
+function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
   /** 当前供应商，用于区分「端点不含语音模型」的说明文案。 */
   provider: AudioGenerationProvider
   models: readonly AudioGenerationModelEntry[]
+  /** 官方内置语音模型，MiniMax 依赖它补齐可选项。 */
+  builtinModels: readonly string[]
   fetchedModels: readonly string[]
   catalogState: 'idle' | 'loading' | 'success' | 'failed'
   /** 失败或提示文案，来自本次拉取结果的固定文案。 */
@@ -1037,7 +1039,9 @@ function AudioAvailableModels({ provider, models, fetchedModels, catalogState, c
   const [addError, setAddError] = React.useState('')
   /** 已启用模型按 id 去重，决定清单里还剩哪些可添加。 */
   const enabledIds = new Set(models.map((model) => model.id))
-  const available = fetchedModels.filter((id) => !enabledIds.has(id))
+  /** 内置清单优先，其次是端点拉取结果，两者都按已启用去重。 */
+  const candidates = [...builtinModels, ...fetchedModels].filter((id, index, all) => all.indexOf(id) === index)
+  const available = candidates.filter((id) => !enabledIds.has(id))
 
   /** 追加一个模型条目（音色留空，随后按模型维护）。 */
   const appendModel = (id: string): void => {
@@ -1075,10 +1079,10 @@ function AudioAvailableModels({ provider, models, fetchedModels, catalogState, c
             ? '正在从供应商获取…'
             : catalogState === 'failed'
               ? catalogMessage ?? '从供应商获取失败，请检查服务地址与凭据后重试'
-              : fetchedModels.length === 0
+              : candidates.length === 0
                 ? catalogState === 'success'
                   ? provider === 'minimax'
-                    ? 'MiniMax 的模型接口只返回对话模型，语音模型请在控制台复制 ID 后手动填写'
+                    ? 'MiniMax 的模型接口只返回对话模型，请手动填写语音模型 ID'
                     : '供应商没有返回语音模型，请手动填写模型 ID'
                   : '点右上角「从供应商获取」读取该账号可用的模型'
                 : '拉取到的模型都已添加'}
@@ -1373,6 +1377,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           <AudioAvailableModels
             provider={draft.provider}
             models={draft.models}
+            builtinModels={providerDefaults.builtinModels}
             fetchedModels={catalogForDraft?.models ?? []}
             catalogState={catalogForDraft?.state ?? 'idle'}
             catalogMessage={catalogForDraft?.message}
