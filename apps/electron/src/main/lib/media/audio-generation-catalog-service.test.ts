@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { AUDIO_GENERATION_CATALOG_MESSAGES } from '@proma/shared'
+import { AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES, AUDIO_GENERATION_CATALOG_MESSAGES } from '@proma/shared'
 import { AudioGenerationCatalogService, type AudioGenerationCatalogFetch } from './audio-generation-catalog-service'
 
 /** 记录一次上游请求，供断言 URL、方法与请求头。 */
@@ -104,7 +104,7 @@ describe('音频供应商目录拉取', () => {
     expect(result).toEqual({
       requestId: 'fetch-1',
       state: 'failed',
-      message: AUDIO_GENERATION_CATALOG_MESSAGES.failed,
+      message: AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.unauthorized,
       models: [],
       voices: [],
     })
@@ -118,6 +118,8 @@ describe('音频供应商目录拉取', () => {
       fetchImpl: createTextFetchStub('{}', 200),
     })
     expect((await unauthorized.fetch(createInput({ credential: { mode: 'saved', profileId: 'missing' } }))).state).toBe('failed')
+    expect((await unauthorized.fetch(createInput({ credential: { mode: 'saved', profileId: 'missing' } }))).message)
+      .toBe(AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.credential)
 
     /** 永不返回的 fetch 必须被超时终止，而不是挂起设置页。 */
     const hanging = new AudioGenerationCatalogService({
@@ -129,7 +131,7 @@ describe('音频供应商目录拉取', () => {
     })
     const timedOut = await hanging.fetch(createInput())
     expect(timedOut.state).toBe('failed')
-    expect(timedOut.message).toBe(AUDIO_GENERATION_CATALOG_MESSAGES.failed)
+    expect(timedOut.message).toBe(AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.timeout)
   })
 
   test('Given 响应不是 JSON 或缺少模型数组 When 拉取 Then 返回失败而不是抛出', async () => {
@@ -144,5 +146,6 @@ describe('音频供应商目录拉取', () => {
       fetchImpl: createTextFetchStub(JSON.stringify({ unexpected: true }), 200),
     })
     expect((await shapeMismatch.fetch(createInput())).state).toBe('failed')
+    expect((await shapeMismatch.fetch(createInput())).message).toBe(AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.malformed)
   })
 })

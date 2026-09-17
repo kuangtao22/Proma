@@ -898,6 +898,12 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
       setCatalog({ state: 'failed', message: '请先填写服务地址', models: [], voices: [], draftIdentity: identity })
       return
     }
+    /** 新建草稿且未填 Key 时不可能通过供应商鉴权，直接给出可操作提示。 */
+    const savedProfileExists = settingsRef.current?.catalog.profiles.some((profile) => profile.id === currentDraft.id) ?? false
+    if (!currentDraft.apiKey.trim() && !savedProfileExists) {
+      setCatalog({ state: 'failed', message: '请先填写 API Key', models: [], voices: [], draftIdentity: identity })
+      return
+    }
     /** 本次表单填了新 Key 就用草稿凭据，否则用已保存密文。 */
     const draftApiKey = currentDraft.apiKey.trim()
     const credential: AudioGenerationCatalogFetchInput['credential'] = draftApiKey
@@ -1014,10 +1020,12 @@ function AudioEnabledModelList({ models, selectedModelId, disabled, onSelect, on
 }
 
 /** 可用模型：拉取结果点选加入上方，底部保留手填一行。 */
-function AudioAvailableModels({ models, fetchedModels, catalogState, disabled, onChange }: {
+function AudioAvailableModels({ models, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
   models: readonly AudioGenerationModelEntry[]
   fetchedModels: readonly string[]
   catalogState: 'idle' | 'loading' | 'success' | 'failed'
+  /** 失败或提示文案，来自本次拉取结果的固定文案。 */
+  catalogMessage?: string
   disabled: boolean
   onChange: (models: AudioGenerationModelEntry[]) => void
 }): React.ReactElement {
@@ -1062,10 +1070,17 @@ function AudioAvailableModels({ models, fetchedModels, catalogState, disabled, o
         <div className="px-4 py-6 text-center text-sm text-muted-foreground">
           {catalogState === 'loading'
             ? '正在从供应商获取…'
+            : catalogState === 'failed'
+              ? catalogMessage ?? '从供应商获取失败，请检查服务地址与凭据后重试'
             : fetchedModels.length === 0
               ? '点右上角「从供应商获取」读取该账号可用的模型'
               : '拉取到的模型都已添加'}
         </div>
+      )}
+      {catalogState === 'failed' && (
+        <p role="alert" className="border-t border-border/50 px-4 py-2 text-xs text-destructive">
+          {catalogMessage ?? '从供应商获取失败，请检查服务地址与凭据后重试'}
+        </p>
       )}
       <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
         <Input
@@ -1347,6 +1362,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
             models={draft.models}
             fetchedModels={catalogForDraft?.models ?? []}
             catalogState={catalogForDraft?.state ?? 'idle'}
+            catalogMessage={catalogForDraft?.message}
             disabled={actionDisabled}
             onChange={(models) => controller.updateDraft({ ...draft, models })}
           />

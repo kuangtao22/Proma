@@ -11,6 +11,7 @@ import type {
   AudioGenerationVoice,
 } from '@proma/shared'
 import {
+  AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES,
   AUDIO_GENERATION_CATALOG_MESSAGES,
   AUDIO_GENERATION_MODEL_LIMIT,
   AUDIO_GENERATION_PROVIDER_DEFAULTS,
@@ -71,10 +72,18 @@ export class AudioGenerationCatalogService {
   /** 解析输入、按供应商拉取，并返回脱敏结果。 */
   async fetch(value: unknown): Promise<AudioGenerationCatalogFetchResult> {
     const input = parseAudioGenerationCatalogFetchInput(value)
+    /** 分类失败文案；未识别的错误回落到通用文案。 */
+    let failureMessage: string = AUDIO_GENERATION_CATALOG_MESSAGES.failed
     try {
-      const apiKey = input.credential.mode === 'draft'
-        ? input.credential.apiKey
-        : this.store.resolveApiKey(input.credential.profileId)
+      /** 已保存凭据解密失败与上游错误必须区分，便于用户知道改哪里。 */
+      let apiKey: string
+      try {
+        apiKey = input.credential.mode === 'draft'
+          ? input.credential.apiKey
+          : this.store.resolveApiKey(input.credential.profileId)
+      } catch {
+        throw new Error('AUDIO_GENERATION_CATALOG_CREDENTIAL')
+      }
       const collected = await this.collect(input, apiKey)
       return parseAudioGenerationCatalogFetchResult({
         requestId: input.requestId,
@@ -83,15 +92,39 @@ export class AudioGenerationCatalogService {
         models: collected.models,
         voices: collected.voices,
       })
-    } catch {
-      /** 失败只暴露固定文案，避免上游正文或本地路径进入 Renderer。 */
+    } catch (error) {
+      if (error instanceof Error) {
+        failureMessage = AudioGenerationCatalogService.describeFailure(error, failureMessage)
+      }
+      /** 失败只暴露分类固定文案，避免上游正文或本地路径进入 Renderer。 */
       return parseAudioGenerationCatalogFetchResult({
         requestId: input.requestId,
         state: 'failed',
-        message: AUDIO_GENERATION_CATALOG_MESSAGES.failed,
+        message: failureMessage,
         models: [],
         voices: [],
       })
+    }
+  }
+
+  /** 把内部错误码翻译成可公开的固定文案。 */
+  private static describeFailure(error: Error, fallback: string): string {
+    switch (error.message) {
+      case 'AUDIO_GENERATION_CATALOG_CREDENTIAL':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.credential
+      case 'AUDIO_GENERATION_CATALOG_UNAUTHORIZED':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.unauthorized
+      case 'AUDIO_GENERATION_CATALOG_NOT_FOUND':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.notFound
+      case 'AUDIO_GENERATION_CATALOG_TIMEOUT':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.timeout
+      case 'AUDIO_GENERATION_CATALOG_INVALID_RESPONSE':
+      case 'AUDIO_GENERATION_CATALOG_RESPONSE_LIMIT':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.malformed
+      case 'AUDIO_GENERATION_CATALOG_UPSTREAM_STATUS':
+        return AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES.upstream
+      default:
+        return fallback
     }
   }
 
@@ -134,7 +167,19 @@ export class AudioGenerationCatalogService {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeoutMs)
     try {
-      const response = await this.fetchImpl(url, { ...init, signal: controller.signal })
+      /** 超时与取消必须与上游错误区分，便于提示用户检查网络或地址。 */
+      let response: Response
+      try {
+        response = await this.fetchImpl(url, { ...init, signal: controller.signal })
+      } catch {
+        throw new Error(controller.signal.aborted
+          ? 'AUDIO_GENERATION_CATALOG_TIMEOUT'
+          : 'AUDIO_GENERATION_CATALOG_UPSTREAM_STATUS')
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('AUDIO_GENERATION_CATALOG_UNAUTHORIZED')
+      }
+      if (response.status === 404) throw new Error('AUDIO_GENERATION_CATALOG_NOT_FOUND')
       if (!response.ok) throw new Error('AUDIO_GENERATION_CATALOG_UPSTREAM_STATUS')
       const text = await response.text()
       if (Buffer.byteLength(text, 'utf8') > CATALOG_RESPONSE_MAX_BYTES) {

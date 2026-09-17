@@ -201,6 +201,7 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await waitFor(window, `document.querySelector('#audio-group-id')`, 'MiniMax 未显示 Group ID')
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-base-url')?.value`), 'https://api.minimax.cn/v1', 'MiniMax 草稿未自动填入默认服务地址')
   /** 「从供应商获取」必须把模型列表拉进界面，点选后写回模型 ID。 */
+  await fillInput(window, '#audio-api-key', fakeSecret)
   await clickButton(window, '从供应商获取')
   await waitFor(window, `document.body.textContent?.includes('mimo-v2.5-tts-voiceclone')`, '模型列表未渲染到界面')
   await clickRoleButton(window, 'mimo-v2.5-tts-voiceclone')
@@ -212,6 +213,7 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await selectProvider(window, '小米 TTS')
   await waitFor(window, `!document.querySelector('#audio-group-id')`, '切回小米后 Group ID 未隐藏')
   /** 小米声音复刻模型不支持内置音色，界面必须提示并要求音频样本。 */
+  await fillInput(window, '#audio-api-key', fakeSecret)
   await clickButton(window, '从供应商获取')
   await waitFor(window, `document.body.textContent?.includes('mimo-v2.5-tts-voiceclone')`, '小米模型列表未渲染')
   await clickRoleButton(window, 'mimo-v2.5-tts-voiceclone')

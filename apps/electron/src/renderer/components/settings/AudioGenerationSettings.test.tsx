@@ -354,6 +354,8 @@ describe('AudioGenerationSettings', () => {
     try {
       await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
       act(() => requireController(controller).startCreate())
+      /** 填了 Key 才会真正走供应商请求，失败态才有意义。 */
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'draft-key' }))
       await act(async () => { await requireController(controller).fetchCatalog() })
       expect(requireController(controller).catalog).toMatchObject({
         state: 'failed',
@@ -361,6 +363,20 @@ describe('AudioGenerationSettings', () => {
         voices: [],
       })
       expect(requireController(controller).catalog?.message).toBe('从供应商获取失败，请检查服务地址与凭据')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 新建草稿尚未填写 Key When 从供应商获取 Then 不发请求并提示先填 Key', async () => {
+    const api = createApi()
+    let controller: AudioGenerationController | null = null
+    const host = createControllerRoot()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      expect(api.catalogFetches).toEqual([])
+      expect(requireController(controller).catalog?.state).toBe('failed')
+      expect(requireController(controller).catalog?.message).toBe('请先填写 API Key')
     } finally { act(() => host.unmount()); host.restore() }
   })
 

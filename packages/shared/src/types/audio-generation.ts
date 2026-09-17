@@ -147,6 +147,16 @@ export const AUDIO_GENERATION_CATALOG_MESSAGES = {
   failed: '从供应商获取失败，请检查服务地址与凭据',
 } as const
 
+/** 拉取失败的分类固定文案；按原因给可操作提示，但不携带上游正文。 */
+export const AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES = {
+  credential: '凭据不可用，请重新填写 API Key',
+  unauthorized: '鉴权失败，请检查 API Key',
+  notFound: '服务地址不正确，未找到模型接口',
+  upstream: '供应商返回错误状态，请稍后重试',
+  timeout: '请求超时，请检查网络或服务地址',
+  malformed: '供应商返回格式无法识别',
+} as const
+
 /** 单次拉取允许返回的模型数量上限。 */
 export const AUDIO_GENERATION_MODEL_LIMIT = 200
 
@@ -585,7 +595,16 @@ function parsePublicMessage(state: AudioGenerationTestState, value: unknown): st
 function parseCatalogMessage(state: 'success' | 'failed', value: unknown): string {
   /** 已执行原始长度限制和空白清洗的候选拉取消息。 */
   const message = parseRequiredText(value, AUDIO_GENERATION_MESSAGE_MAX_LENGTH)
-  if (message !== AUDIO_GENERATION_CATALOG_MESSAGES[state]) {
+  if (state === 'success') {
+    if (message !== AUDIO_GENERATION_CATALOG_MESSAGES.success) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    return message
+  }
+  /** 失败文案只允许通用文案或已声明的分类文案。 */
+  const allowedFailures: readonly string[] = [
+    AUDIO_GENERATION_CATALOG_MESSAGES.failed,
+    ...Object.values(AUDIO_GENERATION_CATALOG_FAILURE_MESSAGES),
+  ]
+  if (!allowedFailures.includes(message)) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
   return message
