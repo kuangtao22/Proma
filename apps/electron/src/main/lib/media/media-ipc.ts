@@ -3,6 +3,10 @@ import {
   AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_LEGACY_WARNING,
   MEDIA_IPC_CHANNELS,
+  parseImageGenerationCatalogFetchInput,
+  parseImageGenerationCatalogFetchResult,
+  parseImageGenerationSettingsResult,
+  parseReplaceImageGenerationCatalogRequest,
   parseAudioGenerationCatalogFetchInput,
   parseAudioGenerationCatalogFetchResult,
   parseAudioGenerationSettingsResult,
@@ -35,6 +39,8 @@ import type {
 import type { AudioGenerationConfigStore } from './audio-generation-config-store'
 import type { AudioGenerationTestService } from './audio-generation-test-service'
 import type { AudioGenerationCatalogService } from './audio-generation-catalog-service'
+import type { ImageGenerationIpcService } from './image-generation-ipc'
+import { throwStableImageError } from './image-generation-ipc'
 import type { MediaConfigStore } from './media-config-store'
 import type { MediaResourceService } from './media-resource-service'
 import { detectMediaFileSignature } from './media-file-probe'
@@ -194,6 +200,7 @@ export interface MediaIpcOptions {
     & { getSchema?: (connectionId: string, projectId: string, classTypes: string[]) => Promise<ComfyObjectInfo> }
     & Partial<Pick<MediaResourceService, 'readRemoteAsset'>>
   audioGeneration: AudioGenerationIpcService
+  imageGeneration: ImageGenerationIpcService
   /** 主进程保留原始异常用于排障，调用方不得把认证对象放入 message。 */
   onBackgroundError?(message: string, error: unknown): void
   importLocalAsset?(event: IpcMainInvokeEvent, projectId: string, kind: MediaKind): Promise<MediaAssetRecord | null>
@@ -290,6 +297,34 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
       return parseAudioGenerationSettingsResult(options.audioGeneration.replace(input))
     } catch (error) {
       throwStableAudioError(error, 'AUDIO_GENERATION_CONFIG_WRITE_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.GET_IMAGE_GENERATION_SETTINGS, (value) => {
+    assertNoInput(value)
+    try {
+      return parseImageGenerationSettingsResult(options.imageGeneration.listSettings())
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_CONFIG_READ_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.REPLACE_IMAGE_GENERATION_CATALOG, (value) => {
+    const input = parseReplaceImageGenerationCatalogRequest(value)
+    try {
+      return parseImageGenerationSettingsResult(options.imageGeneration.replace(input))
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_CONFIG_WRITE_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.FETCH_IMAGE_GENERATION_CATALOG, async (value, event) => {
+    const input = parseImageGenerationCatalogFetchInput(value)
+    try {
+      const result = parseImageGenerationCatalogFetchResult(await options.imageGeneration.fetchCatalog(input))
+      /** 拉取结束后再次核权，销毁或撤权窗口不能收到迟到结果。 */
+      if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
+      return result
+    } catch (error) {
+      if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
+      throwStableImageError(error, 'IMAGE_GENERATION_CATALOG_FAILED')
     }
   })
   handle(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, async (value, event) => {

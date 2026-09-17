@@ -456,6 +456,10 @@ import type { AudioGenerationIpcService } from './lib/media/media-ipc'
 import { AudioGenerationConfigStore } from './lib/media/audio-generation-config-store'
 import { AudioGenerationTestService } from './lib/media/audio-generation-test-service'
 import { AudioGenerationCatalogService } from './lib/media/audio-generation-catalog-service'
+import { ImageGenerationConfigStore } from './lib/media/image-generation-config-store'
+import { ImageGenerationCatalogService } from './lib/media/image-generation-catalog-service'
+import { createImageGenerationIpcService } from './lib/media/image-generation-ipc'
+import type { ImageGenerationIpcService } from './lib/media/image-generation-ipc'
 import { MediaRunService } from './lib/media/media-run-service'
 import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
 import { MediaDesignAssets } from './lib/media/media-design-assets'
@@ -503,7 +507,7 @@ import { resolvePathAgainstAgentCwd } from './lib/agent-file-path'
 import { getLocalProjectRootStatusSync } from './lib/project-root-health'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, getAudioGenerationProfilesPath, resolveAttachmentPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, getImageGenerationProfilesPath, getAudioGenerationProfilesPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -673,6 +677,12 @@ let audioGenerationStore: AudioGenerationConfigStore | undefined
 let audioGenerationTests: AudioGenerationTestService | undefined
 /** 进程级唯一的供应商目录拉取服务，凭据只在 Main 内解析。 */
 let audioGenerationCatalog: AudioGenerationCatalogService | undefined
+/** 独立生图目录延迟到 IPC 装配阶段创建，避免模块加载阶段触碰文件系统。 */
+let imageGenerationStore: ImageGenerationConfigStore | undefined
+/** 生图供应商目录拉取服务，与连接测试共用同一实现。 */
+let imageGenerationCatalog: ImageGenerationCatalogService | undefined
+/** Media IPC 共享的独立生图组合服务。 */
+let imageGenerationIpcService: ImageGenerationIpcService | undefined
 /** Media IPC 共享的独立音频组合服务，旧目录只读投影不建立第二写入口。 */
 let audioGenerationIpcService: AudioGenerationIpcService | undefined
 
@@ -702,6 +712,29 @@ function getAudioGenerationTests(): AudioGenerationTestService {
 /** 返回与唯一 Store 绑定的目录拉取服务，草稿凭据只在本进程内存中存在。 */
 function getAudioGenerationCatalog(): AudioGenerationCatalogService {
   return audioGenerationCatalog ??= new AudioGenerationCatalogService({ store: getAudioGenerationStore() })
+}
+
+/** 返回进程级唯一生图 Store，凭据只在 Main 内由 safeStorage 处理。 */
+function getImageGenerationStore(): ImageGenerationConfigStore {
+  return imageGenerationStore ??= new ImageGenerationConfigStore({
+    configPath: getImageGenerationProfilesPath(),
+    secureStorage: safeStorage,
+    platform: process.platform,
+  })
+}
+
+/** 返回与唯一生图 Store 绑定的目录服务，凭据解析与 CLI 探测都在主进程。 */
+function getImageGenerationCatalog(): ImageGenerationCatalogService {
+  return imageGenerationCatalog ??= new ImageGenerationCatalogService({ store: getImageGenerationStore() })
+}
+
+/** 返回进程级唯一生图 IPC 服务，旧统一媒体目录始终只读。 */
+function getImageGenerationIpcService(): ImageGenerationIpcService {
+  return imageGenerationIpcService ??= createImageGenerationIpcService({
+    store: getImageGenerationStore(),
+    catalog: getImageGenerationCatalog(),
+    listLegacyCatalog: () => getDesignImageModelServices().imageModels.listMediaApiCatalog(),
+  })
 }
 
 /** 返回进程级唯一音频 IPC 服务，旧统一媒体目录始终只读。 */
@@ -2103,6 +2136,7 @@ export function registerIpcHandlers(): void {
     configuration: getMediaConfiguration(),
     resources: mediaResources,
     audioGeneration: getAudioGenerationIpcService(),
+    imageGeneration: getImageGenerationIpcService(),
     onBackgroundError: (message, error) => console.error(message, error),
     listAssets: (projectId) => mediaAssets.list(projectId),
     readAssetThumbnail: async (projectId, asset) => mediaAssetThumbnails.read(projectId, asset),

@@ -4,6 +4,7 @@ import { AUDIO_GENERATION_CATALOG_MESSAGES, AUDIO_GENERATION_LEGACY_WARNING, AUD
 import type { AudioGenerationCatalogFetchInput, AudioGenerationPublicCatalog, AudioGenerationSettingsResult, AudioGenerationTestInput, AudioGenerationTestResult, MediaApiModelCatalogEntry, ReplaceAudioGenerationCatalogRequest } from '@proma/shared'
 import { createAudioGenerationIpcService, registerMediaIpcHandlers as registerProductionMediaIpcHandlers } from './media-ipc'
 import type { AudioGenerationIpcService, MediaIpcOptions } from './media-ipc'
+import type { ImageGenerationIpcService } from './image-generation-ipc'
 import { EventEmitter } from 'node:events'
 import type { MediaRunEvent } from '@proma/shared'
 
@@ -30,6 +31,16 @@ function createAudioCatalog(profiles: AudioGenerationPublicCatalog['profiles'] =
 }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
+const unusedImageCatalogFetch = async (): Promise<never> => { throw new Error('unused') }
+
+/** 既有媒体 IPC 用例无需关心生图调用，统一注入无副作用服务。 */
+const unusedImageGenerationService: ImageGenerationIpcService = {
+  listSettings: () => ({ catalog: { schemaVersion: 1, revision: 0, profiles: [] }, legacyImageProfiles: [] }),
+  replace: () => ({ catalog: { schemaVersion: 1, revision: 0, profiles: [] }, legacyImageProfiles: [] }),
+  fetchCatalog: unusedImageCatalogFetch,
+}
+
+/** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
 const unusedAudioCatalogFetch = async (): Promise<never> => { throw new Error('unused') }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
@@ -42,9 +53,16 @@ const unusedAudioGenerationService: AudioGenerationIpcService = {
   releaseOwner: () => undefined,
 }
 
-/** 测试适配器为既有用例补齐音频依赖，生产注册函数仍保持必填约束。 */
-function registerMediaIpcHandlers(options: Omit<MediaIpcOptions, 'audioGeneration'> & { audioGeneration?: AudioGenerationIpcService }): ReturnType<typeof registerProductionMediaIpcHandlers> {
-  return registerProductionMediaIpcHandlers({ ...options, audioGeneration: options.audioGeneration ?? unusedAudioGenerationService })
+/** 测试适配器为既有用例补齐音频与生图依赖，生产注册函数仍保持必填约束。 */
+function registerMediaIpcHandlers(options: Omit<MediaIpcOptions, 'audioGeneration' | 'imageGeneration'> & {
+  audioGeneration?: AudioGenerationIpcService
+  imageGeneration?: ImageGenerationIpcService
+}): ReturnType<typeof registerProductionMediaIpcHandlers> {
+  return registerProductionMediaIpcHandlers({
+    ...options,
+    audioGeneration: options.audioGeneration ?? unusedAudioGenerationService,
+    imageGeneration: options.imageGeneration ?? unusedImageGenerationService,
+  })
 }
 
 /** 为音频 IPC 测试补齐既有媒体服务依赖，保持断言聚焦新增合同。 */
@@ -56,6 +74,7 @@ function createMediaOptions(
   return {
     ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
     isAuthorizedSender,
+    imageGeneration: unusedImageGenerationService,
     assertProject: () => undefined,
     configuration: {
       read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
