@@ -208,10 +208,12 @@ describe('AudioGenerationSettings', () => {
     expect(xiaomi).toMatchObject({
       provider: 'xiaomi',
       baseUrl: 'https://api.xiaomimimo.com/v1',
-      models: [{ id: 'mimo-v2.5-tts', voices: [] }],
       apiKey: '',
       credentialConfigured: false,
     })
+    /** 默认模型直接带出官方内置音色，用户不需要逐条添加。 */
+    expect(xiaomi.models[0]?.id).toBe('mimo-v2.5-tts')
+    expect(xiaomi.models[0]?.voices.length).toBe(9)
     expect('groupId' in xiaomi).toBeFalse()
     expect(xiaomi.legacyMediaProfileId).toBeUndefined()
     const minimax = changeAudioGenerationProvider(xiaomi, 'minimax')
@@ -263,7 +265,7 @@ describe('AudioGenerationSettings', () => {
     expect(JSON.stringify(copied)).not.toContain('must-not-copy')
   })
 
-  test('Given 含音色的草稿 When 渲染表单 Then 展示已启用音色列表与手填添加行', () => {
+  test('Given 含音色的草稿 When 渲染表单 Then 展示已启用音色且不再提供手填音色', () => {
     const settings = createSettings()
     const common = {
       settings, loading: false, saving: false, needsReload: false, generationEntryCount: 0, pendingCancellationCount: 0, loadError: null, actionError: null, query: '', deleteId: null, testStates: {}, visibleProfiles: settings.catalog.profiles,
@@ -277,8 +279,9 @@ describe('AudioGenerationSettings', () => {
     expect(html).toContain('1 个音色')
     expect(html).toContain('小米旁白音色')
     expect(html).toContain('移除音色 小米旁白音色')
-    expect(html).toContain('添加音色')
-    expect(html).toContain('显示名称（可选）')
+    /** 音色改为随模型自动带出，界面不再提供手填入口。 */
+    expect(html).not.toContain('添加音色')
+    expect(html).not.toContain('显示名称（可选）')
   })
 
   test('Given MiniMax 草稿 When 未拉取 Then 可用模型显示官方内置语音模型', () => {
@@ -330,7 +333,8 @@ describe('AudioGenerationSettings', () => {
     expect(html).toContain('可用模型')
     expect(html).toContain('从供应商获取')
     expect(html).toContain('mimo-v2.5-tts-voiceclone')
-    expect(html).toContain('远端音色')
+    /** 拉到的账号音色不再逐条点选，而是提示会在加入模型时自动带出。 */
+    expect(html).toContain('个音色未加入，重新添加该模型即可全部带出')
 
     /** 切到声音复刻模型后，内置音色与手填行都不应出现。 */
     const cloneHtml = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
@@ -362,6 +366,9 @@ describe('AudioGenerationSettings', () => {
       expect(api.catalogFetches.at(-1)?.credential).toEqual({ mode: 'draft', apiKey: 'draft-key' })
       expect(requireController(controller).catalog?.models).toEqual(['mimo-v2.5-tts'])
       expect(requireController(controller).catalog?.voices).toEqual([{ id: 'remote-1', name: '远端音色', source: 'remote' }])
+      /** 默认模型已自动带上官方内置音色，拉取结果不会覆盖它。 */
+      expect(requireController(controller).draft?.models[0]?.voices.length).toBeGreaterThan(0)
+      expect(requireController(controller).draft?.models[0]?.voices[0]?.source).toBe('builtin')
 
       /** 已保存配置未填新 Key 时必须改用已保存密文，不能让界面发空凭据。 */
       act(() => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))

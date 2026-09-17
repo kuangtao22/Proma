@@ -83,6 +83,22 @@ export function resolveVoiceCapability(provider: AudioGenerationProvider, modelI
   return 'voice-id'
 }
 
+/**
+ * 供应商默认模型条目。
+ * 入参：供应商；返回值：初始模型数组（可能为空）。
+ * 默认模型支持音色 ID 时直接带出官方内置音色，用户无需逐条添加。
+ */
+export function initialModelsForProvider(provider: AudioGenerationProvider): AudioGenerationModelEntry[] {
+  const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[provider]
+  if (!defaults.modelId) return []
+  return [{
+    id: defaults.modelId,
+    voices: resolveVoiceCapability(provider, defaults.modelId) === 'voice-id'
+      ? defaults.builtinVoices.map((voice) => ({ ...voice }))
+      : [],
+  }]
+}
+
 /** 单条配置的本地测试代次，不包含 API Key 或其派生值。 */
 interface AudioGenerationTestGeneration {
   testGeneration: number
@@ -200,8 +216,8 @@ export function changeAudioGenerationProvider(
     enabled: draft.enabled,
     createdAt: draft.createdAt,
     updatedAt: draft.updatedAt,
-    /** 切换供应商后保留一个默认模型条目，用户可再按需扩充。 */
-    models: defaults.modelId ? [{ id: defaults.modelId, voices: [] }] : [],
+    /** 切换供应商后保留一个默认模型条目，并直接带出该模型的音色。 */
+    models: initialModelsForProvider(provider),
     apiKey: '',
     credentialConfigured: false,
   }
@@ -636,7 +652,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     setActionError(null)
     /** 新建配置直接带入小米官方默认端与默认模型。 */
     const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi
-    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: defaults.baseUrl, models: [{ id: defaults.modelId, voices: [] }], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
+    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: defaults.baseUrl, models: initialModelsForProvider('xiaomi'), enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 编辑已保存配置但不读取旧 Key。 */
@@ -929,6 +945,16 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
         voices: result.voices,
         draftIdentity: identity,
       })
+      /** 拉到的账号音色直接补齐没有音色的模型，避免再让用户逐个添加。 */
+      if (result.state === 'success' && result.voices.length > 0) {
+        const latest = draftRef.current ?? currentDraft
+        const filled = latest.models.map((model) => (model.voices.length > 0
+          || resolveVoiceCapability(latest.provider, model.id) !== 'voice-id'
+          ? model
+          : { ...model, voices: result.voices.map((voice) => ({ ...voice })) }))
+        const changed = filled.some((model, index) => model !== latest.models[index])
+        if (changed) publishDraft({ ...latest, models: filled })
+      }
     } catch {
       if (!mountedRef.current || catalogIdentity(draftRef.current ?? currentDraft) !== identity) return
       setCatalog({ state: 'failed', message: '从供应商获取失败，请检查服务地址与凭据', models: [], voices: [], draftIdentity: identity })
@@ -1021,7 +1047,7 @@ function AudioEnabledModelList({ models, selectedModelId, disabled, onSelect, on
 }
 
 /** 可用模型：拉取结果点选加入上方，底部保留手填一行。 */
-function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, catalogState, catalogMessage, disabled, onChange }: {
+function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, catalogState, catalogMessage, disabled, onAddModel }: {
   /** 当前供应商，用于区分「端点不含语音模型」的说明文案。 */
   provider: AudioGenerationProvider
   models: readonly AudioGenerationModelEntry[]
@@ -1032,7 +1058,8 @@ function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, 
   /** 失败或提示文案，来自本次拉取结果的固定文案。 */
   catalogMessage?: string
   disabled: boolean
-  onChange: (models: AudioGenerationModelEntry[]) => void
+  /** 添加模型；音色由调用方按模型语义自动带出。 */
+  onAddModel: (modelId: string) => void
 }): React.ReactElement {
   /** 待添加的模型 ID 与就地错误提示。 */
   const [pendingId, setPendingId] = React.useState('')
@@ -1043,7 +1070,7 @@ function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, 
   const candidates = [...builtinModels, ...fetchedModels].filter((id, index, all) => all.indexOf(id) === index)
   const available = candidates.filter((id) => !enabledIds.has(id))
 
-  /** 追加一个模型条目（音色留空，随后按模型维护）。 */
+  /** 追加一个模型条目；重复或空值就地拒绝。 */
   const appendModel = (id: string): void => {
     const trimmed = id.trim()
     if (!trimmed) {
@@ -1054,7 +1081,7 @@ function AudioAvailableModels({ provider, models, builtinModels, fetchedModels, 
       setAddError('该模型已添加')
       return
     }
-    onChange([...models, { id: trimmed, voices: [] }])
+    onAddModel(trimmed)
     setAddError('')
   }
 
@@ -1174,27 +1201,13 @@ function AudioAvailableVoices({ provider, voices, builtinVoices, fetchedVoices, 
   disabled: boolean
   onChange: (voices: AudioGenerationVoice[]) => void
 }): React.ReactElement {
-  /** 待添加的音色 ID 与可选显示名称。 */
-  const [pendingId, setPendingId] = React.useState('')
-  const [pendingName, setPendingName] = React.useState('')
-  /** 重复或空输入时的就地提示。 */
-  const [addError, setAddError] = React.useState('')
   /** 已启用音色按 id 去重，决定内置清单里还剩哪些可添加。 */
   const enabledIds = new Set(voices.map((voice) => voice.id))
   /** 内置与供应商拉取结果合并后去重，顺序保持内置优先。 */
   const candidates = [...builtinVoices, ...fetchedVoices].filter((voice, index, all) =>
     all.findIndex((entry) => entry.id === voice.id) === index)
-  const availableBuiltins = candidates.filter((voice) => !enabledIds.has(voice.id))
-
-  /** 追加一条已启用音色，重复 id 就地拒绝。 */
-  const appendVoice = (voice: AudioGenerationVoice): void => {
-    if (enabledIds.has(voice.id)) {
-      setAddError('该音色已添加')
-      return
-    }
-    onChange([...voices, voice])
-    setAddError('')
-  }
+  /** 仍未加入当前模型的候选音色；音色由加模型时自动带出，这里只做补充说明。 */
+  const pendingVoices = candidates.filter((voice) => !enabledIds.has(voice.id))
 
   return (
     <SettingsCard divided={false}>
@@ -1208,55 +1221,18 @@ function AudioAvailableVoices({ provider, voices, builtinVoices, fetchedVoices, 
           当前模型是音色设计：请求不传 `voice` 字段，音色由文本描述生成，因此这里不需要选择音色。
         </div>
       )}
-      {availableBuiltins.map((voice) => (
-        <div
-          key={voice.id}
-          role="button"
-          tabIndex={0}
-          onClick={() => appendVoice(voice)}
-          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); appendVoice(voice) } }}
-          className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
-        >
-          <Plus size={14} className="shrink-0 text-muted-foreground" />
-          <span className="flex-1 text-sm text-foreground">{voice.name ?? voice.id}</span>
-        </div>
-      ))}
       {capability === 'voice-id' && candidates.length === 0 && (
         <div className="px-4 py-6 text-center text-sm text-muted-foreground">
           {provider === 'minimax'
-            ? '点右上角「从供应商获取」读取该账号的音色，也可在下方手填'
-            : '点右上角「从供应商获取」读取音色，也可在下方手填'}
+            ? '点右上角「从供应商获取」读取该账号音色，加入模型时会自动带上'
+            : '暂无可用音色，请先确认模型是否支持内置音色'}
         </div>
       )}
-      {builtinVoices.length > 0 && availableBuiltins.length === 0 && (
-        <div className="px-4 py-6 text-center text-sm text-muted-foreground">所有内置音色已启用</div>
+      {capability === 'voice-id' && pendingVoices.length > 0 && (
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+          {pendingVoices.length} 个音色未加入，重新添加该模型即可全部带出
+        </div>
       )}
-      {capability === 'voice-id' && <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
-        <Input id="audio-voice-id" aria-label="音色 ID" className="h-8 flex-1 text-sm" placeholder="音色 ID" value={pendingId} disabled={disabled} onChange={(event) => setPendingId(event.target.value)} />
-        <Input id="audio-voice-name" aria-label="显示名称（可选）" className="h-8 flex-1 text-sm" placeholder="显示名称（可选）" value={pendingName} disabled={disabled} onChange={(event) => setPendingName(event.target.value)} />
-        <Button
-          type="button"
-          size="icon-sm"
-          variant="ghost"
-          aria-label="添加音色"
-          title="添加音色"
-          disabled={disabled}
-          onClick={() => {
-            const id = pendingId.trim()
-            if (!id) {
-              setAddError('请输入音色 ID')
-              return
-            }
-            const name = pendingName.trim()
-            appendVoice(name ? { id, name, source: 'manual' } : { id, source: 'manual' })
-            setPendingId('')
-            setPendingName('')
-          }}
-        >
-          <Plus />
-        </Button>
-      </div>}
-      {addError && <p role="alert" className="px-4 pb-3 text-xs text-destructive">{addError}</p>}
     </SettingsCard>
   )
 }
@@ -1309,6 +1285,14 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
     }
     /** 只展示属于当前草稿身份的拉取结果。 */
     const catalogForDraft = controller.catalog?.draftIdentity === catalogIdentity(draft) ? controller.catalog : null
+    /** 新加入模型时自动带出的音色：小米用官方内置清单，MiniMax 用已拉取的账号音色。 */
+    const defaultVoicesForModel = (modelId: string): AudioGenerationVoice[] => {
+      if (resolveVoiceCapability(draft.provider, modelId) !== 'voice-id') return []
+      if (draft.provider === 'xiaomi') {
+        return AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi.builtinVoices.map((voice) => ({ ...voice }))
+      }
+      return (catalogForDraft?.voices ?? []).map((voice) => ({ ...voice }))
+    }
     return (
       <MediaSettingsPage title={editTitle(draft, settings)} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
         <SettingsSection title="基本信息">
@@ -1391,7 +1375,13 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
             catalogState={catalogForDraft?.state ?? 'idle'}
             catalogMessage={catalogForDraft?.message}
             disabled={actionDisabled}
-            onChange={(models) => controller.updateDraft({ ...draft, models })}
+            onAddModel={(modelId) => {
+              if (draft.models.some((model) => model.id === modelId)) return
+              controller.updateDraft({
+                ...draft,
+                models: [...draft.models, { id: modelId, voices: defaultVoicesForModel(modelId) }],
+              })
+            }}
           />
         </SettingsSection>
 

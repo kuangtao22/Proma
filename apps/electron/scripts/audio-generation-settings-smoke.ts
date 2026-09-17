@@ -206,10 +206,12 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await waitFor(window, `document.body.textContent?.includes('mimo-v2.5-tts-voiceclone')`, '模型列表未渲染到界面')
   await clickRoleButton(window, 'mimo-v2.5-tts-voiceclone')
   await waitFor(window, `document.querySelector('button[aria-label="查看 mimo-v2.5-tts-voiceclone 的音色"]') !== null`, '点选模型未加入已启用模型')
-  /** 同一批拉取里的远端音色必须可以直接加入已启用音色。 */
-  await waitFor(window, `document.body.textContent?.includes('远端 smoke 音色')`, '远端音色未渲染到可用音色')
-  await clickRoleButton(window, '远端 smoke 音色')
-  await waitFor(window, `document.querySelector('button[aria-label="移除音色 远端 smoke 音色"]') !== null`, '远端音色未加入已启用音色')
+  /** 新加入的模型必须自动带上刚拉到的账号音色，不需要逐个添加。 */
+  await waitFor(
+    window,
+    `document.querySelector('button[aria-label="查看 mimo-v2.5-tts-voiceclone 的音色"]')?.textContent?.includes('1 个音色')`,
+    '新模型未自动带上账号音色',
+  )
   await selectProvider(window, '小米 TTS')
   await waitFor(window, `!document.querySelector('#audio-group-id')`, '切回小米后 Group ID 未隐藏')
   /** 小米声音复刻模型不支持内置音色，界面必须提示并要求音频样本。 */
@@ -222,6 +224,9 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await waitFor(window, `document.body.textContent?.includes('归属模型 mimo-v2.5-tts-voiceclone')`, '选中模型未切换到复刻模型')
   await waitFor(window, `document.body.textContent?.includes('音频样本的 base64')`, '声音复刻模型未提示音色样本要求')
   assert.equal(await window.webContents.executeJavaScript(`document.body.textContent?.includes('MiMo-默认')`), false, '声音复刻模型仍展示内置音色')
+  /** 内置音色模型必须自动带上全部音色，而不是让用户逐条添加。 */
+  await clickAriaLabel(window, '查看 mimo-v2.5-tts 的音色')
+  await waitFor(window, `document.querySelector('button[aria-label="查看 mimo-v2.5-tts 的音色"]')?.textContent?.includes('9 个音色')`, '内置音色模型未自动带上音色')
   await clickButton(window, '取消')
   await waitFor(window, `document.querySelector('button[aria-label="编辑 小米配音测试"]')`, '取消草稿后未返回音频配置列表')
 }
@@ -236,9 +241,8 @@ async function verifyCredentialPayloads(window: BrowserWindow, screenshotDir: st
     document.body.textContent?.includes('已启用音色')
       && document.body.textContent?.includes('小米 smoke 音色')
       && document.querySelector('button[aria-label="移除音色 小米 smoke 音色"]')
-      && document.querySelector('#audio-voice-id')
-      && !document.querySelector('button[aria-label="音色 ID"]')
-  )`), true, '编辑表单未渲染音色列表编辑器')
+      && !document.querySelector('#audio-voice-id')
+  )`), true, '编辑表单未渲染已启用音色列表')
   await captureScreenshot(window, join(screenshotDir, `audio-generation-settings-${label}-draft.png`), `${label} 编辑表单`)
   await clickButton(window, '保存')
   await waitFor(window, `window.__audioGenerationSmoke.getSnapshot().replacePayloads.length === 1 && document.body.textContent?.includes('小米配音测试')`, '编辑保存未完成')
