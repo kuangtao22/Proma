@@ -1,8 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES,
+  IMAGE_GENERATION_CATALOG_MESSAGES,
   IMAGE_GENERATION_LEGACY_WARNING,
   IMAGE_GENERATION_PROVIDER_DEFAULTS,
   IMAGE_GENERATION_PROVIDER_DESCRIPTORS,
+  parseImageGenerationCatalogFetchInput,
+  parseImageGenerationCatalogFetchResult,
   parseImageGenerationProfile,
   parseImageGenerationSettingsResult,
   parseReplaceImageGenerationCatalogRequest,
@@ -141,5 +145,60 @@ describe('独立生图生成 Shared 合同', () => {
       catalog: { schemaVersion: 1, revision: 0, profiles: [] },
       legacyImageProfiles: [{ id: 'legacy-2', name: '旧', protocol: 'minimax-image', modelId: 'm', enabled: true }],
     })).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+  })
+
+  test('Given 拉取请求 When 解析 Then 即梦只能用 none 且禁止服务地址', () => {
+    expect(parseImageGenerationCatalogFetchInput({
+      requestId: 'fetch-1',
+      provider: 'dreamina',
+      credential: { mode: 'none' },
+    })).toEqual({ requestId: 'fetch-1', provider: 'dreamina', credential: { mode: 'none' } })
+    expect(parseImageGenerationCatalogFetchInput({
+      requestId: 'fetch-2',
+      provider: 'minimax',
+      baseUrl: 'https://api.minimax.cn/v1//',
+      groupId: ' group-1 ',
+      credential: { mode: 'draft', apiKey: ' secret ' },
+    })).toEqual({
+      requestId: 'fetch-2',
+      provider: 'minimax',
+      baseUrl: 'https://api.minimax.cn/v1',
+      groupId: 'group-1',
+      credential: { mode: 'draft', apiKey: 'secret' },
+    })
+    for (const invalid of [
+      { requestId: 'f', provider: 'dreamina', baseUrl: 'https://x.example/v1', credential: { mode: 'none' } },
+      { requestId: 'f', provider: 'dreamina', credential: { mode: 'draft', apiKey: 'k' } },
+      { requestId: 'f', provider: 'openai-images', baseUrl: 'https://api.openai.com/v1', groupId: 'g', credential: { mode: 'saved', profileId: 'p' } },
+      { requestId: 'f', provider: 'minimax', baseUrl: 'https://api.minimax.cn/v1', credential: { mode: 'none' } },
+    ]) {
+      expect(() => parseImageGenerationCatalogFetchInput(invalid)).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    /** 密钥型供应商缺少服务地址时使用地址错误码，便于界面区分。 */
+    expect(() => parseImageGenerationCatalogFetchInput({
+      requestId: 'f', provider: 'openai-images', credential: { mode: 'saved', profileId: 'p' },
+    })).toThrow('IMAGE_GENERATION_URL_INVALID')
+  })
+
+  test('Given 拉取结果 When 解析 Then 只接受固定文案且模型清单可空', () => {
+    expect(parseImageGenerationCatalogFetchResult({
+      requestId: 'fetch-1',
+      state: 'success',
+      message: IMAGE_GENERATION_CATALOG_MESSAGES.success,
+      models: [{ id: 'gpt-image-1', capabilities: ['text-to-image'] }],
+    })).toMatchObject({ state: 'success' })
+    expect(parseImageGenerationCatalogFetchResult({
+      requestId: 'fetch-1',
+      state: 'failed',
+      message: IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.cliNotLoggedIn,
+      models: [],
+    }).models).toEqual([])
+    for (const invalid of [
+      { requestId: 'f', state: 'success', message: 'upstream said no', models: [] },
+      { requestId: 'f', state: 'failed', message: IMAGE_GENERATION_CATALOG_MESSAGES.failed, models: [{ id: 'dup', capabilities: ['text-to-image'] }, { id: 'dup', capabilities: ['text-to-image'] }] },
+      { requestId: 'f', state: 'success', message: IMAGE_GENERATION_CATALOG_MESSAGES.success, models: [{ id: 'm', capabilities: [] }] },
+    ]) {
+      expect(() => parseImageGenerationCatalogFetchResult(invalid)).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+    }
   })
 })

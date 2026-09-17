@@ -295,8 +295,10 @@ function parseModelEntry(value: unknown): ImageGenerationModelEntry {
 }
 
 /** 严格解析已启用模型列表：至少一条、ID 唯一、能力合法。 */
-export function parseImageGenerationModelList(value: unknown): ImageGenerationModelEntry[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > IMAGE_PROVIDER_MODEL_LIMIT) {
+function parseModelItems(value: unknown, requireAtLeastOne: boolean): ImageGenerationModelEntry[] {
+  if (!Array.isArray(value)
+    || value.length < (requireAtLeastOne ? 1 : 0)
+    || value.length > IMAGE_PROVIDER_MODEL_LIMIT) {
     throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
   }
   /** 已出现的模型 ID，用于拒绝同一配置内的重复模型。 */
@@ -308,6 +310,57 @@ export function parseImageGenerationModelList(value: unknown): ImageGenerationMo
     return entry
   })
 }
+
+/** 严格解析已启用模型列表：至少一条、ID 唯一、能力合法。 */
+export function parseImageGenerationModelList(value: unknown): ImageGenerationModelEntry[] {
+  return parseModelItems(value, true)
+}
+
+/** 解析供应商返回的模型清单，允许为空（例如端点只登记对话模型）。 */
+export function parseImageGenerationCatalogModels(value: unknown): ImageGenerationModelEntry[] {
+  return parseModelItems(value, false)
+}
+
+/** 拉取可用模型时的凭据来源；即梦没有密钥，使用 none。 */
+export type ImageGenerationCatalogCredential =
+  | { mode: 'saved'; profileId: string }
+  | { mode: 'draft'; apiKey: string }
+  | { mode: 'none' }
+
+/** 从供应商拉取可用模型（同时也是连接测试）的输入。 */
+export interface ImageGenerationCatalogFetchInput {
+  requestId: string
+  provider: ImageGenerationProvider
+  baseUrl?: string
+  groupId?: string
+  credential: ImageGenerationCatalogCredential
+}
+
+/** 拉取结果的公开形态，不含上游正文、路径或凭据。 */
+export interface ImageGenerationCatalogFetchResult {
+  requestId: string
+  state: 'success' | 'failed'
+  message: string
+  models: ImageGenerationModelEntry[]
+}
+
+/** 拉取结果唯一允许公开的固定文案。 */
+export const IMAGE_GENERATION_CATALOG_MESSAGES = {
+  success: '已从供应商获取可用生图模型',
+  failed: '从供应商获取失败，请检查服务地址与凭据',
+} as const
+
+/** 拉取失败的分类固定文案；按原因给可操作提示，但不携带上游正文。 */
+export const IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES = {
+  credential: '凭据不可用，请重新填写 API Key',
+  unauthorized: '鉴权失败，请检查 API Key',
+  notFound: '服务地址不正确，未找到模型接口',
+  upstream: '供应商返回错误状态，请稍后重试',
+  timeout: '请求超时，请检查网络或服务地址',
+  malformed: '供应商返回格式无法识别',
+  cliMissing: '未找到即梦 CLI，请检查安装或 cliPath 配置',
+  cliNotLoggedIn: '即梦未登录或登录已失效，请点击登录',
+} as const
 
 /**
  * 严格解析独立生图配置。
@@ -438,6 +491,97 @@ function parsePublicImageProfile(value: unknown): ImageGenerationPublicProfile {
     ...profile,
     credentialConfigured,
     ...(typeof endpointOrigin === 'string' ? { endpointOrigin } : {}),
+  }
+}
+
+/**
+ * 严格解析拉取可用模型的输入。
+ * 入参：来自 Renderer 的未知值；返回值：已校验的拉取请求。
+ * 即梦使用 none 凭据且不允许服务地址；密钥型供应商必须有服务地址与凭据。
+ */
+export function parseImageGenerationCatalogFetchInput(value: unknown): ImageGenerationCatalogFetchInput {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['requestId', 'provider', 'baseUrl', 'groupId', 'credential'])
+    || (value.provider !== 'dreamina' && value.provider !== 'openai-images' && value.provider !== 'minimax')
+    || !isRecord(value.credential)) {
+    throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+  }
+  const requestId = parseStableId(value.requestId)
+  /** 凭据形态按供应商收口：即梦只能 none，另外两家只能 saved 或 draft。 */
+  let credential: ImageGenerationCatalogCredential
+  if (value.credential.mode === 'none') {
+    if (!hasOnlyKeys(value.credential, ['mode']) || value.provider !== 'dreamina') {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    credential = { mode: 'none' }
+  } else if (value.credential.mode === 'saved') {
+    if (!hasOnlyKeys(value.credential, ['mode', 'profileId']) || value.provider === 'dreamina') {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    credential = { mode: 'saved', profileId: parseStableId(value.credential.profileId) }
+  } else if (value.credential.mode === 'draft') {
+    if (!hasOnlyKeys(value.credential, ['mode', 'apiKey']) || value.provider === 'dreamina') {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    credential = {
+      mode: 'draft',
+      apiKey: parseRequiredText(value.credential.apiKey, IMAGE_PROVIDER_API_KEY_MAX_LENGTH),
+    }
+  } else {
+    throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+  }
+  if (value.provider === 'dreamina') {
+    if (value.baseUrl !== undefined || value.groupId !== undefined) {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    return { requestId, provider: 'dreamina', credential }
+  }
+  const baseUrl = parseBaseUrl(value.baseUrl)
+  const groupId = value.provider === 'minimax'
+    ? parseOptionalText(value.groupId, IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH)
+    : undefined
+  if (value.provider === 'openai-images' && value.groupId !== undefined) {
+    throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+  }
+  return {
+    requestId,
+    provider: value.provider,
+    baseUrl,
+    ...(groupId === undefined ? {} : { groupId }),
+    credential,
+  }
+}
+
+/** 严格解析拉取结果的消息：成功只接受固定文案，失败接受分类文案。 */
+function parseCatalogMessage(state: 'success' | 'failed', value: unknown): string {
+  const message = parseRequiredText(value, IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH)
+  if (state === 'success') {
+    if (message !== IMAGE_GENERATION_CATALOG_MESSAGES.success) {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    return message
+  }
+  /** 失败文案只允许通用文案或已声明的分类文案。 */
+  const allowed: readonly string[] = [
+    IMAGE_GENERATION_CATALOG_MESSAGES.failed,
+    ...Object.values(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES),
+  ]
+  if (!allowed.includes(message)) throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+  return message
+}
+
+/** 严格解析拉取结果，模型清单允许为空但必须逐条合法。 */
+export function parseImageGenerationCatalogFetchResult(value: unknown): ImageGenerationCatalogFetchResult {
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['requestId', 'state', 'message', 'models'])
+    || (value.state !== 'success' && value.state !== 'failed')) {
+    throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+  }
+  return {
+    requestId: parseStableId(value.requestId),
+    state: value.state,
+    message: parseCatalogMessage(value.state, value.message),
+    models: parseImageGenerationCatalogModels(value.models),
   }
 }
 
