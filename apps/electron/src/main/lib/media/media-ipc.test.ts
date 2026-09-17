@@ -19,14 +19,14 @@ const imageAsset = {
 function createAudioProfile(overrides: Record<string, unknown> = {}) {
   return {
     id: 'audio-1', name: '小米语音', provider: 'xiaomi' as const,
-    baseUrl: 'https://example.com/tts', modelId: 'tts-model', voices: [{ id: 'voice-1', name: 'voice-1', source: 'manual' as const }],
+    baseUrl: 'https://example.com/tts', models: [{ id: 'tts-model', voices: [{ id: 'voice-1', name: 'voice-1', source: 'manual' as const }] }],
     enabled: true, createdAt: 1, updatedAt: 1, ...overrides,
   }
 }
 
 /** 构造不含凭据的独立目录公开快照。 */
 function createAudioCatalog(profiles: AudioGenerationPublicCatalog['profiles'] = []): AudioGenerationPublicCatalog {
-  return { schemaVersion: 2, revision: 0, profiles }
+  return { schemaVersion: 3, revision: 0, profiles }
 }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */

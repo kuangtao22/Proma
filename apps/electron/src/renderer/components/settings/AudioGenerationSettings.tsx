@@ -3,6 +3,7 @@ import type {
   AudioGenerationCatalogFetchInput,
   AudioGenerationCatalogFetchResult,
   AudioGenerationCredentialUpdate,
+  AudioGenerationModelEntry,
   AudioGenerationProfile,
   AudioGenerationProvider,
   AudioGenerationPublicProfile,
@@ -198,8 +199,8 @@ export function changeAudioGenerationProvider(
     enabled: draft.enabled,
     createdAt: draft.createdAt,
     updatedAt: draft.updatedAt,
-    modelId: defaults.modelId,
-    voices: [],
+    /** 切换供应商后保留一个默认模型条目，用户可再按需扩充。 */
+    models: defaults.modelId ? [{ id: defaults.modelId, voices: [] }] : [],
     apiKey: '',
     credentialConfigured: false,
   }
@@ -219,9 +220,8 @@ export function copyAudioGenerationProfile(
     id,
     name: `${profile.name} 副本`,
     baseUrl: profile.baseUrl,
-    modelId: profile.modelId,
-    /** 复制配置保留音色集合，但不继承凭据与旧目录引用。 */
-    voices: profile.voices.map((voice) => ({ ...voice })),
+    /** 复制配置保留模型与音色集合，但不继承凭据与旧目录引用。 */
+    models: profile.models.map((model) => ({ ...model, voices: model.voices.map((voice) => ({ ...voice })) })),
     enabled: profile.enabled,
     createdAt: now,
     updatedAt: now,
@@ -245,8 +245,11 @@ export function filterAudioGenerationProfiles(
     profile.name,
     profile.provider,
     PROVIDER_LABELS[profile.provider],
-    profile.modelId,
-    ...profile.voices.flatMap((voice) => [voice.id, voice.name ?? '']),
+    ...profile.models.flatMap((model) => [
+      model.id,
+      model.name ?? '',
+      ...model.voices.flatMap((voice) => [voice.id, voice.name ?? '']),
+    ]),
     profile.endpointOrigin,
   ].join('\n').toLocaleLowerCase().includes(normalized))
 }
@@ -258,8 +261,7 @@ function profileToDraft(profile: AudioGenerationPublicProfile): AudioGenerationD
     id: profile.id,
     name: profile.name,
     baseUrl: profile.baseUrl,
-    modelId: profile.modelId,
-    voices: profile.voices.map((voice) => ({ ...voice })),
+    models: profile.models.map((model) => ({ ...model, voices: model.voices.map((voice) => ({ ...voice })) })),
     enabled: profile.enabled,
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt,
@@ -278,14 +280,14 @@ function draftToProfile(draft: AudioGenerationDraft): AudioGenerationProfile {
   const candidate: AudioGenerationProfile = draft.provider === 'minimax'
     ? {
         id: draft.id, name: draft.name, provider: 'minimax', baseUrl: draft.baseUrl,
-        modelId: draft.modelId, voices: draft.voices, enabled: draft.enabled,
+        models: draft.models, enabled: draft.enabled,
         createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.groupId?.trim() ? { groupId: draft.groupId.trim() } : {}),
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
     : {
         id: draft.id, name: draft.name, provider: 'xiaomi', baseUrl: draft.baseUrl,
-        modelId: draft.modelId, voices: draft.voices, enabled: draft.enabled,
+        models: draft.models, enabled: draft.enabled,
         createdAt: draft.createdAt, updatedAt: draft.updatedAt,
         ...(draft.legacyMediaProfileId ? { legacyMediaProfileId: draft.legacyMediaProfileId } : {}),
       }
@@ -297,8 +299,11 @@ function profileIdentity(profile: AudioGenerationProfile): string {
   return JSON.stringify([
     profile.provider,
     profile.baseUrl.trim(),
-    profile.modelId.trim(),
-    ...profile.voices.map((voice) => [voice.id.trim(), voice.name?.trim() ?? '', voice.source]),
+    ...profile.models.map((model) => [
+      model.id.trim(),
+      model.name?.trim() ?? '',
+      ...model.voices.map((voice) => [voice.id.trim(), voice.name?.trim() ?? '', voice.source]),
+    ]),
     profile.provider === 'minimax' ? profile.groupId?.trim() ?? '' : '',
   ])
 }
@@ -630,7 +635,7 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     setActionError(null)
     /** 新建配置直接带入小米官方默认端与默认模型。 */
     const defaults = AUDIO_GENERATION_PROVIDER_DEFAULTS.xiaomi
-    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: defaults.baseUrl, modelId: defaults.modelId, voices: [], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
+    publishDraft({ id: createAudioGenerationId(), name: '', provider: 'xiaomi', baseUrl: defaults.baseUrl, models: [{ id: defaults.modelId, voices: [] }], enabled: true, createdAt: now, updatedAt: now, apiKey: '', credentialConfigured: false })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
 
   /** 编辑已保存配置但不读取旧 Key。 */
@@ -665,8 +670,8 @@ export function useAudioGenerationSettingsController({ api }: AudioGenerationCon
     editBaselineRef.current = null
     setActionError(null)
     publishDraft({
-      id: createAudioGenerationId(), name: legacy.name, provider: 'minimax', baseUrl: AUDIO_GENERATION_PROVIDER_DEFAULTS.minimax.baseUrl, modelId: legacy.modelId,
-      voices: [], groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
+      id: createAudioGenerationId(), name: legacy.name, provider: 'minimax', baseUrl: AUDIO_GENERATION_PROVIDER_DEFAULTS.minimax.baseUrl,
+      models: [{ id: legacy.modelId, voices: [] }], groupId: '', enabled: legacy.enabled, createdAt: now, updatedAt: now,
       legacyMediaProfileId: legacy.id, apiKey: '', credentialConfigured: false,
     })
   }, [ensureCatalogReady, invalidateIdentityTest, publishDraft])
@@ -954,6 +959,144 @@ function FetchCatalogButton({ catalog, disabled, onFetch }: {
   )
 }
 
+/** 已启用模型列表；点击行切换当前模型，最后一个模型不允许删除。 */
+function AudioEnabledModelList({ models, selectedModelId, disabled, onSelect, onChange }: {
+  models: readonly AudioGenerationModelEntry[]
+  selectedModelId: string | null
+  disabled: boolean
+  onSelect: (modelId: string) => void
+  onChange: (models: AudioGenerationModelEntry[]) => void
+}): React.ReactElement {
+  return (
+    <SettingsCard divided={false}>
+      {models.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted-foreground">还没有启用任何模型，从下方可用模型中选择</div>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {models.map((model) => {
+            /** 当前行是否正在被查看音色。 */
+            const selected = model.id === selectedModelId
+            return (
+              <div key={model.id} className={`group flex items-center gap-2 px-4 py-2.5${selected ? ' bg-muted/40' : ''}`}>
+                <button
+                  type="button"
+                  disabled={disabled}
+                  aria-label={`查看 ${model.id} 的音色`}
+                  onClick={() => onSelect(model.id)}
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                >
+                  {selected
+                    ? <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
+                    : <span className="size-3.5 shrink-0 rounded-full border border-muted-foreground/40" />}
+                  <span className="min-w-0 flex-1 text-sm text-foreground">
+                    {model.name ?? model.id}
+                    {model.name && model.name !== model.id ? <span className="ml-1 text-muted-foreground">({model.id})</span> : null}
+                    <span className="ml-2 text-xs text-muted-foreground">{model.voices.length} 个音色</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  disabled={disabled || models.length <= 1}
+                  aria-label={`移除模型 ${model.id}`}
+                  title={models.length <= 1 ? '至少保留一个模型' : '移除模型'}
+                  onClick={() => onChange(models.filter((entry) => entry.id !== model.id))}
+                  className="p-0.5 text-muted-foreground opacity-0 transition-colors group-hover:opacity-100 hover:text-destructive disabled:opacity-30"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </SettingsCard>
+  )
+}
+
+/** 可用模型：拉取结果点选加入上方，底部保留手填一行。 */
+function AudioAvailableModels({ models, fetchedModels, catalogState, disabled, onChange }: {
+  models: readonly AudioGenerationModelEntry[]
+  fetchedModels: readonly string[]
+  catalogState: 'idle' | 'loading' | 'success' | 'failed'
+  disabled: boolean
+  onChange: (models: AudioGenerationModelEntry[]) => void
+}): React.ReactElement {
+  /** 待添加的模型 ID 与就地错误提示。 */
+  const [pendingId, setPendingId] = React.useState('')
+  const [addError, setAddError] = React.useState('')
+  /** 已启用模型按 id 去重，决定清单里还剩哪些可添加。 */
+  const enabledIds = new Set(models.map((model) => model.id))
+  const available = fetchedModels.filter((id) => !enabledIds.has(id))
+
+  /** 追加一个模型条目（音色留空，随后按模型维护）。 */
+  const appendModel = (id: string): void => {
+    const trimmed = id.trim()
+    if (!trimmed) {
+      setAddError('请输入模型 ID')
+      return
+    }
+    if (enabledIds.has(trimmed)) {
+      setAddError('该模型已添加')
+      return
+    }
+    onChange([...models, { id: trimmed, voices: [] }])
+    setAddError('')
+  }
+
+  return (
+    <SettingsCard divided={false}>
+      {available.map((id) => (
+        <div
+          key={id}
+          role="button"
+          tabIndex={0}
+          onClick={() => appendModel(id)}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); appendModel(id) } }}
+          className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
+        >
+          <Plus size={14} className="shrink-0 text-muted-foreground" />
+          <span className="flex-1 text-sm text-foreground">{id}</span>
+        </div>
+      ))}
+      {available.length === 0 && (
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+          {catalogState === 'loading'
+            ? '正在从供应商获取…'
+            : fetchedModels.length === 0
+              ? '点右上角「从供应商获取」读取该账号可用的模型'
+              : '拉取到的模型都已添加'}
+        </div>
+      )}
+      <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
+        <Input
+          id="audio-model-id"
+          aria-label="模型 ID"
+          className="h-8 flex-1 text-sm"
+          placeholder="模型 ID（如 mimo-v2.5-tts）"
+          value={pendingId}
+          disabled={disabled}
+          onChange={(event) => setPendingId(event.target.value)}
+        />
+        <Button
+          type="button"
+          size="icon-sm"
+          variant="ghost"
+          aria-label="添加模型"
+          title="添加模型"
+          disabled={disabled}
+          onClick={() => {
+            appendModel(pendingId)
+            setPendingId('')
+          }}
+        >
+          <Plus />
+        </Button>
+      </div>
+      {addError && <p role="alert" className="px-4 pb-3 text-xs text-destructive">{addError}</p>}
+    </SettingsCard>
+  )
+}
+
 /** 已启用音色列表；悬停可移除，列表为空时给出引导。 */
 function AudioEnabledVoiceList({ voices, disabled, onChange }: {
   voices: readonly AudioGenerationVoice[]
@@ -1083,12 +1226,15 @@ function AudioAvailableVoices({ voices, builtinVoices, fetchedVoices, capability
   )
 }
 
-/** 列表摘要只显示首个音色与总数，避免长列表撑开行。 */
-function voiceSummary(voices: readonly AudioGenerationVoice[]): string {
-  const [first] = voices
-  if (!first) return '未配置音色'
-  const label = first.name ?? first.id
-  return voices.length === 1 ? label : `${label} 等 ${voices.length} 个音色`
+/** 列表摘要只显示模型数量与首个音色，避免长列表撑开行。 */
+function voiceSummary(models: readonly AudioGenerationModelEntry[]): string {
+  const [first] = models
+  if (!first) return '未配置模型'
+  const voiceCount = models.reduce((total, model) => total + model.voices.length, 0)
+  const firstVoice = first.voices[0]
+  const voiceLabel = firstVoice ? firstVoice.name ?? firstVoice.id : '未配置音色'
+  const modelLabel = models.length === 1 ? first.id : `${first.id} 等 ${models.length} 个模型`
+  return `${modelLabel} · ${voiceCount === 0 ? '未配置音色' : voiceLabel}`
 }
 
 /**
@@ -1108,13 +1254,24 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
   const actionDisabled = saving || needsReload
   const legacyReferences = new Set(settings?.catalog.profiles.map((profile) => profile.legacyMediaProfileId).filter((id): id is string => Boolean(id)) ?? [])
   const deleteTarget = settings?.catalog.profiles.find((profile) => profile.id === deleteId)
+  /** 当前正在查看音色的模型；草稿切换时回退到第一个模型。 */
+  const [selectedModelId, setSelectedModelId] = React.useState<string | null>(null)
 
   if (draft) {
     const testState = testStates[draft.id]
     /** 当前供应商的默认端、默认模型与内置音色。 */
     const providerDefaults = AUDIO_GENERATION_PROVIDER_DEFAULTS[draft.provider]
+    /** 当前查看音色的模型。 */
+    const selectedModel = draft.models.find((model) => model.id === selectedModelId) ?? draft.models[0] ?? null
     /** 当前模型允许的音色输入方式。 */
-    const resolvedVoiceCapability = resolveVoiceCapability(draft.provider, draft.modelId)
+    const resolvedVoiceCapability = selectedModel ? resolveVoiceCapability(draft.provider, selectedModel.id) : 'voice-id'
+    /** 只替换选中模型的音色，其它模型的音色保持原样。 */
+    const updateModelVoices = (modelId: string, voices: AudioGenerationVoice[]): void => {
+      controller.updateDraft({
+        ...draft,
+        models: draft.models.map((model) => (model.id === modelId ? { ...model, voices } : model)),
+      })
+    }
     /** 只展示属于当前草稿身份的拉取结果。 */
     const catalogForDraft = controller.catalog?.draftIdentity === catalogIdentity(draft) ? controller.catalog : null
     return (
@@ -1161,14 +1318,6 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
               </div>
               <Input id="audio-api-key" type="password" autoComplete="new-password" value={draft.apiKey} disabled={actionDisabled} placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'} onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })} />
             </div>
-            <SettingsInput
-              id="audio-model-id"
-              label="模型 ID"
-              value={draft.modelId}
-              disabled={actionDisabled}
-              placeholder={providerDefaults.modelId || '例如：speech-2.5-hd'}
-              onChange={(modelId) => controller.updateDraft({ ...draft, modelId })}
-            />
             {draft.provider === 'minimax' && <SettingsInput id="audio-group-id" label="Group ID（可选）" value={draft.groupId ?? ''} disabled={actionDisabled} onChange={(groupId) => controller.updateDraft({ ...draft, groupId })} />}
             <SettingsToggle
               label="启用此配置"
@@ -1180,51 +1329,48 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           </SettingsCard>
         </SettingsSection>
 
-        <SettingsSection title="已启用音色" description={draft.voices.length > 0 ? `${draft.voices.length} 个音色` : undefined}>
-          <AudioEnabledVoiceList voices={draft.voices} disabled={actionDisabled} onChange={(voices) => controller.updateDraft({ ...draft, voices })} />
+        <SettingsSection title="已启用模型" description={draft.models.length > 0 ? `${draft.models.length} 个模型 · 音色按模型分别维护` : undefined}>
+          <AudioEnabledModelList
+            models={draft.models}
+            selectedModelId={selectedModel?.id ?? null}
+            disabled={actionDisabled}
+            onSelect={setSelectedModelId}
+            onChange={(models) => controller.updateDraft({ ...draft, models })}
+          />
         </SettingsSection>
 
         <SettingsSection
           title="可用模型"
           action={<FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />}
         >
-          <SettingsCard divided={false}>
-            {catalogForDraft?.models.length ? catalogForDraft.models.map((model) => (
-              <div
-                key={model}
-                role="button"
-                tabIndex={0}
-                onClick={() => controller.updateDraft({ ...draft, modelId: model })}
-                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); controller.updateDraft({ ...draft, modelId: model }) } }}
-                className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
-              >
-                {draft.modelId.trim() === model
-                  ? <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
-                  : <Plus size={14} className="shrink-0 text-muted-foreground" />}
-                <span className="flex-1 text-sm text-foreground">{model}</span>
-              </div>
-            )) : (
-              <div className="px-4 py-6 text-center text-sm text-muted-foreground">
-                {catalogForDraft?.state === 'loading' ? '正在从供应商获取…' : '点右上角「从供应商获取」读取该账号可用的模型'}
-              </div>
-            )}
-            {catalogForDraft?.state === 'failed' && catalogForDraft.message && (
-              <p role="alert" className="border-t border-border/50 px-4 py-2 text-xs text-destructive">{catalogForDraft.message}</p>
-            )}
-          </SettingsCard>
+          <AudioAvailableModels
+            models={draft.models}
+            fetchedModels={catalogForDraft?.models ?? []}
+            catalogState={catalogForDraft?.state ?? 'idle'}
+            disabled={actionDisabled}
+            onChange={(models) => controller.updateDraft({ ...draft, models })}
+          />
         </SettingsSection>
 
         <SettingsSection
-          title="可用音色"
-          action={<FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />}
+          title="已启用音色"
+          description={selectedModel ? `归属模型 ${selectedModel.id}` : '请先添加模型'}
         >
+          <AudioEnabledVoiceList
+            voices={selectedModel?.voices ?? []}
+            disabled={actionDisabled || !selectedModel}
+            onChange={(voices) => selectedModel && updateModelVoices(selectedModel.id, voices)}
+          />
+        </SettingsSection>
+
+        <SettingsSection title="可用音色">
           <AudioAvailableVoices
-            voices={draft.voices}
+            voices={selectedModel?.voices ?? []}
             builtinVoices={resolvedVoiceCapability === 'voice-id' ? providerDefaults.builtinVoices : []}
             fetchedVoices={resolvedVoiceCapability === 'voice-id' ? catalogForDraft?.voices ?? [] : []}
-            capability={resolvedVoiceCapability}
-            disabled={actionDisabled}
-            onChange={(voices) => controller.updateDraft({ ...draft, voices })}
+            capability={selectedModel ? resolvedVoiceCapability : 'no-voice'}
+            disabled={actionDisabled || !selectedModel}
+            onChange={(voices) => selectedModel && updateModelVoices(selectedModel.id, voices)}
           />
         </SettingsSection>
         {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
@@ -1259,7 +1405,7 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           : settings && visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的音频配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => {
                 const testState = testStates[profile.id]
-                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {profile.modelId} · {voiceSummary(profile.voices)}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
+                return <SettingsRow key={profile.id} label={profile.name} icon={<Volume2 className="size-5 text-muted-foreground" />} description={<><span>{PROVIDER_LABELS[profile.provider]} · {voiceSummary(profile.models)}</span><span className="block">{profile.endpointOrigin} · {profile.credentialConfigured ? '凭据已配置' : '缺少凭据'} · {testState?.message ?? '未验证'}</span></>}><div className="flex flex-wrap items-center justify-end gap-1"><Switch checked={profile.enabled} disabled={actionDisabled} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} /><Button type="button" size="icon-sm" variant="ghost" aria-label={`测试 ${profile.name}`} title="测试连接" disabled={actionDisabled} onClick={() => void controller.testProfile(profile)}>{testState?.state === 'loading' ? <Loader2 className="animate-spin" /> : <TestTube2 />}</Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={actionDisabled} onClick={() => controller.startCopy(profile)}><Copy /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={actionDisabled} onClick={() => controller.startEdit(profile)}><Pencil /></Button><Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={actionDisabled} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button></div></SettingsRow>
               })}</SettingsCard>}
       <ConfirmDialog open={deleteId !== null} onOpenChange={(open) => { if (!open) controller.closeDelete() }} title="删除音频配置？" description={actionError ?? (deleteTarget ? `删除 ${deleteTarget.name} 后，后续音频任务将不能再使用该配置。` : '')} confirmLabel="删除" closeOnConfirm={false} loading={saving} variant="destructive" onConfirm={controller.confirmDelete} />
     </MediaSettingsPage>

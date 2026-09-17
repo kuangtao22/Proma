@@ -20,10 +20,15 @@ function createXiaomiProfile(overrides: Record<string, unknown> = {}): Record<st
     name: ' 小米语音 ',
     provider: 'xiaomi',
     baseUrl: 'https://tts.example/v1///',
-    modelId: ' mimo-tts ',
-    voices: [
-      { id: ' voice-1 ', name: ' 默认音色 ', source: 'manual' },
-      { id: 'voice-2', source: 'builtin' },
+    models: [
+      {
+        id: ' mimo-tts ',
+        voices: [
+          { id: ' voice-1 ', name: ' 默认音色 ', source: 'manual' },
+          { id: 'voice-2', source: 'builtin' },
+        ],
+      },
+      { id: 'mimo-v2.5-tts-voicedesign', name: ' 音色设计 ', voices: [] },
     ],
     enabled: true,
     createdAt: 1,
@@ -39,8 +44,7 @@ function createMiniMaxProfile(overrides: Record<string, unknown> = {}): Record<s
     name: ' MiniMax ',
     provider: 'minimax',
     baseUrl: 'https://api.minimax.example/',
-    modelId: ' speech-02 ',
-    voices: [{ id: ' female-1 ', source: 'remote' }],
+    models: [{ id: ' speech-02 ', voices: [{ id: ' female-1 ', source: 'remote' }] }],
     groupId: ' group-1 ',
     enabled: true,
     createdAt: 1,
@@ -53,31 +57,46 @@ describe('独立音频生成 Shared 合同', () => {
   test('Given 小米与 MiniMax 配置 When 严格解析 Then 清洗字段并保留供应商差异', () => {
     expect(parseAudioGenerationProfile(createXiaomiProfile())).toEqual({
       id: 'audio-1', name: '小米语音', provider: 'xiaomi', baseUrl: 'https://tts.example/v1',
-      modelId: 'mimo-tts',
-      voices: [{ id: 'voice-1', name: '默认音色', source: 'manual' }, { id: 'voice-2', source: 'builtin' }],
+      models: [
+        {
+          id: 'mimo-tts',
+          voices: [{ id: 'voice-1', name: '默认音色', source: 'manual' }, { id: 'voice-2', source: 'builtin' }],
+        },
+        { id: 'mimo-v2.5-tts-voicedesign', name: '音色设计', voices: [] },
+      ],
       enabled: true, createdAt: 1, updatedAt: 2,
     })
     expect(parseAudioGenerationProfile(createMiniMaxProfile())).toEqual({
       id: 'audio-2', name: 'MiniMax', provider: 'minimax', baseUrl: 'https://api.minimax.example',
-      modelId: 'speech-02', voices: [{ id: 'female-1', source: 'remote' }],
+      models: [{ id: 'speech-02', voices: [{ id: 'female-1', source: 'remote' }] }],
       groupId: 'group-1', enabled: true, createdAt: 1, updatedAt: 2,
     })
   })
 
-  test('Given 空音色、重复音色、非法来源、未知字段或超限 When 解析 Then 拒绝', () => {
-    expect(() => parseAudioGenerationProfile(createXiaomiProfile({ voices: [] })))
+  test('Given 空模型、重复模型、重复音色、非法来源或超限 When 解析 Then 拒绝', () => {
+    /** 音色允许为空的模型条目，下同；这里统一用辅助函数包一层。 */
+    const withVoices = (voices: unknown): Record<string, unknown> => ({
+      models: [{ id: 'mimo-tts', voices }],
+    })
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile({ models: [] })))
       .toThrow('AUDIO_GENERATION_CONFIG_INVALID')
     expect(() => parseAudioGenerationProfile(createXiaomiProfile({
-      voices: [{ id: 'dup', source: 'manual' }, { id: 'dup', source: 'builtin' }],
+      models: [{ id: 'dup', voices: [] }, { id: 'dup', voices: [] }],
     }))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile(withVoices([
+      { id: 'voice', source: 'manual' }, { id: 'voice', source: 'builtin' },
+    ])))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile(withVoices([
+      { id: 'voice', source: 'unknown' },
+    ])))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile(withVoices([
+      { id: 'voice', source: 'manual', extra: true },
+    ])))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
+    expect(() => parseAudioGenerationProfile(createXiaomiProfile(withVoices(
+      Array.from({ length: 65 }, (_, index) => ({ id: `voice-${index}`, source: 'manual' })),
+    )))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
     expect(() => parseAudioGenerationProfile(createXiaomiProfile({
-      voices: [{ id: 'voice', source: 'unknown' }],
-    }))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
-    expect(() => parseAudioGenerationProfile(createXiaomiProfile({
-      voices: [{ id: 'voice', source: 'manual', extra: true }],
-    }))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
-    expect(() => parseAudioGenerationProfile(createXiaomiProfile({
-      voices: Array.from({ length: 65 }, (_, index) => ({ id: `voice-${index}`, source: 'manual' })),
+      models: [{ id: 'mimo-tts', voices: [], extra: true }],
     }))).toThrow('AUDIO_GENERATION_CONFIG_INVALID')
   })
 
@@ -286,7 +305,7 @@ describe('独立音频生成 Shared 合同', () => {
   test('Given 设置结果 When 解析 Then 公开 Profile 与旧摘要均使用严格字段', () => {
     const parsed = parseAudioGenerationSettingsResult({
       catalog: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         revision: 4,
         profiles: [{
           ...createXiaomiProfile(), name: '小米语音', baseUrl: 'https://tts.example/v1',

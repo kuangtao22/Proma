@@ -10,7 +10,7 @@ import {
   AUDIO_GENERATION_API_KEY_MAX_LENGTH,
   AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_PROFILE_LIMIT,
-  LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
+  LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSIONS,
   parseAudioGenerationProfile,
   parseReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
@@ -65,9 +65,9 @@ interface PersistedAudioGenerationProfile {
   encryptedApiKey: string
 }
 
-/** 独立音频配置文件的当前持久化结构；读取时仍兼容 v1，写回统一为 v2。 */
+/** 独立音频配置文件的当前持久化结构；读取时仍兼容 v1/v2，写回统一为 v3。 */
 interface PersistedAudioGenerationCatalog {
-  schemaVersion: 2
+  schemaVersion: 3
   revision: number
   profiles: PersistedAudioGenerationProfile[]
 }
@@ -93,6 +93,12 @@ function isCatalogRevision(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
+/** 判断 schema 版本是当前版本或仍兼容的旧版本。 */
+function isCatalogSchemaVersion(value: unknown): value is number {
+  return value === AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
+    || (LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSIONS as readonly number[]).includes(value as number)
+}
+
 /** 严格解析可 JSON 化的非空 canonical base64 密文。 */
 function parseEncryptedApiKey(value: unknown): string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -107,36 +113,50 @@ function parseEncryptedApiKey(value: unknown): string {
 }
 
 /**
- * 把 v1 的单值 voiceId 迁移成 v2 的音色列表。
- * 入参：磁盘上的未知 profile 形状；返回值：可交给严格解析器的 v2 形状或原值。
- * 只做形状转换，校验仍由 parseAudioGenerationProfile 收口。
+ * 把旧目录的扁平模型/音色迁移成 v3 的模型条目。
+ * 入参：磁盘上的未知 profile 形状与来源 schema 版本；返回值：可交给严格解析器的 v3 形状或原值。
+ * v1 是单值 voiceId，v2 是扁平音色列表；两者都归属当时唯一的 modelId。
  */
-function migrateLegacyAudioProfile(value: unknown): unknown {
-  if (!isRecord(value) || typeof value.voiceId !== 'string') return value
-  const { voiceId, ...rest } = value
-  return { ...rest, voices: [{ id: voiceId, name: voiceId, source: 'manual' }] }
+function migrateLegacyAudioProfile(value: unknown, schemaVersion: number): unknown {
+  if (!isRecord(value)) return value
+  if (schemaVersion === 1) {
+    if (typeof value.voiceId !== 'string' || typeof value.modelId !== 'string') return value
+    const { voiceId, modelId, ...rest } = value
+    return {
+      ...rest,
+      models: [{ id: modelId, voices: [{ id: voiceId, name: voiceId, source: 'manual' }] }],
+    }
+  }
+  if (schemaVersion === 2) {
+    if (typeof value.modelId !== 'string' || !Array.isArray(value.voices)) return value
+    const { modelId, voices, ...rest } = value
+    return { ...rest, models: [{ id: modelId, voices }] }
+  }
+  return value
 }
 
 /** 严格解析磁盘目录，不接受未知字段、重复 ID 或非法 Profile。 */
 function parsePersistedCatalog(value: unknown): PersistedAudioGenerationCatalog {
   if (!isRecord(value)
     || !hasOnlyKeys(value, ['schemaVersion', 'revision', 'profiles'])
-    || (value.schemaVersion !== LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
-      && value.schemaVersion !== AUDIO_GENERATION_CATALOG_SCHEMA_VERSION)
+    || !isCatalogSchemaVersion(value.schemaVersion)
     || !isCatalogRevision(value.revision)
     || !Array.isArray(value.profiles)
     || value.profiles.length > AUDIO_GENERATION_PROFILE_LIMIT) {
     throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
   /** 旧文件只影响本次读取的解释方式，绝不回写用户文件。 */
-  const isLegacySchema = value.schemaVersion === LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
+  const schemaVersion = value.schemaVersion
+  const isLegacySchema = schemaVersion !== AUDIO_GENERATION_CATALOG_SCHEMA_VERSION
   /** 按文件顺序解析后的持久化条目。 */
   const profiles = value.profiles.map((item): PersistedAudioGenerationProfile => {
     if (!isRecord(item) || !hasOnlyKeys(item, ['profile', 'encryptedApiKey'])) {
       throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
     }
     return {
-      profile: parseAudioGenerationProfile(isLegacySchema ? migrateLegacyAudioProfile(item.profile) : item.profile),
+      profile: parseAudioGenerationProfile(isLegacySchema
+        ? migrateLegacyAudioProfile(item.profile, schemaVersion)
+        : item.profile),
       encryptedApiKey: parseEncryptedApiKey(item.encryptedApiKey),
     }
   })

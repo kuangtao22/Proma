@@ -11,14 +11,23 @@ export interface AudioGenerationVoice {
   source: AudioGenerationVoiceSource
 }
 
+/**
+ * 已启用模型及其所属音色。
+ * voices 允许为空：声音复刻与音色设计模型不使用内置音色 ID。
+ */
+export interface AudioGenerationModelEntry {
+  id: string
+  name?: string
+  voices: AudioGenerationVoice[]
+}
+
 /** 音频生成配置的供应商无关字段。 */
 export interface AudioGenerationProfileBase {
   id: string
   name: string
   baseUrl: string
-  modelId: string
-  /** 已启用音色，顺序即用户添加顺序；至少一个且同一配置内不重复。 */
-  voices: AudioGenerationVoice[]
+  /** 已启用模型，顺序即用户添加顺序；至少一个且同一配置内不重复。 */
+  models: AudioGenerationModelEntry[]
   enabled: boolean
   createdAt: number
   updatedAt: number
@@ -52,7 +61,7 @@ export type AudioGenerationPublicProfile = AudioGenerationProfile & {
 
 /** Renderer 可读取的独立音频目录快照。 */
 export interface AudioGenerationPublicCatalog {
-  schemaVersion: 2
+  schemaVersion: 3
   revision: number
   profiles: AudioGenerationPublicProfile[]
 }
@@ -227,6 +236,8 @@ export const AUDIO_GENERATION_TEST_MESSAGES = {
 
 /** 单个目录允许保存的配置数量上限。 */
 export const AUDIO_GENERATION_PROFILE_LIMIT = 128
+/** 单条配置允许启用的模型数量上限。 */
+export const AUDIO_GENERATION_MODEL_ENTRY_LIMIT = 32
 /** 单条配置允许启用的音色数量上限。 */
 export const AUDIO_GENERATION_VOICE_LIMIT = 64
 /** 用户可见名称长度上限。 */
@@ -234,9 +245,9 @@ export const AUDIO_GENERATION_NAME_MAX_LENGTH = 128
 /** 音色显示名称长度上限。 */
 export const AUDIO_GENERATION_VOICE_NAME_MAX_LENGTH = 128
 /** 当前独立音频目录的 schema 版本。 */
-export const AUDIO_GENERATION_CATALOG_SCHEMA_VERSION = 2 as const
-/** 仍需兼容读取的旧目录 schema 版本，读取时把 voiceId 迁移成单条音色。 */
-export const LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSION = 1 as const
+export const AUDIO_GENERATION_CATALOG_SCHEMA_VERSION = 3 as const
+/** 仍需兼容读取的旧目录 schema 版本：1 是单值 voiceId，2 是扁平音色列表。 */
+export const LEGACY_AUDIO_GENERATION_CATALOG_SCHEMA_VERSIONS = [1, 2] as const
 /** 模型、音色、供应商专属标识与稳定 ID 的长度上限。 */
 export const AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH = 256
 /** Base URL 的长度上限。 */
@@ -252,10 +263,12 @@ const AUDIO_GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/
 const RESERVED_AUDIO_GENERATION_IDS = new Set(['__proto__', 'constructor', 'prototype'])
 /** 所有供应商共享的配置字段。 */
 const PROFILE_BASE_KEYS = [
-  'id', 'name', 'provider', 'baseUrl', 'modelId', 'voices', 'enabled', 'createdAt', 'updatedAt', 'legacyMediaProfileId',
+  'id', 'name', 'provider', 'baseUrl', 'models', 'enabled', 'createdAt', 'updatedAt', 'legacyMediaProfileId',
 ] as const
 /** 单条音色允许出现的字段。 */
 const VOICE_KEYS = ['id', 'name', 'source'] as const
+/** 单条模型允许出现的字段。 */
+const MODEL_KEYS = ['id', 'name', 'voices'] as const
 /** 公开配置在持久化配置之外增加的字段。 */
 const PUBLIC_PROFILE_KEYS = ['credentialConfigured', 'endpointOrigin'] as const
 
@@ -369,6 +382,34 @@ export function parseAudioGenerationVoiceList(value: unknown): AudioGenerationVo
   return parseVoiceItems(value, true)
 }
 
+/**
+ * 严格解析已启用模型列表。
+ * 入参：来自磁盘或 IPC 的未知值；返回值：已清洗的模型数组（至少一条）。
+ * 模型的音色允许为空，但模型 ID 在同一配置内必须唯一。
+ */
+export function parseAudioGenerationModelList(value: unknown): AudioGenerationModelEntry[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > AUDIO_GENERATION_MODEL_ENTRY_LIMIT) {
+    throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+  }
+  /** 已出现的模型 ID，用于拒绝同一配置内的重复模型。 */
+  const seenIds = new Set<string>()
+  return value.map((item): AudioGenerationModelEntry => {
+    if (!isRecord(item) || !hasOnlyKeys(item, MODEL_KEYS)) {
+      throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    }
+    const id = parseRequiredText(item.id, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH)
+    if (seenIds.has(id)) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
+    seenIds.add(id)
+    /** 显示名称可选，缺失时由界面回退显示 id。 */
+    const name = parseOptionalText(item.name, AUDIO_GENERATION_VOICE_NAME_MAX_LENGTH)
+    return {
+      ...(name === undefined ? {} : { name }),
+      id,
+      voices: parseVoiceItems(item.voices, false),
+    }
+  })
+}
+
 /** 解析独立音频配置，并严格保留供应商字段差异。 */
 export function parseAudioGenerationProfile(value: unknown): AudioGenerationProfile {
   if (!isRecord(value) || (value.provider !== 'xiaomi' && value.provider !== 'minimax')) {
@@ -388,8 +429,7 @@ export function parseAudioGenerationProfile(value: unknown): AudioGenerationProf
     id: parseStableId(value.id),
     name: parseRequiredText(value.name, AUDIO_GENERATION_NAME_MAX_LENGTH),
     baseUrl: parseBaseUrl(value.baseUrl),
-    modelId: parseRequiredText(value.modelId, AUDIO_GENERATION_IDENTIFIER_MAX_LENGTH),
-    voices: parseAudioGenerationVoiceList(value.voices),
+    models: parseAudioGenerationModelList(value.models),
     enabled: value.enabled,
     createdAt: value.createdAt,
     updatedAt: value.updatedAt,

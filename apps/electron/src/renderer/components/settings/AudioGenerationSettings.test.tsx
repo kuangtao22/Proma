@@ -32,17 +32,18 @@ import * as mediaSettingsModule from './MediaSettings'
 function createSettings(revision = 4): AudioGenerationSettingsResult {
   return {
     catalog: {
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision,
       profiles: [
         {
           id: 'xiaomi-1', name: '小米旁白', provider: 'xiaomi', baseUrl: 'https://tts.example.com/private/path',
-          modelId: 'mimo-v1', voices: [{ id: 'xiaomi-voice', name: '小米旁白音色', source: 'manual' as const }], enabled: true, createdAt: 1, updatedAt: 2,
+          models: [{ id: 'mimo-v1', voices: [{ id: 'xiaomi-voice', name: '小米旁白音色', source: 'manual' as const }] }],
+          enabled: true, createdAt: 1, updatedAt: 2,
           credentialConfigured: true, endpointOrigin: 'https://tts.example.com',
         },
         {
           id: 'minimax-1', name: 'MiniMax 配音', provider: 'minimax', baseUrl: 'https://api.minimax.chat/v1/t2a/hidden-path',
-          modelId: 'speech-02-hd', voices: [{ id: 'male-qn-qingse', source: 'remote' as const }], groupId: 'group-secretish', enabled: true,
+          models: [{ id: 'speech-02-hd', voices: [{ id: 'male-qn-qingse', source: 'remote' as const }] }], groupId: 'group-secretish', enabled: true,
           createdAt: 2, updatedAt: 3, credentialConfigured: true, endpointOrigin: 'https://api.minimax.chat',
           legacyMediaProfileId: 'legacy-1',
         },
@@ -193,8 +194,7 @@ describe('AudioGenerationSettings', () => {
     expect(xiaomi).toMatchObject({
       provider: 'xiaomi',
       baseUrl: 'https://api.xiaomimimo.com/v1',
-      modelId: 'mimo-v2.5-tts',
-      voices: [],
+      models: [{ id: 'mimo-v2.5-tts', voices: [] }],
       apiKey: '',
       credentialConfigured: false,
     })
@@ -242,9 +242,10 @@ describe('AudioGenerationSettings', () => {
   test('Given 已有音色的配置 When 复制 Then 保留音色集合但不继承凭据', () => {
     const source = { ...createSettings().catalog.profiles[0]!, apiKey: 'must-not-copy' }
     const copied = copyAudioGenerationProfile(source, 'copy-voices', 70)
-    expect(copied.voices).toEqual([{ id: 'xiaomi-voice', name: '小米旁白音色', source: 'manual' }])
-    /** 音色数组必须是新引用，避免后续编辑反向污染源配置。 */
-    expect(copied.voices).not.toBe(source.voices)
+    expect(copied.models).toEqual([{ id: 'mimo-v1', voices: [{ id: 'xiaomi-voice', name: '小米旁白音色', source: 'manual' }] }])
+    /** 模型与音色数组必须是新引用，避免后续编辑反向污染源配置。 */
+    expect(copied.models).not.toBe(source.models)
+    expect(copied.models[0]!.voices).not.toBe(source.models[0]!.voices)
     expect(JSON.stringify(copied)).not.toContain('must-not-copy')
   })
 
@@ -304,7 +305,7 @@ describe('AudioGenerationSettings', () => {
     /** 切到声音复刻模型后，内置音色与手填行都不应出现。 */
     const cloneHtml = renderToStaticMarkup(<AudioGenerationCatalogView controller={{
       ...common,
-      draft: { ...draft, modelId: 'mimo-v2.5-tts-voiceclone' },
+      draft: { ...draft, models: [{ id: 'mimo-v2.5-tts-voiceclone', voices: [] }] },
       catalog: null,
     }} />)
     expect(cloneHtml).toContain('voice` 字段必须传音频样本的 base64')
@@ -390,7 +391,7 @@ describe('AudioGenerationSettings', () => {
       await act(async () => { await requireController(controller).load() })
 
       act(() => { requireController(controller).startCreate() })
-      act(() => { requireController(controller).updateDraft({ ...requireController(controller).draft!, name: '新增小米', baseUrl: 'https://new.example.com', modelId: 'model', voices: [{ id: 'voice', name: 'voice', source: 'manual' }], apiKey: 'new-key' }) })
+      act(() => { requireController(controller).updateDraft({ ...requireController(controller).draft!, name: '新增小米', baseUrl: 'https://new.example.com', models: [{ id: 'model', voices: [{ id: 'voice', name: 'voice', source: 'manual' }] }], apiKey: 'new-key' }) })
       await act(async () => { await requireController(controller).saveDraft() })
       expect(api.replacements.at(-1)?.expectedRevision).toBe(4)
       expect(api.replacements.at(-1)?.profiles.slice(0, 2).map((item) => item.credentialUpdate)).toEqual([{ mode: 'preserve' }, { mode: 'preserve' }])
@@ -504,7 +505,7 @@ describe('AudioGenerationSettings', () => {
   })
 
   test('Given 首次读取失败 When 重试成功 Then 清除错误并展示权威空目录', async () => {
-    const api = createApi({ catalog: { schemaVersion: 2, revision: 0, profiles: [] }, legacyAudioProfiles: [] })
+    const api = createApi({ catalog: { schemaVersion: 3, revision: 0, profiles: [] }, legacyAudioProfiles: [] })
     let fail = true
     const originalGet = api.getSettings
     api.getSettings = async () => {
@@ -539,7 +540,7 @@ describe('AudioGenerationSettings', () => {
       act(() => requireController(controller).closeDraft())
       act(() => requireController(controller).startMigration('legacy-2'))
       expect(requireController(controller).draft).toMatchObject({
-        name: '待迁移语音', provider: 'minimax', modelId: 'speech-01', voices: [], groupId: '',
+        name: '待迁移语音', provider: 'minimax', models: [{ id: 'speech-01', voices: [] }], groupId: '',
         apiKey: '', credentialConfigured: false, legacyMediaProfileId: 'legacy-2', enabled: false,
       })
     } finally { act(() => host.unmount()); host.restore() }
@@ -573,7 +574,7 @@ describe('AudioGenerationSettings', () => {
       /** 迁移入口按合同固定生成 MiniMax 判别分支。 */
       const migrationDraft = requireController(controller).draft
       if (migrationDraft?.provider !== 'minimax') throw new Error('迁移草稿供应商错误')
-      act(() => requireController(controller).updateDraft({ ...migrationDraft, baseUrl: 'https://api.minimax.chat', voices: [{ id: 'voice', name: 'voice', source: 'manual' }], groupId: 'group', apiKey: 'migration-key' }))
+      act(() => requireController(controller).updateDraft({ ...migrationDraft, baseUrl: 'https://api.minimax.chat', models: [{ id: 'speech-01', voices: [{ id: 'voice', name: 'voice', source: 'manual' }] }], groupId: 'group', apiKey: 'migration-key' }))
       await act(async () => { await requireController(controller).saveDraft() })
       let html = renderToStaticMarkup(<AudioGenerationCatalogView controller={requireController(controller)} />)
       expect(html).toContain('已迁移')
@@ -730,7 +731,7 @@ describe('AudioGenerationSettings', () => {
       const firstRequestId = api.tests[0]!.requestId
       act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, baseUrl: 'https://changed.example.com' }))
       await act(async () => { await Promise.resolve(); await Promise.resolve() })
-      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, modelId: 'changed-model' }))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, models: [{ id: 'changed-model', voices: [] }] }))
       await act(async () => { await requireController(controller).testProfile() })
       expect(api.tests).toHaveLength(1)
       expect(api.cancellations.every((requestId) => requestId === firstRequestId)).toBeTrue()
@@ -922,7 +923,7 @@ describe('AudioGenerationSettings', () => {
       api.resolveTest({ requestId: firstId, state: 'failed', message: '旧失败' })
       await act(async () => { await first })
       expect(requireController(controller).testStates[profile.id]?.requestId).toBe(secondId)
-      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, voices: [{ id: 'changed', name: 'changed', source: 'manual' }] }))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, models: [{ id: 'mimo-v1', voices: [{ id: 'changed', name: 'changed', source: 'manual' }] }] }))
       expect(api.cancellations).toContain(secondId)
       api.resolveTest({ requestId: secondId, state: 'success', message: '旧成功' })
       await act(async () => { await second })

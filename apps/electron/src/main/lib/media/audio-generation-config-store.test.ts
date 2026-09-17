@@ -60,8 +60,7 @@ function xiaomiProfile(overrides: Partial<AudioGenerationProfile> = {}): AudioGe
     name: '小米主音色',
     provider: 'xiaomi',
     baseUrl: 'https://tts.example/v1/audio',
-    modelId: 'mimo-tts',
-    voices: [{ id: 'voice-1', name: '默认音色', source: 'manual' as const }],
+    models: [{ id: 'mimo-tts', voices: [{ id: 'voice-1', name: '默认音色', source: 'manual' as const }] }],
     enabled: true,
     createdAt: 10,
     updatedAt: 20,
@@ -91,14 +90,14 @@ afterEach(() => {
 
 describe('独立音频生成配置存储', () => {
   test('Given 首次读取 When 文件不存在 Then 返回 revision 0 空目录', () => {
-    expect(createStore().readPublic()).toEqual({ schemaVersion: 2, revision: 0, profiles: [] })
+    expect(createStore().readPublic()).toEqual({ schemaVersion: 3, revision: 0, profiles: [] })
   })
 
   test('Given 新配置与 API Key When 替换目录 Then 仅原子持久化 safeStorage 密文', () => {
     const saved = createStore().replace(firstRequest())
 
     expect(saved).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 1,
       profiles: [{
         ...xiaomiProfile(),
@@ -193,7 +192,7 @@ describe('独立音频生成配置存储', () => {
     const ciphertext = Buffer.from('encrypted:secret-key').toString('base64')
 
     expect(store.replace({ expectedRevision: 1, profiles: [] })).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 2,
       profiles: [],
     })
@@ -241,9 +240,10 @@ describe('独立音频生成配置存储', () => {
     const validCiphertext = Buffer.from('encrypted:secret-key').toString('base64')
     const invalidCatalogs: string[] = [
       '{not-json',
-      JSON.stringify({ schemaVersion: 3, revision: 0, profiles: [] }),
-      JSON.stringify({ schemaVersion: 2, revision: -1, profiles: [] }),
-      JSON.stringify({ schemaVersion: 2, revision: 0, profiles: [], unknown: true }),
+      /** 未来版本必须被拒绝，不能按当前版本误读。 */
+      JSON.stringify({ schemaVersion: 4, revision: 0, profiles: [] }),
+      JSON.stringify({ schemaVersion: 3, revision: -1, profiles: [] }),
+      JSON.stringify({ schemaVersion: 3, revision: 0, profiles: [], unknown: true }),
       JSON.stringify({
         schemaVersion: 2,
         revision: 1,
@@ -303,15 +303,14 @@ describe('独立音频生成配置存储', () => {
     writeFileSync(configPath, legacyContents, { mode: 0o600 })
 
     expect(createStore().readPublic()).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 4,
       profiles: [{
         id: 'xiaomi-legacy',
         name: '旧版小米',
         provider: 'xiaomi',
         baseUrl: 'https://tts.example/v1/audio',
-        modelId: 'mimo-tts',
-        voices: [{ id: 'legacy-voice', name: 'legacy-voice', source: 'manual' }],
+        models: [{ id: 'mimo-tts', voices: [{ id: 'legacy-voice', name: 'legacy-voice', source: 'manual' }] }],
         enabled: true,
         createdAt: 10,
         updatedAt: 20,
@@ -325,7 +324,7 @@ describe('独立音频生成配置存储', () => {
 
   test('Given 配置路径是符号链接 When 读取 Then 不跟随到外部文件', () => {
     const externalPath = join(directory, 'external.json')
-    writeFileSync(externalPath, JSON.stringify({ schemaVersion: 2, revision: 0, profiles: [] }))
+    writeFileSync(externalPath, JSON.stringify({ schemaVersion: 3, revision: 0, profiles: [] }))
     symlinkSync(externalPath, configPath)
 
     expect(() => createStore().readPublic()).toThrow('AUDIO_GENERATION_CONFIG_INVALID')

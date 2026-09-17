@@ -48,11 +48,13 @@ async function settle(window: BrowserWindow): Promise<void> {
 
 /** 使用真实鼠标事件点击稳定选择器匹配的元素。 */
 async function clickSelector(window: BrowserWindow, selector: string, message: string): Promise<void> {
-  const point = await window.webContents.executeJavaScript(`(() => {
+  const point = await window.webContents.executeJavaScript(`(async () => {
     const element = document.querySelector(${JSON.stringify(selector)});
     if (!(element instanceof HTMLElement) || element.matches(':disabled')) return null;
     const rect = element.getBoundingClientRect();
     element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    /** 滚动可能是平滑动画，必须等两帧再测量，否则点击会落在旧坐标上。 */
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     const next = element.getBoundingClientRect();
     return { x: Math.round(next.left + next.width / 2), y: Math.round(next.top + next.height / 2) };
   })()`)
@@ -92,6 +94,18 @@ async function selectProvider(window: BrowserWindow, label: string): Promise<voi
     }
   }
   assert.fail(`供应商未切换到 ${label}`)
+}
+
+/** 按 aria-label 点击普通按钮或可点击行，用于列表内的选择动作。 */
+async function clickAriaLabel(window: BrowserWindow, label: string): Promise<void> {
+  const clicked = await window.webContents.executeJavaScript(`(() => {
+    const target = document.querySelector(${JSON.stringify(`[aria-label="${label}"]`)});
+    if (!(target instanceof HTMLElement)) return false;
+    target.scrollIntoView({ block: 'center', inline: 'nearest' });
+    target.click();
+    return true;
+  })()`)
+  assert.equal(clicked, true, `找不到可点击元素：${label}`)
 }
 
 /**
@@ -181,7 +195,7 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await waitFor(window, `document.querySelector('#audio-provider') && !document.querySelector('#audio-group-id')`, '小米草稿字段不正确')
   /** 新建小米配置必须自动带入官方默认服务地址与默认模型。 */
   assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-base-url')?.value`), 'https://api.xiaomimimo.com/v1', '小米草稿未自动填入默认服务地址')
-  assert.equal(await window.webContents.executeJavaScript(`document.querySelector('#audio-model-id')?.value`), 'mimo-v2.5-tts', '小米草稿未自动填入默认模型')
+  await waitFor(window, `document.querySelector('button[aria-label="查看 mimo-v2.5-tts 的音色"]') !== null`, '小米草稿未自动带入默认模型')
   assert.equal(await window.webContents.executeJavaScript(`document.body.textContent?.includes('预览：https://api.xiaomimimo.com/v1/chat/completions')`), true, '服务地址预览未展示真实请求路径')
   await selectProvider(window, 'MiniMax Speech')
   await waitFor(window, `document.querySelector('#audio-group-id')`, 'MiniMax 未显示 Group ID')
@@ -190,7 +204,7 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await clickButton(window, '从供应商获取')
   await waitFor(window, `document.body.textContent?.includes('mimo-v2.5-tts-voiceclone')`, '模型列表未渲染到界面')
   await clickRoleButton(window, 'mimo-v2.5-tts-voiceclone')
-  await waitFor(window, `document.querySelector('#audio-model-id')?.value === 'mimo-v2.5-tts-voiceclone'`, '点选模型未写回模型 ID')
+  await waitFor(window, `document.querySelector('button[aria-label="查看 mimo-v2.5-tts-voiceclone 的音色"]') !== null`, '点选模型未加入已启用模型')
   /** 同一批拉取里的远端音色必须可以直接加入已启用音色。 */
   await waitFor(window, `document.body.textContent?.includes('远端 smoke 音色')`, '远端音色未渲染到可用音色')
   await clickRoleButton(window, '远端 smoke 音色')
@@ -201,6 +215,9 @@ async function verifyProviderFields(window: BrowserWindow): Promise<void> {
   await clickButton(window, '从供应商获取')
   await waitFor(window, `document.body.textContent?.includes('mimo-v2.5-tts-voiceclone')`, '小米模型列表未渲染')
   await clickRoleButton(window, 'mimo-v2.5-tts-voiceclone')
+  /** 隐藏窗口的命中测试不可靠，行内按钮统一用 DOM click 触发。 */
+  await clickAriaLabel(window, '查看 mimo-v2.5-tts-voiceclone 的音色')
+  await waitFor(window, `document.body.textContent?.includes('归属模型 mimo-v2.5-tts-voiceclone')`, '选中模型未切换到复刻模型')
   await waitFor(window, `document.body.textContent?.includes('音频样本的 base64')`, '声音复刻模型未提示音色样本要求')
   assert.equal(await window.webContents.executeJavaScript(`document.body.textContent?.includes('MiMo-默认')`), false, '声音复刻模型仍展示内置音色')
   await clickButton(window, '取消')

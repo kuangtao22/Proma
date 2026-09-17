@@ -21,8 +21,7 @@ function profile(
     id: `${provider}-main`,
     name: `${provider} 主配置`,
     baseUrl: `https://${provider}.example/v1/audio`,
-    modelId: `${provider}-model`,
-    voices: [{ id: `${provider}-voice`, name: `${provider}-voice`, source: 'manual' as const }],
+    models: [{ id: `${provider}-model`, voices: [{ id: `${provider}-voice`, name: `${provider}-voice`, source: 'manual' as const }] }],
     enabled: true,
     createdAt: 10,
     updatedAt: 20,
@@ -47,7 +46,7 @@ function catalog(
   savedProfile: AudioGenerationProfile = profile(),
 ): AudioGenerationPublicCatalog {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: 1,
     profiles: [{
       ...savedProfile,
@@ -320,7 +319,7 @@ describe('独立音频供应商测试服务', () => {
 
   test('Given Store 查找或解密失败 When 测试已保存配置 Then 只返回固定 failed', async () => {
     for (const store of [
-      storeFixture({ publicCatalog: { schemaVersion: 2, revision: 0, profiles: [] } }),
+      storeFixture({ publicCatalog: { schemaVersion: 3, revision: 0, profiles: [] } }),
       storeFixture({ readError: new Error('/Users/alice/corrupt-config') }),
       storeFixture({ resolveError: new Error('Bearer saved-secret') }),
     ]) {
