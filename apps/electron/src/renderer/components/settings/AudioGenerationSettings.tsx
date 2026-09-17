@@ -1164,7 +1164,9 @@ function AudioEnabledVoiceList({ voices, disabled, onChange }: {
  * 可用音色：官方内置清单点击即添加，底部保留手填一行。
  * 入参：已启用集合、内置清单、禁用态与集合变更回调；返回值：可用音色视图。
  */
-function AudioAvailableVoices({ voices, builtinVoices, fetchedVoices, capability, disabled, onChange }: {
+function AudioAvailableVoices({ provider, voices, builtinVoices, fetchedVoices, capability, disabled, onChange }: {
+  /** 当前供应商，用于区分音色为空时的引导文案。 */
+  provider: AudioGenerationProvider
   voices: readonly AudioGenerationVoice[]
   builtinVoices: readonly AudioGenerationVoice[]
   fetchedVoices: readonly AudioGenerationVoice[]
@@ -1219,6 +1221,13 @@ function AudioAvailableVoices({ voices, builtinVoices, fetchedVoices, capability
           <span className="flex-1 text-sm text-foreground">{voice.name ?? voice.id}</span>
         </div>
       ))}
+      {capability === 'voice-id' && candidates.length === 0 && (
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+          {provider === 'minimax'
+            ? '点右上角「从供应商获取」读取该账号的音色，也可在下方手填'
+            : '点右上角「从供应商获取」读取音色，也可在下方手填'}
+        </div>
+      )}
       {builtinVoices.length > 0 && availableBuiltins.length === 0 && (
         <div className="px-4 py-6 text-center text-sm text-muted-foreground">所有内置音色已启用</div>
       )}
@@ -1397,8 +1406,14 @@ export function AudioGenerationCatalogView({ controller, navigation, headerConte
           />
         </SettingsSection>
 
-        <SettingsSection title="可用音色">
+        <SettingsSection
+          title="可用音色"
+          action={selectedModel
+            ? <FetchCatalogButton catalog={catalogForDraft} disabled={actionDisabled} onFetch={controller.fetchCatalog} />
+            : undefined}
+        >
           <AudioAvailableVoices
+            provider={draft.provider}
             voices={selectedModel?.voices ?? []}
             builtinVoices={resolvedVoiceCapability === 'voice-id' ? providerDefaults.builtinVoices : []}
             fetchedVoices={resolvedVoiceCapability === 'voice-id' ? catalogForDraft?.voices ?? [] : []}
