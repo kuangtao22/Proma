@@ -317,13 +317,24 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   }
 
   return (
-    <MediaSettingsPage title="生图模型" action={<Button type="button" size="sm" disabled={loading || saving} onClick={controller.startCreate}><Plus />添加生图配置</Button>} headerContent={headerContent}>
+    <MediaSettingsPage title="生图模型 · 独立供应商配置" action={<Button type="button" size="sm" disabled={loading || saving} onClick={controller.startCreate}><Plus />添加生图配置</Button>} headerContent={headerContent}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         {navigation}
         <div className="relative w-64 max-w-full"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-9" aria-label="搜索生图配置" placeholder="搜索名称、供应商或模型" value={query} onChange={(event) => controller.setQuery(event.target.value)} /></div>
       </div>
       {children}
-      {loadError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 border border-destructive/30 px-3 py-2 text-xs text-destructive"><span>{loadError}</span><Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void controller.load()}>重新加载</Button></div>}
+      {/** 读取失败必须显眼：细条容易被误当成“还在加载”。 */}
+      {loadError && (
+        <SettingsCard divided={false}>
+          <div role="alert" className="flex flex-wrap items-center justify-between gap-3 px-4 py-6">
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium text-destructive">{loadError}</p>
+              <p className="text-xs text-muted-foreground">诊断信息已打印到开发者控制台（以 [生图配置] 开头）。</p>
+            </div>
+            <Button type="button" size="sm" variant="outline" disabled={loading} onClick={() => void controller.load()}>重新加载</Button>
+          </div>
+        </SettingsCard>
+      )}
       {actionError && !deleteId && <p role="alert" className="border border-destructive/30 px-3 py-2 text-xs text-destructive">{actionError}</p>}
       {settings?.legacyWarning && <p className="border border-border/60 px-3 py-2 text-xs text-muted-foreground">{settings.legacyWarning}</p>}
       {settings && settings.legacyImageProfiles.length > 0 && (
