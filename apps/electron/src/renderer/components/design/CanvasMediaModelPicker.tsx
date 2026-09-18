@@ -8,6 +8,7 @@ import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getJimengLogo, getProviderLogo } from '@/lib/model-logo'
 
 /** 供应商稳定标识到中文名的展示映射，与生成模型设置页保持一致。 */
@@ -126,26 +127,25 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
         {(['all', 'image', 'audio', 'video'] as const).map((value) => <Button key={value} type="button" variant={kind === value ? 'secondary' : 'ghost'} size="sm" className="h-7 px-1 text-xs" aria-pressed={kind === value} onClick={() => setKind(value)}>{({ all: '全部', image: '图片', audio: '音频', video: '视频' })[value]}</Button>)}
       </div>
       {/**
-        * 两种使用方式用页签切换：
+        * 两种使用方式用项目自带的 Tabs 组件切换：
         * 自动 = 只选供应商，具体模型由 agent 在范围内适配；自定义 = 逐条指定模型。
         */}
-      <div role="tablist" aria-label="模型选择方式" className="my-2 grid grid-cols-2 gap-1 rounded bg-muted/40 p-1">
-        {([['auto', '按供应商自动'], ['manual', '自定义模型']] as const).map(([value, label]) => (
-          <Button key={value} type="button" role="tab" size="sm" aria-selected={mode === value}
-            variant={mode === value ? 'secondary' : 'ghost'} className="h-7 text-xs"
-            disabled={disabled || loading || !!error}
-            onClick={() => {
-              if (value === mode) return
-              /** 切到自动时保留当前可用范围；切到自定义时固定当前生效模型，避免选择丢失。 */
-              if (value === 'auto') onChange(providerIds.length > 0 && selectedProviders.length === providerIds.length
-                ? { mode: 'all-enabled' }
-                : { mode: 'providers', providers: selectedProviders.length > 0 ? selectedProviders : providerIds })
-              else onChange({ mode: 'selected', modelIds: selection.selectedIds })
-            }}>
-            {label}
-          </Button>
-        ))}
-      </div>
+      <Tabs value={mode} className="my-2" onValueChange={(value) => {
+        if (value === mode) return
+        /** 切到自动时保留当前可用范围；切到自定义时固定当前生效模型，避免选择丢失。 */
+        if (value === 'auto') {
+          onChange(providerIds.length > 0 && selectedProviders.length === providerIds.length
+            ? { mode: 'all-enabled' }
+            : { mode: 'providers', providers: selectedProviders.length > 0 ? selectedProviders : providerIds })
+          return
+        }
+        onChange({ mode: 'selected', modelIds: selection.selectedIds })
+      }}>
+        <TabsList aria-label="模型选择方式" className="w-full">
+          <TabsTrigger value="auto" className="flex-1 text-xs" disabled={disabled || loading || !!error}>按供应商自动</TabsTrigger>
+          <TabsTrigger value="manual" className="flex-1 text-xs" disabled={disabled || loading || !!error}>自定义模型</TabsTrigger>
+        </TabsList>
+      </Tabs>
       <div className="max-h-64 overflow-y-auto" aria-busy={loading}>
         {loading ? <div role="status" className="flex justify-center py-5"><LoaderCircle className="size-4 animate-spin" aria-label="正在加载媒体模型" /></div> : error ? <div role="alert" className="py-3 text-sm text-destructive">{error}<Button variant="ghost" size="sm" onClick={() => { void load() }}>重试</Button></div> : <>
           {/**
