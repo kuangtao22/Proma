@@ -24,6 +24,7 @@ import {
   imageProfileIdentity,
   IMAGE_PROVIDER_LABELS,
   profileToDraft,
+  providerUsesApiKey,
   type ImageGenerationDraft,
 } from './ImageGenerationSettings.logic'
 
@@ -32,6 +33,8 @@ export interface ImageGenerationSettingsApi {
   getSettings: () => Promise<ImageGenerationSettingsResult>
   replaceCatalog: (request: ReplaceImageGenerationCatalogRequest) => Promise<ImageGenerationSettingsResult>
   fetchCatalog: (input: ImageGenerationCatalogFetchInput) => Promise<ImageGenerationCatalogFetchResult>
+  /** 读取已保存配置的明文 API Key，仅用于编辑表单回填。 */
+  revealCredential: (profileId: string) => Promise<string>
 }
 
 /** 供应商目录拉取的展示状态；draftIdentity 保证迟到结果不串草稿。 */
@@ -141,6 +144,12 @@ export function imageSettingsApiFromWindow(): ImageGenerationSettingsApi {
     },
     replaceCatalog: (request) => window.electronAPI.mediaReplaceImageGenerationCatalog(request),
     fetchCatalog: (input) => window.electronAPI.mediaFetchImageGenerationCatalog(input),
+    revealCredential: (profileId) => {
+      /** preload 未更新时接口不存在，抛出可识别的稳定错误。 */
+      const call = window.electronAPI?.mediaRevealImageGenerationCredential
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(profileId)
+    },
   }
 }
 
@@ -341,6 +350,19 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       setActionError(null)
       setCatalog(null)
       setDraft(profileToDraft(profile))
+      /**
+       * 与模型配置一致：编辑时回填已保存的明文 Key，方便查看与局部修改。
+       * 解密失败或接口不可用时保持留空，此时仍按“留空即保留原凭据”保存。
+       */
+      if (providerUsesApiKey(profile.provider) && profile.credentialConfigured) {
+        void api.revealCredential(profile.id).then((apiKey) => {
+          if (!mountedRef.current || !apiKey) return
+          /** 只在仍是同一草稿且用户尚未输入时回填，不覆盖正在编辑的内容。 */
+          setDraft((current) => (current && current.id === profile.id && current.apiKey === ''
+            ? { ...current, apiKey }
+            : current))
+        }).catch(() => undefined)
+      }
     },
     startCopy: (profile) => {
       baselineRef.current = null

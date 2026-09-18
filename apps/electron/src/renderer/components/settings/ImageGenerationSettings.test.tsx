@@ -97,6 +97,15 @@ describe('独立生图设置页视图', () => {
     expect(html).toContain('从供应商获取')
   })
 
+  test('Given 密钥型草稿 When 渲染密钥输入 Then 默认明文并可临时隐藏', () => {
+    /** 与模型配置一致：默认能直接看到 Key，眼睛按钮只负责临时遮挡。 */
+    const draft = profileToDraft(createSettings().catalog.profiles[0]!)
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    const apiKeyInput = html.match(/<input[^>]*id="image-api-key"[^>]*>/)?.[0] ?? ''
+    expect(apiKeyInput).toContain('type="text"')
+    expect(html).toContain('aria-label="隐藏 API Key"')
+  })
+
   test('Given 拉取失败 When 渲染可用模型 Then 展示固定失败提示', () => {
     const draft = { ...createImageGenerationDraft('openai-images', 'image-o', 10), name: 'GPT' }
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({

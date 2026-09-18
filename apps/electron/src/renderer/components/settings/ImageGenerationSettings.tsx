@@ -12,7 +12,7 @@ import type {
   ImageGenerationProvider,
 } from '@proma/shared'
 import { IMAGE_GENERATION_PROVIDER_DESCRIPTORS } from '@proma/shared'
-import { CheckCircle2, Copy, Download, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
+import { CheckCircle2, Copy, Download, Eye, EyeOff, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
@@ -217,6 +217,8 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
 } & ImageGenerationSettingsProps): React.ReactElement {
   const { settings, loading, saving, loadError, actionError, query, draft, deleteId, visibleProfiles } = controller
   const deleteTarget = settings?.catalog.profiles.find((profile) => profile.id === deleteId)
+  /** API Key 默认明文显示，与模型配置一致；眼睛按钮只负责临时遮挡。 */
+  const [showApiKey, setShowApiKey] = React.useState(true)
   /** 即梦登录面板在 S4 接通前只做说明，按钮禁用。 */
   const dreaminaNotice = (
     <div className="space-y-2 px-4 py-3">
@@ -274,15 +276,28 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
                 />
                 <div className="space-y-2 px-4 py-3">
                   <div className="text-sm font-medium text-foreground">API Key</div>
-                  <Input
-                    id="image-api-key"
-                    type="password"
-                    autoComplete="new-password"
-                    value={draft.apiKey}
-                    disabled={saving}
-                    placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'}
-                    onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })}
-                  />
+                  <div className="relative">
+                    <Input
+                      id="image-api-key"
+                      type={showApiKey ? 'text' : 'password'}
+                      autoComplete="new-password"
+                      className="pr-10"
+                      value={draft.apiKey}
+                      disabled={saving}
+                      placeholder={draft.credentialConfigured ? '留空以保留已保存凭据' : '请输入 API Key'}
+                      onChange={(event) => controller.updateDraft({ ...draft, apiKey: event.target.value })}
+                    />
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                      title={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground transition-colors hover:text-foreground"
+                      onClick={() => setShowApiKey(!showApiKey)}
+                    >
+                      {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
                 </div>
                 {draft.provider === 'minimax' && (
                   <SettingsInput

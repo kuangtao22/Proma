@@ -78,6 +78,8 @@ function createApi(initial = createSettings()): ImageGenerationSettingsApi & {
       fetches.push(input)
       return { ...fetchResult, requestId: input.requestId }
     },
+    /** 默认返回已保存的明文凭据，用于断言编辑回填。 */
+    revealCredential: async () => 'sk-saved-plaintext',
   }
 }
 
@@ -215,6 +217,35 @@ describe('独立生图设置控制器', () => {
       expect(api.fetches[0]).toMatchObject({ provider: 'minimax', credential: { mode: 'draft', apiKey: 'secret' } })
       expect(requireController(controller).catalog).toMatchObject({ state: 'success', models: [{ id: 'gpt-image-2' }] })
       expect(requireController(controller).actionError).toBeNull()
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 已保存密钥型配置 When 编辑 Then 回填明文 Key 且不覆盖用户输入', async () => {
+    const api = createApi()
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      /** 解密是异步的，需要让微任务队列走完。 */
+      await act(async () => { await Promise.resolve() })
+      expect(requireController(controller).draft?.apiKey).toBe('sk-saved-plaintext')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 用户已开始输入 When 解密结果迟到 Then 不覆盖正在编辑的 Key', async () => {
+    const api = createApi()
+    let releaseKey!: (key: string) => void
+    api.revealCredential = () => new Promise<string>((resolve) => { releaseKey = resolve })
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'sk-user-typed' }))
+      releaseKey('sk-saved-plaintext')
+      await act(async () => { await Promise.resolve() })
+      expect(requireController(controller).draft?.apiKey).toBe('sk-user-typed')
     } finally { act(() => host.unmount()); host.restore() }
   })
 })

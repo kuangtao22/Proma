@@ -31,11 +31,13 @@ export interface ImageGenerationIpcService {
   replace(input: ReplaceImageGenerationCatalogRequest): ImageGenerationSettingsResult
   /** 向供应商拉取可用模型，同时充当连接测试。 */
   fetchCatalog(input: ImageGenerationCatalogFetchInput): Promise<ImageGenerationCatalogFetchResult>
+  /** 读取单条配置的明文 API Key，仅用于编辑表单回填。 */
+  revealCredential(profileId: string): string
 }
 
 /** 生图 IPC 服务工厂的显式依赖，不让 Renderer 接触凭据存储。 */
 export interface ImageGenerationIpcServiceOptions {
-  store: Pick<ImageGenerationConfigStore, 'readPublic' | 'replace'>
+  store: Pick<ImageGenerationConfigStore, 'readPublic' | 'replace' | 'resolveApiKey'>
   catalog: Pick<ImageGenerationCatalogService, 'fetch'>
   listLegacyCatalog(): MediaApiModelCatalogResult
 }
@@ -146,6 +148,15 @@ export function createImageGenerationIpcService(options: ImageGenerationIpcServi
       /** 在触碰凭据与网络前先做严格解析。 */
       const request = parseImageGenerationCatalogFetchInput(input)
       return options.catalog.fetch(request).then(parseImageGenerationCatalogFetchResult)
+    },
+    revealCredential: (profileId) => {
+      /** 只按稳定 ID 解密；目录读取路径不受影响，仍只返回脱敏摘要。 */
+      if (typeof profileId !== 'string' || !profileId.trim()) throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+      try {
+        return options.store.resolveApiKey(profileId)
+      } catch (error) {
+        throwStableImageError(error, 'IMAGE_GENERATION_CREDENTIAL_DECRYPT_FAILED')
+      }
     },
   }
 }

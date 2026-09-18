@@ -374,6 +374,7 @@ export const MEDIA_IPC_CHANNELS = {
   GET_IMAGE_GENERATION_SETTINGS: 'media:get-image-generation-settings',
   REPLACE_IMAGE_GENERATION_CATALOG: 'media:replace-image-generation-catalog',
   FETCH_IMAGE_GENERATION_CATALOG: 'media:fetch-image-generation-catalog',
+  REVEAL_IMAGE_GENERATION_CREDENTIAL: 'media:reveal-image-generation-credential',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
@@ -409,6 +410,11 @@ export interface MediaPreloadApi {
   mediaReplaceImageGenerationCatalog(input: ReplaceImageGenerationCatalogRequest): Promise<ImageGenerationSettingsResult>
   /** 从生图供应商拉取可用模型（同时充当连接测试）。 */
   mediaFetchImageGenerationCatalog(input: ImageGenerationCatalogFetchInput): Promise<ImageGenerationCatalogFetchResult>
+  /**
+   * 读取已保存生图配置的明文 API Key，仅供编辑表单回填。
+   * 目录读取仍只返回脱敏摘要，这是唯一一次显式解密入口。
+   */
+  mediaRevealImageGenerationCredential(profileId: string): Promise<string>
   /** 取消当前窗口发起的指定音频测试。 */
   mediaCancelAudioGenerationTest(requestId: string): Promise<void>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>

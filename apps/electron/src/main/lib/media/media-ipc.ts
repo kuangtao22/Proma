@@ -2,6 +2,7 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import {
   AUDIO_GENERATION_CATALOG_SCHEMA_VERSION,
   AUDIO_GENERATION_LEGACY_WARNING,
+  IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH,
   MEDIA_IPC_CHANNELS,
   parseImageGenerationCatalogFetchInput,
   parseImageGenerationCatalogFetchResult,
@@ -270,6 +271,18 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
   const assertNoInput = (value: unknown): void => {
     if (value !== undefined) throw new Error('AUDIO_GENERATION_CONFIG_INVALID')
   }
+  /**
+   * 单条生图配置 ID 的调用合同：只接受 { profileId }。
+   * 长度沿用 Shared 的上限，避免 Renderer 传入超长或非字符串标识。
+   */
+  const readImageProfileId = (value: unknown): string => {
+    if (typeof value !== 'object' || value === null) throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    const profileId = (value as { profileId?: unknown }).profileId
+    if (typeof profileId !== 'string' || !profileId.trim() || profileId.length > IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH) {
+      throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+    return profileId.trim()
+  }
   /** 首次测试为 sender 建立 owner 清理；后续测试复用同一监听。 */
   const registerAudioOwner = (event: IpcMainInvokeEvent): void => {
     if (audioCleanupListeners.has(event.sender)) return
@@ -325,6 +338,18 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
     } catch (error) {
       if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
       throwStableImageError(error, 'IMAGE_GENERATION_CATALOG_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.REVEAL_IMAGE_GENERATION_CREDENTIAL, (value, event) => {
+    const profileId = readImageProfileId(value)
+    try {
+      const apiKey = options.imageGeneration.revealCredential(profileId)
+      /** 解密后再次核权，销毁或撤权窗口不能收到迟到明文。 */
+      if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
+      return apiKey
+    } catch (error) {
+      if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
+      throwStableImageError(error, 'IMAGE_GENERATION_CREDENTIAL_DECRYPT_FAILED')
     }
   })
   handle(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, async (value, event) => {

@@ -38,6 +38,7 @@ const unusedImageGenerationService: ImageGenerationIpcService = {
   listSettings: () => ({ catalog: { schemaVersion: 1, revision: 0, profiles: [] }, legacyImageProfiles: [] }),
   replace: () => ({ catalog: { schemaVersion: 1, revision: 0, profiles: [] }, legacyImageProfiles: [] }),
   fetchCatalog: unusedImageCatalogFetch,
+  revealCredential: () => { throw new Error('unused') },
 }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
@@ -70,11 +71,12 @@ function createMediaOptions(
   handlers: Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>,
   audioGeneration: AudioGenerationIpcService,
   isAuthorizedSender: MediaIpcOptions['isAuthorizedSender'] = () => true,
+  imageGeneration: ImageGenerationIpcService = unusedImageGenerationService,
 ): MediaIpcOptions {
   return {
     ipc: { handle: (channel, handler) => { handlers.set(channel, handler) }, removeHandler: (channel) => { handlers.delete(channel) } },
     isAuthorizedSender,
-    imageGeneration: unusedImageGenerationService,
+    imageGeneration,
     assertProject: () => undefined,
     configuration: {
       read: () => ({ schemaVersion: 1, revision: 0, connections: [], workflows: [], profiles: [] }),
@@ -641,6 +643,35 @@ describe('独立音频生成 IPC', () => {
       await expect(handlers.get(MEDIA_IPC_CHANNELS.TEST_AUDIO_GENERATION)!(event, {
         kind: 'saved', requestId: 'request-1', profileId: 'audio-1',
       })).rejects.toThrow('AUDIO_GENERATION_TEST_FAILED')
+    } finally { registration.dispose() }
+  })
+
+  test('Given 已保存生图配置 When 读取明文凭据 Then 走专用通道且只接受 profileId', () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const revealed: string[] = []
+    const registration = registerMediaIpcHandlers(createMediaOptions(handlers, createService(), () => true, {
+      ...unusedImageGenerationService,
+      revealCredential: (profileId) => {
+        if (profileId === 'image-missing') throw new Error('IMAGE_GENERATION_PROFILE_NOT_FOUND')
+        /** 未登记的异常不得原样穿过 IPC。 */
+        if (profileId === 'image-boom') throw new Error('IMAGE_GENERATION_STORAGE_BOOM')
+        revealed.push(profileId)
+        return 'sk-plaintext-value'
+      },
+    }))
+    const event = { sender: { id: 21 } } as unknown as IpcMainInvokeEvent
+    const handler = handlers.get(MEDIA_IPC_CHANNELS.REVEAL_IMAGE_GENERATION_CREDENTIAL)!
+    try {
+      expect(handler(event, { profileId: 'image-1' })).toBe('sk-plaintext-value')
+      expect(revealed).toEqual(['image-1'])
+      /** 稳定错误码原样保留，未知异常统一收敛为解密失败。 */
+      expect(() => handler(event, { profileId: 'image-missing' })).toThrow('IMAGE_GENERATION_PROFILE_NOT_FOUND')
+      expect(() => handler(event, { profileId: 'image-boom' })).toThrow('IMAGE_GENERATION_CREDENTIAL_DECRYPT_FAILED')
+      /** 调用合同只接受 { profileId }，其余形态一律拒绝。 */
+      expect(() => handler(event, 'image-1')).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+      expect(() => handler(event, { profileId: '   ' })).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+      expect(() => handler(event, { profileId: 'x'.repeat(257) })).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+      expect(revealed).toEqual(['image-1'])
     } finally { registration.dispose() }
   })
 
