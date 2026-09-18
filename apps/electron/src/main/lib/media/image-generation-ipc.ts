@@ -5,6 +5,10 @@
  * 旧统一媒体目录始终只读，任何写入都必须走新的独立目录。
  */
 import type {
+  ImageGenerationDreaminaLoginPollResult,
+  ImageGenerationDreaminaLoginStartResult,
+  ImageGenerationDreaminaLogoutResult,
+  ImageGenerationDreaminaStatus,
   ImageGenerationCatalogFetchInput,
   ImageGenerationCatalogFetchResult,
   ImageGenerationPublicCatalog,
@@ -14,12 +18,19 @@ import type {
   ReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
 import {
+  DREAMINA_LOGIN_MESSAGES,
   IMAGE_GENERATION_LEGACY_WARNING,
   parseImageGenerationCatalogFetchInput,
   parseImageGenerationCatalogFetchResult,
   parseImageGenerationSettingsResult,
+  parseDreaminaLoginPollResult,
+  parseDreaminaLoginRequestInput,
+  parseDreaminaLoginStartResult,
+  parseDreaminaLogoutResult,
+  parseDreaminaStatus,
   parseReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
+import type { ImageGenerationDreaminaService } from './image-generation-dreamina-service'
 import type { ImageGenerationConfigStore } from './image-generation-config-store'
 import type { ImageGenerationCatalogService } from './image-generation-catalog-service'
 
@@ -33,12 +44,34 @@ export interface ImageGenerationIpcService {
   fetchCatalog(input: ImageGenerationCatalogFetchInput): Promise<ImageGenerationCatalogFetchResult>
   /** 读取单条配置的明文 API Key，仅用于编辑表单回填。 */
   revealCredential(profileId: string): string
+  /** 查询即梦登录态与剩余额度。 */
+  dreaminaStatus(input: unknown): Promise<ImageGenerationDreaminaStatus>
+  /** 发起即梦设备码登录，按窗口隔离。 */
+  dreaminaLogin(ownerId: number, input: unknown): Promise<ImageGenerationDreaminaLoginStartResult>
+  /** 轮询即梦设备码授权结果。 */
+  dreaminaLoginPoll(ownerId: number, input: unknown): Promise<ImageGenerationDreaminaLoginPollResult>
+  /** 幂等取消当前窗口指定的设备码登录。 */
+  dreaminaLoginCancel(ownerId: number, input: unknown): void
+  /** 清除本地即梦登录态。 */
+  dreaminaLogout(input: unknown): Promise<ImageGenerationDreaminaLogoutResult>
+  /** 窗口销毁时释放该窗口的设备码登录。 */
+  releaseDreaminaOwner(ownerId: number): void
+  /** IPC 整体卸载时释放资源；自定义服务可省略。 */
+  disposeDreamina?(): void
 }
 
 /** 生图 IPC 服务工厂的显式依赖，不让 Renderer 接触凭据存储。 */
 export interface ImageGenerationIpcServiceOptions {
   store: Pick<ImageGenerationConfigStore, 'readPublic' | 'replace' | 'resolveApiKey'>
   catalog: Pick<ImageGenerationCatalogService, 'fetch'>
+  /**
+   * 即梦 CLI 服务；未注入时所有即梦操作返回保守的不可用结果。
+   * dispose 可省略，便于测试注入最小替身。
+   */
+  dreamina?: Pick<
+    ImageGenerationDreaminaService,
+    'status' | 'startLogin' | 'pollLogin' | 'cancelLogin' | 'logout' | 'releaseOwner'
+  > & Partial<Pick<ImageGenerationDreaminaService, 'dispose'>>
   listLegacyCatalog(): MediaApiModelCatalogResult
 }
 
@@ -57,6 +90,8 @@ const IMAGE_GENERATION_STABLE_ERROR_CODES = new Set([
   'IMAGE_GENERATION_SECURE_STORAGE_UNAVAILABLE',
   'IMAGE_GENERATION_LEGACY_REFERENCE_INVALID',
   'IMAGE_GENERATION_CATALOG_FAILED',
+  'IMAGE_GENERATION_DREAMINA_STATUS_FAILED',
+  'IMAGE_GENERATION_DREAMINA_LOGIN_FAILED',
 ])
 
 /** 只把稳定错误码原样抛出，其它异常统一替换为给定兜底码。 */
@@ -158,5 +193,44 @@ export function createImageGenerationIpcService(options: ImageGenerationIpcServi
         throwStableImageError(error, 'IMAGE_GENERATION_CREDENTIAL_DECRYPT_FAILED')
       }
     },
+    dreaminaStatus: async (input) => {
+      /** 未注入 CLI 服务时明确报「找不到 CLI」，不假装查过。 */
+      if (!options.dreamina) {
+        return parseDreaminaStatus({
+          state: 'cliMissing',
+          credit: null,
+          message: DREAMINA_LOGIN_MESSAGES.statusCliMissing,
+        })
+      }
+      return options.dreamina.status(input)
+    },
+    dreaminaLogin: async (ownerId, input) => {
+      if (!options.dreamina) {
+        return parseDreaminaLoginStartResult({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.cliMissing })
+      }
+      return options.dreamina.startLogin(ownerId, input)
+    },
+    dreaminaLoginPoll: async (ownerId, input) => {
+      if (!options.dreamina) {
+        return parseDreaminaLoginPollResult({
+          requestId: parseDreaminaLoginRequestInput(input).requestId,
+          state: 'failed',
+          message: DREAMINA_LOGIN_MESSAGES.requestUnknown,
+        })
+      }
+      return options.dreamina.pollLogin(ownerId, input)
+    },
+    dreaminaLoginCancel: (ownerId, input) => {
+      /** 取消是幂等收尾，服务缺失时同样保持静默成功语义。 */
+      options.dreamina?.cancelLogin(ownerId, input)
+    },
+    dreaminaLogout: async (input) => {
+      if (!options.dreamina) {
+        return parseDreaminaLogoutResult({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.logoutFailed })
+      }
+      return options.dreamina.logout(input)
+    },
+    releaseDreaminaOwner: (ownerId) => { options.dreamina?.releaseOwner(ownerId) },
+    ...(options.dreamina?.dispose === undefined ? {} : { disposeDreamina: () => { options.dreamina?.dispose?.() } }),
   }
 }

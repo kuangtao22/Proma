@@ -7,13 +7,21 @@
  */
 import * as React from 'react'
 import type {
+  DreaminaCliInput,
+  DreaminaLoginRequestInput,
+  DreaminaLoginStartInput,
   ImageGenerationCatalogFetchInput,
   ImageGenerationCatalogFetchResult,
+  ImageGenerationDreaminaLoginPollResult,
+  ImageGenerationDreaminaLoginStartResult,
+  ImageGenerationDreaminaLogoutResult,
+  ImageGenerationDreaminaStatus,
   ImageGenerationModelEntry,
   ImageGenerationSettingsResult,
   ImageGenerationPublicProfile,
   ReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
+import { DREAMINA_LOGIN_MESSAGES } from '@proma/shared'
 import {
   copyImageGenerationProfile,
   createImageGenerationDraft,
@@ -35,6 +43,26 @@ export interface ImageGenerationSettingsApi {
   fetchCatalog: (input: ImageGenerationCatalogFetchInput) => Promise<ImageGenerationCatalogFetchResult>
   /** 读取已保存配置的明文 API Key，仅用于编辑表单回填。 */
   revealCredential: (profileId: string) => Promise<string>
+  /** 查询即梦登录态与剩余额度。 */
+  dreaminaStatus: (input: DreaminaCliInput) => Promise<ImageGenerationDreaminaStatus>
+  /** 发起即梦设备码登录。 */
+  dreaminaLoginStart: (input: DreaminaLoginStartInput) => Promise<ImageGenerationDreaminaLoginStartResult>
+  /** 轮询即梦设备码授权结果。 */
+  dreaminaLoginPoll: (input: DreaminaLoginRequestInput) => Promise<ImageGenerationDreaminaLoginPollResult>
+  /** 取消本窗口发起的一次设备码登录。 */
+  dreaminaLoginCancel: (input: DreaminaLoginRequestInput) => Promise<void>
+  /** 清除本地即梦登录态。 */
+  dreaminaLogout: (input: DreaminaCliInput) => Promise<ImageGenerationDreaminaLogoutResult>
+}
+
+/** 即梦登录面板的展示状态；device_code 不进渲染层。 */
+export interface ImageGenerationDreaminaLoginView {
+  state: 'idle' | 'starting' | 'pending' | 'success' | 'failed'
+  requestId: string | null
+  verificationUri: string | null
+  userCode: string | null
+  expiresInSeconds: number | null
+  message: string | null
 }
 
 /** 供应商目录拉取的展示状态；draftIdentity 保证迟到结果不串草稿。 */
@@ -70,7 +98,31 @@ export interface ImageGenerationController {
   closeDelete: () => void
   confirmDelete: () => Promise<void>
   fetchCatalog: () => Promise<void>
+  /** 即梦账号状态；未查询过时为 null。 */
+  dreaminaStatus: ImageGenerationDreaminaStatus | null
+  /** 即梦面板的登录流程状态。 */
+  dreaminaLogin: ImageGenerationDreaminaLoginView
+  /** 即梦任意异步操作进行中，用于禁用按钮。 */
+  dreaminaBusy: boolean
+  refreshDreaminaStatus: () => Promise<void>
+  startDreaminaLogin: (relogin?: boolean) => Promise<void>
+  pollDreaminaLogin: () => Promise<void>
+  cancelDreaminaLogin: () => Promise<void>
+  logoutDreamina: () => Promise<void>
 }
+
+/** 即梦登录面板的初始状态。 */
+export const EMPTY_DREAMINA_LOGIN: ImageGenerationDreaminaLoginView = {
+  state: 'idle',
+  requestId: null,
+  verificationUri: null,
+  userCode: null,
+  expiresInSeconds: null,
+  message: null,
+}
+
+/** 设备码轮询间隔；CLI 单次 checklogin 自带等待，界面不需要更密集地打点。 */
+const DREAMINA_POLL_INTERVAL_MS = 4_000
 
 /** 生成稳定且不重复的草稿 ID。 */
 function createImageGenerationId(): string {
@@ -150,6 +202,32 @@ export function imageSettingsApiFromWindow(): ImageGenerationSettingsApi {
       if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
       return call(profileId)
     },
+    /** 即梦通道同样在 preload 缺失时给出可识别的稳定错误。 */
+    dreaminaStatus: (input) => {
+      const call = window.electronAPI?.mediaDreaminaLoginStatus
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(input)
+    },
+    dreaminaLoginStart: (input) => {
+      const call = window.electronAPI?.mediaDreaminaLoginStart
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(input)
+    },
+    dreaminaLoginPoll: (input) => {
+      const call = window.electronAPI?.mediaDreaminaLoginPoll
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(input)
+    },
+    dreaminaLoginCancel: (input) => {
+      const call = window.electronAPI?.mediaDreaminaLoginCancel
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(input)
+    },
+    dreaminaLogout: (input) => {
+      const call = window.electronAPI?.mediaDreaminaLogout
+      if (typeof call !== 'function') throw new Error('IMAGE_GENERATION_PRELOAD_MISSING')
+      return call(input)
+    },
   }
 }
 
@@ -165,6 +243,10 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const [draft, setDraft] = React.useState<ImageGenerationDraft | null>(null)
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
   const [catalog, setCatalog] = React.useState<ImageGenerationCatalogViewState | null>(null)
+  /** 即梦账号状态与登录流程状态；只在即梦草稿里展示。 */
+  const [dreaminaStatus, setDreaminaStatus] = React.useState<ImageGenerationDreaminaStatus | null>(null)
+  const [dreaminaLogin, setDreaminaLogin] = React.useState<ImageGenerationDreaminaLoginView>(EMPTY_DREAMINA_LOGIN)
+  const [dreaminaBusy, setDreaminaBusy] = React.useState(false)
   /** 编辑基线用于检测外部修改；保存成功后更新。 */
   const baselineRef = React.useRef<{ id: string; fingerprint: string } | null>(null)
   /**
@@ -296,6 +378,134 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     }
   }, [api, deleteId, saving, settings])
 
+  /** 当前草稿的 CLI 路径；即梦调用只读这里，避免把整份草稿塞进依赖数组。 */
+  const dreaminaCliPathRef = React.useRef<string | undefined>(undefined)
+  /** 设备码登录身份；轮询回调只认最新的 requestId，迟到结果不覆盖新流程。 */
+  const dreaminaRequestRef = React.useRef<string | null>(null)
+  /** 在 effect 里同步 CLI 路径，避免渲染期间写 ref。 */
+  React.useEffect(() => {
+    dreaminaCliPathRef.current = draft?.provider === 'dreamina' ? draft.cliPath : undefined
+  }, [draft])
+
+  /** 组织即梦 CLI 调用的可选路径参数，缺省时由主进程按 PATH 解析。 */
+  const dreaminaCliInput = React.useCallback((): DreaminaCliInput => {
+    const cliPath = dreaminaCliPathRef.current?.trim()
+    return cliPath ? { cliPath } : {}
+  }, [])
+
+  /** 查询即梦登录态与剩余额度；失败保持「未知」而不是假设未登录。 */
+  const refreshDreaminaStatus = React.useCallback(async (): Promise<void> => {
+    setDreaminaBusy(true)
+    try {
+      const status = await api.dreaminaStatus(dreaminaCliInput())
+      if (mountedRef.current) setDreaminaStatus(status)
+    } catch {
+      if (mountedRef.current) {
+        setDreaminaStatus({ state: 'unknown', credit: null, message: DREAMINA_LOGIN_MESSAGES.statusUnknown })
+      }
+    } finally {
+      if (mountedRef.current) setDreaminaBusy(false)
+    }
+  }, [api, dreaminaCliInput])
+
+  /** 轮询一次授权结果；只有主进程给出终态才结束等待。 */
+  const pollDreaminaLogin = React.useCallback(async (): Promise<void> => {
+    const requestId = dreaminaRequestRef.current
+    if (!requestId) return
+    try {
+      const result = await api.dreaminaLoginPoll({ requestId })
+      if (!mountedRef.current || dreaminaRequestRef.current !== requestId) return
+      if (result.state === 'pending') return
+      dreaminaRequestRef.current = null
+      setDreaminaLogin((current) => (current.requestId === requestId
+        ? { ...current, state: result.state === 'success' ? 'success' : 'failed', message: result.message }
+        : current))
+      /** 登录成功后立刻刷新额度，让面板显示真实账号状态。 */
+      if (result.state === 'success') await refreshDreaminaStatus()
+    } catch {
+      /** 单次轮询失败只当作这轮没结论，下一轮继续。 */
+    }
+  }, [api, refreshDreaminaStatus])
+
+  /** 发起设备码登录；已登录时主进程会直接复用。 */
+  const startDreaminaLogin = React.useCallback(async (relogin = false): Promise<void> => {
+    setDreaminaBusy(true)
+    setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'starting' })
+    try {
+      const input: DreaminaLoginStartInput = { ...dreaminaCliInput(), ...(relogin ? { relogin: true } : {}) }
+      const result = await api.dreaminaLoginStart(input)
+      if (!mountedRef.current) return
+      if (result.state === 'reused') {
+        setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'success', message: result.message })
+        await refreshDreaminaStatus()
+        return
+      }
+      if (result.state === 'failed') {
+        setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: result.message })
+        return
+      }
+      dreaminaRequestRef.current = result.requestId
+      setDreaminaLogin({
+        state: 'pending',
+        requestId: result.requestId,
+        verificationUri: result.verificationUri,
+        userCode: result.userCode,
+        expiresInSeconds: result.expiresInSeconds,
+        message: result.message,
+      })
+    } catch {
+      if (mountedRef.current) {
+        setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: DREAMINA_LOGIN_MESSAGES.failed })
+      }
+    } finally {
+      if (mountedRef.current) setDreaminaBusy(false)
+    }
+  }, [api, dreaminaCliInput, refreshDreaminaStatus])
+
+  /** 主动放弃等待；同时通知主进程丢弃 device_code。 */
+  const cancelDreaminaLogin = React.useCallback(async (): Promise<void> => {
+    const requestId = dreaminaRequestRef.current
+    dreaminaRequestRef.current = null
+    setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: DREAMINA_LOGIN_MESSAGES.cancelled })
+    if (!requestId) return
+    try {
+      await api.dreaminaLoginCancel({ requestId })
+    } catch {
+      /** 取消失败不影响界面已结束等待的事实，下次发起时会重新签发设备码。 */
+    }
+  }, [api])
+
+  /** 清除本地登录态并刷新面板。 */
+  const logoutDreamina = React.useCallback(async (): Promise<void> => {
+    setDreaminaBusy(true)
+    try {
+      const result = await api.dreaminaLogout(dreaminaCliInput())
+      if (!mountedRef.current) return
+      if (result.state === 'failed') {
+        setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: result.message })
+        return
+      }
+      setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: result.message })
+      await refreshDreaminaStatus()
+    } catch {
+      if (mountedRef.current) {
+        setDreaminaLogin({ ...EMPTY_DREAMINA_LOGIN, state: 'failed', message: DREAMINA_LOGIN_MESSAGES.logoutFailed })
+      }
+    } finally {
+      if (mountedRef.current) setDreaminaBusy(false)
+    }
+  }, [api, dreaminaCliInput, refreshDreaminaStatus])
+
+  /**
+   * 等待授权期间定时轮询。
+   * 只依赖登录态与 requestId，草稿内其它编辑不会重启计时器。
+   */
+  React.useEffect(() => {
+    if (dreaminaLogin.state !== 'pending' || dreaminaLogin.requestId === null) return
+    const timer = setInterval(() => { void pollDreaminaLogin() }, DREAMINA_POLL_INTERVAL_MS)
+    return () => { clearInterval(timer) }
+  }, [dreaminaLogin.state, dreaminaLogin.requestId, pollDreaminaLogin])
+
   /** 从供应商拉取模型；结果只在同一草稿身份下展示。 */
   const fetchCatalog = React.useCallback(async (): Promise<void> => {
     const currentDraft = draft
@@ -371,12 +581,30 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       setDraft(copyImageGenerationProfile(profile, createImageGenerationId(), Date.now()))
     },
     updateDraft: setDraft,
-    closeDraft: () => { setDraft(null); setCatalog(null); setActionError(null) },
+    closeDraft: () => {
+      /** 关闭表单即丢弃设备码流程，避免后台继续轮询已放弃的授权。 */
+      const pendingRequest = dreaminaRequestRef.current
+      dreaminaRequestRef.current = null
+      if (pendingRequest) void api.dreaminaLoginCancel({ requestId: pendingRequest }).catch(() => undefined)
+      setDraft(null)
+      setCatalog(null)
+      setActionError(null)
+      setDreaminaLogin(EMPTY_DREAMINA_LOGIN)
+      setDreaminaStatus(null)
+    },
     saveDraft,
     toggleEnabled,
     requestDelete: setDeleteId,
     closeDelete: () => { setDeleteId(null); setActionError(null) },
     confirmDelete,
     fetchCatalog,
+    dreaminaStatus,
+    dreaminaLogin,
+    dreaminaBusy,
+    refreshDreaminaStatus,
+    startDreaminaLogin,
+    pollDreaminaLogin,
+    cancelDreaminaLogin,
+    logoutDreamina,
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
-import { AUDIO_GENERATION_CATALOG_MESSAGES, AUDIO_GENERATION_LEGACY_WARNING, AUDIO_GENERATION_TEST_MESSAGES, MEDIA_IPC_CHANNELS } from '@proma/shared'
+import { AUDIO_GENERATION_CATALOG_MESSAGES, AUDIO_GENERATION_LEGACY_WARNING, AUDIO_GENERATION_TEST_MESSAGES, DREAMINA_LOGIN_MESSAGES, MEDIA_IPC_CHANNELS } from '@proma/shared'
 import type { AudioGenerationCatalogFetchInput, AudioGenerationPublicCatalog, AudioGenerationSettingsResult, AudioGenerationTestInput, AudioGenerationTestResult, MediaApiModelCatalogEntry, ReplaceAudioGenerationCatalogRequest } from '@proma/shared'
 import { createAudioGenerationIpcService, registerMediaIpcHandlers as registerProductionMediaIpcHandlers } from './media-ipc'
 import type { AudioGenerationIpcService, MediaIpcOptions } from './media-ipc'
@@ -39,6 +39,16 @@ const unusedImageGenerationService: ImageGenerationIpcService = {
   replace: () => ({ catalog: { schemaVersion: 1, revision: 0, profiles: [] }, legacyImageProfiles: [] }),
   fetchCatalog: unusedImageCatalogFetch,
   revealCredential: () => { throw new Error('unused') },
+  dreaminaStatus: async () => ({ state: 'cliMissing', credit: null, message: DREAMINA_LOGIN_MESSAGES.statusCliMissing }),
+  dreaminaLogin: async () => ({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.cliMissing }),
+  dreaminaLoginPoll: async (_ownerId, input) => ({
+    requestId: (input as { requestId: string }).requestId,
+    state: 'failed',
+    message: DREAMINA_LOGIN_MESSAGES.requestUnknown,
+  }),
+  dreaminaLoginCancel: () => undefined,
+  dreaminaLogout: async () => ({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.logoutFailed }),
+  releaseDreaminaOwner: () => undefined,
 }
 
 /** 既有媒体 IPC 用例无需关心音频调用，统一注入无副作用服务以保留生产必填依赖。 */
@@ -672,6 +682,66 @@ describe('独立音频生成 IPC', () => {
       expect(() => handler(event, { profileId: '   ' })).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
       expect(() => handler(event, { profileId: 'x'.repeat(257) })).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
       expect(revealed).toEqual(['image-1'])
+    } finally { registration.dispose() }
+  })
+
+  test('Given 即梦登录通道 When 调用 Then 解析输入、隔离窗口并在销毁时释放设备码', async () => {
+    const handlers = new Map<string, (event: IpcMainInvokeEvent, input?: unknown) => unknown>()
+    const sender = Object.assign(new EventEmitter(), { id: 31, isDestroyed: () => false })
+    const startedOwners: number[] = []
+    const releasedOwners: number[] = []
+    const statusInputs: unknown[] = []
+    let disposed = 0
+    const registration = registerMediaIpcHandlers(createMediaOptions(handlers, createService(), () => true, {
+      ...unusedImageGenerationService,
+      dreaminaStatus: async (input) => {
+        statusInputs.push(input)
+        return { state: 'loggedIn', credit: 12, message: DREAMINA_LOGIN_MESSAGES.statusLoggedIn }
+      },
+      dreaminaLogin: async (ownerId) => {
+        startedOwners.push(ownerId)
+        return {
+          state: 'pending',
+          requestId: 'dreamina-1',
+          verificationUri: 'https://jimeng.jianying.com/login',
+          userCode: 'ABCD-1234',
+          expiresInSeconds: 600,
+          message: DREAMINA_LOGIN_MESSAGES.pending,
+        }
+      },
+      dreaminaLoginPoll: async (_ownerId, input) => ({
+        requestId: (input as { requestId: string }).requestId,
+        state: 'pending',
+        message: DREAMINA_LOGIN_MESSAGES.pending,
+      }),
+      dreaminaLogout: async () => ({ state: 'loggedOut', message: DREAMINA_LOGIN_MESSAGES.logoutSucceeded }),
+      releaseDreaminaOwner: (ownerId) => { releasedOwners.push(ownerId) },
+      disposeDreamina: () => { disposed += 1 },
+    }))
+    const event = { sender } as unknown as IpcMainInvokeEvent
+    try {
+      expect(await handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_STATUS)!(event, { cliPath: '/opt/dreamina' }))
+        .toMatchObject({ state: 'loggedIn', credit: 12 })
+      /** 输入原样传递但已在 IPC 边界解析过，服务只看到合法结构。 */
+      expect(statusInputs).toEqual([{ cliPath: '/opt/dreamina' }])
+      expect(await handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_START)!(event, { relogin: true }))
+        .toMatchObject({ state: 'pending', userCode: 'ABCD-1234' })
+      expect(startedOwners).toEqual([31])
+      await handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_POLL)!(event, { requestId: 'dreamina-1' })
+      handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_CANCEL)!(event, { requestId: 'dreamina-1' })
+      expect(await handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGOUT)!(event, {}))
+        .toEqual({ state: 'loggedOut', message: DREAMINA_LOGIN_MESSAGES.logoutSucceeded })
+      /** 非法 envelope 在解析阶段拒绝，不进入服务。 */
+      await expect(handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_START)!(event, { relogin: 'yes' }))
+        .rejects.toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+      expect(() => handlers.get(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_STATUS)!(event, { cliPath: '/x', extra: 1 }))
+        .toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+      /** 窗口销毁只释放本窗口的设备码。 */
+      sender.emit('destroyed')
+      expect(releasedOwners).toEqual([31])
+      registration.dispose()
+      expect(releasedOwners).toEqual([31])
+      expect(disposed).toBe(1)
     } finally { registration.dispose() }
   })
 

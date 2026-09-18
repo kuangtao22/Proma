@@ -8,6 +8,7 @@ import type {
   ImageGenerationSettingsResult,
   ReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
+import { DREAMINA_LOGIN_MESSAGES } from '@proma/shared'
 import {
   useImageGenerationController,
   type ImageGenerationController,
@@ -80,6 +81,16 @@ function createApi(initial = createSettings()): ImageGenerationSettingsApi & {
     },
     /** 默认返回已保存的明文凭据，用于断言编辑回填。 */
     revealCredential: async () => 'sk-saved-plaintext',
+    /** 默认未登录，即梦相关断言按需覆盖。 */
+    dreaminaStatus: async () => ({ state: 'loggedOut', credit: null, message: DREAMINA_LOGIN_MESSAGES.statusLoggedOut }),
+    dreaminaLoginStart: async () => ({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.cliMissing }),
+    dreaminaLoginPoll: async (input) => ({
+      requestId: input.requestId,
+      state: 'failed',
+      message: DREAMINA_LOGIN_MESSAGES.requestUnknown,
+    }),
+    dreaminaLoginCancel: async () => undefined,
+    dreaminaLogout: async () => ({ state: 'failed', message: DREAMINA_LOGIN_MESSAGES.logoutFailed }),
   }
 }
 
@@ -246,6 +257,83 @@ describe('独立生图设置控制器', () => {
       releaseKey('sk-saved-plaintext')
       await act(async () => { await Promise.resolve() })
       expect(requireController(controller).draft?.apiKey).toBe('sk-user-typed')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 未登录状态 When 发起即梦登录 Then 展示设备码并接受轮询结果', async () => {
+    const api = createApi()
+    api.dreaminaStatus = async () => ({ state: 'loggedOut', credit: null, message: DREAMINA_LOGIN_MESSAGES.statusLoggedOut })
+    api.dreaminaLoginStart = async () => ({
+      state: 'pending',
+      requestId: 'dreamina-1',
+      verificationUri: 'https://jimeng.jianying.com/login',
+      userCode: 'ABCD-1234',
+      expiresInSeconds: 600,
+      message: DREAMINA_LOGIN_MESSAGES.pending,
+    })
+    let pollState: 'pending' | 'success' = 'pending'
+    api.dreaminaLoginPoll = async (input) => ({
+      requestId: input.requestId,
+      state: pollState,
+      message: pollState === 'success' ? DREAMINA_LOGIN_MESSAGES.success : DREAMINA_LOGIN_MESSAGES.pending,
+    })
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      await act(async () => { await requireController(controller).refreshDreaminaStatus() })
+      expect(requireController(controller).dreaminaStatus?.state).toBe('loggedOut')
+
+      await act(async () => { await requireController(controller).startDreaminaLogin(false) })
+      expect(requireController(controller).dreaminaLogin).toMatchObject({
+        state: 'pending',
+        requestId: 'dreamina-1',
+        userCode: 'ABCD-1234',
+      })
+      /** 等待期间继续轮询仍保持待授权。 */
+      await act(async () => { await requireController(controller).pollDreaminaLogin() })
+      expect(requireController(controller).dreaminaLogin.state).toBe('pending')
+
+      /** 授权完成后必须刷新账号状态，让面板显示已登录。 */
+      pollState = 'success'
+      api.dreaminaStatus = async () => ({ state: 'loggedIn', credit: 321, message: DREAMINA_LOGIN_MESSAGES.statusLoggedIn })
+      await act(async () => { await requireController(controller).pollDreaminaLogin() })
+      expect(requireController(controller).dreaminaLogin.state).toBe('success')
+      expect(requireController(controller).dreaminaStatus).toMatchObject({ state: 'loggedIn', credit: 321 })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 等待授权中 When 取消或关闭表单 Then 通知主进程丢弃设备码', async () => {
+    const api = createApi()
+    api.dreaminaLoginStart = async () => ({
+      state: 'pending',
+      requestId: 'dreamina-2',
+      verificationUri: 'https://jimeng.jianying.com/login',
+      userCode: 'WXYZ-9999',
+      expiresInSeconds: null,
+      message: DREAMINA_LOGIN_MESSAGES.pending,
+    })
+    const cancelled: string[] = []
+    api.dreaminaLoginCancel = async (input) => { cancelled.push(input.requestId) }
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      await act(async () => { await requireController(controller).startDreaminaLogin(false) })
+      await act(async () => { await requireController(controller).cancelDreaminaLogin() })
+      expect(cancelled).toEqual(['dreamina-2'])
+      expect(requireController(controller).dreaminaLogin).toMatchObject({
+        state: 'failed',
+        message: DREAMINA_LOGIN_MESSAGES.cancelled,
+      })
+
+      await act(async () => { await requireController(controller).startDreaminaLogin(false) })
+      expect(requireController(controller).dreaminaLogin.state).toBe('pending')
+      await act(async () => { requireController(controller).closeDraft() })
+      expect(cancelled).toEqual(['dreamina-2', 'dreamina-2'])
+      expect(requireController(controller).dreaminaLogin.state).toBe('idle')
     } finally { act(() => host.unmount()); host.restore() }
   })
 })

@@ -13,6 +13,15 @@ import type {
   ImageGenerationSettingsResult,
   ReplaceImageGenerationCatalogRequest,
 } from './image-generation'
+import type {
+  DreaminaCliInput,
+  DreaminaLoginRequestInput,
+  DreaminaLoginStartInput,
+  ImageGenerationDreaminaLoginPollResult,
+  ImageGenerationDreaminaLoginStartResult,
+  ImageGenerationDreaminaLogoutResult,
+  ImageGenerationDreaminaStatus,
+} from './dreamina-login'
 
 /** 媒体产物类别，音乐归属 audio。 */
 export type MediaKind = 'image' | 'video' | 'audio'
@@ -375,6 +384,11 @@ export const MEDIA_IPC_CHANNELS = {
   REPLACE_IMAGE_GENERATION_CATALOG: 'media:replace-image-generation-catalog',
   FETCH_IMAGE_GENERATION_CATALOG: 'media:fetch-image-generation-catalog',
   REVEAL_IMAGE_GENERATION_CREDENTIAL: 'media:reveal-image-generation-credential',
+  DREAMINA_LOGIN_STATUS: 'media:dreamina-login-status',
+  DREAMINA_LOGIN_START: 'media:dreamina-login-start',
+  DREAMINA_LOGIN_POLL: 'media:dreamina-login-poll',
+  DREAMINA_LOGIN_CANCEL: 'media:dreamina-login-cancel',
+  DREAMINA_LOGOUT: 'media:dreamina-logout',
 } as const
 
 /** 四层 IPC 的公开接口；运行写入口由 Canvas/Agent 授权 Host 接线。 */
@@ -415,6 +429,16 @@ export interface MediaPreloadApi {
    * 目录读取仍只返回脱敏摘要，这是唯一一次显式解密入口。
    */
   mediaRevealImageGenerationCredential(profileId: string): Promise<string>
+  /** 查询即梦 CLI 登录态与剩余额度，不消耗额度。 */
+  mediaDreaminaLoginStatus(input: DreaminaCliInput): Promise<ImageGenerationDreaminaStatus>
+  /** 发起即梦设备码登录；已登录时直接复用并返回 reused。 */
+  mediaDreaminaLoginStart(input: DreaminaLoginStartInput): Promise<ImageGenerationDreaminaLoginStartResult>
+  /** 轮询本次设备码授权结果；device_code 留在主进程。 */
+  mediaDreaminaLoginPoll(input: DreaminaLoginRequestInput): Promise<ImageGenerationDreaminaLoginPollResult>
+  /** 幂等取消当前窗口发起的一次设备码登录。 */
+  mediaDreaminaLoginCancel(input: DreaminaLoginRequestInput): Promise<void>
+  /** 清除本地即梦登录态，不影响已保存的任务与配置。 */
+  mediaDreaminaLogout(input: DreaminaCliInput): Promise<ImageGenerationDreaminaLogoutResult>
   /** 取消当前窗口发起的指定音频测试。 */
   mediaCancelAudioGenerationTest(requestId: string): Promise<void>
   mediaGetRun(projectId: string, runId: string): Promise<MediaRunSnapshot>

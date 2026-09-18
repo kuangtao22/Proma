@@ -14,6 +14,13 @@ import {
   parseAudioGenerationTestCancelInput,
   parseAudioGenerationTestInput,
   parseAudioGenerationTestResult,
+  parseDreaminaCliInput,
+  parseDreaminaLoginPollResult,
+  parseDreaminaLoginRequestInput,
+  parseDreaminaLoginStartInput,
+  parseDreaminaLoginStartResult,
+  parseDreaminaLogoutResult,
+  parseDreaminaStatus,
   parseReplaceAudioGenerationCatalogRequest,
 } from '@proma/shared'
 import type {
@@ -252,6 +259,8 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
   const subscriptionEvents = new Map<WebContents, IpcMainInvokeEvent>()
   /** 音频测试按 sender 只登记一次销毁监听，独立于项目运行订阅。 */
   const audioCleanupListeners = new Map<WebContents, () => void>()
+  /** 即梦设备码登录同样按 sender 只登记一次销毁监听，窗口关闭即丢弃 device_code。 */
+  const dreaminaCleanupListeners = new Map<WebContents, () => void>()
   /** 释放指定窗口的全部引用与监听，不依赖项目仍然存在。 */
   const releaseSender = (sender: WebContents): void => {
     subscriptions.delete(sender)
@@ -293,6 +302,18 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
       audioCleanupListeners.delete(event.sender)
     }
     audioCleanupListeners.set(event.sender, cleanup)
+    event.sender.once('destroyed', cleanup)
+  }
+  /** 首次发起即梦登录为 sender 建立 owner 清理；后续登录复用同一监听。 */
+  const registerDreaminaOwner = (event: IpcMainInvokeEvent): void => {
+    if (dreaminaCleanupListeners.has(event.sender)) return
+    /** 窗口销毁只释放自身 owner 的设备码，不影响其它设置窗口。 */
+    const cleanup = (): void => {
+      options.imageGeneration.releaseDreaminaOwner(event.sender.id)
+      event.sender.removeListener('destroyed', cleanup)
+      dreaminaCleanupListeners.delete(event.sender)
+    }
+    dreaminaCleanupListeners.set(event.sender, cleanup)
     event.sender.once('destroyed', cleanup)
   }
   handle(MEDIA_IPC_CHANNELS.GET_SETTINGS, () => mediaSettingsSnapshot(options.configuration.read()))
@@ -350,6 +371,53 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
     } catch (error) {
       if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
       throwStableImageError(error, 'IMAGE_GENERATION_CREDENTIAL_DECRYPT_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_STATUS, async (value) => {
+    /** 与其它通道一致：先在 IPC 边界解析调用合同，非法 envelope 不进入服务。 */
+    parseDreaminaCliInput(value)
+    try {
+      return parseDreaminaStatus(await options.imageGeneration.dreaminaStatus(value))
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_DREAMINA_STATUS_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_START, async (value, event) => {
+    /** 先按合同解析输入，非法 envelope 不触碰 CLI。 */
+    parseDreaminaLoginStartInput(value)
+    registerDreaminaOwner(event)
+    try {
+      return parseDreaminaLoginStartResult(await options.imageGeneration.dreaminaLogin(event.sender.id, value))
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_DREAMINA_LOGIN_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_POLL, async (value, event) => {
+    parseDreaminaLoginRequestInput(value)
+    try {
+      const result = parseDreaminaLoginPollResult(await options.imageGeneration.dreaminaLoginPoll(event.sender.id, value))
+      /** 轮询结束后再次核权，销毁或撤权窗口不能收到迟到结果。 */
+      if (!options.isAuthorizedSender(event)) throw new Error('MEDIA_ACCESS_DENIED')
+      return result
+    } catch (error) {
+      if (error instanceof Error && error.message === 'MEDIA_ACCESS_DENIED') throw error
+      throwStableImageError(error, 'IMAGE_GENERATION_DREAMINA_LOGIN_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.DREAMINA_LOGIN_CANCEL, (value, event) => {
+    parseDreaminaLoginRequestInput(value)
+    try {
+      options.imageGeneration.dreaminaLoginCancel(event.sender.id, value)
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_DREAMINA_LOGIN_FAILED')
+    }
+  })
+  handle(MEDIA_IPC_CHANNELS.DREAMINA_LOGOUT, async (value) => {
+    parseDreaminaCliInput(value)
+    try {
+      return parseDreaminaLogoutResult(await options.imageGeneration.dreaminaLogout(value))
+    } catch (error) {
+      throwStableImageError(error, 'IMAGE_GENERATION_DREAMINA_LOGIN_FAILED')
     }
   })
   handle(MEDIA_IPC_CHANNELS.FETCH_AUDIO_GENERATION_CATALOG, async (value, event) => {
@@ -558,11 +626,17 @@ export function registerMediaIpcHandlers(options: MediaIpcOptions): { dispose():
         sender.removeListener('destroyed', cleanup)
         options.audioGeneration.releaseOwner(sender.id)
       }
+      for (const [sender, cleanup] of dreaminaCleanupListeners) {
+        sender.removeListener('destroyed', cleanup)
+        options.imageGeneration.releaseDreaminaOwner(sender.id)
+      }
       subscriptions.clear()
       cleanupListeners.clear()
       subscriptionEvents.clear()
       audioCleanupListeners.clear()
+      dreaminaCleanupListeners.clear()
       options.audioGeneration.dispose?.()
+      options.imageGeneration.disposeDreamina?.()
     },
   }
 }

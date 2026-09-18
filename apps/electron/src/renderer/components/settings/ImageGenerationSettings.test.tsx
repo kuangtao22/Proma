@@ -12,6 +12,7 @@ mock.module('@/lib/model-logo', () => ({
   resolveModelProvider: () => 'unknown',
 }))
 import type { ImageGenerationSettingsResult } from '@proma/shared'
+import { EMPTY_DREAMINA_LOGIN } from './ImageGenerationSettings.controller'
 import type { ImageGenerationController } from './ImageGenerationSettings.controller'
 /** 位图 mock 必须先于组件模块加载，因此这里使用动态导入。 */
 const { ImageGenerationCatalogView } = await import('./ImageGenerationSettings')
@@ -50,6 +51,11 @@ function createController(overrides: Partial<ImageGenerationController> = {}): I
     startCopy: () => undefined, updateDraft: () => undefined, closeDraft: () => undefined,
     saveDraft: async () => undefined, toggleEnabled: async () => undefined, requestDelete: () => undefined,
     closeDelete: () => undefined, confirmDelete: async () => undefined, fetchCatalog: async () => undefined,
+    /** 即梦面板的默认替身：未查询状态、无进行中的登录。 */
+    dreaminaStatus: null, dreaminaLogin: EMPTY_DREAMINA_LOGIN, dreaminaBusy: false,
+    refreshDreaminaStatus: async () => undefined, startDreaminaLogin: async () => undefined,
+    pollDreaminaLogin: async () => undefined, cancelDreaminaLogin: async () => undefined,
+    logoutDreamina: async () => undefined,
     ...overrides,
   }
 }
@@ -80,10 +86,46 @@ describe('独立生图设置页视图', () => {
     const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
     expect(html).toContain('即梦登录')
-    expect(html).toContain('dreamina login')
+    expect(html).toContain('登录即梦')
+    /** 即梦走 CLI 登录，必须能在表单里配置 CLI 路径。 */
+    expect(html).toContain('id="image-cli-path"')
     expect(html).not.toContain('id="image-base-url"')
     expect(html).not.toContain('id="image-api-key"')
     expect(html).toContain('id="image-model-id"')
+  })
+
+  test('Given 即梦已登录 When 渲染登录面板 Then 展示额度与账号操作', () => {
+    const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({
+      draft,
+      dreaminaStatus: { state: 'loggedIn', credit: 987, message: '即梦已登录' },
+    })} />)
+    expect(html).toContain('已登录 · 剩余额度 987')
+    expect(html).toContain('重新登录')
+    expect(html).toContain('退出登录')
+    /** 已登录时不再展示「登录即梦」入口，避免重复授权。 */
+    expect(html).not.toContain('>登录即梦<')
+  })
+
+  test('Given 等待授权 When 渲染登录面板 Then 展示设备码与授权入口', () => {
+    const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({
+      draft,
+      dreaminaStatus: { state: 'loggedOut', credit: null, message: '未登录，请先登录即梦' },
+      dreaminaLogin: {
+        state: 'pending',
+        requestId: 'dreamina-1',
+        verificationUri: 'https://jimeng.jianying.com/login',
+        userCode: 'ABCD-1234',
+        expiresInSeconds: 600,
+        message: '请在浏览器完成授权，本页会自动刷新登录状态',
+      },
+    })} />)
+    expect(html).toContain('ABCD-1234')
+    expect(html).toContain('打开授权页面')
+    expect(html).toContain('复制设备码')
+    expect(html).toContain('剩余约 10 分钟')
+    expect(html).toContain('取消')
   })
 
   test('Given 密钥型草稿 When 渲染表单 Then 有服务地址与密钥且保留语义明确', () => {

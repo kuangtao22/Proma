@@ -461,6 +461,7 @@ import { runImageModelLegacyCleanup } from './lib/image-model-legacy-cleanup'
 import { ImageGenerationCatalogService } from './lib/media/image-generation-catalog-service'
 import { createImageGenerationIpcService } from './lib/media/image-generation-ipc'
 import type { ImageGenerationIpcService } from './lib/media/image-generation-ipc'
+import { ImageGenerationDreaminaService } from './lib/media/image-generation-dreamina-service'
 import { MediaRunService } from './lib/media/media-run-service'
 import { MediaRunSupervisor } from './lib/media/media-run-supervisor'
 import { MediaDesignAssets } from './lib/media/media-design-assets'
@@ -682,6 +683,8 @@ let audioGenerationCatalog: AudioGenerationCatalogService | undefined
 let imageGenerationStore: ImageGenerationConfigStore | undefined
 /** 生图供应商目录拉取服务，与连接测试共用同一实现。 */
 let imageGenerationCatalog: ImageGenerationCatalogService | undefined
+/** 即梦 CLI 登录/额度服务的进程级单例，保证设备码只存在一份。 */
+let imageGenerationDreamina: ImageGenerationDreaminaService | undefined
 /** Media IPC 共享的独立生图组合服务。 */
 let imageGenerationIpcService: ImageGenerationIpcService | undefined
 /** Media IPC 共享的独立音频组合服务，旧目录只读投影不建立第二写入口。 */
@@ -729,11 +732,17 @@ function getImageGenerationCatalog(): ImageGenerationCatalogService {
   return imageGenerationCatalog ??= new ImageGenerationCatalogService({ store: getImageGenerationStore() })
 }
 
+/** 返回进程级唯一即梦 CLI 服务，设备码登录只在主进程内存中流转。 */
+function getImageGenerationDreamina(): ImageGenerationDreaminaService {
+  return imageGenerationDreamina ??= new ImageGenerationDreaminaService()
+}
+
 /** 返回进程级唯一生图 IPC 服务，旧统一媒体目录始终只读。 */
 function getImageGenerationIpcService(): ImageGenerationIpcService {
   return imageGenerationIpcService ??= createImageGenerationIpcService({
     store: getImageGenerationStore(),
     catalog: getImageGenerationCatalog(),
+    dreamina: getImageGenerationDreamina(),
     listLegacyCatalog: () => getDesignImageModelServices().imageModels.listMediaApiCatalog(),
   })
 }

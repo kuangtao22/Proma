@@ -12,12 +12,14 @@ import type {
   ImageGenerationProvider,
 } from '@proma/shared'
 import { IMAGE_GENERATION_PROVIDER_DESCRIPTORS } from '@proma/shared'
-import { CheckCircle2, Copy, Download, Eye, EyeOff, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
+import { toast } from 'sonner'
+import { CheckCircle2, Copy, Download, ExternalLink, Eye, EyeOff, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { getProviderLogo } from '@/lib/model-logo'
+import { cn } from '@/lib/utils'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsInput, SettingsRow, SettingsSection, SettingsSelect, SettingsToggle } from './primitives'
 import {
@@ -219,17 +221,18 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   const deleteTarget = settings?.catalog.profiles.find((profile) => profile.id === deleteId)
   /** API Key 默认明文显示，与模型配置一致；眼睛按钮只负责临时遮挡。 */
   const [showApiKey, setShowApiKey] = React.useState(true)
-  /** 即梦登录面板在 S4 接通前只做说明，按钮禁用。 */
-  const dreaminaNotice = (
-    <div className="space-y-2 px-4 py-3">
-      <div className="text-sm font-medium text-foreground">即梦登录</div>
-      <p className="text-xs text-muted-foreground">
-        即梦需要通过官方 CLI 在网页完成登录；登录链路接通后这里会显示设备码与验证链接，现在请先在终端执行
-        <code className="mx-1 rounded bg-muted px-1">dreamina login</code>。
-      </p>
-      <Button type="button" size="sm" variant="outline" disabled>登录即梦（即将支持）</Button>
-    </div>
-  )
+  /**
+   * 打开即梦表单时自动查询一次账号状态。
+   * 只在草稿切到即梦且尚未查询过时触发，避免每次编辑都打点 CLI。
+   */
+  const dreaminaProfileId = draft?.provider === 'dreamina' ? draft.id : null
+  /** 依赖里只放稳定的回调，避免 controller 每次重建触发重复查询。 */
+  const refreshDreaminaStatus = controller.refreshDreaminaStatus
+  React.useEffect(() => {
+    if (dreaminaProfileId === null) return
+    void refreshDreaminaStatus()
+    /** 依赖只包含草稿身份，草稿内其它编辑不会重复查询。 */
+  }, [dreaminaProfileId, refreshDreaminaStatus])
 
   if (draft) {
     return (
@@ -264,7 +267,9 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               required
               onChange={(name) => controller.updateDraft({ ...draft, name })}
             />
-            {draft.provider === 'dreamina' ? dreaminaNotice : (
+            {draft.provider === 'dreamina' ? (
+              <DreaminaLoginPanel controller={controller} draft={draft} disabled={saving} />
+            ) : (
               <>
                 <SettingsInput
                   id="image-base-url"
@@ -417,4 +422,169 @@ export function ImageGenerationSettings(props: ImageGenerationSettingsProps): Re
   const api = React.useMemo(() => imageSettingsApiFromWindow(), [])
   const controller = useImageGenerationController(api)
   return <ImageGenerationCatalogView {...props} controller={controller} />
+}
+
+/**
+ * 即梦登录面板。
+ * 入参：控制器、当前草稿与禁用态；返回值：状态行、CLI 路径、设备码与操作按钮。
+ * 设备码只在等待授权时展示，登录成功后立即回到账号状态，不保留任何凭据。
+ */
+function DreaminaLoginPanel({ controller, draft, disabled }: {
+  controller: ImageGenerationController
+  /** 收窄到即梦草稿：这个面板只在即梦分支渲染，CLI 路径也只在即梦上存在。 */
+  draft: ImageGenerationDraft & { provider: 'dreamina' }
+  disabled: boolean
+}): React.ReactElement {
+  const { dreaminaStatus, dreaminaLogin, dreaminaBusy } = controller
+  const busy = disabled || dreaminaBusy
+  const loggedIn = dreaminaStatus?.state === 'loggedIn'
+  /** 状态行文案：查询前、已登录、未登录与异常各自独立，不互相冒充。 */
+  const statusText = dreaminaStatus === null
+    ? '尚未查询即梦登录态'
+    : dreaminaStatus.state === 'loggedIn'
+      ? `已登录 · 剩余额度 ${dreaminaStatus.credit ?? 0}`
+      : dreaminaStatus.message
+  const statusTone = dreaminaStatus?.state === 'loggedIn'
+    ? 'text-emerald-600'
+    : dreaminaStatus === null || dreaminaStatus.state === 'unknown'
+      ? 'text-muted-foreground'
+      : 'text-destructive'
+
+  /** 复制设备码或授权地址到系统剪贴板。 */
+  const copyText = (text: string, label: string): void => {
+    void window.electronAPI.writeClipboardText(text)
+      .then(() => toast.success(`${label}已复制`))
+      .catch(() => toast.error(`${label}复制失败`))
+  }
+
+  return (
+    <div className="space-y-3 px-4 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-foreground">即梦登录</div>
+          <div className={cn('mt-0.5 text-xs', statusTone)}>{statusText}</div>
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="h-7 shrink-0 text-xs"
+          disabled={busy}
+          onClick={() => void controller.refreshDreaminaStatus()}
+        >
+          {dreaminaBusy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+          <span>刷新状态</span>
+        </Button>
+      </div>
+
+      {dreaminaLogin.state === 'pending' && dreaminaLogin.userCode !== null && (
+        <div className="space-y-2 rounded-lg border border-border/60 bg-muted/20 p-3">
+          <p className="text-xs text-muted-foreground">{dreaminaLogin.message}</p>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-base tracking-widest text-foreground">{dreaminaLogin.userCode}</span>
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label="复制设备码"
+              title="复制设备码"
+              onClick={() => copyText(dreaminaLogin.userCode ?? '', '设备码')}
+            >
+              <Copy />
+            </Button>
+            {dreaminaLogin.expiresInSeconds !== null && (
+              <span className="text-xs text-muted-foreground">
+                剩余约 {Math.max(0, Math.round(dreaminaLogin.expiresInSeconds / 60))} 分钟
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={dreaminaLogin.verificationUri === null}
+              onClick={() => {
+                const uri = dreaminaLogin.verificationUri
+                if (uri === null) return
+                void window.electronAPI.openExternal(uri)
+              }}
+            >
+              <ExternalLink size={12} />
+              <span>打开授权页面</span>
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs"
+              onClick={() => void controller.cancelDreaminaLogin()}
+            >
+              取消
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            在浏览器打开授权页并输入设备码，完成后本页会自动刷新登录状态。
+          </p>
+        </div>
+      )}
+
+      {dreaminaLogin.state !== 'pending' && dreaminaLogin.state !== 'idle' && dreaminaLogin.message !== null && (
+        <p
+          role={dreaminaLogin.state === 'failed' ? 'alert' : undefined}
+          className={cn('text-xs', dreaminaLogin.state === 'failed' ? 'text-destructive' : 'text-emerald-600')}
+        >
+          {dreaminaLogin.message}
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {loggedIn ? (
+          <>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={busy || dreaminaLogin.state === 'pending'}
+              onClick={() => void controller.startDreaminaLogin(true)}
+            >
+              重新登录
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs"
+              disabled={busy || dreaminaLogin.state === 'pending'}
+              onClick={() => void controller.logoutDreamina()}
+            >
+              退出登录
+            </Button>
+          </>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            className="h-7 text-xs"
+            disabled={busy || dreaminaLogin.state === 'pending'}
+            onClick={() => void controller.startDreaminaLogin(false)}
+          >
+            {dreaminaLogin.state === 'starting' ? <Loader2 size={12} className="animate-spin" /> : null}
+            <span>登录即梦</span>
+          </Button>
+        )}
+      </div>
+
+      <SettingsInput
+        id="image-cli-path"
+        label="CLI 路径（可选）"
+        value={draft.cliPath ?? ''}
+        disabled={disabled}
+        placeholder="留空则按 PATH 查找 dreamina"
+        onChange={(cliPath) => controller.updateDraft({ ...draft, cliPath })}
+      />
+    </div>
+  )
 }
