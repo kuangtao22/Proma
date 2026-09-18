@@ -152,6 +152,7 @@ import {
   type DataRootInstanceLeaseRegistry,
 } from './lib/data-root-instance-lease'
 import { prepareNormalDataRoot } from './lib/data-root-marker'
+import { detectStaleDevBundle } from './lib/dev-bundle-freshness'
 import type { DataRootStartupMode } from '@proma/shared'
 import { createDataRootStartupRouter } from './lib/data-root-startup-routing'
 import { getDefaultWorkspaceProjectRelocator } from './lib/workspace-project-relocator-production'
@@ -814,6 +815,11 @@ app.whenReady()
   .then(() => {
     // Safe Storage 初始化完成后再恢复开发客户端的用户可见名称。
     if (!app.isPackaged) app.setName(appIdentity.displayName)
+    /** 开发态只做一次新鲜度提示：产物落后于源码时，别让旧合同伪装成业务故障。 */
+    if (!app.isPackaged) {
+      const staleBundle = detectStaleDevBundle()
+      if (staleBundle) console.warn(staleBundle)
+    }
     return bootstrap()
   })
   .catch(handleBootstrapFailure)
