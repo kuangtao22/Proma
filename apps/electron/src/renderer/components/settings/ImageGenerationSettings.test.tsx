@@ -60,6 +60,8 @@ describe('独立生图设置页视图', () => {
     expect(html).toContain('ChatGPT 生图')
     expect(html).toContain('gpt-image-1')
     expect(html).toContain('文生图 + 图生图')
+    /** 列表行必须带供应商 Logo，与音频页一致。 */
+    expect(html).toContain('src="model-logo.png"')
     expect(html).toContain('旧渠道生图')
     expect(html).toContain('旧配置借用渠道凭据')
   })
