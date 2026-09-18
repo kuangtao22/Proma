@@ -102,7 +102,15 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
             <input type="checkbox" aria-label={option.name} checked={selection.selectedIds.includes(option.profileId)} disabled={disabled || (!option.available && !selection.selectedIds.includes(option.profileId))} onChange={(event) => toggle(option.profileId, event.target.checked)} />
             <span className="min-w-0 flex-1"><span className="block truncate text-sm">{option.name}</span><span className="block truncate text-xs text-muted-foreground" title={option.unavailableReason}>{option.available ? option.modelId : option.unavailableReason ?? '当前不可用'}</span></span>
           </label>)}</div>)}
-          {missingIds.map((id) => <label key={id} className="flex min-w-0 items-center gap-2 px-1 py-2"><input type="checkbox" checked disabled={disabled} aria-label={`移除失效模型 ${id}`} onChange={() => toggle(id, false)} /><span className="min-w-0 truncate text-xs text-muted-foreground">{id} · 已移除</span></label>)}
+          {/**
+            * 失效选择来自旧媒体目录：只给裸 ID 用户看不懂，因此显式说明来源、
+            * 保留完整 ID 作 title，并提供一次清空全部失效引用的入口。
+            */}
+          {missingIds.length > 0 ? <div className="flex items-center justify-between px-1 pt-2">
+            <span className="text-xs text-muted-foreground">失效的旧模型选择 {missingIds.length} 个</span>
+            <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled} onClick={() => { for (const id of missingIds) toggle(id, false) }}>清理全部</Button>
+          </div> : null}
+          {missingIds.map((id) => <label key={id} className="flex min-w-0 items-center gap-2 px-1 py-2" title={id}><input type="checkbox" checked disabled={disabled} aria-label={`移除失效模型 ${id}`} onChange={() => toggle(id, false)} /><span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">该模型已从媒体目录移除，勾选可取消</span></label>)}
           {!filtered.length && !missingIds.length ? <p className="py-4 text-center text-sm text-muted-foreground">{query ? '没有匹配的模型' : '暂无媒体模型'}</p> : null}
         </>}
       </div>
