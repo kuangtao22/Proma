@@ -33,6 +33,9 @@ export interface ExecuteMiniMaxImagesInput {
   cwd?: string
   allowedRoots?: string[]
   aspectRatio?: string
+  /** 自定义输出宽高（像素）；仅 image-01 系列支持，且必须同时给出。 */
+  width?: number
+  height?: number
   numberOfImages?: number
   signal?: AbortSignal
   /** 请求构造完成后、网络发送前同步捕获不含凭据的可信审计信息。 */
@@ -101,6 +104,7 @@ export async function executeMiniMaxImages(
         ? { subject_reference: [{ type: 'character', image_file: `data:${references[0]!.mediaType};base64,${references[0]!.bytes.toString('base64')}` }] }
         : {}),
       ...(resolveAspectRatio(input.aspectRatio) ? { aspect_ratio: resolveAspectRatio(input.aspectRatio) } : {}),
+      ...resolveCustomSize(input),
     }),
     signal: input.signal,
   })
@@ -127,6 +131,26 @@ function normalizeImageCount(value: number | undefined): number {
   if (value === undefined) return 1
   if (!Number.isSafeInteger(value) || value < 1) return 1
   return Math.min(value, MAX_IMAGE_COUNT)
+}
+
+/**
+ * 校验并解析自定义尺寸。
+ * 入参：执行输入；返回值：可写入请求体的宽高字段。
+ * 规则来自官方文档：仅 image-01 支持宽高，取值 512-2048 且必须是 8 的倍数。
+ */
+function resolveCustomSize(input: ExecuteMiniMaxImagesInput): { width?: number; height?: number } {
+  const { width, height } = input
+  if (width === undefined && height === undefined) return {}
+  if (width === undefined || height === undefined) throw new Error('自定义尺寸必须同时提供 width 与 height')
+  if (input.route.snapshot.modelId !== 'image-01') {
+    throw new Error('MiniMax 仅 image-01 支持自定义宽高，请改用 image-01 或使用宽高比')
+  }
+  for (const value of [width, height]) {
+    if (!Number.isSafeInteger(value) || value < 512 || value > 2048 || value % 8 !== 0) {
+      throw new Error('MiniMax 自定义尺寸需在 512-2048 之间且为 8 的倍数')
+    }
+  }
+  return { width, height }
 }
 
 /** 把画布的宽高比映射到 MiniMax 支持的取值。 */

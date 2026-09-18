@@ -132,6 +132,27 @@ describe('MiniMax 图像执行器', () => {
     rmSync(workDir, { recursive: true, force: true })
   })
 
+  test('Given image-01 传入合法尺寸 When 执行 Then 请求体带上宽高', async () => {
+    const { dependencies, requests } = createDependencies()
+    await executeMiniMaxImages(createInput({ width: 1024, height: 1024 }), dependencies)
+    expect(JSON.parse(String((requests[0]!.init as RequestInit).body))).toMatchObject({ width: 1024, height: 1024 })
+  })
+
+  test('Given 尺寸非法或模型不支持 When 执行 Then 在联网前拒绝', async () => {
+    const { dependencies, requests } = createDependencies()
+    await expect(executeMiniMaxImages(createInput({ width: 1024 }), dependencies))
+      .rejects.toThrow('必须同时提供 width 与 height')
+    /** image-01-live 不支持自定义宽高。 */
+    const live = createInput({ width: 1024, height: 1024 })
+    live.route.snapshot.modelId = 'image-01-live'
+    await expect(executeMiniMaxImages(live, dependencies))
+      .rejects.toThrow('仅 image-01 支持自定义宽高')
+    /** 必须满足 8 的倍数与取值区间。 */
+    await expect(executeMiniMaxImages(createInput({ width: 1020, height: 1024 }), dependencies))
+      .rejects.toThrow('8 的倍数')
+    expect(requests).toHaveLength(0)
+  })
+
   test('Given 参考图越出授权目录 When 执行 Then 在联网前拒绝', async () => {
     const { dependencies, requests } = createDependencies()
     const workDir = mkdtempSync(join(tmpdir(), 'minimax-deny-'))

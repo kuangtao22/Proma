@@ -50,6 +50,9 @@ export interface ExecuteDreaminaImagesInput {
   captureRequest?: (request: ImageRequestAudit) => void
   /** 生成结果的等待上限；缺省 4 分钟。 */
   timeoutMs?: number
+  /** 自定义输出宽高（像素）；与宽高比互斥，且必须同时给出。 */
+  width?: number
+  height?: number
   /** 轮询间隔；缺省 3 秒。 */
   pollIntervalMs?: number
 }
@@ -70,6 +73,17 @@ const DEFAULT_POLL_INTERVAL_MS = 3_000
 const CLI_TIMEOUT_MS = 60_000
 /** 即梦支持的宽高比；不在表内的取值不传 --ratio。 */
 const SUPPORTED_ASPECT_RATIOS = new Set(['1:1', '3:4', '16:9', '4:3', '9:16', '21:9'])
+
+/**
+ * 各分辨率档位的边长与总像素上限，来自 `dreamina image2image -h`。
+ * 两个约束必须同时满足，后端配置仍是最终权威。
+ */
+const RESOLUTION_LIMITS: Record<string, { minSide: number; maxSide: number; maxPixels: number }> = {
+  '1k': { minSide: 512, maxSide: 2016, maxPixels: 1_763_584 },
+  '1.5k': { minSide: 972, maxSide: 2268, maxPixels: 2_359_296 },
+  '2k': { minSide: 768, maxSide: 3072, maxPixels: 4_194_304 },
+  '4k': { minSide: 1536, maxSide: 6240, maxPixels: 16_777_216 },
+}
 
 const defaultDependencies: DreaminaImagesExecutorDependencies = {
   runCli: (args, cliPath) => defaultRunCli(args, cliPath),
@@ -151,7 +165,10 @@ async function submitTask(
         '--poll=0',
       ]
   const ratio = resolveAspectRatio(input.aspectRatio)
-  if (ratio) args.push(`--ratio=${ratio}`)
+  /** 自定义尺寸与宽高比互斥，CLI 不接受同时传入。 */
+  const size = resolveCustomSize(input)
+  if (size) args.push(`--width=${size.width}`, `--height=${size.height}`)
+  else if (ratio) args.push(`--ratio=${ratio}`)
   const result = await dependencies.runCli(args, cliPath)
   assertCliAvailable(result)
   /** 需要网页确认等情况 CLI 不返回 JSON，必须先识别提示再尝试解析。 */
@@ -293,6 +310,32 @@ function normalizeImageCount(value: number | undefined): number {
 function resolveAspectRatio(value: string | undefined): string | undefined {
   if (value === undefined) return undefined
   return SUPPORTED_ASPECT_RATIOS.has(value) ? value : undefined
+}
+
+/**
+ * 校验并解析自定义尺寸。
+ * 入参：执行输入；返回值：合法宽高，未指定时返回 null。
+ * 规则来自 CLI 说明：必须同时给出正整数、落在所选分辨率档位的边长与总像素上限内。
+ */
+function resolveCustomSize(input: ExecuteDreaminaImagesInput): { width: number; height: number } | null {
+  const { width, height } = input
+  if (width === undefined && height === undefined) return null
+  if (width === undefined || height === undefined) {
+    throw new Error('自定义尺寸必须同时提供 width 与 height')
+  }
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    throw new Error('自定义尺寸必须为正整数')
+  }
+  /** 档位来自模型参数；未知档位时按 2k 处理，与内置默认一致。 */
+  const resolutionType = input.route.resolutionType ?? '2k'
+  const limits = RESOLUTION_LIMITS[resolutionType.toLowerCase()] ?? RESOLUTION_LIMITS['2k']!
+  const withinSide = width >= limits.minSide && width <= limits.maxSide
+    && height >= limits.minSide && height <= limits.maxSide
+  const withinPixels = width * height <= limits.maxPixels
+  if (!withinSide || !withinPixels) {
+    throw new Error(`自定义尺寸超出 ${resolutionType} 档位限制：每边需在 ${limits.minSide}-${limits.maxSide}，总像素不超过 ${limits.maxPixels}`)
+  }
+  return { width, height }
 }
 
 /** 可被取消的等待。 */

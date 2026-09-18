@@ -28,6 +28,9 @@ export interface ExecuteOpenAIImagesInput {
   allowedRoots?: string[]
   aspectRatio?: string
   imageSize?: string
+  /** 自定义像素尺寸；OpenAI Images 只接受固定档位，给出时明确拒绝。 */
+  width?: number
+  height?: number
   numberOfImages?: number
   signal?: AbortSignal
   /** 请求构造完成后、网络发送前同步捕获不含凭据的可信审计信息。 */
@@ -85,6 +88,10 @@ export async function executeOpenAIImages(
   input.signal?.throwIfAborted()
   const prompt = input.prompt.trim()
   if (!prompt) throw new Error('生图提示词不能为空')
+  /** OpenAI Images 只接受固定尺寸档位，自定义像素无法诚实映射，直接拒绝。 */
+  if (input.width !== undefined || input.height !== undefined) {
+    throw new Error('OpenAI Images 不支持自定义像素尺寸，请改用宽高比或尺寸档位')
+  }
   const count = normalizeImageCount(input.numberOfImages)
   const referenceImages = readAuthorizedReferenceImages(input)
   const endpoint = referenceImages.length > 0 ? 'images/edits' : 'images/generations'

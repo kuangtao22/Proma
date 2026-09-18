@@ -154,4 +154,27 @@ describe('即梦图像执行器', () => {
     expect(fixture.calls).toHaveLength(0)
     rmSync(workDir, { recursive: true, force: true })
   })
+
+  test('Given 自定义尺寸 When 执行 Then 传 --width/--height 且不再传 --ratio', async () => {
+    const fixture = createFixture()
+    await executeDreaminaImages(createInput({ width: 1024, height: 1536, aspectRatio: '16:9' }), fixture.dependencies)
+    expect(fixture.calls[0]).toContain('--width=1024')
+    expect(fixture.calls[0]).toContain('--height=1536')
+    /** 尺寸与宽高比互斥，CLI 会拒绝同时传入。 */
+    expect(fixture.calls[0]!.some((arg) => arg.startsWith('--ratio='))).toBe(false)
+  })
+
+  test('Given 尺寸非法 When 执行 Then 在调用 CLI 前按档位限制拒绝', async () => {
+    const fixture = createFixture()
+    const only = createInput({ width: 1024 })
+    await expect(executeDreaminaImages(only, fixture.dependencies)).rejects.toThrow('必须同时提供 width 与 height')
+
+    /** 2k 档位每边需在 768-3072，总像素不超过 4194304。 */
+    const tooSmall = createInput({ width: 512, height: 512 })
+    await expect(executeDreaminaImages(tooSmall, fixture.dependencies)).rejects.toThrow('超出 2k 档位限制')
+
+    const tooManyPixels = createInput({ width: 3072, height: 2048 })
+    await expect(executeDreaminaImages(tooManyPixels, fixture.dependencies)).rejects.toThrow('超出 2k 档位限制')
+    expect(fixture.calls).toHaveLength(0)
+  })
 })

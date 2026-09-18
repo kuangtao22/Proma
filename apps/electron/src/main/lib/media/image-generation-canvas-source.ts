@@ -157,7 +157,14 @@ export class ImageGenerationCanvasSource {
     /** 即梦凭据是本机 CLI 登录态，路由只需要 CLI 路径。 */
     if (authorizedSnapshotIsDreamina(snapshot)) {
       const cliPath = profile.provider === 'dreamina' ? profile.cliPath?.trim() : undefined
-      return cliPath ? { executor: 'dreamina-image', snapshot, cliPath } : { executor: 'dreamina-image', snapshot }
+      /** 尺寸校验要用到模型的分辨率档位，随路由一起下发。 */
+      const resolutionType = profile.models.find((model) => model.id === snapshot.modelId)?.params?.resolution_type
+      return {
+        executor: 'dreamina-image',
+        snapshot,
+        ...(cliPath ? { cliPath } : {}),
+        ...(resolutionType ? { resolutionType } : {}),
+      }
     }
     if (profile.provider === 'dreamina') {
       throw new Error('生图模型快照与当前配置不一致，请按当前配置重新生成')

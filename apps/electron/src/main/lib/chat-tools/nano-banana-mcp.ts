@@ -446,6 +446,8 @@ export function buildPiNanoBananaTools(
         referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
         aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
         imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
+        width: Type.Optional(Type.Integer({ minimum: 512, maximum: 6240, description: 'Custom output width in pixels; must be paired with height.' })),
+        height: Type.Optional(Type.Integer({ minimum: 512, maximum: 6240, description: 'Custom output height in pixels; must be paired with width.' })),
         numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
       })
     : Type.Object({
@@ -453,6 +455,8 @@ export function buildPiNanoBananaTools(
         referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
         aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
         imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
+        width: Type.Optional(Type.Integer({ minimum: 512, maximum: 6240, description: 'Custom output width in pixels; must be paired with height.' })),
+        height: Type.Optional(Type.Integer({ minimum: 512, maximum: 6240, description: 'Custom output height in pixels; must be paired with width.' })),
         numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
       })
 
@@ -490,6 +494,9 @@ export function buildPiNanoBananaTools(
           ? args.imageSize : undefined
         const requestedNumberOfImages = 'numberOfImages' in args && typeof args.numberOfImages === 'number'
           ? args.numberOfImages : undefined
+        /** 自定义尺寸只在非冻结调用里生效；冻结任务仍以 Host 参数为准。 */
+        const requestedWidth = 'width' in args && typeof args.width === 'number' ? args.width : undefined
+        const requestedHeight = 'height' in args && typeof args.height === 'number' ? args.height : undefined
         let prompt: string
         if (trustedParameters) {
           if (trustedPrompt === undefined) throw new Error('Canvas 冻结图片任务缺少配置原文')
@@ -524,6 +531,8 @@ export function buildPiNanoBananaTools(
                 prompt,
                 referenceImagePaths,
                 aspectRatio: trustedParameters?.aspectRatio ?? requestedAspectRatio,
+                width: trustedParameters ? undefined : requestedWidth,
+                height: trustedParameters ? undefined : requestedHeight,
                 numberOfImages: trustedParameters?.numberOfImages ?? requestedNumberOfImages,
                 signal,
                 captureRequest: ctx.captureDesignImageRequest,
@@ -538,6 +547,8 @@ export function buildPiNanoBananaTools(
                 prompt,
                 referenceImagePaths,
                 aspectRatio: trustedParameters?.aspectRatio ?? requestedAspectRatio,
+                width: trustedParameters ? undefined : requestedWidth,
+                height: trustedParameters ? undefined : requestedHeight,
                 numberOfImages: trustedParameters?.numberOfImages ?? requestedNumberOfImages,
                 signal,
                 captureRequest: ctx.captureDesignImageRequest,
@@ -553,7 +564,9 @@ export function buildPiNanoBananaTools(
                 referenceImagePaths,
                 cwd: ctx.agentCwd,
                 allowedRoots: ctx.allowedRoots,
-                aspectRatio: trustedParameters?.aspectRatio
+                width: trustedParameters ? undefined : requestedWidth,
+              height: trustedParameters ? undefined : requestedHeight,
+              aspectRatio: trustedParameters?.aspectRatio
                   ?? requestedAspectRatio,
                 imageSize: trustedParameters?.imageSize
                   ?? requestedImageSize,

@@ -23,6 +23,8 @@ export type ResolvedImageGenerationRoute =
       snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'dreamina-image' }>
       /** CLI 路径；缺省时按 PATH 解析。即梦凭据是 CLI 登录态，没有密钥。 */
       cliPath?: string
+      /** 模型的分辨率档位（1k/1.5k/2k/4k），用于校验自定义尺寸的合法范围。 */
+      resolutionType?: string
     }
   | {
       executor: 'comfyui'
