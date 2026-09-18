@@ -6,6 +6,7 @@ import {
   createImageGenerationDraft,
   draftToProfile,
   filterImageGenerationProfiles,
+  imageCatalogIdentity,
   imageGenerationSummary,
   imageProfileIdentity,
   profileToDraft,
@@ -99,5 +100,19 @@ describe('独立生图设置纯逻辑', () => {
     })))
     expect(imageProfileIdentity(base)).not.toBe(imageProfileIdentity(changedModel))
     expect(imageProfileIdentity(base)).toBe(imageProfileIdentity(base))
+  })
+
+  test('Given 未添加模型的草稿 When 生成拉取身份 Then 不抛错且随端点与凭据变化', () => {
+    /** 供应商拉取必须在“还没有任何模型”时可用，否则会退回严格合同校验并抛错。 */
+    const empty = { ...createImageGenerationDraft('minimax', 'image-m', 100), models: [] }
+    const identity = imageCatalogIdentity(empty)
+    expect(identity).toBe(imageCatalogIdentity(empty))
+
+    const changedBaseUrl = { ...empty, baseUrl: 'https://api.minimaxi.com/v1' }
+    expect(imageCatalogIdentity(changedBaseUrl)).not.toBe(identity)
+
+    /** 填写新 Key 表示改用草稿凭据，不能和“沿用已保存凭据”混淆。 */
+    const withDraftKey = { ...empty, apiKey: 'secret' }
+    expect(imageCatalogIdentity(withDraftKey)).not.toBe(identity)
   })
 })

@@ -15,7 +15,7 @@ import type { ImageGenerationSettingsResult } from '@proma/shared'
 import type { ImageGenerationController } from './ImageGenerationSettings.controller'
 /** 位图 mock 必须先于组件模块加载，因此这里使用动态导入。 */
 const { ImageGenerationCatalogView } = await import('./ImageGenerationSettings')
-const { createImageGenerationDraft, profileToDraft } = await import('./ImageGenerationSettings.logic')
+const { createImageGenerationDraft, imageCatalogIdentity, profileToDraft } = await import('./ImageGenerationSettings.logic')
 
 /** 构造权威设置快照。 */
 function createSettings(): ImageGenerationSettingsResult {
@@ -89,14 +89,9 @@ describe('独立生图设置页视图', () => {
 
   test('Given 拉取失败 When 渲染可用模型 Then 展示固定失败提示', () => {
     const draft = { ...createImageGenerationDraft('openai-images', 'image-o', 10), name: 'GPT' }
-    /** 即梦没有服务地址，统一取值避免联合类型收窄问题。 */
-    const baseUrl = draft.provider === 'dreamina' ? '' : draft.baseUrl
-    const identity = JSON.stringify([
-      draft.provider, baseUrl.trim(), '', ...draft.models.map((model) => [model.id.trim(), model.name?.trim() ?? '', ...model.capabilities]),
-    ])
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({
       draft,
-      catalog: { state: 'failed', message: '鉴权失败，请检查 API Key', models: [], draftIdentity: identity },
+      catalog: { state: 'failed', message: '鉴权失败，请检查 API Key', models: [], draftIdentity: imageCatalogIdentity(draft) },
     })} />)
     expect(html).toContain('鉴权失败，请检查 API Key')
   })

@@ -27,8 +27,8 @@ import {
 import {
   changeImageGenerationProvider,
   IMAGE_PROVIDER_LABELS,
+  imageCatalogIdentity,
   imageGenerationSummary,
-  imageProfileIdentity,
   providerUsesApiKey,
   type ImageGenerationDraft,
 } from './ImageGenerationSettings.logic'
@@ -104,7 +104,7 @@ function AvailableModels({ draft, controller, disabled }: {
   const [pendingId, setPendingId] = React.useState('')
   const [addError, setAddError] = React.useState('')
   /** 当前草稿的拉取结果；身份不匹配视为过期。 */
-  const catalog = controller.catalog?.draftIdentity === imageProfileIdentity({ ...draft, updatedAt: draft.createdAt })
+  const catalog = controller.catalog?.draftIdentity === imageCatalogIdentity(draft)
     ? controller.catalog
     : null
   const enabledIds = new Set(draft.models.map((model) => model.id))

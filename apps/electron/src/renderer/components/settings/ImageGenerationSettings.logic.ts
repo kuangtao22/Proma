@@ -221,6 +221,22 @@ export function imageProfileIdentity(profile: ImageGenerationProfile): string {
   ])
 }
 
+/**
+ * 目录拉取的归属身份。
+ * 入参：当前草稿；返回值：稳定字符串。
+ * 与严格 Profile 指纹不同：草稿尚未添加模型时也必须能拉取供应商清单，
+ * 因此这里不做任何合同校验，只取与目录相关的字段。
+ */
+export function imageCatalogIdentity(draft: ImageGenerationDraft): string {
+  return JSON.stringify([
+    draft.provider,
+    draft.provider === 'dreamina' ? draft.cliPath?.trim() ?? '' : draft.baseUrl.trim(),
+    draft.provider === 'minimax' ? draft.groupId?.trim() ?? '' : '',
+    draft.apiKey.trim() ? 'draft-key' : 'saved-key',
+    draft.models.map((model) => model.id.trim()),
+  ])
+}
+
 /** 对完整公开配置生成稳定指纹，防止编辑和删除覆盖外部修改。 */
 export function imageProfileFingerprint(profile: ImageGenerationProfile): string {
   return JSON.stringify(profile)

@@ -13,6 +13,7 @@ import {
   type ImageGenerationController,
   type ImageGenerationSettingsApi,
 } from './ImageGenerationSettings.controller'
+import { changeImageGenerationProvider } from './ImageGenerationSettings.logic'
 
 /** 构造权威设置快照：一家 ChatGPT 配置。 */
 function createSettings(revision = 4): ImageGenerationSettingsResult {
@@ -195,6 +196,26 @@ describe('独立生图设置控制器', () => {
       await act(async () => { await requireController(controller).fetchCatalog() })
       expect(requireController(controller).catalog?.models[0]?.id).toBe('gpt-image-2')
       expect(api.fetches.at(-1)?.credential).toEqual({ mode: 'saved', profileId: 'image-1' })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 尚未添加模型的草稿 When 拉取 Then 发出请求且不报配置无效', async () => {
+    /** 新建配置默认零模型，拉取身份不能走严格 Profile 合同（历史 bug：抛 IMAGE_GENERATION_CONFIG_INVALID）。 */
+    const api = createApi()
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      act(() => requireController(controller).startCreate())
+      /** 走生产切换函数，得到与真实界面一致的 MiniMax 草稿（内置模型可能为空）。 */
+      const minimaxDraft = changeImageGenerationProvider(requireController(controller).draft!, 'minimax')
+      expect(minimaxDraft.models).toEqual([])
+      act(() => requireController(controller).updateDraft({ ...minimaxDraft, apiKey: 'secret' }))
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      expect(api.fetches).toHaveLength(1)
+      expect(api.fetches[0]).toMatchObject({ provider: 'minimax', credential: { mode: 'draft', apiKey: 'secret' } })
+      expect(requireController(controller).catalog).toMatchObject({ state: 'success', models: [{ id: 'gpt-image-2' }] })
+      expect(requireController(controller).actionError).toBeNull()
     } finally { act(() => host.unmount()); host.restore() }
   })
 })

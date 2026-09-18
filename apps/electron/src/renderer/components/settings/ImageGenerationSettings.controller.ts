@@ -18,6 +18,7 @@ import {
   copyImageGenerationProfile,
   createImageGenerationDraft,
   draftToProfile,
+  imageCatalogIdentity,
   filterImageGenerationProfiles,
   imageProfileFingerprint,
   imageProfileIdentity,
@@ -290,7 +291,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const fetchCatalog = React.useCallback(async (): Promise<void> => {
     const currentDraft = draft
     if (!currentDraft) return
-    const identity = imageProfileIdentity(draftToProfile({ ...currentDraft, updatedAt: currentDraft.createdAt }))
+    /** 草稿可能还没添加模型，身份不能走严格 Profile 校验。 */
+    const identity = imageCatalogIdentity(currentDraft)
     setCatalog({ state: 'loading', models: [], draftIdentity: identity })
     try {
       const credential = currentDraft.provider === 'dreamina'
