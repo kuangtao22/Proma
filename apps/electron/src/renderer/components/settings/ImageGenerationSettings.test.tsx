@@ -100,11 +100,19 @@ describe('独立生图设置页视图', () => {
       draft,
       dreaminaStatus: { state: 'loggedIn', credit: 987, message: '即梦已登录' },
     })} />)
-    expect(html).toContain('已登录 · 剩余额度 987')
+    expect(html).toContain('本机已登录 · 剩余额度 987')
+    /** 登录态属于本机 CLI，界面上必须说明所有即梦配置共用同一账号。 */
+    expect(html).toContain('本机所有即梦配置共用同一个账号')
     expect(html).toContain('重新登录')
     expect(html).toContain('退出登录')
     /** 已登录时不再展示「登录即梦」入口，避免重复授权。 */
     expect(html).not.toContain('>登录即梦<')
+  })
+
+  test('Given 即梦草稿 When 渲染表单 Then 未查询状态时说明是本机登录态', () => {
+    const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).toContain('尚未查询本机登录态')
   })
 
   test('Given 等待授权 When 渲染登录面板 Then 展示设备码与授权入口', () => {

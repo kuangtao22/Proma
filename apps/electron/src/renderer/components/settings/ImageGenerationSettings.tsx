@@ -268,7 +268,19 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               onChange={(name) => controller.updateDraft({ ...draft, name })}
             />
             {draft.provider === 'dreamina' ? (
-              <DreaminaLoginPanel controller={controller} draft={draft} disabled={saving} />
+              <>
+                <DreaminaLoginPanel controller={controller} disabled={saving} />
+                {/** CLI 路径属于配置字段，放在面板外层避免二次内边距造成错位缩进。 */}
+                <SettingsInput
+                  id="image-cli-path"
+                  label="CLI 路径（可选）"
+                  description="留空则按 PATH 查找 dreamina；换路径不会切换账号，登录态属于本机 CLI"
+                  value={draft.cliPath ?? ''}
+                  disabled={saving}
+                  placeholder="例如：/usr/local/bin/dreamina"
+                  onChange={(cliPath) => controller.updateDraft({ ...draft, cliPath })}
+                />
+              </>
             ) : (
               <>
                 <SettingsInput
@@ -426,23 +438,24 @@ export function ImageGenerationSettings(props: ImageGenerationSettingsProps): Re
 
 /**
  * 即梦登录面板。
- * 入参：控制器、当前草稿与禁用态；返回值：状态行、CLI 路径、设备码与操作按钮。
+ * 入参：控制器与禁用态；返回值：本机登录态、设备码与账号操作按钮。
  * 设备码只在等待授权时展示，登录成功后立即回到账号状态，不保留任何凭据。
  */
-function DreaminaLoginPanel({ controller, draft, disabled }: {
+function DreaminaLoginPanel({ controller, disabled }: {
   controller: ImageGenerationController
-  /** 收窄到即梦草稿：这个面板只在即梦分支渲染，CLI 路径也只在即梦上存在。 */
-  draft: ImageGenerationDraft & { provider: 'dreamina' }
   disabled: boolean
 }): React.ReactElement {
   const { dreaminaStatus, dreaminaLogin, dreaminaBusy } = controller
   const busy = disabled || dreaminaBusy
   const loggedIn = dreaminaStatus?.state === 'loggedIn'
-  /** 状态行文案：查询前、已登录、未登录与异常各自独立，不互相冒充。 */
+  /**
+   * 状态行文案：查询前、已登录、未登录与异常各自独立，不互相冒充。
+   * 明确写成「本机」是因为登录态属于本地 CLI 会话，不属于这条配置。
+   */
   const statusText = dreaminaStatus === null
-    ? '尚未查询即梦登录态'
+    ? '尚未查询本机登录态'
     : dreaminaStatus.state === 'loggedIn'
-      ? `已登录 · 剩余额度 ${dreaminaStatus.credit ?? 0}`
+      ? `本机已登录 · 剩余额度 ${dreaminaStatus.credit ?? 0}`
       : dreaminaStatus.message
   const statusTone = dreaminaStatus?.state === 'loggedIn'
     ? 'text-emerald-600'
@@ -459,16 +472,19 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
 
   return (
     <div className="space-y-3 px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1">
           <div className="text-sm font-medium text-foreground">即梦登录</div>
-          <div className={cn('mt-0.5 text-xs', statusTone)}>{statusText}</div>
+          <div className={cn('text-xs', statusTone)}>{statusText}</div>
+          <p className="text-xs text-muted-foreground">
+            登录态由本地即梦 CLI 保存在系统凭据库，本机所有即梦配置共用同一个账号。
+          </p>
         </div>
         <Button
           type="button"
           size="sm"
           variant="outline"
-          className="h-7 shrink-0 text-xs"
+          className="h-8 shrink-0 text-xs"
           disabled={busy}
           onClick={() => void controller.refreshDreaminaStatus()}
         >
@@ -503,7 +519,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
               type="button"
               size="sm"
               variant="outline"
-              className="h-7 text-xs"
+              className="h-8 text-xs"
               disabled={dreaminaLogin.verificationUri === null}
               onClick={() => {
                 const uri = dreaminaLogin.verificationUri
@@ -518,7 +534,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
               type="button"
               size="sm"
               variant="ghost"
-              className="h-7 text-xs"
+              className="h-8 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => void controller.cancelDreaminaLogin()}
             >
               取消
@@ -539,6 +555,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
         </p>
       )}
 
+      {/** 账号操作统一成一行：主操作在左，退出登录用弱化样式单独收在右侧。 */}
       <div className="flex flex-wrap items-center gap-2">
         {loggedIn ? (
           <>
@@ -546,7 +563,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
               type="button"
               size="sm"
               variant="outline"
-              className="h-7 text-xs"
+              className="h-8 text-xs"
               disabled={busy || dreaminaLogin.state === 'pending'}
               onClick={() => void controller.startDreaminaLogin(true)}
             >
@@ -556,7 +573,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
               type="button"
               size="sm"
               variant="ghost"
-              className="h-7 text-xs"
+              className="h-8 text-xs text-muted-foreground hover:text-destructive"
               disabled={busy || dreaminaLogin.state === 'pending'}
               onClick={() => void controller.logoutDreamina()}
             >
@@ -567,7 +584,7 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
           <Button
             type="button"
             size="sm"
-            className="h-7 text-xs"
+            className="h-8 text-xs"
             disabled={busy || dreaminaLogin.state === 'pending'}
             onClick={() => void controller.startDreaminaLogin(false)}
           >
@@ -576,15 +593,6 @@ function DreaminaLoginPanel({ controller, draft, disabled }: {
           </Button>
         )}
       </div>
-
-      <SettingsInput
-        id="image-cli-path"
-        label="CLI 路径（可选）"
-        value={draft.cliPath ?? ''}
-        disabled={disabled}
-        placeholder="留空则按 PATH 查找 dreamina"
-        onChange={(cliPath) => controller.updateDraft({ ...draft, cliPath })}
-      />
     </div>
   )
 }
