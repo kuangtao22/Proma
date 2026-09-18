@@ -109,6 +109,10 @@ function describeLoadError(error: unknown): string {
   if (code === 'IMAGE_GENERATION_LOAD_TIMEOUT') {
     return '读取生图配置超时：主进程可能仍是旧构建，请重启开发实例后重试。'
   }
+  /** 非设置窗口（例如应用内浏览器）调用设置接口会被主进程拒绝，这里给出准确指引。 */
+  if (code.includes('MEDIA_ACCESS_DENIED')) {
+    return '当前窗口没有读取生图配置的权限：请从「媒体生成 → 生图模型」设置页打开，而不是从应用内浏览器。'
+  }
   return '读取生图配置失败，请重试。'
 }
 
