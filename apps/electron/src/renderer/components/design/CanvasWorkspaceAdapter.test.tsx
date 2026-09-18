@@ -22,6 +22,7 @@ mock.module('@/lib/model-logo', () => ({
   getChannelLogo: () => 'model-logo.png',
   getModelLogo: () => 'model-logo.png',
   getProviderLogo: () => 'model-logo.png',
+  getJimengLogo: () => 'jimeng-logo.png',
   resolveModelDisplayName: (modelId: string) => modelId,
   resolveModelProvider: () => 'unknown',
 }))

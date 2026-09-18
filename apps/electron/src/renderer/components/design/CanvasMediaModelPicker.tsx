@@ -8,12 +8,32 @@ import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { getJimengLogo, getProviderLogo } from '@/lib/model-logo'
 
 /** 供应商稳定标识到中文名的展示映射，与生成模型设置页保持一致。 */
 const PROVIDER_LABELS: Record<string, string> = {
   dreamina: '即梦',
   'openai-images': 'ChatGPT（OpenAI Images）',
   minimax: 'MiniMax 图像',
+}
+
+/**
+ * 供应商到品牌图标的映射。
+ * 即梦用官方图标；OpenAI 与 MiniMax 复用渠道图标；未知供应商不加图标而不是拿别的品牌冒充。
+ */
+function providerIcon(provider: string | undefined): string | undefined {
+  if (provider === 'dreamina') return getJimengLogo()
+  if (provider === 'openai-images') return getProviderLogo('openai')
+  if (provider === 'minimax') return getProviderLogo('minimax')
+  return undefined
+}
+
+/** 供应商图标；缺图标时保持占位宽度，避免同一列表里文字错位。 */
+function ProviderIcon({ provider }: { provider: string | undefined }): React.ReactElement {
+  const icon = providerIcon(provider)
+  return icon === undefined
+    ? <span aria-hidden="true" className="size-5 shrink-0 rounded bg-muted" />
+    : <img src={icon} alt="" className="size-5 shrink-0 rounded object-contain" />
 }
 
 /** 画布媒体配置统一入口；模型范围和服务器绑定分别通过父组件的文档 CAS 保存。 */
@@ -70,6 +90,12 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
   const groups = [...new Set(filtered.map((option) => option.channelId ?? '内置'))]
   /** 当前目录里出现过的供应商，供「按供应商自动」逐家勾选。 */
   const providerIds = [...new Set(options.map((option) => option.provider).filter((provider): provider is string => provider !== undefined))]
+  /** 当前生效的供应商集合；全部已启用等价于「所有供应商都选」。 */
+  const selectedProviders = scope?.mode === 'providers'
+    ? scope.providers.filter((provider) => providerIds.includes(provider))
+    : providerIds
+  /** 页签由范围模式推导：显式选模型才属于自定义。 */
+  const mode: 'auto' | 'manual' = scope?.mode === 'selected' ? 'manual' : 'auto'
   const missingIds = selection.unavailableIds.filter((id) => !optionIds.has(id) && id.toLocaleLowerCase().includes(search))
   /** 首次切换单项即固定当前完整候选集合，保留失效引用以便显式移除。 */
   const toggle = (id: string, checked: boolean): void => {
@@ -99,42 +125,66 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
       <div role="group" aria-label="媒体类型" className="mt-2 grid grid-cols-4 gap-1">
         {(['all', 'image', 'audio', 'video'] as const).map((value) => <Button key={value} type="button" variant={kind === value ? 'secondary' : 'ghost'} size="sm" className="h-7 px-1 text-xs" aria-pressed={kind === value} onClick={() => setKind(value)}>{({ all: '全部', image: '图片', audio: '音频', video: '视频' })[value]}</Button>)}
       </div>
-      <div className="my-2 flex items-center justify-between gap-2 text-xs">
-        <label className="flex min-w-0 items-center gap-2"><input type="checkbox" disabled={disabled || loading || !!error} checked={!scope || scope.mode === 'all-enabled'} onChange={(event) => onChange(event.target.checked ? { mode: 'all-enabled' } : { mode: 'selected', modelIds: selection.selectedIds })} />全部已启用</label>
-        <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled || loading || !!error} onClick={() => onChange({ mode: 'selected', modelIds: [] })}>全不选</Button>
-      </div>
       {/**
-        * 供应商范围：用户只需要说“用哪家”，具体模型交给 agent 在范围内适配，
-        * 不必逐条勾选模型；需要复现特定效果时再退回手动勾选。
+        * 两种使用方式用页签切换：
+        * 自动 = 只选供应商，具体模型由 agent 在范围内适配；自定义 = 逐条指定模型。
         */}
-      {providerIds.length > 0 ? <div className="mb-2 rounded border border-border/60 p-2">
-        <div className="mb-1 flex items-center justify-between gap-2 text-xs">
-          <span className="text-muted-foreground">按供应商自动（模型由 agent 适配）</span>
-          <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled || loading || !!error}
-            onClick={() => onChange({ mode: 'providers', providers: scope?.mode === 'providers' ? [] : providerIds })}>
-            {scope?.mode === 'providers' ? '取消供应商范围' : '启用'}
+      <div role="tablist" aria-label="模型选择方式" className="my-2 grid grid-cols-2 gap-1 rounded bg-muted/40 p-1">
+        {([['auto', '按供应商自动'], ['manual', '自定义模型']] as const).map(([value, label]) => (
+          <Button key={value} type="button" role="tab" size="sm" aria-selected={mode === value}
+            variant={mode === value ? 'secondary' : 'ghost'} className="h-7 text-xs"
+            disabled={disabled || loading || !!error}
+            onClick={() => {
+              if (value === mode) return
+              /** 切到自动时保留当前可用范围；切到自定义时固定当前生效模型，避免选择丢失。 */
+              if (value === 'auto') onChange(providerIds.length > 0 && selectedProviders.length === providerIds.length
+                ? { mode: 'all-enabled' }
+                : { mode: 'providers', providers: selectedProviders.length > 0 ? selectedProviders : providerIds })
+              else onChange({ mode: 'selected', modelIds: selection.selectedIds })
+            }}>
+            {label}
           </Button>
-        </div>
-        {scope?.mode === 'providers' ? <div role="group" aria-label="供应商范围" className="flex flex-wrap items-center gap-2">
-          {providerIds.map((provider) => <label key={provider} className="flex items-center gap-1 text-xs">
-            <input type="checkbox" aria-label={`供应商 ${provider}`} disabled={disabled}
-              checked={scope.providers.includes(provider)}
-              onChange={(event) => onChange({
-                mode: 'providers',
-                providers: event.target.checked ? [...scope.providers, provider] : scope.providers.filter((item) => item !== provider),
-              })} />
-            {PROVIDER_LABELS[provider] ?? provider}
-          </label>)}
-        </div> : null}
-      </div> : null}
+        ))}
+      </div>
       <div className="max-h-64 overflow-y-auto" aria-busy={loading}>
         {loading ? <div role="status" className="flex justify-center py-5"><LoaderCircle className="size-4 animate-spin" aria-label="正在加载媒体模型" /></div> : error ? <div role="alert" className="py-3 text-sm text-destructive">{error}<Button variant="ghost" size="sm" onClick={() => { void load() }}>重试</Button></div> : <>
+          {/**
+            * 自动模式只列供应商，模型交给 agent 适配。
+            * 用列表行而不是内联复选，供应商再多也排得下，并且带上品牌图标。
+            */}
+          {mode === 'auto' ? <>
+            <p className="px-1 pb-1 text-xs text-muted-foreground">勾选供应商即可，具体模型由 agent 在该范围内适配。</p>
+            <div className="divide-y divide-border/40 rounded border border-border/60">
+              {providerIds.map((provider) => {
+                const checked = selectedProviders.includes(provider)
+                /** 全部供应商都选中时回退为「跟随目录」，新增供应商会自动纳入。 */
+                const nextProviders = checked
+                  ? selectedProviders.filter((item) => item !== provider)
+                  : [...selectedProviders, provider]
+                return <label key={provider} className="flex min-w-0 items-center gap-2 px-2 py-2 hover:bg-accent">
+                  <ProviderIcon provider={provider} />
+                  <span className="min-w-0 flex-1 truncate text-sm">{PROVIDER_LABELS[provider] ?? provider}</span>
+                  <input type="checkbox" aria-label={`供应商 ${provider}`} disabled={disabled} checked={checked}
+                    onChange={(event) => onChange(event.target.checked
+                      ? nextProviders.length === providerIds.length
+                        ? { mode: 'all-enabled' }
+                        : { mode: 'providers', providers: nextProviders }
+                      : { mode: 'providers', providers: nextProviders })} />
+                </label>
+              })}
+              {providerIds.length === 0 ? <p className="px-2 py-3 text-center text-xs text-muted-foreground">还没有可用的生成供应商，请先到设置里添加</p> : null}
+            </div>
+          </> : null}
+          {mode === 'manual' ? <>
           {groups.map((group) => <div key={group}>
           <div className="truncate px-1 pt-2 text-xs text-muted-foreground">{filtered.find((option) => option.channelId === group)?.channelName ?? group}</div>
           {filtered.filter((option) => (option.channelId ?? '内置') === group).map((option) => <label key={option.profileId} className="flex min-w-0 items-center gap-2 rounded px-1 py-2 hover:bg-accent">
             <input type="checkbox" aria-label={option.name} checked={selection.selectedIds.includes(option.profileId)} disabled={disabled || (!option.available && !selection.selectedIds.includes(option.profileId))} onChange={(event) => toggle(option.profileId, event.target.checked)} />
+            <ProviderIcon provider={option.provider} />
             <span className="min-w-0 flex-1"><span className="block truncate text-sm">{option.name}</span><span className="block truncate text-xs text-muted-foreground" title={option.unavailableReason}>{option.available ? option.modelId : option.unavailableReason ?? '当前不可用'}</span></span>
           </label>)}</div>)}
+          {!filtered.length ? <p className="py-4 text-center text-sm text-muted-foreground">{query ? '没有匹配的模型' : '暂无媒体模型'}</p> : null}
+          </> : null}
           {/**
             * 失效选择来自旧媒体目录：只给裸 ID 用户看不懂，因此显式说明来源、
             * 保留完整 ID 作 title，并提供一次清空全部失效引用的入口。
@@ -144,7 +194,6 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
             <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled} onClick={() => { for (const id of missingIds) toggle(id, false) }}>清理全部</Button>
           </div> : null}
           {missingIds.map((id) => <label key={id} className="flex min-w-0 items-center gap-2 px-1 py-2" title={id}><input type="checkbox" checked disabled={disabled} aria-label={`移除失效模型 ${id}`} onChange={() => toggle(id, false)} /><span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">该模型已从媒体目录移除，勾选可取消</span></label>)}
-          {!filtered.length && !missingIds.length ? <p className="py-4 text-center text-sm text-muted-foreground">{query ? '没有匹配的模型' : '暂无媒体模型'}</p> : null}
         </>}
       </div>
     </PopoverContent>
