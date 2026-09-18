@@ -7,6 +7,8 @@ mock.module('@/lib/model-logo', () => ({
   PromaLogo: 'proma-logo.png',
   getChannelLogo: () => 'model-logo.png',
   getModelLogo: () => 'model-logo.png',
+  /** 即梦官方图标同样是位图，测试里统一替换为占位资源。 */
+  getJimengLogo: () => 'jimeng-logo.png',
   getProviderLogo: () => 'model-logo.png',
   resolveModelDisplayName: (modelId: string) => modelId,
   resolveModelProvider: () => 'unknown',
@@ -88,6 +90,8 @@ describe('独立生图设置页视图', () => {
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
     expect(html).toContain('即梦登录')
     expect(html).toContain('登录即梦')
+    /** 即梦必须有官方图标，且不能拿其它字节产品冒充。 */
+    expect(html).toContain('src="jimeng-logo.png"')
     /** 即梦走 CLI 登录，必须能在表单里配置 CLI 路径。 */
     expect(html).toContain('id="image-cli-path"')
     expect(html).not.toContain('id="image-base-url"')

@@ -109,6 +109,9 @@ import MiniMaxLogo from '@/assets/models/minimax.png'
 // Xiaomi / MiMo
 import XiaomiLogo from '@/assets/models/xiaomi.png'
 
+// 即梦 / Dreamina（字节官方图标）
+import JimengLogo from '@/assets/models/jimeng.png'
+
 // Proma
 import PromaLogo from '@/assets/models/proma.png'
 
@@ -307,6 +310,15 @@ export function getModelLogo(modelId: string, provider?: ProviderType): string {
  */
 export function getProviderLogo(provider: ProviderType): string {
   return PROVIDER_LOGO_MAP[provider] ?? DefaultLogo
+}
+
+/**
+ * 即梦（Dreamina）品牌图标。
+ * 即梦不是 LLM 渠道供应商，不进入 PROVIDER_LOGO_MAP，
+ * 由独立生成供应商设置页显式取用，避免与 LLM 渠道枚举耦合。
+ */
+export function getJimengLogo(): string {
+  return JimengLogo
 }
 
 /**

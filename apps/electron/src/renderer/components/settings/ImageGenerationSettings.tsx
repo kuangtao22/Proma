@@ -22,7 +22,7 @@ import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { getProviderLogo } from '@/lib/model-logo'
+import { getJimengLogo, getProviderLogo } from '@/lib/model-logo'
 import { cn } from '@/lib/utils'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsInput, SettingsRow, SettingsSection, SettingsSelect, SettingsToggle } from './primitives'
@@ -51,11 +51,11 @@ export interface ImageGenerationSettingsProps {
 
 /**
  * 生成供应商到品牌 Logo 的显式映射。
- * 入参：生成供应商；返回值：Logo URL 或 undefined。
- * 即梦没有可用资源，返回 undefined 而不是拿别的品牌冒充。
+ * 入参：生成供应商；返回值：Logo URL。
+ * 即梦用官方图标，不能拿豆包等其它字节产品冒充。
  */
-function imageProviderLogo(provider: ImageGenerationProvider): string | undefined {
-  if (provider === 'dreamina') return undefined
+function imageProviderLogo(provider: ImageGenerationProvider): string {
+  if (provider === 'dreamina') return getJimengLogo()
   return getProviderLogo(provider === 'openai-images' ? 'openai' : 'minimax')
 }
 
@@ -334,10 +334,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               options={IMAGE_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => ({
                 value: descriptor.provider,
                 label: descriptor.label,
-                /** 即梦暂无官方 Logo 资源，留空避免用其它品牌冒充。 */
-                ...(imageProviderLogo(descriptor.provider) === undefined
-                  ? {}
-                  : { icon: imageProviderLogo(descriptor.provider) }),
+                icon: imageProviderLogo(descriptor.provider),
               }))}
               onValueChange={(value) => {
                 if (value !== 'dreamina' && value !== 'openai-images' && value !== 'minimax') return
@@ -495,9 +492,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               <SettingsRow
                 key={profile.id}
                 label={profile.name}
-                icon={imageProviderLogo(profile.provider) === undefined
-                  ? undefined
-                  : <img src={imageProviderLogo(profile.provider)} alt="" className="h-10 w-10 rounded" />}
+                icon={<img src={imageProviderLogo(profile.provider)} alt="" className="h-10 w-10 rounded" />}
                 description={<><span>{IMAGE_PROVIDER_LABELS[profile.provider]} · {imageGenerationSummary(profile)}</span><span className="block">{profile.endpointOrigin ?? 'CLI 登录态'} · {providerUsesApiKey(profile.provider) ? (profile.credentialConfigured ? '凭据已配置' : '缺少凭据') : 'CLI 登录态'}</span></>}
               >
                 {/** 操作区与音频页一致：开关 + 图标按钮，文字按钮会互相挤压。 */}
