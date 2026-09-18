@@ -66,6 +66,16 @@ describe('独立生图设置页视图', () => {
     expect(html).toContain('旧配置借用渠道凭据')
   })
 
+  test('Given 已配置目录 When 渲染列表行 Then 操作区为开关加图标按钮且可复制', () => {
+    /** 文字按钮会与相邻操作互相挤压（曾出现“启用中编辑”连成一片）。 */
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController()} />)
+    expect(html).toContain('aria-label="停用 ChatGPT 生图"')
+    expect(html).toContain('aria-label="复制 ChatGPT 生图"')
+    expect(html).toContain('aria-label="编辑 ChatGPT 生图"')
+    expect(html).toContain('aria-label="删除 ChatGPT 生图"')
+    expect(html).not.toContain('>启用中<')
+  })
+
   test('Given 即梦草稿 When 渲染表单 Then 没有服务地址与密钥字段而有登录面板', () => {
     const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)

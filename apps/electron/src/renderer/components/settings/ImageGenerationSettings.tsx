@@ -12,10 +12,11 @@ import type {
   ImageGenerationProvider,
 } from '@proma/shared'
 import { IMAGE_GENERATION_PROVIDER_DESCRIPTORS } from '@proma/shared'
-import { CheckCircle2, Download, Loader2, Plus, Search, Trash2, X } from 'lucide-react'
+import { CheckCircle2, Copy, Download, Loader2, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { getProviderLogo } from '@/lib/model-logo'
 import { MediaSettingsPage } from './MediaSettingsPage'
 import { SettingsCard, SettingsInput, SettingsRow, SettingsSection, SettingsSelect, SettingsToggle } from './primitives'
@@ -371,9 +372,11 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
                   : <img src={imageProviderLogo(profile.provider)} alt="" className="h-10 w-10 rounded" />}
                 description={<><span>{IMAGE_PROVIDER_LABELS[profile.provider]} · {imageGenerationSummary(profile)}</span><span className="block">{profile.endpointOrigin ?? 'CLI 登录态'} · {providerUsesApiKey(profile.provider) ? (profile.credentialConfigured ? '凭据已配置' : '缺少凭据') : 'CLI 登录态'}</span></>}
               >
+                {/** 操作区与音频页一致：开关 + 图标按钮，文字按钮会互相挤压。 */}
                 <div className="flex flex-wrap items-center justify-end gap-1">
-                  <Button type="button" size="icon-sm" variant="ghost" aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} title={profile.enabled ? '停用' : '启用'} disabled={saving} onClick={() => void controller.toggleEnabled(profile, !profile.enabled)}>{profile.enabled ? '启用中' : '已停用'}</Button>
-                  <Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => controller.startEdit(profile)}>编辑</Button>
+                  <Switch checked={profile.enabled} disabled={saving} aria-label={`${profile.enabled ? '停用' : '启用'} ${profile.name}`} onCheckedChange={(enabled) => void controller.toggleEnabled(profile, enabled)} />
+                  <Button type="button" size="icon-sm" variant="ghost" aria-label={`复制 ${profile.name}`} title="复制" disabled={saving} onClick={() => controller.startCopy(profile)}><Copy /></Button>
+                  <Button type="button" size="icon-sm" variant="ghost" aria-label={`编辑 ${profile.name}`} title="编辑" disabled={saving} onClick={() => controller.startEdit(profile)}><Pencil /></Button>
                   <Button type="button" size="icon-sm" variant="ghost" aria-label={`删除 ${profile.name}`} title="删除" disabled={saving} onClick={() => controller.requestDelete(profile.id)}><Trash2 /></Button>
                 </div>
               </SettingsRow>
