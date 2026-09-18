@@ -19,6 +19,7 @@ import { saveAttachment, isImageAttachment } from '../attachment-service'
 import type { ResolveImageGenerationRoute } from '../image-generation-runtime'
 import type { TrustedImageParameters } from '../agent-run-extensions'
 import { executeOpenAIImages } from './openai-images-executor'
+import { executeMiniMaxImages } from './minimax-image-executor'
 import type { ImageRequestAudit } from './image-request-context'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
@@ -511,7 +512,22 @@ export function buildPiNanoBananaTools(
         const referenceImagePaths = ctx.trustedReferenceImagePaths !== undefined
           ? [...ctx.trustedReferenceImagePaths]
           : requestedReferenceImagePaths
-        const result: McpToolResult = resolvedRoute?.executor === 'openai-images'
+        /** MiniMax 走独立凭据的 HTTP 执行器；参考图尚未接入，由执行器明确拒绝。 */
+        const result: McpToolResult = resolvedRoute?.executor === 'minimax-image'
+          ? {
+              content: [{ type: 'text', text: '图片已生成。' }],
+              imageAttachments: (await executeMiniMaxImages({
+                route: resolvedRoute,
+                sessionId: ctx.sessionId,
+                prompt,
+                referenceImagePaths,
+                aspectRatio: trustedParameters?.aspectRatio ?? requestedAspectRatio,
+                numberOfImages: trustedParameters?.numberOfImages ?? requestedNumberOfImages,
+                signal,
+                captureRequest: ctx.captureDesignImageRequest,
+              })).imageAttachments,
+            }
+          : resolvedRoute?.executor === 'openai-images'
           ? {
               content: [{ type: 'text', text: '图片已生成。' }],
               imageAttachments: (await executeOpenAIImages({

@@ -80,8 +80,11 @@ function canvasProtocolFor(profile: ImageGenerationPublicProfile, model: ImageGe
   return imageGenerationModelKind(model) === 'video' ? 'minimax-video' : 'minimax-image'
 }
 
-/** 当前真正接过执行器的独立供应商；其余先如实标为不可执行。 */
-const EXECUTABLE_ADAPTERS: ReadonlySet<string> = new Set(['openai-images'])
+/**
+ * 当前真正接过执行器的独立协议；其余先如实标为不可执行。
+ * 即梦（CLI 异步）与 MiniMax 视频尚未接入，保持缺席。
+ */
+const EXECUTABLE_ADAPTERS: ReadonlySet<string> = new Set(['openai-images', 'minimax-image'])
 
 /**
  * 把独立生成目录投影成画布候选。

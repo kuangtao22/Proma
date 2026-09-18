@@ -22,6 +22,13 @@ function createCatalog(): ImageGenerationPublicCatalog {
         enabled: true, createdAt: 1, updatedAt: 2,
         credentialConfigured: true,
       },
+      {
+        id: 'image-minimax', name: '我的 MiniMax', provider: 'minimax',
+        baseUrl: 'https://api.minimax.cn/v1',
+        models: [{ id: 'image-01', capabilities: ['text-to-image'] }],
+        enabled: true, createdAt: 1, updatedAt: 2,
+        credentialConfigured: true,
+      },
     ],
   }
 }
@@ -59,6 +66,18 @@ describe('独立生成配置的画布来源', () => {
     const { source } = createSource()
     expect(() => source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-jimeng', '5.0')))
       .toThrow('执行器尚未接入')
+  })
+
+  test('Given MiniMax 独立配置 When 固化并解析路由 Then 走 MiniMax 执行器', () => {
+    const { source, resolved } = createSource()
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-minimax', 'image-01'))
+    expect(snapshot).toMatchObject({ executor: 'minimax-image', imageProfileId: 'image-minimax', modelId: 'image-01' })
+    expect(source.resolveExecutionRoute(snapshot)).toMatchObject({
+      executor: 'minimax-image',
+      baseUrl: 'https://api.minimax.cn/v1',
+      apiKey: 'sk-independent',
+    })
+    expect(resolved).toEqual(['image-minimax'])
   })
 
   test('Given 已删除或停用的配置 When 固化快照 Then 给出可操作原因', () => {

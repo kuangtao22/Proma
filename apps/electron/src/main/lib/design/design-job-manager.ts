@@ -2566,6 +2566,12 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
   if (value.executor === 'openai-images' && typeof value.imageProfileId === 'string') {
     return isSafeDesignStableId(value.imageProfileId) && Object.keys(value).length === 5
   }
+  /** MiniMax 独立生成配置来源，与 OpenAI 同构但走各自的执行器。 */
+  if (value.executor === 'minimax-image') {
+    return typeof value.imageProfileId === 'string'
+      && isSafeDesignStableId(value.imageProfileId)
+      && Object.keys(value).length === 5
+  }
   /** 历史作业的渠道来源；仅为让既有画布任务继续可解析。 */
   if (value.executor === 'openai-images') return typeof value.channelId === 'string'
     && value.channelId.length > 0

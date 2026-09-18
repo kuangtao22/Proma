@@ -1,4 +1,4 @@
-import type { DesignJobRecord, DesignJobStatus, DesignTraceEntry } from '@proma/shared'
+import type { DesignJobRecord, DesignJobStatus, DesignTraceEntry, ImageGenerationExecutor } from '@proma/shared'
 import { isDeepStrictEqual } from 'node:util'
 import type { CanvasImageCandidateBatchService } from './canvas-image-candidate-batch-service'
 import { createImageJobId } from './canvas-image-run-service'
@@ -37,7 +37,7 @@ export interface CanvasTaskDetailsInput extends CanvasTaskReference {
 export interface CanvasTaskPublicModel {
   name: string
   modelId: string
-  executor: 'nano-banana' | 'openai-images' | 'comfyui'
+  executor: ImageGenerationExecutor
 }
 
 /** 任务详情中的单次尝试。 */

@@ -13,6 +13,12 @@ export type ResolvedImageGenerationRoute =
       apiKey: string
     }
   | {
+      executor: 'minimax-image'
+      snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'minimax-image' }>
+      baseUrl: string
+      apiKey: string
+    }
+  | {
       executor: 'comfyui'
       snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'comfyui' }>
     }

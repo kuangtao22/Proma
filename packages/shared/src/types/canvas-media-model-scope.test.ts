@@ -30,6 +30,15 @@ describe('独立生成配置的画布候选投影', () => {
         ],
         enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
       },
+      {
+        id: 'image-minimax', name: 'MiniMax 图像', provider: 'minimax' as const,
+        baseUrl: 'https://api.minimax.cn/v1',
+        models: [
+          { id: 'image-01', name: 'Image 01', capabilities: ['text-to-image', 'image-to-image'] as const },
+          { id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3', capabilities: ['text-to-video'] as const },
+        ],
+        enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
+      },
     ],
   }
 
@@ -45,6 +54,12 @@ describe('独立生成配置的画布候选投影', () => {
     const video = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', 'seedance2.5'))
     expect(video).toMatchObject({ mediaKind: 'video', executor: 'dreamina' })
     expect(video?.capabilities).toEqual(['text-to-video', 'image-to-video'])
+    /** MiniMax 图像执行器已接入，只有视频模型仍不可用。 */
+    const minimaxImage = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-minimax', 'image-01'))
+    expect(minimaxImage).toMatchObject({ executor: 'minimax-image', available: true })
+    expect(minimaxImage?.support).toEqual({ state: 'supported', adapterId: 'minimax-image' })
+    const minimaxVideo = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-minimax', 'MiniMax-Hailuo-2.3'))
+    expect(minimaxVideo).toMatchObject({ executor: 'minimax-video', mediaKind: 'video', available: false })
   })
 
   test('Given 停用的配置 When 投影候选 Then 标注停用且不伪造可用', () => {

@@ -91,7 +91,7 @@ export interface DesignViewport extends DesignPoint {
 export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
-export type ImageGenerationExecutor = 'nano-banana' | 'openai-images' | 'comfyui'
+export type ImageGenerationExecutor = 'nano-banana' | 'openai-images' | 'minimax-image' | 'comfyui'
 export type DesignContextMode = 'auto' | 'project' | 'none'
 export type DesignContextCategory =
   | 'brand'
@@ -177,6 +177,11 @@ export type ImageGenerationModelSnapshot =
        * 新的选择与生成一律写入 imageProfileId，不再新增这种快照。
        */
       channelId: string
+    }
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'minimax-image'
+      /** 独立生成配置来源；凭据来自生成模型目录。 */
+      imageProfileId: string
     }
   | ImageGenerationModelSnapshotBase & {
       executor: 'comfyui'
