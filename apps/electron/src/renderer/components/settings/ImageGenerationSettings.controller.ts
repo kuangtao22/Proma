@@ -142,7 +142,8 @@ export function imageSettingsApiFromWindow(): ImageGenerationSettingsApi {
 /** 创建独立生图设置页的生产控制器。 */
 export function useImageGenerationController(api: ImageGenerationSettingsApi): ImageGenerationController {
   const [settings, setSettings] = React.useState<ImageGenerationSettingsResult | null>(null)
-  const [loading, setLoading] = React.useState(true)
+  /** 初始不进入 loading：读取失败或悬住时页面仍必须可操作（例如新增配置）。 */
+  const [loading, setLoading] = React.useState(false)
   const [saving, setSaving] = React.useState(false)
   const [loadError, setLoadError] = React.useState<string | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)

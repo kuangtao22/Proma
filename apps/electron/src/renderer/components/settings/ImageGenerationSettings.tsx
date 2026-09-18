@@ -317,7 +317,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   }
 
   return (
-    <MediaSettingsPage title="生图模型 · 独立供应商配置" action={<Button type="button" size="sm" disabled={loading || saving} onClick={controller.startCreate}><Plus />添加生图配置</Button>} headerContent={headerContent}>
+    <MediaSettingsPage title="生图模型 · 独立供应商配置" action={<Button type="button" size="sm" disabled={saving} onClick={controller.startCreate}><Plus />添加生图配置</Button>} headerContent={headerContent}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         {navigation}
         <div className="relative w-64 max-w-full"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-9" aria-label="搜索生图配置" placeholder="搜索名称、供应商或模型" value={query} onChange={(event) => controller.setQuery(event.target.value)} /></div>
@@ -348,9 +348,10 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
           ))}
         </SettingsCard>
       )}
-      {loading && !settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground"><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取生图配置...</div></SettingsCard>
-        : settings && settings.catalog.profiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">尚未配置独立生图供应商</div></SettingsCard>
-          : settings && visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的生图配置</div></SettingsCard>
+      {/** 未读取到目录时仍给出明确状态，并且不阻塞新增。 */}
+      {!settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">{loading ? <><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取生图配置...</> : '未读取到生图配置：可先添加，或点上方「重新加载」重试'}</div></SettingsCard>
+        : settings.catalog.profiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">尚未配置独立生图供应商</div></SettingsCard>
+          : visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的生图配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => (
               <SettingsRow
                 key={profile.id}
