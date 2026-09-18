@@ -8,8 +8,51 @@
 /** 首批支持的独立生图供应商。 */
 export type ImageGenerationProvider = 'dreamina' | 'openai-images' | 'minimax'
 
-/** 单个模型可执行的图像任务能力。 */
-export type ImageGenerationCapability = 'text-to-image' | 'image-to-image' | 'upscale'
+/**
+ * 单个模型可执行的生成能力。
+ * 图片与视频共用一份能力清单，模型条目按能力区分产物类别。
+ */
+export type ImageGenerationCapability =
+  | 'text-to-image'
+  | 'image-to-image'
+  | 'upscale'
+  | 'text-to-video'
+  | 'image-to-video'
+  | 'first-last-frame'
+
+/** 模型条目的产物类别，用于设置页分组与目录筛选。 */
+export type ImageGenerationMediaKind = 'image' | 'video'
+
+/** 能力到产物类别的归属；图片能力与视频能力不允许混用。 */
+const IMAGE_GENERATION_CAPABILITY_KIND: Record<ImageGenerationCapability, ImageGenerationMediaKind> = {
+  'text-to-image': 'image',
+  'image-to-image': 'image',
+  upscale: 'image',
+  'text-to-video': 'video',
+  'image-to-video': 'video',
+  'first-last-frame': 'video',
+}
+
+/** 能力的中文展示文案，主进程与设置页共用同一份标签。 */
+export const IMAGE_GENERATION_CAPABILITY_LABELS: Record<ImageGenerationCapability, string> = {
+  'text-to-image': '文生图',
+  'image-to-image': '图生图',
+  upscale: '放大',
+  'text-to-video': '文生视频',
+  'image-to-video': '图生视频',
+  'first-last-frame': '首尾帧',
+}
+
+/**
+ * 判断模型条目属于图片还是视频。
+ * 入参：模型条目；返回值：产物类别。
+ * 出现任一视频能力即视为视频模型，避免同一模型被算进两个分组。
+ */
+export function imageGenerationModelKind(model: ImageGenerationModelEntry): ImageGenerationMediaKind {
+  return model.capabilities.some((capability) => IMAGE_GENERATION_CAPABILITY_KIND[capability] === 'video')
+    ? 'video'
+    : 'image'
+}
 
 /** 已启用模型条目；params 保存供应商侧参数（如即梦的分辨率档位）。 */
 export interface ImageGenerationModelEntry {
@@ -141,6 +184,22 @@ const DREAMINA_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
   { id: '5.0Pro', name: '即梦 5.0 Pro', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
 ]
 
+/**
+ * 即梦视频模型，来自三个视频子命令的 supported combinations 并集。
+ * 能力按命令逐个核对：text2video 只支持 seedance2.0/2.5 系列，
+ * frames2video 额外不含 seedance1.0fast，其余按各自列出为准。
+ */
+const DREAMINA_BUILTIN_VIDEO_MODELS: readonly ImageGenerationModelEntry[] = [
+  { id: 'seedance2.5', name: '即梦 Seedance 2.5', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance2.0', name: '即梦 Seedance 2.0', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance2.0fast', name: '即梦 Seedance 2.0 Fast', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance2.0_vip', name: '即梦 Seedance 2.0 VIP', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance2.0fast_vip', name: '即梦 Seedance 2.0 Fast VIP', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance2.0mini', name: '即梦 Seedance 2.0 Mini', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance1.5pro', name: '即梦 Seedance 1.5 Pro', capabilities: ['image-to-video', 'first-last-frame'], params: { video_resolution: '720p' } },
+  { id: 'seedance1.0fast', name: '即梦 Seedance 1.0 Fast', capabilities: ['image-to-video'], params: { video_resolution: '720p' } },
+]
+
 /** OpenAI Images 的官方内置模型兜底；端点不可用时仍可选择。 */
 const OPENAI_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
   { id: 'gpt-image-1', name: 'GPT Image 1', capabilities: ['text-to-image', 'image-to-image'] },
@@ -160,13 +219,28 @@ const MINIMAX_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
 ]
 
 /**
+ * MiniMax 视频模型，来自官方文生视频与图生视频 OpenAPI 的 model 枚举并集。
+ * 两家命令的默认分辨率不同：Hailuo 系列默认 768P，T2V/I2V 系列默认 720P。
+ */
+const MINIMAX_BUILTIN_VIDEO_MODELS: readonly ImageGenerationModelEntry[] = [
+  { id: 'MiniMax-Hailuo-2.3', name: 'MiniMax Hailuo 2.3', capabilities: ['text-to-video', 'image-to-video'], params: { resolution: '768P' } },
+  { id: 'MiniMax-Hailuo-2.3-Fast', name: 'MiniMax Hailuo 2.3 Fast', capabilities: ['image-to-video'], params: { resolution: '768P' } },
+  { id: 'MiniMax-Hailuo-02', name: 'MiniMax Hailuo 02', capabilities: ['text-to-video', 'image-to-video'], params: { resolution: '768P' } },
+  { id: 'T2V-01-Director', name: 'MiniMax T2V-01 Director', capabilities: ['text-to-video'], params: { resolution: '720P' } },
+  { id: 'T2V-01', name: 'MiniMax T2V-01', capabilities: ['text-to-video'], params: { resolution: '720P' } },
+  { id: 'I2V-01-Director', name: 'MiniMax I2V-01 Director', capabilities: ['image-to-video'], params: { resolution: '720P' } },
+  { id: 'I2V-01-live', name: 'MiniMax I2V-01 Live', capabilities: ['image-to-video'], params: { resolution: '720P' } },
+  { id: 'I2V-01', name: 'MiniMax I2V-01', capabilities: ['image-to-video'], params: { resolution: '720P' } },
+]
+
+/**
  * 三家供应商的默认服务地址与内置模型。
- * MiniMax 的 /v1/models 只登记对话模型，图像模型按官方 OpenAPI 枚举内置。
+ * MiniMax 的 /v1/models 只登记对话模型，图像与视频模型都按官方 OpenAPI 枚举内置。
  */
 export const IMAGE_GENERATION_PROVIDER_DEFAULTS: Record<ImageGenerationProvider, ImageGenerationProviderDefaults> = {
   dreamina: {
     baseUrl: '',
-    builtinModels: DREAMINA_BUILTIN_MODELS,
+    builtinModels: [...DREAMINA_BUILTIN_MODELS, ...DREAMINA_BUILTIN_VIDEO_MODELS],
     modelsPath: '',
   },
   'openai-images': {
@@ -176,7 +250,7 @@ export const IMAGE_GENERATION_PROVIDER_DEFAULTS: Record<ImageGenerationProvider,
   },
   minimax: {
     baseUrl: 'https://api.minimax.cn/v1',
-    builtinModels: MINIMAX_BUILTIN_MODELS,
+    builtinModels: [...MINIMAX_BUILTIN_MODELS, ...MINIMAX_BUILTIN_VIDEO_MODELS],
     modelsPath: '/models',
   },
 }
@@ -205,7 +279,10 @@ const PROFILE_COMMON_KEYS = ['id', 'name', 'provider', 'models', 'enabled', 'cre
 /** 模型条目允许出现的字段。 */
 const MODEL_KEYS = ['id', 'name', 'capabilities', 'params'] as const
 /** 合法能力集合。 */
-const CAPABILITIES: readonly ImageGenerationCapability[] = ['text-to-image', 'image-to-image', 'upscale']
+const CAPABILITIES: readonly ImageGenerationCapability[] = [
+  'text-to-image', 'image-to-image', 'upscale',
+  'text-to-video', 'image-to-video', 'first-last-frame',
+]
 
 /** 判断未知值是否为可枚举的普通对象。 */
 function isRecord(value: unknown): value is Record<string, unknown> {

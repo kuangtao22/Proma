@@ -13,6 +13,7 @@ import type {
 import {
   IMAGE_GENERATION_PROVIDER_DEFAULTS,
   IMAGE_GENERATION_PROVIDER_DESCRIPTORS,
+  imageGenerationModelKind,
   parseImageGenerationProfile,
 } from '@proma/shared'
 
@@ -137,15 +138,39 @@ export function filterImageGenerationProfiles(
   ].join('\n').toLocaleLowerCase().includes(normalized))
 }
 
-/** 列表摘要只显示模型数量与首个能力，避免长列表撑开行。 */
+/**
+ * 列表摘要：模型数量 + 图片/视频构成。
+ * 入参：公开配置；返回值：面向列表的中文摘要。
+ * 图片与视频合并后只显示首个能力会误导，因此统一按产物类别汇总。
+ */
 export function imageGenerationSummary(profile: ImageGenerationPublicProfile): string {
   const [first] = profile.models
   if (!first) return '未配置模型'
   const modelLabel = profile.models.length === 1 ? first.id : `${first.id} 等 ${profile.models.length} 个模型`
-  const capabilityLabel = first.capabilities.includes('image-to-image')
-    ? '文生图 + 图生图'
-    : first.capabilities.includes('upscale') ? '放大' : '文生图'
-  return `${modelLabel} · ${capabilityLabel}`
+  const imageCount = profile.models.filter((model) => imageGenerationModelKind(model) === 'image').length
+  const videoCount = profile.models.length - imageCount
+  if (videoCount === 0) return `${modelLabel} · 图片模型`
+  if (imageCount === 0) return `${modelLabel} · 视频模型`
+  return `${modelLabel} · ${imageCount} 图片 + ${videoCount} 视频`
+}
+
+/**
+ * 追加模型时按能力补齐供应商必需的参数默认值。
+ * 入参：供应商与模型条目；返回值：补齐默认参数的新条目。
+ * 即梦的图片模型要分辨率档位、视频模型要视频分辨率；其它供应商不附加本地默认值。
+ */
+export function withDefaultCapabilities(
+  provider: ImageGenerationProvider,
+  model: ImageGenerationModelEntry,
+): ImageGenerationModelEntry {
+  if (provider !== 'dreamina') return { ...model }
+  const params = { ...(model.params ?? {}) }
+  if (imageGenerationModelKind(model) === 'video') {
+    params.video_resolution ??= '720p'
+  } else {
+    params.resolution_type ??= '2k'
+  }
+  return { ...model, params }
 }
 
 /** 将公开配置转换为不回填明文凭据的编辑草稿。 */

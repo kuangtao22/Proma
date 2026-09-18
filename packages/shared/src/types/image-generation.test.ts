@@ -5,6 +5,7 @@ import {
   IMAGE_GENERATION_LEGACY_WARNING,
   IMAGE_GENERATION_PROVIDER_DEFAULTS,
   IMAGE_GENERATION_PROVIDER_DESCRIPTORS,
+  imageGenerationModelKind,
   parseImageGenerationCatalogFetchInput,
   parseImageGenerationCatalogFetchResult,
   parseImageGenerationProfile,
@@ -50,9 +51,26 @@ describe('独立生图生成 Shared 合同', () => {
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.baseUrl).toBe('')
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.builtinModels.map((model) => model.id)).toContain('5.0Pro')
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS['openai-images'].baseUrl).toBe('https://api.openai.com/v1')
-    /** MiniMax 的 /v1/models 只登记对话模型，图像模型必须内置，否则新配置没有任何可选模型。 */
-    expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels.map((model) => model.id)).toEqual(['image-01', 'image-01-live'])
+    /** MiniMax 的 /v1/models 只登记对话模型，图像与视频模型都必须内置。 */
+    expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels.map((model) => model.id))
+      .toContain('image-01')
+    expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels.map((model) => model.id))
+      .toContain('MiniMax-Hailuo-2.3')
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels[0]!.capabilities).toContain('image-to-image')
+  })
+
+  test('Given 图片与视频模型 When 判定产物类别 Then 只按能力归属一个分组', () => {
+    const imageModel = { id: 'image-01', capabilities: ['text-to-image'] as const }
+    const videoModel = { id: 'seedance2.5', capabilities: ['text-to-video', 'image-to-video'] as const }
+    expect(imageGenerationModelKind({ ...imageModel, capabilities: [...imageModel.capabilities] })).toBe('image')
+    expect(imageGenerationModelKind({ ...videoModel, capabilities: [...videoModel.capabilities] })).toBe('video')
+    /** 即梦视频模型必须带首尾帧能力，否则画布无法判断能不能做首尾帧。 */
+    const dreaminaVideo = IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.builtinModels
+      .filter((model) => imageGenerationModelKind(model) === 'video')
+    expect(dreaminaVideo.map((model) => model.id)).toContain('seedance2.5')
+    expect(dreaminaVideo.find((model) => model.id === 'seedance2.5')!.capabilities).toContain('first-last-frame')
+    /** 只做图生视频的老模型不能假装支持文生视频。 */
+    expect(dreaminaVideo.find((model) => model.id === 'seedance1.0fast')!.capabilities).toEqual(['image-to-video'])
   })
 
   test('Given 密钥型配置 When 解析 Then 清洗字段并按能力去重', () => {

@@ -75,7 +75,7 @@ export type MediaSettingsTab = 'image-models' | 'audio-generation' | 'connection
 
 /** 媒体设置一级导航的稳定值与用户可见文案。 */
 export const MEDIA_SETTINGS_TABS: ReadonlyArray<{ value: MediaSettingsTab; label: string }> = [
-  { value: 'image-models', label: '生图模型' },
+  { value: 'image-models', label: '生成模型' },
   { value: 'audio-generation', label: '音频生成' },
   { value: 'connections', label: '服务链接' },
   { value: 'workflows', label: '本地工作流' },

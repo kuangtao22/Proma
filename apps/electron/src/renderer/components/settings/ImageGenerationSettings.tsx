@@ -1,8 +1,8 @@
 /**
- * 独立生图供应商设置页。
+ * 独立生成供应商设置页：图片与视频模型合并到同一条供应商配置。
  *
  * 布局与音频生成页逐块对齐：基本信息（供应商类型 / 名称 / 服务地址 / API Key / 启用）、
- * 已启用模型、可用模型。即梦没有服务地址与 API Key，对应位置显示登录面板占位；
+ * 已启用模型、可用模型。即梦没有服务地址与 API Key，对应位置显示登录面板；
  * 旧统一媒体目录里的渠道型生图条目只读提示迁移，不再在这里被编辑。
  */
 import * as React from 'react'
@@ -11,7 +11,11 @@ import type {
   ImageGenerationPublicProfile,
   ImageGenerationProvider,
 } from '@proma/shared'
-import { IMAGE_GENERATION_PROVIDER_DESCRIPTORS } from '@proma/shared'
+import {
+  IMAGE_GENERATION_CAPABILITY_LABELS,
+  IMAGE_GENERATION_PROVIDER_DESCRIPTORS,
+  imageGenerationModelKind,
+} from '@proma/shared'
 import { toast } from 'sonner'
 import { CheckCircle2, Copy, Download, ExternalLink, Eye, EyeOff, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -34,6 +38,7 @@ import {
   imageGenerationSummary,
   initialModelsForProvider,
   providerUsesApiKey,
+  withDefaultCapabilities,
   type ImageGenerationDraft,
 } from './ImageGenerationSettings.logic'
 
@@ -44,10 +49,9 @@ export interface ImageGenerationSettingsProps {
   children?: React.ReactNode
 }
 
-/** 追加模型时按供应商补齐能力默认值。 */
 /**
- * 生图供应商到品牌 Logo 的显式映射。
- * 入参：生图供应商；返回值：Logo URL 或 undefined。
+ * 生成供应商到品牌 Logo 的显式映射。
+ * 入参：生成供应商；返回值：Logo URL 或 undefined。
  * 即梦没有可用资源，返回 undefined 而不是拿别的品牌冒充。
  */
 function imageProviderLogo(provider: ImageGenerationProvider): string | undefined {
@@ -55,31 +59,87 @@ function imageProviderLogo(provider: ImageGenerationProvider): string | undefine
   return getProviderLogo(provider === 'openai-images' ? 'openai' : 'minimax')
 }
 
-/** 追加模型时按供应商补齐能力默认值。 */
-function withDefaultCapabilities(provider: ImageGenerationProvider, model: ImageGenerationModelEntry): ImageGenerationModelEntry {
-  if (provider === 'dreamina') return { ...model, params: { ...(model.params ?? {}), resolution_type: model.params?.resolution_type ?? '2k' } }
-  return { ...model }
+/** 模型条目上的产物类别徽标，让图片与视频在同一列表里可分辨。 */
+function ModelKindBadge({ model }: { model: ImageGenerationModelEntry }): React.ReactElement {
+  const kind = imageGenerationModelKind(model)
+  return (
+    <span className={cn(
+      'shrink-0 rounded px-1 py-0.5 text-[10px] leading-none',
+      kind === 'video' ? 'bg-sky-500/10 text-sky-600' : 'bg-emerald-500/10 text-emerald-600',
+    )}>
+      {kind === 'video' ? '视频' : '图片'}
+    </span>
+  )
+}
+
+/** 能力的中文文案；未知能力原样回显，避免静默丢失信息。 */
+function capabilityText(model: ImageGenerationModelEntry): string {
+  return model.capabilities.map((capability) => IMAGE_GENERATION_CAPABILITY_LABELS[capability] ?? capability).join(' / ')
+}
+
+/** 模型类型筛选：图片与视频合并后必须能分开查看。 */
+export type ModelKindFilter = 'all' | 'image' | 'video'
+
+/** 按产物类别筛选模型；全部时保持原顺序。 */
+function filterModelsByKind(models: readonly ImageGenerationModelEntry[], filter: ModelKindFilter): ImageGenerationModelEntry[] {
+  return filter === 'all' ? [...models] : models.filter((model) => imageGenerationModelKind(model) === filter)
+}
+
+/** 类型筛选控件：显示三档并带上各自数量。 */
+function ModelKindFilterBar({ value, imageCount, videoCount, onChange }: {
+  value: ModelKindFilter
+  imageCount: number
+  videoCount: number
+  onChange: (next: ModelKindFilter) => void
+}): React.ReactElement {
+  const options: { value: ModelKindFilter; label: string }[] = [
+    { value: 'all', label: `全部 ${imageCount + videoCount}` },
+    { value: 'image', label: `图片 ${imageCount}` },
+    { value: 'video', label: `视频 ${videoCount}` },
+  ]
+  return (
+    <div role="group" aria-label="模型类型" className="flex items-center gap-1">
+      {options.map((option) => (
+        <Button
+          key={option.value}
+          type="button"
+          size="sm"
+          variant={value === option.value ? 'secondary' : 'ghost'}
+          className="h-7 px-2 text-xs"
+          aria-pressed={value === option.value}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </Button>
+      ))}
+    </div>
+  )
 }
 
 /** 当前草稿的模型列表编辑：新增、移除与选中摘要。 */
-function ModelListEditor({ draft, disabled, onChange }: {
+function ModelListEditor({ draft, models, disabled, onChange }: {
   draft: ImageGenerationDraft
+  /** 已按类型筛选后的模型；移除仍作用于完整列表。 */
+  models: readonly ImageGenerationModelEntry[]
   disabled: boolean
   onChange: (models: ImageGenerationModelEntry[]) => void
 }): React.ReactElement {
   return (
     <SettingsCard divided={false}>
-      {draft.models.length === 0 ? (
-        <div className="px-4 py-8 text-center text-sm text-muted-foreground">还没有启用任何模型，从下方可用模型中选择</div>
+      {models.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+          {draft.models.length === 0 ? '还没有启用任何模型，从下方可用模型中选择' : '当前类型下没有已启用模型'}
+        </div>
       ) : (
         <div className="divide-y divide-border/50">
-          {draft.models.map((model) => (
+          {models.map((model) => (
             <div key={model.id} className="group flex items-center gap-2 px-4 py-2.5">
               <CheckCircle2 size={14} className="shrink-0 text-emerald-500" />
+              <ModelKindBadge model={model} />
               <span className="min-w-0 flex-1 text-sm text-foreground">
                 {model.name ?? model.id}
                 {model.name && model.name !== model.id ? <span className="ml-1 text-muted-foreground">({model.id})</span> : null}
-                <span className="ml-2 text-xs text-muted-foreground">{model.capabilities.join(' / ')}</span>
+                <span className="ml-2 text-xs text-muted-foreground">{capabilityText(model)}</span>
               </span>
               <button
                 type="button"
@@ -100,10 +160,12 @@ function ModelListEditor({ draft, disabled, onChange }: {
 }
 
 /** 可用模型：内置模型 + 供应商拉取结果，点一下加入已启用模型。 */
-function AvailableModels({ draft, controller, disabled }: {
+function AvailableModels({ draft, controller, disabled, kind }: {
   draft: ImageGenerationDraft
   controller: ImageGenerationController
   disabled: boolean
+  /** 当前类型筛选；供应商拉取结果同样按类型过滤。 */
+  kind: ModelKindFilter
 }): React.ReactElement {
   const [pendingId, setPendingId] = React.useState('')
   const [addError, setAddError] = React.useState('')
@@ -115,7 +177,7 @@ function AvailableModels({ draft, controller, disabled }: {
   /** 内置清单优先，其次是拉取结果；两家都按 ID 去重，与音频页一致。 */
   const candidates = [...initialModelsForProvider(draft.provider), ...(catalog?.models ?? [])].filter((model, index, all) =>
     all.findIndex((entry) => entry.id === model.id) === index)
-  const available = candidates.filter((model) => !enabledIds.has(model.id))
+  const available = filterModelsByKind(candidates, kind).filter((model) => !enabledIds.has(model.id))
 
   /** 追加模型；重复 ID 就地拒绝。 */
   const appendModel = (model: ImageGenerationModelEntry): void => {
@@ -142,8 +204,9 @@ function AvailableModels({ draft, controller, disabled }: {
           className="group flex cursor-pointer items-center gap-2 px-4 py-2.5 transition-colors hover:bg-muted/30"
         >
           <Plus size={14} className="shrink-0 text-muted-foreground" />
+          <ModelKindBadge model={model} />
           <span className="flex-1 text-sm text-foreground">{model.name ?? model.id}</span>
-          <span className="text-xs text-muted-foreground">{model.capabilities.join(' / ')}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">{capabilityText(model)}</span>
         </div>
       ))}
       {available.length === 0 && (
@@ -213,7 +276,7 @@ function FetchModelsButton({ controller, disabled }: {
   )
 }
 
-/** 生图目录、动态表单与旧配置迁移提示的纯视图。 */
+/** 生成目录、动态表单与旧配置迁移提示的纯视图。 */
 export function ImageGenerationCatalogView({ controller, navigation, headerContent, children }: {
   controller: ImageGenerationController
 } & ImageGenerationSettingsProps): React.ReactElement {
@@ -221,6 +284,8 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   const deleteTarget = settings?.catalog.profiles.find((profile) => profile.id === deleteId)
   /** API Key 默认明文显示，与模型配置一致；眼睛按钮只负责临时遮挡。 */
   const [showApiKey, setShowApiKey] = React.useState(true)
+  /** 图片与视频模型合并后按类型查看；不影响任何写入内容。 */
+  const [modelKind, setModelKind] = React.useState<ModelKindFilter>('all')
   /**
    * 打开即梦表单时自动查询一次账号状态。
    * 只在草稿切到即梦且尚未查询过时触发，避免每次编辑都打点 CLI。
@@ -235,8 +300,11 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   }, [dreaminaProfileId, refreshDreaminaStatus])
 
   if (draft) {
+    /** 当前草稿的图片与视频模型数量，供筛选控件与分区描述共用。 */
+    const imageModelCount = draft.models.filter((model) => imageGenerationModelKind(model) === 'image').length
+    const videoModelCount = draft.models.length - imageModelCount
     return (
-      <MediaSettingsPage title={settings?.catalog.profiles.some((profile) => profile.id === draft.id) ? '编辑生图配置' : '添加生图配置'} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
+      <MediaSettingsPage title={settings?.catalog.profiles.some((profile) => profile.id === draft.id) ? '编辑生成模型配置' : '添加生成模型配置'} onBack={controller.closeDraft} busy={saving} headerContent={headerContent}>
         <SettingsSection title="基本信息">
           <SettingsCard>
             <SettingsSelect
@@ -263,7 +331,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               value={draft.name}
               disabled={saving}
               /** 通用示例，避免把某个具体账号名写进界面文案。 */
-              placeholder="例如：我的生图账号"
+              placeholder="例如：我的生成账号"
               required
               onChange={(name) => controller.updateDraft({ ...draft, name })}
             />
@@ -329,7 +397,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
             )}
             <SettingsToggle
               label="启用此配置"
-              description="关闭后该配置的模型不会出现在画布与 agent 的可选列表中"
+              description="关闭后该配置的图片与视频模型都不会出现在画布与 agent 的可选列表中"
               checked={draft.enabled}
               disabled={saving}
               onCheckedChange={(enabled) => controller.updateDraft({ ...draft, enabled })}
@@ -337,16 +405,23 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
           </SettingsCard>
         </SettingsSection>
 
-        <SettingsSection title="已启用模型" description={draft.models.length > 0 ? `${draft.models.length} 个模型` : undefined}>
+        <SettingsSection
+          title="已启用模型"
+          description={draft.models.length > 0
+            ? `${imageModelCount} 个图片模型 · ${videoModelCount} 个视频模型`
+            : undefined}
+          action={<ModelKindFilterBar value={modelKind} imageCount={imageModelCount} videoCount={videoModelCount} onChange={setModelKind} />}
+        >
           <ModelListEditor
             draft={draft}
+            models={filterModelsByKind(draft.models, modelKind)}
             disabled={saving}
             onChange={(models) => controller.updateDraft({ ...draft, models })}
           />
         </SettingsSection>
 
         <SettingsSection title="可用模型" action={<FetchModelsButton controller={controller} disabled={saving} />}>
-          <AvailableModels draft={draft} controller={controller} disabled={saving} />
+          <AvailableModels draft={draft} controller={controller} disabled={saving} kind={modelKind} />
         </SettingsSection>
 
         {actionError && <p role="alert" className="text-sm text-destructive">{actionError}</p>}
@@ -360,7 +435,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   }
 
   return (
-    <MediaSettingsPage title="生图模型 · 独立供应商配置" action={<Button type="button" size="sm" disabled={saving} onClick={controller.startCreate}><Plus />添加生图配置</Button>} headerContent={headerContent}>
+    <MediaSettingsPage title="生成模型 · 独立供应商配置" action={<Button type="button" size="sm" disabled={saving} onClick={controller.startCreate}><Plus />添加生成模型配置</Button>} headerContent={headerContent}>
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         {navigation}
         <div className="relative w-64 max-w-full"><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-9" aria-label="搜索生图配置" placeholder="搜索名称、供应商或模型" value={query} onChange={(event) => controller.setQuery(event.target.value)} /></div>
@@ -392,9 +467,9 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
         </SettingsCard>
       )}
       {/** 未读取到目录时仍给出明确状态，并且不阻塞新增。 */}
-      {!settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">{loading ? <><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取生图配置...</> : '未读取到生图配置：可先添加，或点上方「重新加载」重试'}</div></SettingsCard>
-        : settings.catalog.profiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">尚未配置独立生图供应商</div></SettingsCard>
-          : visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的生图配置</div></SettingsCard>
+      {!settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">{loading ? <><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取生成模型配置...</> : '未读取到生成模型配置：可先添加，或点上方「重新加载」重试'}</div></SettingsCard>
+        : settings.catalog.profiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">尚未配置独立生成供应商</div></SettingsCard>
+          : visibleProfiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">没有匹配的生成配置</div></SettingsCard>
             : <SettingsCard>{visibleProfiles.map((profile) => (
               <SettingsRow
                 key={profile.id}
@@ -416,7 +491,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
       <ConfirmDialog
         open={deleteId !== null}
         onOpenChange={(open) => { if (!open) controller.closeDelete() }}
-        title="删除生图配置？"
+        title="删除生成配置？"
         description={actionError ?? (deleteTarget ? `删除 ${deleteTarget.name} 后，画布与 agent 将不能再使用该配置的模型。` : '')}
         confirmLabel="删除"
         closeOnConfirm={false}

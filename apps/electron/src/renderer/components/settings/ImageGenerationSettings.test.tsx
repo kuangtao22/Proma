@@ -65,7 +65,8 @@ describe('独立生图设置页视图', () => {
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController()} />)
     expect(html).toContain('ChatGPT 生图')
     expect(html).toContain('gpt-image-1')
-    expect(html).toContain('文生图 + 图生图')
+    /** 摘要改为按产物类别汇总：图片与视频合并后仍要说清构成。 */
+    expect(html).toContain('gpt-image-1 · 图片模型')
     /** 列表行必须带供应商 Logo，与音频页一致。 */
     expect(html).toContain('src="model-logo.png"')
     expect(html).toContain('旧渠道生图')
@@ -171,6 +172,26 @@ describe('独立生图设置页视图', () => {
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
     expect(html).toContain('Image 01')
     expect(html).toContain('Image 01 Live')
+  })
+
+  test('Given 即梦草稿 When 渲染模型列表 Then 图片与视频合并展示且可分类筛选', () => {
+    const draft = { ...createImageGenerationDraft('dreamina', 'image-d', 10), name: '即梦主号' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    /** 分区描述按产物类别分别计数，而不是只给一个总数。 */
+    expect(html).toContain('9 个图片模型 · 8 个视频模型')
+    expect(html).toContain('全部 17')
+    /** 能力用中文标签，视频能力必须能看见。 */
+    expect(html).toContain('文生视频')
+    expect(html).toContain('首尾帧')
+  })
+
+  test('Given MiniMax 草稿 When 清空模型 Then 可用模型同时列出图片与视频', () => {
+    const draft = { ...createImageGenerationDraft('minimax', 'image-m', 10), name: '我的', models: [] }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).toContain('MiniMax Hailuo 2.3')
+    expect(html).toContain('I2V-01 Live')
+    /** 只做图生视频的模型不能标成文生视频。 */
+    expect(html).toContain('图生视频')
   })
 
   test('Given 内置模型已全部启用 When 拉取成功但无新增 Then 提示可用模型都已添加', () => {

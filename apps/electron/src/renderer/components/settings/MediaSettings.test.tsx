@@ -397,14 +397,15 @@ describe('MediaSettings 已确认交互合同', () => {
   test('Given 媒体设置 When 渲染一级导航 Then 展示四个确认分区和值', () => {
     const { MEDIA_SETTINGS_TABS, MediaSettingsTabsView } = getExpectedModule()
     expect(MEDIA_SETTINGS_TABS).toEqual([
-      { value: 'image-models', label: '生图模型' },
+      { value: 'image-models', label: '生成模型' },
       { value: 'audio-generation', label: '音频生成' },
       { value: 'connections', label: '服务链接' },
       { value: 'workflows', label: '本地工作流' },
     ])
     const html = renderToStaticMarkup(<MediaSettingsTabsView activeTab="image-models" onTabChange={() => undefined} />)
-    for (const label of ['生图模型', '音频生成', '服务链接', '本地工作流']) expect(html).toContain(label)
-    expect(html).not.toContain('媒体模型')
+    for (const label of ['生成模型', '音频生成', '服务链接', '本地工作流']) expect(html).toContain(label)
+    /** 图片与视频合并后不能再退回只描述图片的旧标题。 */
+    expect(html).not.toContain('生图模型')
     expect(html).not.toContain('服务连接')
     expect(html).not.toContain('公共工作流')
     expect(html).not.toContain('媒体预设')

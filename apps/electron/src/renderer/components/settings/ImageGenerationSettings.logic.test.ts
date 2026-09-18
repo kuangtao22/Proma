@@ -11,6 +11,7 @@ import {
   imageProfileIdentity,
   profileToDraft,
   providerUsesApiKey,
+  withDefaultCapabilities,
 } from './ImageGenerationSettings.logic'
 
 /** 构造公开生图配置快照。 */
@@ -89,8 +90,32 @@ describe('独立生图设置纯逻辑', () => {
     expect(filterImageGenerationProfiles(profiles, '即梦')).toHaveLength(1)
     expect(filterImageGenerationProfiles(profiles, 'gpt-image-1')).toHaveLength(1)
     expect(filterImageGenerationProfiles(profiles, 'private')).toHaveLength(0)
-    expect(imageGenerationSummary(profiles[0]!)).toBe('gpt-image-1 · 文生图 + 图生图')
-    expect(imageGenerationSummary(profiles[1]!)).toBe('5.0 · 文生图')
+    /** 摘要按产物类别汇总，图片与视频模型合并后仍能一眼看出构成。 */
+    expect(imageGenerationSummary(profiles[0]!)).toBe('gpt-image-1 · 图片模型')
+    expect(imageGenerationSummary(profiles[1]!)).toBe('5.0 · 图片模型')
+  })
+
+  test('Given 图片与视频模型混排 When 生成摘要与默认参数 Then 按能力区分处理', () => {
+    const mixed = createProfile({
+      models: [
+        { id: '5.0', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
+        { id: 'seedance2.5', capabilities: ['text-to-video', 'image-to-video', 'first-last-frame'] },
+      ],
+    })
+    expect(imageGenerationSummary(mixed)).toBe('5.0 等 2 个模型 · 1 图片 + 1 视频')
+    /** 即梦图片模型补分辨率档位，视频模型补视频分辨率，不能互相串。 */
+    expect(withDefaultCapabilities('dreamina', { id: '5.1', capabilities: ['text-to-image'] }).params)
+      .toEqual({ resolution_type: '2k' })
+    expect(withDefaultCapabilities('dreamina', { id: 'seedance2.0', capabilities: ['text-to-video'] }).params)
+      .toEqual({ video_resolution: '720p' })
+    /** 已带参数的内置清单不被覆盖。 */
+    expect(withDefaultCapabilities('dreamina', {
+      id: 'seedance2.0_vip',
+      capabilities: ['text-to-video'],
+      params: { video_resolution: '4k' },
+    }).params).toEqual({ video_resolution: '4k' })
+    /** 非即梦供应商不附加任何本地默认参数。 */
+    expect(withDefaultCapabilities('minimax', { id: 'T2V-01', capabilities: ['text-to-video'] }).params).toBeUndefined()
   })
 
   test('Given 身份字段变化 When 生成指纹 Then 模型与端点变化都会改变指纹', () => {
