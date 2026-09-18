@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
 import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, removeMcpServerFromConfig, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
-import { buildCanvasMediaModelOptions, isCanvasMediaModelAllowed } from '@proma/shared'
+import { buildCanvasGenerationModelOptions, isCanvasMediaModelAllowed } from '@proma/shared'
 import type {
   QuickTaskSubmitInput,
   VoiceDictationAudioChunkInput,
@@ -182,6 +182,7 @@ import type {
   CanvasWebviewTarget,
   CanvasWebviewPreviewTarget,
   ExportCanvasArtifactInput,
+  ImageGenerationPublicCatalog,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -459,6 +460,8 @@ import { AudioGenerationCatalogService } from './lib/media/audio-generation-cata
 import { ImageGenerationConfigStore } from './lib/media/image-generation-config-store'
 import { runImageModelLegacyCleanup } from './lib/image-model-legacy-cleanup'
 import { ImageGenerationCatalogService } from './lib/media/image-generation-catalog-service'
+import { ImageGenerationCanvasSource, isGenerationSnapshot } from './lib/media/image-generation-canvas-source'
+import type { CanvasImageModelRuntime } from './lib/media/image-generation-canvas-source'
 import { createImageGenerationIpcService } from './lib/media/image-generation-ipc'
 import type { ImageGenerationIpcService } from './lib/media/image-generation-ipc'
 import { ImageGenerationDreaminaService } from './lib/media/image-generation-dreamina-service'
@@ -791,6 +794,51 @@ function getDesignImageModelServices(): DesignImageModelServices {
     console.error('[生图迁移] 清理过程出现未预期异常', error)
   })
   return designImageModelServices
+}
+
+/** 进程级唯一的独立生成配置画布来源；旧统一目录只再接 ComfyUI 与历史作业。 */
+let canvasImageGenerationSource: ImageGenerationCanvasSource | undefined
+
+/** 读取独立生成目录；读取失败时不阻断画布，只让独立候选为空。 */
+function readIndependentGenerationCatalog(): ImageGenerationPublicCatalog {
+  try {
+    return getImageGenerationStore().readPublic()
+  } catch (error) {
+    console.error('[生成模型] 读取独立生成目录失败，画布将只显示本地工作流候选', error)
+    return { schemaVersion: 1, revision: 0, profiles: [] }
+  }
+}
+
+/** 返回独立生成配置在画布侧的来源。 */
+function getCanvasImageGenerationSource(): ImageGenerationCanvasSource {
+  return canvasImageGenerationSource ??= new ImageGenerationCanvasSource({
+    readCatalog: readIndependentGenerationCatalog,
+    resolveApiKey: (profileId) => getImageGenerationStore().resolveApiKey(profileId),
+  })
+}
+
+/**
+ * 返回画布与 Agent 共用的生图运行入口。
+ * 独立生成配置走新来源；ComfyUI 与历史渠道快照继续走旧目录，避免已有画布失效。
+ */
+function getCanvasImageModelRuntime(): CanvasImageModelRuntime {
+  const legacy = getDesignImageModelServices().imageModels
+  const independent = getCanvasImageGenerationSource()
+  return {
+    resolveAvailableSnapshot: (profileId, projectId) => ImageGenerationCanvasSource.isGenerationSelection(profileId)
+      ? independent.resolveAvailableSnapshot(profileId)
+      : legacy.resolveAvailableSnapshot(profileId, projectId),
+    assertSnapshotAvailable: (snapshot, projectId) => isGenerationSnapshot(snapshot)
+      ? independent.assertSnapshotAvailable(snapshot)
+      : legacy.assertSnapshotAvailable(snapshot, projectId),
+    resolveExecutionRoute: (snapshot, projectId) => isGenerationSnapshot(snapshot)
+      ? independent.resolveExecutionRoute(snapshot)
+      : legacy.resolveExecutionRoute(snapshot, projectId),
+    resolveAvailableWorkflowSnapshot: (workflow, projectId) => {
+      if (!legacy.resolveAvailableWorkflowSnapshot) throw new Error('本地工作流快照解析不可用')
+      return legacy.resolveAvailableWorkflowSnapshot(workflow, projectId)
+    },
+  }
 }
 
 /** 按渲染进程隔离工作区记忆订阅，并在显式清理或渲染进程销毁时释放。 */
@@ -2988,7 +3036,8 @@ export function registerIpcHandlers(): void {
     canvasImageCandidateBatches: canvasImageCandidateBatchService,
     canvasImageInputResolver,
     mediaExecution: createMediaDesignImageExecution({ configuration: getMediaConfiguration(), runs: mediaRuns, supervisor: mediaSupervisor, store: designStore }),
-    imageModels,
+    /** 独立生成配置与历史作业共用同一入口，由运行时按来源分发。 */
+    imageModels: getCanvasImageModelRuntime(),
     contextOrchestrator: designContextOrchestrator,
     getSettings,
     getSession: getAgentSessionMeta,
@@ -3833,7 +3882,8 @@ export function registerIpcHandlers(): void {
         canvasToolAccess.authorizeRead(current)
         if (canvasId) canvasToolAccess.requireLinkedCanvas(current, canvasId)
         const scope = canvasId ? canvasDocumentStore.requireStableAuthoritativeDocument({ projectId: current.projectId, canvasId }).mediaModelScope : undefined
-        return buildCanvasMediaModelOptions(imageModels.listMediaApiCatalog(), imageModels.listOptions(current.projectId))
+        /** 画布候选来自独立生成目录；本地工作流候选保持原语义。 */
+        return buildCanvasGenerationModelOptions(readIndependentGenerationCatalog(), imageModels.listOptions(current.projectId))
           .filter((model) => isCanvasMediaModelAllowed(scope, model.profileId))
       },
       getCanvasConnection: (current, canvasId) => {
