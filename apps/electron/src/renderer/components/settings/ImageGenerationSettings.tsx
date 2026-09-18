@@ -247,7 +247,8 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               label="供应商名称"
               value={draft.name}
               disabled={saving}
-              placeholder="例如：老沈GPT"
+              /** 通用示例，避免把某个具体账号名写进界面文案。 */
+              placeholder="例如：我的生图账号"
               required
               onChange={(name) => controller.updateDraft({ ...draft, name })}
             />

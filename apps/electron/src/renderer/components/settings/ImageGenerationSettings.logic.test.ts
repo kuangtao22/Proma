@@ -45,9 +45,9 @@ describe('独立生图设置纯逻辑', () => {
   })
 
   test('Given 已填写草稿 When 切换供应商 Then 重建默认模型并清空凭据但保留名称', () => {
-    const draft = { ...createImageGenerationDraft('openai-images', 'image-1', 100), name: '老沈GPT', apiKey: 'secret' }
+    const draft = { ...createImageGenerationDraft('openai-images', 'image-1', 100), name: '我的生图账号', apiKey: 'secret' }
     const switched = changeImageGenerationProvider(draft, 'dreamina')
-    expect(switched).toMatchObject({ provider: 'dreamina', name: '老沈GPT', apiKey: '', credentialConfigured: false })
+    expect(switched).toMatchObject({ provider: 'dreamina', name: '我的生图账号', apiKey: '', credentialConfigured: false })
     expect(switched.models.map((model) => model.id)).toContain('5.0Pro')
     /** 重复选择同一供应商不产生新对象，避免无意义重渲染。 */
     expect(changeImageGenerationProvider(switched, 'dreamina')).toBe(switched)
