@@ -44,9 +44,16 @@ interface ParsedImage {
   mediaType: DownloadedRemoteImage['mediaType']
 }
 
-interface AuthorizedReferenceImage extends ParsedImage {
+export interface AuthorizedReferenceImage extends ParsedImage {
   filename: string
   path: string
+}
+
+/** 参考图读取所需的最小输入；各独立供应商执行器共用同一套授权校验。 */
+export interface AuthorizedReferenceImageInput {
+  referenceImagePaths?: string[]
+  cwd?: string
+  allowedRoots?: string[]
 }
 
 interface OpenAIImageResponseItem {
@@ -163,8 +170,8 @@ function createEditRequest(
 }
 
 /** 校验并读取全部参考图，限制本地资源消耗且保留调用顺序。 */
-function readAuthorizedReferenceImages(
-  input: ExecuteOpenAIImagesInput,
+export function readAuthorizedReferenceImages(
+  input: AuthorizedReferenceImageInput,
 ): AuthorizedReferenceImage[] {
   const paths = input.referenceImagePaths ?? []
   if (paths.length === 0) return []
@@ -309,7 +316,7 @@ function decodeStrictBase64(value: string): Buffer {
 }
 
 /** 依据文件签名识别 Proma 支持的四类图片。 */
-function detectImageMediaType(bytes: Buffer): DownloadedRemoteImage['mediaType'] | undefined {
+export function detectImageMediaType(bytes: Buffer): DownloadedRemoteImage['mediaType'] | undefined {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'image/png'
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
   if (bytes.length >= 6 && (bytes.subarray(0, 6).toString('ascii') === 'GIF87a'

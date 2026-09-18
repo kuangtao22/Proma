@@ -4,11 +4,12 @@
  * 只使用独立生成配置提供的 Base URL 与 API Key：POST `${baseUrl}/image_generation`，
  * 取回 image_urls 后下载并保存为本地附件。凭据只在本次调用内存在，不落任何日志。
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { AgentToolResultImage } from '@proma/shared'
 import { deleteAttachment, saveAttachment } from '../attachment-service'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
 import { downloadSafeRemoteImage } from './safe-remote-image'
+import { readAuthorizedReferenceImages } from './openai-images-executor'
 import type { DownloadedRemoteImage } from './safe-remote-image'
 import type { ImageRequestAudit } from './image-request-context'
 
@@ -26,8 +27,11 @@ export interface ExecuteMiniMaxImagesInput {
   route: Extract<ResolvedImageGenerationRoute, { executor: 'minimax-image' }>
   sessionId: string
   prompt: string
-  /** 参考图路径；MiniMax 图生图尚未接入，非空时明确拒绝而不是静默忽略。 */
+  /** 参考图路径；非空时作为人物主体参考走图生图。 */
   referenceImagePaths?: string[]
+  /** 参考图授权根与工作目录，与其它执行器共用同一套校验。 */
+  cwd?: string
+  allowedRoots?: string[]
   aspectRatio?: string
   numberOfImages?: number
   signal?: AbortSignal
@@ -49,6 +53,8 @@ const defaultDependencies: MiniMaxImagesExecutorDependencies = {
 
 /** MiniMax 单次请求的图片数量上限，与官方文档的 n 取值范围一致。 */
 const MAX_IMAGE_COUNT = 9
+/** MiniMax 图生图只接受单张人物主体参考图。 */
+const MAX_REFERENCE_IMAGE_COUNT = 1
 /** 返回体读取上限，避免异常上游撑爆内存。 */
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 /** 官方支持的宽高比；不在表内的取值回落到 1:1。 */
@@ -62,14 +68,24 @@ export async function executeMiniMaxImages(
   input.signal?.throwIfAborted()
   const prompt = input.prompt.trim()
   if (!prompt) throw new Error('生图提示词不能为空')
-  /** 图生图需要 subject_reference 与参考图上传，当前未接入；明确拒绝优于静默丢图。 */
-  if ((input.referenceImagePaths ?? []).length > 0) {
-    throw new Error('MiniMax 图生图执行器尚未接入，请改用文生图或其它供应商')
+  /** 参考图先过授权校验；MiniMax 只接受单张人物主体参考。 */
+  const references = readAuthorizedReferenceImages(input)
+  if (references.length > MAX_REFERENCE_IMAGE_COUNT) {
+    throw new Error('MiniMax 图生图只支持 1 张人物主体参考图')
   }
   const count = normalizeImageCount(input.numberOfImages)
   const url = `${input.route.baseUrl.trim().replace(/\/+$/, '')}/image_generation`
 
-  input.captureRequest?.({ executor: 'minimax-image', modelId: input.route.snapshot.modelId, prompt, referenceImages: [] })
+  input.captureRequest?.({
+    executor: 'minimax-image',
+    modelId: input.route.snapshot.modelId,
+    prompt,
+    referenceImages: references.map((reference) => ({
+      path: reference.path,
+      sha256: createHash('sha256').update(reference.bytes).digest('hex'),
+      byteSize: reference.bytes.length,
+    })),
+  })
   input.signal?.throwIfAborted()
   const response = await dependencies.fetch(url, {
     method: 'POST',
@@ -80,6 +96,10 @@ export async function executeMiniMaxImages(
       n: count,
       response_format: 'url',
       prompt_optimizer: false,
+      /** 有参考图时按人物主体参考做图生图；Data URL 内联，避免上传到第三方存储。 */
+      ...(references.length > 0
+        ? { subject_reference: [{ type: 'character', image_file: `data:${references[0]!.mediaType};base64,${references[0]!.bytes.toString('base64')}` }] }
+        : {}),
       ...(resolveAspectRatio(input.aspectRatio) ? { aspect_ratio: resolveAspectRatio(input.aspectRatio) } : {}),
     }),
     signal: input.signal,

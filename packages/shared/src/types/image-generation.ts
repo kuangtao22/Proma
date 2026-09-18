@@ -175,13 +175,13 @@ export interface ImageGenerationProviderDefaults {
 const DREAMINA_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
   { id: '3.0', name: '即梦 3.0', capabilities: ['text-to-image'], params: { resolution_type: '1k' } },
   { id: '3.1', name: '即梦 3.1', capabilities: ['text-to-image'], params: { resolution_type: '1k' } },
-  { id: '4.0', name: '即梦 4.0', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '4.1', name: '即梦 4.1', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '4.5', name: '即梦 4.5', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '4.6', name: '即梦 4.6', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '4.7', name: '即梦 4.7', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '5.0', name: '即梦 5.0', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
-  { id: '5.0Pro', name: '即梦 5.0 Pro', capabilities: ['text-to-image'], params: { resolution_type: '2k' } },
+  { id: '4.0', name: '即梦 4.0', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '4.1', name: '即梦 4.1', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '4.5', name: '即梦 4.5', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '4.6', name: '即梦 4.6', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '4.7', name: '即梦 4.7', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '5.0', name: '即梦 5.0', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
+  { id: '5.0Pro', name: '即梦 5.0 Pro', capabilities: ['text-to-image', 'image-to-image'], params: { resolution_type: '2k' } },
 ]
 
 /**

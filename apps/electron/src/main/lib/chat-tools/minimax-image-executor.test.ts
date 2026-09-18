@@ -1,4 +1,7 @@
 import { beforeAll, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type {
   ExecuteMiniMaxImagesInput,
@@ -115,10 +118,26 @@ describe('MiniMax 图像执行器', () => {
     expect(failed.saved).toHaveLength(0)
   })
 
-  test('Given 传入参考图 When 执行 Then 明确拒绝而不是静默忽略', async () => {
+  test('Given 传入参考图 When 执行 Then 以 Data URL 走人物主体参考', async () => {
     const { dependencies, requests } = createDependencies()
-    await expect(executeMiniMaxImages(createInput({ referenceImagePaths: ['/tmp/a.png'] }), dependencies))
-      .rejects.toThrow('图生图执行器尚未接入')
+    const workDir = mkdtempSync(join(tmpdir(), 'minimax-i2i-'))
+    const referencePath = join(workDir, 'ref.png')
+    writeFileSync(referencePath, Buffer.from('89504e470d0a1a0a', 'hex'))
+    await executeMiniMaxImages(createInput({ referenceImagePaths: [referencePath], cwd: workDir }), dependencies)
+    const body = JSON.parse(String((requests[0]!.init as RequestInit).body))
+    expect(body.subject_reference).toHaveLength(1)
+    expect(body.subject_reference[0]).toMatchObject({ type: 'character' })
+    /** 参考图以 Data URL 内联，不上传到第三方存储。 */
+    expect(String(body.subject_reference[0].image_file)).toStartWith('data:image/png;base64,')
+    rmSync(workDir, { recursive: true, force: true })
+  })
+
+  test('Given 参考图越出授权目录 When 执行 Then 在联网前拒绝', async () => {
+    const { dependencies, requests } = createDependencies()
+    const workDir = mkdtempSync(join(tmpdir(), 'minimax-deny-'))
+    await expect(executeMiniMaxImages(createInput({ referenceImagePaths: ['/etc/hosts'], cwd: workDir }), dependencies))
+      .rejects.toThrow('参考图不在授权目录内')
     expect(requests).toHaveLength(0)
+    rmSync(workDir, { recursive: true, force: true })
   })
 })

@@ -132,10 +132,26 @@ describe('即梦图像执行器', () => {
     await expect(executeDreaminaImages(createInput(), missingFile.dependencies)).rejects.toThrow('图片文件不存在')
   })
 
-  test('Given 传入参考图 When 执行 Then 在调用 CLI 前明确拒绝', async () => {
+  test('Given 传入参考图 When 执行 Then 改走 image2image 并上传本地图片', async () => {
     const fixture = createFixture()
-    await expect(executeDreaminaImages(createInput({ referenceImagePaths: ['/tmp/a.png'] }), fixture.dependencies))
-      .rejects.toThrow('图生图执行器尚未接入')
+    const workDir = mkdtempSync(join(tmpdir(), 'dreamina-i2i-'))
+    const referencePath = join(workDir, 'ref.png')
+    writeFileSync(referencePath, Buffer.from('89504e470d0a1a0a', 'hex'))
+    await executeDreaminaImages(createInput({ referenceImagePaths: [referencePath], cwd: workDir }), fixture.dependencies)
+    expect(fixture.calls[0]![0]).toBe('image2image')
+    /** 授权校验会解析真实路径（macOS 的 /var 是 /private/var 的软链），因此只断言文件名。 */
+    const imagesArg = fixture.calls[0]!.find((arg) => arg.startsWith('--images='))
+    expect(imagesArg).toBeDefined()
+    expect(imagesArg!.endsWith('ref.png')).toBe(true)
+    rmSync(workDir, { recursive: true, force: true })
+  })
+
+  test('Given 参考图越出授权目录 When 执行 Then 在调用 CLI 前拒绝', async () => {
+    const fixture = createFixture()
+    const workDir = mkdtempSync(join(tmpdir(), 'dreamina-deny-'))
+    await expect(executeDreaminaImages(createInput({ referenceImagePaths: ['/etc/hosts'], cwd: workDir }), fixture.dependencies))
+      .rejects.toThrow('参考图不在授权目录内')
     expect(fixture.calls).toHaveLength(0)
+    rmSync(workDir, { recursive: true, force: true })
   })
 })

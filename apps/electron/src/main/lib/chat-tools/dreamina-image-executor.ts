@@ -5,6 +5,7 @@
  * 再 `query_result --download_dir` 轮询下载结果，最后把文件保存为受管附件。
  * 只有 gen_status=success 才算成功；submit 被接受不等于生成完成。
  */
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
@@ -12,6 +13,7 @@ import type { AgentToolResultImage } from '@proma/shared'
 import { deleteAttachment, saveAttachment } from '../attachment-service'
 import type { ResolvedImageGenerationRoute } from '../image-generation-runtime'
 import type { ImageRequestAudit } from './image-request-context'
+import { readAuthorizedReferenceImages } from './openai-images-executor'
 
 /** 单次 CLI 调用结果；只保留判定所需字段。 */
 export interface DreaminaCliResult {
@@ -37,8 +39,11 @@ export interface ExecuteDreaminaImagesInput {
   route: Extract<ResolvedImageGenerationRoute, { executor: 'dreamina-image' }>
   sessionId: string
   prompt: string
-  /** 参考图路径；即梦图像当前只声明文生图，非空时明确拒绝。 */
+  /** 参考图路径；非空时走 image2image，最多 10 张。 */
   referenceImagePaths?: string[]
+  /** 参考图授权根与工作目录，与其它执行器共用同一套校验。 */
+  cwd?: string
+  allowedRoots?: string[]
   aspectRatio?: string
   numberOfImages?: number
   signal?: AbortSignal
@@ -55,6 +60,8 @@ export interface DreaminaImagesExecutionResult {
 
 /** 单次请求允许生成的图片数量上限。 */
 const MAX_IMAGE_COUNT = 4
+/** 即梦图生图允许的参考图数量上限，来自 CLI 说明。 */
+const MAX_REFERENCE_IMAGE_COUNT = 10
 /** 默认等待生成完成的时长。 */
 const DEFAULT_TIMEOUT_MS = 4 * 60_000
 /** 默认轮询间隔。 */
@@ -88,16 +95,26 @@ export async function executeDreaminaImages(
   input.signal?.throwIfAborted()
   const prompt = input.prompt.trim()
   if (!prompt) throw new Error('生图提示词不能为空')
-  /** 即梦图像目前只声明文生图能力，参考图必须明确拒绝而不是丢掉。 */
-  if ((input.referenceImagePaths ?? []).length > 0) {
-    throw new Error('即梦图生图执行器尚未接入，请改用文生图或其它供应商')
+  /** 参考图必须通过授权目录校验；超限或越界都在调用 CLI 前拒绝。 */
+  const references = readAuthorizedReferenceImages(input)
+  if (references.length > MAX_REFERENCE_IMAGE_COUNT) {
+    throw new Error(`即梦图生图最多支持 ${MAX_REFERENCE_IMAGE_COUNT} 张参考图`)
   }
   const count = normalizeImageCount(input.numberOfImages)
   const cliPath = input.route.cliPath?.trim() || 'dreamina'
   const workDir = await dependencies.createTempDir()
   try {
-    input.captureRequest?.({ executor: 'dreamina-image', modelId: input.route.snapshot.modelId, prompt, referenceImages: [] })
-    const submitted = await submitTask(input, dependencies, cliPath, prompt, count)
+    input.captureRequest?.({
+      executor: 'dreamina-image',
+      modelId: input.route.snapshot.modelId,
+      prompt,
+      referenceImages: references.map((reference) => ({
+        path: reference.path,
+        sha256: createHash('sha256').update(reference.bytes).digest('hex'),
+        byteSize: reference.bytes.length,
+      })),
+    })
+    const submitted = await submitTask(input, dependencies, cliPath, prompt, count, references)
     const payload = await waitForResult(input, dependencies, cliPath, submitted, workDir)
     return await saveResultImages(input, dependencies, payload.imagePaths, workDir)
   } finally {
@@ -113,15 +130,26 @@ async function submitTask(
   cliPath: string,
   prompt: string,
   count: number,
+  references: readonly { path: string }[],
 ): Promise<string> {
   const params = input.route.snapshot
-  const args = [
-    'text2image',
-    `--prompt=${prompt}`,
-    `--model_version=${params.modelId}`,
-    `--generate_num=${count}`,
-    '--poll=0',
-  ]
+  /** 有参考图就是编辑任务，必须走 image2image，而不是把参考图丢掉。 */
+  const args = references.length > 0
+    ? [
+        'image2image',
+        `--prompt=${prompt}`,
+        `--model_version=${params.modelId}`,
+        ...references.map((reference) => `--images=${reference.path}`),
+        `--generate_num=${count}`,
+        '--poll=0',
+      ]
+    : [
+        'text2image',
+        `--prompt=${prompt}`,
+        `--model_version=${params.modelId}`,
+        `--generate_num=${count}`,
+        '--poll=0',
+      ]
   const ratio = resolveAspectRatio(input.aspectRatio)
   if (ratio) args.push(`--ratio=${ratio}`)
   const result = await dependencies.runCli(args, cliPath)
