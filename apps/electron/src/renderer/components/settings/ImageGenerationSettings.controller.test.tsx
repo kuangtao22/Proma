@@ -8,7 +8,7 @@ import type {
   ImageGenerationSettingsResult,
   ReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
-import { DREAMINA_LOGIN_MESSAGES } from '@proma/shared'
+import { DREAMINA_LOGIN_MESSAGES, parseReplaceImageGenerationCatalogRequest } from '@proma/shared'
 import {
   useImageGenerationController,
   type ImageGenerationController,
@@ -161,6 +161,11 @@ describe('独立生图设置控制器', () => {
       expect(api.replacements[0]!.expectedRevision).toBe(4)
       /** 未填新 Key 时必须 preserve，不能清空已保存密文。 */
       expect(api.replacements[0]!.profiles[0]!.credentialUpdate).toEqual({ mode: 'preserve' })
+      /**
+       * 提交载荷必须能通过主进程的严格合同。
+       * 公开配置带 credentialConfigured / endpointOrigin，原样提交会被整体拒绝。
+       */
+      expect(() => parseReplaceImageGenerationCatalogRequest(api.replacements[0]!)).not.toThrow()
       expect(requireController(controller).draft).toBeNull()
     } finally { act(() => host.unmount()); host.restore() }
   })
@@ -334,6 +339,28 @@ describe('独立生图设置控制器', () => {
       await act(async () => { requireController(controller).closeDraft() })
       expect(cancelled).toEqual(['dreamina-2', 'dreamina-2'])
       expect(requireController(controller).dreaminaLogin.state).toBe('idle')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 目录已有配置 When 启停与删除 Then 提交载荷同样通过严格合同', async () => {
+    /** 只要目录非空，未修改条目也会进入替换请求，必须还原为严格配置。 */
+    const api = createApi()
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      await act(async () => {
+        await requireController(controller).toggleEnabled(requireController(controller).settings!.catalog.profiles[0]!, false)
+      })
+      expect(api.replacements).toHaveLength(1)
+      expect(() => parseReplaceImageGenerationCatalogRequest(api.replacements[0]!)).not.toThrow()
+      expect(api.replacements[0]!.profiles[0]!.profile.enabled).toBe(false)
+
+      act(() => requireController(controller).requestDelete('image-1'))
+      await act(async () => { await requireController(controller).confirmDelete() })
+      expect(api.replacements).toHaveLength(2)
+      expect(() => parseReplaceImageGenerationCatalogRequest(api.replacements[1]!)).not.toThrow()
+      expect(api.replacements[1]!.profiles).toHaveLength(0)
     } finally { act(() => host.unmount()); host.restore() }
   })
 })

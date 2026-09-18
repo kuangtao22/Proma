@@ -285,6 +285,21 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
 
   React.useEffect(() => { void load() }, [load])
 
+  /**
+   * 为未修改条目构造「保持凭据」的替换条目。
+   * 入参：权威目录中的公开配置；返回值：严格配置 + preserve 凭据动作。
+   * 公开配置额外带有 credentialConfigured / endpointOrigin 等展示字段，
+   * 直接提交会被 Shared 严格合同拒绝，必须先还原为持久化形态（与音频页一致）。
+   */
+  const toPreserveEntries = React.useCallback(
+    (profiles: readonly ImageGenerationPublicProfile[]): ReplaceImageGenerationCatalogRequest['profiles'] =>
+      profiles.map((profile) => ({
+        profile: draftToProfile(profileToDraft(profile)),
+        credentialUpdate: { mode: 'preserve' as const },
+      })),
+    [],
+  )
+
   /** 保存草稿并提供冲突/结果未知后的重新读取。 */
   const saveDraft = React.useCallback(async (): Promise<void> => {
     if (!settings || !draft || saving) return
@@ -302,12 +317,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
           return
         }
       }
-      /** 完整替换目录：其它条目按原样提交，凭据保持不动。 */
-      /** 其它条目按原样提交，凭据一律保持不动。 */
-      const entries: ReplaceImageGenerationCatalogRequest['profiles'] = settings.catalog.profiles.map((candidate) => ({
-        profile: candidate,
-        credentialUpdate: { mode: 'preserve' as const },
-      }))
+      /** 完整替换目录：其它条目按原样提交，凭据一律保持不动。 */
+      const entries = toPreserveEntries(settings.catalog.profiles)
       const nextEntry: ReplaceImageGenerationCatalogRequest['profiles'][number] = {
         profile: draftToProfile({ ...draft, updatedAt: Date.now() }),
         credentialUpdate: draft.apiKey.trim()
@@ -334,7 +345,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [api, draft, load, saving, settings])
+  }, [api, draft, load, saving, settings, toPreserveEntries])
 
   /** 快捷启停仍完整替换目录，所有凭据保持不变。 */
   const toggleEnabled = React.useCallback(async (profile: ImageGenerationPublicProfile, enabled: boolean): Promise<void> => {
@@ -342,12 +353,13 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     setSaving(true)
     setActionError(null)
     try {
-      const entries = settings.catalog.profiles.map((candidate) => ({
-        profile: candidate.id === profile.id
-          ? { ...candidate, enabled, updatedAt: Date.now() }
-          : candidate,
+      const entries = toPreserveEntries(settings.catalog.profiles)
+      const index = settings.catalog.profiles.findIndex((candidate) => candidate.id === profile.id)
+      if (index < 0) return
+      entries[index] = {
+        profile: { ...entries[index]!.profile, enabled, updatedAt: Date.now() },
         credentialUpdate: { mode: 'preserve' as const },
-      }))
+      }
       const saved = await api.replaceCatalog({ expectedRevision: settings.catalog.revision, profiles: entries })
       if (mountedRef.current) setSettings(saved)
     } catch (error) {
@@ -355,7 +367,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [api, saving, settings])
+  }, [api, saving, settings, toPreserveEntries])
 
   /** 删除同样走整目录 CAS，避免局部写引入不一致。 */
   const confirmDelete = React.useCallback(async (): Promise<void> => {
@@ -363,9 +375,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     setSaving(true)
     setActionError(null)
     try {
-      const entries = settings.catalog.profiles
-        .filter((candidate) => candidate.id !== deleteId)
-        .map((candidate) => ({ profile: candidate, credentialUpdate: { mode: 'preserve' as const } }))
+      const entries = toPreserveEntries(settings.catalog.profiles.filter((candidate) => candidate.id !== deleteId))
       const saved = await api.replaceCatalog({ expectedRevision: settings.catalog.revision, profiles: entries })
       if (!mountedRef.current) return
       setSettings(saved)
@@ -376,7 +386,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [api, deleteId, saving, settings])
+  }, [api, deleteId, saving, settings, toPreserveEntries])
 
   /** 当前草稿的 CLI 路径；即梦调用只读这里，避免把整份草稿塞进依赖数组。 */
   const dreaminaCliPathRef = React.useRef<string | undefined>(undefined)
