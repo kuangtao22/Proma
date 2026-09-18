@@ -157,9 +157,16 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const [catalog, setCatalog] = React.useState<ImageGenerationCatalogViewState | null>(null)
   /** 编辑基线用于检测外部修改；保存成功后更新。 */
   const baselineRef = React.useRef<{ id: string; fingerprint: string } | null>(null)
-  /** 所有异步回调据此判断组件是否仍然挂载。 */
+  /**
+   * 所有异步回调据此判断组件是否仍然挂载。
+   * StrictMode 会“挂载→卸载→再挂载”，必须在挂载时复位，
+   * 否则模拟卸载后的首次读取结果会被整体丢弃，界面永远停在加载态。
+   */
   const mountedRef = React.useRef(true)
-  React.useEffect(() => () => { mountedRef.current = false }, [])
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   /** 读取独立目录；失败保持稳定提示而不会清空已有内容。 */
   const load = React.useCallback(async (): Promise<boolean> => {
