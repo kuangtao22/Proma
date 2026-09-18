@@ -185,6 +185,15 @@ describe('独立生图设置页视图', () => {
     expect(html).toContain('首尾帧')
   })
 
+  test('Given 图片与视频混排 When 渲染筛选栏 Then 每档都带数量便于回退', () => {
+    /** 筛选残留曾让配置看起来像没有模型，计数与退路必须始终可见。 */
+    const draft = { ...createImageGenerationDraft('minimax', 'image-m', 10), name: '我的', models: [] }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).toContain('全部 0')
+    expect(html).toContain('图片 0')
+    expect(html).toContain('视频 0')
+  })
+
   test('Given MiniMax 草稿 When 清空模型 Then 可用模型同时列出图片与视频', () => {
     const draft = { ...createImageGenerationDraft('minimax', 'image-m', 10), name: '我的', models: [] }
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)

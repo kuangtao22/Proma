@@ -117,10 +117,14 @@ function ModelKindFilterBar({ value, imageCount, videoCount, onChange }: {
 }
 
 /** 当前草稿的模型列表编辑：新增、移除与选中摘要。 */
-function ModelListEditor({ draft, models, disabled, onChange }: {
+function ModelListEditor({ draft, models, kind, onShowAll, disabled, onChange }: {
   draft: ImageGenerationDraft
   /** 已按类型筛选后的模型；移除仍作用于完整列表。 */
   models: readonly ImageGenerationModelEntry[]
+  /** 当前类型筛选，用于空状态区分「没启用」与「被筛掉」。 */
+  kind: ModelKindFilter
+  /** 回到全部类型；空状态里给用户一条明确的退路。 */
+  onShowAll: () => void
   disabled: boolean
   onChange: (models: ImageGenerationModelEntry[]) => void
 }): React.ReactElement {
@@ -128,7 +132,16 @@ function ModelListEditor({ draft, models, disabled, onChange }: {
     <SettingsCard divided={false}>
       {models.length === 0 ? (
         <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-          {draft.models.length === 0 ? '还没有启用任何模型，从下方可用模型中选择' : '当前类型下没有已启用模型'}
+          {draft.models.length === 0
+            ? '还没有启用任何模型，从下方可用模型中选择'
+            : (
+              <span className="inline-flex flex-wrap items-center justify-center gap-2">
+                <span>{kind === 'video' ? '该配置还没有启用视频模型' : '该配置还没有启用图片模型'}</span>
+                <Button type="button" size="sm" variant="outline" className="h-7 text-xs" onClick={onShowAll}>
+                  显示全部 {draft.models.length} 个模型
+                </Button>
+              </span>
+            )}
         </div>
       ) : (
         <div className="divide-y divide-border/50">
@@ -287,6 +300,12 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   /** 图片与视频模型合并后按类型查看；不影响任何写入内容。 */
   const [modelKind, setModelKind] = React.useState<ModelKindFilter>('all')
   /**
+   * 换一条配置就回到「全部」。
+   * 图标筛选是视图偏好，残留会让新打开的配置看起来像没有模型。
+   */
+  const editingDraftId = draft?.id ?? null
+  React.useEffect(() => { setModelKind('all') }, [editingDraftId])
+  /**
    * 打开即梦表单时自动查询一次账号状态。
    * 只在草稿切到即梦且尚未查询过时触发，避免每次编辑都打点 CLI。
    */
@@ -415,6 +434,8 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
           <ModelListEditor
             draft={draft}
             models={filterModelsByKind(draft.models, modelKind)}
+            kind={modelKind}
+            onShowAll={() => setModelKind('all')}
             disabled={saving}
             onChange={(models) => controller.updateDraft({ ...draft, models })}
           />
