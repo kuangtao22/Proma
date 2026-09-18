@@ -149,8 +149,19 @@ const OPENAI_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
 ]
 
 /**
+ * MiniMax 图像的官方内置模型。
+ * 来自官方 OpenAPI 的 model 枚举
+ * https://platform.minimaxi.com/docs/api-reference/image/generation/api/text-to-image.json：
+ * 两个模型共用 `POST /v1/image_generation`，`subject_reference` 不限定模型，因此都支持图生图。
+ */
+const MINIMAX_BUILTIN_MODELS: readonly ImageGenerationModelEntry[] = [
+  { id: 'image-01', name: 'Image 01', capabilities: ['text-to-image', 'image-to-image'] },
+  { id: 'image-01-live', name: 'Image 01 Live', capabilities: ['text-to-image', 'image-to-image'] },
+]
+
+/**
  * 三家供应商的默认服务地址与内置模型。
- * MiniMax 的图像模型清单待按官方文档确认后再内置（其 /v1/models 只登记对话模型）。
+ * MiniMax 的 /v1/models 只登记对话模型，图像模型按官方 OpenAPI 枚举内置。
  */
 export const IMAGE_GENERATION_PROVIDER_DEFAULTS: Record<ImageGenerationProvider, ImageGenerationProviderDefaults> = {
   dreamina: {
@@ -165,7 +176,7 @@ export const IMAGE_GENERATION_PROVIDER_DEFAULTS: Record<ImageGenerationProvider,
   },
   minimax: {
     baseUrl: 'https://api.minimax.cn/v1',
-    builtinModels: [],
+    builtinModels: MINIMAX_BUILTIN_MODELS,
     modelsPath: '/models',
   },
 }

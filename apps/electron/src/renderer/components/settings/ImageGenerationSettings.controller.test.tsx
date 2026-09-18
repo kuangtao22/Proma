@@ -207,10 +207,9 @@ describe('独立生图设置控制器', () => {
     try {
       await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
       act(() => requireController(controller).startCreate())
-      /** 走生产切换函数，得到与真实界面一致的 MiniMax 草稿（内置模型可能为空）。 */
+      /** 走生产切换函数，得到与真实界面一致的 MiniMax 草稿；用户清空模型后仍必须能拉取。 */
       const minimaxDraft = changeImageGenerationProvider(requireController(controller).draft!, 'minimax')
-      expect(minimaxDraft.models).toEqual([])
-      act(() => requireController(controller).updateDraft({ ...minimaxDraft, apiKey: 'secret' }))
+      act(() => requireController(controller).updateDraft({ ...minimaxDraft, models: [], apiKey: 'secret' }))
       await act(async () => { await requireController(controller).fetchCatalog() })
       expect(api.fetches).toHaveLength(1)
       expect(api.fetches[0]).toMatchObject({ provider: 'minimax', credential: { mode: 'draft', apiKey: 'secret' } })

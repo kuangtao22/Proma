@@ -29,6 +29,7 @@ import {
   IMAGE_PROVIDER_LABELS,
   imageCatalogIdentity,
   imageGenerationSummary,
+  initialModelsForProvider,
   providerUsesApiKey,
   type ImageGenerationDraft,
 } from './ImageGenerationSettings.logic'
@@ -108,7 +109,8 @@ function AvailableModels({ draft, controller, disabled }: {
     ? controller.catalog
     : null
   const enabledIds = new Set(draft.models.map((model) => model.id))
-  const candidates = [...(catalog?.models ?? [])].filter((model, index, all) =>
+  /** 内置清单优先，其次是拉取结果；两家都按 ID 去重，与音频页一致。 */
+  const candidates = [...initialModelsForProvider(draft.provider), ...(catalog?.models ?? [])].filter((model, index, all) =>
     all.findIndex((entry) => entry.id === model.id) === index)
   const available = candidates.filter((model) => !enabledIds.has(model.id))
 
@@ -147,10 +149,17 @@ function AvailableModels({ draft, controller, disabled }: {
             ? '正在从供应商获取…'
             : catalog?.state === 'failed'
               ? catalog.message ?? '从供应商获取失败'
-              : catalog?.state === 'success'
-                ? '供应商没有返回图像模型，可在下方手填模型 ID'
-                : '点右上角「从供应商获取」读取该账号可用的图像模型'}
+              : candidates.length > 0
+                ? '可用的模型都已添加'
+                : catalog?.state === 'success'
+                  ? '供应商没有返回图像模型，可在下方手填模型 ID'
+                  : '点右上角「从供应商获取」读取该账号可用的图像模型'}
         </div>
+      )}
+      {catalog?.state === 'failed' && (
+        <p role="alert" className="border-t border-border/50 px-4 py-2 text-xs text-destructive">
+          {catalog.message ?? '从供应商获取失败'}
+        </p>
       )}
       <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
         <Input

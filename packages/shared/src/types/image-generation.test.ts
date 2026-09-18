@@ -50,6 +50,9 @@ describe('独立生图生成 Shared 合同', () => {
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.baseUrl).toBe('')
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.builtinModels.map((model) => model.id)).toContain('5.0Pro')
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS['openai-images'].baseUrl).toBe('https://api.openai.com/v1')
+    /** MiniMax 的 /v1/models 只登记对话模型，图像模型必须内置，否则新配置没有任何可选模型。 */
+    expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels.map((model) => model.id)).toEqual(['image-01', 'image-01-live'])
+    expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.minimax.builtinModels[0]!.capabilities).toContain('image-to-image')
   })
 
   test('Given 密钥型配置 When 解析 Then 清洗字段并按能力去重', () => {

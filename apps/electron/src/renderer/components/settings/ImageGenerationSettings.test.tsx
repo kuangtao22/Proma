@@ -95,4 +95,23 @@ describe('独立生图设置页视图', () => {
     })} />)
     expect(html).toContain('鉴权失败，请检查 API Key')
   })
+
+  test('Given MiniMax 草稿清空模型 When 渲染可用模型 Then 列出官方内置图像模型', () => {
+    /** 供应商拉取失败或只返回对话模型时，内置清单必须仍然可添加。 */
+    const draft = { ...createImageGenerationDraft('minimax', 'image-m', 10), name: '我的', models: [] }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).toContain('Image 01')
+    expect(html).toContain('Image 01 Live')
+  })
+
+  test('Given 内置模型已全部启用 When 拉取成功但无新增 Then 提示可用模型都已添加', () => {
+    /** MiniMax 的 /v1/models 只返回对话模型，过滤后为空，此时不能显示成拉取失败。 */
+    const draft = { ...createImageGenerationDraft('minimax', 'image-m', 10), name: '我的' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({
+      draft,
+      catalog: { state: 'success', models: [], draftIdentity: imageCatalogIdentity(draft) },
+    })} />)
+    expect(html).toContain('可用的模型都已添加')
+    expect(html).not.toContain('从供应商获取失败')
+  })
 })
