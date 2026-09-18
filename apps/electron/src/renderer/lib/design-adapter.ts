@@ -113,6 +113,7 @@ import type {
   CreateCanvasImageJobInput,
   DesignPreloadApi,
 } from '../../preload/design-preload'
+import type { ImageGenerationPublicCatalog } from '@proma/shared'
 
 /** Canvas 工作区组合使用的 preload 合同。 */
 type CanvasWorkspacePreloadApi =
@@ -248,6 +249,11 @@ export interface DesignAdapter extends CanvasMediaPreloadApi,
   listImageModelProfiles: () => ReturnType<DesignPreloadApi['listImageModelProfiles']>
   /** 读取图片、音频、视频 API 模型的统一公开目录。 */
   listMediaApiModelProfiles: () => ReturnType<DesignPreloadApi['listMediaApiModelProfiles']>
+  /**
+   * 读取独立生成配置的公开目录，供画布选择器组装候选。
+   * 复用已有生成模型设置通道，不新增 IPC 边界，也不经过 LLM 渠道。
+   */
+  getCanvasGenerationCatalog: () => Promise<ImageGenerationPublicCatalog>
   saveImageModelProfiles: (input: SaveImageGenerationModelProfilesInput) => ReturnType<DesignPreloadApi['saveImageModelProfiles']>
   getImageModelSelection: (projectId: string) => ReturnType<DesignPreloadApi['getImageModelSelection']>
   setImageModelSelection: (input: UpdateDesignImageModelSelectionInput) => ReturnType<DesignPreloadApi['setImageModelSelection']>
@@ -880,6 +886,7 @@ export function createDesignAdapter(api: PartialDesignApi): DesignAdapter {
     onCanvasSessionChanged: (listener) => requireMethod(api, 'onCanvasSessionChanged')(listener),
     listImageModelProfiles: () => requireMethod(api, 'listImageModelProfiles')(),
     listMediaApiModelProfiles: () => requireMethod(api, 'listMediaApiModelProfiles')(),
+    getCanvasGenerationCatalog: async () => (await window.electronAPI.mediaGetImageGenerationSettings()).catalog,
     saveImageModelProfiles: (input) => requireMethod(api, 'saveImageModelProfiles')(input),
     getImageModelSelection: (projectId) => requireMethod(api, 'getImageModelSelection')(projectId),
     setImageModelSelection: (input) => requireMethod(api, 'setImageModelSelection')(input),

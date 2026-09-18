@@ -309,8 +309,8 @@ export interface NativeCanvasAdapter {
   getTaskTrace?: DesignAdapter['getTaskTrace']
   /** Canvas 工作台复用项目模型目录，但模型选择仍写入图片模块草稿。 */
   getImageModelSelection?: DesignAdapter['getImageModelSelection']
-  /** 顶部候选范围使用统一 API 媒体目录，旧嵌入宿主仍可省略。 */
-  listMediaApiModelProfiles?: DesignAdapter['listMediaApiModelProfiles']
+  /** 顶部候选范围读取独立生成配置目录，旧嵌入宿主仍可省略。 */
+  getCanvasGenerationCatalog?: DesignAdapter['getCanvasGenerationCatalog']
   setImageModelSelection?: DesignAdapter['setImageModelSelection']
   onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
   onImageModelSelectionChanged?: DesignAdapter['onImageModelSelectionChanged']
@@ -4406,7 +4406,7 @@ export function NativeCanvasWorkspace({
                     scope={(viewDocument ?? state.snapshot.document).mediaModelScope}
                     disabled={!workspaceWritable}
                     getImageModelSelection={adapter.getImageModelSelection}
-                    listMediaApiModelProfiles={adapter.listMediaApiModelProfiles}
+                    getCanvasGenerationCatalog={adapter.getCanvasGenerationCatalog}
                     onImageModelProfilesChanged={adapter.onImageModelProfilesChanged}
                     connectionPicker={adapter.mediaGetSettings ? <CanvasComfyUiConnectionPicker
                       connections={canvasComfyUiConnectionOptions}

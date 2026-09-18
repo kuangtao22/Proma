@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { useSetAtom } from 'jotai'
 import { LoaderCircle, Settings2, SlidersHorizontal } from 'lucide-react'
-import { buildCanvasMediaModelOptions, resolveCanvasMediaModelOptions } from '@proma/shared'
+import { buildCanvasGenerationModelOptions, resolveCanvasMediaModelOptions } from '@proma/shared'
 import type { CanvasMediaModelOption, CanvasMediaModelScope, MediaApiModelKind } from '@proma/shared'
 import type { DesignAdapter } from '@/lib/design-adapter'
 import { settingsOpenAtom, settingsTabAtom } from '@/atoms/settings-tab'
@@ -15,7 +15,8 @@ export interface CanvasMediaModelPickerProps {
   scope?: CanvasMediaModelScope
   disabled?: boolean
   getImageModelSelection?: DesignAdapter['getImageModelSelection']
-  listMediaApiModelProfiles?: DesignAdapter['listMediaApiModelProfiles']
+  /** 读取独立生成配置的公开目录；画布候选由它组装，不再读旧统一目录。 */
+  getCanvasGenerationCatalog?: DesignAdapter['getCanvasGenerationCatalog']
   onImageModelProfilesChanged?: DesignAdapter['onImageModelProfilesChanged']
   /** 已连接画布绑定状态的服务器控件，与模型多选保持独立。 */
   connectionPicker?: React.ReactNode
@@ -23,7 +24,7 @@ export interface CanvasMediaModelPickerProps {
 }
 
 /** 同一弹层管理服务器与 API 模型候选，不为节点自动挑选执行模型。 */
-export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageModelSelection, listMediaApiModelProfiles, onImageModelProfilesChanged, connectionPicker, onChange }: CanvasMediaModelPickerProps): React.ReactElement {
+export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageModelSelection, getCanvasGenerationCatalog, onImageModelProfilesChanged, connectionPicker, onChange }: CanvasMediaModelPickerProps): React.ReactElement {
   /** 目录响应按请求代次接管，防止切换项目后旧请求覆盖当前选择器。 */
   const requestVersion = React.useRef(0)
   const [options, setOptions] = React.useState<CanvasMediaModelOption[]>([])
@@ -39,14 +40,15 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
     setLoading(true)
     setError(null)
     try {
-      const [selection, catalog] = await Promise.all([getImageModelSelection?.(projectId), listMediaApiModelProfiles?.()])
-      if (version === requestVersion.current) setOptions(buildCanvasMediaModelOptions(catalog, selection?.options ?? []))
+      const [selection, catalog] = await Promise.all([getImageModelSelection?.(projectId), getCanvasGenerationCatalog?.()])
+      /** 独立生成配置与本地工作流候选合并；历史渠道条目不再进入画布选择。 */
+      if (version === requestVersion.current) setOptions(buildCanvasGenerationModelOptions(catalog, selection?.options ?? []))
     } catch {
       if (version === requestVersion.current) setError('媒体模型加载失败')
     } finally {
       if (version === requestVersion.current) setLoading(false)
     }
-  }, [getImageModelSelection, listMediaApiModelProfiles, projectId])
+  }, [getCanvasGenerationCatalog, getImageModelSelection, projectId])
   React.useEffect(() => {
     void load()
     const unsubscribe = onImageModelProfilesChanged?.(() => { void load() })
