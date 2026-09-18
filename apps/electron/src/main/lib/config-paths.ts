@@ -172,6 +172,16 @@ export function getImageGenerationProfilesPath(): string {
   return join(getConfigDir(), 'image-generation-profiles.json')
 }
 
+/** 返回旧渠道型生图条目一次性清理的标记文件路径。 */
+export function getImageModelLegacyCleanupMarkerPath(): string {
+  return join(getConfigDir(), 'image-model-legacy-cleanup.json')
+}
+
+/** 返回清理前写入的备份文件路径，保证旧条目可恢复。 */
+export function getLegacyImageModelProfilesBackupPath(): string {
+  return join(getConfigDir(), 'legacy-image-model-profiles-backup.json')
+}
+
 /**
  * 获取用户授权的 Markdown Vault 配置路径。
  * 内容仅保存 Vault 根目录与用户授予的能力，不保存笔记正文或索引。

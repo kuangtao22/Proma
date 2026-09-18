@@ -457,6 +457,7 @@ import { AudioGenerationConfigStore } from './lib/media/audio-generation-config-
 import { AudioGenerationTestService } from './lib/media/audio-generation-test-service'
 import { AudioGenerationCatalogService } from './lib/media/audio-generation-catalog-service'
 import { ImageGenerationConfigStore } from './lib/media/image-generation-config-store'
+import { runImageModelLegacyCleanup } from './lib/image-model-legacy-cleanup'
 import { ImageGenerationCatalogService } from './lib/media/image-generation-catalog-service'
 import { createImageGenerationIpcService } from './lib/media/image-generation-ipc'
 import type { ImageGenerationIpcService } from './lib/media/image-generation-ipc'
@@ -507,7 +508,7 @@ import { resolvePathAgainstAgentCwd } from './lib/agent-file-path'
 import { getLocalProjectRootStatusSync } from './lib/project-root-health'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, getImageGenerationProfilesPath, getAudioGenerationProfilesPath, resolveAttachmentPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getConversationAttachmentsDir, getWorkspaceSkillsDir, getScratchPadPath, getImageGenerationModelsPath, getImageGenerationProfilesPath, getImageModelLegacyCleanupMarkerPath, getLegacyImageModelProfilesBackupPath, getAudioGenerationProfilesPath, resolveAttachmentPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -764,6 +765,22 @@ function getDesignImageModelServices(): DesignImageModelServices {
     imageModels,
   })
   designImageModelServices = { imageModels, imagePreferences }
+  /** 升级后自动清理旧渠道型生图条目；只跑一次，失败只记日志不影响启动。 */
+  void Promise.resolve().then(() => {
+    const outcome = runImageModelLegacyCleanup({
+      markerPath: getImageModelLegacyCleanupMarkerPath(),
+      backupPath: getLegacyImageModelProfilesBackupPath(),
+      listCatalog: () => imageModels.listMediaApiCatalog(),
+      replaceProfiles: (profiles, expectedRevision) => imageModels.replaceMediaApiProfiles(profiles, expectedRevision),
+    })
+    if (outcome.status === 'cleaned') {
+      console.log(`[生图迁移] 已清理 ${outcome.count} 条旧渠道型生图条目，备份见 ${getLegacyImageModelProfilesBackupPath()}`)
+    } else if (outcome.status === 'failed') {
+      console.error(`[生图迁移] 清理失败，将在下次启动重试：${outcome.message}`)
+    }
+  }).catch((error: unknown) => {
+    console.error('[生图迁移] 清理过程出现未预期异常', error)
+  })
   return designImageModelServices
 }
 
