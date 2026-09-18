@@ -4,7 +4,7 @@ import { isSafeDesignStableId } from './design-paths'
 /** 请求外发前持久化的元数据；不包含路径、凭据或图片正文。 */
 export interface DesignImageRequestAudit {
   /** 独立供应商执行器；审计只记录归因，不保留正文或路径。 */
-  executor: 'openai-images' | 'minimax-image'
+  executor: 'openai-images' | 'minimax-image' | 'dreamina-image'
   modelId: string
   promptSha256: string
   preparedAt: number
@@ -20,7 +20,7 @@ export function isDesignImageRequestAudit(value: unknown): value is DesignImageR
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   /** 未知持久化输入必须逐项收窄，不沿用 TypeScript 类型断言作为验证。 */
   const record = value as Record<string, unknown>
-  if (Object.keys(record).length !== 5 || (record.executor !== 'openai-images' && record.executor !== 'minimax-image')
+  if (Object.keys(record).length !== 5 || (record.executor !== 'openai-images' && record.executor !== 'minimax-image' && record.executor !== 'dreamina-image')
     || typeof record.modelId !== 'string' || !record.modelId.trim()
     || record.modelId.length > IMAGE_GENERATION_MODEL_ID_MAX_LENGTH
     || typeof record.promptSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.promptSha256)

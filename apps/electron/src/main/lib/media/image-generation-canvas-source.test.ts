@@ -62,10 +62,15 @@ describe('独立生成配置的画布来源', () => {
     expect(isGenerationSnapshot(snapshot)).toBe(true)
   })
 
-  test('Given 未接入执行器的供应商 When 固化快照 Then 在选择阶段就拒绝', () => {
-    const { source } = createSource()
-    expect(() => source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-jimeng', '5.0')))
-      .toThrow('执行器尚未接入')
+  test('Given 即梦独立配置 When 固化并解析路由 Then 走 CLI 执行器且不带密钥', () => {
+    const { source, resolved } = createSource()
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-jimeng', '5.0'))
+    expect(snapshot).toMatchObject({ executor: 'dreamina-image', imageProfileId: 'image-jimeng', modelId: '5.0' })
+    const route = source.resolveExecutionRoute(snapshot)
+    expect(route.executor).toBe('dreamina-image')
+    /** 即梦凭据是本机 CLI 登录态，不能解析出任何密钥。 */
+    expect(resolved).toEqual([])
+    expect('apiKey' in route).toBe(false)
   })
 
   test('Given MiniMax 独立配置 When 固化并解析路由 Then 走 MiniMax 执行器', () => {

@@ -33,10 +33,14 @@ export interface ImageGenerationCanvasSourceOptions {
  * 供应商到执行器的映射。
  * 只列出主进程已实现执行器的供应商；即梦尚未接入，保持缺席以便如实拒绝。
  */
-const PROVIDER_EXECUTORS: Partial<Record<ImageGenerationPublicProfile['provider'], 'openai-images' | 'minimax-image'>> = {
+const PROVIDER_EXECUTORS: Partial<Record<ImageGenerationPublicProfile['provider'], GenerationExecutor>> = {
   'openai-images': 'openai-images',
   minimax: 'minimax-image',
+  dreamina: 'dreamina-image',
 }
+
+/** 独立生成配置可用的执行器标识。 */
+type GenerationExecutor = 'openai-images' | 'minimax-image' | 'dreamina-image'
 
 /**
  * 画布与 Agent 需要的生图运行能力。
@@ -56,11 +60,22 @@ export interface CanvasImageModelRuntime {
 export type GenerationSourceSnapshot =
   | (Extract<ImageGenerationModelSnapshot, { executor: 'openai-images' }> & { imageProfileId: string })
   | (Extract<ImageGenerationModelSnapshot, { executor: 'minimax-image' }> & { imageProfileId: string })
+  | (Extract<ImageGenerationModelSnapshot, { executor: 'dreamina-image' }> & { imageProfileId: string })
 
 /** 判断快照是否来自独立生成配置（而不是历史渠道快照）。 */
 export function isGenerationSnapshot(snapshot: ImageGenerationModelSnapshot): snapshot is GenerationSourceSnapshot {
-  return (snapshot.executor === 'openai-images' || snapshot.executor === 'minimax-image')
+  return (snapshot.executor === 'openai-images' || snapshot.executor === 'minimax-image' || snapshot.executor === 'dreamina-image')
     && 'imageProfileId' in snapshot
+}
+
+/** 收窄到 MiniMax 快照；联合类型分支需要显式判断才能配对执行器。 */
+function authorizedSnapshotIsMiniMax(snapshot: GenerationSourceSnapshot): snapshot is Extract<GenerationSourceSnapshot, { executor: 'minimax-image' }> {
+  return snapshot.executor === 'minimax-image'
+}
+
+/** 收窄到即梦快照；即梦走 CLI，不需要密钥。 */
+function authorizedSnapshotIsDreamina(snapshot: GenerationSourceSnapshot): snapshot is Extract<GenerationSourceSnapshot, { executor: 'dreamina-image' }> {
+  return snapshot.executor === 'dreamina-image'
 }
 
 /** 按选择 ID 读取独立生成配置与模型，任何不匹配都视为无效选择。 */
@@ -107,9 +122,9 @@ export class ImageGenerationCanvasSource {
       imageProfileId: profile.id,
     }
     const executor = this.executorFor(profile)
-    return executor === 'minimax-image'
-      ? { ...base, executor: 'minimax-image' }
-      : { ...base, executor: 'openai-images' }
+    if (executor === 'minimax-image') return { ...base, executor: 'minimax-image' }
+    if (executor === 'dreamina-image') return { ...base, executor: 'dreamina-image' }
+    return { ...base, executor: 'openai-images' }
   }
 
   /** 实时复核快照仍指向同一条已启用配置与同一个模型。 */
@@ -134,19 +149,23 @@ export class ImageGenerationCanvasSource {
       throw new Error('生图模型快照来源不受支持，请按当前配置重新生成')
     }
     const { profile } = resolveTarget(this.options.readCatalog(), snapshot.profileId)
-    /** 即梦没有服务地址，不属于独立 HTTP 执行器范围。 */
-    if (profile.provider === 'dreamina') {
-      throw new Error('生图模型不可用：即梦需要通过 CLI 执行，尚未接入')
-    }
     /** 快照执行器必须与当前配置推导出的执行器一致，避免供应商被换掉后沿用旧路由。 */
     const executor = this.executorFor(profile)
     if (executor !== snapshot.executor) {
       throw new Error('生图模型快照与当前配置不一致，请按当前配置重新生成')
     }
+    /** 即梦凭据是本机 CLI 登录态，路由只需要 CLI 路径。 */
+    if (authorizedSnapshotIsDreamina(snapshot)) {
+      const cliPath = profile.provider === 'dreamina' ? profile.cliPath?.trim() : undefined
+      return cliPath ? { executor: 'dreamina-image', snapshot, cliPath } : { executor: 'dreamina-image', snapshot }
+    }
+    if (profile.provider === 'dreamina') {
+      throw new Error('生图模型快照与当前配置不一致，请按当前配置重新生成')
+    }
     const baseUrl = profile.baseUrl.trim()
     const apiKey = this.options.resolveApiKey(profile.id)
     /** 联合类型需要在分支里收窄，才能让执行器与快照类型配对。 */
-    if (snapshot.executor === 'minimax-image') return { executor: 'minimax-image', snapshot, baseUrl, apiKey }
+    if (authorizedSnapshotIsMiniMax(snapshot)) return { executor: 'minimax-image', snapshot, baseUrl, apiKey }
     return {
       executor: 'openai-images',
       snapshot: snapshot as Extract<GenerationSourceSnapshot, { executor: 'openai-images' }>,
@@ -161,7 +180,7 @@ export class ImageGenerationCanvasSource {
   }
 
   /** 推导供应商对应的执行器；未接入的一律在运行前拒绝。 */
-  private executorFor(profile: ImageGenerationPublicProfile): 'openai-images' | 'minimax-image' {
+  private executorFor(profile: ImageGenerationPublicProfile): GenerationExecutor {
     const allowed = this.executableOverrides === null || this.executableOverrides.has(profile.provider)
     const executor = allowed ? PROVIDER_EXECUTORS[profile.provider] : undefined
     if (!executor) throw new Error(`生图模型不可用：${profile.provider} 的执行器尚未接入`)

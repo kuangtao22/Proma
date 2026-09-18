@@ -2566,8 +2566,8 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
   if (value.executor === 'openai-images' && typeof value.imageProfileId === 'string') {
     return isSafeDesignStableId(value.imageProfileId) && Object.keys(value).length === 5
   }
-  /** MiniMax 独立生成配置来源，与 OpenAI 同构但走各自的执行器。 */
-  if (value.executor === 'minimax-image') {
+  /** 独立生成配置来源：MiniMax 与即梦同构，走各自的执行器。 */
+  if (value.executor === 'minimax-image' || value.executor === 'dreamina-image') {
     return typeof value.imageProfileId === 'string'
       && isSafeDesignStableId(value.imageProfileId)
       && Object.keys(value).length === 5

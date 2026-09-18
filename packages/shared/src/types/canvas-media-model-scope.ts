@@ -75,16 +75,17 @@ const CANVAS_CAPABILITY_MAP: Record<string, MediaApiModelCapability | undefined>
 
 /** 独立供应商到画布执行协议的映射；协议名不代表适配器已存在。 */
 function canvasProtocolFor(profile: ImageGenerationPublicProfile, model: ImageGenerationModelEntry): string {
-  if (profile.provider === 'dreamina') return 'dreamina'
+  /** 视频模型必须与图片分开标注，否则会被当成已接执行器的图片模型。 */
+  if (profile.provider === 'dreamina') return imageGenerationModelKind(model) === 'video' ? 'dreamina-video' : 'dreamina-image'
   if (profile.provider === 'openai-images') return 'openai-images'
   return imageGenerationModelKind(model) === 'video' ? 'minimax-video' : 'minimax-image'
 }
 
 /**
  * 当前真正接过执行器的独立协议；其余先如实标为不可执行。
- * 即梦（CLI 异步）与 MiniMax 视频尚未接入，保持缺席。
+ * MiniMax 与即梦视频尚未接入，保持缺席。
  */
-const EXECUTABLE_ADAPTERS: ReadonlySet<string> = new Set(['openai-images', 'minimax-image'])
+const EXECUTABLE_ADAPTERS: ReadonlySet<string> = new Set(['openai-images', 'minimax-image', 'dreamina-image'])
 
 /**
  * 把独立生成目录投影成画布候选。

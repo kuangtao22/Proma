@@ -47,12 +47,13 @@ describe('独立生成配置的画布候选投影', () => {
     const openai = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
     expect(openai).toMatchObject({ executor: 'openai-images', mediaKind: 'image', available: true })
     expect(openai?.support).toEqual({ state: 'supported', adapterId: 'openai-images' })
-    /** 即梦执行器还没接，必须在选择阶段就标成不可用并给出原因。 */
+    /** 即梦图像已接 CLI 执行器，可用。 */
     const jimeng = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', '5.0'))
-    expect(jimeng).toMatchObject({ available: false, executor: 'dreamina', unavailableReason: '该供应商的执行器尚未接入' })
-    /** 视频模型按产物类别投影，而不是混进图片候选。 */
+    expect(jimeng).toMatchObject({ available: true, executor: 'dreamina-image', mediaKind: 'image' })
+    expect(jimeng?.support).toEqual({ state: 'supported', adapterId: 'dreamina-image' })
+    /** 即梦视频尚未接入，必须与图片分开标注且不可用。 */
     const video = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', 'seedance2.5'))
-    expect(video).toMatchObject({ mediaKind: 'video', executor: 'dreamina' })
+    expect(video).toMatchObject({ mediaKind: 'video', executor: 'dreamina-video', available: false })
     expect(video?.capabilities).toEqual(['text-to-video', 'image-to-video'])
     /** MiniMax 图像执行器已接入，只有视频模型仍不可用。 */
     const minimaxImage = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-minimax', 'image-01'))

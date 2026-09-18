@@ -19,6 +19,12 @@ export type ResolvedImageGenerationRoute =
       apiKey: string
     }
   | {
+      executor: 'dreamina-image'
+      snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'dreamina-image' }>
+      /** CLI 路径；缺省时按 PATH 解析。即梦凭据是 CLI 登录态，没有密钥。 */
+      cliPath?: string
+    }
+  | {
       executor: 'comfyui'
       snapshot: Extract<ImageGenerationModelSnapshot, { executor: 'comfyui' }>
     }

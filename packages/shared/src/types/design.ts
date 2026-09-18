@@ -91,7 +91,7 @@ export interface DesignViewport extends DesignPoint {
 export type DesignNodeKind = 'asset' | 'job'
 export type DesignJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
 export type DesignJobAction = 'generate' | 'edit'
-export type ImageGenerationExecutor = 'nano-banana' | 'openai-images' | 'minimax-image' | 'comfyui'
+export type ImageGenerationExecutor = 'nano-banana' | 'openai-images' | 'minimax-image' | 'dreamina-image' | 'comfyui'
 export type DesignContextMode = 'auto' | 'project' | 'none'
 export type DesignContextCategory =
   | 'brand'
@@ -181,6 +181,11 @@ export type ImageGenerationModelSnapshot =
   | ImageGenerationModelSnapshotBase & {
       executor: 'minimax-image'
       /** 独立生成配置来源；凭据来自生成模型目录。 */
+      imageProfileId: string
+    }
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'dreamina-image'
+      /** 独立生成配置来源；凭据是本地 CLI 登录态，不需要密钥。 */
       imageProfileId: string
     }
   | ImageGenerationModelSnapshotBase & {
