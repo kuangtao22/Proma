@@ -791,7 +791,9 @@ function assertProfileMatchesSnapshot(
   const matches = profile.executor === snapshot.executor
     && profile.modelId === snapshot.modelId
     && (profile.executor !== 'openai-images'
-      || (snapshot.executor === 'openai-images' && profile.channelId === snapshot.channelId))
+      || (snapshot.executor === 'openai-images'
+        && 'channelId' in snapshot
+        && profile.channelId === snapshot.channelId))
   if (!matches) {
     throw new Error(`生图模型快照与当前配置不一致: ${snapshot.profileId}；模型或渠道已变更，请按当前配置重新生成`)
   }

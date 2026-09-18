@@ -39,7 +39,7 @@ import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
 import { getConversationAttachmentsDir, resolveAttachmentPath } from '../config-paths'
 import type { AgentRunExtensions } from '../agent-service'
 import type { HeadlessAgentRunTerminalOptions } from '../agent-headless-runner-registry'
-import type { ImageGenerationModelCatalog } from '../image-generation-model-catalog'
+import type { CanvasImageModelRuntime } from '../media/image-generation-canvas-source'
 import { runSafeImageModelOperation } from '../image-generation-model-error'
 import { resolveProjectInstructions } from '../project-instruction-resolver'
 import type {
@@ -217,10 +217,7 @@ export interface DesignJobManagerDependencies {
   /** ComfyUI 图片执行器返回已登记素材，Manager 只负责原候选链与任务 journal。 */
   mediaExecution?: DesignMediaImageExecution
   /** 只暴露任务创建、预检和单次工具运行所需的模型路由能力。 */
-  imageModels: Pick<
-    ImageGenerationModelCatalog,
-    'resolveAvailableSnapshot' | 'assertSnapshotAvailable' | 'resolveExecutionRoute'
-  > & Partial<Pick<ImageGenerationModelCatalog, 'resolveAvailableWorkflowSnapshot'>>
+  imageModels: CanvasImageModelRuntime
   /** 为每次 Design 运行创建隔离的只读上下文工具、预算与审计状态。 */
   contextOrchestrator: Pick<DesignContextOrchestrator, 'createRun'>
   getSettings: () => DesignJobSettings
@@ -2565,6 +2562,11 @@ function isImageModelSnapshot(value: unknown): value is ImageGenerationModelSnap
     && value.modelId === value.modelId.trim()
   if (!baseValid) return false
   if (value.executor === 'nano-banana') return Object.keys(value).length === 4
+  /** 独立生成配置来源：凭据属于生成模型目录，不引用 LLM 渠道。 */
+  if (value.executor === 'openai-images' && typeof value.imageProfileId === 'string') {
+    return isSafeDesignStableId(value.imageProfileId) && Object.keys(value).length === 5
+  }
+  /** 历史作业的渠道来源；仅为让既有画布任务继续可解析。 */
   if (value.executor === 'openai-images') return typeof value.channelId === 'string'
     && value.channelId.length > 0
     && value.channelId === value.channelId.trim()

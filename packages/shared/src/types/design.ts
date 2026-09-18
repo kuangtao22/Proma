@@ -167,6 +167,15 @@ export type ImageGenerationModelSnapshot =
     }
   | ImageGenerationModelSnapshotBase & {
       executor: 'openai-images'
+      /** 独立生成配置来源：凭据来自生成模型目录，不再借用 LLM 渠道。 */
+      imageProfileId: string
+    }
+  | ImageGenerationModelSnapshotBase & {
+      executor: 'openai-images'
+      /**
+       * 历史作业的渠道来源，仅为让已存在的画布任务继续可解析。
+       * 新的选择与生成一律写入 imageProfileId，不再新增这种快照。
+       */
       channelId: string
     }
   | ImageGenerationModelSnapshotBase & {

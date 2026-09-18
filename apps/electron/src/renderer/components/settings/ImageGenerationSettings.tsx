@@ -472,18 +472,10 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
         </SettingsCard>
       )}
       {actionError && !deleteId && <p role="alert" className="border border-destructive/30 px-3 py-2 text-xs text-destructive">{actionError}</p>}
-      {settings?.legacyWarning && <p className="border border-border/60 px-3 py-2 text-xs text-muted-foreground">{settings.legacyWarning}</p>}
-      {settings && settings.legacyImageProfiles.length > 0 && (
-        <SettingsCard>
-          {settings.legacyImageProfiles.map((legacy) => (
-            <SettingsRow
-              key={legacy.id}
-              label={legacy.name}
-              description={`旧配置借用渠道凭据 · ${legacy.modelId} · 请在上方新建独立配置后停用旧条目`}
-            />
-          ))}
-        </SettingsCard>
-      )}
+      {/**
+        * 旧统一媒体目录已从生成模型里退场：不再展示借用渠道凭据的旧条目，
+        * 也不再提示迁移，避免用户以为还需要维护两套配置。
+        */}
       {/** 未读取到目录时仍给出明确状态，并且不阻塞新增。 */}
       {!settings ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">{loading ? <><Loader2 className="mr-2 inline size-4 animate-spin" />正在读取生成模型配置...</> : '未读取到生成模型配置：可先添加，或点上方「重新加载」重试'}</div></SettingsCard>
         : settings.catalog.profiles.length === 0 ? <SettingsCard divided={false}><div className="px-4 py-8 text-center text-sm text-muted-foreground">尚未配置独立生成供应商</div></SettingsCard>

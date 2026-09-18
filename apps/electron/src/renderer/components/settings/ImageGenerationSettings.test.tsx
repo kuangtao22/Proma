@@ -63,7 +63,7 @@ function createController(overrides: Partial<ImageGenerationController> = {}): I
 }
 
 describe('独立生图设置页视图', () => {
-  test('Given 目录含旧配置 When 渲染列表 Then 展示独立配置与迁移提示', () => {
+  test('Given 目录含旧配置 When 渲染列表 Then 只展示独立配置且不再提示迁移', () => {
     const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController()} />)
     expect(html).toContain('ChatGPT 生图')
     expect(html).toContain('gpt-image-1')
@@ -71,8 +71,9 @@ describe('独立生图设置页视图', () => {
     expect(html).toContain('gpt-image-1 · 图片模型')
     /** 列表行必须带供应商 Logo，与音频页一致。 */
     expect(html).toContain('src="model-logo.png"')
-    expect(html).toContain('旧渠道生图')
-    expect(html).toContain('旧配置借用渠道凭据')
+    /** 旧统一目录已退场，界面不应该再出现旧条目或迁移提示。 */
+    expect(html).not.toContain('旧渠道生图')
+    expect(html).not.toContain('旧配置借用渠道凭据')
   })
 
   test('Given 已配置目录 When 渲染列表行 Then 操作区为开关加图标按钮且可复制', () => {

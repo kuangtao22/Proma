@@ -1,6 +1,80 @@
 import { describe, expect, test } from 'bun:test'
 import { applyCanvasMutations, createEmptyCanvasDocument, parseCanvasWorkspaceSnapshot } from './canvas'
-import { buildCanvasMediaModelOptions, isCanvasMediaModelAllowed, parseCanvasMediaModelScope, resolveCanvasMediaModelOptions } from './canvas-media-model-scope'
+import {
+  buildCanvasGenerationModelId,
+  buildCanvasGenerationModelOptions,
+  buildCanvasMediaModelOptions,
+  isCanvasMediaModelAllowed,
+  parseCanvasGenerationModelId,
+  parseCanvasMediaModelScope,
+  resolveCanvasMediaModelOptions,
+} from './canvas-media-model-scope'
+
+describe('独立生成配置的画布候选投影', () => {
+  /** 目录含一条已接执行器的 OpenAI 配置与一条未接执行器的即梦配置。 */
+  const catalog = {
+    schemaVersion: 1 as const,
+    revision: 1,
+    profiles: [
+      {
+        id: 'image-openai', name: '我的 ChatGPT', provider: 'openai-images' as const,
+        baseUrl: 'https://api.openai.com/v1',
+        models: [{ id: 'gpt-image-1', name: 'GPT Image 1', capabilities: ['text-to-image', 'image-to-image'] as const }],
+        enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
+      },
+      {
+        id: 'image-jimeng', name: '即梦', provider: 'dreamina' as const,
+        models: [
+          { id: '5.0', name: '即梦 5.0', capabilities: ['text-to-image'] as const },
+          { id: 'seedance2.5', name: 'Seedance 2.5', capabilities: ['text-to-video', 'image-to-video'] as const },
+        ],
+        enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
+      },
+    ],
+  }
+
+  test('Given 独立生成目录 When 投影候选 Then 只有已接执行器的协议可用', () => {
+    const options = buildCanvasGenerationModelOptions(catalog, [])
+    const openai = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
+    expect(openai).toMatchObject({ executor: 'openai-images', mediaKind: 'image', available: true })
+    expect(openai?.support).toEqual({ state: 'supported', adapterId: 'openai-images' })
+    /** 即梦执行器还没接，必须在选择阶段就标成不可用并给出原因。 */
+    const jimeng = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', '5.0'))
+    expect(jimeng).toMatchObject({ available: false, executor: 'dreamina', unavailableReason: '该供应商的执行器尚未接入' })
+    /** 视频模型按产物类别投影，而不是混进图片候选。 */
+    const video = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', 'seedance2.5'))
+    expect(video).toMatchObject({ mediaKind: 'video', executor: 'dreamina' })
+    expect(video?.capabilities).toEqual(['text-to-video', 'image-to-video'])
+  })
+
+  test('Given 停用的配置 When 投影候选 Then 标注停用且不伪造可用', () => {
+    const disabled = { ...catalog, profiles: catalog.profiles.map((profile) => ({ ...profile, enabled: false })) }
+    const options = buildCanvasGenerationModelOptions(disabled, [])
+    expect(options.every((option) => !option.available)).toBe(true)
+    expect(options[0]?.unavailableReason).toBe('模型已停用')
+  })
+
+  test('Given 本地工作流候选 When 投影 Then 保持原语义且不混入生成配置', () => {
+    const options = buildCanvasGenerationModelOptions(undefined, [{
+      profileId: 'workflow', name: '本地工作流', modelId: 'flow', executor: 'comfyui',
+      mediaProfileId: 'legacy', mediaProfileRevision: 1, connectionId: 'gpu',
+      workflowId: 'flow', workflowRevision: 1, workflowHash: 'a'.repeat(64), available: true,
+    }])
+    expect(options).toHaveLength(1)
+    expect(options[0]).toMatchObject({ profileId: 'workflow', executor: 'comfyui', available: true })
+  })
+
+  test('Given 选择 ID When 往返解析 Then 模型 ID 含冒号也不歧义', () => {
+    const id = buildCanvasGenerationModelId('image-openai', 'gpt-image-1')
+    expect(id).toBe('imagegen:image-openai:gpt-image-1')
+    expect(parseCanvasGenerationModelId(id)).toEqual({ profileId: 'image-openai', modelId: 'gpt-image-1' })
+    expect(parseCanvasGenerationModelId(buildCanvasGenerationModelId('p', 'a:b'))).toEqual({ profileId: 'p', modelId: 'a:b' })
+    /** 旧目录 ID 不参与解析，避免两套身份混淆。 */
+    expect(parseCanvasGenerationModelId('image')).toBeNull()
+    /** 生成的 ID 必须能通过画布范围解析的字符合同。 */
+    expect(() => parseCanvasMediaModelScope({ mode: 'selected', modelIds: [id] })).not.toThrow()
+  })
+})
 
 describe('画布媒体模型候选范围', () => {
   test('Given 统一音频 API 与旧图片目录 When 合并候选 Then 保留能力并拒绝配置占位执行且不重复图片', () => {
