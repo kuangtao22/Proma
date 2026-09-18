@@ -3,17 +3,33 @@ import type { MediaApiModelCapability, MediaApiModelCatalogResult, MediaApiModel
 import type { ImageGenerationModelEntry, ImageGenerationPublicCatalog, ImageGenerationPublicProfile } from './image-generation'
 import { imageGenerationModelKind } from './image-generation'
 
-/** 全部启用模式持续跟随目录，明确选择模式允许空集合。 */
-export type CanvasMediaModelScope = { mode: 'all-enabled' } | { mode: 'selected'; modelIds: string[] }
+/**
+ * 画布媒体模型范围。
+ * - all-enabled：跟随目录里所有已启用模型，用户不需要挑模型。
+ * - providers：只限定到供应商，具体模型由 agent 在范围内自行适配。
+ * - selected：显式指定模型，保留给需要复现特定效果的场景。
+ */
+export type CanvasMediaModelScope =
+  | { mode: 'all-enabled' }
+  | { mode: 'providers'; providers: string[] }
+  | { mode: 'selected'; modelIds: string[] }
 
 /** 候选只要求稳定模型身份与实时可用性，不依赖具体供应商。 */
-export interface CanvasMediaModelCandidate { profileId: string; available: boolean; executor: string }
+export interface CanvasMediaModelCandidate {
+  profileId: string
+  available: boolean
+  executor: string
+  /** 稳定供应商标识；供应商范围需要它，本地工作流等候选可以缺省。 */
+  provider?: string
+}
 
 /** 设置、Canvas 和 Agent 共用的模型公开信息；不包含渠道凭据。 */
 export interface CanvasMediaModelOption extends CanvasMediaModelCandidate {
   name: string
   modelId: string
   mediaKind: MediaApiModelKind
+  /** 稳定供应商标识（dreamina / openai-images / minimax）；本地工作流没有供应商。 */
+  provider?: string
   channelId?: string
   channelName?: string
   capabilities: MediaApiModelCapability[]
@@ -50,19 +66,27 @@ export const CANVAS_GENERATION_MODEL_ID_PREFIX = 'imagegen'
  * 组装独立生成配置在画布候选里的选择 ID。
  * 入参：配置 ID 与模型 ID；返回值：可持久化到画布范围的稳定 ID。
  */
-export function buildCanvasGenerationModelId(profileId: string, modelId: string): string {
-  return `${CANVAS_GENERATION_MODEL_ID_PREFIX}:${profileId}:${modelId}`
+export function buildCanvasGenerationModelId(provider: string, profileId: string, modelId: string): string {
+  /** 供应商写进 ID：冻结快照只保留选择 ID，范围校验需要它判断供应商范围。 */
+  return `${CANVAS_GENERATION_MODEL_ID_PREFIX}:${provider}:${profileId}:${modelId}`
 }
 
 /** 解析画布选择 ID；不是独立生成配置时返回 null。 */
-export function parseCanvasGenerationModelId(value: string): { profileId: string; modelId: string } | null {
+export function parseCanvasGenerationModelId(value: string): { provider: string; profileId: string; modelId: string } | null {
   const prefix = `${CANVAS_GENERATION_MODEL_ID_PREFIX}:`
   if (!value.startsWith(prefix)) return null
   const rest = value.slice(prefix.length)
-  /** 模型 ID 允许包含冒号，因此按第一个冒号切分配置 ID。 */
-  const separator = rest.indexOf(':')
-  if (separator <= 0) return null
-  return { profileId: rest.slice(0, separator), modelId: rest.slice(separator + 1) }
+  /** 依次切出供应商与配置 ID；模型 ID 允许包含冒号，剩余部分整体归它。 */
+  const providerEnd = rest.indexOf(':')
+  if (providerEnd <= 0) return null
+  const remainder = rest.slice(providerEnd + 1)
+  const profileEnd = remainder.indexOf(':')
+  if (profileEnd <= 0) return null
+  return {
+    provider: rest.slice(0, providerEnd),
+    profileId: remainder.slice(0, profileEnd),
+    modelId: remainder.slice(profileEnd + 1),
+  }
 }
 
 /** 独立能力到画布能力的映射；没有对应项的（如放大）不下放给画布。 */
@@ -120,11 +144,12 @@ export function buildCanvasGenerationModelOptions(
         && EXECUTABLE_ADAPTERS.has(protocol)
       const reason = !profile.enabled ? '模型已停用' : '该供应商的执行器尚未接入'
       generationOptions.push({
-        profileId: buildCanvasGenerationModelId(profile.id, model.id),
+        profileId: buildCanvasGenerationModelId(profile.provider, profile.id, model.id),
         name: `${profile.name} · ${model.name ?? model.id}`,
         modelId: model.id,
         executor: protocol,
         mediaKind: imageGenerationModelKind(model),
+        provider: profile.provider,
         channelName: profile.name,
         capabilities,
         support: executable ? { state: 'supported', adapterId: protocol } : { state: 'unavailable', reason },
@@ -141,6 +166,16 @@ export function parseCanvasMediaModelScope(value: unknown): CanvasMediaModelScop
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('CANVAS_MEDIA_MODEL_SCOPE_INVALID')
   const input = value as Record<string, unknown>
   if (input.mode === 'all-enabled' && Object.keys(input).length === 1) return { mode: 'all-enabled' }
+  /** 供应商范围只接受已登记的稳定标识，且不允许空集合被当成全部。 */
+  if (input.mode === 'providers') {
+    if (Object.keys(input).length !== 2 || !Array.isArray(input.providers)
+      || input.providers.length === 0 || input.providers.length > 16
+      || input.providers.some((provider) => typeof provider !== 'string' || !MEDIA_PROVIDER_IDS.has(provider))
+      || new Set(input.providers).size !== input.providers.length) {
+      throw new Error('CANVAS_MEDIA_MODEL_SCOPE_INVALID')
+    }
+    return { mode: 'providers', providers: [...input.providers] as string[] }
+  }
   if (input.mode !== 'selected' || Object.keys(input).length !== 2 || !Array.isArray(input.modelIds)
     || input.modelIds.length > 256 || input.modelIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(id)
       || ['__proto__', 'constructor', 'prototype'].includes(id)) || new Set(input.modelIds).size !== input.modelIds.length) {
@@ -149,9 +184,22 @@ export function parseCanvasMediaModelScope(value: unknown): CanvasMediaModelScop
   return { mode: 'selected', modelIds: [...input.modelIds] as string[] }
 }
 
-/** 判断画布是否允许这个 API 模型；启用与供应商配置由模型目录再校验。 */
-export function isCanvasMediaModelAllowed(scope: CanvasMediaModelScope | undefined, modelId: string): boolean {
-  return scope === undefined || scope.mode === 'all-enabled' || scope.modelIds.includes(modelId)
+/** 允许作为画布范围的供应商标识；与生成配置的 provider 取值一致。 */
+const MEDIA_PROVIDER_IDS: ReadonlySet<string> = new Set(['dreamina', 'openai-images', 'minimax'])
+
+/**
+ * 判断画布是否允许这个模型。
+ * 入参：画布范围、模型选择 ID 与供应商标识；返回值：是否允许使用。
+ * 供应商模式下必须给出 provider，缺失一律视为不允许，避免越权放行。
+ */
+export function isCanvasMediaModelAllowed(
+  scope: CanvasMediaModelScope | undefined,
+  modelId: string,
+  provider?: string,
+): boolean {
+  if (scope === undefined || scope.mode === 'all-enabled') return true
+  if (scope.mode === 'providers') return provider !== undefined && scope.providers.includes(provider)
+  return scope.modelIds.includes(modelId)
 }
 
 /** 以实时目录计算有效交集，并保留停用或删除模型供用户显式移除。 */
@@ -159,6 +207,11 @@ export function resolveCanvasMediaModelOptions(scope: CanvasMediaModelScope | un
   selectedIds: string[]; availableIds: string[]; unavailableIds: string[]
 } {
   const available = new Set(options.filter((option) => option.available && option.executor !== 'comfyui').map((option) => option.profileId))
-  const selectedIds = scope?.mode === 'selected' ? [...scope.modelIds] : [...available]
+  /** 供应商模式下由范围推导实际生效的模型，用户不需要逐条勾选。 */
+  const selectedIds = scope?.mode === 'selected'
+    ? [...scope.modelIds]
+    : scope?.mode === 'providers'
+      ? options.filter((option) => option.provider !== undefined && scope.providers.includes(option.provider)).map((option) => option.profileId)
+      : [...available]
   return { selectedIds, availableIds: selectedIds.filter((id) => available.has(id)), unavailableIds: selectedIds.filter((id) => !available.has(id)) }
 }

@@ -51,7 +51,7 @@ function createSource(catalog: ImageGenerationPublicCatalog = createCatalog()): 
 describe('独立生成配置的画布来源', () => {
   test('Given 已接入执行器的配置 When 固化快照 Then 引用生成配置而不是渠道', () => {
     const { source } = createSource()
-    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'))
     expect(snapshot).toMatchObject({
       executor: 'openai-images',
       imageProfileId: 'image-openai',
@@ -64,7 +64,7 @@ describe('独立生成配置的画布来源', () => {
 
   test('Given 即梦独立配置 When 固化并解析路由 Then 走 CLI 执行器且不带密钥', () => {
     const { source, resolved } = createSource()
-    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-jimeng', '5.0'))
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('dreamina', 'image-jimeng', '5.0'))
     expect(snapshot).toMatchObject({ executor: 'dreamina-image', imageProfileId: 'image-jimeng', modelId: '5.0' })
     const route = source.resolveExecutionRoute(snapshot)
     expect(route.executor).toBe('dreamina-image')
@@ -75,7 +75,7 @@ describe('独立生成配置的画布来源', () => {
 
   test('Given MiniMax 独立配置 When 固化并解析路由 Then 走 MiniMax 执行器', () => {
     const { source, resolved } = createSource()
-    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-minimax', 'image-01'))
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('minimax', 'image-minimax', 'image-01'))
     expect(snapshot).toMatchObject({ executor: 'minimax-image', imageProfileId: 'image-minimax', modelId: 'image-01' })
     expect(source.resolveExecutionRoute(snapshot)).toMatchObject({
       executor: 'minimax-image',
@@ -88,9 +88,9 @@ describe('独立生成配置的画布来源', () => {
   test('Given 已删除或停用的配置 When 固化快照 Then 给出可操作原因', () => {
     const catalog = createCatalog()
     catalog.profiles[0]!.enabled = false
-    expect(() => createSource(catalog).source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-openai', 'gpt-image-1')))
+    expect(() => createSource(catalog).source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1')))
       .toThrow('配置已停用')
-    expect(() => createSource(catalog).source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-missing', 'gpt-image-1')))
+    expect(() => createSource(catalog).source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-missing', 'gpt-image-1')))
       .toThrow('配置已删除')
     expect(() => createSource(catalog).source.resolveAvailableSnapshot('image-openai'))
       .toThrow('请重新选择模型')
@@ -98,7 +98,7 @@ describe('独立生成配置的画布来源', () => {
 
   test('Given 有效快照 When 解析路由 Then 用独立目录的地址与密钥', () => {
     const { source, resolved } = createSource()
-    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'))
     const route = source.resolveExecutionRoute(snapshot)
     expect(route).toMatchObject({
       executor: 'openai-images',
@@ -110,7 +110,7 @@ describe('独立生成配置的画布来源', () => {
 
   test('Given 快照与当前配置不一致 When 复核或解析路由 Then 拒绝运行', () => {
     const { source } = createSource()
-    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
+    const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'))
     /** 历史渠道来源的快照不再由独立来源解析（必须真的没有 imageProfileId 字段）。 */
     const { imageProfileId: _ignored, ...base } = snapshot as typeof snapshot & { imageProfileId: string }
     const legacySnapshot = { ...base, channelId: 'channel-1' } as unknown as typeof snapshot

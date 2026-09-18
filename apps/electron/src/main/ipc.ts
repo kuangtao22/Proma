@@ -3884,7 +3884,7 @@ export function registerIpcHandlers(): void {
         const scope = canvasId ? canvasDocumentStore.requireStableAuthoritativeDocument({ projectId: current.projectId, canvasId }).mediaModelScope : undefined
         /** 画布候选来自独立生成目录；本地工作流候选保持原语义。 */
         return buildCanvasGenerationModelOptions(readIndependentGenerationCatalog(), imageModels.listOptions(current.projectId))
-          .filter((model) => isCanvasMediaModelAllowed(scope, model.profileId))
+          .filter((model) => isCanvasMediaModelAllowed(scope, model.profileId, model.provider))
       },
       getCanvasConnection: (current, canvasId) => {
         canvasToolAccess.authorizeRead(current)

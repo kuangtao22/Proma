@@ -116,7 +116,7 @@ export class ImageGenerationCanvasSource {
     const model = profile.models.find((candidate) => candidate.id === modelId)
     /** 联合类型需要分支构造，才能让 executor 与快照成员严格配对。 */
     const base = {
-      profileId: buildCanvasGenerationModelId(profile.id, modelId),
+      profileId: buildCanvasGenerationModelId(profile.provider, profile.id, modelId),
       name: `${profile.name} · ${model?.name ?? modelId}`,
       modelId,
       imageProfileId: profile.id,

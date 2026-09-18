@@ -44,22 +44,22 @@ describe('独立生成配置的画布候选投影', () => {
 
   test('Given 独立生成目录 When 投影候选 Then 只有已接执行器的协议可用', () => {
     const options = buildCanvasGenerationModelOptions(catalog, [])
-    const openai = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-openai', 'gpt-image-1'))
+    const openai = options.find((option) => option.profileId === buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'))
     expect(openai).toMatchObject({ executor: 'openai-images', mediaKind: 'image', available: true })
     expect(openai?.support).toEqual({ state: 'supported', adapterId: 'openai-images' })
     /** 即梦图像已接 CLI 执行器，可用。 */
-    const jimeng = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', '5.0'))
+    const jimeng = options.find((option) => option.profileId === buildCanvasGenerationModelId('dreamina', 'image-jimeng', '5.0'))
     expect(jimeng).toMatchObject({ available: true, executor: 'dreamina-image', mediaKind: 'image' })
     expect(jimeng?.support).toEqual({ state: 'supported', adapterId: 'dreamina-image' })
     /** 即梦视频尚未接入，必须与图片分开标注且不可用。 */
-    const video = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-jimeng', 'seedance2.5'))
+    const video = options.find((option) => option.profileId === buildCanvasGenerationModelId('dreamina', 'image-jimeng', 'seedance2.5'))
     expect(video).toMatchObject({ mediaKind: 'video', executor: 'dreamina-video', available: false })
     expect(video?.capabilities).toEqual(['text-to-video', 'image-to-video'])
     /** MiniMax 图像执行器已接入，只有视频模型仍不可用。 */
-    const minimaxImage = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-minimax', 'image-01'))
+    const minimaxImage = options.find((option) => option.profileId === buildCanvasGenerationModelId('minimax', 'image-minimax', 'image-01'))
     expect(minimaxImage).toMatchObject({ executor: 'minimax-image', available: true })
     expect(minimaxImage?.support).toEqual({ state: 'supported', adapterId: 'minimax-image' })
-    const minimaxVideo = options.find((option) => option.profileId === buildCanvasGenerationModelId('image-minimax', 'MiniMax-Hailuo-2.3'))
+    const minimaxVideo = options.find((option) => option.profileId === buildCanvasGenerationModelId('minimax', 'image-minimax', 'MiniMax-Hailuo-2.3'))
     expect(minimaxVideo).toMatchObject({ executor: 'minimax-video', mediaKind: 'video', available: false })
   })
 
@@ -81,10 +81,11 @@ describe('独立生成配置的画布候选投影', () => {
   })
 
   test('Given 选择 ID When 往返解析 Then 模型 ID 含冒号也不歧义', () => {
-    const id = buildCanvasGenerationModelId('image-openai', 'gpt-image-1')
-    expect(id).toBe('imagegen:image-openai:gpt-image-1')
-    expect(parseCanvasGenerationModelId(id)).toEqual({ profileId: 'image-openai', modelId: 'gpt-image-1' })
-    expect(parseCanvasGenerationModelId(buildCanvasGenerationModelId('p', 'a:b'))).toEqual({ profileId: 'p', modelId: 'a:b' })
+    const id = buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1')
+    /** 供应商写进选择 ID，冻结快照才能校验供应商范围。 */
+    expect(id).toBe('imagegen:openai-images:image-openai:gpt-image-1')
+    expect(parseCanvasGenerationModelId(id)).toEqual({ provider: 'openai-images', profileId: 'image-openai', modelId: 'gpt-image-1' })
+    expect(parseCanvasGenerationModelId(buildCanvasGenerationModelId('dreamina', 'p', 'a:b'))).toEqual({ provider: 'dreamina', profileId: 'p', modelId: 'a:b' })
     /** 旧目录 ID 不参与解析，避免两套身份混淆。 */
     expect(parseCanvasGenerationModelId('image')).toBeNull()
     /** 生成的 ID 必须能通过画布范围解析的字符合同。 */

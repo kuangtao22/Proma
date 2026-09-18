@@ -9,6 +9,13 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 
+/** 供应商稳定标识到中文名的展示映射，与生成模型设置页保持一致。 */
+const PROVIDER_LABELS: Record<string, string> = {
+  dreamina: '即梦',
+  'openai-images': 'ChatGPT（OpenAI Images）',
+  minimax: 'MiniMax 图像',
+}
+
 /** 画布媒体配置统一入口；模型范围和服务器绑定分别通过父组件的文档 CAS 保存。 */
 export interface CanvasMediaModelPickerProps {
   projectId: string
@@ -61,6 +68,8 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
     && `${option.name} ${option.modelId} ${option.channelId ?? ''}`.toLocaleLowerCase().includes(search))
   /** 按渠道归组，保留同一媒体类型下的不同供应商。 */
   const groups = [...new Set(filtered.map((option) => option.channelId ?? '内置'))]
+  /** 当前目录里出现过的供应商，供「按供应商自动」逐家勾选。 */
+  const providerIds = [...new Set(options.map((option) => option.provider).filter((provider): provider is string => provider !== undefined))]
   const missingIds = selection.unavailableIds.filter((id) => !optionIds.has(id) && id.toLocaleLowerCase().includes(search))
   /** 首次切换单项即固定当前完整候选集合，保留失效引用以便显式移除。 */
   const toggle = (id: string, checked: boolean): void => {
@@ -94,6 +103,30 @@ export function CanvasMediaModelPicker({ projectId, scope, disabled, getImageMod
         <label className="flex min-w-0 items-center gap-2"><input type="checkbox" disabled={disabled || loading || !!error} checked={!scope || scope.mode === 'all-enabled'} onChange={(event) => onChange(event.target.checked ? { mode: 'all-enabled' } : { mode: 'selected', modelIds: selection.selectedIds })} />全部已启用</label>
         <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled || loading || !!error} onClick={() => onChange({ mode: 'selected', modelIds: [] })}>全不选</Button>
       </div>
+      {/**
+        * 供应商范围：用户只需要说“用哪家”，具体模型交给 agent 在范围内适配，
+        * 不必逐条勾选模型；需要复现特定效果时再退回手动勾选。
+        */}
+      {providerIds.length > 0 ? <div className="mb-2 rounded border border-border/60 p-2">
+        <div className="mb-1 flex items-center justify-between gap-2 text-xs">
+          <span className="text-muted-foreground">按供应商自动（模型由 agent 适配）</span>
+          <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={disabled || loading || !!error}
+            onClick={() => onChange({ mode: 'providers', providers: scope?.mode === 'providers' ? [] : providerIds })}>
+            {scope?.mode === 'providers' ? '取消供应商范围' : '启用'}
+          </Button>
+        </div>
+        {scope?.mode === 'providers' ? <div role="group" aria-label="供应商范围" className="flex flex-wrap items-center gap-2">
+          {providerIds.map((provider) => <label key={provider} className="flex items-center gap-1 text-xs">
+            <input type="checkbox" aria-label={`供应商 ${provider}`} disabled={disabled}
+              checked={scope.providers.includes(provider)}
+              onChange={(event) => onChange({
+                mode: 'providers',
+                providers: event.target.checked ? [...scope.providers, provider] : scope.providers.filter((item) => item !== provider),
+              })} />
+            {PROVIDER_LABELS[provider] ?? provider}
+          </label>)}
+        </div> : null}
+      </div> : null}
       <div className="max-h-64 overflow-y-auto" aria-busy={loading}>
         {loading ? <div role="status" className="flex justify-center py-5"><LoaderCircle className="size-4 animate-spin" aria-label="正在加载媒体模型" /></div> : error ? <div role="alert" className="py-3 text-sm text-destructive">{error}<Button variant="ghost" size="sm" onClick={() => { void load() }}>重试</Button></div> : <>
           {groups.map((group) => <div key={group}>

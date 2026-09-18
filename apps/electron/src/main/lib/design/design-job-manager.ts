@@ -33,6 +33,7 @@ import {
   isCanvasArtifactInputSlot,
   isCanvasArtifactOutputCapability,
   isCanvasMediaModelAllowed,
+  parseCanvasGenerationModelId,
   parseCanvasImageMediaWorkflow,
 } from '@proma/shared'
 import { removeFileAtomic, writeJsonFileAtomic } from '../safe-file'
@@ -580,7 +581,10 @@ export class DesignJobManager {
     }
     /** 连线输入独立于 contextMode，始终从权威直接入边重新解析。 */
     if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
-      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
+      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId),
+      imageModelSnapshot.profileId,
+      /** 供应商范围需要从选择 ID 还原供应商；历史渠道快照没有该信息。 */
+      parseCanvasGenerationModelId(imageModelSnapshot.profileId)?.provider,
     )) throw new Error('CANVAS_MEDIA_MODEL_OUT_OF_SCOPE')
     const canvasInputReferences = await inputResolver.resolve(
       toCanvasImageTarget(input.projectId, input.target),
@@ -600,7 +604,10 @@ export class DesignJobManager {
     }
     // 素材解析可能等待磁盘；提交前再次读取范围，避免期间撤选被旧快照绕过。
     if (imageModelSnapshot.executor !== 'comfyui' && !isCanvasMediaModelAllowed(
-      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId), imageModelSnapshot.profileId,
+      this.dependencies.getCanvasMediaModelScope?.(input.projectId, input.target.canvasId),
+      imageModelSnapshot.profileId,
+      /** 供应商范围需要从选择 ID 还原供应商；历史渠道快照没有该信息。 */
+      parseCanvasGenerationModelId(imageModelSnapshot.profileId)?.provider,
     )) throw new Error('CANVAS_MEDIA_MODEL_OUT_OF_SCOPE')
     return {
       target: input.target,
