@@ -177,7 +177,7 @@ describe('GitHub Release 双来源历史', () => {
     const result = await listReleases({ source: 'official', perPage: 2 })
 
     expect(requestedUrls).toHaveLength(1)
-    expect(requestedUrls[0]).toContain('/repos/ErlichLiu/Proma/releases?')
+    expect(requestedUrls[0]).toContain('/repos/proma-ai/Proma/releases?')
     expect(result.map(release => release.tag_name)).toEqual([
       'v0.17.56',
       'v0.17.54',
@@ -192,7 +192,7 @@ describe('GitHub Release 双来源历史', () => {
       return jsonResponse([
         createRelease(
           requestedUrls.length,
-          url.includes('/ErlichLiu/') ? 'v0.17.55' : 'v0.17.55-bone.1'
+          url.includes('/proma-ai/') ? 'v0.17.55' : 'v0.17.55-bone.1'
         ),
       ])
     })
@@ -214,7 +214,7 @@ describe('GitHub Release 双来源历史', () => {
         jsonResponse([
           createRelease(
             1,
-            String(input).includes('/ErlichLiu/')
+            String(input).includes('/proma-ai/')
               ? 'v0.17.55'
               : 'v0.17.55-bone.1'
           ),

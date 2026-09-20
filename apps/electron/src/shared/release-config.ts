@@ -10,7 +10,7 @@ export const PROMA_DOWNLOAD_URL = `${PROMA_RELEASE_REPOSITORY.webUrl}/releases/l
 
 /** Proma 官方版本历史的固定 Release 仓库配置。 */
 export const PROMA_OFFICIAL_RELEASE_REPOSITORY = {
-  owner: 'ErlichLiu',
+  owner: 'proma-ai',
   repo: 'Proma',
-  webUrl: 'https://github.com/ErlichLiu/Proma',
+  webUrl: 'https://github.com/proma-ai/Proma',
 } as const
