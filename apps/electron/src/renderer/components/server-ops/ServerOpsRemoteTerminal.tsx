@@ -92,8 +92,10 @@ export function ServerOpsRemoteTerminal({ hostId, connectionId }: ServerOpsRemot
   }, [connectionId, hostId])
 
   return (
-    <div className="h-full min-h-0 w-full overflow-hidden bg-[#111113] p-2">
-      <div ref={hostRef} className="h-full min-h-0 w-full min-w-0" />
+    <div className="h-full min-h-0 w-full overflow-hidden bg-content-area p-1.5">
+      <div className="h-full min-h-0 overflow-hidden rounded-md border border-border/40 bg-[#111113] p-1.5">
+        <div ref={hostRef} className="h-full min-h-0 w-full min-w-0" />
+      </div>
     </div>
   )
 }

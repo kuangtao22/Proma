@@ -11,6 +11,7 @@ import type { ServerOpsFileService } from './server-ops-file-service'
 import type { ServerOpsDockerConsoleService } from './server-ops-docker-console-service'
 import type { ServerOpsFileTransferService } from './server-ops-file-transfer-service'
 import type { ServerOpsLocalFileLeaseRegistry } from './server-ops-local-file-leases'
+import type { ServerOpsDataService } from './server-ops-data-service'
 
 /** Server Ops 主进程唯一服务实例边界。 */
 export interface ServerOpsServiceContext {
@@ -29,6 +30,8 @@ export interface ServerOpsServiceContext {
   console?: ServerOpsDockerConsoleService
   transfers?: ServerOpsFileTransferService
   fileLeases?: ServerOpsLocalFileLeaseRegistry
+  /** 数据服务：数据源元数据、密码密文与 SSH 隧道只读读取。 */
+  data?: ServerOpsDataService
   /** 注册代次拥有的配置监听，与连接一起释放。 */
   disposeTrustWatcher?: () => void
 }
@@ -98,6 +101,10 @@ async function disposeContext(context: ServerOpsServiceContext | null, nextConte
   if (!context) return
   /** 保留首个异常，但不能让它阻断后续连接释放。 */
   let firstError: unknown
+  /** 先同步撤销授权，避免异步传输/连接清理期间模型继续发起读取；共享实例归继任者。 */
+  if (!ownedByNewerContext(context, nextContext, 'access')) {
+    try { context.access?.clear() } catch (error) { firstError = error }
+  }
   if (!ownedByNewerContext(context, nextContext, 'trustManagement')) {
     try { context.trustManagement?.dispose() } catch (error) { firstError = error }
   }
@@ -115,6 +122,9 @@ async function disposeContext(context: ServerOpsServiceContext | null, nextConte
   }
   if (!ownedByNewerContext(context, nextContext, 'logs')) {
     try { context.logs?.dispose() } catch (error) { firstError ??= error }
+  }
+  if (!ownedByNewerContext(context, nextContext, 'data')) {
+    try { context.data?.dispose() } catch (error) { firstError ??= error }
   }
   /** 传输和未领取句柄可并行收口，但连接必须等待两者都进入终态。 */
   const asyncDisposals: Promise<void>[] = []

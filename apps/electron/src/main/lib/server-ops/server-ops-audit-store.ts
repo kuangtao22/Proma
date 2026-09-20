@@ -22,7 +22,7 @@ import {
 import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
 
 /** 审计文件当前写入的 schema 版本。 */
-const SERVER_OPS_AUDIT_SCHEMA_VERSION = 3
+const SERVER_OPS_AUDIT_SCHEMA_VERSION = 5
 /** 审计文件固定保留的最近记录数量。 */
 const SERVER_OPS_AUDIT_MAX_RECORDS = 5_000
 /** 单条命令允许进入公开审计的最大字符数。 */
@@ -100,9 +100,31 @@ interface ServerOpsAuditFileV2 {
   records: ServerOpsAuditRecordV2[]
 }
 
-/** 磁盘中的当前审计文件。 */
+/** schema v3 已支持资源动作，但所有记录仍必须绑定主机。 */
+type ServerOpsAuditRecordV3 = Omit<
+  ServerOpsAuditRecord,
+  'operation' | 'resourceType' | 'hostId' | 'sourceId' | 'readAction' | 'scope' | 'database' | 'table' | 'queryHash' | 'tables'
+> & {
+  hostId: string
+  operation: Exclude<ServerOpsAuditRecord['operation'], 'agent-read' | 'data-query'>
+  resourceType?: Exclude<NonNullable<ServerOpsAuditRecord['resourceType']>, 'ops-resource' | 'data-query'>
+}
+
+/** 磁盘中的旧版 v3 审计文件。 */
 interface ServerOpsAuditFileV3 {
   version: 3
+  records: ServerOpsAuditRecordV3[]
+}
+
+/** 磁盘中的旧版只读审计文件。 */
+interface ServerOpsAuditFileV4 {
+  version: 4
+  records: ServerOpsAuditRecord[]
+}
+
+/** 当前文件新增 SQL 查询摘要与表集合，旧客户端不得误写为 v4。 */
+interface ServerOpsAuditFileV5 {
+  version: 5
   records: ServerOpsAuditRecord[]
 }
 
@@ -145,6 +167,11 @@ const SERVER_OPS_AUDIT_RECORD_V1_KEYS = new Set([
 /** schema v2 记录允许出现的精确旧字段。 */
 const SERVER_OPS_AUDIT_RECORD_V2_KEYS = new Set([
   ...SERVER_OPS_AUDIT_RECORD_V1_KEYS, 'actor', 'unitId',
+])
+
+/** schema v3 记录允许出现的精确旧字段。 */
+const SERVER_OPS_AUDIT_RECORD_V3_KEYS = new Set([
+  ...SERVER_OPS_AUDIT_RECORD_V2_KEYS, 'operationId', 'windowId', 'resourceType', 'resourceId', 'containerId',
 ])
 
 /** 判断未知值是否为仅包含指定字段的普通对象。 */
@@ -193,8 +220,27 @@ function isServerOpsAuditFileV2(value: unknown): value is ServerOpsAuditFileV2 {
     && record.records.every(isServerOpsAuditRecordV2)
 }
 
+/** 判断未知值是否为严格、有界的 schema v3 记录。 */
+function isServerOpsAuditRecordV3(value: unknown): value is ServerOpsAuditRecordV3 {
+  if (!hasOnlyKeys(value, SERVER_OPS_AUDIT_RECORD_V3_KEYS)) return false
+  if (value.operation === 'agent-read' || value.operation === 'data-query') return false
+  return isServerOpsAuditRecord(value)
+}
+
 /** 判断磁盘值是否为严格、有界的 schema v3 文件。 */
 function isServerOpsAuditFileV3(value: unknown): value is ServerOpsAuditFileV3 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  /** 待检查的顶层审计对象。 */
+  const record = value as Record<string, unknown>
+  return Object.keys(record).every((key) => key === 'version' || key === 'records')
+    && record.version === 3
+    && Array.isArray(record.records)
+    && record.records.length <= SERVER_OPS_AUDIT_MAX_RECORDS
+    && record.records.every(isServerOpsAuditRecordV3)
+}
+
+/** 判断磁盘值是否为严格、有界的当前 schema 文件。 */
+function isServerOpsAuditFileV5(value: unknown): value is ServerOpsAuditFileV5 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   /** 待检查的顶层审计对象。 */
   const record = value as Record<string, unknown>
@@ -203,6 +249,16 @@ function isServerOpsAuditFileV3(value: unknown): value is ServerOpsAuditFileV3 {
     && Array.isArray(record.records)
     && record.records.length <= SERVER_OPS_AUDIT_MAX_RECORDS
     && record.records.every(isServerOpsAuditRecord)
+}
+
+/** v4 严格拒绝新查询字段，避免错误标记的文件混入未升级语义。 */
+function isServerOpsAuditFileV4(value: unknown): value is ServerOpsAuditFileV4 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const file = value as Record<string, unknown>
+  return Object.keys(file).every((key) => key === 'version' || key === 'records') && file.version === 4
+    && Array.isArray(file.records) && file.records.length <= SERVER_OPS_AUDIT_MAX_RECORDS
+    && file.records.every((record) => isServerOpsAuditRecord(record) && record.operation !== 'data-query'
+      && record.queryHash === undefined && record.tables === undefined)
 }
 
 /** 旧 start=success 只表示动作已开始，读取时归一为 pending。 */
@@ -222,9 +278,14 @@ function migrateAuditRecordV2(record: ServerOpsAuditRecordV2): ServerOpsAuditRec
   return { ...normalizeLegacyAuditOutcome(record) }
 }
 
+/** v3 记录只需提升文件版本，业务字段保持原样。 */
+function migrateAuditRecordV3(record: ServerOpsAuditRecordV3): ServerOpsAuditRecord {
+  return { ...record }
+}
+
 /** 复制单条公开记录，防止调用方修改 Store 内部对象。 */
 function cloneAuditRecord(record: ServerOpsAuditRecord): ServerOpsAuditRecord {
-  return { ...record }
+  return { ...record, ...(record.tables ? { tables: [...record.tables] } : {}) }
 }
 
 /** 脱敏后的有界命令摘要及真实截断状态。 */
@@ -524,7 +585,7 @@ export class ServerOpsAuditStore {
 
   /** 每次访问都从主文件读取权威快照，禁止缓存或备份掩盖损坏现场。 */
   private readAuthoritativeRecords(): {
-    schema: 'missing' | 1 | 2 | 3
+    schema: 'missing' | 1 | 2 | 3 | 4 | 5
     records: ServerOpsAuditRecord[]
     expectedDestination: AtomicDestinationExpectation
     priorBackup?: object
@@ -540,8 +601,19 @@ export class ServerOpsAuditStore {
     } catch {
       throw new Error('SERVER_OPS_AUDIT_READ_FAILED')
     }
+    if (isServerOpsAuditFileV5(primary)) {
+      return { schema: 5, records: primary.records.map(cloneAuditRecord), expectedDestination, priorBackup: primary }
+    }
+    if (isServerOpsAuditFileV4(primary)) {
+      return { schema: 4, records: primary.records.map(cloneAuditRecord), expectedDestination, priorBackup: primary }
+    }
     if (isServerOpsAuditFileV3(primary)) {
-      return { schema: 3, records: primary.records.map(cloneAuditRecord), expectedDestination, priorBackup: primary }
+      return {
+        schema: 3,
+        records: primary.records.map(migrateAuditRecordV3).map(cloneAuditRecord),
+        expectedDestination,
+        priorBackup: primary,
+      }
     }
     if (isServerOpsAuditFileV2(primary)) {
       return {
@@ -564,7 +636,7 @@ export class ServerOpsAuditStore {
 
   /** 在旧实例 guard 内初始化或迁移审计 schema，等待结束后必须重读权威文件。 */
   async prepareForWrites(acquireGuard: () => Promise<() => void>): Promise<void> {
-    /** 当前 v3 不需要争用旧实例 guard；损坏文件仍在此处 fail closed。 */
+    /** 当前 v5 不需要争用旧实例 guard；损坏文件仍在此处 fail closed。 */
     if (this.readAuthoritativeRecords().schema === SERVER_OPS_AUDIT_SCHEMA_VERSION) return
     const release = await acquireGuard()
     try {
@@ -640,6 +712,7 @@ export class ServerOpsAuditStore {
     /** 筛选后按最近上限截取，保留时间正序便于稳定阅读。 */
     const filtered = records.filter((record) => (
       (filter.hostId === undefined || record.hostId === filter.hostId)
+      && (filter.sourceId === undefined || record.sourceId === filter.sourceId)
       && (filter.actor === undefined || record.actor === filter.actor)
       && (filter.operation === undefined || record.operation === filter.operation)
     ))

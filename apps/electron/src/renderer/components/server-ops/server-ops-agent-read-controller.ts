@@ -1,0 +1,123 @@
+import { parseServerOpsAgentReadGrant } from '@proma/shared'
+import type { ServerOpsAgentReadAccess, ServerOpsAgentReadChanged, ServerOpsAgentReadGrant, ServerOpsAgentReadResource } from '@proma/shared'
+
+/** 只读权限页面仅使用这三个受控主进程接口。 */
+export interface ServerOpsAgentReadAccessApi {
+  get(sessionId: string): Promise<ServerOpsAgentReadAccess | null>
+  set(grant: ServerOpsAgentReadGrant): Promise<ServerOpsAgentReadAccess | null>
+  onChanged?: (listener: (event: ServerOpsAgentReadChanged) => void) => () => void
+}
+
+/** 权威快照与编辑草稿分离，未保存选择不计入授权数。 */
+export interface ServerOpsAgentReadProjection {
+  sessionId: string | null
+  projectId: string
+  access: ServerOpsAgentReadAccess | null
+  resources: ServerOpsAgentReadResource[]
+  open: boolean
+  loading: boolean
+  saving: boolean
+  error: string | null
+}
+
+/** Controller 的初始空投影，不含持久化或后台轮询。 */
+export function emptyServerOpsAgentReadProjection(): ServerOpsAgentReadProjection {
+  return { sessionId: null, projectId: '', access: null, resources: [], open: false, loading: false, saving: false, error: null }
+}
+
+/** 创建实际授权页面使用的状态机；所有 IPC 迟到结果受同一动作代次约束。 */
+export function createServerOpsAgentReadController(options: { api: ServerOpsAgentReadAccessApi; publish: (state: ServerOpsAgentReadProjection) => void }) {
+  /** 状态只存在于当前挂载页面；权限事实仍由主进程掌握。 */
+  let state = emptyServerOpsAgentReadProjection()
+  /** 广播、目标切换与卸载均使旧回执失效。 */
+  let epoch = 0
+  /** 同一主进程有序授权事件的已见最高代次。 */
+  let knownRevision = 0
+  /** 卸载不撤销权限，只阻止该页面继续写状态。 */
+  let active = true
+  /** 每次发布独立副本，不让 React/调用者修改内部快照。 */
+  const publish = (): void => { if (active) options.publish(structuredClone(state)) }
+  /** 把匹配会话的主进程回执应用为权威事实。 */
+  const adopt = (access: ServerOpsAgentReadAccess | null): void => {
+    state.access = access?.sessionId === state.sessionId ? structuredClone(access) : null
+    state.resources = structuredClone(state.access?.resources ?? [])
+    knownRevision = Math.max(knownRevision, access?.revision ?? 0)
+  }
+  return {
+    /** 供实际组件与行为测试读取隔离投影。 */
+    snapshot: (): ServerOpsAgentReadProjection => structuredClone(state),
+    /** StrictMode 重新 setup 可复用同一控制器。 */
+    activate(): void { active = true },
+    /** 卸载使全部 get/save 回执失效。 */
+    dispose(): void { active = false; epoch += 1 },
+    /** 切换项目保留同会话权限，切换会话立即清除旧显示与编辑。 */
+    async select(sessionId: string | null, projectId: string): Promise<void> {
+      const sameSession = state.sessionId === sessionId
+      const needsRead = !sameSession || state.loading || state.error !== null || state.projectId === ''
+      const revision = ++epoch
+      state = { ...emptyServerOpsAgentReadProjection(), sessionId, projectId, access: sameSession ? state.access : null }
+      state.resources = structuredClone(state.access?.resources ?? [])
+      state.loading = Boolean(sessionId && needsRead)
+      publish()
+      if (!sessionId || !needsRead) return
+      try {
+        const access = await options.api.get(sessionId)
+        if (!active || epoch !== revision) return
+        adopt(access)
+      } catch (error) {
+        if (!active || epoch !== revision) return
+        state.error = error instanceof Error ? error.message : '读取授权失败'
+      } finally {
+        if (active && epoch === revision) { state.loading = false; publish() }
+      }
+    },
+    /** 打开时从已保存事实重建草稿，取消残留不会被再次提交。 */
+    open(): void {
+      if (!active || !state.sessionId || state.loading || state.saving) return
+      state.open = true; state.error = null; state.resources = structuredClone(state.access?.resources ?? [])
+      publish()
+    },
+    /** 取消、Escape 和遮罩关闭共用同一草稿收口。 */
+    close(): void {
+      if (state.saving) return
+      state.open = false; state.resources = structuredClone(state.access?.resources ?? []); state.error = null
+      publish()
+    },
+    /** 只编辑草稿，保存前再做全量严格合同校验。 */
+    edit(resources: ServerOpsAgentReadResource[]): void {
+      if (!state.open || state.loading || state.saving) return
+      state.resources = structuredClone(resources); state.error = null; publish()
+    },
+    /** 广播优先于 get/save；保存自身的广播也可立即关闭弹窗而不等待 IPC 回执。 */
+    changed(event: ServerOpsAgentReadChanged): void {
+      const revision = Math.max(event.current?.revision ?? 0, event.previous?.revision ?? 0)
+      if (!active || revision < knownRevision) return
+      epoch += 1; knownRevision = revision
+      if (state.saving) state.open = false
+      adopt(event.current)
+      state.loading = false; state.saving = false; state.error = null
+      publish()
+    },
+    /** 保存或撤销整个资源集合；失败保留草稿，方便用户修正或重试。 */
+    async save(resources = state.resources): Promise<void> {
+      if (!active || !state.sessionId || state.loading || state.saving || !state.open) return
+      let grant: ServerOpsAgentReadGrant
+      try { grant = parseServerOpsAgentReadGrant({ sessionId: state.sessionId, resources }) } catch {
+        state.error = '请检查授权范围：MySQL 需选择实例或数据库，指定表不能为空，最多 32 个连接、每连接 20 个库、每库 100 张表。'
+        publish(); return
+      }
+      const revision = ++epoch
+      state.saving = true; state.error = null; publish()
+      try {
+        const access = await options.api.set(grant)
+        if (!active || epoch !== revision) return
+        adopt(access); state.open = false
+      } catch (error) {
+        if (!active || epoch !== revision) return
+        state.error = error instanceof Error ? error.message : '保存授权失败'
+      } finally {
+        if (active && epoch === revision) { state.saving = false; publish() }
+      }
+    },
+  }
+}

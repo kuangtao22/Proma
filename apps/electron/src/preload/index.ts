@@ -29,6 +29,12 @@ import { createServerOpsConsolePreload } from './server-ops-console-preload'
 import type { ServerOpsConsolePreloadApi } from './server-ops-console-preload'
 import { createServerOpsTransferPreload } from './server-ops-transfer-preload'
 import type { ServerOpsTransferPreload } from './server-ops-transfer-preload'
+import { createServerOpsDataPreload } from './server-ops-data-preload'
+import { createServerOpsAgentReadPreload } from './server-ops-agent-read-preload'
+import type { ServerOpsAgentReadPreload } from './server-ops-agent-read-preload'
+import type { ServerOpsDataPreload } from './server-ops-data-preload'
+import { createServerOpsProjectPreload } from './server-ops-project-preload'
+import type { ServerOpsProjectPreload } from './server-ops-project-preload'
 import {
   invokeServerOpsLogAck,
   invokeServerOpsLogExport,
@@ -213,6 +219,8 @@ import type {
   ServerOpsAgentAccessTarget,
   ServerOpsSaveHostInput,
   ServerOpsConnectInput,
+  ServerOpsTestConnectionInput,
+  ServerOpsTestConnectionResult,
   ServerOpsConfirmHostKeyInput,
   ServerOpsConnectionState,
   ServerOpsTerminalInput,
@@ -272,7 +280,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload, MediaPreloadApi, CanvasMediaPreloadApi {
+export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload, ServerOpsDataPreload, ServerOpsProjectPreload, ServerOpsAgentReadPreload, MediaPreloadApi, CanvasMediaPreloadApi {
   // ===== 运行时相关 =====
 
   /**
@@ -304,6 +312,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   upsertServerOpsHost: (input: ServerOpsSaveHostInput) => Promise<ServerOpsHost>
   deleteServerOpsHost: (hostId: string) => Promise<boolean>
   connectServerOpsHost: (input: ServerOpsConnectInput) => Promise<ServerOpsConnectionState>
+  /** 用弹窗草稿测试连接；不保存主机、不改变信任状态。 */
+  testServerOpsConnection: (input: ServerOpsTestConnectionInput) => Promise<ServerOpsTestConnectionResult>
   confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => Promise<ServerOpsConnectionState>
   disconnectServerOpsHost: (hostId: string) => Promise<ServerOpsConnectionState>
   writeServerOpsTerminal: (input: ServerOpsTerminalInput) => Promise<void>
@@ -1482,6 +1492,14 @@ const electronAPI: ElectronAPI = {
   ...createServerOpsTrustPreload((channel, input) => ipcRenderer.invoke(channel, input)),
   ...createServerOpsDockerPreload((channel, input) => ipcRenderer.invoke(channel, input)),
   ...createServerOpsFilesPreload((channel, input) => ipcRenderer.invoke(channel, input)),
+  ...createServerOpsDataPreload((channel, input) => ipcRenderer.invoke(channel, input)),
+  ...createServerOpsAgentReadPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
+    /** 每次订阅使用唯一 handler 引用，卸载时仅移除自己的事件。 */
+    const handler = (_event: Electron.IpcRendererEvent, value: unknown): void => listener(value)
+    ipcRenderer.on(channel, handler)
+    return () => { ipcRenderer.removeListener(channel, handler) }
+  }),
+  ...createServerOpsProjectPreload((channel, input) => ipcRenderer.invoke(channel, input)),
   ...createServerOpsConsolePreload(ipcRenderer),
   ...createServerOpsTransferPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
     /** 隔离 Electron 事件对象，只向文件视图传递严格解析的进度。 */
@@ -1541,6 +1559,7 @@ const electronAPI: ElectronAPI = {
   upsertServerOpsHost: (input: ServerOpsSaveHostInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.UPSERT_HOST, input),
   deleteServerOpsHost: (hostId: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.DELETE_HOST, hostId),
   connectServerOpsHost: (input: ServerOpsConnectInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONNECT, input),
+  testServerOpsConnection: (input: ServerOpsTestConnectionInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.TEST_CONNECTION, input),
   confirmServerOpsHostKey: (input: ServerOpsConfirmHostKeyInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.CONFIRM_HOST_KEY, input),
   disconnectServerOpsHost: (hostId: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.DISCONNECT, hostId),
   writeServerOpsTerminal: (input: ServerOpsTerminalInput) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.WRITE_TERMINAL, input),

@@ -1,6 +1,11 @@
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2'
+import type { Duplex } from 'node:stream'
+import { connect as connectTcp } from 'node:net'
 import { ServerOpsSftpRuntime, ServerOpsSftpRuntimeError } from './server-ops/server-ops-sftp-runtime'
 import type { ServerOpsSftpRequest } from './server-ops/server-ops-sftp-runtime'
+import { runServerOpsDataRead } from './server-ops/server-ops-data-runtime'
+import type { ServerOpsDataRuntimeInput } from './server-ops/server-ops-data-runtime'
+import type { ServerOpsRuntimeDataReadRequest } from './server-ops/server-ops-runtime-protocol'
 import type { ServerOpsTerminalExitEvent } from '@proma/shared'
 import { ServerOpsConsoleRuntimeController } from './server-ops/server-ops-console-runtime'
 import type { ServerOpsConsoleRuntimeChannel } from './server-ops/server-ops-console-runtime'
@@ -49,6 +54,8 @@ interface ManagedSshConnection {
   flushTimer?: ReturnType<typeof setTimeout>
   exitEvent?: ServerOpsTerminalExitEvent
   execChannels: Set<ClientChannel>
+  /** 数据服务读取占用的 SSH 转发通道，随连接统一释放。 */
+  dataChannels: Set<ClientChannel>
   logStreams: Map<string, ManagedLogStream>
   logController: RuntimeLogStreamController
   /** Docker Console 使用独立 exec PTY，不与主机终端 channel 混用。 */
@@ -70,6 +77,14 @@ const pendingClients = new Map<string, Client>()
 const parentPort = (process as typeof process & { parentPort?: RuntimeParentPort }).parentPort
 /** 主进程传入的专用 MessagePort。 */
 let runtimePort: RuntimePort | undefined
+/** 活跃数据库读取；取消必须匹配完整跨进程身份。 */
+const activeDataReads = new Map<string, {
+  hostId: string
+  connectionId: string
+  controller: AbortController
+  cancelTransport: () => void
+  fail: (code: string, message: string) => void
+}>()
 
 if (!parentPort) {
   console.error('[ServerOpsRuntime] Electron parentPort 不可用')
@@ -112,6 +127,16 @@ function handleRequest(raw: unknown): void {
     case 'server-ops.exec':
       exec(request.input)
       return
+    case 'server-ops.data-read':
+      dataRead(request.input)
+      return
+    case 'server-ops.data-cancel': {
+      const active = activeDataReads.get(request.requestId)
+      if (!active || active.hostId !== request.hostId || active.connectionId !== request.connectionId) return
+      active.controller.abort()
+      active.cancelTransport()
+      return
+    }
     case 'server-ops.sftp':
       void dispatchSftp(request.input)
       return
@@ -183,6 +208,8 @@ function handleRequest(raw: unknown): void {
       return
     }
     case 'server-ops.shutdown':
+      for (const active of activeDataReads.values()) { active.controller.abort(); active.cancelTransport() }
+      activeDataReads.clear()
       for (const connectionId of [...connections.keys()]) disconnect(connectionId, '应用正在退出')
       for (const connectionId of [...pendingClients.keys()]) disconnect(connectionId, '应用正在退出', false)
       post({ type: 'server-ops.stopped' })
@@ -282,6 +309,7 @@ function connect(input: ServerOpsRuntimeConnectRequest): void {
         channel,
         output: createRuntimeOutputState(),
         execChannels: new Set(),
+        dataChannels: new Set(),
         logStreams,
         logController,
         consoleController,
@@ -405,6 +433,172 @@ function exec(input: import('./server-ops/server-ops-runtime-protocol').ServerOp
   }
 }
 
+/** 建立直连数据库的原始 TCP socket；MySQL 与 Redis 各自由协议适配器完成 TLS 升级。 */
+function createDirectSocket(address: string, port: number): ReturnType<typeof connectTcp> {
+  return connectTcp({ host: address, port })
+}
+
+function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
+  /** 直连不依赖 SSH 连接；经由 SSH 时仍必须命中完整连接身份。 */
+  const connection = input.transport === 'direct' ? undefined : connections.get(input.connectionId)
+  if (input.transport === 'ssh' && (!connection || connection.hostId !== input.hostId)) {
+    post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code: 'SERVER_OPS_CONNECTION_NOT_ACTIVE', message: 'SSH 连接未激活' })
+    return
+  }
+  /** 单次读取只允许结算一次，超时、取消与正常完成共用该标志。 */
+  let settled = false
+  /** 当前读取持有的直连 socket 或 SSH 隧道通道，结算时立即销毁。 */
+  let activeChannel: Duplex | undefined
+  /** activeChannel 属于 SSH 时保留窄类型，用于从连接资源表精确移除。 */
+  let activeSshChannel: ClientChannel | undefined
+  /** 查询执行器与驱动共享的取消信号。 */
+  const controller = new AbortController()
+  /** timeout 或连接关闭触发 abort 时保留原始终态分类，不能降级成用户取消。 */
+  let terminalError: { code: string; message: string } | undefined
+  /** 释放当前读取持有的底层通道；直连与 SSH 共用同一条收口路径。 */
+  const releaseActiveChannel = (): void => {
+    /** 先清空引用，避免 close 事件与 finally 重复释放。 */
+    const channel = activeChannel
+    activeChannel = undefined
+    if (activeSshChannel) {
+      connection?.dataChannels.delete(activeSshChannel)
+      activeSshChannel = undefined
+    }
+    if (channel && !channel.destroyed) {
+      try { channel.destroy() } catch { /* 通道可能已被驱动或远端关闭。 */ }
+    }
+  }
+  activeDataReads.set(input.requestId, {
+    hostId: input.hostId,
+    connectionId: input.connectionId,
+    controller,
+    cancelTransport: releaseActiveChannel,
+    fail: (code, message) => {
+      if (settled || controller.signal.aborted) return
+      terminalError = { code, message }
+      controller.abort()
+      releaseActiveChannel()
+    },
+  })
+  /** 完成取消清理并向主进程确认；只有这里才允许释放外层并发计数。 */
+  const finishCancelled = (): void => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    releaseActiveChannel()
+    activeDataReads.delete(input.requestId)
+    post({ type: 'server-ops.data-read-cancelled', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId })
+  }
+  /** 清除定时器并返回稳定错误码。 */
+  const finishError = (code: string, message: string): void => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    releaseActiveChannel()
+    activeDataReads.delete(input.requestId)
+    post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code, message })
+  }
+  const timer = setTimeout(() => {
+    /** 先 abort 驱动 await，退出后仍按 TIMEOUT 而非用户取消回报。 */
+    activeDataReads.get(input.requestId)?.fail('SERVER_OPS_DATA_TIMEOUT', '数据库读取超时')
+  }, input.timeoutMs)
+  /**
+   * 为本次读取建立通道。
+   *
+   * `direct` 方式在 utility 内发起原始 TCP，不经任何主机；`ssh` 方式复用已认证连接的转发通道。
+   */
+  const createChannel = (): Promise<Duplex> => new Promise<Duplex>((resolve, reject) => {
+    if (settled || controller.signal.aborted) {
+      reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+      return
+    }
+    if (input.transport === 'direct') {
+      // 直连只在本机发起；非回环地址的 TLS 策略已由主进程在发起前校验。
+      const socket = createDirectSocket(input.address, input.port)
+      /** 必须在 connect 前登记，才能让整体超时销毁仍在建连或查询中的 socket。 */
+      activeChannel = socket
+      /** 单次直连建链 Promise 的结算标志。 */
+      let channelSettled = false
+      /** 拒绝尚未完成的直连建链。 */
+      const rejectChannel = (error: Error): void => {
+        if (channelSettled) return
+        channelSettled = true
+        reject(error)
+      }
+      socket.once('error', rejectChannel)
+      socket.once('close', () => { rejectChannel(new Error('SERVER_OPS_DATA_CHANNEL_CLOSED')) })
+      socket.once('connect', () => {
+        if (settled || controller.signal.aborted) {
+          socket.destroy()
+          rejectChannel(new Error('SERVER_OPS_DATA_CANCELLED'))
+          return
+        }
+        channelSettled = true
+        resolve(socket)
+      })
+      return
+    }
+    try {
+      connection!.client.forwardOut('127.0.0.1', 0, input.address, input.port, (error, channel) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        if (settled || controller.signal.aborted || connections.get(input.connectionId) !== connection) {
+          try { channel.destroy() } catch { /* 通道关闭失败不影响请求结算。 */ }
+          reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+          return
+        }
+        activeChannel = channel
+        activeSshChannel = channel
+        connection!.dataChannels.add(channel)
+        channel.once('close', () => {
+          connection!.dataChannels.delete(channel)
+          if (activeChannel === channel) activeChannel = undefined
+          if (activeSshChannel === channel) activeSshChannel = undefined
+        })
+        resolve(channel)
+      })
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error('SERVER_OPS_DATA_CHANNEL_FAILED'))
+    }
+  })
+  /** protocol parser 已按 mode 强制 query 字段完整性，这里只收窄成执行器判别 union。 */
+  void runServerOpsDataRead(input as ServerOpsDataRuntimeInput, createChannel, controller.signal).then((result) => {
+    if (settled) return
+    if (controller.signal.aborted) {
+      if (terminalError) finishError(terminalError.code, terminalError.message)
+      else finishCancelled()
+      return
+    }
+    settled = true
+    clearTimeout(timer)
+    /** 驱动退出后隧道通道不应继续占用远端 socket，这里再兜底销毁一次。 */
+    releaseActiveChannel()
+    activeDataReads.delete(input.requestId)
+    /** 连接期间切换主机或断线时不再回写结果，主进程侧会按自身代次丢弃。 */
+    if (input.transport === 'ssh' && connections.get(input.connectionId) !== connection) return
+    post({ type: 'server-ops.data-read-result', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, result })
+  }).catch((error: unknown) => {
+    if (controller.signal.aborted) {
+      if (terminalError) finishError(terminalError.code, terminalError.message)
+      else finishCancelled()
+      return
+    }
+    /** SQL 与驱动错误都映射到固定码和中文，不返回原始 SQL 或数据库异常。 */
+    const code = error instanceof Error && error.message.startsWith('SERVER_OPS_DATA_QUERY_')
+      ? error.message
+      : 'SERVER_OPS_DATA_CHANNEL_FAILED'
+    const message = code === 'SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE' ? '查询引用的表不存在、不可见或不是基础表'
+      : code === 'SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE' ? '查询引用的列不存在或不可见'
+        : code === 'SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN' ? '查询包含不允许直接读取的敏感列'
+          : code === 'SERVER_OPS_DATA_QUERY_SQL_INVALID' ? '仅支持受控的只读 SELECT 查询'
+            : code.startsWith('SERVER_OPS_DATA_QUERY_') ? 'SQL 查询失败，请检查语句与读取权限'
+              : '无法建立到数据库的通道'
+    finishError(code, message)
+  })
+}
+
 /** 把 ssh2 ClientChannel 适配为不泄漏依赖的 core 日志 channel。 */
 function createRuntimeLogChannel(channel: ClientChannel): RuntimeLogChannel {
   return {
@@ -482,14 +676,27 @@ function emitExitWhenDrained(connection: ManagedSshConnection): void {
   post({ type: 'server-ops.terminal-exit', event: connection.exitEvent })
 }
 
+/** 让指定 SSH 连接上的数据库读取退出 await，并保留“连接关闭”终态分类。 */
+function failDataReadsForConnection(connection: ManagedSshConnection, message: string): void {
+  for (const active of activeDataReads.values()) {
+    if (active.hostId === connection.hostId && active.connectionId === connection.connectionId) {
+      active.fail('SERVER_OPS_CONNECTION_CLOSED', message)
+    }
+  }
+}
+
 /** 收束已关闭 channel 的输出、连接和退出事件。 */
 function closeManagedConnection(connection: ManagedSshConnection, message: string): void {
   if (connections.get(connection.connectionId) !== connection) return
   connection.sftp.dispose()
   connection.logController.finishAll('connection-closed')
   connection.consoleController.dispose(message)
+  failDataReadsForConnection(connection, message)
   for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
   connection.execChannels.clear()
+  /** 数据库隧道通道必须与 exec 通道一起释放，否则断线后仍占用远端 socket。 */
+  for (const dataChannel of connection.dataChannels) { try { dataChannel.destroy() } catch { /* 隧道通道关闭时可幂等收束。 */ } }
+  connection.dataChannels.clear()
   flushOutput(connection)
   connection.exitEvent ??= { hostId: connection.hostId, connectionId: connection.connectionId, message }
   connection.client.end()
@@ -514,9 +721,12 @@ function disconnect(connectionId: string, message: string, notify = true): void 
   if (connection.flushTimer) clearTimeout(connection.flushTimer)
   connection.logController.finishAll('connection-closed')
   connection.consoleController.dispose(message)
+  failDataReadsForConnection(connection, message)
   try { connection.channel.close() } catch { /* channel 已关闭时可幂等收束。 */ }
   for (const execChannel of connection.execChannels) { try { execChannel.close() } catch { /* exec channel 已关闭时可幂等收束。 */ } }
   connection.execChannels.clear()
+  for (const dataChannel of connection.dataChannels) { try { dataChannel.destroy() } catch { /* 隧道通道关闭时可幂等收束。 */ } }
+  connection.dataChannels.clear()
   connection.client.end()
   if (notify) post({ type: 'server-ops.terminal-exit', event: { hostId: connection.hostId, connectionId, message } })
 }

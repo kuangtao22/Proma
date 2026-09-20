@@ -9,8 +9,27 @@
   container-type: inline-size;
 }
 
+/* 项目入口按运维面板宽度排卡片，筛选与添加不受主窗口宽度误导。 */
+.server-ops-project-container {
+  container: server-ops-project / inline-size;
+}
+
+@container server-ops-project (min-width: 560px) {
+  [data-server-ops-project-cards] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* 常规面板对齐 Skills 的双列阅读密度，仅宽面板采用三列。 */
+@container server-ops-project (min-width: 1120px) {
+  [data-server-ops-project-cards] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @container (max-width: 430px) {
   [data-server-ops-toolbar] [data-server-ops-connection-badge],
+  [data-server-ops-toolbar] [data-server-ops-engine-badge],
   [data-server-ops-toolbar] [data-server-ops-connection-label] {
     display: none;
   }
@@ -24,7 +43,7 @@
 }
 
 /* 运维概览资源区在中等 Pane 中横向展开，窄 Pane 保持单列。 */
-@container (min-width: 520px) {
+@container (min-width: 720px) {
   [data-server-ops-overview-resource-grid] {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -38,25 +57,8 @@
   }
 }
 
-/* 宽 Pane 才展开高密度概览与服务详情，避免跟随整个窗口断点误判。 */
+/* 服务详情按 Pane 宽度展开；概览卡片在组件内独立排版，不再共享拼格边框。 */
 @container (min-width: 700px) {
-  [data-server-ops-overview-grid] {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  [data-server-ops-overview-grid] > * {
-    border-right-width: 1px;
-    border-bottom-width: 0;
-  }
-
-  [data-server-ops-overview-grid] > *:last-child {
-    border-right-width: 0;
-  }
-
-  [data-server-ops-overview-system-grid] {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   [data-server-ops-service-detail-grid] {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1612,6 +1614,15 @@
 }
 
 .agent-side-panel:has([data-canvas-workspace-expanded="true"]) {
+  z-index: 30;
+}
+
+/* 数据库工作台与 Canvas 使用相同展开宿主规则，避免右栏分隔线穿透。 */
+.agent-right-panel-host:has([data-server-ops-workbench-expanded="true"]) {
+  z-index: 90;
+}
+
+.agent-side-panel:has([data-server-ops-workbench-expanded="true"]) {
   z-index: 30;
 }
 

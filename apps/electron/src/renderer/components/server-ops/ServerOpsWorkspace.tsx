@@ -1,16 +1,16 @@
 import * as React from 'react'
 import { isServerOpsAuditActorOperation } from '@proma/shared'
-import { useAtom } from 'jotai'
+import { atom, useAtom, useStore } from 'jotai'
 import {
   Box,
   ClipboardList,
-  Database,
   FileText,
   Fingerprint,
   FolderOpen,
   Gauge,
   LoaderCircle,
   LogIn,
+  MoreHorizontal,
   PanelLeft,
   Pencil,
   Plus,
@@ -25,11 +25,14 @@ import {
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type {
+  AgentSessionMeta,
   ServerOpsAgentAccess,
   ServerOpsAgentAccessChanged,
   ServerOpsAgentAccessTarget,
   ServerOpsConnectionState,
   ServerOpsCredentialInput,
+  ServerOpsDataEngine,
+  ServerOpsDataSourceUpsertInput,
   ServerOpsHost,
   ServerOpsSaveHostInput,
   ServerOpsAuditActor,
@@ -38,24 +41,39 @@ import type {
   ServerOpsAuditListResult,
   ServerOpsAuditRecord,
 } from '@proma/shared'
-import { currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
+import { isOrdinaryTopLevelAgentSession } from '@proma/shared'
+import { agentSessionsAtom, currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
 import {
-  selectedServerOpsHostIdAtom,
   serverOpsAgentAccessProjectionAtom,
   serverOpsConnectionStatesAtom,
+  serverOpsDataSourcesAtom,
+  serverOpsDataSourcesErrorAtom,
+  serverOpsDataSourcesStatusAtom,
   serverOpsHostsAtom,
   serverOpsHostsErrorAtom,
   serverOpsHostsStatusAtom,
+  serverOpsProjectsAtom,
+  serverOpsProjectsErrorAtom,
+  serverOpsProjectsStatusAtom,
+  selectedServerOpsConnectionIdAtom,
+  selectedServerOpsProjectIdAtom,
 } from '@/atoms/server-ops-atoms'
 import type { ServerOpsAgentAccessProjection, ServerOpsAgentAccessStatus, ServerOpsHostsStatus } from '@/atoms/server-ops-atoms'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import { ServerOpsHostDialog } from './ServerOpsHostDialog'
-import { ServerOpsHostDrawer } from './ServerOpsHostDrawer'
+import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
 import { ServerOpsConnectDialog } from './ServerOpsConnectDialog'
 import { ServerOpsRemoteTerminal } from './ServerOpsRemoteTerminal'
 import { ServerOpsOverviewPanel } from './ServerOpsOverviewPanel'
@@ -64,6 +82,34 @@ import { ServerOpsLogsPanel } from './ServerOpsLogsPanel'
 import { ServerOpsTrustDialog } from './ServerOpsTrustDialog'
 import { ServerOpsDockerPanel } from './ServerOpsDockerPanel'
 import type { ServerOpsDockerPanelApi } from './ServerOpsDockerPanel'
+import type { ServerOpsDataPanelApi } from './ServerOpsDataServicesPanel'
+import { ServerOpsDataConnectionView } from './ServerOpsDataConnectionView'
+import { ServerOpsProjectDrawer } from './ServerOpsProjectDrawer'
+import { ServerOpsProjectDialog } from './ServerOpsProjectDialog'
+import { ServerOpsConnectionMoveDialog } from './ServerOpsConnectionMoveDialog'
+import { createServerOpsConnectionMoveController, createServerOpsConnectionMoveIdleProjection, mergeServerOpsMovedAsset } from './server-ops-connection-move-controller'
+import { ServerOpsProjectView } from './ServerOpsProjectView'
+import { ServerOpsAgentReadAccess } from './ServerOpsAgentReadAccess'
+import {
+  buildServerOpsConnections,
+  createServerOpsDataConnectionId,
+  createServerOpsSshConnectionId,
+  listServerOpsProjectConnections,
+  resolveServerOpsWorkspaceTarget,
+  summarizeServerOpsConnections,
+} from './server-ops-connections'
+import type { ServerOpsConnection, ServerOpsConnectionKind, ServerOpsConnectionSource } from './server-ops-connections'
+import {
+  SERVER_OPS_SEGMENTED_CLASS,
+  SERVER_OPS_TAB_CLASS,
+  SERVER_OPS_TABS_LIST_CLASS,
+  SERVER_OPS_TOOLBAR_CLASS,
+} from './server-ops-ui'
+import { createServerOpsProjectController, createServerOpsProjectsIdleProjection } from './server-ops-project-controller'
+import type { ServerOpsProjectControllerOptions } from './server-ops-project-controller'
+import { resolveServerOpsCurrentProjectId } from './server-ops-project-controller'
+import { createServerOpsDataSourceListController } from './server-ops-data-source-list-controller'
+import { getServerOpsDataErrorMessage } from './server-ops-data-display'
 import { ServerOpsFilesWorkspace } from './ServerOpsFilesWorkspace'
 import { ServerOpsDockerConsole } from './ServerOpsDockerConsole'
 import { useServerOpsTransferLeave } from './useServerOpsTransferLeave'
@@ -114,8 +160,32 @@ const serverOpsConsoleApi: ServerOpsConsolePreloadApi = {
   onServerOpsConsoleExit: (listener) => window.electronAPI.onServerOpsConsoleExit(listener),
 }
 
-/** 运维控制台首批固定页签。 */
-export type ServerOpsSection = 'overview' | 'terminal' | 'services' | 'logs' | 'files' | 'docker' | 'data-services' | 'audit'
+/** 数据服务只读查询与数据源管理使用独立 bridge。 */
+export const serverOpsDataApi: ServerOpsDataPanelApi = {
+  listServerOpsDataSources: (input) => window.electronAPI.listServerOpsDataSources(input),
+  upsertServerOpsDataSource: (input) => window.electronAPI.upsertServerOpsDataSource(input),
+  deleteServerOpsDataSource: (input) => window.electronAPI.deleteServerOpsDataSource(input),
+  probeServerOpsDataSource: (input) => window.electronAPI.probeServerOpsDataSource(input),
+  diagnoseServerOpsDataSource: (input) => window.electronAPI.diagnoseServerOpsDataSource(input),
+  revealServerOpsDataSourcePassword: (input) => window.electronAPI.revealServerOpsDataSourcePassword(input),
+  listServerOpsDataSchemaTables: (input) => window.electronAPI.listServerOpsDataSchemaTables(input),
+  describeServerOpsDataSchemaTable: (input) => window.electronAPI.describeServerOpsDataSchemaTable(input),
+  readServerOpsDataSchemaRows: (input) => window.electronAPI.readServerOpsDataSchemaRows(input),
+  /** 延迟读取真实可选接口；热更新遇到旧 preload 时保留 undefined，让查询门禁生效。 */
+  get queryServerOpsDatabase() { return window.electronAPI.queryServerOpsDatabase },
+  get cancelServerOpsDatabaseQuery() { return window.electronAPI.cancelServerOpsDatabaseQuery },
+  /** 历史同样保留桥接能力缺失，避免包装函数掩盖版本不一致。 */
+  get listServerOpsDatabaseQueryHistory() { return window.electronAPI.listServerOpsDatabaseQueryHistory },
+  get saveServerOpsDatabaseQueryHistory() { return window.electronAPI.saveServerOpsDatabaseQueryHistory },
+}
+
+/**
+ * SSH 连接的能力页签。
+ *
+ * 数据服务不再是页签：数据库 / Redis 是项目内的独立连接，
+ * 从项目视图点进去就是数据服务详情，页签里不需要第二个指向同一批数据的入口。
+ */
+export type ServerOpsSection = 'overview' | 'terminal' | 'services' | 'logs' | 'files' | 'docker' | 'audit'
 
 /** 运维页签的显示元数据。 */
 interface ServerOpsSectionMeta {
@@ -135,7 +205,6 @@ const SERVER_OPS_SECTIONS: readonly ServerOpsSectionMeta[] = [
   { id: 'logs', label: '日志', icon: FileText },
   { id: 'files', label: '文件', icon: FolderOpen },
   { id: 'docker', label: 'Docker', icon: Box },
-  { id: 'data-services', label: '数据服务', icon: Database },
   { id: 'audit', label: '审计', icon: ClipboardList },
 ]
 
@@ -165,6 +234,15 @@ export interface ServerOpsWorkspaceViewProps {
   onContainerLogChange?: (target: { hostId: string; containerId: string } | null) => void
   onContainerConsoleChange?: (target: { hostId: string; containerId: string } | null) => void
   onOpenDrawer: () => void
+  /** 当前项目名；作为连接视图面包屑的第一段（同时也是返回项目视图的入口）。 */
+  projectLabel?: string
+  /**
+   * 返回项目视图。
+   *
+   * 能力页签挂在"选中的 SSH 连接"下面，项目分组列表在中间区域展示，
+   * 因此连接视图必须能回到自己所属项目的分组视图。
+   */
+  onBackToProject?: () => void
   onCreateHost: () => void
   onEditHost: (host: ServerOpsHost) => void
   onDeleteHost: (host: ServerOpsHost) => void
@@ -194,6 +272,8 @@ export function getServerOpsOverviewInstanceKey(
 
 /** 审计记录中的操作显示名。 */
 const SERVER_OPS_AUDIT_OPERATION_LABELS: Record<ServerOpsAuditOperation, string> = {
+  'data-query': 'SQL 查询',
+  'agent-read': 'Agent 只读访问',
   connect: '连接',
   exec: '执行命令',
   disconnect: '断开',
@@ -224,6 +304,8 @@ const SERVER_OPS_AUDIT_ACTOR_LABELS: Record<ServerOpsAuditActor, string> = {
 
 /** 审计操作筛选的固定顺序。 */
 const SERVER_OPS_AUDIT_OPERATIONS: readonly ServerOpsAuditOperation[] = [
+  'agent-read',
+  'data-query',
   'connect', 'exec', 'disconnect',
   'service-start', 'service-stop', 'service-restart', 'service-enable', 'service-disable',
   'trust-replace', 'trust-revoke',
@@ -261,14 +343,15 @@ export function ServerOpsAudit({
     || isServerOpsAuditActorOperation(actorFilter, operation)
   ))
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-        <div className="flex h-7 items-center rounded-sm border border-border p-0.5" aria-label="筛选审计服务器">
+    <div className="flex min-h-0 flex-1 flex-col" style={{ containerType: 'inline-size' }} data-server-ops-audit>
+      <style>{'@container (min-width: 620px) { [data-server-ops-audit-filters="true"] { grid-template-columns: auto minmax(7rem, 10rem) minmax(8rem, 12rem) 1fr; } [data-server-ops-audit-row="true"] { grid-template-columns: 9rem 4rem 5.5rem 4rem minmax(0, 1fr); } }'}</style>
+      <div className="grid shrink-0 grid-cols-2 items-center gap-2 border-b border-border/40 px-4 py-2" data-server-ops-audit-filters>
+        <div className={SERVER_OPS_SEGMENTED_CLASS} aria-label="筛选审计服务器">
           {(['current', 'all'] as const).map((filter) => (
             <button
               key={filter}
               type="button"
-              className={cn('h-6 px-2 text-[11px]', hostFilter === filter ? 'bg-accent text-foreground' : 'text-muted-foreground')}
+              className={cn('h-7 shrink-0 rounded-md px-2 text-[11px] transition-colors', hostFilter === filter ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground')}
               aria-pressed={hostFilter === filter}
               onClick={() => onHostFilterChange?.(filter)}
             >
@@ -277,7 +360,7 @@ export function ServerOpsAudit({
           ))}
         </div>
         <select
-          className="h-7 min-w-24 rounded-sm border border-input bg-background px-2 text-[11px] text-foreground"
+          className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-[11px] text-foreground"
           aria-label="筛选审计主体"
           value={actorFilter}
           onChange={(event) => onActorFilterChange?.(event.target.value as ServerOpsAuditActor | 'all')}
@@ -287,7 +370,7 @@ export function ServerOpsAudit({
           <option value="user">用户</option>
         </select>
         <select
-          className="h-7 min-w-28 rounded-sm border border-input bg-background px-2 text-[11px] text-foreground"
+          className="h-8 min-w-0 rounded-md border border-input bg-background px-2 text-[11px] text-foreground"
           aria-label="筛选审计操作"
           value={operationFilter}
           onChange={(event) => onOperationFilterChange?.(event.target.value as ServerOpsAuditOperation | 'all')}
@@ -297,7 +380,7 @@ export function ServerOpsAudit({
             <option key={operation} value={operation}>{SERVER_OPS_AUDIT_OPERATION_LABELS[operation]}</option>
           ))}
         </select>
-        <Button type="button" variant="ghost" size="icon-sm" className="ml-auto" aria-label="刷新审计记录" onClick={onRefresh}>
+        <Button type="button" variant="ghost" size="icon-sm" className="ml-auto justify-self-end" aria-label="刷新审计记录" onClick={onRefresh}>
           <RefreshCw className={cn('size-3.5', status === 'loading' && 'animate-spin')} aria-hidden="true" />
         </Button>
       </div>
@@ -315,9 +398,9 @@ export function ServerOpsAudit({
         <div className="flex flex-1 items-center justify-center px-6 text-sm text-muted-foreground">暂无审计记录</div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="divide-y divide-border">
+          <div className="divide-y divide-border/30">
             {[...records].reverse().map((record) => (
-              <div key={record.id} className="grid min-w-0 grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 px-3 py-2 text-xs sm:grid-cols-[9rem_4rem_5.5rem_4rem_minmax(0,1fr)]">
+              <div key={record.id} className="grid min-w-0 grid-cols-[minmax(7rem,auto)_minmax(0,1fr)] gap-x-3 gap-y-1 px-4 py-2 text-xs" data-server-ops-audit-row>
                 <time className="whitespace-nowrap text-muted-foreground" dateTime={new Date(record.timestamp).toISOString()}>
                   {new Date(record.timestamp).toLocaleString()}
                 </time>
@@ -330,6 +413,8 @@ export function ServerOpsAudit({
                 </span>
                 <div className="min-w-0 break-words font-mono text-[11px] text-muted-foreground">
                   {record.operation === 'exec' ? record.command : record.unitId}
+                  {record.operation === 'agent-read' ? <span>{record.readAction} · {record.sourceId ?? record.hostId}{record.database ? ` · ${record.database}` : ''}{record.table ? ` / ${record.table}` : ''}</span> : null}
+                  {record.operation === 'data-query' ? <span>SQL 查询 · {record.sourceId} · {record.database}{record.tables?.length ? ` / ${record.tables.join('、')}` : ''}</span> : null}
                   {record.exitCode !== undefined ? <span className="ml-2 text-foreground">退出码 {record.exitCode}</span> : null}
                   {record.signal ? <span className="ml-2 text-foreground">Signal {record.signal}</span> : null}
                   {record.errorCode ? <span className="ml-2 text-foreground">错误码 {record.errorCode}</span> : null}
@@ -361,43 +446,6 @@ function ServerOpsDisconnectedSection({ section, connected }: { section: ServerO
   )
 }
 
-/** 展示 PostgreSQL、MySQL 与 Redis 的连接入口和安全基线。 */
-function ServerOpsDataServices(): React.ReactElement {
-  /** 首批支持的数据服务。 */
-  const services = [
-    { name: 'PostgreSQL', detail: '连接、容量、慢查询与复制状态' },
-    { name: 'MySQL', detail: '连接、容量、慢查询与复制状态' },
-    { name: 'Redis', detail: 'Keyspace、内存、复制与 Slowlog' },
-  ] as const
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto p-4">
-      <div className="mx-auto w-full max-w-3xl">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h3 className="text-sm font-medium">数据服务</h3>
-            <p className="mt-1 text-xs text-muted-foreground">当前开发版本尚未提供数据库连接。</p>
-          </div>
-          <Badge variant="outline" className="font-normal">尚未接入</Badge>
-        </div>
-        <div className="divide-y divide-border border-y border-border">
-          {services.map((service) => (
-            <div key={service.name} className="flex min-h-16 items-center gap-3 py-3">
-              <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted/55 text-muted-foreground">
-                <Database className="size-4" aria-hidden="true" />
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium">{service.name}</div>
-                <div className="truncate text-xs text-muted-foreground">{service.detail}</div>
-              </div>
-              <span className="shrink-0 text-[11px] text-muted-foreground">尚未接入</span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
-}
-
 /** 纯展示的运维右侧工作区。 */
 export function ServerOpsWorkspaceView({
   status,
@@ -424,6 +472,8 @@ export function ServerOpsWorkspaceView({
   onContainerLogChange,
   onContainerConsoleChange,
   onOpenDrawer,
+  onBackToProject,
+  projectLabel,
   onCreateHost,
   onEditHost,
   onDeleteHost,
@@ -467,21 +517,41 @@ export function ServerOpsWorkspaceView({
 
   return (
     <div className="server-ops-workspace-container flex min-h-0 flex-1 flex-col bg-content-area" data-server-ops-workspace>
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2" data-server-ops-toolbar>
+      <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'min-h-14 px-4')} data-server-ops-toolbar>
         <TooltipProvider delayDuration={200}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button type="button" variant="ghost" size="icon-sm" aria-label="打开服务器列表" onClick={onOpenDrawer}>
+              <Button type="button" variant="ghost" size="icon-sm" aria-label="打开项目列表" onClick={onOpenDrawer}>
                 <PanelLeft className="size-3.5" aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom">服务器列表</TooltipContent>
+            <TooltipContent side="bottom">项目列表</TooltipContent>
           </Tooltip>
         </TooltipProvider>
-        <Server className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-xs font-medium">{selectedHost?.name ?? '服务器运维'}</div>
-          {selectedHost && <div className="truncate font-mono text-[10px] text-muted-foreground">{selectedHost.username}@{selectedHost.address}:{selectedHost.port}</div>}
+          {/*
+            身份只写一遍：第一行是"项目 › 服务器"面包屑（项目段可点，代替独立的返回按钮），
+            第二行是这条连接的登录身份。
+          */}
+          <div className="flex min-w-0 items-center gap-1 text-xs font-medium">
+            {onBackToProject && projectLabel ? (
+              <button
+                type="button"
+                className="truncate rounded-sm px-0.5 text-muted-foreground transition-colors hover:text-foreground"
+                aria-label="返回项目视图"
+                data-server-ops-connection-project
+                onClick={onBackToProject}
+              >
+                {projectLabel}
+              </button>
+            ) : null}
+            {onBackToProject && projectLabel ? <span className="shrink-0 text-muted-foreground" aria-hidden="true">›</span> : null}
+            <span className="flex min-w-0 items-center gap-1.5 truncate" data-server-ops-connection-module>
+              <Server className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+              {selectedHost?.name ?? '服务器运维'}
+            </span>
+          </div>
+          {selectedHost && <div className="truncate font-mono text-[11px] text-muted-foreground">{selectedHost.username}@{selectedHost.address}:{selectedHost.port}</div>}
         </div>
         {selectedHost && <Badge variant="outline" className={cn('shrink-0 px-2 py-0 text-[10px] font-normal', connected ? 'border-emerald-500/40 text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground')} data-server-ops-connection-badge>{connectionLabel}</Badge>}
         <TooltipProvider delayDuration={200}>
@@ -522,18 +592,6 @@ export function ServerOpsWorkspaceView({
           <span className="sr-only" role="status">当前 Agent 的服务器权限同步失败：{agentAccessError}</span>
         )}
         {selectedHost && (
-          <TooltipProvider delayDuration={200}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button type="button" variant="ghost" size="icon-sm" aria-label="管理服务器信任" onClick={onManageTrust}>
-                  <Fingerprint className="size-3.5" aria-hidden="true" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">管理服务器信任</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
-        )}
-        {selectedHost && (
           <>
             {connected ? (
               <Button type="button" variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-[11px]" aria-label="断开 SSH" data-server-ops-connection-action onClick={onDisconnect}>
@@ -545,12 +603,25 @@ export function ServerOpsWorkspaceView({
                 <span data-server-ops-connection-label>连接</span>
               </Button>
             )}
-            <Button type="button" variant="ghost" size="icon-sm" aria-label="编辑当前服务器" onClick={() => onEditHost(selectedHost)}>
-              <Pencil className="size-3.5" aria-hidden="true" />
-            </Button>
-            <Button type="button" variant="ghost" size="icon-sm" aria-label="删除当前服务器" onClick={() => onDeleteHost(selectedHost)}>
-              <Trash2 className="size-3.5" aria-hidden="true" />
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" variant="ghost" size="icon-sm" aria-label="更多服务器操作">
+                  <MoreHorizontal className="size-3.5" aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="z-[9999] min-w-40">
+                <DropdownMenuItem aria-label="管理服务器信任" onSelect={onManageTrust}>
+                  <Fingerprint className="size-3.5" aria-hidden="true" />管理服务器信任
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => onEditHost(selectedHost)}>
+                  <Pencil className="size-3.5" aria-hidden="true" />编辑服务器
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => onDeleteHost(selectedHost)}>
+                  <Trash2 className="size-3.5" aria-hidden="true" />删除服务器
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </>
         )}
       </div>
@@ -579,7 +650,7 @@ export function ServerOpsWorkspaceView({
         </div>
       ) : (
         <>
-          <nav className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border px-2" aria-label="服务器控制台">
+          <nav className={SERVER_OPS_TABS_LIST_CLASS} aria-label="服务器控制台">
             {SERVER_OPS_SECTIONS.map((section) => {
               /** 当前页签是否处于选中状态。 */
               const active = section.id === activeSection
@@ -590,8 +661,8 @@ export function ServerOpsWorkspaceView({
                   key={section.id}
                   type="button"
                   className={cn(
-                    'relative flex h-9 shrink-0 items-center gap-1.5 px-2.5 text-[11px] transition-colors',
-                    active ? 'text-foreground after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:bg-primary' : 'text-muted-foreground hover:text-foreground',
+                    SERVER_OPS_TAB_CLASS,
+                    active && 'bg-muted text-foreground',
                   )}
                   aria-current={active ? 'page' : undefined}
                   onClick={() => { if (section.id !== 'docker') onContainerConsoleChange?.(null); onSectionChange(section.id) }}
@@ -649,8 +720,6 @@ export function ServerOpsWorkspaceView({
               ? null
             : activeSection === 'logs'
               ? null
-            : activeSection === 'data-services'
-              ? <ServerOpsDataServices />
             : activeSection === 'files'
               ? <ServerOpsFilesWorkspace
                   key={getServerOpsOverviewInstanceKey(selectedHost.id, connectionState)}
@@ -844,6 +913,62 @@ interface ServerOpsAgentAccessViewStateInput {
   projection: ServerOpsAgentAccessProjection
   sessionId: string | null
   hostId: string | null
+  /** 会话存在但不可用于授权时的稳定原因；缺省表示确实没有会话。 */
+  sessionUnavailableReason?: string
+}
+
+/** 授权目标解析结果；`sessionId` 为 null 时不会发起任何主进程请求。 */
+export interface ServerOpsAgentAccessSessionResolution {
+  sessionId: string | null
+  unavailableReason?: string
+}
+
+/**
+ * 解析可用于服务器授权的会话身份。
+ *
+ * 主进程只允许普通顶层交互式 Agent 获得服务器授权，定时任务、子会话与画布派生会话都会被拒绝。
+ * 这里提前用同一份 `@proma/shared` 规则判断，把按钮置灰并给出原因，避免点下去才报错；
+ * 真正的主进程守卫保持不变，渲染层判断只影响交互提示。
+ *
+ * @param sessions Renderer 已加载的会话元数据
+ * @param sessionId 当前会话 ID
+ * @returns 可授权时返回原 ID，不可授权时返回 null 与稳定原因
+ */
+export function resolveServerOpsAgentAccessSession(
+  sessions: readonly AgentSessionMeta[],
+  sessionId: string | null,
+): ServerOpsAgentAccessSessionResolution {
+  if (!sessionId) return { sessionId: null }
+  /** 当前会话元数据；尚未加载时保持原行为，由主进程兜底。 */
+  const session = sessions.find((entry) => entry.id === sessionId)
+  if (!session) return { sessionId }
+  if (isOrdinaryTopLevelAgentSession(session)) return { sessionId }
+  return {
+    sessionId: null,
+    unavailableReason: '当前会话不是普通 Agent 会话（定时任务或子会话），请切换会话后再授权',
+  }
+}
+
+/** 授权身份依据全局连接选择解析，项目只控制连接列表的展示归属。 */
+interface ServerOpsAgentAccessTargetInput {
+  sessionId: string | null
+  projectViewActive: boolean
+  selectedConnectionId: string | null
+  connections: readonly ServerOpsConnection[]
+}
+
+/**
+ * 移动主机时保留精确授权身份；显式进入项目、选择数据连接或删除主机仍解除绑定。
+ * @param input 普通会话、显式导航状态、选中 ID 与全局连接事实
+ * @returns 精确 sessionId + hostId 组合；没有有效 SSH 选择时返回 null
+ */
+export function resolveServerOpsAgentAccessTarget(input: ServerOpsAgentAccessTargetInput): ServerOpsAgentAccessTarget | null {
+  if (!input.sessionId || input.projectViewActive) return null
+  /** 通过全局连接事实精确命中，不能从 ID 字符串推测已删除或不存在的主机。 */
+  const connection = input.connections.find((entry) => entry.id === input.selectedConnectionId)
+  return connection?.kind === 'ssh' && connection.hostId
+    ? { sessionId: input.sessionId, hostId: connection.hostId }
+    : null
 }
 
 /** 组件绑定层输出，属性名可直接传给纯展示组件。 */
@@ -860,6 +985,7 @@ export function resolveServerOpsAgentAccessViewState({
   projection,
   sessionId,
   hostId,
+  sessionUnavailableReason,
 }: ServerOpsAgentAccessViewStateInput): ServerOpsAgentAccessViewState {
   if (!hostId) {
     return {
@@ -876,7 +1002,7 @@ export function resolveServerOpsAgentAccessViewState({
       agentAccessGranted: false,
       agentAccessStatus: 'idle',
       agentAccessError: null,
-      agentAccessDisabledReason: '请先打开普通 Agent 会话',
+      agentAccessDisabledReason: sessionUnavailableReason ?? '请先打开普通 Agent 会话',
     }
   }
   /** 当前 render 对应的精确授权目标。 */
@@ -1063,7 +1189,9 @@ export function isServerOpsCredentialRecoveryState(state: ServerOpsConnectionSta
 }
 
 /** 绑定 Jotai 与 Electron IPC 的运维工作区。 */
-export function ServerOpsWorkspace(): React.ReactElement {
+export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }: { viewScope?: string; paneActive?: boolean } = {}): React.ReactElement {
+  /** 多个 Pane 的项目列表共用同一 Jotai Store，操作弹窗仍各自独立。 */
+  const workspaceStore = useStore()
   /** 当前 Renderer 缓存的服务器列表。 */
   const [hosts, setHosts] = useAtom(serverOpsHostsAtom)
   /** 服务器列表加载阶段。 */
@@ -1072,22 +1200,182 @@ export function ServerOpsWorkspace(): React.ReactElement {
   const [error, setError] = useAtom(serverOpsHostsErrorAtom)
   /** 每台主机的公开 SSH 连接状态。 */
   const [connectionStates, setConnectionStates] = useAtom(serverOpsConnectionStatesAtom)
-  /** 跨会话保留的当前服务器 ID。 */
-  const [selectedHostId, setSelectedHostId] = useAtom(selectedServerOpsHostIdAtom)
+  /** 全部数据源；数据库与 Redis 连接由它构造。 */
+  const [dataSources, setDataSources] = useAtom(serverOpsDataSourcesAtom)
+  const [dataSourcesStatus, setDataSourcesStatus] = useAtom(serverOpsDataSourcesStatusAtom)
+  const [dataSourcesError, setDataSourcesError] = useAtom(serverOpsDataSourcesErrorAtom)
+  /** 跨会话保留的当前连接 ID（`ssh:<hostId>` 或 `data:<sourceId>`）。 */
+  const [selectedConnectionId, setSelectedConnectionId] = useAtom(selectedServerOpsConnectionIdAtom)
   /** 当前普通 Agent 会话决定授权身份的一半。 */
   const [currentAgentSessionId] = useAtom(currentAgentSessionIdAtom)
+  /** Renderer 已加载的会话元数据，用于提前判断会话是否支持服务器授权。 */
+  const [agentSessions] = useAtom(agentSessionsAtom)
+  /** 项目列表的公开投影。 */
+  const [projects, setProjects] = useAtom(serverOpsProjectsAtom)
+  const [projectsStatus, setProjectsStatus] = useAtom(serverOpsProjectsStatusAtom)
+  const [projectsError, setProjectsError] = useAtom(serverOpsProjectsErrorAtom)
+  /** 用户最后选择的项目与写入口。 */
+  const [selectedProjectId, setSelectedProjectId] = useAtom(selectedServerOpsProjectIdAtom)
+  /** 筛选属于当前 Pane；记录项目身份以同步隔离上一项目的搜索，不写入业务配置。 */
+  const projectBrowseAtom = React.useMemo(() => atom<{ projectId: string | null; kind: ServerOpsConnectionKind | 'all'; query: string }>({ projectId: null, kind: 'all', query: '' }), [])
+  const [projectBrowseState, setProjectBrowseState] = useAtom(projectBrowseAtom)
+  /** 每个工作区独立的操作投影，避免不同 Pane 共享弹窗草稿或提交状态。 */
+  const projectManagementAtom = React.useMemo(() => atom(createServerOpsProjectsIdleProjection()), [])
+  /** 项目表单和错误随控制器投影一起更新。 */
+  const [projectManagement, setProjectManagement] = useAtom(projectManagementAtom)
+  /** 移动弹窗属于当前 Pane，资产回执仍写入全局共享 atoms。 */
+  const connectionMoveAtom = React.useMemo(() => atom(createServerOpsConnectionMoveIdleProjection()), [])
+  const [connectionMove, setConnectionMove] = useAtom(connectionMoveAtom)
+  /** 持续存在的连接菜单按钮及项目视图，供弹窗关闭时恢复焦点。 */
+  const connectionMoveFocusRef = React.useRef<{ trigger: HTMLElement | null; view: HTMLElement | null }>({ trigger: null, view: null })
+  /** 移动成功后连接行会卸载，焦点回到原项目的列表入口。 */
+  const restoreConnectionMoveFocus = (): void => {
+    /** 本次操作的入口与所属项目视图。 */
+    const { trigger, view } = connectionMoveFocusRef.current
+    if (trigger?.isConnected) trigger.focus()
+    else if (view?.isConnected) view.querySelector<HTMLElement>('[aria-label="打开项目列表"]')?.focus()
+  }
+  /** 移动仅提交项目元数据，不触发 SSH 连接、密码写入或诊断。 */
+  const [connectionMoveController] = React.useState(() => createServerOpsConnectionMoveController({
+    getProjects: () => workspaceStore.get(serverOpsProjectsAtom),
+    getConnections: () => buildServerOpsConnections({
+      projects: workspaceStore.get(serverOpsProjectsAtom),
+      hosts: workspaceStore.get(serverOpsHostsAtom),
+      dataSources: workspaceStore.get(serverOpsDataSourcesAtom),
+      connectionStates: workspaceStore.get(serverOpsConnectionStatesAtom),
+    }),
+    move: (input) => window.electronAPI.moveServerOpsConnection(input),
+    acceptMoved: (result, input) => {
+      if (result.kind === 'ssh') {
+        workspaceStore.set(serverOpsHostsAtom, (current) => mergeServerOpsMovedAsset(current, result.host, input.fromProjectId))
+      } else {
+        workspaceStore.set(serverOpsDataSourcesAtom, (current) => mergeServerOpsMovedAsset(current, result.source, input.fromProjectId))
+      }
+    },
+    onSuccess: (name) => toast.success(`已移动到「${name}」`),
+    publish: setConnectionMove,
+  }))
+  React.useEffect(() => {
+    connectionMoveController.activate()
+    return () => connectionMoveController.dispose()
+  }, [connectionMoveController])
+  /** 捕获当前菜单对应的稳定按钮，移动弹窗关闭后可继续键盘操作。 */
+  const handleMoveConnection = (connection: ServerOpsConnection): void => {
+    /** 菜单项本身即将卸载，通过菜单标签关系定位所属连接按钮。 */
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const triggerId = active?.closest('[role="menu"]')?.getAttribute('aria-labelledby')
+    const trigger = triggerId ? document.getElementById(triggerId) : active
+    connectionMoveFocusRef.current = { trigger, view: trigger?.closest<HTMLElement>('[data-server-ops-project-view]') ?? null }
+    connectionMoveController.open(connection)
+  }
+  /** 保留本 Pane 的管理入口及抽屉；项目删除后入口卸载时仍可回到抽屉。 */
+  const projectDialogFocusRef = React.useRef<{ trigger: HTMLElement | null; drawer: HTMLElement | null }>({ trigger: null, drawer: null })
+  /** 打开弹窗前记录触发器；菜单项会卸载，需经 Radix 的标签关系找到持续存在的更多按钮。 */
+  const rememberProjectDialogFocus = (): void => {
+    /** 本次点击或键盘操作的焦点。 */
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    /** 菜单的 aria-labelledby 指向所属项目的更多按钮。 */
+    const triggerId = active?.closest('[role="menu"]')?.getAttribute('aria-labelledby')
+    /** 普通添加按钮直接保留，菜单入口换成所属按钮。 */
+    const trigger = triggerId ? document.getElementById(triggerId) : active
+    projectDialogFocusRef.current = { trigger, drawer: trigger?.closest<HTMLElement>('[data-server-ops-project-drawer]') ?? null }
+  }
+  /** 弹窗完成关闭后恢复键盘位置；只在所属抽屉内寻找替代入口。 */
+  const restoreProjectDialogFocus = (): void => {
+    /** 保留的入口及其抽屉可能因新建项目跳转而同时卸载。 */
+    const { trigger, drawer } = projectDialogFocusRef.current
+    if (trigger?.isConnected) trigger.focus()
+    else if (drawer?.isConnected) drawer.querySelector<HTMLElement>('[aria-label="收起项目列表"]')?.focus()
+  }
+  /** 稳定控制器在异步成功时使用当前导航上下文，仍经过传输离开守卫。 */
+  const projectNavigationRef = React.useRef<Pick<ServerOpsProjectControllerOptions, 'onCreated' | 'onDeleted'>>({})
+  /**
+   * 单组件生命周期内稳定的项目控制器。
+   *
+   * 项目是连接与 Agent 授权的顶层分组，因此它的加载与其它领域一样带 owner 代次；
+   * 这里只负责把投影写进 atoms，选择器与侧栏在后续步骤消费这些 atoms。
+   */
+  const [projectController] = React.useState(() => createServerOpsProjectController({
+    /**
+     * 旧客户端（preload 未更新）没有这个方法；这里显式降级为一条可读错误，
+     * 让运维面板仍然可用，而不是让整个页面因为一个同步 TypeError 崩掉。
+     */
+    listProjects: () => window.electronAPI.listServerOpsProjects?.({}) ?? Promise.reject(new Error('SERVER_OPS_PROJECT_API_UNAVAILABLE')),
+    getProjects: () => workspaceStore.get(serverOpsProjectsAtom),
+    createProject: (input) => window.electronAPI.createServerOpsProject(input),
+    renameProject: (input) => window.electronAPI.renameServerOpsProject(input),
+    deleteProject: (input) => window.electronAPI.deleteServerOpsProject(input),
+    onCreated: (project) => projectNavigationRef.current.onCreated?.(project),
+    onDeleted: (projectId, remainingProjects) => projectNavigationRef.current.onDeleted?.(projectId, remainingProjects),
+    publish: (projection) => {
+      setProjects(projection.projects)
+      setProjectsStatus(projection.status)
+      setProjectsError(projection.error)
+      setProjectManagement(projection)
+    },
+  }))
+
+  React.useEffect(() => {
+    /** 每次真实挂载或 StrictMode setup 重放都建立新的 owner 代次。 */
+    projectController.activate()
+    return () => projectController.dispose()
+  }, [projectController])
+  /**
+   * 单组件生命周期内稳定的数据源列表控制器。
+   *
+   * 数据源一次读全量、按项目在渲染层过滤：切项目只是重新分组，不会为每条连接发一次请求，
+   * 也不会产生"切项目时迟到结果写回旧列表"的竞态。
+   */
+  const [dataSourceController] = React.useState(() => createServerOpsDataSourceListController({
+    api: { listServerOpsDataSources: (input) => window.electronAPI.listServerOpsDataSources(input) },
+    getSources: () => workspaceStore.get(serverOpsDataSourcesAtom),
+    publish: (projection) => {
+      setDataSources(projection.sources)
+      setDataSourcesStatus(projection.status)
+      setDataSourcesError(projection.error)
+    },
+  }))
+
+  React.useEffect(() => {
+    /** 每次真实挂载或 StrictMode setup 重放都建立新的 owner 代次。 */
+    dataSourceController.activate()
+    return () => dataSourceController.dispose()
+  }, [dataSourceController])
   /** 当前精确组合的主进程授权事实投影。 */
   const [agentAccessProjection, setAgentAccessProjection] = useAtom(serverOpsAgentAccessProjectionAtom)
+  /** 多资源只读授权桥接保持引用稳定，避免每次工作区渲染重新读取或重置弹窗。 */
+  const agentReadApi = React.useMemo(() => typeof window.electronAPI.getServerOpsAgentReadAccess === 'function' && typeof window.electronAPI.setServerOpsAgentReadAccess === 'function' ? {
+    get: window.electronAPI.getServerOpsAgentReadAccess,
+    set: window.electronAPI.setServerOpsAgentReadAccess,
+    onChanged: window.electronAPI.onServerOpsAgentReadAccessChanged,
+  } : undefined, [])
   /** 当前控制台页签。 */
   const [activeSection, setActiveSection] = React.useState<ServerOpsSection>('overview')
+  /**
+   * 中间区域是否停留在项目视图。
+   *
+   * 项目视图是连接清单本身；只有用户显式点进某条连接后才切到连接视图，
+   * 因此应用重启后的默认落点是项目分组，而不是上次那条连接。
+   */
+  const [projectViewActive, setProjectViewActive] = React.useState(true)
   /** 服务器列表抽屉是否展开。 */
   const [drawerOpen, setDrawerOpen] = React.useState(false)
   /** 当前正在编辑的服务器；null 表示新建。 */
   const [editingHost, setEditingHost] = React.useState<ServerOpsHost | null>(null)
   /** 主机表单是否打开。 */
   const [dialogOpen, setDialogOpen] = React.useState(false)
+  /** 主机创建表单打开时的归属，保存期间不跟随工作区选择变化。 */
+  const [creatingHostProjectId, setCreatingHostProjectId] = React.useState<string | null>(null)
   /** 主机写入是否正在进行。 */
   const [saving, setSaving] = React.useState(false)
+  /** 项目视图里"添加数据库 / 添加 Redis"打开的初始引擎；null 表示表单关闭。 */
+  const [creatingDataSourceEngine, setCreatingDataSourceEngine] = React.useState<ServerOpsDataEngine | null>(null)
+  /** 数据服务创建时的项目身份；数据库与 Redis 共用此边界。 */
+  const [creatingDataSourceProjectId, setCreatingDataSourceProjectId] = React.useState<string | null>(null)
+  /** 数据源写入是否正在进行。 */
+  const [savingDataSource, setSavingDataSource] = React.useState(false)
+  /** 数据源表单的公开错误。 */
+  const [dataSourceFormError, setDataSourceFormError] = React.useState<string | null>(null)
   /** 等待用户确认删除的服务器。 */
   const [pendingDeleteHost, setPendingDeleteHost] = React.useState<ServerOpsHost | null>(null)
   /** 删除写入是否正在进行。 */
@@ -1100,8 +1388,6 @@ export function ServerOpsWorkspace(): React.ReactElement {
   const [confirmingHostKey, setConfirmingHostKey] = React.useState(false)
   /** 当前服务器的独立信任管理弹窗是否打开。 */
   const [trustDialogOpen, setTrustDialogOpen] = React.useState(false)
-  /** 主机切换前等待所属窗口传输收口。 */
-  const transferLeave = useServerOpsTransferLeave(selectedHostId)
   /** 仅在用户显式选择的主机上显示容器日志。 */
   const [containerLog, setContainerLog] = React.useState<{ hostId: string; containerId: string } | null>(null)
   /** 当前用户显式打开的容器终端。 */
@@ -1135,19 +1421,201 @@ export function ServerOpsWorkspace(): React.ReactElement {
     reportError: (message) => toast.error('服务器授权同步失败', { description: message }),
   }))
 
-  /** 根据持久选择和实际列表解析当前服务器。 */
-  const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? hosts[0] ?? null
+  /** 当前生效的项目；选择失效时回落到列表第一项，界面不停留在已删除项目上。 */
+  const currentProjectId = resolveServerOpsCurrentProjectId(projects, selectedProjectId)
+  /** 项目切换当帧就使用默认条件，effect 随后清理旧状态，不短暂显示旧搜索结果。 */
+  const projectBrowse = projectBrowseState.projectId === currentProjectId
+    ? projectBrowseState
+    : { projectId: currentProjectId, kind: 'all' as const, query: '' }
+  React.useEffect(() => {
+    setProjectBrowseState((current) => current.projectId === currentProjectId
+      ? current
+      : { projectId: currentProjectId, kind: 'all', query: '' })
+  }, [currentProjectId, setProjectBrowseState])
+  /** 连接模型输入：项目、主机、数据源与公开连接状态。 */
+  const connectionSource: ServerOpsConnectionSource = React.useMemo(
+    () => ({ projects, hosts, dataSources, connectionStates }),
+    [connectionStates, dataSources, hosts, projects],
+  )
+  /** 全部连接；抽屉统计与项目视图共用同一份模型，避免两处数字对不上。 */
+  const connections = React.useMemo(() => buildServerOpsConnections(connectionSource), [connectionSource])
+  /** 每个项目的连接统计。 */
+  const connectionSummaries = React.useMemo(() => summarizeServerOpsConnections(connections), [connections])
+  /** 当前项目下的连接；项目未知时为空。 */
+  const projectConnections = React.useMemo(
+    () => listServerOpsProjectConnections(connectionSource, currentProjectId),
+    [connectionSource, currentProjectId],
+  )
+  /** 中间区域要渲染的目标：项目分组或某条连接。 */
+  const workspaceTarget = resolveServerOpsWorkspaceTarget({ projectViewActive, connections: projectConnections, selectedConnectionId })
+  /** 当前生效的连接；项目视图下为空。 */
+  const selectedConnection: ServerOpsConnection | null = workspaceTarget.kind === 'connection' ? workspaceTarget.connection : null
+  /** 当前 SSH 连接对应的主机；数据连接与项目视图下为空。 */
+  const selectedHost = selectedConnection?.kind === 'ssh'
+    ? hosts.find((host) => host.id === selectedConnection.hostId) ?? null
+    : null
+  /** 当前打开的数据连接对应的数据源。 */
+  const selectedDataSource = selectedConnection !== null && selectedConnection.kind !== 'ssh'
+    ? dataSources.find((dataSource) => dataSource.id === selectedConnection.sourceId) ?? null
+    : null
+  /** 当前项目；项目视图标题与数据连接归属都取自它。 */
+  const currentProject = projects.find((project) => project.id === currentProjectId) ?? null
+  /**
+   * 数据连接编辑时的跳板主机。
+   *
+   * 数据源弹窗目前只支持一个跳板选项：优先用这条连接自己的跳板，
+   * 其次用项目内第一台服务器（跨项目跳板选择是后续工作）。
+   */
+  const selectedDataSourceJumpHost = React.useMemo(() => {
+    if (selectedDataSource === null) return null
+    /** 该连接自己的跳板主机 ID。 */
+    const jumpHostId = selectedDataSource.transport === 'ssh'
+      ? selectedDataSource.hostId
+      : projectConnections.find((connection) => connection.kind === 'ssh')?.hostId
+    /** 跳板主机记录；已删除的跳板返回 null，界面如实说明而不是回退成直连。 */
+    return hosts.find((host) => host.id === jumpHostId) ?? null
+  }, [hosts, projectConnections, selectedDataSource])
+  /**
+   * 连接切换前等待所属窗口传输收口。
+   *
+   * 作用域是"当前正在查看的 SSH 主机"：进入项目视图或数据连接都会离开该主机，
+   * 因此必须和切换主机一样先确认文件传输收口。
+   */
+  const transferLeave = useServerOpsTransferLeave(selectedHost?.id ?? null)
+
+  /**
+   * 切换项目（进入该项目视图）。
+   *
+   * 抽屉里的项目行代表"进入这个项目"，因此中间区域切回项目分组视图；同时把选中连接
+   * 同步到该项目内的第一条，避免返回连接视图时串到上一个项目。离开正在查看的服务器
+   * 同样要先让文件传输收口，因此所有状态都提交在收口回调里。
+   *
+   * @param projectId 目标项目 ID
+   */
+  const handleSelectProject = (projectId: string): void => {
+    transferLeave.requestLeave(() => {
+      setSelectedProjectId(projectId)
+      setProjectViewActive(true)
+      setContainerConsole(null)
+      setContainerLog(null)
+      /** 目标项目下的连接；未迁移条目归入第一个项目。 */
+      const targetConnections = listServerOpsProjectConnections(connectionSource, projectId)
+      setSelectedConnectionId((current) => targetConnections.some((connection) => connection.id === current)
+        ? current
+        : targetConnections[0]?.id ?? null)
+    })
+  }
+
+  /** 项目 CRUD 成功只改变必要的选择，重命名不触碰当前连接和诊断。 */
+  projectNavigationRef.current = {
+    onCreated: (project) => {
+      setDrawerOpen(false)
+      handleSelectProject(project.id)
+      toast.success('项目已添加')
+    },
+    onDeleted: (projectId, remainingProjects) => {
+      if (projectId === currentProjectId && remainingProjects[0]) handleSelectProject(remainingProjects[0].id)
+      toast.success('项目已删除')
+    },
+  }
+
+  /**
+   * 进入一条连接。
+   *
+   * 服务器进入能力页签，数据库 / Redis 进入只读诊断。
+   *
+   * **顺序是这里的全部要点**：必须先把选择与视图都放在传输收口回调里提交，
+   * 不能在调用 `requestLeave()` 之前翻动任何会影响传输作用域的状态——否则中间那次渲染
+   * 会按"旧选择"立刻画出上一条连接（通常是服务器），
+   * 于是 `useServerOpsTransferLeave` 的作用域发生变化、挂起中的收口确认被作废，
+   * 表现为"点数据库却进了服务器界面"（这是真实踩过的 bug）。
+   *
+   * @param connection 目标连接
+   */
+  const handleSelectConnection = (connection: ServerOpsConnection): void => {
+    /** 已经在看这条连接时不需要再走一次收口。 */
+    if (!projectViewActive && connection.id === selectedConnectionId) return
+    transferLeave.requestLeave(() => {
+      setContainerConsole(null)
+      setContainerLog(null)
+      /** 同一批次内先提交选择再切换视图，渲染不会出现"新模式 + 旧选择"的中间态。 */
+      setSelectedConnectionId(connection.id)
+      setProjectViewActive(false)
+    })
+  }
+
+  /** 返回当前项目的分组视图；离开服务器前同样等待文件传输收口。 */
+  const handleBackToProject = (): void => {
+    transferLeave.requestLeave(() => {
+      setContainerConsole(null)
+      setContainerLog(null)
+      setProjectViewActive(true)
+    })
+  }
+
+  /**
+   * 数据连接详情里的数据源变更。
+   *
+   * 编辑只需重读连接清单；删除会让这条连接消失，必须退回项目视图，
+   * 否则用户会被动落到同项目的另一条连接上，与"删除服务器后退回项目"不一致。
+   *
+   * @param change 变更类别
+   */
+  const handleDataSourceMutated = React.useCallback((change: 'updated' | 'deleted'): void => {
+    dataSourceController.refresh()
+    if (change !== 'deleted') return
+    setSelectedConnectionId(null)
+    setProjectViewActive(true)
+  }, [dataSourceController, setSelectedConnectionId])
+
+  /**
+   * 新建数据源并直接进入这条连接。
+   *
+   * 写入成功后合并主进程返回的新连接，再把选择切到它，
+   * 让用户立刻看到只读诊断，而不是回到一个看不出变化的列表。
+   *
+   * @param input 已通过表单校验的写入输入
+   */
+  const handleCreateDataSource = async (input: ServerOpsDataSourceUpsertInput): Promise<void> => {
+    if (!creatingDataSourceProjectId || savingDataSource) return
+    setSavingDataSource(true)
+    setDataSourceFormError(null)
+    try {
+      /** 主进程写盘后返回的连接记录。 */
+      const result = await window.electronAPI.upsertServerOpsDataSource({ ...input, projectId: creatingDataSourceProjectId })
+      dataSourceController.acceptSavedSource(result.source)
+      setCreatingDataSourceEngine(null)
+      /** 以写入回执为归属依据；创建使用打开表单时捕获的项目身份。 */
+      const landedProjectId = result.source.projectId
+      const switchedProject = landedProjectId !== undefined && landedProjectId !== currentProjectId
+      if (switchedProject) setSelectedProjectId(landedProjectId)
+      setSelectedConnectionId(createServerOpsDataConnectionId(result.source.id))
+      setProjectViewActive(false)
+      toast.success('数据连接已添加')
+    } catch (createError) {
+      /** 主进程错误统一收敛成中文说明，避免把 IPC 原文（含稳定错误码）直接暴露给用户。 */
+      setDataSourceFormError(getServerOpsDataErrorMessage(createError))
+    } finally {
+      setSavingDataSource(false)
+    }
+  }
   /** 当前选中主机的公开连接状态。 */
   const selectedConnectionState = selectedHost ? connectionStates[selectedHost.id] : undefined
-  /** 当前可授权的精确普通 Agent + 服务器组合。 */
-  const agentAccessTarget = currentAgentSessionId && selectedHost
-    ? { sessionId: currentAgentSessionId, hostId: selectedHost.id }
-    : null
+  /** 当前会话能否作为服务器授权目标；定时任务与子会话会被提前排除。 */
+  const agentAccessSession = resolveServerOpsAgentAccessSession(agentSessions, currentAgentSessionId)
+  /** 移动仅改变列表归属；按全局稳定身份保持授权，展示仍由当前项目 selectedHost 决定。 */
+  const agentAccessTarget = resolveServerOpsAgentAccessTarget({
+    sessionId: agentAccessSession.sessionId,
+    projectViewActive,
+    selectedConnectionId,
+    connections,
+  })
   /** render 同步门禁早于 effect，旧目标投影不会产生可点击窗口。 */
   const agentAccessViewState = resolveServerOpsAgentAccessViewState({
     projection: agentAccessProjection,
-    sessionId: currentAgentSessionId,
+    sessionId: agentAccessSession.sessionId,
     hostId: selectedHost?.id ?? null,
+    ...(agentAccessSession.unavailableReason === undefined ? {} : { sessionUnavailableReason: agentAccessSession.unavailableReason }),
   })
 
   React.useEffect(() => {
@@ -1187,19 +1655,26 @@ export function ServerOpsWorkspace(): React.ReactElement {
 
   /** 从主进程重新读取服务器资产。 */
   const loadHosts = React.useCallback(async (): Promise<void> => {
+    /** 在途读取不能覆盖其他 Pane 刚完成的移动或编辑回执。 */
+    const hostsAtStart = workspaceStore.get(serverOpsHostsAtom)
     setStatus('loading')
     setError(null)
     try {
       /** 主进程返回的权威服务器列表。 */
       const loaded = await window.electronAPI.listServerOpsHosts()
+      if (workspaceStore.get(serverOpsHostsAtom) !== hostsAtStart) { setStatus('ready'); return }
       setHosts(loaded)
-      setSelectedHostId((current) => loaded.some((host) => host.id === current) ? current : loaded[0]?.id ?? null)
+      /** 已删除的服务器对应的连接选择必须一起失效，否则会停留在不存在的连接上。 */
+      setSelectedConnectionId((current) => current === null || loaded.some((host) => createServerOpsSshConnectionId(host.id) === current)
+        ? current
+        : null)
       setStatus('ready')
     } catch (loadError) {
+      if (workspaceStore.get(serverOpsHostsAtom) !== hostsAtStart) { setStatus('ready'); return }
       setError(getErrorMessage(loadError))
       setStatus('error')
     }
-  }, [setError, setHosts, setSelectedHostId, setStatus])
+  }, [setError, setHosts, setSelectedConnectionId, setStatus, workspaceStore])
 
   React.useEffect(() => {
     void loadHosts()
@@ -1224,6 +1699,8 @@ export function ServerOpsWorkspace(): React.ReactElement {
 
   /** 打开空白主机表单。 */
   const handleCreateHost = (): void => {
+    if (!currentProjectId) return
+    setCreatingHostProjectId(currentProjectId)
     setEditingHost(null)
     setDialogOpen(true)
   }
@@ -1232,6 +1709,25 @@ export function ServerOpsWorkspace(): React.ReactElement {
   const handleEditHost = (host: ServerOpsHost): void => {
     setEditingHost(host)
     setDialogOpen(true)
+  }
+
+  /**
+   * 项目视图里的"添加连接"入口。
+   *
+   * 服务器与数据库 / Redis 是不同类别的连接，字段完全不重叠，
+   * 因此按类别各自打开对应的表单，而不是在一个弹窗里混三类字段。
+   *
+   * @param kind 连接类别
+   */
+  const handleAddConnection = (kind: ServerOpsConnectionKind): void => {
+    if (!currentProjectId) return
+    if (kind === 'ssh') {
+      handleCreateHost()
+      return
+    }
+    setDataSourceFormError(null)
+    setCreatingDataSourceProjectId(currentProjectId)
+    setCreatingDataSourceEngine(kind === 'redis' ? 'redis' : 'mysql')
   }
 
   /** 使用本次表单凭据发起真实 SSH 登录。 */
@@ -1314,10 +1810,14 @@ export function ServerOpsWorkspace(): React.ReactElement {
 
   /** 原子保存主机，并在成功后更新全局选择。 */
   const handleSaveHost = async (input: ServerOpsSaveHostInput): Promise<void> => {
+    if (saving || (!input.host.id && !creatingHostProjectId)) return
     setSaving(true)
     try {
       /** 主进程确认写盘后的服务器记录。 */
-      const saved = await window.electronAPI.upsertServerOpsHost(input)
+      const saved = await window.electronAPI.upsertServerOpsHost(input.host.id ? input : {
+        ...input,
+        host: { ...input.host, projectId: creatingHostProjectId! },
+      })
       setHosts((current) => {
         /** 编辑目标在当前 Renderer 快照中的位置。 */
         const index = current.findIndex((host) => host.id === saved.id)
@@ -1325,7 +1825,13 @@ export function ServerOpsWorkspace(): React.ReactElement {
           ? [...current, saved]
           : current.map((host) => host.id === saved.id ? saved : host)
       })
-      setSelectedHostId(saved.id)
+      /** 回执确认最终归属；重命名或切换项目不改变已打开表单的目标。 */
+      const landedProjectId = saved.projectId
+      const switchedProject = landedProjectId !== undefined && landedProjectId !== currentProjectId
+      if (switchedProject) setSelectedProjectId(landedProjectId)
+      /** 保存后直接进入这条连接的视图：用户刚写完配置，下一步通常是连接或查看。 */
+      setSelectedConnectionId(createServerOpsSshConnectionId(saved.id))
+      setProjectViewActive(false)
       setDialogOpen(false)
       setDrawerOpen(false)
       toast.success(input.host.id ? '服务器已更新' : '服务器已添加')
@@ -1336,7 +1842,7 @@ export function ServerOpsWorkspace(): React.ReactElement {
     }
   }
 
-  /** 删除确认成功后更新列表，并选择下一台可用服务器。 */
+  /** 删除确认成功后更新列表；删除的正是当前连接时退回项目视图。 */
   const handleConfirmDelete = async (): Promise<void> => {
     if (!pendingDeleteHost) return
     setDeleting(true)
@@ -1347,7 +1853,12 @@ export function ServerOpsWorkspace(): React.ReactElement {
       /** 删除后的本地服务器列表。 */
       const nextHosts = hosts.filter((host) => host.id !== deletedId)
       setHosts(nextHosts)
-      setSelectedHostId((selected) => selected === deletedId ? nextHosts[0]?.id ?? null : selected)
+      /** 被删除主机对应的连接 ID。 */
+      const removedConnectionId = createServerOpsSshConnectionId(deletedId)
+      if (selectedConnectionId === removedConnectionId) {
+        setSelectedConnectionId(null)
+        setProjectViewActive(true)
+      }
       setPendingDeleteHost(null)
       toast.success('服务器已删除')
     } catch (deleteError) {
@@ -1357,57 +1868,154 @@ export function ServerOpsWorkspace(): React.ReactElement {
     }
   }
 
+  /**
+   * 新增数据连接时表单里的唯一跳板选项。
+   *
+   * 数据源弹窗当前只支持一个跳板主机，项目视图里没有"当前服务器"，
+   * 因此取本项目第一台服务器；本项目还没有服务器时留空，用户可以选"本机直连"。
+   */
+  const projectJumpHost = connections.find((connection) => connection.projectId === creatingDataSourceProjectId && connection.kind === 'ssh')
+  /** 项目分组视图；连接不存在或身份失效时作为中间区域的稳定回退。 */
+  const projectPane = (
+    <ServerOpsProjectView
+      project={currentProject}
+      status={projectsStatus}
+      error={projectsError}
+      connections={projectConnections}
+      selectedConnectionId={selectedConnectionId}
+      onSelectConnection={handleSelectConnection}
+      onOpenDrawer={() => setDrawerOpen(true)}
+      onRetry={() => projectController.refresh()}
+      onAddConnection={handleAddConnection}
+      filterKind={projectBrowse.kind}
+      searchQuery={projectBrowse.query}
+      onFilterKindChange={(kind) => setProjectBrowseState({ ...projectBrowse, kind })}
+      onSearchQueryChange={(query) => setProjectBrowseState({ ...projectBrowse, query })}
+      onMoveConnection={projectsStatus === 'ready' ? handleMoveConnection : undefined}
+      toolbarActions={currentProject ? <ServerOpsAgentReadAccess
+        sessionId={agentAccessSession.sessionId}
+        unavailableReason={agentAccessSession.unavailableReason}
+        projectId={currentProject.id}
+        projects={projects}
+        connections={projectConnections}
+        allConnections={connections}
+        dataSources={dataSources}
+        api={agentReadApi}
+      /> : undefined}
+    />
+  )
+
+  /**
+   * 选中连接对应的面板。
+   *
+   * 服务器进入能力页签，数据库 / Redis 进入只读诊断；连接身份失效（主机或数据源刚被删除）
+   * 时保持为空，由项目分组视图兜底，中间区域不会出现空白。
+   */
+  const connectionPane = workspaceTarget.kind !== 'connection'
+    ? null
+    : workspaceTarget.connection.kind === 'ssh'
+      ? selectedHost === null ? null : (
+        <ServerOpsWorkspaceView
+          status={status}
+          error={error}
+          hosts={hosts}
+          selectedHost={selectedHost}
+          activeSection={activeSection}
+          connectionState={selectedConnectionState}
+          agentSessionId={currentAgentSessionId}
+          containerLog={containerLog}
+          containerConsole={containerConsole}
+          onContainerLogChange={setContainerLog}
+          onContainerConsoleChange={setContainerConsole}
+          {...agentAccessViewState}
+          terminalContent={selectedConnectionState?.phase === 'connected' && selectedConnectionState.connectionId
+            ? <ServerOpsRemoteTerminal hostId={selectedHost.id} connectionId={selectedConnectionState.connectionId} />
+            : undefined}
+          auditStatus={auditStatus}
+          auditError={auditError}
+          auditRecords={auditRecords}
+          auditHostFilter={auditHostFilter}
+          auditActorFilter={auditActorFilter}
+          auditOperationFilter={auditOperationFilter}
+          onOpenDrawer={() => setDrawerOpen(true)}
+          onBackToProject={handleBackToProject}
+          projectLabel={currentProject?.name ?? '未命名项目'}
+          onCreateHost={handleCreateHost}
+          onEditHost={handleEditHost}
+          onDeleteHost={setPendingDeleteHost}
+          onSectionChange={setActiveSection}
+          onConnect={handleOpenConnect}
+          onDisconnect={() => { void handleDisconnect() }}
+          onToggleAgentAccess={() => { void agentAccessController.toggle() }}
+          onManageTrust={() => setTrustDialogOpen(true)}
+          onRefresh={() => void loadHosts()}
+          onAuditHostFilterChange={setAuditHostFilter}
+          onAuditActorFilterChange={handleAuditActorFilterChange}
+          onAuditOperationFilterChange={setAuditOperationFilter}
+          onRefreshAudit={() => { void auditController.refresh() }}
+        />
+      )
+      : selectedDataSource === null ? null : (
+        <ServerOpsDataConnectionView
+          api={serverOpsDataApi}
+          viewScope={viewScope}
+          paneActive={paneActive}
+          source={selectedDataSource}
+          projectLabel={currentProject?.name ?? '未归属项目'}
+          jumpHost={selectedDataSourceJumpHost === null ? null : {
+            id: selectedDataSourceJumpHost.id,
+            label: selectedDataSourceJumpHost.name,
+            description: `${selectedDataSourceJumpHost.username}@${selectedDataSourceJumpHost.address}:${selectedDataSourceJumpHost.port}`,
+            /**
+             * 直连连接不依赖 SSH：跳板连接状态只对"经由"方式有意义。
+             * 这里不订阅无关状态，避免跳板服务器连接状态刷新带动数据面板上下文反复变化。
+             */
+            connected: selectedDataSource.transport === 'ssh'
+              ? connectionStates[selectedDataSourceJumpHost.id]?.phase === 'connected'
+              : true,
+          }}
+          onOpenDrawer={() => setDrawerOpen(true)}
+          onBackToProject={handleBackToProject}
+          onSourceMutated={handleDataSourceMutated}
+        />
+      )
+
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
-      <ServerOpsWorkspaceView
-        status={status}
-        error={error}
-        hosts={hosts}
-        selectedHost={selectedHost}
-        activeSection={activeSection}
-        connectionState={selectedConnectionState}
-        agentSessionId={currentAgentSessionId}
-        containerLog={containerLog}
-        containerConsole={containerConsole}
-        onContainerLogChange={setContainerLog}
-        onContainerConsoleChange={setContainerConsole}
-        {...agentAccessViewState}
-        terminalContent={selectedHost && selectedConnectionState?.phase === 'connected' && selectedConnectionState.connectionId
-          ? <ServerOpsRemoteTerminal hostId={selectedHost.id} connectionId={selectedConnectionState.connectionId} />
-          : undefined}
-        auditStatus={auditStatus}
-        auditError={auditError}
-        auditRecords={auditRecords}
-        auditHostFilter={auditHostFilter}
-        auditActorFilter={auditActorFilter}
-        auditOperationFilter={auditOperationFilter}
-        onOpenDrawer={() => setDrawerOpen(true)}
-        onCreateHost={handleCreateHost}
-        onEditHost={handleEditHost}
-        onDeleteHost={setPendingDeleteHost}
-        onSectionChange={setActiveSection}
-        onConnect={handleOpenConnect}
-        onDisconnect={() => { void handleDisconnect() }}
-        onToggleAgentAccess={() => { void agentAccessController.toggle() }}
-        onManageTrust={() => setTrustDialogOpen(true)}
-        onRefresh={() => void loadHosts()}
-        onAuditHostFilterChange={setAuditHostFilter}
-        onAuditActorFilterChange={handleAuditActorFilterChange}
-        onAuditOperationFilterChange={setAuditOperationFilter}
-        onRefreshAudit={() => { void auditController.refresh() }}
-      />
-      <ServerOpsHostDrawer
+      {/* 中间区域三选一：项目分组列表、SSH 能力页签、数据连接详情。 */}
+      {connectionPane ?? projectPane}
+      <ServerOpsProjectDrawer
         open={drawerOpen}
-        hosts={hosts}
-        selectedHostId={selectedHost?.id ?? null}
+        projects={projects}
+        selectedProjectId={currentProjectId}
+        summaries={connectionSummaries}
+        status={projectsStatus}
+        error={projectsError}
+        onSelectProject={handleSelectProject}
         onOpenChange={setDrawerOpen}
-        onSelect={(hostId) => {
-          if (hostId === selectedHost?.id) return
-          transferLeave.requestLeave(() => { setContainerConsole(null); setContainerLog(null); setSelectedHostId(hostId) })
-        }}
-        onCreate={handleCreateHost}
-        onEdit={handleEditHost}
-        onDelete={setPendingDeleteHost}
+        onRetry={() => projectController.refresh()}
+        onCreateProject={() => { rememberProjectDialogFocus(); projectController.openCreate() }}
+        onRenameProject={(project) => { rememberProjectDialogFocus(); projectController.openRename(project) }}
+        onDeleteProject={(project) => { rememberProjectDialogFocus(); projectController.requestDelete(project) }}
+        managementOpen={projectManagement.dialog !== null}
+      />
+      <ServerOpsProjectDialog
+        dialog={projectManagement.dialog}
+        onRestoreFocus={restoreProjectDialogFocus}
+        submitting={projectManagement.submitting}
+        error={projectManagement.dialogError}
+        projectCount={projects.length}
+        connectionCount={projectManagement.dialog?.kind === 'delete' ? connectionSummaries[projectManagement.dialog.project.id]?.total ?? 0 : 0}
+        onSubmit={(name) => { void projectController.submit(name) }}
+        onClose={() => projectController.closeDialog()}
+      />
+      <ServerOpsConnectionMoveDialog
+        {...connectionMove}
+        projects={projects}
+        onTargetChange={(projectId) => connectionMoveController.selectTarget(projectId)}
+        onSubmit={() => { void connectionMoveController.submit() }}
+        onClose={() => connectionMoveController.close()}
+        onRestoreFocus={restoreConnectionMoveFocus}
       />
       <ServerOpsHostDialog
         open={dialogOpen}
@@ -1415,6 +2023,24 @@ export function ServerOpsWorkspace(): React.ReactElement {
         saving={saving}
         onOpenChange={setDialogOpen}
         onSubmit={handleSaveHost}
+        onTest={(input) => window.electronAPI.testServerOpsConnection(input)}
+      />
+      {/*
+        项目视图的"添加数据库 / 添加 Redis"入口。
+        数据源弹窗当前只支持一个跳板选项，取打开表单时项目内的第一台服务器。
+      */}
+      <ServerOpsDataSourceDialog
+        open={creatingDataSourceEngine !== null}
+        mode="create"
+        source={null}
+        initialEngine={creatingDataSourceEngine ?? 'mysql'}
+        hostId={projectJumpHost?.hostId ?? ''}
+        hostLabel={projectJumpHost?.label ?? ''}
+        submitting={savingDataSource}
+        error={dataSourceFormError}
+        onTest={(draft) => serverOpsDataApi.probeServerOpsDataSource({ draft })}
+        onSubmit={(input) => { void handleCreateDataSource(input) }}
+        onClose={() => { setCreatingDataSourceEngine(null); setDataSourceFormError(null) }}
       />
       {transferLeave.dialog}
       <ServerOpsConnectDialog

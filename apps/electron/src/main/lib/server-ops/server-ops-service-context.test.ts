@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import type { ServerOpsServiceContext } from './server-ops-service-context'
 import {
   clearServerOpsServiceContext,
@@ -27,6 +28,18 @@ describe('Server Ops 共享服务上下文', () => {
     registerServerOpsServiceContext(context)
 
     expect(getServerOpsServiceContext()).toBe(context)
+  })
+
+  test('Given 共享只读授权 Store When 旧代释放 Then 不撤销新代；最终清理同步失效授权', async () => {
+    const access = new ServerOpsAgentAccessStore()
+    access.grantRead({ sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] }, [{ key: 'ssh:host-1', fingerprint: 'host', hostId: 'host-1' }])
+    const first = registerServerOpsServiceContext({ ...createContext(), access })
+    const second = registerServerOpsServiceContext({ ...createContext(), access })
+    await first.dispose()
+    expect(access.getReadCurrent()).toBeDefined()
+    const closing = second.dispose()
+    expect(access.getReadCurrent()).toBeUndefined()
+    await closing
   })
 
   test('旧注册的 dispose 不会清理新代次复用的连接实例', async () => {

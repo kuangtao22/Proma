@@ -39,6 +39,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { SERVER_OPS_TABLE_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 
 /** 服务面板由当前普通 Agent、主机、可见性和连接事实共同驱动。 */
 export interface ServerOpsServicesPanelProps {
@@ -631,8 +632,8 @@ export function ServerOpsServicesPanelView({
   const pendingActionMeta = pendingAction ? SERVER_OPS_SERVICE_ACTIONS[pendingAction.action] : null
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-server-ops-services-panel>
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2">
+    <div className="flex min-h-0 flex-1 flex-col bg-content-area" data-server-ops-services-panel>
+      <div className={SERVER_OPS_TOOLBAR_CLASS}>
         <div className="relative min-w-40 flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
           <Input
@@ -680,14 +681,14 @@ export function ServerOpsServicesPanelView({
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           <div className="shrink-0 overflow-x-auto">
-            <table className="w-full min-w-[620px] table-fixed text-left text-xs">
+            <table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[620px] table-fixed text-left')}>
               <colgroup><col className="w-[30%]" /><col className="w-[38%]" /><col className="w-[16%]" /><col className="w-[16%]" /></colgroup>
-              <thead className="sticky top-0 z-10 border-b border-border bg-content-area text-[11px] text-muted-foreground">
+              <thead className="sticky top-0 z-10 bg-content-area">
                 <tr><th className="px-3 py-2 font-medium">Unit</th><th className="px-3 py-2 font-medium">描述</th><th className="px-3 py-2 font-medium">状态</th><th className="px-3 py-2 font-medium">开机启动</th></tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody>
                 {filteredServices.map((service) => (
-                  <tr key={service.unitId} className={cn('hover:bg-muted/35', selectedUnitId === service.unitId && 'bg-accent/55')}>
+                  <tr key={service.unitId} className={cn(selectedUnitId === service.unitId && 'bg-muted/55')}>
                     <td className="truncate px-1 py-1 font-mono text-[11px] font-medium">
                       <Button
                         type="button"
@@ -709,11 +710,11 @@ export function ServerOpsServicesPanelView({
             </table>
           </div>
           {filteredServices.length === 0 && (
-            <div className="flex min-h-24 items-center justify-center border-b border-border px-6 text-xs text-muted-foreground">没有匹配当前筛选的服务</div>
+            <div className="flex min-h-24 items-center justify-center border-b border-border/40 px-6 text-xs text-muted-foreground">没有匹配当前筛选的服务</div>
           )}
 
           {selectedService && (
-            <section className="border-t border-border px-3 py-3" aria-label={`${selectedService.unitId} 服务详情`}>
+            <section className="border-t border-border/40 bg-card/30 px-4 py-3" aria-label={`${selectedService.unitId} 服务详情`}>
               <div className="flex flex-wrap items-start gap-2">
                 <div className="min-w-0 flex-1">
                   <h3 className="truncate font-mono text-xs font-medium">{selectedService.unitId}</h3>
@@ -769,11 +770,11 @@ export function ServerOpsServicesPanelView({
                 <div className="mt-3 grid gap-3" data-server-ops-service-detail-grid>
                   <div className="min-w-0">
                     <h4 className="mb-1 text-[11px] font-medium text-muted-foreground">systemctl status</h4>
-                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words bg-muted/30 p-2 font-mono text-[11px] leading-5">{detail.statusLines.join('\n') || '没有状态输出'}</pre>
+                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/30 bg-muted/25 p-2.5 font-mono text-[11px] leading-5">{detail.statusLines.join('\n') || '没有状态输出'}</pre>
                   </div>
                   <div className="min-w-0">
                     <h4 className="mb-1 text-[11px] font-medium text-muted-foreground">近期日志</h4>
-                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words bg-muted/30 p-2 font-mono text-[11px] leading-5">{detail.recentLogLines.join('\n') || '没有近期日志'}</pre>
+                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/30 bg-muted/25 p-2.5 font-mono text-[11px] leading-5">{detail.recentLogLines.join('\n') || '没有近期日志'}</pre>
                   </div>
                 </div>
               ) : null}

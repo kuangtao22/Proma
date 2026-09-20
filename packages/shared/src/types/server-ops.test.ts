@@ -10,6 +10,8 @@ import {
   parseServerOpsLogOutputAck,
   parseServerOpsLogOutputEvent,
   parseServerOpsLogStartInput,
+  parseServerOpsTestConnectionInput,
+  parseServerOpsTestConnectionResult,
   parseServerOpsLogStartResult,
   parseServerOpsOverviewInput,
   parseServerOpsOverviewResult,
@@ -227,6 +229,19 @@ describe('服务器运维共享合同', () => {
     expect(() => parseServerOpsHostInput({ ...baseInput, port: 22, password: 'secret' })).toThrow('SERVER_OPS_HOST_INPUT_INVALID')
   })
 
+  test('Given 主机保存输入 When 指定或省略项目 Then 都保持兼容', () => {
+    /** 不带项目的旧版保存请求。 */
+    const legacy = {
+      host: { name: '生产 API', address: '10.0.0.8', port: 22, username: 'deploy', authMethod: 'ssh-agent', tags: [] },
+      credentialUpdate: { action: 'clear' },
+    } as const
+    expect(parseServerOpsSaveHostInput(legacy).host.projectId).toBeUndefined()
+    expect(parseServerOpsSaveHostInput({ ...legacy, host: { ...legacy.host, projectId: 'project-2' } }).host.projectId)
+      .toBe('project-2')
+    expect(() => parseServerOpsSaveHostInput({ ...legacy, host: { ...legacy.host, projectId: 'project 2' } }))
+      .toThrow('SERVER_OPS_PROJECT_ID_INVALID')
+  })
+
   test('主机列表校验要求完整持久化字段且不允许凭据', () => {
     const host = {
       id: 'host-1',
@@ -251,6 +266,7 @@ describe('服务器运维共享合同', () => {
       UPSERT_HOST: 'server-ops:upsert-host',
       DELETE_HOST: 'server-ops:delete-host',
       CONNECT: 'server-ops:connect',
+      TEST_CONNECTION: 'server-ops:test-connection',
       CONFIRM_HOST_KEY: 'server-ops:confirm-host-key',
       DISCONNECT: 'server-ops:disconnect',
       WRITE_TERMINAL: 'server-ops:write-terminal',
@@ -519,5 +535,138 @@ describe('服务器运维共享合同', () => {
     expect(isServerOpsAuditRecord({ ...record, resourceId: '/secret/path' })).toBe(false)
     expect(isServerOpsAuditRecord({ ...record, content: 'secret' })).toBe(false)
     expect(isServerOpsAuditRecord({ ...record, actor: 'agent', windowId: undefined, sessionId: 'session-1' })).toBe(true)
+  })
+
+  test('Given Agent 读取服务器或数据源 When 校验审计 Then 资源身份必须严格二选一', () => {
+    /** 服务器只读诊断只绑定已授权主机。 */
+    const serverRead = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, sessionId: 'session-1', hostId: 'host-1',
+      actor: 'agent', operation: 'agent-read', resourceType: 'ops-resource', readAction: 'server-overview',
+      phase: 'result', outcome: 'success', durationMs: 20,
+    } as const
+    /** 数据读取只绑定已保存数据源，不伪造 hostId。 */
+    const dataRead = {
+      id: 'audit-2', operationId: 'operation-2', timestamp: 2, sessionId: 'session-1', sourceId: 'source-1',
+      actor: 'agent', operation: 'agent-read', resourceType: 'ops-resource', readAction: 'schema-list',
+      database: 'app_db', scope: 'database', phase: 'start', outcome: 'pending',
+    } as const
+
+    expect(isServerOpsAuditRecord(serverRead)).toBe(true)
+    expect(isServerOpsAuditRecord(dataRead)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...serverRead, operationId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, operationId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...serverRead, actor: 'user', windowId: 7, sessionId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, hostId: 'host-1' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, sourceId: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, resourceType: undefined })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'sql-query' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, scope: 'cluster' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, rows: [['secret']] })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, sql: 'select secret from users' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, password: 'secret' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, errorMessage: 'raw remote error' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...serverRead, operation: 'connect', hostId: undefined })).toBe(false)
+  })
+
+  test('Given Agent 数据读取的库表范围 When 校验审计 Then 仅接受有界无控制字符名称', () => {
+    /** 带明确库表范围的合法行读取审计。 */
+    const record = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, sessionId: 'session-1', sourceId: 'source-1', actor: 'agent',
+      operation: 'agent-read', resourceType: 'ops-resource', readAction: 'rows-read',
+      database: 'app_db', table: 'users', scope: 'database', phase: 'result', outcome: 'success',
+    } as const
+
+    expect(isServerOpsAuditRecord(record)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...record, database: 'x'.repeat(64), table: 'y'.repeat(128) })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...record, database: '' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, database: 'x'.repeat(65) })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, table: 'y'.repeat(129) })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, table: 'users\nsecret' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, table: undefined })).toBe(false)
+  })
+
+  test('Given Agent 读取动作 When 校验范围元数据 Then 每类动作仅接受对应层级', () => {
+    /** 数据源读取审计的公共字段，用于逐项证明动作与范围的精确合同。 */
+    const dataRead = {
+      id: 'audit-1', operationId: 'operation-1', timestamp: 1, sessionId: 'session-1', sourceId: 'source-1', actor: 'agent',
+      operation: 'agent-read', resourceType: 'ops-resource', phase: 'result', outcome: 'success',
+    } as const
+
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-probe' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-probe', scope: 'instance' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-probe', database: 'app_db' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-probe', table: 'users' })).toBe(false)
+
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose', scope: 'instance' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose', scope: 'instance', database: 'app_db' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose', scope: 'database', database: 'app_db' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose', scope: 'database' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'data-diagnose', scope: 'database', database: 'app_db', table: 'users' })).toBe(false)
+
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'schema-list', scope: 'database', database: 'app_db' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'schema-list', database: 'app_db' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'schema-list', scope: 'database' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...dataRead, readAction: 'schema-list', scope: 'database', database: 'app_db', table: 'users' })).toBe(false)
+
+    /** 表级读取动作都必须同时记录库名和表名。 */
+    for (const readAction of ['schema-describe', 'rows-read'] as const) {
+      expect(isServerOpsAuditRecord({ ...dataRead, readAction, scope: 'database', database: 'app_db', table: 'users' })).toBe(true)
+      expect(isServerOpsAuditRecord({ ...dataRead, readAction, scope: 'database', database: 'app_db' })).toBe(false)
+      expect(isServerOpsAuditRecord({ ...dataRead, readAction, scope: 'database', table: 'users' })).toBe(false)
+      expect(isServerOpsAuditRecord({ ...dataRead, readAction, scope: 'instance', database: 'app_db', table: 'users' })).toBe(false)
+    }
+
+    /** 服务器读取动作只允许绑定主机，不接受任何数据源范围字段。 */
+    for (const readAction of ['server-overview', 'server-services'] as const) {
+      /** 当前服务器动作的最小合法审计记录。 */
+      const serverRead = { ...dataRead, sourceId: undefined, hostId: 'host-1', readAction }
+      expect(isServerOpsAuditRecord(serverRead)).toBe(true)
+      expect(isServerOpsAuditRecord({ ...serverRead, scope: 'instance' })).toBe(false)
+      expect(isServerOpsAuditRecord({ ...serverRead, database: 'app_db' })).toBe(false)
+      expect(isServerOpsAuditRecord({ ...serverRead, table: 'users' })).toBe(false)
+    }
+  })
+
+  test('Given 审计列表按数据源筛选 When 解析 Then 接受合法 sourceId 且拒绝未知字段', () => {
+    expect(parseServerOpsAuditListInput({ sourceId: 'source-1', actor: 'agent', operation: 'agent-read', limit: 20 }))
+      .toEqual({ sourceId: 'source-1', actor: 'agent', operation: 'agent-read', limit: 20 })
+    expect(() => parseServerOpsAuditListInput({ sourceId: 'source 1' })).toThrow('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
+    expect(() => parseServerOpsAuditListInput({ sourceId: 'source-1', database: 'app' })).toThrow('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
+  })
+
+  test('Given 连接测试输入 When 凭据来源不唯一或字段越界 Then fail closed', () => {
+    /** 使用内联密码的合法测试输入。 */
+    const inlineCredential = {
+      address: '127.0.0.1', port: 22, username: 'deploy',
+      credential: { kind: 'password' as const, password: 'p@ss', remember: false },
+    }
+    expect(parseServerOpsTestConnectionInput(inlineCredential)).toEqual(inlineCredential)
+    /** 复用已保存凭据时只允许带 hostId。 */
+    expect(parseServerOpsTestConnectionInput({ address: '127.0.0.1', port: 22, username: 'deploy', hostId: 'host-1' }))
+      .toEqual({ address: '127.0.0.1', port: 22, username: 'deploy', hostId: 'host-1' })
+    /** 两者同时出现或都不出现都无法确定测试来源。 */
+    expect(() => parseServerOpsTestConnectionInput({ ...inlineCredential, hostId: 'host-1' })).toThrow('SERVER_OPS_TEST_CONNECTION_INPUT_INVALID')
+    expect(() => parseServerOpsTestConnectionInput({ address: '127.0.0.1', port: 22, username: 'deploy' })).toThrow('SERVER_OPS_TEST_CONNECTION_INPUT_INVALID')
+    expect(() => parseServerOpsTestConnectionInput({ ...inlineCredential, port: 0 })).toThrow('SERVER_OPS_TEST_CONNECTION_INPUT_INVALID')
+    expect(() => parseServerOpsTestConnectionInput({ ...inlineCredential, username: 'deploy user' })).toThrow('SERVER_OPS_TEST_CONNECTION_INPUT_INVALID')
+    expect(() => parseServerOpsTestConnectionInput({ ...inlineCredential, secret: 'x' })).toThrow('SERVER_OPS_TEST_CONNECTION_INPUT_INVALID')
+  })
+
+  test('Given 连接测试结果 When 结论或指纹非法 Then 拒绝', () => {
+    /** 已观测指纹的合法结果。 */
+    const result = {
+      status: 'host-key-untrusted' as const, message: '首次连接：请核对指纹后再确认',
+      hostKey: { algorithm: 'ssh-ed25519', fingerprint: `SHA256:${'A'.repeat(43)}` }, latencyMs: 12,
+    }
+    expect(parseServerOpsTestConnectionResult(result)).toEqual(result)
+    expect(parseServerOpsTestConnectionResult({ status: 'auth-failed', message: 'SSH 认证失败，请检查登录信息' }).hostKey).toBeUndefined()
+    expect(() => parseServerOpsTestConnectionResult({ status: 'ok', message: '成功' })).toThrow('SERVER_OPS_TEST_CONNECTION_RESULT_INVALID')
+    expect(() => parseServerOpsTestConnectionResult({ ...result, hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'md5:aa' } }))
+      .toThrow('SERVER_OPS_TEST_CONNECTION_RESULT_INVALID')
+    expect(() => parseServerOpsTestConnectionResult({ ...result, hostKey: { algorithm: 'ssh ed25519', fingerprint: `SHA256:${'A'.repeat(43)}` } }))
+      .toThrow('SERVER_OPS_TEST_CONNECTION_RESULT_INVALID')
+    expect(() => parseServerOpsTestConnectionResult({ ...result, latencyMs: -1 })).toThrow('SERVER_OPS_TEST_CONNECTION_RESULT_INVALID')
+    expect(() => parseServerOpsTestConnectionResult({ ...result, extra: true })).toThrow('SERVER_OPS_TEST_CONNECTION_RESULT_INVALID')
   })
 })

@@ -263,7 +263,7 @@ export function ServerOpsTrustDialogView({
   return (
     <div className="grid min-w-0 gap-4" data-server-ops-trust-layout="responsive">
       {(error || warning) && (
-        <div className="flex items-start gap-2 border-y border-border py-2 text-xs" role="alert">
+        <div className="flex items-start gap-2 rounded-lg bg-destructive/5 px-3 py-2 text-xs" role="alert">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" aria-hidden="true" />
           <span className="min-w-0 flex-1 break-words">{error ?? warning}</span>
           <Button type="button" variant="ghost" size="icon-sm" aria-label="刷新服务器信任" disabled={loading} onClick={onRefresh}>
@@ -277,11 +277,11 @@ export function ServerOpsTrustDialogView({
         </div>
       ) : (
         <>
-          <div className="min-w-0 border-y border-border py-3">
+          <div className="min-w-0 rounded-lg bg-muted/35 px-3 py-2.5">
             <div className="text-xs font-medium">{snapshot.name}</div>
             <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{snapshot.address}:{snapshot.port}</div>
           </div>
-          <div className="grid min-w-0 grid-cols-1 divide-y divide-border sm:grid-cols-2 sm:divide-x sm:divide-y-0">
+          <div className="grid min-w-0 grid-cols-1 divide-y divide-border/40 sm:grid-cols-2 sm:divide-x sm:divide-y-0">
             <ServerOpsTrustKey label="已信任指纹" value={snapshot.trustedKey} />
             <div className="sm:pl-4"><ServerOpsTrustKey label="新观测指纹" value={snapshot.observedKey} dangerous={Boolean(snapshot.observedKey)} /></div>
           </div>
@@ -292,7 +292,7 @@ export function ServerOpsTrustDialogView({
             </div>
           </div>
           {candidate ? (
-            <div className="grid gap-3 border-t border-border pt-4">
+            <div className="grid gap-3 border-t border-border/40 pt-4">
               <div className="text-xs leading-5">
                 {candidate.action === 'replace' ? '替换指纹' : '撤销信任'}会断开同 endpoint 的连接并撤销其 Agent 权限。提交后不会自动连接。
               </div>
@@ -322,7 +322,7 @@ export function ServerOpsTrustDialogView({
               </DialogFooter>
             </div>
           ) : (
-            <div className="flex flex-col gap-2 border-t border-border pt-4 sm:flex-row sm:justify-end">
+            <div className="flex flex-col gap-2 border-t border-border/40 pt-4 sm:flex-row sm:justify-end">
               <Button type="button" variant="outline" data-trust-action="replace" disabled={loading || !canReplace} onClick={() => onPrepare('replace')}>
                 <Fingerprint className="size-3.5" aria-hidden="true" />替换为新指纹
               </Button>

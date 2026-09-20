@@ -41,6 +41,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { SERVER_OPS_SEGMENTED_CLASS, SERVER_OPS_TABLE_CLASS, SERVER_OPS_TAB_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 
 /** Docker 面板的四个只读资源页签。 */
 export type ServerOpsDockerTab = 'containers' | 'images' | 'networks' | 'volumes'
@@ -511,14 +512,14 @@ function ContainersView({
   return (
     <div className="min-h-0 overflow-y-auto">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[620px] table-fixed text-left text-xs">
+        <table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[620px] table-fixed text-left')}>
           <colgroup><col className="w-[24%]" /><col className="w-[31%]" /><col className="w-[16%]" /><col className="w-[29%]" /></colgroup>
-          <thead className="sticky top-0 z-10 border-b border-border bg-content-area text-[11px] text-muted-foreground">
+          <thead className="sticky top-0 z-10 bg-content-area">
             <tr><th className="px-3 py-2 font-medium">容器</th><th className="px-3 py-2 font-medium">镜像</th><th className="px-3 py-2 font-medium">状态</th><th className="px-3 py-2 font-medium">端口</th></tr>
           </thead>
-          <tbody className="divide-y divide-border">
+          <tbody>
             {containers.map((container) => (
-              <tr key={container.containerId} className={cn('hover:bg-muted/35', selected?.containerId === container.containerId && 'bg-accent/55')}>
+              <tr key={container.containerId} className={cn(selected?.containerId === container.containerId && 'bg-muted/55')}>
                 <td className="px-1 py-1">
                   <Button type="button" variant="ghost" className="h-8 max-w-full justify-start px-2" aria-label={`查看容器 ${container.names[0]} 详情`}
                     aria-pressed={selected?.containerId === container.containerId} onClick={() => onSelectContainer(container.containerId)}>
@@ -534,7 +535,7 @@ function ContainersView({
         </table>
       </div>
       {selected && (
-        <section className="border-t border-border px-3 py-3" aria-label={`${selected.names[0]} 容器详情`}>
+        <section className="border-t border-border/40 bg-card/30 px-4 py-3" aria-label={`${selected.names[0]} 容器详情`}>
           <div className="flex min-w-0 flex-wrap items-start gap-2">
             <div className="min-w-0 flex-1"><h3 className="truncate text-xs font-medium">{selected.names[0]}</h3><p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">{selected.containerId}</p></div>
             {onOpenContainerLogs && (
@@ -598,19 +599,19 @@ function EmptyResource({ label }: { label: string }): React.ReactElement {
 /** 镜像只读列表。 */
 function ImagesView({ resources }: { resources: ServerOpsDockerResourcesResult }): React.ReactElement {
   if (resources.images.length === 0) return <EmptyResource label="镜像" />
-  return <div className="min-h-0 overflow-auto"><table className="w-full min-w-[620px] text-left text-xs"><thead className="sticky top-0 border-b border-border bg-content-area text-[11px] text-muted-foreground"><tr><th className="px-3 py-2 font-medium">仓库</th><th className="px-3 py-2 font-medium">标签</th><th className="px-3 py-2 font-medium">大小</th><th className="px-3 py-2 font-medium">镜像 ID</th></tr></thead><tbody className="divide-y divide-border">{resources.images.map((image) => <tr key={image.imageId}><td className="px-3 py-2">{image.repository}</td><td className="px-3 py-2 font-mono">{image.tag}</td><td className="px-3 py-2">{image.size}</td><td className="px-3 py-2 font-mono text-[11px] text-muted-foreground">{compactIdentity(image.imageId)}</td></tr>)}</tbody></table></div>
+  return <div className="min-h-0 overflow-auto"><table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[620px] text-left')}><thead className="sticky top-0 bg-content-area"><tr><th>仓库</th><th>标签</th><th>大小</th><th>镜像 ID</th></tr></thead><tbody>{resources.images.map((image) => <tr key={image.imageId}><td>{image.repository}</td><td className="font-mono">{image.tag}</td><td>{image.size}</td><td className="font-mono text-[11px] text-muted-foreground">{compactIdentity(image.imageId)}</td></tr>)}</tbody></table></div>
 }
 
 /** 网络只读列表。 */
 function NetworksView({ resources }: { resources: ServerOpsDockerResourcesResult }): React.ReactElement {
   if (resources.networks.length === 0) return <EmptyResource label="网络" />
-  return <div className="min-h-0 overflow-auto"><table className="w-full min-w-[520px] text-left text-xs"><thead className="sticky top-0 border-b border-border bg-content-area text-[11px] text-muted-foreground"><tr><th className="px-3 py-2 font-medium">网络</th><th className="px-3 py-2 font-medium">驱动</th><th className="px-3 py-2 font-medium">范围</th><th className="px-3 py-2 font-medium">内部</th></tr></thead><tbody className="divide-y divide-border">{resources.networks.map((network) => <tr key={network.networkId}><td className="px-3 py-2 font-medium">{network.name}</td><td className="px-3 py-2 font-mono">{network.driver}</td><td className="px-3 py-2">{network.scope}</td><td className="px-3 py-2">{network.internal ? '是' : '否'}</td></tr>)}</tbody></table></div>
+  return <div className="min-h-0 overflow-auto"><table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[520px] text-left')}><thead className="sticky top-0 bg-content-area"><tr><th>网络</th><th>驱动</th><th>范围</th><th>内部</th></tr></thead><tbody>{resources.networks.map((network) => <tr key={network.networkId}><td className="font-medium">{network.name}</td><td className="font-mono">{network.driver}</td><td>{network.scope}</td><td>{network.internal ? '是' : '否'}</td></tr>)}</tbody></table></div>
 }
 
 /** 卷只读列表。 */
 function VolumesView({ resources }: { resources: ServerOpsDockerResourcesResult }): React.ReactElement {
   if (resources.volumes.length === 0) return <EmptyResource label="卷" />
-  return <div className="min-h-0 overflow-auto"><table className="w-full min-w-[440px] text-left text-xs"><thead className="sticky top-0 border-b border-border bg-content-area text-[11px] text-muted-foreground"><tr><th className="px-3 py-2 font-medium">卷</th><th className="px-3 py-2 font-medium">驱动</th><th className="px-3 py-2 font-medium">范围</th></tr></thead><tbody className="divide-y divide-border">{resources.volumes.map((volume) => <tr key={volume.name}><td className="px-3 py-2 font-medium">{volume.name}</td><td className="px-3 py-2 font-mono">{volume.driver}</td><td className="px-3 py-2">{volume.scope}</td></tr>)}</tbody></table></div>
+  return <div className="min-h-0 overflow-auto"><table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[440px] text-left')}><thead className="sticky top-0 bg-content-area"><tr><th>卷</th><th>驱动</th><th>范围</th></tr></thead><tbody>{resources.volumes.map((volume) => <tr key={volume.name}><td className="font-medium">{volume.name}</td><td className="font-mono">{volume.driver}</td><td>{volume.scope}</td></tr>)}</tbody></table></div>
 }
 
 /** Docker 四类资源、白名单详情和逐次确认的纯展示层。 */
@@ -636,15 +637,15 @@ export function ServerOpsDockerPanelView({
   /** 当前候选动作的显示元数据。 */
   const candidateMeta = projection.candidate ? DOCKER_ACTION_META[projection.candidate.action] : null
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-server-ops-docker-panel>
+    <div className="flex min-h-0 flex-1 flex-col bg-content-area" style={{ containerType: 'inline-size' }} data-server-ops-docker-panel>
       <style>{'@container (min-width: 700px) { [data-server-ops-docker-detail-grid="true"] { grid-template-columns: repeat(2, minmax(0, 1fr)); } }'}</style>
       <Tabs value={activeTab} onValueChange={(value) => onTabChange(value as ServerOpsDockerTab)} className="flex min-h-0 flex-1 flex-col">
-        <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
-          <TabsList className="h-8 min-w-0 flex-1 justify-start overflow-x-auto rounded-md p-0.5">
-            <TabsTrigger className="h-7 gap-1.5 px-2 text-xs" value="containers"><Box className="size-3.5" />容器 {resources?.containers.length ?? 0}</TabsTrigger>
-            <TabsTrigger className="h-7 gap-1.5 px-2 text-xs" value="images"><Image className="size-3.5" />镜像 {resources?.images.length ?? 0}</TabsTrigger>
-            <TabsTrigger className="h-7 gap-1.5 px-2 text-xs" value="networks"><Network className="size-3.5" />网络 {resources?.networks.length ?? 0}</TabsTrigger>
-            <TabsTrigger className="h-7 gap-1.5 px-2 text-xs" value="volumes"><HardDrive className="size-3.5" />卷 {resources?.volumes.length ?? 0}</TabsTrigger>
+        <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'flex-nowrap')}>
+          <TabsList className={cn(SERVER_OPS_SEGMENTED_CLASS, 'min-w-0 flex-1 justify-start')}>
+            <TabsTrigger className={SERVER_OPS_TAB_CLASS} value="containers"><Box className="size-3.5" />容器 {resources?.containers.length ?? 0}</TabsTrigger>
+            <TabsTrigger className={SERVER_OPS_TAB_CLASS} value="images"><Image className="size-3.5" />镜像 {resources?.images.length ?? 0}</TabsTrigger>
+            <TabsTrigger className={SERVER_OPS_TAB_CLASS} value="networks"><Network className="size-3.5" />网络 {resources?.networks.length ?? 0}</TabsTrigger>
+            <TabsTrigger className={SERVER_OPS_TAB_CLASS} value="volumes"><HardDrive className="size-3.5" />卷 {resources?.volumes.length ?? 0}</TabsTrigger>
           </TabsList>
           <Button type="button" variant="ghost" size="icon-sm" aria-label="刷新 Docker 资源" disabled={!connected || projection.committing} onClick={onRefresh}>
             <RefreshCw className={cn('size-3.5', projection.status === 'loading' && 'animate-spin')} aria-hidden="true" />

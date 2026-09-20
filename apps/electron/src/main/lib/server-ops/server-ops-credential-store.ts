@@ -105,6 +105,8 @@ export class ServerOpsCredentialStore {
   private readonly dependencies: ServerOpsCredentialStoreDependencies
   /** 覆盖同目录协作写入的同步短事务。 */
   private readonly transaction: ServerOpsConfigTransaction
+  /** 调用方是否注入了真实 safeStorage；未注入属于接线错误，必须与系统不支持区分开。 */
+  private readonly safeStorageInjected: boolean
   /** 本次应用生命周期内按主机保存的短期凭据。 */
   private readonly volatileByHost = new Map<string, ServerOpsResolvedCredential>()
 
@@ -120,6 +122,7 @@ export class ServerOpsCredentialStore {
       encryptString: () => { throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE') },
       decryptString: () => { throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE') },
     }
+    this.safeStorageInjected = dependencies.safeStorage !== undefined
     this.dependencies = {
       platform: process.platform,
       safeStorage: unavailableSafeStorage,
@@ -220,7 +223,9 @@ export class ServerOpsCredentialStore {
 
   /** Linux 明文 backend 和不可用状态一律拒绝落盘或解密。 */
   private assertSecureStorage(): void {
-    if (!this.dependencies.safeStorage.isEncryptionAvailable()) throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE')
+    if (!this.dependencies.safeStorage.isEncryptionAvailable()) {
+      throw new Error(this.safeStorageInjected ? 'SERVER_OPS_SECURE_STORAGE_UNAVAILABLE' : 'SERVER_OPS_SAFE_STORAGE_NOT_INJECTED')
+    }
     if (this.dependencies.platform === 'linux' && this.dependencies.safeStorage.getSelectedStorageBackend() === 'basic_text') {
       throw new Error('SERVER_OPS_SECURE_STORAGE_UNAVAILABLE')
     }

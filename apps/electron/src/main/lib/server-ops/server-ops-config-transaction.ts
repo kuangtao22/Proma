@@ -8,6 +8,10 @@ export type ServerOpsConfigFileName =
   | 'credentials.json'
   | 'known-hosts.json'
   | 'audit.json'
+  | 'data-sources.json'
+  | 'data-source-credentials.json'
+  | 'query-history.json'
+  | 'projects.json'
 
 /** 配置事务向上层暴露的稳定错误码。 */
 export type ServerOpsConfigTransactionErrorCode =
@@ -97,6 +101,13 @@ const CONFIG_FILES: ReadonlySet<string> = new Set<ServerOpsConfigFileName>([
   'credentials.json',
   'known-hosts.json',
   'audit.json',
+  // 数据服务元数据与数据库密码密文同样参与同目录跨进程互斥写入。
+  'data-sources.json',
+  'data-source-credentials.json',
+  // SQL 查询历史与数据源元数据共用锁，防止多窗口或多实例 fresh-read 后相互覆盖。
+  'query-history.json',
+  // 运维项目是主机与数据源的归属边界，必须与它们共用同一把跨进程写锁。
+  'projects.json',
 ])
 
 /** 当前 JS isolate 内唯一的外层事务；同步调用不会在中途交出事件循环。 */

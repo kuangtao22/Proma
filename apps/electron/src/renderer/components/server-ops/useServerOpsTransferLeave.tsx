@@ -2,7 +2,13 @@ import * as React from 'react'
 import { toast } from 'sonner'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 
-/** 切换主机、关闭运维标签和收起工作区共用传输退出确认。 */
+/**
+ * 切换主机、关闭运维标签和收起工作区共用传输退出确认。
+ *
+ * `scopeKey` 变化会立即作废挂起中的确认（保护"切换目标后不再导航到陈旧目标"）。
+ * 因此调用方必须在 `requestLeave` 的回调里提交导航，不能在调用之前提前改动任何会
+ * 影响 `scopeKey` 的状态，否则确认会被自己的中间渲染悄悄取消。
+ */
 export function useServerOpsTransferLeave(scopeKey: string | null): { requestLeave(action: () => void): void; dialog: React.ReactNode } {
   const [count, setCount] = React.useState(0)
   const [closing, setClosing] = React.useState(false)

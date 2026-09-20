@@ -161,6 +161,92 @@ function createDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void
 }
 
 describe('服务器运维连接 Service', () => {
+  test('Given 已信任主机 When 用草稿测试连接 Then 复用握手路径并立即断开', async () => {
+    /** 已固定的服务器身份。 */
+    const key = { algorithm: 'ssh-ed25519', fingerprint: `SHA256:${'A'.repeat(43)}` }
+    const host = createHost({ authMethod: 'ssh-agent' })
+    const fixture = createDependencies([{ status: 'connected', hostKey: key }], host, key)
+    try {
+      const result = await fixture.service.testConnection({
+        address: '10.0.0.8', port: 22, username: 'deploy', credential: { kind: 'ssh-agent' },
+      })
+      expect(result.status).toBe('reachable')
+      expect(result.hostKey).toEqual(key)
+      expect(result.latencyMs).toBeGreaterThanOrEqual(0)
+      /** 测试使用独立临时 hostId，并带上当前信任值作为唯一预期身份。 */
+      expect(fixture.connects[0]!.hostId).toBe('server-ops-connection-test')
+      expect(fixture.connects[0]!.expectedHostKey).toEqual(key)
+      expect(fixture.connects[0]!.address).toBe('10.0.0.8')
+      /** 测试结束必须立刻释放握手占用，且不得改变真实主机的连接状态。 */
+      expect(fixture.disconnects).toHaveLength(1)
+      expect(fixture.service.getState(host.id).phase).toBe('disconnected')
+    } finally { fixture.service.dispose() }
+  })
+
+  test('Given 未信任主机 When 用草稿测试连接 Then 只报告首次指纹且不写入信任', async () => {
+    /** 首次观测到的服务器身份。 */
+    const observed = { algorithm: 'ssh-ed25519', fingerprint: `SHA256:${'B'.repeat(43)}` }
+    const host = createHost({ authMethod: 'ssh-agent' })
+    const fixture = createDependencies([{ status: 'host-key-rejected', observedHostKey: observed }], host, undefined)
+    try {
+      const result = await fixture.service.testConnection({
+        address: host.address, port: host.port, username: host.username, credential: { kind: 'ssh-agent' },
+      })
+      expect(result.status).toBe('host-key-untrusted')
+      expect(result.hostKey).toEqual(observed)
+      /** 测试只是观测，不能因为一次握手就把服务器标记为可信。 */
+      expect(fixture.getTrustedKey()).toBeUndefined()
+    } finally { fixture.service.dispose() }
+  })
+
+  test('Given 指纹与已信任记录不一致 When 测试连接 Then 报告阻断且保留旧身份', async () => {
+    /** 已固定的旧身份。 */
+    const trusted = { algorithm: 'ssh-ed25519', fingerprint: `SHA256:${'C'.repeat(43)}` }
+    /** 服务器实际返回的新身份。 */
+    const observed = { algorithm: 'ssh-ed25519', fingerprint: `SHA256:${'D'.repeat(43)}` }
+    const host = createHost({ authMethod: 'ssh-agent' })
+    const fixture = createDependencies([{ status: 'host-key-rejected', observedHostKey: observed }], host, trusted)
+    try {
+      const result = await fixture.service.testConnection({
+        address: host.address, port: host.port, username: host.username, credential: { kind: 'ssh-agent' },
+      })
+      expect(result.status).toBe('host-key-mismatch')
+      expect(result.hostKey).toEqual(observed)
+      expect(fixture.getTrustedKey()).toEqual(trusted)
+    } finally { fixture.service.dispose() }
+  })
+
+  test('Given 认证失败 When 测试连接 Then 返回分类结论且不泄露底层原因', async () => {
+    /** runtime 抛出的稳定认证错误。 */
+    const authError = Object.assign(new Error('SSH 认证失败，请检查登录信息'), { name: 'ServerOpsRuntimeError', code: 'SERVER_OPS_AUTH_FAILED' })
+    const host = createHost({ authMethod: 'password' })
+    const fixture = createDependencies([Promise.reject(authError)], host, undefined)
+    try {
+      const result = await fixture.service.testConnection({
+        address: host.address, port: host.port, username: host.username,
+        credential: { kind: 'password', password: 'wrong', remember: false },
+      })
+      expect(result.status).toBe('auth-failed')
+      expect(result.message).toBe('SSH 认证失败，请检查登录信息')
+      expect(result.message).not.toContain('wrong')
+      expect(fixture.disconnects).toHaveLength(1)
+    } finally { fixture.service.dispose() }
+  })
+
+  test('Given 无法复用已保存凭据 When 测试连接 Then 直接给出结论且不发起握手', async () => {
+    const host = createHost({ authMethod: 'ssh-agent' })
+    const fixture = createDependencies([], host, undefined)
+    try {
+      /** 目标主机不存在时不允许复用凭据，也不能悄悄改用匿名连接。 */
+      const result = await fixture.service.testConnection({
+        address: host.address, port: host.port, username: host.username, hostId: 'missing-host',
+      })
+      expect(result.status).toBe('failed')
+      expect(result.message).toBe('请输入当前服务器的登录凭据')
+      expect(fixture.connects).toEqual([])
+    } finally { fixture.service.dispose() }
+  })
+
   test('Given 旧地址观测到变化密钥 When 主机改到新 endpoint Then 不把旧观测作为新地址的替换候选', async () => {
     const oldKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:old' }
     const newKey = { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:new' }

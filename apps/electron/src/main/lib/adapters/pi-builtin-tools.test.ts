@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { ServerOpsAgentFacade } from '../server-ops/server-ops-agent-facade'
+import type { ServerOpsAgentReadFacade } from '../server-ops/server-ops-agent-read-facade'
 
 type PiBuiltinToolsModule = typeof import('./pi-builtin-tools')
 let buildServerOpsTools: PiBuiltinToolsModule['buildServerOpsTools']
@@ -102,11 +103,15 @@ describe('Pi Server Ops 工具合同', () => {
       channelId: 'channel-1',
       triggeredBy,
       serverOpsFacade: {} as ServerOpsAgentFacade,
+      serverOpsReadFacade: {} as ServerOpsAgentReadFacade,
       productivityTools: { todosEnabled: false, calendarEnabled: false, obsidianEnabled: false },
     })
     const registeredNames = result.tools.map((tool) => tool.name)
     expect(registeredNames.includes('server_list')).toBe(expected)
     expect(registeredNames.includes('server_exec')).toBe(expected)
+    expect(registeredNames.includes('ops_resources')).toBe(expected)
+    expect(registeredNames.includes('ops_database_rows')).toBe(expected)
+    expect(registeredNames.includes('ops_database_query')).toBe(expected)
   })
 })
 

@@ -8,6 +8,7 @@ import {
   sanitizeServerOpsAuditCommand,
 } from './server-ops-audit-store'
 import type { ServerOpsAuditStoreDependencies } from './server-ops-audit-store'
+import type { ServerOpsAuditRecord } from '@proma/shared'
 
 interface Deferred<T> {
   promise: Promise<T>
@@ -34,6 +35,26 @@ function createConfigDir(): string {
 }
 
 describe('Server Ops Agent 审计 Store', () => {
+  test('Given v4 读取审计 When 添加 SQL 查询 Then 升级 v5 并保留旧记录和独立表集合', async () => {
+    /** 使用隔离目录保存真实旧版合同，验证迁移不会忽略旧数据。 */
+    const configDir = createConfigDir()
+    const directory = join(configDir, 'server-ops')
+    mkdirSync(directory, { recursive: true })
+    const filePath = join(directory, 'audit.json')
+    const old: ServerOpsAuditRecord = { id: 'old-1', timestamp: 1, operationId: 'read-1', sessionId: 'session-1', actor: 'agent', sourceId: 'db-1',
+      operation: 'agent-read', resourceType: 'ops-resource', readAction: 'data-probe', phase: 'result', outcome: 'success' }
+    writeFileSync(filePath, JSON.stringify({ version: 4, records: [old] }))
+    const store = new ServerOpsAuditStore(configDir, { requirePreparedSchema: true })
+    await store.prepareForWrites(async () => () => {})
+    const input = { actor: 'user' as const, windowId: 7, operationId: 'query-1', sourceId: 'db-1',
+      operation: 'data-query' as const, resourceType: 'data-query' as const, database: 'app', tables: ['users'],
+      queryHash: `sha256:${'a'.repeat(64)}`, phase: 'start' as const, outcome: 'pending' as const }
+    const appended = store.append(input)
+    appended.tables!.push('other')
+    expect(store.list().records[0]).toEqual(old)
+    expect(store.list().records[1]!.tables).toEqual(['users'])
+    expect(JSON.parse(readFileSync(filePath, 'utf8')).version).toBe(5)
+  })
   test('Given 命令包含多种秘密 When 脱敏 Then 先全量脱敏再截断到 512 字符', () => {
     const command = `${'x'.repeat(500)} --token secret-after-boundary password=hunter2 https://example.test?a=1&api_key=url-secret Authorization: Bearer bearer-secret`
     const sanitized = sanitizeServerOpsAuditCommand(command)
@@ -274,16 +295,16 @@ describe('Server Ops Agent 审计 Store', () => {
     expect(records[0]?.id).toBe('initial-2')
     records[0]!.command = 'mutated'
     expect(store.list({ limit: 5_000 }).records[0]?.command).not.toBe('mutated')
-    expect(JSON.parse(readFileSync(join(directory, 'audit.json'), 'utf8'))).toMatchObject({ version: 3 })
+    expect(JSON.parse(readFileSync(join(directory, 'audit.json'), 'utf8'))).toMatchObject({ version: 5 })
   })
 
-  test('Given 默认写入依赖 When 追加记录 Then 使用版本 3 原子 JSON 文件', () => {
+  test('Given 默认写入依赖 When 追加记录 Then 使用版本 5 原子 JSON 文件', () => {
     const configDir = createConfigDir()
     const store = new ServerOpsAuditStore(configDir, { uuid: () => 'audit-1', now: () => 1 })
 
     store.append({ actor: 'agent', sessionId: 'session-1', hostId: 'host-1', operation: 'connect', phase: 'start', outcome: 'success' })
 
-    expect(JSON.parse(readFileSync(join(configDir, 'server-ops', 'audit.json'), 'utf8'))).toMatchObject({ version: 3 })
+    expect(JSON.parse(readFileSync(join(configDir, 'server-ops', 'audit.json'), 'utf8'))).toMatchObject({ version: 5 })
   })
 
   test('Given strict Store 尚未准备且审计文件不存在 When 直接追加 Then 拒绝且不创建文件', () => {
@@ -298,7 +319,7 @@ describe('Server Ops Agent 审计 Store', () => {
     expect(existsSync(filePath)).toBe(false)
   })
 
-  test.each([1, 2] as const)('Given strict Store 面对 v%s 文件 When 直接追加 Then 拒绝且不升级', (version) => {
+  test.each([1, 2, 3] as const)('Given strict Store 面对 v%s 文件 When 直接追加 Then 拒绝且不升级', (version) => {
     const configDir = createConfigDir()
     const directory = join(configDir, 'server-ops')
     const filePath = join(directory, 'audit.json')
@@ -314,7 +335,7 @@ describe('Server Ops Agent 审计 Store', () => {
     expect(readFileSync(filePath, 'utf8')).toBe(content)
   })
 
-  test('Given v1 文件且 guard 正在等待 When 另一方追加旧记录 Then prepare fresh-read 后完整迁移为 v3', async () => {
+  test('Given v1 文件且 guard 正在等待 When 另一方追加旧记录 Then prepare fresh-read 后完整迁移为 v4', async () => {
     const configDir = createConfigDir()
     const directory = join(configDir, 'server-ops')
     const filePath = join(directory, 'audit.json')
@@ -335,12 +356,12 @@ describe('Server Ops Agent 审计 Store', () => {
     await preparing
 
     expect(JSON.parse(readFileSync(filePath, 'utf8'))).toMatchObject({
-      version: 3,
+      version: 5,
       records: [{ id: 'audit-legacy', actor: 'agent', operation: 'connect' }],
     })
   })
 
-  test('Given guard 等待期间另一方已升级 v3 When prepare 获准 Then 不重复写文件', async () => {
+  test('Given guard 等待期间另一方已升级 v5 When prepare 获准 Then 不重复写文件', async () => {
     const configDir = createConfigDir()
     const directory = join(configDir, 'server-ops')
     const filePath = join(directory, 'audit.json')
@@ -357,12 +378,12 @@ describe('Server Ops Agent 审计 Store', () => {
       await acquired.promise
       return () => {}
     })
-    writeFileSync(filePath, JSON.stringify({ version: 3, records: [] }))
+    writeFileSync(filePath, JSON.stringify({ version: 5, records: [] }))
     acquired.resolve()
     await preparing
 
     expect(writes).toBe(0)
-    expect(JSON.parse(readFileSync(filePath, 'utf8')).version).toBe(3)
+    expect(JSON.parse(readFileSync(filePath, 'utf8')).version).toBe(5)
   })
 
   test('Given schema 迁移已提交但 guard release 失败 When prepare 返回 Then 已提交事实仍可继续追加', async () => {
@@ -382,11 +403,11 @@ describe('Server Ops Agent 审计 Store', () => {
       actor: 'agent', sessionId: 'session-1', hostId: 'host-1',
       operation: 'connect', phase: 'start', outcome: 'pending',
     })).not.toThrow()
-    expect(JSON.parse(readFileSync(filePath, 'utf8'))).toMatchObject({ version: 3, records: [{ id: 'audit-1' }] })
+    expect(JSON.parse(readFileSync(filePath, 'utf8'))).toMatchObject({ version: 5, records: [{ id: 'audit-1' }] })
   })
 
   test('Given 损坏或未知版本文件 When 构造 Store Then 保留原文件并以稳定错误阻断 list 与 append', () => {
-    for (const content of ['{broken', JSON.stringify({ version: 4, records: [] })]) {
+    for (const content of ['{broken', JSON.stringify({ version: 99, records: [] })]) {
       const configDir = createConfigDir()
       const directory = join(configDir, 'server-ops')
       const filePath = join(directory, 'audit.json')
@@ -481,6 +502,32 @@ describe('Server Ops Agent 审计 Store', () => {
     expect(readFileSync(filePath, 'utf8')).toBe(raw)
   })
 
+  test('Given 合法 v3 审计文件 When 只读并迁移 Then 旧记录不丢失且原文件只在 prepare 后升级', async () => {
+    /** 隔离的旧审计目录。 */
+    const configDir = createConfigDir()
+    /** 旧审计文件目录。 */
+    const directory = join(configDir, 'server-ops')
+    /** 旧审计文件路径。 */
+    const filePath = join(directory, 'audit.json')
+    mkdirSync(directory, { recursive: true })
+    /** 合法的 v3 Agent 命令记录。 */
+    const oldRecord = {
+      id: 'audit-v3', operationId: 'operation-v3', timestamp: 3, sessionId: 'session-1', hostId: 'host-1',
+      actor: 'agent', operation: 'exec', phase: 'result', outcome: 'success', command: 'uptime', commandTruncated: false, exitCode: 0,
+    } as const
+    /** 升级前的原始 v3 文本。 */
+    const raw = JSON.stringify({ version: 3, records: [oldRecord] })
+    writeFileSync(filePath, raw)
+    /** 强制通过 prepare 执行版本升级的 Store。 */
+    const store = new ServerOpsAuditStore(configDir, { requirePreparedSchema: true })
+
+    expect(store.list().records).toEqual([oldRecord])
+    expect(readFileSync(filePath, 'utf8')).toBe(raw)
+
+    await store.prepareForWrites(async () => () => {})
+    expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual({ version: 5, records: [oldRecord] })
+  })
+
   test('Given v2 记录缺 actor 或含未知字段 When 加载 Then 保留主文件并 fail closed', () => {
     const validRecord = {
       id: 'audit-2', timestamp: 2, sessionId: 'session-1', hostId: 'host-1', actor: 'agent',
@@ -525,7 +572,7 @@ describe('Server Ops Agent 审计 Store', () => {
     }
   })
 
-  test('Given v1 只读迁移 When 首次追加升级 v3 写失败 Then 保留旧文件并持续 fail closed', () => {
+  test('Given v1 只读迁移 When 首次追加升级 v5 写失败 Then 保留旧文件并持续 fail closed', () => {
     const configDir = createConfigDir()
     const directory = join(configDir, 'server-ops')
     mkdirSync(directory, { recursive: true })
@@ -562,7 +609,7 @@ describe('Server Ops Agent 审计 Store', () => {
     })).toThrow('SERVER_OPS_AUDIT_WRITE_FAILED')
     const persistedAfterFailure = readFileSync(filePath, 'utf8')
     expect(JSON.parse(persistedAfterFailure)).toMatchObject({
-      version: 3,
+      version: 5,
       records: [{ id: 'audit-1', actor: 'agent', operation: 'connect' }],
     })
     expect(() => store.list()).toThrow('SERVER_OPS_AUDIT_WRITE_FAILED')
@@ -592,7 +639,7 @@ describe('Server Ops Agent 审计 Store', () => {
       version: number
       records: Array<Record<string, unknown>>
     }
-    expect(persisted.version).toBe(3)
+    expect(persisted.version).toBe(5)
     expect(Object.keys(persisted.records[1]!).sort()).toEqual([
       'actor', 'durationMs', 'errorCode', 'hostId', 'id', 'operation', 'outcome',
       'phase', 'sessionId', 'timestamp', 'unitId',
@@ -614,6 +661,71 @@ describe('Server Ops Agent 审计 Store', () => {
       .toMatchObject([{ id: 'audit-4', actor: 'user', hostId: 'host-1', operation: 'service-restart' }])
     expect(store.list({ actor: 'user', hostId: 'host-1', operation: 'service-restart', limit: 1 }).records)
       .toMatchObject([{ id: 'audit-4', actor: 'user', hostId: 'host-1', operation: 'service-restart' }])
+  })
+
+  test('Given Agent 读取直连数据源 When 追加审计 Then 不伪造 hostId 且不持久化结果正文', () => {
+    /** 隔离的审计目录。 */
+    const configDir = createConfigDir()
+    /** 使用确定 ID 与时间的审计 Store。 */
+    const store = new ServerOpsAuditStore(configDir, { uuid: () => 'audit-read-1', now: () => 10 })
+
+    /** 直连数据源结构读取产生的公开审计。 */
+    const record = store.append({
+      actor: 'agent', sessionId: 'session-1', sourceId: 'source-1', operationId: 'operation-1',
+      operation: 'agent-read', resourceType: 'ops-resource', readAction: 'schema-describe',
+      database: 'app_db', table: 'users', scope: 'database', phase: 'result', outcome: 'success', durationMs: 12,
+    })
+
+    expect(record).toEqual({
+      id: 'audit-read-1', timestamp: 10, actor: 'agent', sessionId: 'session-1', sourceId: 'source-1',
+      operationId: 'operation-1', operation: 'agent-read', resourceType: 'ops-resource',
+      readAction: 'schema-describe', database: 'app_db', table: 'users', scope: 'database',
+      phase: 'result', outcome: 'success', durationMs: 12,
+    })
+    /** 最终持久化的审计 JSON。 */
+    const persisted = readFileSync(join(configDir, 'server-ops', 'audit.json'), 'utf8')
+    expect(persisted).not.toMatch(/hostId|password|credential|sql|stdout|stderr|rows/)
+  })
+
+  test('Given Agent 读取审计 When 缺少关联 ID 或表名命中边界 Then 拒绝未关联记录并接受 128 字符表名', () => {
+    const configDir = createConfigDir()
+    const store = new ServerOpsAuditStore(configDir, { uuid: () => 'audit-read-boundary', now: () => 10 })
+    const input = {
+      actor: 'agent' as const, sessionId: 'session-1', sourceId: 'source-1', operation: 'agent-read' as const,
+      resourceType: 'ops-resource' as const, readAction: 'schema-describe' as const,
+      database: 'd'.repeat(64), table: 't'.repeat(128), scope: 'database' as const,
+      phase: 'result' as const, outcome: 'success' as const,
+    }
+
+    expect(() => store.append(input)).toThrow('SERVER_OPS_AUDIT_RECORD_INVALID')
+    expect(store.append({ ...input, operationId: 'operation-1' })).toMatchObject({
+      operationId: 'operation-1', database: 'd'.repeat(64), table: 't'.repeat(128),
+    })
+  })
+
+  test('Given 多数据源读取记录 When 按 sourceId 查询 Then 仅返回目标数据源', () => {
+    /** 隔离的审计目录。 */
+    const configDir = createConfigDir()
+    /** 确定性审计 ID 计数。 */
+    let uuid = 0
+    /** 使用确定 ID 与时间的审计 Store。 */
+    const store = new ServerOpsAuditStore(configDir, { uuid: () => `audit-read-${++uuid}`, now: () => uuid })
+    store.append({
+      actor: 'agent', sessionId: 'session-1', hostId: 'host-1', operationId: 'operation-1', operation: 'agent-read',
+      resourceType: 'ops-resource', readAction: 'server-overview', phase: 'result', outcome: 'success',
+    })
+    store.append({
+      actor: 'agent', sessionId: 'session-1', sourceId: 'source-1', operationId: 'operation-2', operation: 'agent-read',
+      resourceType: 'ops-resource', readAction: 'data-probe', phase: 'result', outcome: 'success',
+    })
+    store.append({
+      actor: 'agent', sessionId: 'session-1', sourceId: 'source-2', operationId: 'operation-3', operation: 'agent-read',
+      resourceType: 'ops-resource', readAction: 'data-diagnose', scope: 'instance', phase: 'result', outcome: 'success',
+    })
+
+    expect(store.list({ sourceId: 'source-1' }).records).toMatchObject([
+      { id: 'audit-read-2', sourceId: 'source-1', readAction: 'data-probe' },
+    ])
   })
 
   test('Given 下一阶段稳定错误码 When 生成审计错误码 Then 允许公开且未知值继续降级', () => {
@@ -672,7 +784,7 @@ describe('Server Ops Agent 审计 Store', () => {
       { id: 'audit-1', operationId: 'operation-1', outcome: 'pending' },
       { id: 'audit-2', operationId: 'operation-2', outcome: 'pending' },
     ])
-    expect(JSON.parse(readFileSync(join(configDir, 'server-ops', 'audit.json'), 'utf8')).version).toBe(3)
+    expect(JSON.parse(readFileSync(join(configDir, 'server-ops', 'audit.json'), 'utf8')).version).toBe(5)
   })
 
   test('Given v1 与 v2 旧审计 When 只读加载 Then 内存归一 start 且不改写原文件', () => {

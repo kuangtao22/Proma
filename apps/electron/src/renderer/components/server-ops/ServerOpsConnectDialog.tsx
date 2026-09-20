@@ -72,12 +72,13 @@ export function ServerOpsConnectDialog({
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!connecting) onOpenChange(nextOpen) }}>
-      <DialogContent className="max-w-md">
-        <form className="grid gap-4" onSubmit={handleSubmit}>
+      <DialogContent className="w-[calc(100vw-1rem)] max-w-md p-4 sm:p-5">
+        <form className="grid gap-5 [&_label]:text-xs" onSubmit={handleSubmit}>
           <DialogHeader>
-            <DialogTitle>补录 {host?.name ?? '服务器'} 凭据</DialogTitle>
-            <DialogDescription>{host ? `${host.username}@${host.address}:${host.port}` : 'SSH 登录'}</DialogDescription>
+            <DialogTitle className="text-base">补录 {host?.name ?? '服务器'} 凭据</DialogTitle>
+            <DialogDescription className="font-mono text-xs">{host ? `${host.username}@${host.address}:${host.port}` : 'SSH 登录'}</DialogDescription>
           </DialogHeader>
+          <div className="text-[11px] font-medium text-muted-foreground">登录凭据</div>
           {host?.authMethod === 'password' && (
             <div className="grid gap-1.5">
               <Label htmlFor="server-ops-password">密码</Label>
@@ -111,7 +112,7 @@ export function ServerOpsConnectDialog({
             </>
           )}
           {host?.authMethod === 'ssh-agent' && (
-            <div className="border-y border-border py-3 text-xs leading-5 text-muted-foreground">
+            <div className="rounded-lg bg-muted/40 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
               将使用系统 SSH Agent 中已加载的密钥。Proma 不读取或保存私钥。
             </div>
           )}
@@ -130,7 +131,7 @@ export function ServerOpsConnectDialog({
             </label>
           )}
           {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
-          <DialogFooter>
+          <DialogFooter className="flex-row justify-end gap-2 space-x-0">
             <Button type="button" variant="outline" disabled={connecting} onClick={() => onOpenChange(false)}>取消</Button>
             <Button type="submit" disabled={connecting || !canSubmit}>{connecting ? '正在连接...' : '连接'}</Button>
           </DialogFooter>

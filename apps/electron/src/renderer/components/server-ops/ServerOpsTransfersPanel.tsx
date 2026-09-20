@@ -13,13 +13,19 @@ export interface ServerOpsTransfersPanelProps {
 /** 显示当前窗口的有界文件传输队列与明确终态。 */
 export function ServerOpsTransfersPanel({ transfers, onCancel }: ServerOpsTransfersPanelProps): React.ReactElement {
   if (transfers.length === 0) {
-    return <div className="flex min-h-32 items-center justify-center border-t text-sm text-muted-foreground">暂无文件传输</div>
+    return <div className="flex min-h-32 items-center justify-center border-t border-border/40 bg-content-area text-sm text-muted-foreground">暂无文件传输</div>
   }
   return (
     <TooltipProvider>
-      <div className="divide-y border-t" aria-label="文件传输列表">
-        {transfers.map((transfer) => <TransferRow key={transfer.transferId} transfer={transfer} onCancel={onCancel} />)}
-      </div>
+      <section className="border-t border-border/40 bg-content-area" aria-label="文件传输列表">
+        <div className="flex h-9 items-center justify-between border-b border-border/40 px-4">
+          <h3 className="text-xs font-medium">文件传输</h3>
+          <span className="text-[11px] tabular-nums text-muted-foreground">{transfers.length} 项</span>
+        </div>
+        <div className="divide-y divide-border/30">
+          {transfers.map((transfer) => <TransferRow key={transfer.transferId} transfer={transfer} onCancel={onCancel} />)}
+        </div>
+      </section>
     </TooltipProvider>
   )
 }
@@ -30,11 +36,11 @@ function TransferRow({ transfer, onCancel }: { transfer: ServerOpsTransferSnapsh
   const cancellable = transfer.status === 'queued' || transfer.status === 'running'
   const DirectionIcon = transfer.direction === 'upload' ? Upload : Download
   return (
-    <div className="grid min-h-24 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2.5">
-      <div className="min-w-0 space-y-2">
+    <div className="grid min-h-20 grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-2.5">
+      <div className="min-w-0 space-y-1.5">
         <div className="flex min-w-0 items-center gap-2">
           <DirectionIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-          <span className="truncate text-sm font-medium" title={transfer.fileName}>{transfer.fileName}</span>
+          <span className="truncate text-xs font-medium" title={transfer.fileName}>{transfer.fileName}</span>
           <StatusBadge status={transfer.status} />
         </div>
         <div className="truncate font-mono text-[11px] text-muted-foreground" title={transfer.remotePath}>{transfer.remotePath}</div>

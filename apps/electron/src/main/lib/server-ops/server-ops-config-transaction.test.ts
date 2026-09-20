@@ -462,7 +462,7 @@ describe('Server Ops config transaction', () => {
     }
   })
 
-  test('Given 固定 Server Ops 配置目录 When 解析文件路径 Then 只允许四个协作文件', async () => {
+  test('Given 固定 Server Ops 配置目录 When 解析文件路径 Then 只允许已登记的协作文件', async () => {
     const module = await import('./server-ops-config-transaction').catch(() => null)
     expect(module).not.toBeNull()
     if (!module) return
@@ -473,6 +473,7 @@ describe('Server Ops config transaction', () => {
     expect(module.resolveServerOpsConfigFilePath(directory, 'credentials.json')).toBe(join(canonicalDirectory, 'credentials.json'))
     expect(module.resolveServerOpsConfigFilePath(directory, 'known-hosts.json')).toBe(join(canonicalDirectory, 'known-hosts.json'))
     expect(module.resolveServerOpsConfigFilePath(directory, 'audit.json')).toBe(join(canonicalDirectory, 'audit.json'))
+    expect(module.resolveServerOpsConfigFilePath(directory, 'query-history.json')).toBe(join(canonicalDirectory, 'query-history.json'))
     expect(() => module.resolveServerOpsConfigFilePath(directory, '../settings.json' as 'hosts.json'))
       .toThrow('SERVER_OPS_CONFIG_FILE_UNSUPPORTED')
   })

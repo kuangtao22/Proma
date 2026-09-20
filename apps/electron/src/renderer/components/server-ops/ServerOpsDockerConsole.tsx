@@ -96,5 +96,5 @@ export function ServerOpsDockerConsole({ api, hostId, containerId, active, onSes
     })
   }, [active, api, containerId, hostId, onSession])
 
-  return <div ref={hostRef} className="h-full min-h-[240px] w-full bg-[#111113]" aria-label="容器终端" />
+  return <div className="h-full min-h-0 w-full overflow-hidden bg-content-area p-1.5"><div ref={hostRef} className="h-full min-h-0 w-full overflow-hidden rounded-md border border-border/40 bg-[#111113]" aria-label="容器终端" /></div>
 }

@@ -480,6 +480,7 @@ import { ServerOpsAgentAccessStore } from './lib/server-ops/server-ops-agent-acc
 import { ServerOpsAuditStore } from './lib/server-ops/server-ops-audit-store'
 import { disposeServerOpsLifecycle, registerServerOpsBeforeQuitBarrier, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
 import { ServerOpsHostStore } from './lib/server-ops/server-ops-host-store'
+import { ServerOpsProjectStore } from './lib/server-ops/server-ops-project-store'
 import { ServerOpsCredentialStore } from './lib/server-ops/server-ops-credential-store'
 import { ServerOpsHostTrustStore } from './lib/server-ops/server-ops-host-trust-store'
 import { ServerOpsTrustService } from './lib/server-ops/server-ops-trust-service'
@@ -493,6 +494,10 @@ import { ServerOpsFileService } from './lib/server-ops/server-ops-file-service'
 import { ServerOpsDockerConsoleService } from './lib/server-ops/server-ops-docker-console-service'
 import { ServerOpsFileTransferService, ServerOpsSafeFileTransferRecoveryStore } from './lib/server-ops/server-ops-file-transfer-service'
 import { ServerOpsLocalFileLeaseRegistry } from './lib/server-ops/server-ops-local-file-leases'
+import { ServerOpsDataSourceStore } from './lib/server-ops/server-ops-data-source-store'
+import { ServerOpsDataQueryHistoryStore } from './lib/server-ops/server-ops-data-query-history-store'
+import { ServerOpsDataSourceCredentialStore } from './lib/server-ops/server-ops-data-credential-store'
+import { ServerOpsDataService } from './lib/server-ops/server-ops-data-service'
 import { SERVER_OPS_TRANSFER_CHANNELS, parseServerOpsTransferSnapshot } from '@proma/shared'
 import { SERVER_OPS_CONSOLE_IPC_CHANNELS, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleExitEvent } from '@proma/shared'
 import { ServerOpsLogService } from './lib/server-ops/server-ops-log-service'
@@ -2315,8 +2320,33 @@ export function registerIpcHandlers(): void {
     const contents = getStoredMainWindow()?.webContents
     return contents && !contents.isDestroyed() ? [contents] : []
   }
-  /** 全局服务器资产只初始化一次，并复用当前主窗口授权边界。 */
-  const serverOpsHostStore = new ServerOpsHostStore()
+  /** 项目、主机与数据源共享同一配置事务，归属验证和空项目删除不会出现检查窗口。 */
+  const serverOpsConfigTransaction = createServerOpsConfigTransaction(join(getConfigDir(), 'server-ops'))
+  /** 项目引用回调在 Store 完成装配后才执行，先声明两个资产 Store。 */
+  let serverOpsHostStore: ServerOpsHostStore
+  let serverOpsDataSourceStore: ServerOpsDataSourceStore
+  /** 项目先创建闭包边界；删除时 fresh-read 两类资产的权威配置。 */
+  const serverOpsProjectStore = new ServerOpsProjectStore(undefined, {
+    transaction: serverOpsConfigTransaction,
+    hasProjectReferences: (projectId) => {
+      /** 两类资产都 fresh-read，保证旧记录都在删除判定前完成默认归属迁移。 */
+      const hasHostReferences = serverOpsHostStore.list().some((host) => host.projectId === projectId)
+      const hasDataSourceReferences = serverOpsDataSourceStore.list().some((dataSource) => dataSource.projectId === projectId)
+      return hasHostReferences || hasDataSourceReferences
+    },
+  })
+  /** 新主机在同一事务内验证显式项目；旧调用仍由项目 Store 解析默认归属。 */
+  serverOpsHostStore = new ServerOpsHostStore(undefined, {
+    transaction: serverOpsConfigTransaction,
+    resolveDefaultProjectId: () => serverOpsProjectStore.ensureDefaultProject(),
+    resolveProjectId: (projectId) => serverOpsProjectStore.resolveProjectId(projectId),
+  })
+  /** 数据源使用同一归属与事务合同，直连数据源同样受项目删除保护。 */
+  serverOpsDataSourceStore = new ServerOpsDataSourceStore(undefined, {
+    transaction: serverOpsConfigTransaction,
+    resolveDefaultProjectId: () => serverOpsProjectStore.ensureDefaultProject(),
+    resolveProjectId: (projectId) => serverOpsProjectStore.resolveProjectId(projectId),
+  })
   /** 运维凭据只通过 Electron safeStorage 加密，Linux basic_text 会 fail closed。 */
   const serverOpsCredentialStore = new ServerOpsCredentialStore(undefined, { safeStorage })
   /** endpoint Host Key 与显示主机资产分离持久化。 */
@@ -2359,7 +2389,7 @@ export function registerIpcHandlers(): void {
     trust: serverOpsHostTrustStore,
     connections: serverOpsConnectionService,
     audit: serverOpsAudit,
-    transaction: createServerOpsConfigTransaction(join(getConfigDir(), 'server-ops')),
+    transaction: serverOpsConfigTransaction,
     revokeHostAccess: (hostId) => serverOpsIpcRegistration.revokeHost(hostId),
     acquireMutationGuard: acquireServerOpsMutationGuard,
   })
@@ -2442,6 +2472,21 @@ export function registerIpcHandlers(): void {
     connection: serverOpsConnectionService,
     uuid: randomUUID,
   })
+  /** 数据库密码复用 Electron safeStorage，但与 SSH 凭据分文件保存。 */
+  const serverOpsDataCredentialStore = new ServerOpsDataSourceCredentialStore(undefined, { safeStorage, transaction: serverOpsConfigTransaction })
+  /** SQL 查询历史与其它运维配置共用短事务，跨窗口和实例提交前始终 fresh-read。 */
+  const serverOpsDataQueryHistoryStore = new ServerOpsDataQueryHistoryStore(undefined, {
+    transaction: serverOpsConfigTransaction,
+  })
+  /** 数据服务只通过当前活跃 SSH 连接读取，不创建本机监听端口。 */
+  const serverOpsDataService = new ServerOpsDataService({
+    store: serverOpsDataSourceStore,
+    credentials: serverOpsDataCredentialStore,
+    connection: serverOpsConnectionService,
+    runtime: serverOpsRuntimeClient,
+    transaction: serverOpsConfigTransaction,
+    now: Date.now,
+  })
   /** Server Ops 初始化事务只在 IPC 与 context 全部就绪后发布注册结果。 */
   const serverOpsLifecycle = (() => {
     /** IPC 注册成功后用于异常路径精确回滚本轮 handler 与订阅。 */
@@ -2466,6 +2511,9 @@ export function registerIpcHandlers(): void {
         console: serverOpsConsoleService,
         transfers: serverOpsTransfers,
         fileLeases: serverOpsFileLeases,
+        data: serverOpsDataService,
+        queryHistory: serverOpsDataQueryHistoryStore,
+        projects: serverOpsProjectStore,
         resolveOwnerWindow: (sender) => BrowserWindow.fromWebContents(sender),
         showLogSaveDialog: async (owner, options) => {
           /** owner 必然来自 BrowserWindow.fromWebContents，这里只恢复 Electron 的完整类型。 */
@@ -2496,6 +2544,7 @@ export function registerIpcHandlers(): void {
         console: serverOpsConsoleService,
         transfers: serverOpsTransfers,
         fileLeases: serverOpsFileLeases,
+        data: serverOpsDataService,
         disposeTrustWatcher,
       })
       return {
@@ -2533,6 +2582,9 @@ export function registerIpcHandlers(): void {
       }
       void serverOpsTransfers.dispose().catch((cleanupError) => console.error('[Server Ops] 传输初始化回滚失败:', cleanupError))
       void serverOpsFileLeases.dispose().catch((cleanupError) => console.error('[Server Ops] 文件句柄初始化回滚失败:', cleanupError))
+      try { serverOpsDataService.dispose() } catch (cleanupError) {
+        console.error('[Server Ops] 数据服务初始化回滚失败:', cleanupError)
+      }
       try { serverOpsConnectionService.dispose() } catch (cleanupError) {
         console.error('[Server Ops] 连接服务初始化回滚失败:', cleanupError)
       }

@@ -121,9 +121,9 @@ export function ServerOpsFilesWorkspace({ transferApi, ...files }: ServerOpsFile
     }
   }
 
-  return <div className="flex min-h-0 flex-1 flex-col">
+  return <div className="flex min-h-0 flex-1 flex-col bg-content-area">
     <ServerOpsFilesPanel {...files} onUpload={(path) => { void selectUpload(path) }} onDownload={(entry) => { void download(entry) }} />
-    {transfers.length > 0 && <div className="max-h-48 shrink-0 overflow-y-auto"><ServerOpsTransfersPanel transfers={transfers} onCancel={(transfer) => {
+    {transfers.length > 0 && <div className="max-h-56 shrink-0 overflow-y-auto"><ServerOpsTransfersPanel transfers={transfers} onCancel={(transfer) => {
       void transferApi.cancelServerOpsTransfer({ hostId: transfer.hostId, transferId: transfer.transferId }).catch(() => toast.error(getTransferErrorMessage('SERVER_OPS_TRANSFER_CANCEL_FAILED')))
     }} /></div>}
     <Dialog open={uploadSelection !== null} onOpenChange={(open) => { if (!open) dismissUpload() }}>

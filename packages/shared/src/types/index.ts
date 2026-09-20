@@ -23,6 +23,7 @@ export * from './chat'
 
 // Agent 相关类型
 export * from './agent'
+export * from './agent-session-eligibility'
 export * from './browser'
 export * from './reasoning-profile'
 
@@ -36,6 +37,13 @@ export * from './server-ops-docker'
 export * from './server-ops-console'
 export * from './server-ops-files'
 export * from './server-ops-transfers'
+export * from './server-ops-data'
+export * from './server-ops-data-schema'
+export * from './server-ops-data-query'
+export * from './server-ops-data-query-history'
+export * from './server-ops-sql-parser'
+export * from './server-ops-project'
+export * from './server-ops-connection-move'
 
 // 环境检测相关类型
 export * from './environment'
@@ -98,3 +106,4 @@ export * from './dreamina-login'
 export * from './media'
 // 用户授权的 Markdown Vault 相关类型
 export * from './vault'
+export * from './server-ops-agent-read'

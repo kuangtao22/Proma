@@ -18,16 +18,71 @@ import {
   createServerOpsAuditController,
   createServerOpsAgentAccessController,
   isServerOpsCredentialRecoveryState,
+  resolveServerOpsAgentAccessSession,
+  resolveServerOpsAgentAccessTarget,
   resolveServerOpsAgentAccessViewState,
   shouldPromptForServerOpsCredential,
   ServerOpsWorkspaceView,
+  serverOpsDataApi,
 } from './ServerOpsWorkspace'
+import { useServerOpsTransferLeave } from './useServerOpsTransferLeave'
 import type { ServerOpsAgentAccessProjection } from '@/atoms/server-ops-atoms'
 import { createServerOpsOverviewController, ServerOpsOverviewPanel } from './ServerOpsOverviewPanel'
 import type { ServerOpsOverviewProjection } from './ServerOpsOverviewPanel'
 import { ServerOpsServicesPanel } from './ServerOpsServicesPanel'
 import { createServerOpsLogsController, ServerOpsLogsPanel } from './ServerOpsLogsPanel'
 import type { ServerOpsLogsController, ServerOpsLogsProjection } from './ServerOpsLogsPanel'
+import { buildServerOpsConnections, resolveServerOpsWorkspaceTarget } from './server-ops-connections'
+import { createServerOpsSqlQueryHistoryController } from './server-ops-sql-query-history-controller'
+import { createServerOpsSqlQueryController } from './server-ops-sql-query-controller'
+
+test('Given 实际工作区加载旧 preload When 进入 SQL 工作台 Then 禁用执行并明确提示重启而非伪装为可调用接口', async () => {
+  /** 保存测试前的全局窗口，避免兼容性用例影响其它组件。 */
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { electronAPI: {} } })
+  try {
+    /** 通过实际工作区适配器验证能力检查，不直接注入空接口替代生产接线。 */
+    const history = createServerOpsSqlQueryHistoryController({
+      api: { list: serverOpsDataApi.listServerOpsDatabaseQueryHistory, save: serverOpsDataApi.saveServerOpsDatabaseQueryHistory },
+      publish: () => undefined,
+    })
+    history.activate()
+    history.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1' })
+    await Promise.resolve()
+    expect(history.snapshot().error).toBe('SQL 查询历史接口尚未就绪，请重启应用后重试')
+    expect(serverOpsDataApi.saveServerOpsDatabaseQueryHistory).toBeUndefined()
+    /** 执行与取消任一接口缺失时都不能发起查询。 */
+    const query = createServerOpsSqlQueryController({
+      api: { query: serverOpsDataApi.queryServerOpsDatabase, cancel: serverOpsDataApi.cancelServerOpsDatabaseQuery },
+      publish: () => undefined,
+    })
+    query.activate()
+    query.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true })
+    query.setDraft('SELECT id FROM users')
+    expect(query.snapshot().canExecute).toBe(false)
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
+
+test('Given 新 preload 已加载 When 实际工作区读取历史 Then 保留桥接返回值与原始数据库范围', async () => {
+  /** 只使用本地模拟范围，不读写用户真实历史。 */
+  const scope = { sourceId: 'source-1', database: 'app' }
+  /** 记录真实适配器转交的参数。 */
+  const calls: unknown[] = []
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { electronAPI: {
+    listServerOpsDatabaseQueryHistory: async (input: unknown) => { calls.push(input); return { entries: [] } },
+  } } })
+  try {
+    expect(await serverOpsDataApi.listServerOpsDatabaseQueryHistory?.(scope)).toEqual({ entries: [] })
+    expect(calls).toEqual([scope])
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow)
+    else Reflect.deleteProperty(globalThis, 'window')
+  }
+})
 
 interface Deferred<T> {
   promise: Promise<T>
@@ -187,6 +242,81 @@ function createReconciliationRoot(): {
   const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
   class FakeHtmlIFrameElement {}
   const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement }
+  const fakeDocument = {
+    ...eventTarget,
+    nodeType: 9,
+    defaultView: fakeWindow,
+    activeElement: null,
+    body: null,
+    documentElement: { namespaceURI: 'http://www.w3.org/1999/xhtml' },
+  }
+  const container = {
+    ...eventTarget,
+    nodeType: 1,
+    tagName: 'DIV',
+    namespaceURI: 'http://www.w3.org/1999/xhtml',
+    ownerDocument: fakeDocument,
+  }
+  const globals = globalThis as unknown as { window?: unknown; document?: unknown; IS_REACT_ACT_ENVIRONMENT?: boolean }
+  const previousWindow = globals.window
+  const previousDocument = globals.document
+  const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT
+  globals.window = fakeWindow
+  globals.document = fakeDocument
+  globals.IS_REACT_ACT_ENVIRONMENT = true
+  const root = createRoot(container as unknown as Element)
+  return {
+    render: (node) => { root.render(node) },
+    unmount: () => { root.unmount() },
+    restore: () => {
+      globals.window = previousWindow
+      globals.document = previousDocument
+      globals.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment
+    },
+  }
+}
+
+/** 传输收口的真实快照形状；测试只关心 status。 */
+interface TransferSnapshotStub {
+  status: string
+}
+
+/** 只渲染传输退出确认 hook 的探针。 */
+function TransferLeaveProbe({
+  scopeKey,
+  onRequestLeave,
+}: {
+  scopeKey: string | null
+  onRequestLeave: (requestLeave: (action: () => void) => void) => void
+}): React.ReactElement {
+  /** 真实的传输退出确认能力。 */
+  const { requestLeave, dialog } = useServerOpsTransferLeave(scopeKey)
+  React.useEffect(() => {
+    onRequestLeave(requestLeave)
+  }, [onRequestLeave, requestLeave])
+  return <>{dialog}</>
+}
+
+/**
+ * 创建注入 electronAPI 的最小 React root。
+ *
+ * `createReconciliationRoot` 只提供 window/document 骨架，
+ * 这里再补上传出确认需要的两个 IPC 方法。
+ *
+ * @param electronApi 传输相关 IPC 替身
+ * @returns 可渲染、可卸载并恢复全局环境的最小 root
+ */
+function createTransferLeaveRoot(electronApi: {
+  listServerOpsTransfers: () => Promise<TransferSnapshotStub[]>
+  closeServerOpsTransferOwner: () => Promise<void>
+}): {
+  render: (node: React.ReactElement) => void
+  unmount: () => void
+  restore: () => void
+} {
+  const eventTarget: MinimalEventTarget = { addEventListener: () => undefined, removeEventListener: () => undefined }
+  class FakeHtmlIFrameElement {}
+  const fakeWindow = { ...eventTarget, event: undefined, HTMLIFrameElement: FakeHtmlIFrameElement, electronAPI: electronApi }
   const fakeDocument = {
     ...eventTarget,
     nodeType: 9,
@@ -505,13 +635,13 @@ describe('服务器运维右侧工作区', () => {
     expect(html).toContain('<option value="trust-revoke">')
   })
 
-  test('Given 已选择服务器 When 渲染工具栏 Then 信任入口与 Agent Shield 权限入口语义分离', () => {
+  test('Given 已选择服务器 When 渲染工具栏 Then 次要服务器操作收进菜单且 Agent Shield 权限入口保持可见', () => {
     const host = createHost()
     const html = renderToStaticMarkup(
       <ServerOpsWorkspaceView {...createCallbacks()} status="ready" hosts={[host]} selectedHost={host} activeSection="overview" />,
     )
 
-    expect(html).toContain('aria-label="管理服务器信任"')
+    expect(html).toContain('aria-label="更多服务器操作"')
     expect(html).toContain('aria-label="允许当前 Agent 使用此服务器"')
   })
 
@@ -650,6 +780,52 @@ describe('服务器运维右侧工作区', () => {
     expect(html).toContain('data-server-ops-agent-access="true" disabled=""')
     expect(html).toContain('aria-label="请先选择服务器"')
     expect(html).toContain('aria-pressed="false"')
+  })
+
+  test('Given 定时任务会话 When 解析授权会话 Then 返回禁用原因而不是发起授权请求', () => {
+    /** 用户自己新建的普通 Agent 会话。 */
+    const ordinarySession = { id: 'agent-1', title: '排查 API 延迟', createdAt: 1, updatedAt: 1 }
+    /** 定时任务创建的会话；列表里可见，但不允许获取服务器授权。 */
+    const automationSession = {
+      id: 'agent-automation', title: '用心读书每日汇报', sourceAutomationId: 'automation-1', createdAt: 1, updatedAt: 1,
+    }
+
+    expect(resolveServerOpsAgentAccessSession([ordinarySession], 'agent-1')).toEqual({ sessionId: 'agent-1' })
+    expect(resolveServerOpsAgentAccessSession([ordinarySession], null)).toEqual({ sessionId: null })
+    /** 元数据尚未加载时保持原行为，由主进程守卫兜底。 */
+    expect(resolveServerOpsAgentAccessSession([], 'agent-1')).toEqual({ sessionId: 'agent-1' })
+
+    /** 定时任务会话解析后的授权身份。 */
+    const resolved = resolveServerOpsAgentAccessSession([ordinarySession, automationSession], 'agent-automation')
+    expect(resolved.sessionId).toBeNull()
+    expect(resolved.unavailableReason).toBe('当前会话不是普通 Agent 会话（定时任务或子会话），请切换会话后再授权')
+  })
+
+  test('Given 定时任务会话 When 渲染顶栏 Then 禁用 Shield 并给出会话类型原因', () => {
+    /** 会话类型不可用时同步计算出的视图状态。 */
+    const viewState = resolveServerOpsAgentAccessViewState({
+      projection: { target: null, access: null, status: 'idle', error: null },
+      sessionId: null,
+      hostId: 'host-1',
+      sessionUnavailableReason: '当前会话不是普通 Agent 会话（定时任务或子会话），请切换会话后再授权',
+    })
+    /** 顶栏 Shield 的静态标记。 */
+    const html = renderToStaticMarkup(
+      <ServerOpsWorkspaceView
+        {...createCallbacks()}
+        status="ready"
+        hosts={[createHost()]}
+        selectedHost={createHost()}
+        activeSection="overview"
+        {...viewState}
+        onToggleAgentAccess={() => undefined}
+      />,
+    )
+
+    expect(viewState).toMatchObject({ agentAccessAvailable: false, agentAccessStatus: 'idle' })
+    expect(html).toContain('data-server-ops-agent-access="true" disabled=""')
+    expect(html).toContain('aria-label="当前会话不是普通 Agent 会话（定时任务或子会话），请切换会话后再授权"')
+    expect(html).not.toContain('aria-label="请先打开普通 Agent 会话"')
   })
 
   test('Given 没有普通 Agent session When 渲染顶栏 Then 禁用 Shield 并提示先打开会话', () => {
@@ -804,6 +980,43 @@ describe('服务器运维右侧工作区', () => {
     })
   })
 
+  test('Given 另一 Pane 移动已授权主机 When 当前项目退回清单 Then 保留授权直到用户显式离开', async () => {
+    /** 模拟主进程的精确授权槽，项目移动不能触碰它。 */
+    let authority: ServerOpsAgentAccess | null = { sessionId: 'agent-1', hostId: 'host-1', granted: true }
+    /** 真实授权控制器通过模拟 IPC 观察是否发生撤销。 */
+    const harness = createAgentAccessHarness()
+    harness.setGetAccess(async () => authority)
+    harness.setSetAccess(async (access) => { harness.setCalls.push(access); authority = access.granted ? access : null; return authority })
+    /** 当前 Pane 原先明确查看项目一的服务器。 */
+    const selection = { sessionId: 'agent-1', selectedConnectionId: 'ssh:host-1', projectViewActive: false }
+    const source = { projects: [], hosts: [{ ...createHost(), projectId: 'project-1' }], dataSources: [], connectionStates: {} }
+    await harness.controller.select(resolveServerOpsAgentAccessTarget({ ...selection, connections: buildServerOpsConnections(source) }))
+    /** 另一 Pane 的移动回执只改变共享归属。 */
+    const connections = buildServerOpsConnections({ ...source, hosts: [{ ...source.hosts[0]!, projectId: 'project-2' }] })
+    expect(resolveServerOpsWorkspaceTarget({ ...selection, connections: connections.filter((entry) => entry.projectId === 'project-1') })).toEqual({ kind: 'project' })
+    expect(resolveServerOpsAgentAccessTarget({ ...selection, connections })).toEqual({ sessionId: 'agent-1', hostId: 'host-1' })
+    await harness.controller.select(resolveServerOpsAgentAccessTarget({ ...selection, connections }))
+    expect(harness.setCalls).toEqual([])
+    expect(authority).toEqual({ sessionId: 'agent-1', hostId: 'host-1', granted: true })
+
+    /** 显式进入项目仍按原规则撤销，不能把移动特例变成永久授权。 */
+    await harness.controller.select(resolveServerOpsAgentAccessTarget({ ...selection, connections, projectViewActive: true }))
+    expect(harness.setCalls).toEqual([{ sessionId: 'agent-1', hostId: 'host-1', granted: false }])
+    expect(authority).toBeNull()
+  })
+
+  test('Given 全局主机已删除或身份无效 When 解析移动后的授权目标 Then 返回空且删除会撤销原组合', async () => {
+    /** 有效的全局连接，不通过字符串前缀推测主机身份。 */
+    const connections = buildServerOpsConnections({ projects: [], hosts: [createHost()], dataSources: [], connectionStates: {} })
+    const selection = { sessionId: 'agent-1', selectedConnectionId: 'ssh:host-1', projectViewActive: false, connections }
+    const harness = createAgentAccessHarness()
+    await harness.controller.select(resolveServerOpsAgentAccessTarget(selection))
+    expect(resolveServerOpsAgentAccessTarget({ ...selection, sessionId: null })).toBeNull()
+    expect(resolveServerOpsAgentAccessTarget({ ...selection, selectedConnectionId: 'ssh:missing' })).toBeNull()
+    await harness.controller.select(resolveServerOpsAgentAccessTarget({ ...selection, connections: [] }))
+    expect(harness.setCalls).toEqual([{ sessionId: 'agent-1', hostId: 'host-1', granted: false }])
+  })
+
   test('Given 当前组合已授权 When SSH disconnect 完成 Then Renderer 投影立即撤销', async () => {
     const harness = createAgentAccessHarness()
     harness.setGetAccess(async (target) => ({ ...target, granted: true }))
@@ -901,9 +1114,14 @@ describe('服务器运维右侧工作区', () => {
       />,
     )
 
-    for (const label of ['概览', '终端', '服务', '日志', '文件', 'Docker', '数据服务', '审计']) {
+    for (const label of ['概览', '终端', '服务', '日志', '文件', 'Docker', '审计']) {
       expect(overviewHtml).toContain(label)
     }
+    /**
+     * 数据服务不再是页签：数据库 / Redis 是项目内的独立连接，
+     * 从项目视图点进去才是数据服务详情，页签里不能出现第二个入口。
+     */
+    expect(overviewHtml).not.toContain('数据服务')
     expect(overviewHtml).toContain('生产 API')
     expect(overviewHtml).toContain('deploy@10.0.0.8:22')
     expect(overviewHtml).toContain('尚未连接')
@@ -914,22 +1132,107 @@ describe('服务器运维右侧工作区', () => {
     expect(overviewHtml).not.toContain('68%')
     expect(overviewHtml).not.toContain('下一阶段')
     expect(overviewHtml).not.toContain('连接身份')
+  })
 
-    /** 数据服务页 HTML。 */
-    const dataHtml = renderToStaticMarkup(
+  test('Given 项目制的连接视图 When 渲染 Then 提供返回项目入口且不再出现数据服务页签', () => {
+    /** 当前选中的测试服务器。 */
+    const host = createHost()
+    /** 带项目导航的连接视图 HTML。 */
+    const html = renderToStaticMarkup(
       <ServerOpsWorkspaceView
         {...createCallbacks()}
         status="ready"
         hosts={[host]}
         selectedHost={host}
-        activeSection="data-services"
+        activeSection="overview"
+        onBackToProject={() => undefined}
+        projectLabel="默认项目"
       />,
     )
-    expect(dataHtml).toContain('PostgreSQL')
-    expect(dataHtml).toContain('MySQL')
-    expect(dataHtml).toContain('Redis')
-    expect(dataHtml).toContain('尚未接入')
-    expect(dataHtml).not.toContain('等待能力探测')
+
+    /** 项目列表在抽屉里；回项目视图由面包屑第一段承担，不再单独占一个返回按钮。 */
+    expect(html).toContain('aria-label="打开项目列表"')
+    expect(html).toContain('aria-label="返回项目视图"')
+    expect(html).toContain('data-server-ops-connection-project')
+    expect(html).toContain('默认项目')
+    expect(html).toContain('data-server-ops-connection-module')
+    expect(html).not.toContain('数据服务')
+  })
+
+  test('Given 传输收口仍在进行 When 作用域发生变化 Then 挂起的离开动作被作废', async () => {
+    /**
+     * 这条断言锁住的是"点数据库却进了服务器界面"那类 bug 的机制：
+     * 容器若在调用 `requestLeave` 之前就翻动视图，中间渲染会立刻按旧选择画出上一条连接，
+     * 传输作用域随之变化，挂起中的确认被自己的中间渲染作废。
+     * 因此导航必须在确认回调里一次性提交（见 ServerOpsWorkspace 的 handleSelectConnection）。
+     */
+    /** 可控结算的在途传输列表响应。 */
+    const pendingList = createDeferred<TransferSnapshotStub[]>()
+    const root = createTransferLeaveRoot({
+      listServerOpsTransfers: () => pendingList.promise,
+      closeServerOpsTransferOwner: async () => undefined,
+    })
+    /** 最近一次渲染拿到的 requestLeave。 */
+    let requestLeave: ((action: () => void) => void) | null = null
+    /** 实际提交的导航动作。 */
+    const commits: string[] = []
+    /** 探针回调必须稳定，避免 effect 反复触发。 */
+    const handleRequestLeave = (next: (action: () => void) => void): void => { requestLeave = next }
+    try {
+      await act(async () => {
+        root.render(<TransferLeaveProbe scopeKey="host-a" onRequestLeave={handleRequestLeave} />)
+      })
+      act(() => { requestLeave?.((() => { commits.push('leave') })) })
+      /** 收口尚未返回时作用域变化：等价于容器提前把视图切到了上一条连接。 */
+      await act(async () => {
+        root.render(<TransferLeaveProbe scopeKey="host-b" onRequestLeave={handleRequestLeave} />)
+      })
+      await act(async () => {
+        pendingList.resolve([])
+        await pendingList.promise
+        /** 收口链还有 closeOwner 与计数复位，全部在 act 内结算完，避免测试外的异步更新告警。 */
+        await flushPromises()
+        await flushPromises()
+      })
+      expect(commits).toEqual([])
+    } finally {
+      /** 卸载同样会触发 hook 的清理状态更新，必须包在 act 内。 */
+      await act(async () => { root.unmount() })
+      root.restore()
+    }
+  })
+
+  test('Given 传输收口仍在进行 When 作用域未变 Then 动作照常提交', async () => {
+    /** 可控结算的在途传输列表响应。 */
+    const pendingList = createDeferred<TransferSnapshotStub[]>()
+    const root = createTransferLeaveRoot({
+      listServerOpsTransfers: () => pendingList.promise,
+      closeServerOpsTransferOwner: async () => undefined,
+    })
+    /** 最近一次渲染拿到的 requestLeave。 */
+    let requestLeave: ((action: () => void) => void) | null = null
+    /** 实际提交的导航动作。 */
+    const commits: string[] = []
+    /** 探针回调必须稳定，避免 effect 反复触发。 */
+    const handleRequestLeave = (next: (action: () => void) => void): void => { requestLeave = next }
+    try {
+      await act(async () => {
+        root.render(<TransferLeaveProbe scopeKey="host-a" onRequestLeave={handleRequestLeave} />)
+      })
+      act(() => { requestLeave?.((() => { commits.push('leave') })) })
+      await act(async () => {
+        pendingList.resolve([])
+        await pendingList.promise
+        /** 收口链还有 closeOwner 与计数复位，全部在 act 内结算完，避免测试外的异步更新告警。 */
+        await flushPromises()
+        await flushPromises()
+      })
+      expect(commits).toEqual(['leave'])
+    } finally {
+      /** 卸载同样会触发 hook 的清理状态更新，必须包在 act 内。 */
+      await act(async () => { root.unmount() })
+      root.restore()
+    }
   })
 
   test('Given 已选择服务器 When 在概览与服务页切换 Then 服务面板保持同一实例且仅切换 active', () => {

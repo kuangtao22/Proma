@@ -4,7 +4,11 @@ import type { ServerOpsSftpRequest, ServerOpsSftpResult } from './server-ops-sft
 import type { ServerOpsHostKey, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck, ServerOpsTerminalOutputEvent } from '@proma/shared'
 import { parseServerOpsConsoleAck, parseServerOpsConsoleExitEvent, parseServerOpsConsoleIdentity,
   parseServerOpsConsoleInput, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleResizeInput } from '@proma/shared'
-import type { ServerOpsConsoleIdentity } from '@proma/shared'
+import { isServerOpsDataCapability, isServerOpsDataEngine, parseServerOpsDataMetricList,
+  parseServerOpsDataTableList, parseServerOpsDataWarnings, parseServerOpsDataDiagnosticsResult, parseServerOpsDataSourceRowsResult,
+  parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult } from '@proma/shared'
+import type { ServerOpsConsoleIdentity, ServerOpsDataCapability, ServerOpsDataEngine, ServerOpsDataMetric, ServerOpsDataTable } from '@proma/shared'
+import type { ServerOpsDataDiagnosticSection, ServerOpsDataParameter, ServerOpsDataQueryResult, ServerOpsDataSchemaCell } from '@proma/shared'
 import type { ServerOpsConsoleRuntimeStart } from './server-ops-console-runtime'
 
 /** utility process 接收的 SSH 认证材料。 */
@@ -40,6 +44,101 @@ export interface ServerOpsRuntimeExecResult {
   signal?: string
   truncated: boolean
 }
+/**
+ * 数据服务读取模式。
+ *
+ * - `probe` / `diagnostics`：连接测试与只读诊断（回答"这台库健康吗"）。
+ * - `schema-tables` / `schema-table` / `schema-rows`：表浏览（回答"库里有什么、长什么样"）。
+ */
+export type ServerOpsRuntimeDataReadMode = 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'sql-query'
+/** 主进程发往 runtime 的数据服务读取请求；密码只在进程内传递。 */
+export interface ServerOpsRuntimeDataReadRequest {
+  requestId: string
+  hostId: string
+  connectionId: string
+  /** 连接方式：`ssh` 走转发通道，`direct` 在 utility 内直接发起 TCP/TLS。 */
+  transport: 'ssh' | 'direct'
+  mode: ServerOpsRuntimeDataReadMode
+  engine: ServerOpsDataEngine
+  address: string
+  port: number
+  database?: string
+  username?: string
+  password?: string
+  tlsMode: 'disabled' | 'verify'
+  tlsServerName?: string
+  timeoutMs: number
+  /** MySQL 诊断分区；省略保持旧版全量诊断，Redis 忽略分区能力。 */
+  diagnosticSection?: ServerOpsDataDiagnosticSection
+  /** MySQL 会话或慢语句的库级筛选；与连接配置默认库相互独立。 */
+  diagnosticDatabase?: string
+  /** 表浏览目标库；`schema-*` 模式使用，必须已在 information_schema 内校验过。 */
+  schemaDatabase?: string
+  /** 表浏览目标表；`schema-table` 与 `schema-rows` 使用。 */
+  schemaTable?: string
+  /** 行预览偏移与页大小；`schema-rows` 使用。 */
+  rowOffset?: number
+  rowLimit?: number
+  /** SQL 查询公开身份与受控正文；只允许 `sql-query` 模式携带。 */
+  queryId?: string
+  sql?: string
+  maxRows?: number
+}
+/** runtime 返回的数据服务读取结果，指标与表格已按共享合同裁剪。 */
+export type ServerOpsRuntimeDataReadResult =
+  | ServerOpsRuntimeDataDiagnosticsResult
+  | ServerOpsRuntimeDataSchemaTablesResult
+  | ServerOpsRuntimeDataSchemaTableResult
+  | ServerOpsRuntimeDataSchemaRowsResult
+  | ServerOpsDataQueryResult
+
+/** 连接测试与只读诊断结果。 */
+export interface ServerOpsRuntimeDataDiagnosticsResult {
+  capability: ServerOpsDataCapability
+  serverVersion?: string
+  metrics: ServerOpsDataMetric[]
+  tables: ServerOpsDataTable[]
+  warnings: string[]
+  parameters?: ServerOpsDataParameter[]
+  parametersTruncated?: boolean
+}
+
+/** 表浏览：库与表清单结果。 */
+export interface ServerOpsRuntimeDataSchemaTablesResult {
+  mode: 'schema-tables'
+  capability: ServerOpsDataCapability
+  /** runtime 已通过参数化查询精确验证的目标库。 */
+  database?: string
+  databases: string[]
+  tables: import('@proma/shared').ServerOpsDataSchemaTableSummary[]
+  databasesTruncated?: boolean
+  tablesTruncated?: boolean
+  warnings: string[]
+}
+
+/** 表浏览：单表结构结果。 */
+export interface ServerOpsRuntimeDataSchemaTableResult {
+  mode: 'schema-table'
+  capability: ServerOpsDataCapability
+  columns: import('@proma/shared').ServerOpsDataSchemaColumn[]
+  indexes: import('@proma/shared').ServerOpsDataSchemaIndex[]
+  warnings: string[]
+}
+
+/** 表浏览：分页行预览结果。 */
+export interface ServerOpsRuntimeDataSchemaRowsResult {
+  mode: 'schema-rows'
+  capability: ServerOpsDataCapability
+  columns: string[]
+  rows: ServerOpsDataSchemaCell[][]
+  offset: number
+  limit: number
+  totalEstimate?: number
+  truncated: boolean
+  hasMore?: boolean
+  orderedByPrimaryKey?: boolean
+  warnings: string[]
+}
 /** utility process 内部启动独立日志 channel 的请求。 */
 export interface ServerOpsRuntimeLogStartRequest {
   streamId: string
@@ -60,6 +159,8 @@ export type ServerOpsRuntimeRequest =
   | { type: 'server-ops.sftp'; input: ServerOpsSftpRequest }
   | { type: 'server-ops.connect'; input: ServerOpsRuntimeConnectRequest }
   | { type: 'server-ops.exec'; input: ServerOpsRuntimeExecRequest }
+  | { type: 'server-ops.data-read'; input: ServerOpsRuntimeDataReadRequest }
+  | { type: 'server-ops.data-cancel'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.disconnect'; hostId: string; connectionId: string }
   | { type: 'server-ops.terminal-input'; hostId: string; connectionId: string; data: string }
   | { type: 'server-ops.terminal-resize'; hostId: string; connectionId: string; cols: number; rows: number }
@@ -80,6 +181,8 @@ export type ServerOpsRuntimeMessage =
   | { type: 'server-ops.ready'; pid: number }
   | { type: 'server-ops.connect-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeConnectResult }
   | { type: 'server-ops.exec-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeExecResult }
+  | { type: 'server-ops.data-read-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeDataReadResult }
+  | { type: 'server-ops.data-read-cancelled'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.error'; requestId?: string; hostId: string; connectionId: string; code: string; message: string }
   | { type: 'server-ops.terminal-output'; event: ServerOpsTerminalOutputEvent }
   | { type: 'server-ops.terminal-exit'; event: ServerOpsTerminalExitEvent }
@@ -118,6 +221,21 @@ function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<
 /** 判断跨进程 ID 是否为可安全用于 Map key 的规范字符串。 */
 function isRuntimeId(value: unknown): value is string {
   return typeof value === 'string' && value.length >= 1 && value.length <= 128 && /^[A-Za-z0-9_-]+$/u.test(value)
+}
+
+/**
+ * 解析表浏览使用的标识符。
+ *
+ * 只做"有界文本"校验，真正的安全边界是运行时先查 information_schema 白名单，
+ * 只有命中白名单的名字才允许拼进语句（见 server-ops-data-runtime）。
+ *
+ * @param value 未知输入
+ * @param maximum 允许的最大长度
+ * @returns 通过校验的标识符
+ */
+function parseSchemaIdentifier(value: unknown, maximum: number): string {
+  if (!isConnectionText(value, maximum)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  return value
 }
 
 /** 判断远程端口是否位于 TCP 有效范围。 */
@@ -222,6 +340,120 @@ function parseExecRequest(value: unknown): ServerOpsRuntimeExecRequest {
   return { requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, command: value.command, timeoutMs: value.timeoutMs }
 }
 
+/** 严格解析数据服务读取请求；密码等秘密字段只做边界校验，不进入日志。 */
+function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
+  if (!isRecord(value)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  /** 可选字段按实际存在情况参与 exact-key 校验。 */
+  const keys = ['requestId', 'hostId', 'connectionId', 'mode', 'engine', 'address', 'port', 'tlsMode', 'timeoutMs']
+    .concat(['transport'])
+    .concat(value.database === undefined ? [] : ['database'])
+    .concat(value.username === undefined ? [] : ['username'])
+    .concat(value.password === undefined ? [] : ['password'])
+    .concat(value.tlsServerName === undefined ? [] : ['tlsServerName'])
+    .concat(value.schemaDatabase === undefined ? [] : ['schemaDatabase'])
+    .concat(value.schemaTable === undefined ? [] : ['schemaTable'])
+    .concat(value.rowOffset === undefined ? [] : ['rowOffset'])
+    .concat(value.rowLimit === undefined ? [] : ['rowLimit'])
+    .concat(value.diagnosticSection === undefined ? [] : ['diagnosticSection'])
+    .concat(value.diagnosticDatabase === undefined ? [] : ['diagnosticDatabase'])
+    .concat(value.queryId === undefined ? [] : ['queryId'])
+    .concat(value.sql === undefined ? [] : ['sql'])
+    .concat(value.maxRows === undefined ? [] : ['maxRows'])
+  if (!hasExactKeys(value, keys)
+    || !isRuntimeId(value.requestId) || !isRuntimeId(value.hostId) || !isRuntimeId(value.connectionId)
+    || (value.mode !== 'probe' && value.mode !== 'diagnostics'
+      && value.mode !== 'schema-tables' && value.mode !== 'schema-table' && value.mode !== 'schema-rows'
+      && value.mode !== 'sql-query')
+    || (value.transport !== 'ssh' && value.transport !== 'direct')
+    || !isServerOpsDataEngine(value.engine)
+    || !isConnectionText(value.address, 255) || !isPort(value.port)
+    || (value.database !== undefined && (!isConnectionText(value.database, 64)
+      || (value.engine === 'redis' && !/^\d{1,2}$/u.test(value.database))))
+    || (value.username !== undefined && !isConnectionText(value.username, 128))
+    || (value.password !== undefined && !isSecretText(value.password))
+    || (value.tlsMode !== 'disabled' && value.tlsMode !== 'verify')
+    || (value.tlsServerName !== undefined && !isConnectionText(value.tlsServerName, 255))
+    || typeof value.timeoutMs !== 'number' || !Number.isSafeInteger(value.timeoutMs)
+    || value.timeoutMs < 1_000 || value.timeoutMs > 120_000) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  /** TLS 校验必须绑定数据库真实主机名，否则拒绝该请求。 */
+  if (value.tlsMode === 'verify' && value.tlsServerName === undefined) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  if (value.diagnosticSection !== undefined && (value.mode !== 'diagnostics'
+    || (value.diagnosticSection !== 'overview' && value.diagnosticSection !== 'sessions'
+      && value.diagnosticSection !== 'statements' && value.diagnosticSection !== 'parameters'))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  if (value.diagnosticDatabase !== undefined && (value.mode !== 'diagnostics' || value.engine !== 'mysql'
+    || (value.diagnosticSection !== 'sessions' && value.diagnosticSection !== 'statements')
+    || typeof value.diagnosticDatabase !== 'string' || value.diagnosticDatabase.length > 64
+    || value.diagnosticDatabase.trim().length === 0 || /\p{Cc}/u.test(value.diagnosticDatabase))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  /**
+   * 表浏览与诊断是两条不同的意图，参数不得互相夹带：
+   * 既防止"看起来在读诊断、实际在读表数据"的歧义请求，也防止缺参数时静默走错分支。
+   */
+  const isSchemaTables = value.mode === 'schema-tables'
+  const isSchemaTable = value.mode === 'schema-table'
+  const isSchemaRows = value.mode === 'schema-rows'
+  const isSqlQuery = value.mode === 'sql-query'
+  if (!isSchemaTables && !isSchemaTable && !isSchemaRows
+    && (value.schemaDatabase !== undefined || value.schemaTable !== undefined
+      || value.rowOffset !== undefined || value.rowLimit !== undefined)) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  /** 表浏览标识符：只有对应模式才解析，越界即拒绝。 */
+  const schemaDatabase = isSchemaTable || isSchemaRows || (isSchemaTables && value.schemaDatabase !== undefined)
+    ? parseSchemaIdentifier(value.schemaDatabase, 64)
+    : undefined
+  const schemaTable = isSchemaTable || isSchemaRows ? parseSchemaIdentifier(value.schemaTable, 128) : undefined
+  if (isSchemaRows) {
+    if (typeof value.rowOffset !== 'number' || !Number.isSafeInteger(value.rowOffset) || value.rowOffset < 0 || value.rowOffset > 1_000_000
+      || typeof value.rowLimit !== 'number' || !Number.isSafeInteger(value.rowLimit) || value.rowLimit < 1 || value.rowLimit > 200
+      || value.rowOffset % value.rowLimit !== 0) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  } else if (value.rowOffset !== undefined || value.rowLimit !== undefined) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  if (isSqlQuery) {
+    if (value.engine !== 'mysql' || typeof value.database !== 'string'
+      || !isRuntimeId(value.queryId) || typeof value.sql !== 'string' || value.sql.trim().length === 0
+      || value.sql.includes('\0') || getUtf8ByteLength(value.sql) > 16_384
+      || typeof value.maxRows !== 'number' || !Number.isSafeInteger(value.maxRows) || value.maxRows < 1 || value.maxRows > 200
+      || value.diagnosticSection !== undefined || value.diagnosticDatabase !== undefined
+      || value.schemaDatabase !== undefined || value.schemaTable !== undefined) {
+      throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+    }
+  } else if (value.queryId !== undefined || value.sql !== undefined || value.maxRows !== undefined) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  return {
+    requestId: value.requestId,
+    hostId: value.hostId,
+    connectionId: value.connectionId,
+    transport: value.transport,
+    mode: value.mode,
+    engine: value.engine,
+    address: value.address,
+    port: value.port,
+    ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.username === undefined ? {} : { username: value.username }),
+    ...(value.password === undefined ? {} : { password: value.password }),
+    tlsMode: value.tlsMode,
+    ...(value.tlsServerName === undefined ? {} : { tlsServerName: value.tlsServerName }),
+    timeoutMs: value.timeoutMs,
+    ...(value.diagnosticSection === undefined ? {} : { diagnosticSection: value.diagnosticSection }),
+    ...(value.diagnosticDatabase === undefined ? {} : { diagnosticDatabase: value.diagnosticDatabase }),
+    ...(schemaDatabase === undefined ? {} : { schemaDatabase }),
+    ...(schemaTable === undefined ? {} : { schemaTable }),
+    ...(value.rowOffset === undefined ? {} : { rowOffset: value.rowOffset }),
+    ...(value.rowLimit === undefined ? {} : { rowLimit: value.rowLimit }),
+    ...(value.queryId === undefined ? {} : { queryId: value.queryId }),
+    ...(value.sql === undefined ? {} : { sql: value.sql }),
+    ...(value.maxRows === undefined ? {} : { maxRows: value.maxRows }),
+  }
+}
+
 /** 严格解析只在 main 与 utility 间传输的日志命令。 */
 function parseLogStartRequest(value: unknown): ServerOpsRuntimeLogStartRequest {
   if (!hasExactKeys(value, ['streamId', 'hostId', 'connectionId', 'command'])
@@ -250,6 +482,13 @@ export function parseServerOpsRuntimeRequest(value: unknown): ServerOpsRuntimeRe
     }
     if (value.type === 'server-ops.exec' && hasExactKeys(value, ['type', 'input'])) {
       return { type: value.type, input: parseExecRequest(value.input) }
+    }
+    if (value.type === 'server-ops.data-read' && hasExactKeys(value, ['type', 'input'])) {
+      return { type: value.type, input: parseDataReadRequest(value.input) }
+    }
+    if (value.type === 'server-ops.data-cancel' && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId'])
+      && isRuntimeId(value.requestId) && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
+      return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId }
     }
     if ((value.type === 'server-ops.disconnect' || value.type === 'server-ops.terminal-input')
       && hasExactKeys(value, value.type === 'server-ops.disconnect' ? ['type', 'hostId', 'connectionId'] : ['type', 'hostId', 'connectionId', 'data'])
@@ -345,6 +584,154 @@ function parseExecResult(value: unknown): ServerOpsRuntimeExecResult {
   }
 }
 
+/** 严格解析 utility process 返回的数据服务读取结果。 */
+function parseDataReadResult(value: unknown): ServerOpsRuntimeDataReadResult {
+  if (!isRecord(value)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  if (value.queryId !== undefined) return parseServerOpsDataQueryResult(value)
+  /** 表浏览结果按 mode 走各自的严格解析；没有 mode 字段的即为诊断/连接测试结果。 */
+  if (value.mode === 'schema-tables') return parseSchemaTablesResult(value)
+  if (value.mode === 'schema-table') return parseSchemaTableResult(value)
+  if (value.mode === 'schema-rows') return parseSchemaRowsResult(value)
+  /** 版本字段可选，其余字段必须齐全。 */
+  const keys = ['capability', 'metrics', 'tables', 'warnings']
+    .concat(value.serverVersion === undefined ? [] : ['serverVersion'])
+    .concat(value.parameters === undefined ? [] : ['parameters'])
+    .concat(value.parametersTruncated === undefined ? [] : ['parametersTruncated'])
+  if (!hasExactKeys(value, keys)
+    || !isServerOpsDataCapability(value.capability)
+    || (value.serverVersion !== undefined && (typeof value.serverVersion !== 'string'
+      || value.serverVersion.length < 1 || value.serverVersion.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.serverVersion)))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  /** 指标与表格复用共享合同的严格解析，避免两侧形状漂移。 */
+  const metrics = parseServerOpsDataMetricList(value.metrics)
+  const tables = parseServerOpsDataTableList(value.tables)
+  /** 参数结果复用公开诊断 parser，集中保持数量与字段边界。 */
+  const parsedDiagnostics = importDiagnosticsFields(value)
+  /** 能力状态与结果内容必须自洽，未连通时不允许携带诊断数据。 */
+  if (value.capability === 'available') {
+    if (value.serverVersion === undefined) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  } else if (value.serverVersion !== undefined || metrics.length > 0 || tables.length > 0) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  return {
+    capability: value.capability,
+    ...(value.serverVersion === undefined ? {} : { serverVersion: value.serverVersion }),
+    metrics,
+    tables,
+    ...(parsedDiagnostics.parameters === undefined ? {} : { parameters: parsedDiagnostics.parameters }),
+    ...(parsedDiagnostics.parametersTruncated === undefined ? {} : { parametersTruncated: parsedDiagnostics.parametersTruncated }),
+    warnings: parseServerOpsDataWarnings(value.warnings),
+  }
+}
+
+/** 解析 runtime 诊断中的可选参数字段。 */
+function importDiagnosticsFields(value: Record<string, unknown>): Pick<import('@proma/shared').ServerOpsDataDiagnosticsResult, 'parameters' | 'parametersTruncated'> {
+  const parsed = parseServerOpsDataDiagnosticsResult({
+    sourceId: 'runtime-result',
+    engine: 'mysql',
+    capability: value.capability,
+    collectedAt: 0,
+    metrics: value.metrics,
+    tables: value.tables,
+    ...(value.parameters === undefined ? {} : { parameters: value.parameters }),
+    ...(value.parametersTruncated === undefined ? {} : { parametersTruncated: value.parametersTruncated }),
+    warnings: value.warnings,
+  })
+  return {
+    ...(parsed.parameters === undefined ? {} : { parameters: parsed.parameters }),
+    ...(parsed.parametersTruncated === undefined ? {} : { parametersTruncated: parsed.parametersTruncated }),
+  }
+}
+
+/** 解析表浏览的库/表清单结果。 */
+function parseSchemaTablesResult(value: Record<string, unknown>): ServerOpsRuntimeDataSchemaTablesResult {
+  const keys = ['mode', 'capability', 'databases', 'tables', 'warnings']
+    .concat(value.database === undefined ? [] : ['database'])
+    .concat(value.databasesTruncated === undefined ? [] : ['databasesTruncated'])
+    .concat(value.tablesTruncated === undefined ? [] : ['tablesTruncated'])
+  if (!hasExactKeys(value, keys)
+    || !isServerOpsDataCapability(value.capability)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  /** 清单字段复用共享合同的表摘要校验，避免两侧字段漂移。 */
+  const parsed = parseServerOpsDataSourceTablesResult({
+    databases: value.databases,
+    tables: value.tables,
+    ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.databasesTruncated === undefined ? {} : { databasesTruncated: value.databasesTruncated }),
+    ...(value.tablesTruncated === undefined ? {} : { tablesTruncated: value.tablesTruncated }),
+  })
+  /** 能力状态与内容必须自洽：未连通时不允许携带清单。 */
+  if (parsed.database !== undefined && !parsed.databases.includes(parsed.database)) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  if (value.capability !== 'available' && (parsed.database !== undefined || parsed.databases.length > 0 || parsed.tables.length > 0)) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  return {
+    mode: 'schema-tables',
+    capability: value.capability,
+    ...(parsed.database === undefined ? {} : { database: parsed.database }),
+    databases: parsed.databases,
+    tables: parsed.tables,
+    ...(parsed.databasesTruncated === undefined ? {} : { databasesTruncated: parsed.databasesTruncated }),
+    ...(parsed.tablesTruncated === undefined ? {} : { tablesTruncated: parsed.tablesTruncated }),
+    warnings: parseServerOpsDataWarnings(value.warnings),
+  }
+}
+
+/** 解析单表结构结果。 */
+function parseSchemaTableResult(value: Record<string, unknown>): ServerOpsRuntimeDataSchemaTableResult {
+  if (!hasExactKeys(value, ['mode', 'capability', 'columns', 'indexes', 'warnings'])
+    || !isServerOpsDataCapability(value.capability)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  const parsed = parseServerOpsDataSourceTableResult({ columns: value.columns, indexes: value.indexes })
+  if (value.capability === 'available') {
+    if (parsed.columns.length === 0) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  } else if (parsed.columns.length > 0 || parsed.indexes.length > 0) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  return {
+    mode: 'schema-table',
+    capability: value.capability,
+    columns: parsed.columns,
+    indexes: parsed.indexes,
+    warnings: parseServerOpsDataWarnings(value.warnings),
+  }
+}
+
+/** 解析分页行预览结果。 */
+function parseSchemaRowsResult(value: Record<string, unknown>): ServerOpsRuntimeDataSchemaRowsResult {
+  const keys = ['mode', 'capability', 'columns', 'rows', 'offset', 'limit', 'truncated', 'warnings']
+    .concat(value.totalEstimate === undefined ? [] : ['totalEstimate'])
+    .concat(value.hasMore === undefined ? [] : ['hasMore'])
+    .concat(value.orderedByPrimaryKey === undefined ? [] : ['orderedByPrimaryKey'])
+  if (!hasExactKeys(value, keys) || !isServerOpsDataCapability(value.capability)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  const parsed = parseServerOpsDataSourceRowsResult({
+    columns: value.columns,
+    rows: value.rows,
+    offset: value.offset,
+    limit: value.limit,
+    truncated: value.truncated,
+    ...(value.totalEstimate === undefined ? {} : { totalEstimate: value.totalEstimate }),
+    ...(value.hasMore === undefined ? {} : { hasMore: value.hasMore }),
+    ...(value.orderedByPrimaryKey === undefined ? {} : { orderedByPrimaryKey: value.orderedByPrimaryKey }),
+  })
+  /** 未连通时只允许回空网格，不允许携带任何行。 */
+  if (value.capability !== 'available' && parsed.rows.length > 0) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  return {
+    mode: 'schema-rows',
+    capability: value.capability,
+    columns: parsed.columns,
+    rows: parsed.rows,
+    offset: parsed.offset,
+    limit: parsed.limit,
+    truncated: parsed.truncated,
+    ...(parsed.totalEstimate === undefined ? {} : { totalEstimate: parsed.totalEstimate }),
+    ...(parsed.hasMore === undefined ? {} : { hasMore: parsed.hasMore }),
+    ...(parsed.orderedByPrimaryKey === undefined ? {} : { orderedByPrimaryKey: parsed.orderedByPrimaryKey }),
+    warnings: parseServerOpsDataWarnings(value.warnings),
+  }
+}
+
 /** 严格解析 utility process 返回的终端退出事件。 */
 function parseTerminalExitEvent(value: unknown): ServerOpsTerminalExitEvent {
   const keys = ['hostId', 'connectionId', 'message']
@@ -378,11 +765,17 @@ export function parseServerOpsRuntimeMessage(value: unknown): ServerOpsRuntimeMe
       && typeof value.pid === 'number' && Number.isSafeInteger(value.pid) && value.pid >= 1 && value.pid <= 2_147_483_647) {
       return { type: value.type, pid: value.pid }
     }
-    if ((value.type === 'server-ops.connect-result' || value.type === 'server-ops.exec-result')
+    if ((value.type === 'server-ops.connect-result' || value.type === 'server-ops.exec-result' || value.type === 'server-ops.data-read-result')
       && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId', 'result'])
       && isRuntimeId(value.requestId) && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
       if (value.type === 'server-ops.connect-result') return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseConnectResult(value.result) }
-      return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseExecResult(value.result) }
+      if (value.type === 'server-ops.exec-result') return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseExecResult(value.result) }
+      return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseDataReadResult(value.result) }
+    }
+    if (value.type === 'server-ops.data-read-cancelled'
+      && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId'])
+      && isRuntimeId(value.requestId) && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
+      return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId }
     }
     if (value.type === 'server-ops.error'
       && hasExactKeys(value, value.requestId === undefined

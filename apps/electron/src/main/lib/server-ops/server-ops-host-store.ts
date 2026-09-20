@@ -38,6 +38,15 @@ export interface ServerOpsHostStoreDependencies {
   now: () => number
   /** 覆盖 fresh-read 与原子提交的同步短事务。 */
   transaction?: ServerOpsConfigTransaction
+  /**
+   * 迁移期解析默认项目 ID。
+   *
+   * 未注入时保持原行为（不补 `projectId`），便于不关心项目模型的测试继续沿用；
+   * 主进程会注入项目 Store 的 `ensureDefaultProject()`。
+   */
+  resolveDefaultProjectId?: () => string
+  /** 在当前配置事务内解析并验证新主机的项目归属。 */
+  resolveProjectId?: (projectId?: string) => string
 }
 
 /** 创建生产环境使用的主机 Store 依赖。 */
@@ -58,6 +67,11 @@ export function createServerOpsHostStoreDependencies(): ServerOpsHostStoreDepend
 /** 复制单条主机记录，阻断调用方修改内部标签数组。 */
 function cloneHost(host: ServerOpsHost): ServerOpsHost {
   return { ...host, tags: [...host.tags] }
+}
+
+/** 判断单条主机记录是否缺少项目归属。 */
+function needsProjectMigration(host: ServerOpsHost): boolean {
+  return host.projectId === undefined
 }
 
 /** 旧版曾把私钥路径保存在公开主机记录中。 */
@@ -92,9 +106,14 @@ function migrateStoredHost(host: ServerOpsStoredHost): ServerOpsHost {
   return migrated as unknown as ServerOpsHost
 }
 
+/** 为缺少项目归属的主机补默认项目，其余字段原样保留。 */
+function withDefaultProject(host: ServerOpsHost, projectId: string): ServerOpsHost {
+  return host.projectId === undefined ? { ...host, projectId } : host
+}
+
 /** 判断 Store 时间源是否返回可持久化时间戳。 */
 function isValidTimestamp(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= 0
+  return Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000
 }
 
 /** 管理 `~/.proma/server-ops/hosts.json` 的全局服务器资产。 */
@@ -127,12 +146,12 @@ export class ServerOpsHostStore {
   /** 返回当前主机资产的深层副本。 */
   list(): ServerOpsHost[] {
     const loaded = this.readStoredHosts()
-    if (!loaded.hasLegacyKeyPath) return loaded.hosts.map(cloneHost)
+    if (!loaded.needsMigration) return loaded.hosts.map(cloneHost)
     return this.transaction(() => {
       /** 迁移前在锁内重新读取，避免覆盖另一实例刚提交的变化。 */
       const authoritative = this.readStoredHosts()
-      if (authoritative.hasLegacyKeyPath) {
-        // 连续两次原子提交让 safe-file 的主文件与备份都替换为已脱敏 schema。
+      if (authoritative.needsMigration) {
+        // 连续两次原子提交让 safe-file 的主文件与备份都换成已迁移 schema（脱敏 + 项目归属）。
         this.persist(authoritative.hosts, authoritative.expectedDestination, authoritative.priorBackup)
         this.persist(authoritative.hosts, this.captureDestinationExpectation(), authoritative.hosts.map(cloneHost))
       }
@@ -182,17 +201,21 @@ export class ServerOpsHostStore {
         /** 经过索引存在性校验的当前主机。 */
         const existing = hosts[index]
         if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+        if (input.projectId !== undefined && input.projectId !== existing.projectId) {
+          throw new Error('SERVER_OPS_HOST_PROJECT_MISMATCH')
+        }
         /** 保留创建时间并更新可编辑字段的新记录。 */
         const updated: ServerOpsHost = {
           ...parsed,
           id: hostId,
+          ...(existing.projectId === undefined ? {} : { projectId: existing.projectId }),
           ...(existing.authMethod === parsed.authMethod && existing.credentialRef ? { credentialRef: existing.credentialRef } : {}),
           createdAt: existing.createdAt,
           updatedAt: Math.max(now, existing.updatedAt),
         }
         /** 原子写入前构造的完整下一快照。 */
         const nextHosts = hosts.map((host, hostIndex) => hostIndex === index ? updated : host)
-        this.persistAndClearLegacyBackup(nextHosts, loaded.hasLegacyKeyPath, loaded.expectedDestination, loaded.priorBackup)
+        this.persistAndClearLegacyBackup(nextHosts, loaded.needsMigration, loaded.expectedDestination, loaded.priorBackup)
         return cloneHost(updated)
       }
 
@@ -202,9 +225,67 @@ export class ServerOpsHostStore {
         throw new Error('SERVER_OPS_HOST_ID_INVALID')
       }
       /** 待新增并写盘的主机记录。 */
-      const created: ServerOpsHost = { ...parsed, id, createdAt: now, updatedAt: now }
-      this.persistAndClearLegacyBackup([...hosts, created], loaded.hasLegacyKeyPath, loaded.expectedDestination, loaded.priorBackup)
+      const projectId = this.resolveCreatedProjectId(input.projectId)
+      const created: ServerOpsHost = {
+        ...parsed,
+        id,
+        ...(projectId === undefined ? {} : { projectId }),
+        createdAt: now,
+        updatedAt: now,
+      }
+      this.persistAndClearLegacyBackup([...hosts, created], loaded.needsMigration, loaded.expectedDestination, loaded.priorBackup)
       return cloneHost(created)
+    })
+  }
+
+  /** 在外层写事务内解析新主机归属，显式项目缺少解析器时 fail closed。 */
+  private resolveCreatedProjectId(projectId?: string): string | undefined {
+    if (this.dependencies.resolveProjectId !== undefined) return this.dependencies.resolveProjectId(projectId)
+    if (projectId !== undefined) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+    return this.dependencies.resolveDefaultProjectId?.()
+  }
+
+  /**
+   * 独立移动主机归属；只修改项目与更新时间，保留稳定身份、凭据和连接配置。
+   *
+   * @param hostId 待移动主机 ID
+   * @param fromProjectId 调用方看到的原项目，用于拒绝过期操作
+   * @param targetProjectId 当前权威项目文件中必须存在的目标项目
+   * @returns 移动后的权威主机副本
+   */
+  move(hostId: string, fromProjectId: string, targetProjectId: string): ServerOpsHost {
+    if (!isServerOpsId(hostId)) throw new Error('SERVER_OPS_HOST_ID_INVALID')
+    if (!isServerOpsId(fromProjectId) || !isServerOpsId(targetProjectId)) {
+      throw new Error('SERVER_OPS_PROJECT_ID_INVALID')
+    }
+    return this.transaction(() => {
+      /** 移动必须基于锁内 fresh read，避免覆盖其它窗口已完成的归属变更。 */
+      const loaded = this.readStoredHosts()
+      const index = loaded.hosts.findIndex((host) => host.id === hostId)
+      if (index < 0) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+      const existing = loaded.hosts[index]
+      if (!existing) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
+      if (existing.projectId !== fromProjectId) throw new Error('SERVER_OPS_CONNECTION_PROJECT_CHANGED')
+      /** 目标验证必须与写入处于同一配置事务；漏接依赖时禁止盲写。 */
+      const resolveProjectId = this.dependencies.resolveProjectId
+      if (!resolveProjectId) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+      const resolvedTargetProjectId = resolveProjectId(targetProjectId)
+      if (resolvedTargetProjectId === existing.projectId) return cloneHost(existing)
+      /** 只有真实跨项目移动才读取时间源并写盘。 */
+      const now = this.dependencies.now()
+      if (!isValidTimestamp(now)) throw new Error('SERVER_OPS_HOST_TIMESTAMP_INVALID')
+      const moved: ServerOpsHost = {
+        ...existing,
+        projectId: resolvedTargetProjectId,
+        updatedAt: Math.max(now, existing.updatedAt),
+      }
+      this.persistAndClearLegacyBackup(
+        loaded.hosts.map((host, hostIndex) => hostIndex === index ? moved : host),
+        loaded.needsMigration,
+        loaded.expectedDestination,
+        loaded.priorBackup,
+      )
+      return cloneHost(moved)
     })
   }
 
@@ -219,14 +300,14 @@ export class ServerOpsHostStore {
     return this.transaction(() => {
       const loaded = this.readStoredHosts()
       if (!loaded.hosts.some((host) => host.id === hostId)) {
-        if (loaded.hasLegacyKeyPath) {
+        if (loaded.needsMigration) {
           this.persistAndClearLegacyBackup(loaded.hosts, true, loaded.expectedDestination, loaded.priorBackup)
         }
         return false
       }
       this.persistAndClearLegacyBackup(
         loaded.hosts.filter((host) => host.id !== hostId),
-        loaded.hasLegacyKeyPath,
+        loaded.needsMigration,
         loaded.expectedDestination,
         loaded.priorBackup,
       )
@@ -258,7 +339,7 @@ export class ServerOpsHostStore {
       if (credentialRef === undefined) delete updated.credentialRef
       this.persistAndClearLegacyBackup(
         loaded.hosts.map((host, hostIndex) => hostIndex === index ? updated : host),
-        loaded.hasLegacyKeyPath,
+        loaded.needsMigration,
         loaded.expectedDestination,
         loaded.priorBackup,
       )
@@ -269,7 +350,8 @@ export class ServerOpsHostStore {
   /** fresh-read 当前或旧 schema；已有坏文件不得被当作空列表覆盖。 */
   private readStoredHosts(): {
     hosts: ServerOpsHost[]
-    hasLegacyKeyPath: boolean
+    /** 是否存在需要立刻回写的迁移（旧 keyPath 或缺少项目归属）。 */
+    needsMigration: boolean
     expectedDestination: AtomicDestinationExpectation
     priorBackup?: object
   } {
@@ -278,26 +360,32 @@ export class ServerOpsHostStore {
     const expectedDestination = this.captureDestinationExpectation()
     if (loaded === null) {
       if (existed) throw new Error('SERVER_OPS_HOST_READ_FAILED')
-      return { hosts: [], hasLegacyKeyPath: false, expectedDestination }
+      return { hosts: [], needsMigration: false, expectedDestination }
     }
+    /** 去除旧 keyPath 后的主机记录。 */
+    const migrated = loaded.map(migrateStoredHost).map(cloneHost)
+    /** 缺少项目归属的主机数量；决定是否需要回写迁移结果。 */
+    const missingProject = migrated.filter((host) => needsProjectMigration(host)).length
+    /** 迁移期解析默认项目；未接线时保持原行为。 */
+    const defaultProjectId = missingProject > 0 ? this.dependencies.resolveDefaultProjectId?.() : undefined
     return {
-      hosts: loaded.map(migrateStoredHost).map(cloneHost),
-      hasLegacyKeyPath: loaded.some((host) => 'keyPath' in host),
+      hosts: defaultProjectId === undefined ? migrated : migrated.map((host) => withDefaultProject(host, defaultProjectId)),
+      needsMigration: loaded.some((host) => 'keyPath' in host) || (missingProject > 0 && defaultProjectId !== undefined),
       expectedDestination,
       priorBackup: loaded.map((host) => ({ ...host, tags: [...host.tags] })),
     }
   }
 
-  /** 写入最终快照；旧 keyPath 存在时再写一次，确保 backup 同样脱敏。 */
+  /** 写入最终快照；存在迁移时再写一次，确保 backup 与主文件一致。 */
   private persistAndClearLegacyBackup(
     hosts: readonly ServerOpsHost[],
-    hadLegacyKeyPath: boolean,
+    hadMigration: boolean,
     expectedDestination: AtomicDestinationExpectation,
     priorBackup?: object,
   ): void {
     const sanitized = hosts.map(cloneHost)
     this.persist(hosts, expectedDestination, priorBackup)
-    if (hadLegacyKeyPath) this.persist(hosts, this.captureDestinationExpectation(), sanitized)
+    if (hadMigration) this.persist(hosts, this.captureDestinationExpectation(), sanitized)
   }
 
   /** 使用 safe-file 原子边界持久化完整主机快照。 */

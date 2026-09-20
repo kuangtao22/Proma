@@ -41,6 +41,10 @@ describe('Server Ops utility runtime 请求协议', () => {
       { type: 'server-ops.log-start', input: { streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', command: 'journalctl -f' } },
       { type: 'server-ops.log-stop', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.log-ack', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: 0 },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'parameters' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-2', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'sessions', diagnosticDatabase: ' app data ' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: 3306, database: 'app', tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT id FROM users', maxRows: 50 } },
+      { type: 'server-ops.data-cancel', requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.shutdown' },
     ]
 
@@ -69,6 +73,15 @@ describe('Server Ops utility runtime 请求协议', () => {
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: 'pwd', timeoutMs: 999 } },
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: 'pwd', timeoutMs: 120_001 } },
       { ...createConnectRequest() as object, extra: true },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'unknown' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'overview', diagnosticDatabase: 'app' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'redis', address: '127.0.0.1', port: 6379, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'sessions', diagnosticDatabase: '0' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'probe', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticDatabase: 'app' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'sessions', diagnosticDatabase: ' \n ' } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'diagnostics', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000, diagnosticSection: 'statements', diagnosticDatabase: 'x'.repeat(65) } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'sql-query', engine: 'redis', address: '127.0.0.1', port: 6379, database: '0', tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 50 } },
+      { type: 'server-ops.data-read', input: { requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: 3306, database: 'app', tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 50, rowLimit: 50 } },
+      { type: 'server-ops.data-cancel', requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', extra: true },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, address: 'bad host' } },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, port: 65_536 } },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, username: '' } },
@@ -100,6 +113,11 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.log-chunk', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: 0, data: '服务\n' },
       { type: 'server-ops.log-exit', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', reason: 'stopped' },
       { type: 'server-ops.log-exit', streamId: 'stream-2', hostId: 'host-1', connectionId: 'connection-1', reason: 'error', errorCode: 'SERVER_OPS_LOG_STREAM_FAILED' },
+      { type: 'server-ops.data-read-result', requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', result: { capability: 'available', serverVersion: '8.0.36', metrics: [], tables: [], parameters: [{ name: 'autocommit', value: 'ON', scope: 'global' }], parametersTruncated: false, warnings: [] } },
+      { type: 'server-ops.data-read-result', requestId: 'data-2', hostId: 'host-1', connectionId: 'connection-1', result: { mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users', type: 'table' }], databasesTruncated: true, tablesTruncated: false, warnings: [] } },
+      { type: 'server-ops.data-read-result', requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', result: { mode: 'schema-rows', capability: 'available', columns: ['payload'], rows: [[{ kind: 'binary', bytes: 8 }]], offset: 0, limit: 50, truncated: false, hasMore: false, orderedByPrimaryKey: true, warnings: [] } },
+      { type: 'server-ops.data-read-result', requestId: 'data-4', hostId: 'host-1', connectionId: 'connection-1', result: { queryId: 'query-1', database: 'app', columns: ['id'], rows: [['1']], rowCount: 1, durationMs: 12, truncated: false, warnings: [] } },
+      { type: 'server-ops.data-read-cancelled', requestId: 'data-4', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.stopped' },
     ]
 
@@ -127,6 +145,8 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.log-chunk', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', sequence: 0, data: '你'.repeat(10_923) },
       { type: 'server-ops.log-exit', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', reason: 'stopped', errorCode: 'SERVER_OPS_LOG_STREAM_FAILED' },
       { type: 'server-ops.log-exit', streamId: 'stream-1', hostId: 'host-1', connectionId: 'connection-1', reason: 'unknown' },
+      { type: 'server-ops.data-read-result', requestId: 'data-1', hostId: 'host-1', connectionId: 'connection-1', result: { mode: 'schema-rows', capability: 'available', columns: ['payload'], rows: [[{ kind: 'binary', bytes: -1 }]], offset: 0, limit: 50, truncated: false, warnings: [] } },
+      { type: 'server-ops.data-read-cancelled', requestId: '', hostId: 'host-1', connectionId: 'connection-1' },
     ]
 
     for (const message of invalidMessages) {

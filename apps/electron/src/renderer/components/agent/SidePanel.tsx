@@ -2167,7 +2167,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ) : paneTab === 'vault' ? (
       <div className="min-h-0 flex-1 overflow-hidden"><VaultView embedded sessionId={sessionId} /></div>
     ) : paneTab === 'server-ops' ? (
-      <ServerOpsWorkspace />
+      <ServerOpsWorkspace viewScope={`${sessionId}:${pane ?? 'single'}`} paneActive={paneActive} />
     ) : paneTab === 'changes' ? (
       sessionPath ? (
         <DiffChangesList

@@ -171,6 +171,155 @@ describe('服务器运维主机资产 Store', () => {
     expect(store.remove('missing')).toBe(false)
   })
 
+  test('Given 新主机 When 指定项目或沿用旧调用 Then 在事务内解析归属', () => {
+    const configDir = createConfigDir()
+    /** 记录归属解析时事务是否仍然持有。 */
+    let transactionDepth = 0
+    /** 测试使用的同步事务。 */
+    const transaction = <T>(callback: () => T): T => {
+      transactionDepth += 1
+      try { return callback() } finally { transactionDepth -= 1 }
+    }
+    const store = new ProductionServerOpsHostStore(configDir, {
+      transaction,
+      uuid: (() => { let sequence = 0; return () => `host-${++sequence}` })(),
+      now: () => 1_000,
+      resolveProjectId: (projectId) => {
+        expect(transactionDepth).toBeGreaterThan(0)
+        if (projectId === 'project-missing') throw new Error('SERVER_OPS_PROJECT_NOT_FOUND')
+        return projectId ?? 'project-default'
+      },
+    })
+    /** 基础主机输入。 */
+    const input = { name: '生产 API', address: '10.0.0.8', port: 22, username: 'deploy', authMethod: 'ssh-agent' as const, tags: [] }
+    expect(store.upsert({ ...input, projectId: 'project-2' }).projectId).toBe('project-2')
+    expect(store.upsert(input).projectId).toBe('project-default')
+    expect(() => store.upsert({ ...input, projectId: 'project-missing' })).toThrow('SERVER_OPS_PROJECT_NOT_FOUND')
+    expect(store.list()).toHaveLength(2)
+  })
+
+  test('Given 已归属主机 When 编辑 Then 保留归属且拒绝迁移', () => {
+    const configDir = createConfigDir()
+    const store = new ServerOpsHostStore(configDir, {
+      uuid: () => 'host-1', now: () => 1_000, resolveProjectId: (projectId) => projectId ?? 'project-1',
+    })
+    /** 已归属项目一的主机。 */
+    const created = store.upsert({
+      projectId: 'project-1', name: '生产 API', address: '10.0.0.8', port: 22,
+      username: 'deploy', authMethod: 'ssh-agent', tags: [],
+    })
+    expect(store.upsert({ ...created, name: '生产 API 01', projectId: undefined }).projectId).toBe('project-1')
+    expect(() => store.upsert({ ...created, projectId: 'project-2' })).toThrow('SERVER_OPS_HOST_PROJECT_MISMATCH')
+  })
+
+  test('Given 已归属 SSH 主机 When 独立移动 Then 仅更新项目与时间并保留身份凭据', () => {
+    const configDir = createConfigDir()
+    let now = 1_000
+    const store = new ServerOpsHostStore(configDir, {
+      uuid: () => 'host-1', now: () => now, resolveProjectId: (projectId) => projectId ?? 'project-1',
+    })
+    const created = store.upsert({
+      projectId: 'project-1', name: '生产 API', address: '10.0.0.8', port: 2222,
+      username: 'deploy', authMethod: 'password', tags: ['生产'],
+    })
+    store.setCredentialRef(created.id, 'credential-1')
+    now = 2_000
+
+    expect(store.move('host-1', 'project-1', 'project-2')).toEqual({
+      ...created, projectId: 'project-2', credentialRef: 'credential-1', updatedAt: 2_000,
+    })
+  })
+
+  test('Given 目标缺失、源缺失或原项目过期 When 移动 SSH 主机 Then 拒绝且不写盘', () => {
+    const configDir = createConfigDir()
+    const store = new ServerOpsHostStore(configDir, {
+      uuid: () => 'host-1', now: () => 1_000,
+      resolveProjectId: (projectId) => {
+        if (projectId === 'project-missing') throw new Error('SERVER_OPS_PROJECT_NOT_FOUND')
+        return projectId ?? 'project-1'
+      },
+    })
+    store.upsert({ projectId: 'project-1', name: 'A', address: '10.0.0.1', port: 22, username: 'root', authMethod: 'ssh-agent', tags: [] })
+    const filePath = join(configDir, 'server-ops', 'hosts.json')
+    const before = readFileSync(filePath, 'utf8')
+
+    expect(() => store.move('host-missing', 'project-1', 'project-2')).toThrow('SERVER_OPS_HOST_NOT_FOUND')
+    expect(() => store.move('host-1', 'project-stale', 'project-2')).toThrow('SERVER_OPS_CONNECTION_PROJECT_CHANGED')
+    expect(() => store.move('host-1', 'project-1', 'project-missing')).toThrow('SERVER_OPS_PROJECT_NOT_FOUND')
+    expect(readFileSync(filePath, 'utf8')).toBe(before)
+  })
+
+  test('Given 同项目、缺少项目解析器或写盘失败 When 移动 SSH 主机 Then 幂等或 fail closed 且保留原文件', () => {
+    const configDir = createConfigDir()
+    const dependencies = createServerOpsHostStoreDependencies()
+    let writes = 0
+    let failWrite = false
+    const store = new ServerOpsHostStore(configDir, {
+      uuid: () => 'host-1', now: () => 2_000, resolveProjectId: (projectId) => projectId ?? 'project-1',
+      writeJson: (filePath, data, expectedDestination, priorBackup) => {
+        writes += 1
+        if (failWrite) throw new Error('WRITE_FAILED')
+        dependencies.writeJson(filePath, data, expectedDestination, priorBackup)
+      },
+    })
+    store.upsert({ projectId: 'project-1', name: 'A', address: '10.0.0.1', port: 22, username: 'root', authMethod: 'ssh-agent', tags: [] })
+    const filePath = join(configDir, 'server-ops', 'hosts.json')
+    const before = readFileSync(filePath, 'utf8')
+    const writesBeforeIdempotentMove = writes
+    expect(store.move('host-1', 'project-1', 'project-1').updatedAt).toBe(2_000)
+    expect(writes).toBe(writesBeforeIdempotentMove)
+
+    const unavailable = new ServerOpsHostStore(configDir, { now: () => 3_000 })
+    expect(() => unavailable.move('host-1', 'project-1', 'project-2')).toThrow('SERVER_OPS_PROJECT_UNAVAILABLE')
+    failWrite = true
+    expect(() => store.move('host-1', 'project-1', 'project-2')).toThrow('WRITE_FAILED')
+    expect(readFileSync(filePath, 'utf8')).toBe(before)
+  })
+
+  test('Given 同目录两个 Store 已读取旧归属 When A 移动后 B 继续操作 Then 过期移动拒绝且另一记录不覆盖 A', () => {
+    const configDir = createConfigDir()
+    /** 模拟生产共用事务，并验证目标项目解析发生在持锁期间。 */
+    let transactionDepth = 0
+    const transaction = <T>(callback: () => T): T => {
+      transactionDepth += 1
+      try { return callback() } finally { transactionDepth -= 1 }
+    }
+    let sequence = 0
+    const seed = new ProductionServerOpsHostStore(configDir, {
+      transaction,
+      uuid: () => `host-${++sequence}`,
+      now: () => 1_000,
+      resolveProjectId: (projectId) => projectId ?? 'project-1',
+    })
+    const input = { projectId: 'project-1', address: '10.0.0.1', port: 22,
+      username: 'root', authMethod: 'ssh-agent' as const, tags: [] }
+    seed.upsert({ ...input, name: 'A' })
+    seed.upsert({ ...input, name: 'B', address: '10.0.0.2' })
+    /** 两个实例在移动前都读取同一份旧归属，模拟两个 Pane 的陈旧视图。 */
+    const createStore = (now: number): ProductionServerOpsHostStore => new ProductionServerOpsHostStore(configDir, {
+      transaction,
+      now: () => now,
+      resolveProjectId: (projectId) => {
+        expect(transactionDepth).toBeGreaterThan(0)
+        return projectId ?? 'project-1'
+      },
+    })
+    const first = createStore(2_000)
+    const second = createStore(3_000)
+    expect(first.list().map((host) => host.projectId)).toEqual(['project-1', 'project-1'])
+    expect(second.list().map((host) => host.projectId)).toEqual(['project-1', 'project-1'])
+
+    first.move('host-1', 'project-1', 'project-2')
+    expect(() => second.move('host-1', 'project-1', 'project-3'))
+      .toThrow('SERVER_OPS_CONNECTION_PROJECT_CHANGED')
+    second.move('host-2', 'project-1', 'project-3')
+
+    expect(second.list().map((host) => ({ id: host.id, projectId: host.projectId }))).toEqual([
+      { id: 'host-1', projectId: 'project-2' },
+      { id: 'host-2', projectId: 'project-3' },
+    ])
+  })
+
   test('凭据引用由 Store 内部绑定且切换认证方式时清除', () => {
     /** 当前测试使用的主机 Store。 */
     const store = new ServerOpsHostStore(createConfigDir(), {

@@ -73,6 +73,7 @@ import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
 import { createServerOpsAgentFacade } from './server-ops/server-ops-agent-facade'
+import { createServerOpsAgentReadFacade } from './server-ops/server-ops-agent-read-facade'
 import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
 import { buildPiMcpTools } from './adapters/pi-mcp-tools'
 import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
@@ -1151,6 +1152,8 @@ export class AgentOrchestrator {
         triggeredBy: input.triggeredBy,
         getSession: getAgentSessionMeta,
       })
+      /** 只读多资源能力复用同一真实运行身份，内部/自动化来源不继承用户临时授权。 */
+      const serverOpsReadFacade = createServerOpsAgentReadFacade({ sessionId, triggeredBy: input.triggeredBy, getSession: getAgentSessionMeta })
       const builtinMcpResult = await buildPiBuiltinTools(piSdk, {
         sessionId,
         channelId,
@@ -1172,6 +1175,7 @@ export class AgentOrchestrator {
         trustedReferenceImagePaths: extensions.trustedReferenceImagePaths,
         captureDesignImageRequest: extensions.captureDesignImageRequest,
         ...(serverOpsFacade ? { serverOpsFacade } : {}),
+        ...(serverOpsReadFacade ? { serverOpsReadFacade } : {}),
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools
@@ -1506,6 +1510,11 @@ export class AgentOrchestrator {
             },
           )
           return denyStaleToolRun() ?? result
+        }
+
+        // 专用只读工具在 Facade 内逐次验证会话、配置身份与具体资源/库表授权。
+        if (['ops_resources', 'ops_server_overview', 'ops_server_services', 'ops_data_test', 'ops_data_diagnose', 'ops_database_tables', 'ops_database_describe', 'ops_database_rows', 'ops_database_query'].includes(toolName)) {
+          return { behavior: 'allow' as const, updatedInput: input }
         }
 
         // 服务器元数据、连接和断开均由 Facade 再次校验当前会话与单槽授权，可直接放行。

@@ -13,6 +13,8 @@ import {
 /** 可由测试主动投递 runtime 消息的内存端口。 */
 class TestRuntimePort implements ServerOpsRuntimePort {
   readonly messages: ServerOpsRuntimeRequest[] = []
+  /** 模拟已关闭 MessagePort 的同步发送异常。 */
+  throwOnPostMessage = false
   private listener: ((event: { data: unknown }) => void) | undefined
 
   close(): void {}
@@ -20,6 +22,7 @@ class TestRuntimePort implements ServerOpsRuntimePort {
   start(): void {}
 
   postMessage(message: ServerOpsRuntimeRequest): void {
+    if (this.throwOnPostMessage) throw new Error('TEST_PORT_CLOSED')
     this.messages.push(message)
   }
 
@@ -775,5 +778,51 @@ describe('服务器运维 runtime client 日志流', () => {
     expect(() => oldProcess.emit('error')).not.toThrow()
     expect(oldProcess.killCalls).toBe(1)
     await connectRotatingFixture(fixture, 1, 'connect-2')
+  })
+
+  test('Given 数据读取被取消 When utility 先返回终态结果且不再 ACK Then 丢弃结果并立即按取消结算', async () => {
+    const fixture = createFixture()
+    const controller = new AbortController()
+    const reading = fixture.client.dataRead({
+      hostId: 'server-ops-local-direct', connectionId: 'data-connection-1', transport: 'direct',
+      mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: 3306, database: 'app',
+      tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 20,
+    }, controller.signal)
+    await flushRuntimeClient()
+    fixture.port.emit({ type: 'server-ops.ready', pid: 100 })
+    await flushRuntimeClient()
+    /** 实际 requestId 由 fixture 的首个 UUID 生成。 */
+    const request = fixture.port.messages.find((message) => message.type === 'server-ops.data-read')
+    if (!request || request.type !== 'server-ops.data-read') throw new Error('SERVER_OPS_TEST_DATA_REQUEST_MISSING')
+
+    controller.abort()
+    await flushRuntimeClient()
+    expect(fixture.port.messages.at(-1)).toEqual({
+      type: 'server-ops.data-cancel', requestId: request.input.requestId,
+      hostId: request.input.hostId, connectionId: request.input.connectionId,
+    })
+    /** 匹配结果证明 utility 已完成真实清理；数据必须丢弃，但不能继续死等 ACK。 */
+    fixture.port.emit({ type: 'server-ops.data-read-result', requestId: request.input.requestId,
+      hostId: request.input.hostId, connectionId: request.input.connectionId,
+      result: { queryId: 'query-1', database: 'app', columns: [], rows: [], rowCount: 0, durationMs: 1, truncated: false, warnings: [] } })
+    await expect(reading).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CANCELLED' })
+  })
+
+  test('Given 取消消息发送时端口已关闭 When Abort Then 不抛未捕获异常并停止 utility 清理 transport', async () => {
+    const fixture = createFixture()
+    const controller = new AbortController()
+    const reading = fixture.client.dataRead({
+      hostId: 'server-ops-local-direct', connectionId: 'data-connection-1', transport: 'direct',
+      mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: 3306, database: 'app',
+      tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 20,
+    }, controller.signal)
+    await flushRuntimeClient()
+    fixture.port.emit({ type: 'server-ops.ready', pid: 100 })
+    await flushRuntimeClient()
+    fixture.port.throwOnPostMessage = true
+
+    expect(() => { controller.abort() }).not.toThrow()
+    await expect(reading).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CANCELLED' })
+    expect(fixture.runtimeProcess.killCalls).toBe(1)
   })
 })

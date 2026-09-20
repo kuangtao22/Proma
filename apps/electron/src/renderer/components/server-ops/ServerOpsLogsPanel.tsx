@@ -19,6 +19,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 
 /** 日志面板由当前主机、可见性和 SSH 连接事实共同驱动。 */
 export interface ServerOpsLogsPanelProps {
@@ -799,9 +800,9 @@ export function ServerOpsLogsPanelView({
               : connected ? '日志流未启动' : '等待 SSH 连接'
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-content-area">
-      <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-2 py-2">
+      <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'gap-1.5')}>
         {sourceLocked || source.kind === 'container' ? (
-          <div className="flex h-8 min-w-0 items-center gap-2 border border-border/60 bg-background/40 px-2 text-xs">
+          <div className="flex h-8 min-w-0 items-center gap-2 rounded-md border border-border/40 bg-background/40 px-2 text-xs">
             <span className="shrink-0">{source.kind === 'container' ? '容器日志' : source.kind === 'unit' ? '服务日志' : '系统日志'}</span>
             {source.kind === 'container' && <span className="truncate font-mono text-[10px] text-muted-foreground">{source.containerId.slice(0, 12)}...{source.containerId.slice(-6)}</span>}
           </div>
@@ -849,13 +850,13 @@ export function ServerOpsLogsPanelView({
           </div>
         </TooltipProvider>
       </div>
-      <div className="flex h-7 shrink-0 items-center gap-2 border-b border-border px-3 text-[10px] text-muted-foreground">
+      <div className={cn(SERVER_OPS_STATUSBAR_CLASS, 'min-h-7 border-b border-t-0 py-1 text-[10px]')}>
         <span role="status" aria-live="polite" aria-atomic="true">{statusLabel}</span>
         <span className="ml-auto tabular-nums">{lineCount} 行 · {Math.ceil(byteLength / 1024)} KiB · tail {tailLines}</span>
       </div>
-      {truncated && <div className="shrink-0 border-b border-border bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">日志已达到本地缓冲上限，较早内容已淘汰</div>}
-      {warning && <div className="shrink-0 border-b border-border bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">{warning}</div>}
-      {error && <div className="shrink-0 border-b border-border bg-destructive/10 px-3 py-1.5 text-[11px] text-destructive">{error}</div>}
+      {truncated && <div className="shrink-0 border-b border-border/40 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">日志已达到本地缓冲上限，较早内容已淘汰</div>}
+      {warning && <div className="shrink-0 border-b border-border/40 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">{warning}</div>}
+      {error && <div className="shrink-0 border-b border-border/40 bg-destructive/10 px-4 py-1.5 text-[11px] text-destructive">{error}</div>}
       <div className="relative min-h-0 flex-1">
         <div ref={viewportRef} onScroll={onScroll} className="absolute inset-0 overflow-auto bg-muted/15 p-3 font-mono text-[11px] leading-5 text-foreground select-text" tabIndex={0} aria-label="实时日志正文">
           {status === 'loading' && lineCount === 0 ? <div className="flex h-full items-center justify-center gap-2 text-muted-foreground"><LoaderCircle className="size-3.5 animate-spin" />正在建立日志流...</div>

@@ -1,4 +1,14 @@
+import { createHash } from 'node:crypto'
 import {
+  SERVER_OPS_DATA_QUERY_CHANNELS,
+  SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS,
+  parseServerOpsDataQueryHistoryRecordInput,
+  parseServerOpsDataQueryHistoryResultForScope,
+  parseServerOpsDataQueryHistoryScope,
+  analyzeServerOpsSqlQuery,
+  parseServerOpsDataQueryInput,
+  parseServerOpsDataQueryCancelInput,
+  parseServerOpsDataQueryResult,
   SERVER_OPS_TRANSFER_CHANNELS,
   parseServerOpsLocalFileSelection,
   parseServerOpsTransferUploadSelectionInput,
@@ -38,7 +48,35 @@ import {
   parseServerOpsDockerActionCommitInput,
   parseServerOpsDockerActionResult,
   parseServerOpsDockerActionCancelInput,
+  SERVER_OPS_DATA_CHANNELS,
+  SERVER_OPS_PROJECT_CHANNELS,
+  parseServerOpsConnectionMoveInput,
+  parseServerOpsConnectionMoveResult,
+  parseServerOpsProjectListInput,
+  parseServerOpsProjectListResult,
+  parseServerOpsProjectCreateInput,
+  parseServerOpsProjectRenameInput,
+  parseServerOpsProjectDeleteInput,
+  parseServerOpsProjectResult,
+  parseServerOpsDataSourceListInput,
+  parseServerOpsDataSourceListResult,
+  parseServerOpsDataSourceUpsertInput,
+  parseServerOpsDataSourceUpsertResult,
+  parseServerOpsDataSourceDeleteInput,
+  parseServerOpsDataSourcePasswordInput,
+  parseServerOpsDataSourcePasswordResult,
+  parseServerOpsDataSourceProbeInput,
+  parseServerOpsDataSourceRowsInput,
+  parseServerOpsDataSourceRowsResult,
+  parseServerOpsDataSourceTableInput,
+  parseServerOpsDataSourceTableResult,
+  parseServerOpsDataSourceTablesInput,
+  parseServerOpsDataSourceTablesResult,
+  parseServerOpsDataProbeResult,
+  parseServerOpsDataDiagnoseInput,
+  parseServerOpsDataDiagnosticsResult,
   SERVER_OPS_TRUST_CHANNELS,
+  SERVER_OPS_DATA_SCHEMA_CHANNELS,
   parseServerOpsTrustInput,
   parseServerOpsTrustPrepareInput,
   parseServerOpsTrustCommitInput,
@@ -49,6 +87,8 @@ import {
   SERVER_OPS_IPC_CHANNELS,
   isServerOpsId,
   parseServerOpsConnectInput,
+  parseServerOpsTestConnectionInput,
+  parseServerOpsTestConnectionResult,
   parseServerOpsConfirmHostKeyInput,
   parseServerOpsSaveHostInput,
   parseServerOpsAgentAccessInput,
@@ -75,6 +115,8 @@ import {
 import type {
   AgentSessionMeta,
   ServerOpsConnectInput,
+  ServerOpsTestConnectionInput,
+  ServerOpsTestConnectionResult,
   ServerOpsConfirmHostKeyInput,
   ServerOpsConnectionState,
   ServerOpsAgentAccess,
@@ -109,12 +151,20 @@ import type {
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { requireOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import type { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
+import { SERVER_OPS_AGENT_READ_CHANNELS, parseServerOpsAgentReadGrant, parseServerOpsAgentReadSession } from '@proma/shared'
+import { captureServerOpsReadBindings, revalidateServerOpsReadBindings } from './server-ops-agent-read-identity'
 import type { ServerOpsTrustService } from './server-ops-trust-service'
 import type { ServerOpsDockerService } from './server-ops-docker-service'
 import type { ServerOpsFileService } from './server-ops-file-service'
 import type { ServerOpsDockerConsoleService } from './server-ops-docker-console-service'
 import type { ServerOpsFileTransferService } from './server-ops-file-transfer-service'
 import type { ServerOpsLocalFileLeaseRegistry } from './server-ops-local-file-leases'
+import type { ServerOpsDataService } from './server-ops-data-service'
+import type { ServerOpsProjectStore } from './server-ops-project-store'
+import type { ServerOpsDataQueryHistoryStore } from './server-ops-data-query-history-store'
+import type { ServerOpsAuditStore } from './server-ops-audit-store'
+import { ServerOpsQueryRegistry } from './server-ops-query-registry'
+import { runAuditedServerOpsQuery } from './server-ops-query-audit'
 
 /** 运维 IPC handler 的最小签名。 */
 type ServerOpsIpcHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -132,6 +182,8 @@ export interface ServerOpsHostStoreContract {
   upsert: (input: ServerOpsUpsertHostInput) => ServerOpsHost
   setCredentialRef: (hostId: string, credentialRef?: string) => ServerOpsHost
   remove: (hostId: string) => boolean
+  /** 独立移动归属；旧测试替身可省略，真实运行时必须接线。 */
+  move?: (hostId: string, fromProjectId: string, targetProjectId: string) => ServerOpsHost
 }
 
 /** 安全凭据 Store 暴露给 IPC 层的窄接口。 */
@@ -143,6 +195,8 @@ export interface ServerOpsCredentialStoreContract {
 /** 真实 SSH 连接 Service 暴露给 IPC 的窄接口。 */
 export interface ServerOpsConnectionContract {
   connect: (input: ServerOpsConnectInput) => Promise<ServerOpsConnectionState>
+  /** 用弹窗草稿做一次不落盘的 SSH 握手测试。 */
+  testConnection: (input: ServerOpsTestConnectionInput) => Promise<ServerOpsTestConnectionResult>
   confirmHostKey: (input: ServerOpsConfirmHostKeyInput) => Promise<ServerOpsConnectionState>
   disconnect: (hostId: string) => ServerOpsConnectionState
   writeTerminal: (input: ServerOpsTerminalInput) => void
@@ -204,7 +258,8 @@ export interface ServerOpsIpcOptions {
   connections: ServerOpsConnectionContract
   credentials: ServerOpsCredentialStoreContract
   access: ServerOpsAgentAccessStore
-  audit: { list: (input: ServerOpsAuditListInput) => ServerOpsAuditListResult }
+  audit: { list: (input: ServerOpsAuditListInput) => ServerOpsAuditListResult; prepareForWrites?: () => Promise<void> }
+    & Partial<Pick<ServerOpsAuditStore, 'append'>>
   overview?: ServerOpsOverviewContract
   systemd?: ServerOpsSystemdContract
   logs?: ServerOpsLogContract
@@ -214,6 +269,12 @@ export interface ServerOpsIpcOptions {
   console?: Pick<ServerOpsDockerConsoleService, 'start' | 'close' | 'write' | 'resize' | 'acknowledge' | 'getSnapshot' | 'disposeOwner'>
   transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
   fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
+  data?: Pick<ServerOpsDataService, 'listSources' | 'upsertSource' | 'deleteSource' | 'probeSource' | 'diagnoseSource' | 'revealSourcePassword' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows' | 'removeHost'>
+    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource'>>
+  /** 本地 SQL 查询历史；不经过数据库 runtime、Agent 或审计。 */
+  queryHistory?: Pick<ServerOpsDataQueryHistoryStore, 'list' | 'save'>
+  /** 运维项目：侧栏分组与连接归属的边界。 */
+  projects?: Pick<ServerOpsProjectStore, 'list' | 'create' | 'rename' | 'remove'>
   resolveOwnerWindow?: (sender: WebContents) => ServerOpsOwnerWindow | null
   showLogSaveDialog?: (window: ServerOpsOwnerWindow, options: ServerOpsLogSaveDialogOptions) => Promise<{ canceled: boolean; filePath?: string }>
   writeTextFileAtomic?: (filePath: string, content: string) => unknown
@@ -241,6 +302,15 @@ function assertAuthorizedSender(event: IpcMainInvokeEvent, options: ServerOpsIpc
     !contents.isDestroyed() && contents.id === event.sender.id
   ))
   if (!authorized) throw new Error('SERVER_OPS_ACCESS_DENIED')
+}
+
+/** 查询历史只允许绑定到仍存在的 MySQL 数据源，避免陈旧或 Redis scope 落盘。 */
+function assertQueryHistorySource(sourceId: string, options: ServerOpsIpcOptions): void {
+  const data = options.data
+  if (!data) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+  const result = parseServerOpsDataSourceListResult(data.listSources({}))
+  const source = result.sources.find((candidate) => candidate.id === sourceId)
+  if (!source || source.engine !== 'mysql') throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
 }
 
 /** 判断主机 ID 是否满足跨进程稳定标识约束。 */
@@ -295,6 +365,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.UPSERT_HOST,
     SERVER_OPS_IPC_CHANNELS.DELETE_HOST,
     SERVER_OPS_IPC_CHANNELS.CONNECT,
+    SERVER_OPS_IPC_CHANNELS.TEST_CONNECTION,
     SERVER_OPS_IPC_CHANNELS.CONFIRM_HOST_KEY,
     SERVER_OPS_IPC_CHANNELS.DISCONNECT,
     SERVER_OPS_IPC_CHANNELS.WRITE_TERMINAL,
@@ -313,15 +384,24 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.STOP_LOG_STREAM,
     SERVER_OPS_IPC_CHANNELS.ACK_LOG_OUTPUT,
     SERVER_OPS_IPC_CHANNELS.EXPORT_LOG,
+    SERVER_OPS_AGENT_READ_CHANNELS.GET,
+    SERVER_OPS_AGENT_READ_CHANNELS.SET,
     ...Object.values(SERVER_OPS_TRUST_CHANNELS),
     ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
     ...Object.values(SERVER_OPS_FILE_CHANNELS),
     ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
     ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS),
+    ...Object.values(SERVER_OPS_DATA_CHANNELS),
+    ...Object.values(SERVER_OPS_DATA_SCHEMA_CHANNELS),
+    ...Object.values(SERVER_OPS_DATA_QUERY_CHANNELS),
+    ...Object.values(SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS),
+    ...Object.values(SERVER_OPS_PROJECT_CHANNELS),
   ]
 
   /** 当前注册器已见过的窗口 owner。 */
   const owners = new Map<string, ServerOpsOwnerWindow>()
+  /** 每个窗口只拥有自己启动的 SQL 查询，取消不得按数据源全局广播。 */
+  const queries = new ServerOpsQueryRegistry()
   /** 当前文件页代次按窗口和主机隔离；对象身份用于失效等待中的旧请求。 */
   const fileOwners = new Map<string, { windowId: number }>()
   /** 同一窗口/主机复用稳定 runtime key，但重新打开必须等待旧资源清理 ACK。 */
@@ -364,6 +444,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     if (!owners.has(ownerKey)) {
       /** listener 引用必须保留，registration dispose 才能精确解绑。 */
       const listener = (): void => {
+        queries.closeOwner(window.id)
         closedListeners.delete(ownerKey)
         try { options.logs?.disposeOwner(ownerKey) } catch { /* 窗口终态清理不能反向击穿 Electron。 */ }
         try { options.trustManagement?.disposeOwner(window.id) } catch { /* 独立清理未提交的信任候选。 */ }
@@ -489,6 +570,157 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const { window } = requireOwner(event)
     if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
     options.docker.cancelAction(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.LIST_SOURCES, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceListInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourceListResult(options.data.listSources(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.UPSERT_SOURCE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceUpsertInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    const result = parseServerOpsDataSourceUpsertResult(options.data.upsertSource(parsed))
+    /** 密码替换可能保持同一凭据引用，也必须重新授权；仅改名则保留。 */
+    if (parsed.sourceId && (parsed.password !== undefined || parsed.clearPassword)) options.access.revokeSource(parsed.sourceId)
+    revalidateServerOpsReadBindings(options.access, options)
+    return result
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.DELETE_SOURCE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceDeleteInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    options.data.deleteSource(parsed)
+    options.access.revokeSource(parsed.sourceId)
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.PROBE_SOURCE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceProbeInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataProbeResult(await options.data.probeSource(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.DIAGNOSE_SOURCE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataDiagnoseInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataDiagnosticsResult(await options.data.diagnoseSource(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.REVEAL_SOURCE_PASSWORD, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourcePasswordInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourcePasswordResult(options.data.revealSourcePassword(parsed))
+  })
+  /** 表浏览三个通道：一律只读，且标识符由 runtime 先过 information_schema 白名单。 */
+  installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.LIST_TABLES, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceTablesInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourceTablesResult(await options.data.listSchemaTables(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.DESCRIBE_TABLE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceTableInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourceTableResult(await options.data.describeSchemaTable(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_ROWS, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceRowsInput(input)
+    if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourceRowsResult(await options.data.readSchemaRows(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const request = parseServerOpsDataQueryInput(input)
+    const { window } = requireOwner(event)
+    const data = options.data
+    if (!data?.querySource) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    if (!options.audit.append) throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED')
+    /** 完整语法解析先于远端执行，审计只写无字面值的结构摘要。 */
+    const plan = analyzeServerOpsSqlQuery(request.sql, request.database)
+    return queries.run(window.id, request, (signal) => runAuditedServerOpsQuery({
+      actor: { actor: 'user', windowId: window.id },
+      summary: { sourceId: request.sourceId, database: request.database, tables: plan.tables,
+        queryHash: `sha256:${createHash('sha256').update(plan.fingerprint).digest('hex')}` },
+      audit: { append: (record) => options.audit.append!(record), prepareForWrites: () => options.audit.prepareForWrites?.() ?? Promise.resolve() },
+      check: () => {
+        if (signal.aborted || window.isDestroyed()) throw new Error('SERVER_OPS_SQL_CANCELLED')
+        assertAuthorizedSender(event, options)
+      },
+      execute: async () => {
+        const result = parseServerOpsDataQueryResult(await data.querySource!(request, signal))
+        if (result.queryId !== request.queryId || result.database !== request.database || result.rowCount > request.maxRows) throw new Error('SERVER_OPS_DATA_QUERY_RESULT_INVALID')
+        return result
+      },
+    }))
+  })
+  installHandler(SERVER_OPS_DATA_QUERY_CHANNELS.CANCEL, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const request = parseServerOpsDataQueryCancelInput(input)
+    const { window } = requireOwner(event)
+    await queries.cancel(window.id, request)
+  })
+  /** 查询历史只访问本地配置，但仍要求授权窗口与仍存在的 MySQL 数据源。 */
+  installHandler(SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const scope = parseServerOpsDataQueryHistoryScope(input)
+    const history = options.queryHistory
+    if (!history) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_UNAVAILABLE')
+    assertQueryHistorySource(scope.sourceId, options)
+    return parseServerOpsDataQueryHistoryResultForScope(history.list(scope), scope)
+  })
+  installHandler(SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.SAVE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const record = parseServerOpsDataQueryHistoryRecordInput(input)
+    const history = options.queryHistory
+    if (!history) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_UNAVAILABLE')
+    assertQueryHistorySource(record.sourceId, options)
+    return parseServerOpsDataQueryHistoryResultForScope(
+      history.save(record),
+      { sourceId: record.sourceId, database: record.database },
+    )
+  })
+  installHandler(SERVER_OPS_PROJECT_CHANNELS.MOVE_CONNECTION, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsConnectionMoveInput(input)
+    if (parsed.kind === 'ssh') {
+      if (!options.hosts.move) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+      return parseServerOpsConnectionMoveResult({
+        kind: 'ssh',
+        host: options.hosts.move(parsed.id, parsed.fromProjectId, parsed.targetProjectId),
+      })
+    }
+    if (!options.data?.moveSource) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsConnectionMoveResult({
+      kind: 'data',
+      source: options.data.moveSource(parsed.id, parsed.fromProjectId, parsed.targetProjectId),
+    })
+  })
+  installHandler(SERVER_OPS_PROJECT_CHANNELS.LIST, (event, input) => {
+    assertAuthorizedSender(event, options)
+    parseServerOpsProjectListInput(input)
+    if (!options.projects) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+    return parseServerOpsProjectListResult({ projects: options.projects.list() })
+  })
+  installHandler(SERVER_OPS_PROJECT_CHANNELS.CREATE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsProjectCreateInput(input)
+    if (!options.projects) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+    return parseServerOpsProjectResult({ project: options.projects.create(parsed.name) })
+  })
+  installHandler(SERVER_OPS_PROJECT_CHANNELS.RENAME, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsProjectRenameInput(input)
+    if (!options.projects) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+    return parseServerOpsProjectResult({ project: options.projects.rename(parsed.projectId, parsed.name) })
+  })
+  installHandler(SERVER_OPS_PROJECT_CHANNELS.DELETE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsProjectDeleteInput(input)
+    if (!options.projects) throw new Error('SERVER_OPS_PROJECT_UNAVAILABLE')
+    options.projects.remove(parsed.projectId)
   })
   installHandler(SERVER_OPS_FILE_CHANNELS.LIST, async (event, input) => {
     assertAuthorizedSender(event, options)
@@ -636,6 +868,9 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     }
     /** 主机资产原子提交后的公开记录。 */
     const saved = options.hosts.upsert(parsed.host)
+    /** 编辑端点或认证材料时先撤销旧绑定；改名/移动不影响授权。 */
+    revalidateServerOpsReadBindings(options.access, options)
+    if (previous && parsed.credentialUpdate.action !== 'keep') revokeHostAccess(saved.id)
     if (parsed.credentialUpdate.action === 'keep') return saved
     if (parsed.credentialUpdate.action === 'replace') {
       /** safeStorage 持久化后供公开主机绑定的非敏感引用。 */
@@ -656,12 +891,19 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     if (removed) {
       revokeHostAccess(input)
       options.credentials.forgetHost(input)
+      /** 数据源元数据与数据库密码密文随主机一起清理，避免留下不可达的孤儿配置。 */
+      try { options.data?.removeHost(input) } catch { /* 数据服务尚未初始化时不阻断主机删除。 */ }
     }
     return removed
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.CONNECT, (event, input) => {
     assertAuthorizedSender(event, options)
     return options.connections.connect(parseServerOpsConnectInput(input))
+  })
+  installHandler(SERVER_OPS_IPC_CHANNELS.TEST_CONNECTION, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsTestConnectionInput(input)
+    return parseServerOpsTestConnectionResult(await options.connections.testConnection(parsed))
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.CONFIRM_HOST_KEY, (event, input) => {
     assertAuthorizedSender(event, options)
@@ -698,6 +940,28 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(target.sessionId))
     if (!options.hosts.get(target.hostId)) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
     return options.access.get(target.sessionId, target.hostId) ?? null
+  })
+  installHandler(SERVER_OPS_AGENT_READ_CHANNELS.GET, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const sessionId = parseServerOpsAgentReadSession(input)
+    requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(sessionId))
+    revalidateServerOpsReadBindings(options.access, options)
+    const current = options.access.getReadCurrent()
+    return current?.sessionId === sessionId ? current : null
+  })
+  installHandler(SERVER_OPS_AGENT_READ_CHANNELS.SET, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const grant = parseServerOpsAgentReadGrant(input)
+    requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(grant.sessionId))
+    /** 先验证整组事实再一次替换，任一资源失效不能清除现有有效授权。 */
+    const bindings = captureServerOpsReadBindings(grant.resources, options)
+    const previous = options.access.getCurrent() ?? null
+    options.access.grantRead(grant, bindings)
+    if (previous && !options.access.getCurrent()) {
+      broadcast(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, { previous, current: null } satisfies ServerOpsAgentAccessChanged)
+    }
+    const current = options.access.getReadCurrent()
+    return current?.sessionId === grant.sessionId ? current : null
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, (event, input) => {
     assertAuthorizedSender(event, options)
@@ -827,7 +1091,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   const revokeHostAccess = (hostId: string): void => {
     /** 撤销前快照用于 Renderer 精确同步。 */
     const previous = options.access.getCurrent() ?? null
-    if (!previous || !options.access.revokeHost(hostId)) return
+    if (!options.access.revokeHost(hostId) || !previous || previous.hostId !== hostId) return
     broadcast(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, {
       previous,
       current: null,
@@ -837,13 +1101,14 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   const revokeSession = (sessionId: string): void => {
     /** 撤销前快照用于 Renderer 精确同步。 */
     const previous = options.access.getCurrent() ?? null
-    if (!previous || !options.access.revokeSession(sessionId)) return
+    if (!options.access.revokeSession(sessionId) || !previous || previous.sessionId !== sessionId) return
     broadcast(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, {
       previous,
       current: null,
     } satisfies ServerOpsAgentAccessChanged)
   }
   /** 逐项安装 runtime 与日志订阅，使中途失败可精确逆序回滚。 */
+  installSubscription(() => options.access.onReadChanged((event) => broadcast(SERVER_OPS_AGENT_READ_CHANNELS.CHANGED, event)))
   installSubscription(() => options.connections.onState((state) => {
     if (state.phase === 'disconnected' || state.phase === 'blocked' || state.phase === 'error') revokeHostAccess(state.hostId)
     broadcast(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, state)
@@ -897,6 +1162,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
 
   /** 注册失败时逆序、best-effort 回滚所有已安装资源。 */
   function rollbackRegistration(): void {
+    queries.closeAll()
     for (const unsubscribe of [...subscriptions].reverse()) {
       try { unsubscribe() } catch { /* 保留原注册错误，继续回滚。 */ }
     }
@@ -930,6 +1196,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     dispose: () => {
       if (disposed) return
       disposed = true
+      queries.closeAll()
       /** 释放错误延迟到全部资源收口后再抛出。 */
       let firstError: unknown
       for (const unsubscribe of subscriptions) {

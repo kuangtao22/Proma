@@ -37,6 +37,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
+import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TABLE_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 
 export interface ServerOpsFilesPanelProps {
   api: ServerOpsFilesPreload
@@ -248,8 +249,8 @@ export function ServerOpsFilesPanel({
   if (!connected) return <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">连接服务器后浏览远程文件。</div>
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-server-ops-files-panel>
-      <div className="flex flex-wrap items-center gap-2 border-b border-border p-2">
+    <div className="flex min-h-0 flex-1 flex-col bg-content-area" data-server-ops-files-panel>
+      <div className={SERVER_OPS_TOOLBAR_CLASS}>
         <Button type="button" variant="ghost" size="icon" className="size-8" title="返回父目录" disabled={path === '/' || status === 'loading'} onClick={() => void loadDirectory(parentPath(path))}><ArrowUp className="size-4" /></Button>
         <Input aria-label="远程目录路径" className="h-8 min-w-48 flex-1 font-mono text-xs" value={pathInput} onChange={(event) => setPathInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void loadDirectory(pathInput) }} />
         <Button type="button" size="sm" variant="secondary" disabled={status === 'loading'} onClick={() => void loadDirectory(pathInput)}>前往</Button>
@@ -257,26 +258,28 @@ export function ServerOpsFilesPanel({
         <Button type="button" size="sm" variant="outline" disabled={!onUpload} onClick={() => onUpload?.(path)}><Upload className="size-4" />上传</Button>
         <Button type="button" size="sm" variant="outline" onClick={() => setMutationDraft({ action: 'mkdir', path, value: '' })}><FolderPlus className="size-4" />新建目录</Button>
       </div>
-      <div className="flex min-h-0 flex-1 flex-col @container">
-        <div className="grid min-h-0 flex-1 grid-cols-1 @min-[760px]:grid-cols-[minmax(340px,1fr)_minmax(300px,0.9fr)]">
-          <section className="flex min-h-0 flex-col border-b border-border @min-[760px]:border-b-0 @min-[760px]:border-r" aria-label="远程目录">
-            <div className="relative border-b border-border p-2">
-              <Search className="pointer-events-none absolute left-4 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+      {/* 使用原生容器查询；当前 Tailwind 不会生成 @min 任意断点的样式。 */}
+      <style>{'@container ops-files (min-width: 760px) { [data-server-ops-files-grid] { grid-template-columns: minmax(340px, 1fr) minmax(300px, 0.9fr); } [data-server-ops-files-directory] { border-bottom-width: 0; border-right-width: 1px; } }'}</style>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col" style={{ containerType: 'inline-size', containerName: 'ops-files' }}>
+        <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1" data-server-ops-files-grid>
+          <section className="flex min-h-0 min-w-0 flex-col border-b border-border/40" aria-label="远程目录" data-server-ops-files-directory>
+            <div className="relative border-b border-border/40 px-4 py-2">
+              <Search className="pointer-events-none absolute left-6 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input aria-label="搜索已加载文件" className="h-8 pl-8 text-xs" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前已加载列表" />
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
               {status === 'error' ? <div className="p-4 text-sm text-destructive">{error}</div>
                 : status === 'loading' && entries.length === 0 ? <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground"><LoaderCircle className="size-4 animate-spin" />正在读取目录</div>
                 : filteredEntries.length === 0 ? <div className="p-4 text-sm text-muted-foreground">当前目录没有可显示项目。</div>
-                : <table className="w-full table-fixed text-left text-xs">
-                    <thead className="sticky top-0 bg-background text-muted-foreground"><tr><th className="w-[48%] px-3 py-2 font-medium">名称</th><th className="w-20 px-2 py-2 font-medium">大小</th><th className="w-16 px-2 py-2 font-medium">权限</th><th className="px-2 py-2 font-medium">修改时间</th></tr></thead>
+                : <table className={cn(SERVER_OPS_TABLE_CLASS, 'table-fixed text-left [&_td]:py-1 [&_th.text-right]:text-right')}>
+                    <thead className="sticky top-0 bg-content-area"><tr><th className="w-[48%]">名称</th><th className="w-20 text-right">大小</th><th className="w-16">权限</th><th>修改时间</th></tr></thead>
                     <tbody>{filteredEntries.map((entry) => <FileRow key={entry.path} entry={entry} selected={selected?.path === entry.path} onSelect={() => void loadPreview(entry)} onOpen={() => { if (entry.kind === 'directory') void loadDirectory(entry.path) }} />)}</tbody>
                   </table>}
             </div>
-            {cursor ? <div className="border-t border-border p-2"><Button type="button" size="sm" variant="secondary" disabled={status === 'loading'} onClick={() => void loadDirectory(path, cursor)}>加载更多</Button><span className="ml-2 text-xs text-muted-foreground">已加载 {entries.length} 项</span></div> : null}
+            {cursor ? <div className={SERVER_OPS_STATUSBAR_CLASS}><Button type="button" size="sm" variant="secondary" disabled={status === 'loading'} onClick={() => void loadDirectory(path, cursor)}>加载更多</Button><span>已加载 {entries.length} 项</span></div> : null}
           </section>
           <section className="flex min-h-0 flex-col" aria-label="文件预览">
-            <div className="flex h-11 items-center justify-between gap-2 border-b border-border px-3">
+            <div className="flex h-11 items-center justify-between gap-2 border-b border-border/40 px-4">
               <div className="min-w-0 truncate text-xs font-medium">{selected?.path ?? '选择文件以预览'}</div>
               {selected ? <div className="flex shrink-0 gap-1">
                 {selected.kind === 'file' ? <Button type="button" variant="ghost" size="icon" className="size-8" title="下载" disabled={!onDownload} onClick={() => onDownload?.(selected)}><Download className="size-4" /></Button> : null}
@@ -292,7 +295,7 @@ export function ServerOpsFilesPanel({
                 : preview?.kind === 'symlink' ? <PreviewNotice icon={File} title="符号链接不会自动跟随" detail={`目标：${preview.target}`} />
                 : <PreviewNotice icon={File} title="未选择可预览文件" detail="" />}
             </div>
-            {preview?.kind === 'text' ? <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border p-2">
+            {preview?.kind === 'text' ? <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/40 px-4 py-2">
               <span className="text-xs text-muted-foreground">{formatBytes(preview.bytesRead)} · UTF-8</span>
               <div className="flex gap-2"><Button type="button" size="sm" variant="outline" onClick={() => setMutationDraft({ action: 'save-as', path: preview.path, value: childPath(parentPath(preview.path), `${selected?.name ?? 'copy'}.copy`), content: draftContent })}>另存</Button><Button type="button" size="sm" disabled={draftContent === preview.content || mutating} onClick={() => void prepareMutation({ hostId, action: 'save', path: preview.path, content: draftContent, editToken: preview.editToken })}><Save className="size-4" />保存</Button></div>
             </div> : null}
@@ -327,7 +330,7 @@ export function ServerOpsFilesPanel({
 
 function FileRow({ entry, selected, onSelect, onOpen }: { entry: ServerOpsFileEntry; selected: boolean; onSelect(): void; onOpen(): void }): React.ReactElement {
   const Icon = entry.kind === 'directory' ? Folder : File
-  return <tr className={cn('border-t border-border/60 hover:bg-muted/40', selected && 'bg-muted')}><td className="px-2 py-1"><button type="button" className="flex h-8 w-full items-center gap-2 overflow-hidden rounded-sm px-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={onSelect} onDoubleClick={onOpen}><Icon className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{entry.name}</span></button></td><td className="px-2 py-1 text-right tabular-nums text-muted-foreground">{entry.kind === 'file' ? formatBytes(entry.size) : '—'}</td><td className="px-2 py-1 font-mono text-muted-foreground">{formatMode(entry.mode)}</td><td className="truncate px-2 py-1 text-muted-foreground">{new Date(entry.mtime * 1_000).toLocaleString()}</td></tr>
+  return <tr className={cn(selected && 'bg-muted/55')}><td><button type="button" className="flex h-8 w-full items-center gap-2 overflow-hidden rounded-sm px-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={onSelect} onDoubleClick={onOpen}><Icon className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{entry.name}</span></button></td><td className="text-right tabular-nums text-muted-foreground">{entry.kind === 'file' ? formatBytes(entry.size) : '—'}</td><td className="font-mono text-muted-foreground">{formatMode(entry.mode)}</td><td className="truncate text-muted-foreground">{new Date(entry.mtime * 1_000).toLocaleString()}</td></tr>
 }
 
 function PreviewNotice({ icon: Icon, title, detail }: { icon: React.ComponentType<{ className?: string }>; title: string; detail: string }): React.ReactElement { return <div className="flex min-h-40 flex-col items-center justify-center text-center"><Icon className="mb-3 size-8 text-muted-foreground" /><div className="text-sm font-medium">{title}</div><div className="mt-1 max-w-md break-all text-xs text-muted-foreground">{detail}</div></div> }

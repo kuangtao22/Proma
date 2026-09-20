@@ -12,6 +12,7 @@ import type { LucideIcon } from 'lucide-react'
 import type { ServerOpsOverviewResult } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { SERVER_OPS_CARD_CLASS, SERVER_OPS_TABLE_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 
 /** 概览面板由当前主机身份、可见性和连接事实驱动。 */
 export interface ServerOpsOverviewPanelProps {
@@ -397,15 +398,12 @@ function ServerOpsOverviewSkeleton(): React.ReactElement {
   /** 四个稳定指标占位。 */
   const metricSkeletons = Array.from({ length: 4 }, (_, index) => index)
   return (
-    <div className="space-y-5" data-server-ops-overview-skeleton>
-      <div className="grid grid-cols-2 overflow-hidden rounded-md border border-border" data-server-ops-overview-grid>
+    <div className="space-y-4" data-server-ops-overview-skeleton>
+      <div className="grid grid-cols-2 gap-3" data-server-ops-overview-grid>
         {metricSkeletons.map((index) => (
           <div
             key={index}
-            className={cn(
-              'min-h-24 animate-pulse border-border p-3 odd:border-r',
-              index < 2 && 'border-b',
-            )}
+            className={cn(SERVER_OPS_CARD_CLASS, 'min-h-24 animate-pulse p-3')}
           >
             <div className="h-3 w-12 rounded-sm bg-muted" />
             <div className="mt-4 h-6 w-20 rounded-sm bg-muted" />
@@ -413,8 +411,8 @@ function ServerOpsOverviewSkeleton(): React.ReactElement {
           </div>
         ))}
       </div>
-      <div className="h-28 animate-pulse rounded-md border border-border bg-muted/25" />
-      <div className="h-40 animate-pulse rounded-md border border-border bg-muted/25" />
+      <div className="h-28 animate-pulse rounded-xl border border-border/40 bg-muted/25" />
+      <div className="h-40 animate-pulse rounded-xl border border-border/40 bg-muted/25" />
     </div>
   )
 }
@@ -422,7 +420,7 @@ function ServerOpsOverviewSkeleton(): React.ReactElement {
 /** 概览没有可展示快照时提供明确恢复入口。 */
 function ServerOpsOverviewEmpty({ onRefresh }: { onRefresh: () => void }): React.ReactElement {
   return (
-    <div className="flex min-h-52 flex-col items-center justify-center gap-3 rounded-md border border-dashed border-border px-6 text-center">
+    <div className="flex min-h-52 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border/50 bg-card/30 px-6 text-center">
       <HardDrive className="size-5 text-muted-foreground" aria-hidden="true" />
       <div>
         <p className="text-sm font-medium">暂无可用的服务器概览</p>
@@ -445,7 +443,7 @@ export function ServerOpsOverviewPanelView({
 }: ServerOpsOverviewPanelViewProps): React.ReactElement {
   if (status === 'loading' && !snapshot) {
     return (
-      <div className="min-h-0 flex-1 overflow-y-auto p-3" data-server-ops-overview-panel aria-busy="true">
+      <div className="min-h-0 flex-1 overflow-y-auto bg-content-area p-4" data-server-ops-overview-panel aria-busy="true">
         <ServerOpsOverviewSkeleton />
       </div>
     )
@@ -454,7 +452,7 @@ export function ServerOpsOverviewPanelView({
     /** 即使 View 被误传原始文本，也只允许展示固定恢复文案。 */
     const safeError = getOverviewErrorMessage(error)
     return (
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 text-center" data-server-ops-overview-panel>
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-content-area px-6 text-center" data-server-ops-overview-panel>
         <AlertTriangle className="size-5 text-destructive" aria-hidden="true" />
         <div>
           <p className="text-sm font-medium">服务器概览读取失败</p>
@@ -468,7 +466,7 @@ export function ServerOpsOverviewPanelView({
   }
   if (!snapshot) {
     return (
-      <div className="min-h-0 flex-1 overflow-y-auto p-3" data-server-ops-overview-panel>
+      <div className="min-h-0 flex-1 overflow-y-auto bg-content-area p-4" data-server-ops-overview-panel>
         <ServerOpsOverviewEmpty onRefresh={onRefresh} />
       </div>
     )
@@ -481,9 +479,11 @@ export function ServerOpsOverviewPanelView({
   /** stale 错误在 View 边界再次收敛，阻止调用方绕过 Controller。 */
   const safeError = error ? getOverviewErrorMessage(error) : SERVER_OPS_OVERVIEW_FALLBACK_ERROR
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto" data-server-ops-overview-panel aria-busy={status === 'loading' ? true : undefined}>
-      <div className="mx-auto w-full max-w-5xl space-y-5 p-3">
-        <div className="flex min-h-7 items-center justify-between gap-3">
+    <div className="min-h-0 flex-1 overflow-y-auto bg-content-area" style={{ containerType: 'inline-size' }} data-server-ops-overview-panel aria-busy={status === 'loading' ? true : undefined}>
+      {/* 四项关键指标宽时同排，窄时两两排列；系统信息保持三列/两列。 */}
+      <style>{'@container (min-width: 900px) { [data-server-ops-overview-grid] { grid-template-columns: repeat(4, minmax(0, 1fr)); } } @container (min-width: 720px) { [data-server-ops-overview-system-grid] { grid-template-columns: repeat(3, minmax(0, 1fr)); } [data-server-ops-overview-resource-grid] { grid-template-columns: repeat(3, minmax(0, 1fr)); } }'}</style>
+      <div className="mx-auto w-full max-w-5xl space-y-4 pb-4">
+        <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'justify-between border-b-0')}>
           <div className="min-w-0 text-[11px] text-muted-foreground">
             采集于 <time dateTime={new Date(snapshot.capturedAt).toISOString()}>{new Date(snapshot.capturedAt).toLocaleString()}</time>
             {status === 'loading' ? <span role="status"> · 正在更新</span> : null}
@@ -494,13 +494,13 @@ export function ServerOpsOverviewPanelView({
         </div>
 
         {stale ? (
-          <div className="flex items-start gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300" role="status">
+          <div className="mx-4 flex items-start gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300" role="status">
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
             <span>当前显示最近一次成功数据，刷新失败：{safeError}</span>
           </div>
         ) : null}
         {outputTruncated ? (
-          <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300" role="status" data-server-ops-overview-global-warning>
+          <div className="mx-4 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300" role="status" data-server-ops-overview-global-warning>
             <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
             <span>远程输出已截断，部分数据可能不完整</span>
           </div>
@@ -508,18 +508,15 @@ export function ServerOpsOverviewPanelView({
 
         <section aria-labelledby="server-overview-metrics-heading" data-server-ops-overview-section="metrics">
           <h3 id="server-overview-metrics-heading" className="sr-only">关键指标</h3>
-          <div className="grid grid-cols-2 overflow-hidden rounded-md border border-border" data-server-ops-overview-grid>
-            {metrics.map((metric, index) => {
+          <div className="grid grid-cols-2 gap-3 px-4" data-server-ops-overview-grid>
+            {metrics.map((metric) => {
               /** 当前指标的语义图标。 */
               const Icon = metric.icon
               return (
                 <div
                   key={metric.label}
                   data-server-ops-overview-metric={metric.id}
-                  className={cn(
-                    'min-h-24 border-border p-3 odd:border-r',
-                    index < 2 && 'border-b',
-                  )}
+                  className={cn(SERVER_OPS_CARD_CLASS, 'min-h-24 p-3')}
                 >
                   <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
                     <Icon className="size-3.5" aria-hidden="true" />{metric.label}
@@ -533,12 +530,12 @@ export function ServerOpsOverviewPanelView({
           </div>
         </section>
 
-        <section aria-labelledby="server-overview-system-heading" data-server-ops-overview-section="system">
+        <section className="px-4" aria-labelledby="server-overview-system-heading" data-server-ops-overview-section="system">
           <h3 id="server-overview-system-heading" className="mb-2 text-xs font-medium">系统信息</h3>
           {snapshot.warnings.includes('SYSTEM_PARTIAL') ? <ServerOpsLocalWarning message="系统信息可能不完整" /> : null}
           {snapshot.system ? (
             <dl
-              className={cn('grid grid-cols-2 gap-x-6 gap-y-3 rounded-md border border-border px-3 py-3 text-xs', snapshot.warnings.includes('SYSTEM_PARTIAL') && 'mt-2')}
+              className={cn(SERVER_OPS_CARD_CLASS, 'grid grid-cols-2 gap-x-6 gap-y-3 px-3 py-3 text-xs', snapshot.warnings.includes('SYSTEM_PARTIAL') && 'mt-2')}
               data-server-ops-overview-system-grid
             >
               <div><dt className="text-[11px] text-muted-foreground">主机名</dt><dd className="mt-1 break-all font-mono">{snapshot.system.hostname}</dd></div>
@@ -548,13 +545,13 @@ export function ServerOpsOverviewPanelView({
               <div><dt className="text-[11px] text-muted-foreground">运行时间</dt><dd className="mt-1">{formatUptime(snapshot.system.uptimeSeconds)}</dd></div>
               <div><dt className="text-[11px] text-muted-foreground">采样窗口</dt><dd className="mt-1">{snapshot.sampleWindowMs} ms</dd></div>
             </dl>
-          ) : <p className="rounded-md border border-dashed border-border px-3 py-5 text-center text-xs text-muted-foreground">系统信息不可用</p>}
+          ) : <p className="rounded-xl border border-dashed border-border/50 px-3 py-5 text-center text-xs text-muted-foreground">系统信息不可用</p>}
         </section>
 
-        <section aria-labelledby="server-overview-resources-heading" data-server-ops-overview-section="resources">
+        <section className="px-4" aria-labelledby="server-overview-resources-heading" data-server-ops-overview-section="resources">
           <h3 id="server-overview-resources-heading" className="mb-2 text-xs font-medium">资源详情</h3>
-          <div className="grid grid-cols-1 overflow-hidden rounded-md border border-border" data-server-ops-overview-resource-grid>
-            <div className="border-b border-border p-3 text-xs" data-server-ops-overview-resource="memory">
+          <div className={cn(SERVER_OPS_CARD_CLASS, 'grid grid-cols-1')} data-server-ops-overview-resource-grid>
+            <div className="border-b border-border/30 p-3 text-xs" data-server-ops-overview-resource="memory">
               <div className="mb-2 flex items-center gap-1.5 font-medium"><MemoryStick className="size-3.5 text-muted-foreground" aria-hidden="true" />内存</div>
               {snapshot.warnings.includes('MEMORY_PARTIAL') ? <ServerOpsLocalWarning message="内存数据可能不完整" /> : null}
               {snapshot.memory ? (
@@ -566,7 +563,7 @@ export function ServerOpsOverviewPanelView({
                 </dl>
               ) : <p className="mt-2 text-[11px] text-muted-foreground">内存详情不可用</p>}
             </div>
-            <div className="border-b border-border p-3 text-xs" data-server-ops-overview-resource="swap">
+            <div className="border-b border-border/30 p-3 text-xs" data-server-ops-overview-resource="swap">
               <div className="mb-2 flex items-center gap-1.5 font-medium"><HardDrive className="size-3.5 text-muted-foreground" aria-hidden="true" />Swap</div>
               {snapshot.swap ? (
                 <dl className="grid grid-cols-2 gap-x-3 gap-y-2">
@@ -588,15 +585,15 @@ export function ServerOpsOverviewPanelView({
           </div>
         </section>
 
-        <section aria-labelledby="server-overview-filesystem-heading" data-server-ops-overview-section="filesystems">
+        <section className="px-4" aria-labelledby="server-overview-filesystem-heading" data-server-ops-overview-section="filesystems">
           <h3 id="server-overview-filesystem-heading" className="mb-2 text-xs font-medium">文件系统</h3>
           {snapshot.warnings.includes('FILESYSTEM_PARTIAL') ? <ServerOpsLocalWarning message="文件系统数据可能不完整" /> : null}
-          <div className={cn('overflow-x-auto rounded-md border border-border', snapshot.warnings.includes('FILESYSTEM_PARTIAL') && 'mt-2')}>
-            <table className="w-full min-w-[640px] border-collapse text-left text-xs">
-              <thead className="bg-muted/35 text-[11px] text-muted-foreground">
+          <div className={cn(SERVER_OPS_CARD_CLASS, 'overflow-x-auto', snapshot.warnings.includes('FILESYSTEM_PARTIAL') && 'mt-2')}>
+            <table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[640px] text-left [&_th.text-right]:text-right')}>
+              <thead>
                 <tr><th className="px-3 py-2 font-medium">设备</th><th className="px-3 py-2 font-medium">挂载点</th><th className="px-3 py-2 font-medium">类型</th><th className="px-3 py-2 text-right font-medium">总容量</th><th className="px-3 py-2 text-right font-medium">已用</th><th className="px-3 py-2 text-right font-medium">可用</th><th className="px-3 py-2 text-right font-medium">占用</th></tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody>
                 {snapshot.filesystems.length > 0 ? snapshot.filesystems.map((filesystem) => (
                   <tr key={`${filesystem.device}:${filesystem.mountPoint}`}>
                     <td className="whitespace-nowrap px-3 py-2 font-mono">{filesystem.device}</td>
@@ -613,15 +610,15 @@ export function ServerOpsOverviewPanelView({
           </div>
         </section>
 
-        <section aria-labelledby="server-overview-process-heading" data-server-ops-overview-section="processes">
+        <section className="px-4" aria-labelledby="server-overview-process-heading" data-server-ops-overview-section="processes">
           <h3 id="server-overview-process-heading" className="mb-2 text-xs font-medium">高资源进程</h3>
           {snapshot.warnings.includes('PROCESS_PARTIAL') ? <ServerOpsLocalWarning message="进程数据可能不完整" /> : null}
-          <div className={cn('overflow-x-auto rounded-md border border-border', snapshot.warnings.includes('PROCESS_PARTIAL') && 'mt-2')}>
-            <table className="w-full min-w-[460px] border-collapse text-left text-xs">
-              <thead className="bg-muted/35 text-[11px] text-muted-foreground">
+          <div className={cn(SERVER_OPS_CARD_CLASS, 'overflow-x-auto', snapshot.warnings.includes('PROCESS_PARTIAL') && 'mt-2')}>
+            <table className={cn(SERVER_OPS_TABLE_CLASS, 'min-w-[460px] text-left [&_th.text-right]:text-right')}>
+              <thead>
                 <tr><th className="px-3 py-2 font-medium">PID</th><th className="px-3 py-2 font-medium">进程</th><th className="px-3 py-2 text-right font-medium">CPU</th><th className="px-3 py-2 text-right font-medium">内存</th></tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody>
                 {snapshot.processes.length > 0 ? snapshot.processes.map((process) => (
                   <tr key={process.pid}>
                     <td className="px-3 py-2 font-mono tabular-nums">{process.pid}</td>

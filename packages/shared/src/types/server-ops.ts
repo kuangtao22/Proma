@@ -4,6 +4,7 @@ export const SERVER_OPS_IPC_CHANNELS = {
   UPSERT_HOST: 'server-ops:upsert-host',
   DELETE_HOST: 'server-ops:delete-host',
   CONNECT: 'server-ops:connect',
+  TEST_CONNECTION: 'server-ops:test-connection',
   CONFIRM_HOST_KEY: 'server-ops:confirm-host-key',
   DISCONNECT: 'server-ops:disconnect',
   WRITE_TERMINAL: 'server-ops:write-terminal',
@@ -48,6 +49,8 @@ export type ServerOpsAuditOperation =
   | 'docker-start'
   | 'docker-stop'
   | 'docker-restart'
+  | 'agent-read'
+  | 'data-query'
   | 'file-mkdir' | 'file-rename' | 'file-delete' | 'file-save' | 'file-save-as' | 'file-upload' | 'file-download'
 
 /** 审计记录处于远程动作开始或完成阶段。 */
@@ -57,7 +60,20 @@ export type ServerOpsAuditPhase = 'start' | 'result'
 export type ServerOpsAuditOutcome = 'pending' | 'success' | 'error' | 'unknown'
 
 /** 需要独立资源语义的审计对象类别。 */
-export type ServerOpsAuditResourceType = 'host-trust' | 'docker-container' | 'remote-file'
+export type ServerOpsAuditResourceType = 'host-trust' | 'docker-container' | 'remote-file' | 'ops-resource' | 'data-query'
+
+/** Agent 只读运维工具允许写入审计的有界动作。 */
+export type ServerOpsAuditReadAction =
+  | 'server-overview'
+  | 'server-services'
+  | 'data-probe'
+  | 'data-diagnose'
+  | 'schema-list'
+  | 'schema-describe'
+  | 'rows-read'
+
+/** Agent 数据诊断的显式实例或数据库范围。 */
+export type ServerOpsAuditReadScope = 'instance' | 'database'
 
 /** 可跨 IPC 展示的有界审计记录。 */
 export interface ServerOpsAuditRecord {
@@ -66,7 +82,10 @@ export interface ServerOpsAuditRecord {
   timestamp: number
   sessionId?: string
   windowId?: number
-  hostId: string
+  /** 服务器读取或旧操作绑定的主机；直连数据源读取不伪造该字段。 */
+  hostId?: string
+  /** MySQL 或 Redis 读取绑定的已保存数据源。 */
+  sourceId?: string
   actor: ServerOpsAuditActor
   operation: ServerOpsAuditOperation
   resourceType?: ServerOpsAuditResourceType
@@ -77,6 +96,17 @@ export interface ServerOpsAuditRecord {
   durationMs?: number
   unitId?: string
   containerId?: string
+  /** Agent 实际调用的只读能力。 */
+  readAction?: ServerOpsAuditReadAction
+  /** 数据诊断的实例或数据库范围。 */
+  scope?: ServerOpsAuditReadScope
+  /** 只记录目标库名，不记录 SQL 或业务数据。 */
+  database?: string
+  /** 只记录目标表名，不记录行内容。 */
+  table?: string
+  /** SQL 查询只记录哈希和真实表集合，绝不保存正文或参数。 */
+  queryHash?: string
+  tables?: string[]
   command?: string
   commandTruncated?: boolean
   exitCode?: number
@@ -89,7 +119,10 @@ export interface ServerOpsAuditAppendInput {
   operationId?: string
   sessionId?: string
   windowId?: number
-  hostId: string
+  /** 服务器读取或旧操作绑定的主机；直连数据源读取不伪造该字段。 */
+  hostId?: string
+  /** MySQL 或 Redis 读取绑定的已保存数据源。 */
+  sourceId?: string
   actor: ServerOpsAuditActor
   operation: ServerOpsAuditOperation
   resourceType?: ServerOpsAuditResourceType
@@ -100,6 +133,17 @@ export interface ServerOpsAuditAppendInput {
   durationMs?: number
   unitId?: string
   containerId?: string
+  /** Agent 实际调用的只读能力。 */
+  readAction?: ServerOpsAuditReadAction
+  /** 数据诊断的实例或数据库范围。 */
+  scope?: ServerOpsAuditReadScope
+  /** 只记录目标库名，不记录 SQL 或业务数据。 */
+  database?: string
+  /** 只记录目标表名，不记录行内容。 */
+  table?: string
+  /** SQL 查询只记录哈希和真实表集合，绝不保存正文或参数。 */
+  queryHash?: string
+  tables?: string[]
   command?: string
   exitCode?: number
   signal?: string
@@ -109,6 +153,8 @@ export interface ServerOpsAuditAppendInput {
 /** 审计页支持的严格有界筛选。 */
 export interface ServerOpsAuditListInput {
   hostId?: string
+  /** 按已保存数据源筛选直连数据库或 Redis 的读取记录。 */
+  sourceId?: string
   actor?: ServerOpsAuditActor
   operation?: ServerOpsAuditOperation
   limit?: number
@@ -325,6 +371,8 @@ export interface ServerOpsHostInput {
 /** 已持久化并可返回 Renderer 的服务器资产。 */
 export interface ServerOpsHost extends ServerOpsHostInput {
   id: string
+  /** 归属的运维项目；缺失表示尚未迁移，由主进程归入默认项目。 */
+  projectId?: string
   credentialRef?: string
   createdAt: number
   updatedAt: number
@@ -352,6 +400,8 @@ export interface ServerOpsAgentAccessChanged {
 /** 新增时不含 ID，编辑时携带目标 ID。 */
 export interface ServerOpsUpsertHostInput extends ServerOpsHostInput {
   id?: string
+  /** 新建时指定归属项目；编辑时仅允许与现有归属一致。 */
+  projectId?: string
 }
 
 /** 保存服务器时持久化的密码凭据，不携带临时连接选项。 */
@@ -411,6 +461,39 @@ export interface ServerOpsConnectInput {
   cols: number
   rows: number
   credential?: ServerOpsCredentialInput
+}
+
+/** 连接测试输入：直接使用弹窗里的草稿，不要求主机已保存。 */
+export interface ServerOpsTestConnectionInput {
+  address: string
+  port: number
+  username: string
+  /** 复用已保存凭据时的主机 ID；新建草稿不提供。 */
+  hostId?: string
+  /** 本次测试使用的内联凭据；`remember` 在测试路径中被忽略，永不持久化。 */
+  credential?: ServerOpsCredentialInput
+}
+
+/** 连接测试的稳定结论。 */
+export type ServerOpsTestConnectionStatus =
+  | 'reachable'
+  | 'host-key-untrusted'
+  | 'host-key-mismatch'
+  | 'auth-failed'
+  | 'unreachable'
+  | 'timeout'
+  | 'agent-unavailable'
+  | 'failed'
+
+/** 连接测试结果；不改变信任状态、不建立会话、不写审计。 */
+export interface ServerOpsTestConnectionResult {
+  status: ServerOpsTestConnectionStatus
+  /** 不含秘密的中文说明。 */
+  message: string
+  /** 观测到的服务器 Host Key，仅在握手阶段拿到时有值。 */
+  hostKey?: ServerOpsHostKey
+  /** 从发起到握手结束的耗时；仅成功或指纹判定时提供。 */
+  latencyMs?: number
 }
 
 /** 用户确认首次观测 Host Key 后发起 fresh reconnect 的请求。 */
@@ -496,10 +579,10 @@ export interface ServerOpsTerminalExitEvent {
 const SERVER_OPS_HOST_INPUT_KEYS = new Set(['name', 'address', 'port', 'username', 'authMethod', 'tags'])
 
 /** 新增或编辑主机请求允许出现的公开字段。 */
-const SERVER_OPS_UPSERT_HOST_KEYS = new Set([...SERVER_OPS_HOST_INPUT_KEYS, 'id'])
+const SERVER_OPS_UPSERT_HOST_KEYS = new Set([...SERVER_OPS_HOST_INPUT_KEYS, 'id', 'projectId'])
 
 /** 主机持久化记录允许出现的完整字段。 */
-const SERVER_OPS_HOST_KEYS = new Set([...SERVER_OPS_HOST_INPUT_KEYS, 'id', 'credentialRef', 'createdAt', 'updatedAt'])
+const SERVER_OPS_HOST_KEYS = new Set([...SERVER_OPS_HOST_INPUT_KEYS, 'id', 'projectId', 'credentialRef', 'createdAt', 'updatedAt'])
 
 /** 判断未知值是否为可枚举的普通对象。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -513,9 +596,9 @@ function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: ReadonlySet<st
 
 /** 审计记录允许出现的公开字段集合。 */
 const SERVER_OPS_AUDIT_RECORD_KEYS = new Set([
-  'id', 'operationId', 'timestamp', 'sessionId', 'windowId', 'hostId', 'actor', 'operation', 'resourceType', 'resourceId', 'phase', 'outcome',
-  'durationMs', 'unitId', 'containerId', 'command', 'exitCode', 'signal', 'errorCode',
-  'commandTruncated',
+  'id', 'operationId', 'timestamp', 'sessionId', 'windowId', 'hostId', 'sourceId', 'actor', 'operation', 'resourceType', 'resourceId', 'phase', 'outcome',
+  'durationMs', 'unitId', 'containerId', 'readAction', 'scope', 'database', 'table', 'command', 'exitCode', 'signal', 'errorCode',
+  'commandTruncated', 'queryHash', 'tables',
 ])
 
 /** 判断未知值是否为允许审计的操作。 */
@@ -525,17 +608,26 @@ function isServerOpsAuditOperation(value: unknown): value is ServerOpsAuditOpera
     || value === 'service-enable' || value === 'service-disable'
     || value === 'trust-replace' || value === 'trust-revoke'
     || value === 'docker-start' || value === 'docker-stop' || value === 'docker-restart'
+    || value === 'agent-read' || value === 'data-query'
     || value === 'file-mkdir' || value === 'file-rename' || value === 'file-delete' || value === 'file-save'
     || value === 'file-save-as' || value === 'file-upload' || value === 'file-download'
+}
+
+/** 判断 Agent 只读动作是否属于公开审计枚举。 */
+function isServerOpsAuditReadAction(value: unknown): value is ServerOpsAuditReadAction {
+  return value === 'server-overview' || value === 'server-services'
+    || value === 'data-probe' || value === 'data-diagnose'
+    || value === 'schema-list' || value === 'schema-describe' || value === 'rows-read'
 }
 
 /** 判断审计主体与操作是否符合权限矩阵。 */
 export function isServerOpsAuditActorOperation(actor: unknown, operation: unknown): actor is ServerOpsAuditActor {
   if (actor === 'agent') return operation === 'connect' || operation === 'exec' || operation === 'disconnect'
     || operation === 'docker-start' || operation === 'docker-stop' || operation === 'docker-restart'
+    || operation === 'agent-read' || operation === 'data-query'
     || typeof operation === 'string' && operation.startsWith('file-') && isServerOpsAuditOperation(operation)
   if (actor === 'user') return typeof operation === 'string'
-    && (operation.startsWith('service-') || operation.startsWith('trust-') || operation.startsWith('docker-') || operation.startsWith('file-'))
+    && (operation === 'data-query' || operation.startsWith('service-') || operation.startsWith('trust-') || operation.startsWith('docker-') || operation.startsWith('file-'))
     && isServerOpsAuditOperation(operation)
   return false
 }
@@ -543,12 +635,27 @@ export function isServerOpsAuditActorOperation(actor: unknown, operation: unknow
 /** 校验公开审计记录，拒绝未知字段和所有非有界字符串。 */
 export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, SERVER_OPS_AUDIT_RECORD_KEYS)) return false
-  if (!isServerOpsId(value.id) || !isServerOpsId(value.hostId)) return false
+  if (!isServerOpsId(value.id)) return false
   if (value.operationId !== undefined && !isServerOpsId(value.operationId)) return false
   if (!Number.isSafeInteger(value.timestamp) || typeof value.timestamp !== 'number'
     || value.timestamp < 0 || value.timestamp > 8_640_000_000_000_000) return false
   if (!isServerOpsAuditOperation(value.operation)) return false
   if (!isServerOpsAuditActorOperation(value.actor, value.operation)) return false
+  /** 当前记录是否使用 Agent 只读资源合同；旧操作继续强制绑定主机。 */
+  const isAgentReadOperation = value.operation === 'agent-read'
+  /** SQL 查询对窗口用户与普通 Agent 使用同一有界审计形状。 */
+  const isDataQueryOperation = value.operation === 'data-query'
+  if (isAgentReadOperation) {
+    /** 是否绑定合法服务器主机。 */
+    const hasHost = isServerOpsId(value.hostId)
+    /** 是否绑定合法数据源。 */
+    const hasSource = isServerOpsId(value.sourceId)
+    if (hasHost === hasSource) return false
+  } else if (isDataQueryOperation) {
+    if (!isServerOpsId(value.sourceId) || value.hostId !== undefined) return false
+  } else if (!isServerOpsId(value.hostId) || value.sourceId !== undefined) {
+    return false
+  }
   /** Agent 必须来自真实会话；用户允许旧 service session 或新的窗口来源，二者互斥。 */
   if (value.actor === 'agent') {
     if (!isServerOpsId(value.sessionId) || value.windowId !== undefined) return false
@@ -582,7 +689,51 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
   if (isFileOperation !== (value.resourceType === 'remote-file')) return false
   if (isFileOperation !== (value.resourceId !== undefined)) return false
   if (isFileOperation && (value.operationId === undefined || typeof value.resourceId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.resourceId))) return false
-  if (!isTrustOperation && !isDockerOperation && !isFileOperation && value.resourceType !== undefined) return false
+  if (isAgentReadOperation !== (value.resourceType === 'ops-resource')) return false
+  if (isDataQueryOperation !== (value.resourceType === 'data-query')) return false
+  if (!isTrustOperation && !isDockerOperation && !isFileOperation && !isAgentReadOperation && !isDataQueryOperation && value.resourceType !== undefined) return false
+  if (isDataQueryOperation) {
+    if (value.operationId === undefined || typeof value.queryHash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.queryHash)
+      || typeof value.database !== 'string' || value.database.length < 1 || value.database.length > 64 || /\p{Cc}/u.test(value.database)
+      || !Array.isArray(value.tables) || value.tables.length > 16 || new Set(value.tables).size !== value.tables.length
+      || value.tables.some((table) => typeof table !== 'string' || table.length < 1 || table.length > 128 || /\p{Cc}/u.test(table))
+      || value.scope !== undefined || value.table !== undefined || value.readAction !== undefined
+      || (value.actor === 'user' && value.windowId === undefined)) return false
+  } else if (value.queryHash !== undefined || value.tables !== undefined) return false
+  /** Agent 读取按动作区分主机和数据源，且只记录有界范围元数据。 */
+  if (isAgentReadOperation !== isServerOpsAuditReadAction(value.readAction)) return false
+  if (isAgentReadOperation) {
+    /** 开始与结果必须共享业务生成的关联 ID，不能只依赖两条独立审计记录的时间顺序。 */
+    if (value.operationId === undefined) return false
+    /** 服务器读取与数据源读取使用不同资源身份，禁止跨类型复用。 */
+    const isServerRead = value.readAction === 'server-overview' || value.readAction === 'server-services'
+    if (isServerRead !== (value.hostId !== undefined)) return false
+    if (isServerRead && (value.database !== undefined || value.table !== undefined || value.scope !== undefined)) return false
+    if (value.scope !== undefined && value.scope !== 'instance' && value.scope !== 'database') return false
+    /** 数据源动作必须精确对应实例、数据库或数据表层级，避免审计记录丢失或夸大真实读取范围。 */
+    if (value.readAction === 'data-probe') {
+      if (value.scope !== undefined || value.database !== undefined || value.table !== undefined) return false
+    } else if (value.readAction === 'data-diagnose') {
+      if (value.scope === 'instance') {
+        if (value.database !== undefined || value.table !== undefined) return false
+      } else if (value.scope === 'database') {
+        if (value.database === undefined || value.table !== undefined) return false
+      } else {
+        return false
+      }
+    } else if (value.readAction === 'schema-list') {
+      if (value.scope !== 'database' || value.database === undefined || value.table !== undefined) return false
+    } else if (value.readAction === 'schema-describe' || value.readAction === 'rows-read') {
+      if (value.scope !== 'database' || value.database === undefined || value.table === undefined) return false
+    }
+    /** 数据库与表沿用各自领域边界，MySQL 表名允许 128 字符。 */
+    for (const [name, maximum] of [[value.database, 64], [value.table, 128]] as const) {
+      if (name !== undefined && (typeof name !== 'string' || name.length < 1 || name.length > maximum
+        || name.trim().length === 0 || /\p{Cc}/u.test(name))) return false
+    }
+  } else if (!isDataQueryOperation && (value.scope !== undefined || value.database !== undefined || value.table !== undefined)) {
+    return false
+  }
   if (isDockerOperation && value.operationId === undefined) return false
   if (value.command !== undefined && (typeof value.command !== 'string' || value.command.length > 512)) return false
   if (value.command === undefined) {
@@ -611,10 +762,11 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
 
 /** 严格解析审计列表筛选，禁止 Renderer 扩大读取合同。 */
 export function parseServerOpsAuditListInput(value: unknown): ServerOpsAuditListInput {
-  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['hostId', 'actor', 'operation', 'limit']))) {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['hostId', 'sourceId', 'actor', 'operation', 'limit']))) {
     throw new Error('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
   }
   if (value.hostId !== undefined && !isServerOpsId(value.hostId)) throw new Error('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
+  if (value.sourceId !== undefined && !isServerOpsId(value.sourceId)) throw new Error('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
   if (value.actor !== undefined && value.actor !== 'agent' && value.actor !== 'user') throw new Error('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
   if (value.operation !== undefined && !isServerOpsAuditOperation(value.operation)) throw new Error('SERVER_OPS_AUDIT_LIST_INPUT_INVALID')
   if (value.actor !== undefined && value.operation !== undefined
@@ -625,6 +777,7 @@ export function parseServerOpsAuditListInput(value: unknown): ServerOpsAuditList
   }
   return {
     ...(typeof value.hostId === 'string' ? { hostId: value.hostId } : {}),
+    ...(typeof value.sourceId === 'string' ? { sourceId: value.sourceId } : {}),
     ...(value.actor === 'agent' || value.actor === 'user' ? { actor: value.actor } : {}),
     ...(isServerOpsAuditOperation(value.operation) ? { operation: value.operation } : {}),
     ...(typeof value.limit === 'number' ? { limit: value.limit } : {}),
@@ -638,7 +791,7 @@ export function parseServerOpsAuditListResult(value: unknown): ServerOpsAuditLis
     || !value.records.every(isServerOpsAuditRecord)) {
     throw new Error('SERVER_OPS_AUDIT_LIST_RESULT_INVALID')
   }
-  return { records: value.records.map((record) => ({ ...record })) }
+  return { records: value.records.map((record) => ({ ...record, ...(record.tables ? { tables: [...record.tables] } : {}) })) }
 }
 
 /** 复用单个 UTF-8 编码器执行跨平台字节上限校验。 */
@@ -1160,10 +1313,12 @@ export function parseServerOpsSaveHostInput(value: unknown): ServerOpsSaveHostIn
     tags: value.host.tags,
   })
   if (value.host.id !== undefined && !isServerOpsId(value.host.id)) throw new Error('SERVER_OPS_HOST_ID_INVALID')
+  if (value.host.projectId !== undefined && !isServerOpsId(value.host.projectId)) throw new Error('SERVER_OPS_PROJECT_ID_INVALID')
   /** 编辑请求中经过稳定 ID 校验的目标主机。 */
   const host: ServerOpsUpsertHostInput = {
     ...parsedHost,
     ...(typeof value.host.id === 'string' ? { id: value.host.id } : {}),
+    ...(typeof value.host.projectId === 'string' ? { projectId: value.host.projectId } : {}),
   }
   /** 待执行的凭据变更对象。 */
   const update = value.credentialUpdate
@@ -1201,6 +1356,68 @@ export function parseServerOpsConnectInput(value: unknown): ServerOpsConnectInpu
   const size = parseTerminalSize(value.cols, value.rows)
   if (value.credential === undefined) return { hostId: value.hostId, ...size }
   return { hostId: value.hostId, ...size, credential: parseCredentialInput(value.credential) }
+}
+
+/** 严格解析 Host Key 公开投影。 */
+function parseServerOpsHostKeyValue(value: unknown, errorCode: string): ServerOpsHostKey {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['algorithm', 'fingerprint']))
+    || typeof value.algorithm !== 'string' || value.algorithm.length < 1 || value.algorithm.length > 128
+    || !/^[A-Za-z0-9@._+-]+$/u.test(value.algorithm)
+    || typeof value.fingerprint !== 'string' || value.fingerprint.length < 8 || value.fingerprint.length > 192
+    || !/^SHA256:[A-Za-z0-9+/]+$/u.test(value.fingerprint)) {
+    throw new Error(errorCode)
+  }
+  return { algorithm: value.algorithm, fingerprint: value.fingerprint }
+}
+
+/** 解析连接测试输入；地址、端口与用户名沿用主机合同规则。 */
+export function parseServerOpsTestConnectionInput(value: unknown): ServerOpsTestConnectionInput {
+  const errorCode = 'SERVER_OPS_TEST_CONNECTION_INPUT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['address', 'port', 'username', 'hostId', 'credential']))
+    || !Number.isInteger(value.port) || typeof value.port !== 'number' || value.port < 1 || value.port > 65_535) {
+    throw new Error(errorCode)
+  }
+  if (value.hostId !== undefined && !isServerOpsId(value.hostId)) throw new Error(errorCode)
+  /** 复用已保存凭据与内联凭据必须二选一，避免测试来源不确定。 */
+  if ((value.hostId === undefined) === (value.credential === undefined)) throw new Error(errorCode)
+  /** 主机地址禁止空白和 NUL。 */
+  const address = parseRequiredText(value.address, 255, errorCode)
+  if (/\s/.test(address)) throw new Error(errorCode)
+  /** SSH 登录用户名。 */
+  const username = parseRequiredText(value.username, 64, errorCode)
+  if (/\s/.test(username)) throw new Error(errorCode)
+  return {
+    address,
+    port: value.port,
+    username,
+    ...(value.hostId === undefined ? {} : { hostId: value.hostId }),
+    ...(value.credential === undefined ? {} : { credential: parseCredentialInput(value.credential) }),
+  }
+}
+
+/** 判定连接测试结论是否在允许集合内。 */
+function isServerOpsTestConnectionStatus(value: unknown): value is ServerOpsTestConnectionStatus {
+  return value === 'reachable' || value === 'host-key-untrusted' || value === 'host-key-mismatch'
+    || value === 'auth-failed' || value === 'unreachable' || value === 'timeout'
+    || value === 'agent-unavailable' || value === 'failed'
+}
+
+/** 解析连接测试结果，拒绝未知字段与超界耗时。 */
+export function parseServerOpsTestConnectionResult(value: unknown): ServerOpsTestConnectionResult {
+  const errorCode = 'SERVER_OPS_TEST_CONNECTION_RESULT_INVALID'
+  const keys = new Set(['status', 'message', 'hostKey', 'latencyMs'])
+  if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsTestConnectionStatus(value.status)
+    || typeof value.message !== 'string' || value.message.length < 1 || value.message.length > 512
+    || (value.latencyMs !== undefined && (typeof value.latencyMs !== 'number'
+      || !Number.isSafeInteger(value.latencyMs) || value.latencyMs < 0 || value.latencyMs > 120_000))) {
+    throw new Error(errorCode)
+  }
+  return {
+    status: value.status,
+    message: value.message,
+    ...(value.hostKey === undefined ? {} : { hostKey: parseServerOpsHostKeyValue(value.hostKey, errorCode) }),
+    ...(value.latencyMs === undefined ? {} : { latencyMs: value.latencyMs }),
+  }
 }
 
 /** 解析首次 Host Key 确认请求。 */
@@ -1247,6 +1464,7 @@ export function isServerOpsHostList(value: unknown): value is ServerOpsHost[] {
   return value.every((item) => {
     if (!isRecord(item) || !hasOnlyKeys(item, SERVER_OPS_HOST_KEYS)) return false
     if (!isServerOpsId(item.id)) return false
+    if (item.projectId !== undefined && !isServerOpsId(item.projectId)) return false
     if (item.credentialRef !== undefined && !isServerOpsId(item.credentialRef)) return false
     if (!Number.isSafeInteger(item.createdAt) || typeof item.createdAt !== 'number' || item.createdAt < 0) return false
     if (!Number.isSafeInteger(item.updatedAt) || typeof item.updatedAt !== 'number' || item.updatedAt < item.createdAt) return false

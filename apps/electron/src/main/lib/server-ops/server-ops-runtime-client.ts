@@ -23,6 +23,8 @@ import {
   parseServerOpsRuntimeMessage,
   type ServerOpsRuntimeConnectRequest,
   type ServerOpsRuntimeConnectResult,
+  type ServerOpsRuntimeDataReadRequest,
+  type ServerOpsRuntimeDataReadResult,
   type ServerOpsRuntimeExecResult,
   type ServerOpsRuntimeLogExitReason,
   type ServerOpsRuntimeMessage,
@@ -78,6 +80,18 @@ interface PendingExec {
   resolve: (result: ServerOpsRuntimeExecResult) => void
   reject: (error: ServerOpsRuntimeError) => void
   timeout: ReturnType<typeof setTimeout>
+}
+/** 在途的数据服务读取请求；结果只允许回给发起它的完整连接身份。 */
+interface PendingDataRead {
+  hostId: string
+  connectionId: string
+  resolve: (result: ServerOpsRuntimeDataReadResult) => void
+  reject: (error: ServerOpsRuntimeError) => void
+  timeout: ReturnType<typeof setTimeout>
+  /** 收到取消后继续占用 pending，直到 utility 确认底层资源已释放。 */
+  cancelRequested: boolean
+  /** 请求结算时移除 AbortSignal 监听，避免长期会话积累闭包。 */
+  removeAbortListener: () => void
 }
 
 /** 尚未收到 utility started 确认的日志启动。 */
@@ -198,6 +212,8 @@ export class ServerOpsRuntimeClient {
   /** requestId 对应的连接请求。 */
   private readonly pendingConnects = new Map<string, PendingConnect>()
   private readonly pendingExecs = new Map<string, PendingExec>()
+  /** 在途的数据服务读取；同一 hostId 的连接关闭时必须立即拒绝。 */
+  private readonly pendingDataReads = new Map<string, PendingDataRead>()
   /** SFTP 在途请求最多 64 个，窗口资源归属单独保留至显式关闭。 */
   private readonly pendingSftp = new Map<string, PendingSftp>()
   private readonly sftpOwners = new Map<string, Map<string, string>>()
@@ -297,6 +313,13 @@ export class ServerOpsRuntimeClient {
       clearTimeout(pending.timeout)
       pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       this.pendingExecs.delete(requestId)
+    }
+    for (const [requestId, pending] of this.pendingDataReads) {
+      if (pending.hostId !== hostId || pending.connectionId !== connectionId) continue
+      clearTimeout(pending.timeout)
+      pending.removeAbortListener()
+      pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
+      this.pendingDataReads.delete(requestId)
     }
     this.port?.postMessage({ type: 'server-ops.disconnect', hostId, connectionId })
   }
@@ -443,6 +466,67 @@ export class ServerOpsRuntimeClient {
     })
   }
 
+  /**
+   * 在已连接 SSH 上通过转发通道执行一次数据服务只读读取。
+   *
+   * @param input 完整连接身份、数据源参数与读取模式；密码只在本进程内传递
+   * @returns runtime 返回的结构化能力状态与诊断结果
+   */
+  async dataRead(input: Omit<ServerOpsRuntimeDataReadRequest, 'requestId'>, signal?: AbortSignal): Promise<ServerOpsRuntimeDataReadResult> {
+    /** 直连不依赖 SSH 连接，只有经由隧道时才要求连接仍然活跃。 */
+    if (input.transport === 'ssh' && this.activeConnections.get(input.connectionId) !== input.hostId) {
+      throw new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_NOT_ACTIVE', 'SSH 连接未激活')
+    }
+    await this.start()
+    if (signal?.aborted) throw new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消')
+    /** 本次读取的跨进程请求 ID，只在本 client 生命周期内唯一。 */
+    const requestId = this.dependencies.uuid()
+    return new Promise((resolve, reject) => {
+      /** 主进程侧 deadline 比 runtime 自身超时略长，保证先收到 runtime 的分类结果。 */
+      const timeout = setTimeout(() => {
+        this.pendingDataReads.delete(requestId)
+        pending.removeAbortListener()
+        const cancelRequested = pending.cancelRequested
+        /** utility 未在总预算内确认终态时终止进程，确保底层 socket 不会继续占用资源。 */
+        this.stop()
+        reject(cancelRequested
+          ? new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消')
+          : new ServerOpsRuntimeError('SERVER_OPS_DATA_TIMEOUT', '数据库读取超时'))
+      }, input.timeoutMs + 1000)
+      /** AbortSignal 只发送一次精确取消，pending 保留到取消 ACK。 */
+      const onAbort = (): void => {
+        const current = this.pendingDataReads.get(requestId)
+        if (!current || current.cancelRequested) return
+        current.cancelRequested = true
+        try {
+          this.port?.postMessage({ type: 'server-ops.data-cancel', requestId, hostId: input.hostId, connectionId: input.connectionId })
+        } catch {
+          /** 取消消息无法送达时终止共享 utility，确保失联的数据库 transport 不继续运行。 */
+          clearTimeout(current.timeout)
+          this.pendingDataReads.delete(requestId)
+          current.removeAbortListener()
+          this.stop()
+          current.reject(new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消'))
+        }
+      }
+      const removeAbortListener = (): void => signal?.removeEventListener('abort', onAbort)
+      const pending: PendingDataRead = {
+        hostId: input.hostId, connectionId: input.connectionId, resolve, reject, timeout,
+        cancelRequested: false, removeAbortListener,
+      }
+      this.pendingDataReads.set(requestId, pending)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        this.port?.postMessage({ type: 'server-ops.data-read', input: { ...input, requestId } })
+      } catch {
+        clearTimeout(timeout)
+        this.pendingDataReads.delete(requestId)
+        removeAbortListener()
+        reject(new ServerOpsRuntimeError('SERVER_OPS_DATA_DISPATCH_FAILED', '数据库读取请求下发失败'))
+      }
+    })
+  }
+
   /** 向精确远程 PTY 写入用户输入。 */
   input(hostId: string, connectionId: string, data: string): void {
     this.port?.postMessage({ type: 'server-ops.terminal-input', hostId, connectionId, data })
@@ -513,15 +597,16 @@ export class ServerOpsRuntimeClient {
     const port = this.port
     this.port = undefined
     if (port) {
-      port.postMessage({ type: 'server-ops.shutdown' })
-      port.close()
+      try { port.postMessage({ type: 'server-ops.shutdown' }) } catch { /* 端口已失效时继续强制终止进程。 */ }
+      try { port.close() } catch { /* 关闭失败不能阻断本地状态收口。 */ }
     }
-    this.runtimeProcess?.kill()
+    try { this.runtimeProcess?.kill() } catch { /* kill 失败仍需清空本地代次与 pending。 */ }
     this.runtimeProcess = undefined
     this.starting = undefined
     this.usedLogStreamIds.clear()
     this.rejectPending(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.rejectPendingExec(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
+    this.rejectPendingDataReads(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.rejectPendingLogStarts(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
     this.finishAllLogStreams('error', 'SERVER_OPS_RUNTIME_STOPPED')
     this.finishAllConsoles(new ServerOpsRuntimeError('SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止'))
@@ -629,12 +714,40 @@ export class ServerOpsRuntimeClient {
       pending.resolve(message.result)
       return
     }
+    if (message.type === 'server-ops.data-read-result') {
+      const pending = this.pendingDataReads.get(message.requestId)
+      if (!pending || pending.hostId !== message.hostId || pending.connectionId !== message.connectionId) return
+      clearTimeout(pending.timeout)
+      this.pendingDataReads.delete(message.requestId)
+      pending.removeAbortListener()
+      if (pending.cancelRequested) pending.reject(new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消'))
+      else pending.resolve(message.result)
+      return
+    }
+    if (message.type === 'server-ops.data-read-cancelled') {
+      const pending = this.pendingDataReads.get(message.requestId)
+      if (!pending || !pending.cancelRequested || pending.hostId !== message.hostId || pending.connectionId !== message.connectionId) return
+      clearTimeout(pending.timeout)
+      this.pendingDataReads.delete(message.requestId)
+      pending.removeAbortListener()
+      pending.reject(new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消'))
+      return
+    }
     if (message.type === 'server-ops.error' && message.requestId) {
       /** 对应 requestId 的待处理连接。 */
       const pending = this.pendingConnects.get(message.requestId)
       if (pending && pending.hostId === message.hostId && pending.connectionId === message.connectionId) { clearTimeout(pending.timeout); this.pendingConnects.delete(message.requestId); pending.reject(new ServerOpsRuntimeError(message.code, message.message)) }
       const exec = this.pendingExecs.get(message.requestId)
       if (exec && exec.hostId === message.hostId && exec.connectionId === message.connectionId) { clearTimeout(exec.timeout); this.pendingExecs.delete(message.requestId); exec.reject(new ServerOpsRuntimeError(message.code, message.message)) }
+      const dataRead = this.pendingDataReads.get(message.requestId)
+      if (dataRead && dataRead.hostId === message.hostId && dataRead.connectionId === message.connectionId) {
+        clearTimeout(dataRead.timeout)
+        this.pendingDataReads.delete(message.requestId)
+        dataRead.removeAbortListener()
+        dataRead.reject(dataRead.cancelRequested
+          ? new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', '数据库读取已取消')
+          : new ServerOpsRuntimeError(message.code, message.message))
+      }
       return
     }
     if (message.type === 'server-ops.error') {
@@ -727,6 +840,14 @@ export class ServerOpsRuntimeClient {
         this.pendingExecs.delete(requestId)
         pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       }
+      /** 数据服务读取与 exec 一样不能跨连接存活，断线即拒绝在途请求。 */
+      for (const [requestId, pending] of this.pendingDataReads) {
+        if (pending.connectionId !== message.event.connectionId) continue
+        clearTimeout(pending.timeout)
+        this.pendingDataReads.delete(requestId)
+        pending.removeAbortListener()
+        pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
+      }
       for (const listener of this.exitListeners) listener(message.event)
     }
   }
@@ -754,6 +875,7 @@ export class ServerOpsRuntimeClient {
     this.usedLogStreamIds.clear()
     this.rejectPending(error)
     this.rejectPendingExec(error)
+    this.rejectPendingDataReads(error)
     this.rejectPendingLogStarts(error)
     this.finishAllLogStreams('error', error.code)
     this.finishAllConsoles(error)
@@ -840,6 +962,16 @@ export class ServerOpsRuntimeClient {
     this.pendingExecs.clear()
   }
 
+  /** 拒绝并清理全部在途数据服务读取。 */
+  private rejectPendingDataReads(error: ServerOpsRuntimeError): void {
+    for (const pending of this.pendingDataReads.values()) {
+      clearTimeout(pending.timeout)
+      pending.removeAbortListener()
+      pending.reject(error)
+    }
+    this.pendingDataReads.clear()
+  }
+
   /** 拒绝并清理全部待启动日志流。 */
   private rejectPendingLogStarts(error: ServerOpsRuntimeError): void {
     for (const pending of this.pendingLogStarts.values()) {
@@ -867,6 +999,9 @@ export class ServerOpsRuntimeClient {
       if (pending.connectionId === connectionId && pending.hostId !== hostId) return true
     }
     for (const pending of this.pendingExecs.values()) {
+      if (pending.connectionId === connectionId && pending.hostId !== hostId) return true
+    }
+    for (const pending of this.pendingDataReads.values()) {
       if (pending.connectionId === connectionId && pending.hostId !== hostId) return true
     }
     for (const pending of this.pendingLogStarts.values()) {

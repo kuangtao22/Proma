@@ -101,6 +101,8 @@ import { updateSettings } from '../settings-service'
 import { getConfiguredVaultFileSystem, getVaultConfig } from '../vault-service'
 import type { ProductivityToolsSettings } from '../../../types'
 import type { ServerOpsAgentFacade } from '../server-ops/server-ops-agent-facade'
+import type { ServerOpsAgentReadFacade } from '../server-ops/server-ops-agent-read-facade'
+import { buildServerOpsReadTools } from './pi-server-ops-read-tools'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -140,6 +142,8 @@ export interface PiBuiltinToolsContext {
   captureDesignImageRequest?: (request: ImageRequestAudit) => void
   /** 已由 Orchestrator 绑定真实会话与运行来源的服务器运维 Facade。 */
   serverOpsFacade?: ServerOpsAgentFacade
+  /** 多资源只读接口独立于单服务器操作接口，授权由主进程逐次验证。 */
+  serverOpsReadFacade?: ServerOpsAgentReadFacade
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1686,6 +1690,9 @@ export async function buildPiBuiltinTools(
     } catch (error) {
       console.error('[Pi 桥接] 注入服务器运维工具失败:', error)
     }
+  }
+  if (ctx.serverOpsReadFacade && serverOpsSourceAllowed) {
+    tools.push(...buildServerOpsReadTools(sdk, ctx.serverOpsReadFacade))
   }
 
   if (isWebSearchEnabledForAgent()) {

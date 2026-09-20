@@ -21,6 +21,9 @@ import type {
   ServerOpsTerminalOutputAck,
   ServerOpsTerminalOutputEvent,
   ServerOpsTerminalResizeInput,
+  ServerOpsTestConnectionInput,
+  ServerOpsTestConnectionResult,
+  ServerOpsTestConnectionStatus,
 } from '@proma/shared'
 import type { ServerOpsResolvedCredential } from './server-ops-credential-store'
 import type {
@@ -376,6 +379,95 @@ export class ServerOpsConnectionService {
       /** 领域错误只允许已知稳定码，其余统一收敛。 */
       const code = error instanceof Error && error.message.startsWith('SERVER_OPS_') ? error.message : 'SERVER_OPS_CONNECTION_FAILED'
       return this.publishError(host.id, code, getPublicErrorMessage(code))
+    }
+  }
+
+  /**
+   * 用弹窗草稿做一次真实 SSH 握手，用于“测试”按钮。
+   *
+   * 复用 `connect` 的握手路径与 Host Key 判定，避免另写一条会产生差异的连接实现。
+   * 测试不建立可用会话、不改变信任状态、不写审计，结束后立即断开 runtime 连接；
+   * 私钥内容只在主进程内读取，草稿与凭据都不落盘。
+   *
+   * @param input 弹窗当前草稿的地址、端口、用户名与内联凭据
+   * @returns 稳定结论与不含秘密的中文说明
+   */
+  async testConnection(input: ServerOpsTestConnectionInput): Promise<ServerOpsTestConnectionResult> {
+    /** 信任文件不可读时不发起任何握手，避免在不可信基线上做判断。 */
+    if (!this.trustMonitoringAvailable) return { status: 'failed', message: '服务器信任监听不可用，请重启应用' }
+    /** 只用于信任查询的临时端点身份；不写入任何 Store。 */
+    const endpoint = { address: input.address, port: input.port }
+    /** 认证材料；私钥在读取失败或 Agent 不可用时直接给出明确结论。 */
+    let authentication: ServerOpsRuntimeConnectionInput['authentication']
+    try {
+      authentication = this.resolveTestAuthentication(input)
+    } catch (error) {
+      const code = error instanceof Error && error.message.startsWith('SERVER_OPS_') ? error.message : 'SERVER_OPS_CONNECTION_FAILED'
+      return {
+        status: code === 'SERVER_OPS_SSH_AGENT_UNAVAILABLE' ? 'agent-unavailable' : 'failed',
+        message: getPublicErrorMessage(code),
+      }
+    }
+    /** 当前 endpoint 已固定的 Host Key；未信任时由 runtime 在认证前阻断。 */
+    const expectedHostKey = this.dependencies.trust.get(endpoint)
+    /** 本次测试独占的临时连接身份，与真实主机生命周期完全隔离。 */
+    const connectionId = this.dependencies.uuid()
+    /** 握手耗时起点，用于给用户一个可比较的往返延迟。 */
+    const startedAt = Date.now()
+    try {
+      const result = await this.dependencies.runtime.connect({
+        hostId: SERVER_OPS_TEST_CONNECTION_HOST_ID,
+        connectionId,
+        address: input.address,
+        port: input.port,
+        username: input.username,
+        ...(expectedHostKey ? { expectedHostKey } : {}),
+        authentication,
+        cols: SERVER_OPS_TEST_CONNECTION_COLS,
+        rows: SERVER_OPS_TEST_CONNECTION_ROWS,
+      })
+      /** 测试不得留下连接或 PTY，无论握手结果如何都立即释放。 */
+      this.disconnectRuntimeConnection(SERVER_OPS_TEST_CONNECTION_HOST_ID, connectionId)
+      const latencyMs = Math.max(0, Date.now() - startedAt)
+      if (result.status === 'connected') {
+        return { status: 'reachable', message: '连接成功', hostKey: result.hostKey, latencyMs }
+      }
+      /** 握手被拒时区分“首次未信任”和“指纹变化”，两者对用户的含义完全不同。 */
+      const trustResult = this.dependencies.trust.check(endpoint, result.observedHostKey)
+      return trustResult.status === 'changed'
+        ? { status: 'host-key-mismatch', message: '服务器指纹与已信任记录不一致，已阻断', hostKey: result.observedHostKey, latencyMs }
+        : { status: 'host-key-untrusted', message: '首次连接：请核对指纹后再确认', hostKey: result.observedHostKey, latencyMs }
+    } catch (error) {
+      this.disconnectRuntimeConnection(SERVER_OPS_TEST_CONNECTION_HOST_ID, connectionId)
+      /** runtime 暴露的已经是脱敏稳定文案，与真实连接失败时的展示保持一致。 */
+      if (isServerOpsRuntimeError(error)) return { status: mapTestConnectionStatus(error.code), message: error.message }
+      return { status: 'failed', message: getPublicErrorMessage('SERVER_OPS_CONNECTION_FAILED') }
+    }
+  }
+
+  /**
+   * 把测试输入转换为 runtime 认证材料。
+   *
+   * 优先使用弹窗里刚填写的内联凭据；未提供时按 hostId 复用已保存凭据，
+   * 让编辑已有主机时不必重新输入密码。私钥内容只在本进程读取，不返回 Renderer。
+   */
+  private resolveTestAuthentication(input: ServerOpsTestConnectionInput): ServerOpsRuntimeConnectionInput['authentication'] {
+    /** 内联凭据优先；缺失时回落到已保存凭据。 */
+    const credential = input.credential
+    if (!credential) {
+      const host = input.hostId === undefined ? undefined : this.dependencies.hosts.get(input.hostId)
+      if (!host) throw new Error('SERVER_OPS_CREDENTIAL_REQUIRED')
+      /** 已保存凭据按草稿里的地址与端口复用，认证方式必须与主机记录一致。 */
+      return this.resolveAuthentication({ ...host, address: input.address, port: input.port, username: input.username })
+    }
+    if (credential.kind === 'ssh-agent') return { kind: 'ssh-agent', agent: this.dependencies.resolveSshAgent() }
+    if (credential.kind === 'password') return { kind: 'password', password: credential.password }
+    try {
+      /** 私钥内容随请求传入隔离 runtime，不返回 Renderer。 */
+      const privateKey = this.dependencies.readPrivateKey(credential.keyPath)
+      return { kind: 'private-key', privateKey, ...(credential.passphrase === undefined ? {} : { passphrase: credential.passphrase }) }
+    } catch {
+      throw new Error('SERVER_OPS_PRIVATE_KEY_UNAVAILABLE')
     }
   }
 
@@ -803,6 +895,21 @@ export class ServerOpsConnectionService {
   private publishError(hostId: string, errorCode: string, message: string): ServerOpsConnectionState {
     return this.publish({ hostId, phase: 'error', errorCode, message })
   }
+}
+
+/** 连接测试使用的临时 hostId；不属于任何真实主机，也不进入主机资产。 */
+const SERVER_OPS_TEST_CONNECTION_HOST_ID = 'server-ops-connection-test'
+/** 连接测试使用的固定终端尺寸；测试不用于交互，仅满足 runtime 合同。 */
+const SERVER_OPS_TEST_CONNECTION_COLS = 80
+const SERVER_OPS_TEST_CONNECTION_ROWS = 24
+
+/** 把稳定错误码映射为测试结论。 */
+function mapTestConnectionStatus(code: string): ServerOpsTestConnectionStatus {
+  if (code === 'SERVER_OPS_AUTH_FAILED') return 'auth-failed'
+  if (code === 'SERVER_OPS_CONNECTION_TIMEOUT') return 'timeout'
+  if (code === 'SERVER_OPS_NETWORK_UNREACHABLE') return 'unreachable'
+  if (code === 'SERVER_OPS_SSH_AGENT_UNAVAILABLE') return 'agent-unavailable'
+  return 'failed'
 }
 
 /** 创建生产连接 Service 使用的系统依赖。 */

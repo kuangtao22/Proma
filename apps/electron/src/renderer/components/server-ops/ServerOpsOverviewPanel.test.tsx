@@ -153,13 +153,14 @@ describe('服务器运维真实概览面板', () => {
   })
 
   test('Given 概览工作区 When Pane 宽度变化 Then 原生容器查询控制指标、系统与资源列数', async () => {
-    /** 运维工作区的真实容器查询样式。 */
+    /** 公共资源分隔样式与组件独立卡片排版共同按实际 Pane 响应。 */
     const styles = await Bun.file(new URL('../../styles/globals.css', import.meta.url)).text()
+    const html = renderToStaticMarkup(<ServerOpsOverviewPanelView status="ready" snapshot={createSnapshot()} stale={false} error={null} onRefresh={() => undefined} />)
 
-    expect(styles).toContain('@container (min-width: 520px)')
-    expect(styles).toContain('@container (min-width: 700px)')
-    expect(styles).toContain('[data-server-ops-overview-grid]')
-    expect(styles).toContain('[data-server-ops-overview-system-grid]')
+    expect(styles).toContain('@container (min-width: 720px)')
+    expect(html).toContain('@container (min-width: 900px)')
+    expect(html).toContain('[data-server-ops-overview-grid]')
+    expect(html).toContain('[data-server-ops-overview-system-grid]')
     expect(styles).toContain('[data-server-ops-overview-resource-grid]')
   })
 

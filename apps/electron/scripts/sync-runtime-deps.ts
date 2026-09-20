@@ -69,6 +69,9 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
   'node-pty',
   // 独立 Server Ops utility process 使用 ssh2 的纯 JavaScript crypto 路径。
   'ssh2',
+  // 数据服务在 Server Ops utility process 内通过 SSH forwardOut 通道直连数据库，不经过本机监听端口。
+  'mysql2',
+  'ioredis',
 ]
 
 /** ssh2 的性能型可选依赖含 native binding，跨平台打包统一走 JS fallback。 */
