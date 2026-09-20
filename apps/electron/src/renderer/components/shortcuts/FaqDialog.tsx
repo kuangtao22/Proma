@@ -13,8 +13,11 @@ import { faqDialogOpenAtom } from '@/atoms/faq-dialog'
 import { FAQ_GROUPS } from '@/components/onboarding/faq-content'
 import { iconButtonNoRingFocusClass } from '@/components/ui/icon-button-styles'
 import { cn } from '@/lib/utils'
+import { useBrowserModalRef } from '@/hooks/useBrowserModalRef'
 
 export function FaqDialog(): React.ReactElement {
+  /** 自定义模态内容与共用 Dialog 一样优先于原生网页展示。 */
+  const contentRef = useBrowserModalRef<HTMLDivElement>()
   const open = useAtomValue(faqDialogOpenAtom)
   const setOpen = useSetAtom(faqDialogOpenAtom)
   const scrollRef = React.useRef<HTMLDivElement>(null)
@@ -32,6 +35,7 @@ export function FaqDialog(): React.ReactElement {
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-[80] bg-black/40 backdrop-blur-sm" />
         <DialogPrimitive.Content
+          ref={contentRef}
           className={cn(
             'fixed left-1/2 top-1/2 z-[81] flex h-[80vh] w-[min(860px,90vw)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-2xl dark:border-neutral-800 dark:bg-neutral-900',
           )}

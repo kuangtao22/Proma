@@ -78,6 +78,8 @@ type BrowserTabRecord = {
   lastBounds?: BrowserViewLayout['bounds']
   /** 仅记录当前实际挂载的 owner；隐藏时 detach，但保留 WebContents 及页面状态。 */
   attachedOwner: BrowserWindow | null
+  /** 应用 overlay 临时遮挡当前 BrowserSlot 时保持所属 session 的回收保护。 */
+  preserveSessionOnHide: boolean
 }
 type BrowserTabOptions = {
   isLocalPreview?: boolean
@@ -109,8 +111,6 @@ type BrowserSessionRecord = {
   agentAbortController: AbortController
   /** 当前已入队或正在执行的 Agent 浏览器操作数量；非零时 session 不参与后台回收。 */
   activeAgentOperationCount: number
-  /** 应用 overlay 临时遮挡 BrowserSlot 时保持回收保护。 */
-  preserveSessionOnHide: boolean
   allowedRoots: string[]
   executionSource: BrowserExecutionSource
   /** 全会话的脱敏账本，避免仅显示 Agent 当前 tab 的最后 30 条。 */
@@ -578,7 +578,6 @@ export class BrowserController {
       agentTabId: null,
       agentAbortController: new AbortController(),
       activeAgentOperationCount: 0,
-      preserveSessionOnHide: false,
       allowedRoots: [...new Set((allowedRoots.length > 0 ? allowedRoots : configuration?.allowedRoots ?? []).filter(Boolean))],
       executionSource: configuration?.executionSource ?? 'user',
       ledger: [],
@@ -621,6 +620,7 @@ export class BrowserController {
       lastActivityAt: Date.now(),
       favicon: null,
       attachedOwner: null,
+      preserveSessionOnHide: false,
     }
     view.setVisible(false)
     view.webContents.setWindowOpenHandler(({ url }) => {
@@ -915,7 +915,7 @@ export class BrowserController {
 
   private isBackgroundSession(browserSession: BrowserSessionRecord): boolean {
     if (this.hasPresentationForSession(browserSession.sessionId)) return false
-    if (browserSession.preserveSessionOnHide) return false
+    if ([...browserSession.tabs.values()].some((tab) => tab.preserveSessionOnHide)) return false
     if (browserSession.activeAgentOperationCount > 0) return false
     return [...browserSession.tabs.values()].every((tab) => !tab.state.visible)
   }
@@ -944,11 +944,11 @@ export class BrowserController {
     activeTab.lastActivityAt = Date.now()
     const changedSessions = new Set<BrowserSessionRecord>()
     for (const tab of browserSession.tabs.values()) {
+      tab.preserveSessionOnHide = false
       if (this.hideTabView(tab)) changedSessions.add(browserSession)
     }
     this.clearPresentationsForSession(browserSession.sessionId)
     if (this.foregroundPresentationSessionId === browserSession.sessionId) this.foregroundPresentationSessionId = null
-    browserSession.preserveSessionOnHide = false
     this.emitChangedSessions(changedSessions)
     this.pruneBackgroundSessions()
   }
@@ -965,7 +965,7 @@ export class BrowserController {
     const previousRevision = browserSession.lastLayoutRevisionByTab.get(tab.tabId) ?? 0
     if (!isNewBrowserTabLayoutRevision(layout.revision, previousRevision)) return
     browserSession.lastLayoutRevisionByTab.set(tab.tabId, layout.revision)
-    browserSession.preserveSessionOnHide = layout.preserveSessionOnHide === true
+    tab.preserveSessionOnHide = layout.preserveSessionOnHide === true
 
     const bounds = layout.bounds
     const visible = layout.visible && bounds.width > 4 && bounds.height > 4 && !!this.owner && !this.owner.isDestroyed() && this.owner.isVisible()

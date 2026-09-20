@@ -12,6 +12,7 @@ import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { cn } from '@/lib/utils'
 import { iconButtonNoRingFocusClass } from '@/components/ui/icon-button-styles'
+import { useBrowserModalRef } from '@/hooks/useBrowserModalRef'
 import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_CATEGORY_LABELS,
@@ -129,6 +130,8 @@ function ShortcutTile({ item }: { item: ShortcutGuideItem }): React.ReactElement
 }
 
 export function ShortcutGuideDialog(): React.ReactElement {
+  /** 快捷键地图使用自定义 Content，也必须让原生网页避让。 */
+  const contentRef = useBrowserModalRef<HTMLDivElement>()
   const open = useAtomValue(shortcutGuideOpenAtom)
   const setOpen = useSetAtom(shortcutGuideOpenAtom)
   const overrides = useAtomValue(shortcutOverridesAtom)
@@ -219,6 +222,7 @@ export function ShortcutGuideDialog(): React.ReactElement {
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-[100] bg-black/40 titlebar-no-drag transition-opacity duration-100 data-[state=open]:opacity-100 data-[state=closed]:opacity-0" />
         <DialogPrimitive.Content
+          ref={contentRef}
           aria-describedby={undefined}
           className="fixed left-1/2 top-1/2 z-[100] flex h-[85vh] max-h-[752px] w-[85vw] max-w-[992px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl bg-dialog text-dialog-foreground shadow-2xl titlebar-no-drag transition-all duration-100 data-[state=open]:opacity-100 data-[state=open]:scale-100 data-[state=closed]:opacity-0 data-[state=closed]:scale-[0.98]"
         >

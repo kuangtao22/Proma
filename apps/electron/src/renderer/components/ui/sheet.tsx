@@ -6,8 +6,11 @@ import { X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { detectIsWindows } from "@/lib/platform"
 import { iconButtonNoRingFocusClass } from "@/components/ui/icon-button-styles"
+import { Dialog } from "@/components/ui/dialog"
+import { BrowserModalContext, useBrowserModalRef } from "@/hooks/useBrowserModalRef"
 
-const Sheet = SheetPrimitive.Root
+// Sheet 与 Dialog 共用 Root，保证 modal=false 的语义一致。
+const Sheet = Dialog
 
 const SheetTrigger = SheetPrimitive.Trigger
 
@@ -60,6 +63,9 @@ const SheetContent = React.forwardRef<
   React.ElementRef<typeof SheetPrimitive.Content>,
   SheetContentProps
 >(({ side = "right", className, children, hideClose, ...props }, ref) => {
+  /** 抽屉退出动画比普通弹窗更长，以真实内容节点生命周期控制网页恢复。 */
+  const modal = React.useContext(BrowserModalContext)
+  const contentRef = useBrowserModalRef(ref, modal)
   // Windows 下右侧抽屉的关闭按钮（right-4 top-4）会与窗口控制按钮重叠，隐藏它；
   // 用户可点击遮罩空白处或按 Esc 关闭。其他方向的抽屉不在窗口边缘，不受影响。
   // 业务组件也可通过 hideClose 显式移除关闭按钮。
@@ -69,7 +75,7 @@ const SheetContent = React.forwardRef<
     <SheetPortal>
       <SheetOverlay />
       <SheetPrimitive.Content
-        ref={ref}
+        ref={contentRef}
         className={cn(sheetVariants({ side }), className)}
         {...props}
       >

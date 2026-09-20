@@ -16,6 +16,7 @@ import { ChevronLeft, ChevronRight, Download, Pencil, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { iconButtonNoRingFocusClass } from '@/components/ui/icon-button-styles'
 import { ImageEditor } from '@/components/ui/image-editor'
+import { useBrowserModalRef } from '@/hooks/useBrowserModalRef'
 
 /** 单张图片描述（多图导航时使用） */
 export interface LightboxImage {
@@ -64,6 +65,8 @@ export function ImageLightbox({
   onIndexChange,
   initialMode = 'preview',
 }: ImageLightboxProps): React.ReactElement | null {
+  /** 图片预览/编辑仍挂载时保留模态避让，避免网页遮住预览和操作按钮。 */
+  const contentRef = useBrowserModalRef<HTMLDivElement>()
   const [mode, setMode] = React.useState<'preview' | 'editing'>('preview')
 
   const hasImages = Array.isArray(images) && images.length > 0
@@ -138,6 +141,7 @@ export function ImageLightbox({
           )}
         />
         <DialogPrimitive.Content
+          ref={contentRef}
           className={cn(
             'fixed inset-0 z-[200] flex flex-col items-center justify-center titlebar-no-drag',
             'data-[state=open]:animate-in data-[state=closed]:animate-out',
