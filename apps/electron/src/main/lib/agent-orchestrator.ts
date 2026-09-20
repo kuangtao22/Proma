@@ -1743,9 +1743,10 @@ export class AgentOrchestrator {
 
         // 标题请求与前台 Agent run 使用独立的 Codex Responses 请求，可并发执行。
         // 自动标题只会写入仍为默认名称的会话，因此不会覆盖用户的手动重命名。
+        // 标题优先基于用户原文；Bridge 追加的来源标记等 Agent 运行上下文不应出现在标题中。
         this.autoGenerateTitle(
           sessionId,
-          userMessage,
+          rawUserMessage ?? userMessage,
           channelId,
           resolvedModel,
           callbacks,
@@ -1788,8 +1789,6 @@ export class AgentOrchestrator {
             console.error(`[Agent 编排] 保存 Pi session_id 失败:`, err)
           }
         }
-
-        startAutoTitleGeneration()
       }
       const handleModelResolved = (model: string): void => {
         if (!isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)) return
@@ -1897,6 +1896,10 @@ export class AgentOrchestrator {
           this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'retry', ...retry } })
         },
       }
+
+      // 首条用户消息已持久化且运行参数已就绪，立刻启动自动命名。
+      // 不依赖 Pi onSessionId：部分第三方渠道在该回调延迟或缺失时仍必须完成重命名。
+      startAutoTitleGeneration()
 
       console.log(`[Agent 编排] 开始通过 Adapter 遍历事件流...`)
 

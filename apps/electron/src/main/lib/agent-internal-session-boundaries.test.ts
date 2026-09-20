@@ -109,6 +109,24 @@ describe('外部 Bridge 会话边界', () => {
     expect(headlessInputs[0]?.userMessage).toBe(transformEnabled ? `解释报告\n\n${marker}` : '解释报告')
   })
 
+  test('Given Bridge 首次收到外部消息 When 自动创建会话 Then 保留默认标题以便复用统一自动命名', async () => {
+    agentSessionManagerTestMock.reset()
+    bridgeReplies.length = 0
+    startedSessions.length = 0
+    const { BridgeCommandHandler } = await import('./bridge-command-handler')
+    const handler = new BridgeCommandHandler({
+      platformName: '微信',
+      adapter: { sendText: async (_chatId, text) => { bridgeReplies.push(text) } },
+    })
+
+    await handler.handleIncomingMessage('chat-title', '帮我看看这个报错')
+
+    const createdSessionId = agentSessionManagerTestMock.createdSessionIds.at(-1)
+    expect(createdSessionId).toBeDefined()
+    /** 平台来源由 binding 保存；标题必须是默认名，否则会被判定为「用户已命名」而跳过自动命名。 */
+    expect(sessions.get(createdSessionId ?? '')?.title).toBe('新 Agent 会话')
+  })
+
   test('Given 普通、Design、Canvas 与半归属会话 When Bridge 列表和按 ID 切换 Then 只允许普通会话', async () => {
     agentSessionManagerTestMock.reset()
     bridgeReplies.length = 0

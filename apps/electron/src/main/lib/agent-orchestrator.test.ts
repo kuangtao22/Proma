@@ -469,6 +469,30 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(methodBody.match(/if \(!isCurrent\(\)\) return/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
   })
 
+  test('Given 外部 Bridge 会话且渠道不回调 session_id When 检查自动命名接入 Then 运行前启动且标题取用户原文', () => {
+    /** 读取真实编排源码，约束自动命名不依赖 Pi onSessionId，且不被 Bridge 上下文标记污染。 */
+    const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')
+    const sendStart = source.indexOf('  async sendMessage(')
+    const sendEnd = source.indexOf('\n  /**\n   * 中止指定会话', sendStart)
+    const sendBody = source.slice(sendStart, sendEnd)
+
+    /** 标题请求使用用户原文，Bridge 追加的来源标记只应进入模型输入。 */
+    expect(sendBody).toContain('rawUserMessage ?? userMessage')
+
+    /** session_id 回调只负责持久化 artifact，不再充当自动命名的唯一入口。 */
+    const sessionIdHandlerStart = sendBody.indexOf('const handleSessionId = (')
+    const sessionIdHandlerEnd = sendBody.indexOf('const handleModelResolved', sessionIdHandlerStart)
+    const sessionIdHandlerBody = sendBody.slice(sessionIdHandlerStart, sessionIdHandlerEnd)
+    expect(sessionIdHandlerStart).toBeGreaterThan(-1)
+    expect(sessionIdHandlerBody).not.toContain('startAutoTitleGeneration()')
+
+    /** 自动命名必须在遍历 Adapter 事件流之前启动，避免渠道不回调时永不命名。 */
+    const autoTitleCallIndex = sendBody.indexOf('startAutoTitleGeneration()')
+    const eventLoopIndex = sendBody.indexOf('// 14. 遍历 Adapter 事件流')
+    expect(autoTitleCallIndex).toBeGreaterThan(-1)
+    expect(eventLoopIndex).toBeGreaterThan(autoTitleCallIndex)
+  })
+
   test('Given Agent 使用自定义兼容渠道 When 生成自动标题 Then 复用 Pi 模型路由且失败统一本地兜底', () => {
     /** 读取真实编排源码，防止标题请求退回与 Agent 不一致的 Chat Provider Adapter。 */
     const source = readFileSync(join(import.meta.dir, 'agent-orchestrator.ts'), 'utf8')

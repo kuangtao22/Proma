@@ -40,11 +40,12 @@ mock.module('./agent-session-manager', () => ({
   listVisibleAgentSessions: () => Array.from(agentSessionManagerTestMock.sessions.values()).filter(isVisible),
   getAgentSessionMeta: (sessionId: string) => agentSessionManagerTestMock.getSessionMetaOverride?.(sessionId)
     ?? agentSessionManagerTestMock.sessions.get(sessionId),
-  createAgentSession: (title: string, channelId: string, workspaceId?: string, modelId?: string) => {
+  /** 与真实 createAgentSession 一致：未命名时落到默认标题，便于断言自动命名前提。 */
+  createAgentSession: (title?: string, channelId?: string, workspaceId?: string, modelId?: string) => {
     const id = `${agentSessionManagerTestMock.sessionIdPrefix}-${agentSessionManagerTestMock.createdSessionIds.length + 1}`
     const created: AgentSessionMeta = {
       id,
-      title,
+      title: title || '新 Agent 会话',
       channelId,
       modelId,
       workspaceId,
