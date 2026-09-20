@@ -20,6 +20,7 @@ import {
   ensureDirectoryDurable,
   readAtomicFileState,
   readJsonFileSafe,
+  readJsonFileStrict,
   removeFileAtomic,
   writeJsonFileAtomic,
   writeJsonLinesFileAtomic,
@@ -280,6 +281,98 @@ describe('readJsonFileSafe validator', () => {
 
     expect(readJsonFileSafe(filePath, { validate: isVersionedValue })).toEqual(validBackup)
     expect(JSON.parse(readFileSync(filePath, 'utf-8'))).toEqual(validBackup)
+  })
+
+  test('Given 主文件超过候选字节预算且备份有效 When 严格读取 Then 跳过主文件并恢复备份', () => {
+    /** 主文件在 JSON.parse 前就必须因候选预算被拒绝。 */
+    writeFileSync(filePath, JSON.stringify({ version: 1, value: 'x'.repeat(256) }), 'utf8')
+    const backup: VersionedValue = { version: 1, value: 'backup' }
+    writeFileSync(`${filePath}.bak`, JSON.stringify(backup), 'utf8')
+    const warning = console.warn
+    const log = console.log
+    console.warn = () => undefined
+    console.log = () => undefined
+    try {
+      expect(readJsonFileStrict(filePath, {
+        validate: isVersionedValue,
+        description: '测试索引',
+        maxBytes: 128,
+      })).toEqual(backup)
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual(backup)
+    } finally {
+      console.warn = warning
+      console.log = log
+    }
+  })
+
+  test('Given 备份校验期间主文件被并发替换 When 安全恢复 Then CAS 冲突且保留新主文件', () => {
+    const backup: VersionedValue = { version: 1, value: 'backup' }
+    const concurrent: VersionedValue = { version: 1, value: 'concurrent' }
+    writeFileSync(filePath, JSON.stringify({ version: 2, value: 'invalid' }), 'utf8')
+    writeFileSync(`${filePath}.bak`, JSON.stringify(backup), 'utf8')
+    let replaced = false
+    const warning = console.warn
+    console.warn = () => undefined
+    try {
+      expect(() => readJsonFileStrict(filePath, {
+        validate: (value): value is VersionedValue => {
+          if (isVersionedValue(value) && value.value === backup.value && !replaced) {
+            replaced = true
+            writeFileSync(filePath, JSON.stringify(concurrent), 'utf8')
+          }
+          return isVersionedValue(value)
+        },
+        description: '测试索引',
+        maxBytes: 128,
+        secureRecovery: true,
+      })).toThrow()
+      expect(JSON.parse(readFileSync(filePath, 'utf8'))).toEqual(concurrent)
+    } finally {
+      console.warn = warning
+    }
+  })
+
+  test('Given 主/tmp/bak 三个候选均超过字节预算 When 严格读取 Then 稳定失败而不覆盖主文件', () => {
+    const oversized = JSON.stringify({ version: 1, value: 'x'.repeat(256) })
+    writeFileSync(filePath, oversized, 'utf8')
+    writeFileSync(`${filePath}.tmp`, oversized, 'utf8')
+    writeFileSync(`${filePath}.bak`, oversized, 'utf8')
+    const warning = console.warn
+    const error = console.error
+    console.warn = () => undefined
+    console.error = () => undefined
+    try {
+      expect(() => readJsonFileStrict(filePath, {
+        validate: isVersionedValue,
+        description: '测试索引',
+        maxBytes: 128,
+      })).toThrow('测试索引的所有 JSON 候选均损坏')
+      expect(readFileSync(filePath, 'utf8')).toBe(oversized)
+    } finally {
+      console.warn = warning
+      console.error = error
+    }
+  })
+
+  test('Given 未提供候选字节预算 When 读取大 JSON Then 保持原有无限读取兼容行为', () => {
+    const value: VersionedValue = { version: 1, value: 'x'.repeat(4_096) }
+    writeFileSync(filePath, JSON.stringify(value), 'utf8')
+    expect(readJsonFileSafe(filePath, { validate: isVersionedValue })).toEqual(value)
+  })
+
+  test('Given 候选路径是根外 symlink When 使用字节预算读取 Then 不跟随链接内容', () => {
+    const outsidePath = join(tempDir, 'outside.json')
+    const outsideValue: VersionedValue = { version: 1, value: 'outside' }
+    writeFileSync(outsidePath, JSON.stringify(outsideValue), 'utf8')
+    symlinkSync(outsidePath, filePath)
+    const warning = console.warn
+    console.warn = () => undefined
+    try {
+      expect(readJsonFileSafe(filePath, { validate: isVersionedValue, maxBytes: 128 })).toBeNull()
+      expect(JSON.parse(readFileSync(outsidePath, 'utf8'))).toEqual(outsideValue)
+    } finally {
+      console.warn = warning
+    }
   })
 
   test('Given schema-invalid tmp and valid backup When reading with validator Then tmp is not promoted', () => {

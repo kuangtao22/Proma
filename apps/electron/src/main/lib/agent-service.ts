@@ -813,7 +813,7 @@ export async function runAgentHeadless(
           })
         }
       },
-      onRunStarted: ({ startedAt: persistedStartedAt, runGeneration: persistedRunGeneration }) => {
+      onRunStarted: ({ startedAt: persistedStartedAt, runGeneration: persistedRunGeneration, userMessage, userMessageUuid }) => {
         activeStartedAt = persistedStartedAt
         runGeneration = persistedRunGeneration
         const session = getAgentSessionMeta(runInput.sessionId)
@@ -834,6 +834,8 @@ export async function runAgentHeadless(
               startedAt: persistedStartedAt,
               runGeneration: persistedRunGeneration,
               ...(session ? { session } : {}),
+              ...(userMessage !== undefined ? { userMessage } : {}),
+              ...(userMessageUuid ? { userMessageUuid } : {}),
             },
           })
         })

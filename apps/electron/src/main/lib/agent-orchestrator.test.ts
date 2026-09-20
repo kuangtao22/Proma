@@ -309,7 +309,8 @@ describe('Agent sendMessage 准入顺序合同', () => {
     expect(sendBody).toContain('onError: terminalNotifier.onError')
     expect(sendBody).toContain('onComplete: completeBeforeRun')
     expect(sendBody).not.toMatch(/callbacks\.on(?:Error|Complete)\(/)
-    expect(sendBody).toContain('callbacks.onRunStarted?.({ startedAt: streamStartedAt, runGeneration })')
+    expect(sendBody).toContain('callbacks.onRunStarted?.({')
+    expect(sendBody).toContain('userMessageUuid: initialUserMessageUuid')
   })
 
   test('Given Pi typed-error 与正常 result When 完成运行 Then 只有正常 result 透传可证明的 success subtype', () => {

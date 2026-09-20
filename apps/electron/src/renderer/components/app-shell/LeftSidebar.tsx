@@ -11,7 +11,7 @@
 import * as React from 'react'
 import { useAtom, useSetAtom, useAtomValue, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelLeftOpen, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, ChevronsDownUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw, Info } from 'lucide-react'
+import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelRight, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, ChevronsDownUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw, Info } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { ModeSwitcher } from './ModeSwitcher'
@@ -3256,13 +3256,19 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
                 className="group flex size-10 items-center justify-center p-1 titlebar-no-drag"
               >
                 <span className="flex size-8 items-center justify-center rounded-[10px] bg-muted text-foreground/60 transition-[background-color,color] duration-150 group-hover:bg-foreground/[0.08] group-hover:text-foreground">
-                  <PanelLeftOpen size={16} />
+                  <PanelRight size={16} />
                 </span>
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">
-              展开侧边栏 (
-              {navigator.platform.includes("Mac") ? "⌘B" : "Ctrl+Shift+E"})
+              <span className="flex items-center gap-2">
+                <span>展开侧边栏</span>
+                <ShortcutKeycaps
+                  shortcutId="toggle-sidebar"
+                  keycapClassName="h-5 min-w-5 px-1 text-[11px]"
+                  separatorClassName="text-[10px]"
+                />
+              </span>
             </TooltipContent>
           </Tooltip>
 
@@ -3476,7 +3482,16 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
               <PanelLeft size={14} />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="right">收起侧边栏 ({navigator.platform.includes('Mac') ? '⌘B' : 'Ctrl+Shift+E'})</TooltipContent>
+          <TooltipContent side="right">
+            <span className="flex items-center gap-2">
+              <span>收起侧边栏</span>
+              <ShortcutKeycaps
+                shortcutId="toggle-sidebar"
+                keycapClassName="h-5 min-w-5 px-1 text-[11px]"
+                separatorClassName="text-[10px]"
+              />
+            </span>
+          </TooltipContent>
         </Tooltip>
       </div>
 
@@ -3519,7 +3534,16 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
               <Search size={16} />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="bottom">搜索 ({getAcceleratorDisplay(getActiveAccelerator('global-search'))})</TooltipContent>
+          <TooltipContent side="bottom">
+            <span className="flex items-center gap-2">
+              <span>搜索</span>
+              <ShortcutKeycaps
+                shortcutId="global-search"
+                keycapClassName="h-5 min-w-5 px-1 text-[11px]"
+                separatorClassName="text-[10px]"
+              />
+            </span>
+          </TooltipContent>
         </Tooltip>
       </div>
 

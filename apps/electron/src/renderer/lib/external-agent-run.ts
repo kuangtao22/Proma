@@ -1,4 +1,4 @@
-import type { AgentSessionMeta } from '@proma/shared'
+import type { AgentSessionMeta, SDKMessage, SDKUserMessage } from '@proma/shared'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 import type { TabItem } from '@/atoms/tab-atoms'
 
@@ -24,6 +24,43 @@ export interface ExternalAgentRunActivation {
   workspaceId?: string
   modelId?: string
   streamState: AgentStreamState
+}
+
+/** 已持久化外部消息的实时展示字段，兼容旧版缺少正文或 UUID 的事件。 */
+interface ExternalAgentRunMessageInput {
+  /** 原始用户正文，不含模型专用平台标记。 */
+  userMessage?: string
+  /** 主进程签发并持久化的消息 UUID。 */
+  userMessageUuid?: string
+  /** 当前运行的权威开始时间。 */
+  startedAt: number
+}
+
+/** 实时消息在基础 SDK 形状之外携带时间，以复用当前轮分组逻辑。 */
+interface ExternalAgentRunUserMessage extends SDKUserMessage {
+  /** 展示排序时间，与启动事件一致。 */
+  _createdAt: number
+  /** 当前轮标记，避免用户输入被分到上一轮。 */
+  _promaLiveRunStartedAt: number
+}
+
+/** 追加已持久化的外部输入；旧事件或重复 UUID 返回原数组，避免额外渲染。 */
+export function appendExternalAgentRunUserMessage(
+  messages: SDKMessage[],
+  input: ExternalAgentRunMessageInput,
+): SDKMessage[] {
+  if (input.userMessage === undefined || !input.userMessageUuid) return messages
+  if (messages.some((message) => 'uuid' in message && message.uuid === input.userMessageUuid)) return messages
+  /** 展示副本复用持久化身份，不再生成消息 ID。 */
+  const userMessage: ExternalAgentRunUserMessage = {
+    type: 'user',
+    uuid: input.userMessageUuid,
+    message: { content: [{ type: 'text', text: input.userMessage }] },
+    parent_tool_use_id: null,
+    _createdAt: input.startedAt,
+    _promaLiveRunStartedAt: input.startedAt,
+  }
+  return [...messages, userMessage]
 }
 
 /** 迟到的启动事件不得复活已结束运行，或覆盖同一会话的更新运行。 */

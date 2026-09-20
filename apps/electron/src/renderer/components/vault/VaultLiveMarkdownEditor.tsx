@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { LiveMarkdownEditor, type LiveMarkdownEditorHandle, type LiveMarkdownTextSelection, type LiveMarkdownPropertyEntry } from '@/components/markdown/LiveMarkdownEditor'
 import { serializeFlatLeadingFrontmatter } from '@/components/markdown/live-markdown-frontmatter'
+import { createVaultWikiLinks } from './vault-wikilinks'
 
 const MAX_PASTED_IMAGE_BYTES = 10 * 1024 * 1024
 
@@ -21,12 +22,23 @@ interface VaultLiveMarkdownEditorProps {
   onTextSelectionChange?: (selection: LiveMarkdownTextSelection | null) => void
   /** CodeMirror 异步挂载完成后通知外层，用于恢复阅读位置。 */
   onReady?: () => void
+  /** 当前笔记相对 Vault 根目录的路径，用于解析媒体和相对双链。 */
   relativePath: string
+  /** 用户点击正文双链时，把原始目标交给 Vault 导航层解析。 */
+  onOpenWikiLink: (target: string) => void
 }
 
 /** Vault's file adapter around the reusable, domain-neutral Markdown editor. */
 export const VaultLiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, VaultLiveMarkdownEditorProps>(
-  function VaultLiveMarkdownEditor({ relativePath, ...props }, ref): React.ReactElement {
+  function VaultLiveMarkdownEditor({ relativePath, onOpenWikiLink, ...props }, ref): React.ReactElement {
+    /** 保存最新双链导航回调，避免回调变化时重建 CodeMirror 扩展。 */
+    const onOpenWikiLinkRef = React.useRef(onOpenWikiLink)
+    onOpenWikiLinkRef.current = onOpenWikiLink
+    /** Vault 专属 CodeMirror 扩展；只创建一次并通过 ref 调用最新导航回调。 */
+    const extensions = React.useMemo(
+      () => [createVaultWikiLinks((target) => onOpenWikiLinkRef.current(target))],
+      [],
+    )
     const valueRef = React.useRef(props.value)
     const onChangeRef = React.useRef(props.onChange)
     valueRef.current = props.value
@@ -58,6 +70,6 @@ export const VaultLiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle
       onChangeRef.current(nextValue)
     }, [])
 
-    return <LiveMarkdownEditor ref={ref} {...props} enableProperties onChangeProperties={handlePropertiesChange} resolveImageSrc={resolveImageSrc} savePastedImage={savePastedImage} />
+    return <LiveMarkdownEditor ref={ref} {...props} extensions={extensions} enableProperties onChangeProperties={handlePropertiesChange} resolveImageSrc={resolveImageSrc} savePastedImage={savePastedImage} />
   },
 )

@@ -643,7 +643,8 @@ export type PromaEvent =
   | { type: 'context_window'; contextWindow: number }
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
   | { type: 'title_updated'; title: string }
-  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta }
+  /** userMessage/userMessageUuid 是主进程已持久化的原文与身份；旧事件可省略。 */
+  | { type: 'external_run_started'; source: AgentExternalRunSource; sessionId: string; title?: string; workspaceId?: string; modelId?: string; startedAt: number; runGeneration?: number; session?: AgentSessionMeta; userMessage?: string; userMessageUuid?: string }
   /** 桌面会话已开始执行；startedAt 区分连续运行，session 提供权威轻量事件归属。 */
   | { type: 'run_started'; startedAt: number; runGeneration?: number; session?: AgentStreamSessionMeta }
   /** 普通桌面会话已结束；供已显式配置的外部通知通道发送摘要。 */

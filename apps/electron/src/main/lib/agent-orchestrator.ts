@@ -133,7 +133,14 @@ export interface SessionCallbacks {
   /** 发送标题更新 */
   onTitleUpdated: (title: string) => void
   /** 用户消息已持久化，外部入口可据此通知前端切到实时会话 */
-  onRunStarted?: (opts: { startedAt: number; runGeneration: number }) => void
+  onRunStarted?: (opts: {
+    startedAt: number
+    runGeneration: number
+    /** 已持久化的用户原文，排除平台只给模型的来源说明。 */
+    userMessage?: string
+    /** 与 JSONL 相同的用户消息身份，供实时列表去重。 */
+    userMessageUuid?: string
+  }) => void
 }
 
 /** 单次 Agent 运行完成时发送给外部入口的选项。 */
@@ -1005,7 +1012,14 @@ export class AgentOrchestrator {
     }
 
     // 2.1 所有同步预检通过后，才通知外部本轮已进入可见运行态。
-    callbacks.onRunStarted?.({ startedAt: streamStartedAt, runGeneration })
+    callbacks.onRunStarted?.({
+      startedAt: streamStartedAt,
+      runGeneration,
+      ...(initialUserMessageUuid ? {
+        userMessage: rawUserMessage ?? userMessage,
+        userMessageUuid: initialUserMessageUuid,
+      } : {}),
+    })
     const completeRun = (
       messages?: AgentMessage[],
       opts?: AgentRunCompleteOptions,
@@ -2604,8 +2618,9 @@ export class AgentOrchestrator {
   /**
    * 回退 Pi 会话到指定消息点。
    *
-   * Pi 可安全回退其对话树；文件快照不属于 Pi runtime，因此明确告知用户
-   * 当前不会修改工作区文件。退役 Claude 会话仅可查看，不允许回退或继续。
+   * Pi 可安全回退其对话树；文件快照不属于 Pi runtime，当前不会修改工作区文件。
+   * 未提供文件回退能力是正常状态，不作为回退错误返回。
+   * 退役 Claude 会话仅可查看，不允许回退或继续。
    */
   async rewindSession(
     sessionId: string,
@@ -2629,7 +2644,6 @@ export class AgentOrchestrator {
       remainingMessages,
       fileRewind: {
         canRewind: false,
-        error: '已回退 Pi 对话；Pi 文件回退尚未启用，当前未修改任何文件。',
       },
     }
   }

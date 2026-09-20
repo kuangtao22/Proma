@@ -7,10 +7,18 @@
 
 import { autoUpdater } from 'electron-updater'
 import { BrowserWindow, app } from 'electron'
+import { join } from 'node:path'
 import type { UpdateStatus } from './updater-types'
 import { UPDATER_IPC_CHANNELS } from './updater-types'
 import { createIdleInstallScheduler } from './idle-install-scheduler'
 import { isNewerVersion } from './version'
+import {
+  bindUpdateCacheCleanupHealthEvents,
+  createUpdateCacheCleanup,
+  createUpdateCacheCleanupStartupGate,
+  getDefaultUpdaterBaseCacheDirectory,
+  shouldDeferUpdateCacheCleanup,
+} from './update-cache-cleanup'
 
 /** 当前更新状态 */
 let currentStatus: UpdateStatus = { status: 'idle' }
@@ -20,6 +28,9 @@ let win: BrowserWindow | null = null
 
 /** 定时检查定时器 */
 let checkInterval: ReturnType<typeof setInterval> | null = null
+
+/** 当前主窗口关联的更新缓存健康监听与门禁释放函数。 */
+let updateCacheCleanupDisposer: (() => void) | null = null
 
 /**
  * 已下载更新时仍会定期检查最新 Release。保留该快照可以在“更新源版本
@@ -191,6 +202,8 @@ export function cleanupUpdater(): void {
     clearInterval(checkInterval)
     checkInterval = null
   }
+  updateCacheCleanupDisposer?.()
+  updateCacheCleanupDisposer = null
   downloadedStatusDuringCheck = null
   activeDownloadVersion = null
   idleInstallScheduler.dispose()
@@ -203,6 +216,62 @@ export function cleanupUpdater(): void {
  */
 export function initAutoUpdater(mainWindow: BrowserWindow): void {
   configureUpdater(mainWindow)
+
+  /** 记录下载路径并按当前实际运行版本清理已安装包。 */
+  const updateCacheCleanup = createUpdateCacheCleanup({
+    stateFilePath: join(app.getPath('userData'), 'updater-cache-state.json'),
+    baseCacheDirectory: getDefaultUpdaterBaseCacheDirectory(),
+  })
+  /** 主窗口稳定 15 秒后才允许执行的缓存清理门禁。 */
+  const startupGate = createUpdateCacheCleanupStartupGate({
+    cleanup: () => updateCacheCleanup.cleanupForRunningVersion(app.getVersion()),
+    shouldDefer: () => shouldDeferUpdateCacheCleanup(
+      activeDownloadVersion !== null,
+      currentStatus.status === 'downloading',
+    ),
+  })
+  /** 主窗口与 renderer 三类健康失败事件的可解绑绑定。 */
+  const healthBinding = bindUpdateCacheCleanupHealthEvents({
+    gate: startupGate,
+    addWindowUnresponsiveListener: (listener) => {
+      mainWindow.on('unresponsive', listener)
+      return () => mainWindow.removeListener('unresponsive', listener)
+    },
+    addDidFailLoadListener: (listener) => {
+      /** 把 Electron 完整事件参数收敛成门禁需要的错误码与主框架标记。 */
+      const handleDidFailLoad = (
+        _event: unknown,
+        errorCode: number,
+        _errorDescription: string,
+        _validatedURL: string,
+        isMainFrame: boolean,
+      ): void => listener(errorCode, isMainFrame)
+      mainWindow.webContents.on('did-fail-load', handleDidFailLoad)
+      return () => mainWindow.webContents.removeListener('did-fail-load', handleDidFailLoad)
+    },
+    addRenderProcessGoneListener: (listener) => {
+      mainWindow.webContents.on('render-process-gone', listener)
+      return () => mainWindow.webContents.removeListener('render-process-gone', listener)
+    },
+  })
+  /** 主窗口可展示后开始 15 秒稳定计时。 */
+  const scheduleStartupCleanup = (): void => startupGate.schedule()
+  if (mainWindow.isVisible()) {
+    scheduleStartupCleanup()
+  } else {
+    mainWindow.once('ready-to-show', scheduleStartupCleanup)
+  }
+  /** 防止 cleanupUpdater、重复初始化和窗口关闭重复释放。 */
+  let cacheCleanupDisposed = false
+  /** 解绑窗口健康监听、待触发显示监听并释放门禁定时器。 */
+  const disposeUpdateCacheCleanup = (): void => {
+    if (cacheCleanupDisposed) return
+    cacheCleanupDisposed = true
+    mainWindow.removeListener('ready-to-show', scheduleStartupCleanup)
+    healthBinding.dispose()
+  }
+  updateCacheCleanupDisposer?.()
+  updateCacheCleanupDisposer = disposeUpdateCacheCleanup
 
   autoUpdater.logger = {
     info: (...args: unknown[]) => console.log('[更新-updater]', ...args),
@@ -266,6 +335,7 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
   autoUpdater.on('update-downloaded', (info) => {
     downloadedStatusDuringCheck = null
     activeDownloadVersion = null
+    updateCacheCleanup.recordDownloadedUpdate(info.version, info.downloadedFile)
     console.log('[更新] 下载完成:', info.version)
     setStatus({
       status: 'downloaded',
@@ -316,6 +386,8 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
 
   // 窗口关闭时清理定时器
   mainWindow.on('closed', () => {
+    disposeUpdateCacheCleanup()
+    if (updateCacheCleanupDisposer === disposeUpdateCacheCleanup) updateCacheCleanupDisposer = null
     if (checkInterval) {
       clearInterval(checkInterval)
       checkInterval = null

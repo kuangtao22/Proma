@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test'
-import type { AgentSessionMeta, FeishuBotConfig, FeishuChatBinding, FeishuMessageContext } from '@proma/shared'
+import type { AgentSendInput, AgentSessionMeta, FeishuBotConfig, FeishuChatBinding, FeishuMessageContext } from '@proma/shared'
 import { readFileSync } from 'node:fs'
 import { agentSessionManagerTestMock } from './agent-session-manager.test-mock'
 
@@ -11,6 +11,8 @@ const bridgeReplies: string[] = []
 const stoppedSessions: string[] = []
 /** Bridge 触发的 Agent 运行副作用。 */
 const startedSessions: string[] = []
+/** 捕获真实 Bridge 入口交给无头 Agent 的输入，验证原文与模型文本分离。 */
+const headlessInputs: AgentSendInput[] = []
 /** 测试捕获的无头 Agent 终态回调。 */
 const headlessCallbacks = new Map<string, { onError: (error: string) => void }>()
 /** 飞书对外发送的序列化消息内容。 */
@@ -49,10 +51,11 @@ mock.module('./agent-service', () => ({
   isAgentSessionActive: () => false,
   stopAgent: (sessionId: string) => stoppedSessions.push(sessionId),
   runAgentHeadless: async (
-    input: { sessionId: string },
+    input: AgentSendInput,
     callbacks: { onError: (error: string) => void },
   ) => {
     startedSessions.push(input.sessionId)
+    headlessInputs.push(input)
     headlessCallbacks.set(input.sessionId, callbacks)
   },
 }))
@@ -87,6 +90,25 @@ function createSession(id: string, fields: Partial<AgentSessionMeta> = {}): Agen
 }
 
 describe('外部 Bridge 会话边界', () => {
+  test.each([true, false])('Given Bridge 来源转换启用=%s When 普通消息进入 Agent Then 原文独立保留且只转换模型输入', async (transformEnabled) => {
+    agentSessionManagerTestMock.reset()
+    headlessInputs.length = 0
+    /** 使用真实 Bridge 入口，仅替换末端模型运行。 */
+    const { BridgeCommandHandler } = await import('./bridge-command-handler')
+    /** 标记只用于模型副本，持久化原文不得携带。 */
+    const marker = '（消息通过微信 Bot 发送）'
+    /** 两种平台配置共用同一条消息派发链。 */
+    const handler = new BridgeCommandHandler({
+      platformName: '测试',
+      adapter: { sendText: async () => undefined },
+      ...(transformEnabled ? { transformAgentInput: (message: string) => `${message}\n\n${marker}` } : {}),
+    })
+    await handler.handleIncomingMessage('chat-source', '解释报告')
+    expect(headlessInputs).toHaveLength(1)
+    expect(headlessInputs[0]?.rawUserMessage).toBe('解释报告')
+    expect(headlessInputs[0]?.userMessage).toBe(transformEnabled ? `解释报告\n\n${marker}` : '解释报告')
+  })
+
   test('Given 普通、Design、Canvas 与半归属会话 When Bridge 列表和按 ID 切换 Then 只允许普通会话', async () => {
     agentSessionManagerTestMock.reset()
     bridgeReplies.length = 0

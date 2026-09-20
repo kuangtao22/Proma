@@ -127,7 +127,7 @@ export function updateLiveMarkdownTableCell(
   columnIndex: number,
   value: string,
 ): LiveMarkdownTable {
-  if (rowIndex < 0 || columnIndex < 0) return table
+  if (rowIndex < 0 || columnIndex < 0 || columnIndex >= table.header.length) return table
   if (rowIndex === 0) {
     const header = [...table.header]
     header[columnIndex] = value
@@ -137,4 +137,12 @@ export function updateLiveMarkdownTableCell(
   if (!rows[rowIndex - 1]) return table
   rows[rowIndex - 1]![columnIndex] = value
   return { ...table, rows }
+}
+
+/** 将焦点查询限定到当前表格块，避免多个表格的同坐标单元格发生串位。 */
+export function liveMarkdownTableFocusTargetSelector(
+  blockFrom: number,
+  cell: { row: number; column: number },
+): string {
+  return `[data-live-markdown-block-from="${blockFrom}"] [data-live-markdown-table-cell="${cell.row}:${cell.column}"]`
 }

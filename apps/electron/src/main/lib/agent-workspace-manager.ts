@@ -791,7 +791,9 @@ function parseSkillFrontmatter(content: string, slug: string, enabled: boolean):
 
 export function getWorkspaceCapabilities(workspaceSlug: string): WorkspaceCapabilities {
   const mcpConfig = getWorkspaceMcpConfig(workspaceSlug)
-  const skills = getWorkspaceSkills(workspaceSlug)
+  // 能力摘要服务于 UI 状态对比，需要保留关闭的 Skill 才能区分关闭与移除。
+  // Agent 运行时仍通过 getWorkspaceSkills() 只读取 skills/ 下的启用项。
+  const skills = getAllWorkspaceSkills(workspaceSlug)
   const builtinMcpServers = listBuiltinMcpServers({ workspaceSlug })
   const memory = getWorkspaceMemorySummary(workspaceSlug)
 

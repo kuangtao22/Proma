@@ -106,6 +106,7 @@ import type { AgentCanvasBinding, AgentCanvasBindingChangeEvent, AgentStreamEven
 import { inferContextWindow } from '@proma/shared'
 import {
   buildExternalAgentRunActivation,
+  appendExternalAgentRunUserMessage,
   shouldActivateExternalAgentRun,
   shouldRevealDelegatedSession,
 } from '@/lib/external-agent-run'
@@ -1062,6 +1063,19 @@ export function useGlobalAgentListeners(): void {
           const map = new Map(prev)
           map.set(event.sessionId, activation.streamState)
           return map
+        })
+
+        // 通过运行代次门禁后再显示已持久化原文；旧事件和重复 UUID 不触发消息更新。
+        store.set(liveMessagesMapAtom, (previous) => {
+          /** 当前会话已有消息；不影响其他会话的实时投影。 */
+          const current = previous.get(event.sessionId) ?? []
+          /** 复用持久化 UUID 追加，重放同一事件保持原数组。 */
+          const next = appendExternalAgentRunUserMessage(current, event)
+          if (next === current) return previous
+          /** 只为产生新用户消息的会话更新 Map。 */
+          const updated = new Map(previous)
+          updated.set(event.sessionId, next)
+          return updated
         })
 
         // 协作子 Agent 仅在用户正查看其父会话时才自动展开到右侧工作区。

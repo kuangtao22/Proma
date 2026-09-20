@@ -18,6 +18,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   unlinkSync,
@@ -30,6 +31,10 @@ import { basename, dirname, isAbsolute, join } from 'node:path'
 export interface ReadJsonFileSafeOptions<T> extends DurabilitySyncOptions {
   /** 判断解析结果是否符合调用方要求的运行时 schema。 */
   validate?: (value: unknown) => value is T
+  /** 单个主/tmp/bak 候选允许读取的最大字节数；省略时保持原有无限读取行为。 */
+  maxBytes?: number
+  /** 使用 0600 随机临时文件和目标 CAS 恢复 tmp/bak；省略时保持旧恢复行为。 */
+  secureRecovery?: boolean
 }
 
 /** 严格 JSON 读取的 schema 与错误上下文。 */
@@ -38,6 +43,10 @@ export interface ReadJsonFileStrictOptions<T> {
   validate: (value: unknown) => value is T
   /** 候选全部损坏时用于错误消息的业务对象名称。 */
   description: string
+  /** 单个主/tmp/bak 候选允许读取的最大字节数。 */
+  maxBytes?: number
+  /** 使用 0600 随机临时文件和目标 CAS 恢复 tmp/bak。 */
+  secureRecovery?: boolean
 }
 
 /** 原子文件边界实际达到的持久化等级。 */
@@ -851,10 +860,23 @@ export function writeJsonLinesFileAtomic(
  * @returns 第一个有效候选，全部无效时返回 null。
  */
 export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeOptions<T> = {}): T | null {
+  if (options.maxBytes !== undefined
+    && (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1)) {
+    throw new Error('JSON 候选字节预算无效')
+  }
   /** 上次原子写可能遗留的临时文件路径。 */
   const tmpPath = filePath + '.tmp'
   /** 上次成功主文件的备份路径。 */
   const bakPath = filePath + '.bak'
+  /** 安全恢复在读取任何候选前冻结主文件状态，阻断旧候选覆盖并发新提交。 */
+  const secureRecoveryExpectation: AtomicDestinationExpectation | null = options.secureRecovery
+    ? (() => {
+        const destinationState = readAtomicFileState(filePath)
+        return destinationState === null
+          ? { kind: 'missing' }
+          : { kind: 'state', state: destinationState }
+      })()
+    : null
 
   // 1. 尝试读取主文件
   if (existsSync(filePath)) {
@@ -863,7 +885,7 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     /** 主文件解析后的未知值，仅在 parsedPrimary 为 true 时校验。 */
     let primaryValue: unknown
     try {
-      const raw = readFileSync(filePath, 'utf-8')
+      const raw = readJsonCandidateText(filePath, options.maxBytes)
       if (raw.trim().length > 0) {
         primaryValue = JSON.parse(raw)
         parsedPrimary = true
@@ -882,8 +904,15 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     let parsedTmp = false
     /** 临时文件解析后的未知值，仅在 parsedTmp 为 true 时校验。 */
     let tmpValue: unknown
+    /** 安全恢复时绑定已读取 tmp 的身份，避免清理竞态置换文件。 */
+    let tmpIdentity: FileSystemIdentity | null = null
     try {
-      const raw = readFileSync(tmpPath, 'utf-8')
+      if (secureRecoveryExpectation !== null) {
+        const tmpState = readAtomicFileState(tmpPath)
+        if (tmpState === null) throw new Error('JSON 临时候选已消失')
+        tmpIdentity = { dev: tmpState.dev, ino: tmpState.ino }
+      }
+      const raw = readJsonCandidateText(tmpPath, options.maxBytes)
       if (raw.trim().length > 0) {
         tmpValue = JSON.parse(raw)
         parsedTmp = true
@@ -893,13 +922,26 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     }
     if (parsedTmp && isAcceptedJsonValue(tmpValue, options.validate)) {
       // .tmp 有效 → 提升为主文件；提升失败必须保留 tmp 并向上传播。
-      renameSync(tmpPath, filePath)
-      syncCommittedFileDurability(filePath, options)
+      if (secureRecoveryExpectation !== null) {
+        /** 以当前主文件状态做 CAS，且不继承 tmp 可能过宽的权限。 */
+        writeJsonFileAtomicSecure(filePath, tmpValue as object, {
+          ...options,
+          expectedDestination: secureRecoveryExpectation,
+        })
+        if (tmpIdentity !== null) unlinkIfIdentityMatches(tmpPath, tmpIdentity)
+      } else {
+        renameSync(tmpPath, filePath)
+        syncCommittedFileDurability(filePath, options)
+      }
       console.log(`[数据恢复] 从 .tmp 文件恢复: ${filePath}`)
       return tmpValue
     }
     // 清理无效的 .tmp
-    try { unlinkSync(tmpPath) } catch { /* ignore */ }
+    if (secureRecoveryExpectation !== null) {
+      if (tmpIdentity !== null) unlinkIfIdentityMatches(tmpPath, tmpIdentity)
+    } else {
+      try { unlinkSync(tmpPath) } catch { /* ignore */ }
+    }
   }
 
   // 3. Fallback 到 .bak
@@ -909,7 +951,7 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     /** 备份文件解析后的未知值，仅在 parsedBackup 为 true 时校验。 */
     let backupValue: unknown
     try {
-      const raw = readFileSync(bakPath, 'utf-8')
+      const raw = readJsonCandidateText(bakPath, options.maxBytes)
       if (raw.trim().length > 0) {
         backupValue = JSON.parse(raw)
         parsedBackup = true
@@ -919,7 +961,15 @@ export function readJsonFileSafe<T>(filePath: string, options: ReadJsonFileSafeO
     }
     if (parsedBackup && isAcceptedJsonValue(backupValue, options.validate)) {
       // 用 .bak 恢复主文件；恢复失败必须原样向上传播。
-      writeJsonFileAtomic(filePath, backupValue as object, true, options)
+      if (secureRecoveryExpectation === null) {
+        writeJsonFileAtomic(filePath, backupValue as object, true, options)
+      } else {
+        /** 安全恢复绑定当前目标状态，并通过随机临时文件保持 0600 权限。 */
+        writeJsonFileAtomicSecure(filePath, backupValue as object, {
+          ...options,
+          expectedDestination: secureRecoveryExpectation,
+        })
+      }
       console.log(`[数据恢复] 从 .bak 文件恢复: ${filePath}`)
       return backupValue
     }
@@ -941,9 +991,61 @@ export function readJsonFileStrict<T>(filePath: string, options: ReadJsonFileStr
   const candidatePaths = [filePath, `${filePath}.tmp`, `${filePath}.bak`]
   const hasCandidate = candidatePaths.some(jsonCandidateExistsStrict)
   if (!hasCandidate) return null
-  const value = readJsonFileSafe<T>(filePath, { validate: options.validate })
+  const value = readJsonFileSafe<T>(filePath, {
+    validate: options.validate,
+    ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    ...(options.secureRecovery === undefined ? {} : { secureRecovery: options.secureRecovery }),
+  })
   if (value === null) throw new Error(`${options.description}的所有 JSON 候选均损坏`)
   return value
+}
+
+/**
+ * 在可选预算下读取单个 JSON 候选。
+ *
+ * 未设置预算时保留旧的 readFileSync 行为；设置预算时绑定打开后的普通文件身份，
+ * 并最多读取 `maxBytes + 1` 字节，从而同时阻断初始超限与 fstat 后继续增长。
+ */
+function readJsonCandidateText(candidatePath: string, maxBytes?: number): string {
+  if (maxBytes === undefined) return readFileSync(candidatePath, 'utf8')
+  /** 打开前路径状态用于阻断 symlink、FIFO 和打开竞态。 */
+  const pathStat = lstatSync(candidatePath)
+  if (!pathStat.isFile() || !isOwnedByCurrentUser(pathStat.uid)) {
+    throw new Error('JSON 候选不是当前用户拥有的普通文件')
+  }
+  /** O_NONBLOCK 避免候选被置换为 FIFO 时阻塞；O_NOFOLLOW 在支持平台直接拒绝链接。 */
+  const descriptor = openSync(
+    candidatePath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+  )
+  try {
+    /** 打开后的状态才是本次实际读取对象，必须与路径观察到的身份一致。 */
+    const openedStat = fstatSync(descriptor)
+    if (!openedStat.isFile()
+      || !isOwnedByCurrentUser(openedStat.uid)
+      || !isSameIdentity(toIdentity(pathStat), toIdentity(openedStat))) {
+      throw new Error('JSON 候选打开后身份无效')
+    }
+    if (openedStat.size > maxBytes) throw new Error('JSON 候选超过字节预算')
+
+    /** 分块累积避免按调用方预算一次性分配大 Buffer。 */
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+    while (totalBytes <= maxBytes) {
+      /** 多读一个字节用于发现 fstat 后继续增长的文件。 */
+      const remaining = maxBytes + 1 - totalBytes
+      if (remaining <= 0) break
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining))
+      const bytesRead = readSync(descriptor, chunk, 0, chunk.length, null)
+      if (bytesRead === 0) break
+      chunks.push(chunk.subarray(0, bytesRead))
+      totalBytes += bytesRead
+    }
+    if (totalBytes > maxBytes) throw new Error('JSON 候选超过字节预算')
+    return Buffer.concat(chunks, totalBytes).toString('utf8')
+  } finally {
+    closeSync(descriptor)
+  }
 }
 
 /** lstat 候选并只把明确不存在视为缺失，权限和 I/O 错误继续向上传播。 */

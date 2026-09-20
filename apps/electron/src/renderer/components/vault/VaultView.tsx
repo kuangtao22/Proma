@@ -47,6 +47,7 @@ import { getVaultEditorKey, shouldRemountVaultEditor } from './vault-editor-life
 import { getVaultDocumentController } from './vault-document-controller'
 import { buildVaultTree, getInitialVaultExpandedFolders, getVaultFolderAncestors, hasSameVaultTreeEntries, type VaultFolderNode } from './vault-tree-model'
 import { getVaultSidebarDisplayWidth, getVaultSidebarToggleLabel } from './vault-sidebar-layout'
+import { isVaultFileNotFoundError, openVaultWikiLink } from './vault-wikilinks'
 
 const VAULT_NAME = 'Vault'
 const VAULT_SIDEBAR_MIN_WIDTH = 180
@@ -277,6 +278,7 @@ function VaultMarkdownEditor({
   bodyFocusRequest,
   onBodyFocused,
   onOpenTutorial,
+  onOpenWikiLink,
 }: {
   readResult: VaultReadResult
   /** Stable renderer-safe identity of the currently authorized Vault. */
@@ -290,6 +292,8 @@ function VaultMarkdownEditor({
   bodyFocusRequest: VaultBodyFocusRequest | null
   onBodyFocused: (request: VaultBodyFocusRequest) => void
   onOpenTutorial: () => void
+  /** 将编辑器双链点击交给当前 Vault 文件树导航。 */
+  onOpenWikiLink: (target: string) => void
 }): React.ReactElement {
   const documentController = React.useMemo(() => getVaultDocumentController(readResult, vaultId), [readResult.relativePath, vaultId])
   const documentSnapshot = React.useSyncExternalStore(
@@ -528,6 +532,7 @@ function VaultMarkdownEditor({
             onSave={() => { void flushPendingSave() }}
             onReady={handleEditorReady}
             onTextSelectionChange={handleTextSelectionChange}
+            onOpenWikiLink={onOpenWikiLink}
           />
         </div>
       </div>
@@ -557,6 +562,7 @@ function VaultMarkdownPane({
   bodyFocusRequest,
   onBodyFocused,
   onOpenTutorial,
+  onOpenWikiLink,
 }: {
   readResult: VaultReadResult | null
   vaultId?: string
@@ -571,6 +577,8 @@ function VaultMarkdownPane({
   bodyFocusRequest: VaultBodyFocusRequest | null
   onBodyFocused: (request: VaultBodyFocusRequest) => void
   onOpenTutorial: () => void
+  /** 将当前笔记中的双链目标传回 Vault 视图解析。 */
+  onOpenWikiLink: (target: string) => void
 }): React.ReactElement {
   if (loading || !readResult || !vaultId) {
     return (
@@ -604,6 +612,7 @@ function VaultMarkdownPane({
           bodyFocusRequest={bodyFocusRequest}
           onBodyFocused={onBodyFocused}
           onOpenTutorial={onOpenTutorial}
+          onOpenWikiLink={onOpenWikiLink}
         />
       </VaultContentErrorBoundary>
     </section>
@@ -856,13 +865,34 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
       }
     } catch (error) {
       if (requestId === readRequestRef.current) {
+        // 外部删除或重命名会让内存文件树短暂陈旧；刷新后移除不可用目标。
+        if (isVaultFileNotFoundError(error)) void refresh()
         toast.error(error instanceof Error ? error.message : '无法打开笔记')
         setReadResult(null)
       }
     } finally {
       if (requestId === readRequestRef.current) setFileLoading(false)
     }
-  }, [flushCurrentEditor, selectFile, setReadResult])
+  }, [flushCurrentEditor, refresh, selectFile, setReadResult])
+
+  /** 解析正文双链并通过现有 openFile 链路完成保存、读取与异步切换。 */
+  const openWikiLink = React.useCallback((target: string): void => {
+    if (!readResult) return
+    /** 当前文件树中可作为双链目标的全部笔记路径。 */
+    const noteFiles = entries
+      .filter((entry) => entry.kind === 'file')
+      .map((entry) => entry.relativePath)
+    void openVaultWikiLink({
+      target,
+      source: readResult.relativePath,
+      files: noteFiles,
+      onOpen: openFile,
+      /** 目标缺失或同名歧义时保留当前笔记并给出可操作提示。 */
+      onMissing: (missingTarget) => {
+        toast.error(`无法定位笔记“${missingTarget}”，请检查名称或使用完整的 Vault 内路径`)
+      },
+    })
+  }, [entries, openFile, readResult])
 
   const selectVaultManually = async (): Promise<void> => {
     if (!await flushCurrentEditor()) return
@@ -1237,6 +1267,7 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
             bodyFocusRequest={bodyFocusRequest}
             onBodyFocused={consumeBodyFocus}
             onOpenTutorial={() => setVaultHelpOpen(true)}
+            onOpenWikiLink={openWikiLink}
           />
         </div>
       </main>
