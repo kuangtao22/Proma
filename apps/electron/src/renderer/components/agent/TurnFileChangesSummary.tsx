@@ -39,8 +39,15 @@ function getFilePath(toolName: string, input: Record<string, unknown>): string |
   return typeof fp === 'string' ? fp : null
 }
 
-function collectFilePaths(turnMessages: SDKMessage[], tools: Set<string> = MUTATING_TOOLS): string[] {
-  const failed = new Set<string>()
+/**
+ * 收集本轮可展示的文件改动路径。
+ *
+ * 入参 `turnMessages`：本轮全部 SDK 消息；`tools`：视为改动来源的工具集合。
+ * 返回值：按出现顺序去重的文件路径。只有已返回且未报错的工具调用才算证据，
+ * 流式过程中尚未返回的 tool_use 不能提前渲染为可点击 Chip。
+ */
+export function collectFilePaths(turnMessages: SDKMessage[], tools: Set<string> = MUTATING_TOOLS): string[] {
+  const succeeded = new Set<string>()
   for (const msg of turnMessages) {
     if (msg.type !== 'user') continue
     const blocks = (msg as SDKUserMessage).message?.content
@@ -48,7 +55,7 @@ function collectFilePaths(turnMessages: SDKMessage[], tools: Set<string> = MUTAT
     for (const block of blocks) {
       if (block.type !== 'tool_result') continue
       const rb = block as SDKToolResultBlock
-      if (rb.is_error === true) failed.add(rb.tool_use_id)
+      if (rb.is_error !== true) succeeded.add(rb.tool_use_id)
     }
   }
 
@@ -62,7 +69,7 @@ function collectFilePaths(turnMessages: SDKMessage[], tools: Set<string> = MUTAT
       if (block.type !== 'tool_use') continue
       const tu = block as SDKToolUseBlock
       if (!tools.has(tu.name)) continue
-      if (failed.has(tu.id)) continue
+      if (!succeeded.has(tu.id)) continue
 
       const filePath = getFilePath(tu.name, tu.input as Record<string, unknown>)
       if (!filePath || seen.has(filePath)) continue

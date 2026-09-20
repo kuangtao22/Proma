@@ -1339,7 +1339,8 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
     expect(sourceByPath.get('FileMentionSuggestion')).toMatch(/searchWorkspaceFiles\([\s\S]*\{\s*sessionId:\s*currentSessionIdRef\?\.current/)
     expect(sourceByPath.get('RichTextInput')).toContain('currentSessionIdRef,')
     expect(sourceByPath.get('FilePathChip')).toMatch(/showItemInFolder\(cleanPath,\s*\{[\s\S]*sessionId:[\s\S]*candidateBasePaths:/)
-    expect(sourceByPath.get('FilePathChip')).toContain('resolveAuthorizedFilePath(cleanPath')
+    /** 解析统一走共享 helper，仍必须使用会话授权解析并携带 FileAccessOptions。 */
+    expect(sourceByPath.get('FilePathChip')).toMatch(/resolveAuthorizedFilePath\(filePath,\s*\{\s*sessionId,\s*[\s\S]*candidateBasePaths:/)
     expect(sourceByPath.get('FilePathChip')).not.toContain('resolveFilePath(cleanPath')
     expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(summary\.agentsMd\.path,\s*\{\s*workspaceSlug\s*\}\)/)
     expect(sourceByPath.get('WorkspaceMemoryTab')).toMatch(/showItemInFolder\(autoMemoryPath\(summary, path\),\s*\{\s*workspaceSlug\s*\}\)/)

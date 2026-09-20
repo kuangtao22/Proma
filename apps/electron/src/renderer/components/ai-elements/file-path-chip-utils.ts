@@ -19,11 +19,17 @@ const CODE_EXTS = new Set([
 ])
 const DOC_EXTS = new Set(['pdf', 'docx'])
 const ALL_PREVIEWABLE_EXTS = new Set([...IMAGE_EXTS, ...VIDEO_EXTS, ...CODE_EXTS, ...DOC_EXTS])
+/** 常见无扩展名文件，允许裸文件名升级为可点击 Chip。 */
+const EXTENSIONLESS_FILE_NAMES = new Set(['makefile', 'dockerfile', 'license', 'readme', 'agents'])
+/** 单条路径引用长度上限，避免把整段正文当路径送进主进程解析。 */
+const MAX_FILE_REFERENCE_LENGTH = 4096
 
 /** 路径分隔符正则（同时匹配 / 和 \\） */
 const PATH_SEP_RE = /[\\/]/
 const WIN_DRIVE_RE = /^[A-Za-z]:[\\/]/
 const UNC_PATH_RE = /^\\\\/
+/** 主进程文件预览同样支持 `~/...` 形式的主目录路径。 */
+const HOME_DIRECTORY_RE = /^~(?:[\\/]|$)/
 
 function getExtension(filename: string): string {
   const dot = filename.lastIndexOf('.')
@@ -46,7 +52,7 @@ export function stripLineCol(filePath: string): { path: string; suffix: string }
 
 /** 与主进程 file-preview-service.ts 的绝对路径规则保持一致。 */
 export function isAbsolutePreviewPath(filePath: string): boolean {
-  return filePath.startsWith('/') || UNC_PATH_RE.test(filePath) || WIN_DRIVE_RE.test(filePath)
+  return filePath.startsWith('/') || UNC_PATH_RE.test(filePath) || WIN_DRIVE_RE.test(filePath) || HOME_DIRECTORY_RE.test(filePath)
 }
 
 export function isImageFilePath(filePath: string): boolean {
@@ -66,16 +72,40 @@ export function isAbsoluteFilePath(text: string): boolean {
   return isAbsolutePreviewPath(clean)
 }
 
+/**
+ * 判断未带根目录的文件引用。这里负责「像文件路径」而非「一定存在」：最终必须由主进程
+ * 根据可信候选根解析并校验。允许 Unicode、空格与括号，兼容模型常见的自然语言文件名。
+ *
+ * 入参 `text`：模型输出的原始片段（可能带行号后缀）。
+ * 返回值：真表示可交给主进程尝试解析；不代表该文件真实存在。
+ */
 export function isRelativeFilePath(text: string): boolean {
   const trimmed = text.trim()
-  if (trimmed.length < 3) return false
+  if (trimmed.length < 2 || trimmed.length > MAX_FILE_REFERENCE_LENGTH) return false
+  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return false
 
   const { path: clean } = stripLineCol(trimmed)
-  const ext = getExtension(clean)
-  if (!ext || !ALL_PREVIEWABLE_EXTS.has(ext)) return false
-  if (!/^[\w./@\\-]+$/.test(clean)) return false
-  if (clean.startsWith('.') && !PATH_SEP_RE.test(clean)) return false
-  return true
+  if (!clean || isAbsolutePreviewPath(clean)) return false
+  // 回复中的相对引用不得跨出候选根；需要父目录文件时模型应输出已授权的绝对路径。
+  if (clean.split(PATH_SEP_RE).includes('..')) return false
+  // 不将 URL、file URI 或协议相对地址当作本地文件路径。
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(clean) || clean.startsWith('//')) return false
+  if (clean.endsWith('/') || clean.endsWith('\\')) return false
+
+  const filename = getFileName(clean)
+  const ext = getExtension(filename)
+  const hasExplicitRelativePrefix = clean.startsWith('./') || clean.startsWith('.\\')
+  // 裸文本必须是已知可预览类型或常见无扩展名文件，任意带点文本（如 v1.2）不应触发 IPC；
+  // 显式相对路径与含目录分隔符的路径交由主进程最终校验，渲染侧只做解析门控。
+  return hasExplicitRelativePrefix
+    || PATH_SEP_RE.test(clean)
+    || ALL_PREVIEWABLE_EXTS.has(ext)
+    || EXTENSIONLESS_FILE_NAMES.has(filename.toLowerCase())
+}
+
+/** 可安全交给主进程解析的本地文件引用（绝对或相对）。 */
+export function isLocalFileReference(text: string): boolean {
+  return isAbsoluteFilePath(text) || isRelativeFilePath(text)
 }
 
 export interface FilePathDisplayInput {

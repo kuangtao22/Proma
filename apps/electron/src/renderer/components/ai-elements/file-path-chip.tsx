@@ -27,6 +27,7 @@ import {
   isAbsoluteFilePath,
   isAsyncResultCurrent,
   isImageFilePath,
+  isLocalFileReference,
   isRelativeFilePath,
   stripLineCol,
 } from './file-path-chip-utils'
@@ -36,10 +37,50 @@ interface FileResolutionCacheEntry {
   resolvedPath?: string
 }
 
-/** 文件存在性缓存（模块级共享，避免重复 IPC）。key = filePath + basePaths */
+/** 文件存在性缓存（模块级共享，避免重复 IPC）。key 含会话授权上下文。 */
 const fileExistsCache = new Map<string, FileResolutionCacheEntry>()
-function existsCacheKey(filePath: string, bases: string[]): string {
-  return `${filePath}\0${bases.join('\0')}`
+/** 同 key 的解析进行中请求，供多个 Chip 复用同一次 IPC。 */
+const fileResolutionRequests = new Map<string, Promise<FileResolutionCacheEntry>>()
+function existsCacheKey(filePath: string, bases: string[], sessionId?: string): string {
+  return `${sessionId ?? ''}\0${filePath}\0${bases.join('\0')}`
+}
+
+/**
+ * 解析单个文件路径是否在授权范围内存在，并复用缓存与在途请求。
+ *
+ * 入参 `filePath`：已剥离行号后缀的路径；`bases`：候选根目录；`sessionId`：当前会话（授权上下文）；
+ * `options.bypassCache`：为真时忽略已解析缓存（Tooltip 复查需要拿到最新事实）。
+ * 返回值：存在性缓存条目，IPC 失败时由调用方决定降级表现。
+ */
+export function resolveFilePathEntry(
+  filePath: string,
+  bases: string[],
+  sessionId?: string,
+  options: { bypassCache?: boolean } = {},
+): Promise<FileResolutionCacheEntry> {
+  const key = existsCacheKey(filePath, bases, sessionId)
+  // 只复用「已解析」结果：「不存在」不能长期缓存，否则本轮之后新建的文件永远无法升级为 Chip。
+  const cached = fileExistsCache.get(key)
+  if (!options.bypassCache && cached?.exists) return Promise.resolve(cached)
+
+  const inFlight = fileResolutionRequests.get(key)
+  if (inFlight) return inFlight
+
+  const promise = window.electronAPI.resolveAuthorizedFilePath(filePath, {
+    sessionId,
+    candidateBasePaths: bases.length > 0 ? bases : undefined,
+  }).then((resolved) => {
+    const entry: FileResolutionCacheEntry = {
+      exists: resolved !== null,
+      ...(resolved?.resolvedPath ? { resolvedPath: resolved.resolvedPath } : {}),
+    }
+    fileExistsCache.set(key, entry)
+    return entry
+  }).finally(() => {
+    fileResolutionRequests.delete(key)
+  })
+  fileResolutionRequests.set(key, promise)
+  return promise
 }
 
 interface FilePathChipProps {
@@ -80,25 +121,16 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
   }), [trimmedPath, resolvedPath, lineColSuffix])
 
   const resolveCurrentPath = React.useCallback((): Promise<void> => {
-    const key = existsCacheKey(cleanPath, candidateBases)
+    const sessionId = store.get(currentAgentSessionIdAtom)
+    const key = existsCacheKey(cleanPath, candidateBases, sessionId ?? undefined)
     const inFlight = resolutionRequestRef.current
     if (inFlight?.key === key) return inFlight.promise
 
     const generation = ++requestGenerationRef.current
-    const bases = candidateBases.length > 0 ? candidateBases : undefined
-    const sessionId = store.get(currentAgentSessionIdAtom)
     let promise: Promise<void>
-    promise = window.electronAPI.resolveAuthorizedFilePath(cleanPath, {
-      sessionId: sessionId ?? undefined,
-      candidateBasePaths: bases,
-    })
-      .then((resolved) => {
+    promise = resolveFilePathEntry(cleanPath, candidateBases, sessionId ?? undefined, { bypassCache: true })
+      .then((entry) => {
         if (!isAsyncResultCurrent(generation, requestGenerationRef.current, mountedRef.current)) return
-        const entry: FileResolutionCacheEntry = {
-          exists: resolved !== null,
-          ...(resolved?.resolvedPath ? { resolvedPath: resolved.resolvedPath } : {}),
-        }
-        fileExistsCache.set(key, entry)
         setFileStatus(entry.exists ? 'resolved' : 'broken')
         setResolvedPath(entry.resolvedPath)
       })
@@ -121,7 +153,7 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
     mountedRef.current = true
     setFileStatus('idle')
     setResolvedPath(undefined)
-    const key = existsCacheKey(cleanPath, candidateBases)
+    const key = existsCacheKey(cleanPath, candidateBases, store.get(currentAgentSessionIdAtom) ?? undefined)
     const cached = fileExistsCache.get(key)
     if (cached) {
       setFileStatus(cached.exists ? 'resolved' : 'broken')
@@ -146,7 +178,7 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
       requestGenerationRef.current += 1
       observer.disconnect()
     }
-  }, [cleanPath, candidateBases, resolveCurrentPath])
+  }, [cleanPath, candidateBases, resolveCurrentPath, store])
 
   const handleTooltipOpenChange = React.useCallback((open: boolean) => {
     if (open) void resolveCurrentPath()
@@ -212,4 +244,55 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
   )
 }
 
-export { isAbsoluteFilePath, isImageFilePath, isRelativeFilePath }
+interface ResolvableFilePathChipProps extends FilePathChipProps {
+  /** 路径未通过主进程解析时保留的原始节点，避免渲染出不可用的 Chip。 */
+  fallback: React.ReactElement
+}
+
+/**
+ * 用于模型自由文本中的路径候选：只有文件在授权范围内存在时才升级为 Chip，
+ * 解析期间与解析失败都保留调用方提供的原始 Markdown 外观。
+ *
+ * 入参：同 FilePathChip，另加 `fallback`。
+ * 返回值：已解析时渲染 FilePathChip，否则渲染 fallback。
+ */
+export function ResolvableFilePathChip({
+  fallback,
+  filePath,
+  basePath,
+  basePaths,
+  className,
+}: ResolvableFilePathChipProps): React.ReactElement {
+  const store = useStore()
+  const candidateBases = React.useMemo<string[]>(() => {
+    if (basePaths && basePaths.length > 0) return basePaths.filter(Boolean)
+    if (basePath) return [basePath]
+    return []
+  }, [basePath, basePaths])
+  const cleanPath = React.useMemo(() => stripLineCol(filePath.trim()).path, [filePath])
+  const sessionId = store.get(currentAgentSessionIdAtom) ?? undefined
+  const resolutionKey = React.useMemo(
+    () => existsCacheKey(cleanPath, candidateBases, sessionId),
+    [candidateBases, cleanPath, sessionId],
+  )
+  const [resolvedKey, setResolvedKey] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    let cancelled = false
+    setResolvedKey(null)
+    void resolveFilePathEntry(cleanPath, candidateBases, sessionId)
+      .then((entry) => {
+        if (!cancelled && entry.exists) setResolvedKey(resolutionKey)
+      })
+      .catch(() => {
+        // IPC 失败时保持原始 Markdown 外观，不制造不可点击的 Chip。
+        if (!cancelled) setResolvedKey(null)
+      })
+    return () => { cancelled = true }
+  }, [candidateBases, cleanPath, sessionId, resolutionKey])
+
+  if (resolvedKey !== resolutionKey) return fallback
+  return <FilePathChip filePath={filePath} basePath={basePath} basePaths={basePaths} className={className} />
+}
+
+export { isAbsoluteFilePath, isImageFilePath, isLocalFileReference, isRelativeFilePath }
