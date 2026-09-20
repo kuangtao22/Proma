@@ -5,6 +5,7 @@ import { ServerOpsSftpRuntime, ServerOpsSftpRuntimeError } from './server-ops/se
 import type { ServerOpsSftpRequest } from './server-ops/server-ops-sftp-runtime'
 import { runServerOpsDataRead } from './server-ops/server-ops-data-runtime'
 import type { ServerOpsDataRuntimeInput } from './server-ops/server-ops-data-runtime'
+import { getServerOpsSqlQueryPublicError } from './server-ops/server-ops-query-runtime'
 import type { ServerOpsRuntimeDataReadRequest } from './server-ops/server-ops-runtime-protocol'
 import type { ServerOpsTerminalExitEvent } from '@proma/shared'
 import { ServerOpsConsoleRuntimeController } from './server-ops/server-ops-console-runtime'
@@ -585,17 +586,12 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       else finishCancelled()
       return
     }
-    /** SQL 与驱动错误都映射到固定码和中文，不返回原始 SQL 或数据库异常。 */
-    const code = error instanceof Error && error.message.startsWith('SERVER_OPS_DATA_QUERY_')
-      ? error.message
-      : 'SERVER_OPS_DATA_CHANNEL_FAILED'
-    const message = code === 'SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE' ? '查询引用的表不存在、不可见或不是基础表'
-      : code === 'SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE' ? '查询引用的列不存在或不可见'
-        : code === 'SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN' ? '查询包含不允许直接读取的敏感列'
-          : code === 'SERVER_OPS_DATA_QUERY_SQL_INVALID' ? '仅支持受控的只读 SELECT 查询'
-            : code.startsWith('SERVER_OPS_DATA_QUERY_') ? 'SQL 查询失败，请检查语句与读取权限'
-              : '无法建立到数据库的通道'
-    finishError(code, message)
+    /** 仅透传执行器与共享解析器确认过的稳定码，绝不按前缀接受驱动正文。 */
+    const publicError = getServerOpsSqlQueryPublicError(error)
+    finishError(
+      publicError?.code ?? 'SERVER_OPS_DATA_CHANNEL_FAILED',
+      publicError?.message ?? '无法建立到数据库的通道',
+    )
   })
 }
 

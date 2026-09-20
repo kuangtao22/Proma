@@ -474,6 +474,7 @@ describe('Server Ops config transaction', () => {
     expect(module.resolveServerOpsConfigFilePath(directory, 'known-hosts.json')).toBe(join(canonicalDirectory, 'known-hosts.json'))
     expect(module.resolveServerOpsConfigFilePath(directory, 'audit.json')).toBe(join(canonicalDirectory, 'audit.json'))
     expect(module.resolveServerOpsConfigFilePath(directory, 'query-history.json')).toBe(join(canonicalDirectory, 'query-history.json'))
+    expect(module.resolveServerOpsConfigFilePath(directory, 'schema-cache.json')).toBe(join(canonicalDirectory, 'schema-cache.json'))
     expect(() => module.resolveServerOpsConfigFilePath(directory, '../settings.json' as 'hosts.json'))
       .toThrow('SERVER_OPS_CONFIG_FILE_UNSUPPORTED')
   })

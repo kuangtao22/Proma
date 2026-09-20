@@ -1,3 +1,4 @@
+import { getServerOpsSqlDiagnostic, validateServerOpsSqlQuery } from '@proma/shared'
 import type {
   ServerOpsDataQueryCancelInput,
   ServerOpsDataQueryInput,
@@ -16,6 +17,12 @@ export interface ServerOpsSqlQueryContext {
   database: string | null
   configurationKey: string
   available: boolean
+}
+
+/** 比对当前页面与控制器的查询目标，防止 React effect 同步前查询旧数据库。 */
+export function isServerOpsSqlQueryContextCurrent(actual: ServerOpsSqlQueryContext | null, expected: ServerOpsSqlQueryContext): boolean {
+  return actual !== null && actual.sourceId === expected.sourceId && actual.database === expected.database
+    && actual.configurationKey === expected.configurationKey && actual.available === expected.available
 }
 
 /** 成功结果固定执行快照，避免后续编辑让旧结果看起来属于新 SQL。 */
@@ -49,9 +56,20 @@ export interface ServerOpsSqlQueryControllerOptions {
 /** 将主进程稳定码收敛为中文说明，未知驱动正文绝不进入界面。 */
 export function getServerOpsSqlQueryErrorMessage(error: unknown, phase: 'query' | 'cancel' = 'query'): string {
   const text = error instanceof Error ? error.message : String(error)
+  if (text.includes('SERVER_OPS_OTHER_INSTANCE_ACTIVE')) return '审计记录需要初始化或升级，请先退出其他 Proma 实例后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_TRUST_BUSY')) return '运维配置正在准备，请稍后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_CONFIG_BUSY')) return '运维配置正在写入，请稍后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_CONFIG_LOCK_UNAVAILABLE')) return '运维配置写锁不可用，请重启或更新 Proma 后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_CONFIG_OUTCOME_UNKNOWN')) return '审计写入状态无法确认，请稍后重试，若持续失败再重启 Proma；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_READ_FAILED')) return '本地审计记录无法读取，需要检查审计文件；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED')) return '本地审计记录尚未准备完成，请重启 Proma 后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_WRITE_FAILED')) return '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 Proma；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_START_WRITE_FAILED')) return '无法记录查询审计，请检查本地运维配置后重试；SQL 尚未执行'
   if (text.includes('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN') || text.includes('SERVER_OPS_SQL_SENSITIVE_COLUMN')) return '查询包含敏感字段，无法执行'
   if (text.includes('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')) return '查询中的表不存在、不可见或不是基础表'
   if (text.includes('SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE')) return '查询中的字段不存在或不可见'
+  if (text.includes('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')) return '数据库认证失败或账号权限不足'
+  if (text.includes('SERVER_OPS_DATA_QUERY_TIMEOUT')) return '查询超时，请缩小扫描范围后重试'
   if (text.includes('SERVER_OPS_DATA_QUERY_TOO_MANY_COLUMNS')) return '查询结果字段超过 64 列，请减少选择字段'
   if (text.includes('SERVER_OPS_DATA_QUERY_COLUMN_TOO_LARGE')) return '字段内容过大，请明确选择字段，或使用 SUBSTRING(字段, 1, 256) 缩小文本后查询'
   if (text.includes('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')) return '当前数据源不支持 SQL 查询'
@@ -63,7 +81,12 @@ export function getServerOpsSqlQueryErrorMessage(error: unknown, phase: 'query' 
   if (text.includes('SERVER_OPS_SQL_BUSY')) return '该数据源已有 SQL 查询正在进行，请等待完成或取消后重试'
   if (text.includes('SERVER_OPS_SQL_CROSS_DATABASE') || text.includes('SERVER_OPS_SQL_SYSTEM_SCHEMA')) return '只允许查询当前已授权数据库中的基础表'
   if (text.includes('SERVER_OPS_AUDIT_RESULT_WRITE_FAILED')) return '查询已完成，但审计结果写入失败'
-  if (text.includes('SERVER_OPS_DATA_QUERY_SQL_INVALID') || text.includes('SERVER_OPS_SQL_')) return 'SQL 语法或查询范围不受支持，请调整后重试'
+  /** Electron IPC 会包裹错误文字，只提取已知稳定码，不回显驱动正文。 */
+  const parserCode = text.match(/\bSERVER_OPS_SQL_[A-Z_]+\b/u)?.[0]
+  const diagnostic = parserCode ? getServerOpsSqlDiagnostic(parserCode) : null
+  if (diagnostic) return diagnostic.message
+  if (text.includes('SERVER_OPS_DATA_QUERY_SQL_INVALID')) return '数据库未通过 SQL 语法检查，请检查语句和数据库版本'
+  if (text.includes('SERVER_OPS_SQL_')) return 'SQL 校验未通过，请调整后重试'
   if (/AUTH|ACCESS_DENIED|PERMISSION_DENIED/iu.test(text)) return '数据库认证失败或账号权限不足'
   if (text.includes('SERVER_OPS_DATA_QUERY_FAILED')) return 'SQL 查询失败，请检查连接、语句与账号权限'
   return phase === 'cancel' ? '取消查询失败，请稍后重试' : 'SQL 查询失败，请稍后重试'
@@ -148,9 +171,7 @@ export function createServerOpsSqlQueryController(options: ServerOpsSqlQueryCont
     activate(): void { active = true; publish() },
     /** 切库、连接配置变化或可达性变化都清空旧结果并取消在途请求。 */
     setContext(context: ServerOpsSqlQueryContext): void {
-      const previousKey = state.context ? JSON.stringify([state.context.sourceId, state.context.database, state.context.configurationKey, state.context.available]) : null
-      const nextKey = JSON.stringify([context.sourceId, context.database, context.configurationKey, context.available])
-      if (previousKey === nextKey) return
+      if (isServerOpsSqlQueryContextCurrent(state.context, context)) return
       state = { ...state, context: { ...context }, execution: null, error: null }
       if (activeRequest) {
         activeRequest.abandoned = true
@@ -169,11 +190,20 @@ export function createServerOpsSqlQueryController(options: ServerOpsSqlQueryCont
       publish()
     },
     /** 按点击瞬间的 SQL、数据库和行数执行，不自动响应草稿变化。 */
-    async execute(): Promise<void> {
+    async execute(expectedContext?: ServerOpsSqlQueryContext): Promise<void> {
       if (!canExecute()) return
+      /** UI 将本次显示的目标一起提交，尚未同步上下文时只拒绝，不猜测或切换目标。 */
+      if (expectedContext && !isServerOpsSqlQueryContextCurrent(state.context, expectedContext)) return
       const context = state.context
       const query = options.api.query
       if (!context?.database || !query) return
+      /** 每次按下执行都检查当前文本，不能依赖防抖前的旧结果；本地拒绝不记历史。 */
+      const validation = validateServerOpsSqlQuery(state.draft, context.database)
+      if (!validation.plan) {
+        state.status = 'error'; state.error = validation.diagnostics[0]?.message ?? 'SQL 校验未通过，请调整后重试'
+        publish()
+        return
+      }
       const queryId = createQueryId()
       const revision = ++generation
       const sql = state.draft.trim()

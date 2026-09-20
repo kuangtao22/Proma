@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { isServerOpsId } from '@proma/shared'
@@ -192,6 +192,22 @@ export class ServerOpsDataSourceCredentialStore {
     } catch {
       throw new Error('SERVER_OPS_DATA_CREDENTIAL_CORRUPTED')
     }
+  }
+
+  /**
+   * 返回当前密文的不可逆版本摘要，供主进程派生缓存身份使用。
+   *
+   * 摘要基于 safeStorage 密文字节而不是明文密码；同一 ref 原位换密文也会改变版本，
+   * 同时不会把密码的可离线猜测哈希持久化到 schema 缓存。
+   *
+   * @param ref 数据源元数据中的凭据引用
+   * @returns 当前密文 SHA-256；引用不存在时为 undefined
+   */
+  getSecretVersion(ref: string): string | undefined {
+    if (!isServerOpsId(ref)) return undefined
+    const stored = this.readStoredCredentials().credentials.find((item) => item.ref === ref)
+    if (!stored) return undefined
+    return createHash('sha256').update(Buffer.from(stored.ciphertext, 'base64')).digest('hex')
   }
 
   /**

@@ -497,6 +497,7 @@ import { ServerOpsLocalFileLeaseRegistry } from './lib/server-ops/server-ops-loc
 import { ServerOpsDataSourceStore } from './lib/server-ops/server-ops-data-source-store'
 import { ServerOpsDataQueryHistoryStore } from './lib/server-ops/server-ops-data-query-history-store'
 import { ServerOpsDataSourceCredentialStore } from './lib/server-ops/server-ops-data-credential-store'
+import { ServerOpsDataSchemaCache } from './lib/server-ops/server-ops-data-schema-cache'
 import { ServerOpsDataService } from './lib/server-ops/server-ops-data-service'
 import { SERVER_OPS_TRANSFER_CHANNELS, parseServerOpsTransferSnapshot } from '@proma/shared'
 import { SERVER_OPS_CONSOLE_IPC_CHANNELS, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleExitEvent } from '@proma/shared'
@@ -2478,6 +2479,10 @@ export function registerIpcHandlers(): void {
   const serverOpsDataQueryHistoryStore = new ServerOpsDataQueryHistoryStore(undefined, {
     transaction: serverOpsConfigTransaction,
   })
+  /** 数据库目录与表结构使用显式 opt-in 的本地派生缓存，不缓存行数据与 SQL。 */
+  const serverOpsDataSchemaCache = new ServerOpsDataSchemaCache(undefined, {
+    transaction: serverOpsConfigTransaction,
+  })
   /** 数据服务只通过当前活跃 SSH 连接读取，不创建本机监听端口。 */
   const serverOpsDataService = new ServerOpsDataService({
     store: serverOpsDataSourceStore,
@@ -2485,6 +2490,7 @@ export function registerIpcHandlers(): void {
     connection: serverOpsConnectionService,
     runtime: serverOpsRuntimeClient,
     transaction: serverOpsConfigTransaction,
+    schemaCache: serverOpsDataSchemaCache,
     now: Date.now,
   })
   /** Server Ops 初始化事务只在 IPC 与 context 全部就绪后发布注册结果。 */

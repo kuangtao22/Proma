@@ -332,6 +332,8 @@ describe('服务器运维数据源凭据 Store', () => {
 
     const ref = store.setSecret('host-1', 'source-1', 'p@ssw0rd')
     expect(ref).toBe('ref-1')
+    const firstVersion = store.getSecretVersion(ref)
+    expect(firstVersion).toMatch(/^[a-f0-9]{64}$/)
     expect(store.resolveSecret('ref-1')).toBe('p@ssw0rd')
     expect(store.hasSecret('ref-1')).toBe(true)
     expect(store.hasSecret('ref-unknown')).toBe(false)
@@ -345,9 +347,11 @@ describe('服务器运维数据源凭据 Store', () => {
 
     /** 覆盖写入保持同一 ref，避免数据源元数据失效。 */
     expect(store.setSecret('host-1', 'source-1', 'next-secret')).toBe('ref-1')
+    expect(store.getSecretVersion(ref)).not.toBe(firstVersion)
     expect(store.resolveSecret('ref-1')).toBe('next-secret')
     expect(store.removeSecret('source-1')).toBe(true)
     expect(store.resolveSecret('ref-1')).toBeUndefined()
+    expect(store.getSecretVersion(ref)).toBeUndefined()
     expect(store.removeSecret('source-1')).toBe(false)
   })
 

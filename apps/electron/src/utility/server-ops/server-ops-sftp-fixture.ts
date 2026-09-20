@@ -21,6 +21,11 @@ const sftpConstants = {
   OPEN_MODE: { READ: 1, WRITE: 2, CREAT: 8, TRUNC: 16, EXCL: 32 },
 } as const
 
+/** 生成 ssh2 可稳定解析的测试 Host Key，避开其 Ed25519 OpenSSH 编码偶发截断公钥的问题。 */
+export function createServerOpsSshFixtureHostKey(): string {
+  return utils.generateKeyPairSync('ecdsa', { bits: 256 }).private
+}
+
 /** @types/ssh2 未公开服务端 SFTP stream，fixture 在本地声明实际使用的最小接口。 */
 interface FixtureSftpStream {
   on(event: 'OPENDIR', listener: (requestId: number, path: string) => void): this
@@ -55,8 +60,7 @@ export async function startServerOpsSftpServerFixture(): Promise<ServerOpsSftpSe
   const handles = new Map<number, FixtureHandle>()
   const clients = new Set<Connection>()
   let handleSequence = 0
-  const hostKey = utils.generateKeyPairSync('ed25519')
-  const server = new Server({ hostKeys: [hostKey.private] }, (connection) => {
+  const server = new Server({ hostKeys: [createServerOpsSshFixtureHostKey()] }, (connection) => {
     clients.add(connection)
     connection.on('error', () => undefined)
     connection.once('close', () => clients.delete(connection))

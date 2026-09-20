@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
-import { bindServerOpsSqlQueryAbort, executeServerOpsSqlQuery } from './server-ops-query-runtime'
+import { analyzeServerOpsSqlQuery } from '@proma/shared'
+import { bindServerOpsSqlQueryAbort, executeServerOpsSqlQuery, getServerOpsSqlQueryPublicError } from './server-ops-query-runtime'
 
 /** 构造记录所有查询的内存 MySQL 连接。 */
 function createConnection(
@@ -28,16 +29,20 @@ function createConnection(
       calls.push({ sql, values: [] })
       const command = new EventEmitter()
       queueMicrotask(() => {
-        const response = respond(sql, [])
-        const rows = Array.isArray(response) && Array.isArray(response[0]) ? response[0] : []
-        const fields = Array.isArray(response) && Array.isArray(response[1]) ? response[1] : []
-        command.emit('fields', fields)
-        for (const row of rows) {
-          if (destroyed) break
-          streamedRows += 1
-          command.emit('result', row)
+        try {
+          const response = respond(sql, [])
+          const rows = Array.isArray(response) && Array.isArray(response[0]) ? response[0] : []
+          const fields = Array.isArray(response) && Array.isArray(response[1]) ? response[1] : []
+          command.emit('fields', fields)
+          for (const row of rows) {
+            if (destroyed) break
+            streamedRows += 1
+            command.emit('result', row)
+          }
+          if (!destroyed) command.emit('end')
+        } catch (error) {
+          command.emit('error', error)
         }
-        if (!destroyed) command.emit('end')
       })
       return command
     },
@@ -51,6 +56,23 @@ function createInput(sql = 'SELECT id, name FROM users') {
 }
 
 describe('Server Ops 受控 SQL 查询执行器', () => {
+  test('Given runtime 错误跨 utility 边界 When 读取公开信息 Then 只允许查询与解析器白名单稳定码', () => {
+    /** 真实解析器实例用于证明不能只依赖相同的 message 字符串。 */
+    let parserError: unknown
+    try {
+      analyzeServerOpsSqlQuery('DELETE FROM users', 'app')
+    } catch (error) {
+      parserError = error
+    }
+    expect(getServerOpsSqlQueryPublicError(new Error('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')))
+      .toEqual({ code: 'SERVER_OPS_DATA_QUERY_PERMISSION_DENIED', message: '数据库账号没有执行该查询的权限' })
+    expect(getServerOpsSqlQueryPublicError(parserError))
+      .toEqual({ code: 'SERVER_OPS_SQL_EXPECTED_SELECT', message: '查询必须以 SELECT 开始' })
+    expect(getServerOpsSqlQueryPublicError(new Error('SERVER_OPS_SQL_EXPECTED_SELECT'))).toBeUndefined()
+    expect(getServerOpsSqlQueryPublicError(new Error('SERVER_OPS_DATA_QUERY_PRIVATE_PAYLOAD'))).toBeUndefined()
+    expect(getServerOpsSqlQueryPublicError(new Error('private driver details'))).toBeUndefined()
+  })
+
   test('Given 运行中的连接 When 取消 Then 驱动 destroy 只触发一次且可清理监听', () => {
     const controller = new AbortController()
     let destroyCalls = 0
@@ -81,11 +103,125 @@ describe('Server Ops 受控 SQL 查询执行器', () => {
     expect(destroyCalls).toBeGreaterThan(0)
   })
 
-  test('Given 非只读 SQL When 执行 Then 在任何数据库调用前拒绝', async () => {
+  test('Given 非只读 SQL When 执行 Then 在任何数据库调用前保留解析器稳定码', async () => {
     const connection = createConnection(() => [[], []])
 
-    await expect(executeServerOpsSqlQuery(connection, createInput('DELETE FROM users'))).rejects.toThrow('SERVER_OPS_DATA_QUERY_SQL_INVALID')
+    await expect(executeServerOpsSqlQuery(connection, createInput('DELETE FROM users'))).rejects.toThrow('SERVER_OPS_SQL_EXPECTED_SELECT')
     expect(connection.calls).toHaveLength(0)
+  })
+
+  test('Given 版本探测返回权限错误 When 执行 Then 分类为权限不足且不透传驱动正文', async () => {
+    const connection = createConnection(() => [[], []])
+    connection.query = async (statement: unknown, values: readonly unknown[] = []): Promise<unknown> => {
+      /** 记录失败前唯一一次数据库调用，证明解析仍先于后台验证。 */
+      const sql = typeof statement === 'string' ? statement : (statement as { sql: string }).sql
+      connection.calls.push({ sql, values })
+      throw Object.assign(new Error('private connection and SQL details'), { code: 'ER_TABLEACCESS_DENIED_ERROR' })
+    }
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')
+    expect(connection.calls.map((call) => call.sql)).toEqual(['SELECT VERSION() AS version'])
+  })
+
+  test('Given 基础表元数据读取返回不存在 When 执行 Then 分类为表不可用且不执行用户 SQL', async () => {
+    const connection = createConnection((sql) => {
+      if (sql.includes('information_schema.TABLES')) {
+        throw Object.assign(new Error('private table name'), { errno: 1146 })
+      }
+      return [[], []]
+    })
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
+    expect(connection.calls.some((call) => call.sql.includes('FROM `users`'))).toBe(false)
+  })
+
+  test('Given 字段元数据读取返回未知列 When 执行 Then 分类为字段不可用且不执行用户 SQL', async () => {
+    const connection = createConnection((sql) => {
+      if (sql.includes('information_schema.TABLES')) return [[{ name: 'users', type: 'BASE TABLE' }], []]
+      if (sql.includes('information_schema.COLUMNS')) {
+        throw Object.assign(new Error('private column name'), { code: 'ER_BAD_FIELD_ERROR' })
+      }
+      return [[], []]
+    })
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE')
+    expect(connection.calls.some((call) => call.sql.includes('FROM `users`'))).toBe(false)
+  })
+
+  test('Given 事务准备返回驱动语法错误 When 执行 Then 分类为语法无效', async () => {
+    const connection = createConnection((sql) => {
+      if (sql.includes('information_schema.TABLES')) return [[{ name: 'users', type: 'BASE TABLE' }], []]
+      if (sql.includes('information_schema.COLUMNS')) return [[{ name: 'id' }, { name: 'name' }], []]
+      if (sql === 'SET SESSION TRANSACTION READ ONLY') {
+        throw Object.assign(new Error('private syntax details'), { code: 'ER_PARSE_ERROR' })
+      }
+      return [[], []]
+    })
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_SQL_INVALID')
+  })
+
+  test('Given 流式查询返回未知列 When 执行 Then 分类为字段不可用并回滚只读事务', async () => {
+    const connection = createConnection((sql) => {
+      if (sql.includes('information_schema.TABLES')) return [[{ name: 'users', type: 'BASE TABLE' }], []]
+      if (sql.includes('information_schema.COLUMNS')) return [[{ name: 'id' }, { name: 'name' }], []]
+      if (sql.includes('FROM `users`') && !sql.includes('information_schema')) {
+        throw Object.assign(new Error('private streamed SQL'), { code: 'ER_BAD_FIELD_ERROR' })
+      }
+      return [[], []]
+    })
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE')
+    expect(connection.calls.at(-1)?.sql).toBe('ROLLBACK')
+  })
+
+  test('Given 元数据读取超时 When 执行 Then 分类为查询超时', async () => {
+    const connection = createConnection(() => [[], []])
+    connection.query = async (): Promise<unknown> => {
+      throw Object.assign(new Error('private timeout details'), { code: 'ETIMEDOUT' })
+    }
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_TIMEOUT')
+  })
+
+  test('Given MySQL 或 MariaDB 服务端中止慢查询 When 流式执行 Then 分类为查询超时并回滚', async () => {
+    for (const driverError of [
+      { code: 'ER_QUERY_TIMEOUT' },
+      { errno: 3024 },
+      { code: 'ER_STATEMENT_TIMEOUT' },
+      { errno: 1969 },
+    ]) {
+      const connection = createConnection((sql) => {
+        if (sql.includes('information_schema.TABLES')) return [[{ name: 'users', type: 'BASE TABLE' }], []]
+        if (sql.includes('information_schema.COLUMNS')) return [[{ name: 'id' }, { name: 'name' }], []]
+        if (sql.includes('FROM `users`') && !sql.includes('information_schema')) {
+          throw Object.assign(new Error('private server timeout details'), driverError)
+        }
+        return [[], []]
+      })
+
+      await expect(executeServerOpsSqlQuery(connection, createInput()))
+        .rejects.toThrow('SERVER_OPS_DATA_QUERY_TIMEOUT')
+      expect(connection.calls.at(-1)?.sql).toBe('ROLLBACK')
+    }
+  })
+
+  test('Given 驱动伪造非白名单查询稳定码 When 执行 Then 收口为通用查询失败', async () => {
+    const connection = createConnection((sql) => {
+      if (sql.includes('information_schema.TABLES')) return [[{ name: 'users', type: 'BASE TABLE' }], []]
+      if (sql.includes('information_schema.COLUMNS')) return [[{ name: 'id' }, { name: 'name' }], []]
+      if (sql === 'SET SESSION TRANSACTION READ ONLY') throw new Error('SERVER_OPS_DATA_QUERY_PRIVATE_PAYLOAD')
+      return [[], []]
+    })
+
+    await expect(executeServerOpsSqlQuery(connection, createInput()))
+      .rejects.toThrow('SERVER_OPS_DATA_QUERY_FAILED')
   })
 
   test('Given 显式 authorization 敏感列 When 执行 Then 在任何数据库调用前拒绝', async () => {

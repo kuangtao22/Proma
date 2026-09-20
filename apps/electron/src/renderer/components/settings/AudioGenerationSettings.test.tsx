@@ -8,6 +8,8 @@ mock.module('@/lib/model-logo', () => ({
   getChannelLogo: () => 'model-logo.png',
   getModelLogo: () => 'model-logo.png',
   getProviderLogo: () => 'model-logo.png',
+  /** MediaSettings 同时加载图片页，替身需覆盖即梦图标导出。 */
+  getJimengLogo: () => 'jimeng-logo.png',
   resolveModelDisplayName: (modelId: string) => modelId,
   resolveModelProvider: () => 'unknown',
 }))

@@ -1,7 +1,12 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { ServerOpsDataSourceUpsertInput } from '@proma/shared'
 import { ServerOpsDataService } from './server-ops-data-service'
 import type { ServerOpsStoredDataSource } from './server-ops-data-source-store'
+import { ServerOpsDataSchemaCache } from './server-ops-data-schema-cache'
+import type { ServerOpsDataSchemaCacheScope, ServerOpsDataSchemaCacheValue } from './server-ops-data-schema-cache'
 import type { ServerOpsRuntimeDataReadRequest, ServerOpsRuntimeDataReadResult } from '../../../utility/server-ops/server-ops-runtime-protocol'
 
 /** 内存数据源 Store 替身，只实现服务实际使用的方法。 */
@@ -134,6 +139,12 @@ class FakeCredentialStore {
     return this.secrets.get(ref)?.secret
   }
 
+  /** 密文版本替身；测试中用明文变化模拟 safeStorage 密文变化。 */
+  getSecretVersion(ref: string): string | undefined {
+    const secret = this.secrets.get(ref)?.secret
+    return secret === undefined ? undefined : `version:${secret}`
+  }
+
   removeSecret(sourceId: string): boolean {
     /** 本次是否实际删除。 */
     let removed = false
@@ -154,6 +165,67 @@ class FakeCredentialStore {
       removed += 1
     }
     return removed
+  }
+}
+
+/** 内存 schema 缓存替身，记录失效范围与写入次数。 */
+class FakeSchemaCache {
+  /** 精确范围与身份到值的映射。 */
+  private readonly entries = new Map<string, ServerOpsDataSchemaCacheValue>()
+  /** 服务触发的失效范围。 */
+  readonly invalidations: Array<{ sourceId: string; database?: string; table?: string }> = []
+  /** 实际写入缓存的次数。 */
+  writes = 0
+  /** 测试缓存故障降级时注入写失败。 */
+  failWrites = false
+  /** 测试 refresh 失效提交失败时注入异常。 */
+  failInvalidations = false
+  /** 模拟跨实例 fresh-read CAS 的全局代次。 */
+  private revision = 0
+
+  /** 生成无分隔符碰撞的精确键。 */
+  private key(scope: ServerOpsDataSchemaCacheScope, identity: string): string {
+    return JSON.stringify([scope.kind, scope.sourceId, scope.database ?? null, scope.kind === 'table' ? scope.table : null, identity])
+  }
+
+  /** 返回精确身份命中的缓存副本。 */
+  get(scope: ServerOpsDataSchemaCacheScope, identity: string): { value: ServerOpsDataSchemaCacheValue; cachedAt: number } | undefined {
+    const value = this.entries.get(this.key(scope, identity))
+    return value === undefined ? undefined : { value: structuredClone(value), cachedAt: 1_000 }
+  }
+
+  /** 返回当前代次和可选命中。 */
+  lookup(scope: ServerOpsDataSchemaCacheScope, identity: string): { revision: number; value?: ServerOpsDataSchemaCacheValue; cachedAt?: number } {
+    const found = this.get(scope, identity)
+    return found === undefined ? { revision: this.revision } : { revision: this.revision, ...found }
+  }
+
+  /** 保存精确身份的结果副本。 */
+  set(scope: ServerOpsDataSchemaCacheScope, identity: string, value: ServerOpsDataSchemaCacheValue): void {
+    if (this.failWrites) throw new Error('CACHE_WRITE_FAILED')
+    this.writes += 1
+    this.entries.set(this.key(scope, identity), structuredClone(value))
+    this.revision += 1
+  }
+
+  /** 仅代次未变化时写入，模拟生产 Store 的跨实例 CAS。 */
+  setIfRevision(scope: ServerOpsDataSchemaCacheScope, identity: string, value: ServerOpsDataSchemaCacheValue, expectedRevision: number): boolean {
+    if (expectedRevision !== this.revision) return false
+    this.set(scope, identity, value)
+    return true
+  }
+
+  /** 按 source / database / table 范围失效。 */
+  invalidate(scope: { sourceId: string; database?: string; table?: string }): void {
+    if (this.failInvalidations) throw new Error('CACHE_INVALIDATE_FAILED')
+    this.invalidations.push({ ...scope })
+    for (const key of [...this.entries.keys()]) {
+      const [kind, sourceId, database, table] = JSON.parse(key) as [string, string, string | null, string | null]
+      if (sourceId === scope.sourceId
+        && (scope.database === undefined || database === scope.database)
+        && (scope.table === undefined || (kind === 'table' && table === scope.table))) this.entries.delete(key)
+    }
+    this.revision += 1
   }
 }
 
@@ -192,13 +264,27 @@ const availableResult: ServerOpsRuntimeDataReadResult = {
 }
 
 /** 构造服务与替身。 */
-function createService(options: { connected?: boolean; now?: () => number } = {}) {
+function createService(options: {
+  /** 是否模拟 SSH 已连接。 */
+  connected?: boolean
+  /** 可替换的服务时间源。 */
+  now?: () => number
+  /** 是否注入可控内存缓存替身。 */
+  cache?: boolean
+  /** 可选真实 schema 缓存，用于跨 Store 集成回归。 */
+  schemaCache?: ServerOpsDataSchemaCache
+} = {}) {
   const store = new FakeSourceStore()
   const credentials = new FakeCredentialStore()
   /** 可控 runtime。 */
   const runtime = createRuntimeHarness()
   /** 记录 getActiveIdentity 调用的主机。 */
   const identityCalls: string[] = []
+  /** 当前 SSH 活跃代次，可由竞态测试推进。 */
+  let connectionGeneration = 1
+  const schemaCache = new FakeSchemaCache()
+  /** 可选真实缓存供 Store 与服务集成回归使用，其余用例继续使用可控替身。 */
+  const injectedSchemaCache = options.schemaCache ?? (options.cache === true ? schemaCache : undefined)
   const service = new ServerOpsDataService({
     store,
     credentials,
@@ -206,13 +292,17 @@ function createService(options: { connected?: boolean; now?: () => number } = {}
       getActiveIdentity: (hostId: string) => {
         identityCalls.push(hostId)
         if (options.connected === false) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
-        return { hostId, connectionId: 'connection-1', generation: 1 }
+        return { hostId, connectionId: `connection-${connectionGeneration}`, generation: connectionGeneration }
       },
     },
     runtime,
     now: options.now ?? (() => 5_000),
+    ...(injectedSchemaCache === undefined ? {} : { schemaCache: injectedSchemaCache }),
   })
-  return { service, store, credentials, runtime, identityCalls }
+  return {
+    service, store, credentials, runtime, identityCalls, schemaCache,
+    advanceConnection: () => { connectionGeneration += 1 },
+  }
 }
 
 /** 构造数据源写入输入。 */
@@ -620,6 +710,196 @@ describe('服务器运维数据服务编排', () => {
       warnings: [],
     })
     expect(await rowsPending).toMatchObject({ rows: [['51']], offset: 50, limit: 50 })
+  })
+
+  test('Given 未显式启用缓存 When 连续读取目录 Then 每次都实时访问 runtime', async () => {
+    const { service, runtime } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    for (const tableName of ['users', 'orders']) {
+      const pending = service.listSchemaTables({ sourceId: created.source.id })
+      runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: tableName }], warnings: [] })
+      await pending
+    }
+    expect(runtime.requests).toHaveLength(2)
+  })
+
+  test('Given prefer-cache 目录读取 When 首次成功后再次读取 Then 返回缓存且不重复访问 runtime', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const input = { sourceId: created.source.id, cacheMode: 'prefer-cache' as const }
+    const first = service.listSchemaTables(input)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
+    await expect(first).resolves.toMatchObject({ tables: [{ name: 'users' }] })
+    await expect(service.listSchemaTables(input)).resolves.toMatchObject({ tables: [{ name: 'users' }] })
+    expect(runtime.requests).toHaveLength(1)
+    expect(schemaCache.writes).toBe(1)
+  })
+
+  test('Given 两个相同 prefer-cache 请求并发未命中 When 实时结果返回 Then 共用一次 runtime 读取', async () => {
+    const { service, runtime } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const input = { sourceId: created.source.id, database: 'app', table: 'users', cacheMode: 'prefer-cache' as const }
+    const first = service.describeSchemaTable(input)
+    const second = service.describeSchemaTable(input)
+    expect(runtime.requests).toHaveLength(1)
+    runtime.settle({ mode: 'schema-table', capability: 'available', columns: [], indexes: [], warnings: [] })
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+  })
+
+  test('Given 有凭据但缺少密文版本能力 When prefer-cache Then 禁用缓存并保持实时读取', async () => {
+    const { service, runtime, credentials, schemaCache } = createService({ cache: true })
+    Object.defineProperty(credentials, 'getSecretVersion', { value: undefined })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app', password: 'secret' }))
+    for (let index = 0; index < 2; index += 1) {
+      const pending = service.listSchemaTables({ sourceId: created.source.id, cacheMode: 'prefer-cache' })
+      runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+      await pending
+    }
+    expect(runtime.requests).toHaveLength(2)
+    expect(schemaCache.writes).toBe(0)
+  })
+
+  test('Given 派生缓存写入失败 When 实时读取成功 Then 仍返回实时结果', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    schemaCache.failWrites = true
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const pending = service.listSchemaTables({ sourceId: created.source.id, cacheMode: 'prefer-cache' })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
+    await expect(pending).resolves.toMatchObject({ tables: [{ name: 'users' }] })
+  })
+
+  test('Given refresh 目录读取 When 指定或未指定库 Then 失效对应库或整个数据源缓存', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    for (const database of ['app', undefined]) {
+      const pending = service.listSchemaTables({ sourceId: created.source.id, ...(database === undefined ? {} : { database }), cacheMode: 'refresh' })
+      runtime.settle({ mode: 'schema-tables', capability: 'available', ...(database === undefined ? { database: 'app' } : { database }), databases: ['app'], tables: [], warnings: [] })
+      await pending
+    }
+    expect(schemaCache.invalidations).toEqual([
+      { sourceId: created.source.id, database: 'app' },
+      { sourceId: created.source.id },
+    ])
+  })
+
+  test('Given 表结构读取先于目录 refresh 在途 When 旧结构迟到 Then revision CAS 不会重新回填', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const oldTable = service.describeSchemaTable({
+      sourceId: created.source.id, database: 'app', table: 'users', cacheMode: 'prefer-cache',
+    })
+    const refreshedDirectory = service.listSchemaTables({ sourceId: created.source.id, database: 'app', cacheMode: 'refresh' })
+    expect(runtime.requests.map((request) => request.mode)).toEqual(['schema-table', 'schema-tables'])
+
+    runtime.settle({ mode: 'schema-table', capability: 'available', columns: [{ name: 'old', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [] })
+    await oldTable
+    expect(schemaCache.writes).toBe(0)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
+    await refreshedDirectory
+    expect(schemaCache.writes).toBe(1)
+  })
+
+  test('Given 目录 refresh 的缓存失效写失败 When 后续读取表结构 Then 本实例绕过旧缓存并实时读取', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const tableInput = { sourceId: created.source.id, database: 'app', table: 'users', cacheMode: 'prefer-cache' as const }
+    const oldTable = service.describeSchemaTable(tableInput)
+    runtime.settle({
+      mode: 'schema-table', capability: 'available',
+      columns: [{ name: 'old_column', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [],
+    })
+    await oldTable
+
+    schemaCache.failInvalidations = true
+    const refresh = service.listSchemaTables({ sourceId: created.source.id, database: 'app', cacheMode: 'refresh' })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
+    await refresh
+
+    const freshTable = service.describeSchemaTable(tableInput)
+    expect(runtime.requests.at(-1)?.mode).toBe('schema-table')
+    runtime.settle({
+      mode: 'schema-table', capability: 'available',
+      columns: [{ name: 'new_column', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [],
+    })
+    await expect(freshTable).resolves.toMatchObject({ columns: [{ name: 'new_column' }] })
+
+    schemaCache.failInvalidations = false
+    const otherScopeRefresh = service.listSchemaTables({ sourceId: created.source.id, database: 'analytics', cacheMode: 'refresh' })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'analytics', databases: ['app', 'analytics'], tables: [], warnings: [] })
+    await otherScopeRefresh
+    const appAfterOtherScopeRefresh = service.describeSchemaTable(tableInput)
+    expect(runtime.requests.at(-1)?.mode).toBe('schema-table')
+    runtime.settle({
+      mode: 'schema-table', capability: 'available',
+      columns: [{ name: 'latest_column', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [],
+    })
+    await expect(appAfterOtherScopeRefresh).resolves.toMatchObject({ columns: [{ name: 'latest_column' }] })
+  })
+
+  test('Given schema 主文件与备份均损坏 When 连续 prefer-cache Then 本实例两次都实时读取', async () => {
+    /** 隔离真实缓存文件，覆盖 safe-file 严格读取到服务降级的完整链路。 */
+    const configDir = mkdtempSync(join(tmpdir(), 'proma-schema-service-'))
+    try {
+      /** 使用真实 Store，但用同步空事务避免本用例重复验证原生锁。 */
+      const cache = new ServerOpsDataSchemaCache(configDir, { transaction: (callback) => callback() })
+      /** 主文件和备份同时损坏，不能被解释为首次缺失。 */
+      const filePath = join(configDir, 'server-ops', 'schema-cache.json')
+      writeFileSync(filePath, '{broken', 'utf8')
+      writeFileSync(`${filePath}.bak`, '{broken', 'utf8')
+      /** 注入真实损坏缓存的服务与可控 runtime。 */
+      const { service, runtime } = createService({ schemaCache: cache })
+      /** 不含凭据的直连数据源，避免其它身份门禁干扰缓存故障断言。 */
+      const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+      /** 两次相同 opt-in 请求用于证明首次异常后的实例级禁用闩锁。 */
+      const input = { sourceId: created.source.id, database: 'app', table: 'users', cacheMode: 'prefer-cache' as const }
+
+      /** 首次读取应在缓存异常后降级到实时 runtime。 */
+      const first = service.describeSchemaTable(input)
+      expect(runtime.requests.at(-1)?.mode).toBe('schema-table')
+      runtime.settle({
+        mode: 'schema-table', capability: 'available',
+        columns: [{ name: 'first_live', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [],
+      })
+      await expect(first).resolves.toMatchObject({ columns: [{ name: 'first_live' }] })
+
+      /** 第二次读取应命中实例禁用闩锁，不能重新读取或修复缓存。 */
+      const second = service.describeSchemaTable(input)
+      expect(runtime.requests.filter((request) => request.mode === 'schema-table')).toHaveLength(2)
+      runtime.settle({
+        mode: 'schema-table', capability: 'available',
+        columns: [{ name: 'second_live', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [],
+      })
+      await expect(second).resolves.toMatchObject({ columns: [{ name: 'second_live' }] })
+    } finally {
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given 缓存读取期间密码或 SSH 身份变化 When 迟到结果返回 Then 拒绝回填旧身份', async () => {
+    const { service, runtime, schemaCache, advanceConnection } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ database: 'app', password: 'old-secret' }))
+    const input = { sourceId: created.source.id, cacheMode: 'prefer-cache' as const }
+    const passwordChanged = service.listSchemaTables(input)
+    service.upsertSource(createInput({ sourceId: created.source.id, database: 'app', password: 'new-secret' }))
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+    await expect(passwordChanged).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    expect(schemaCache.writes).toBe(0)
+
+    const connectionChanged = service.listSchemaTables(input)
+    advanceConnection()
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+    await expect(connectionChanged).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    expect(schemaCache.writes).toBe(0)
+  })
+
+  test('Given opt-in 实时读取期间数据源被删除 When 结果迟到 Then 不返回也不写缓存', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const pending = service.listSchemaTables({ sourceId: created.source.id, cacheMode: 'prefer-cache' })
+    service.deleteSource({ sourceId: created.source.id })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+    await expect(pending).rejects.toThrow('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
+    expect(schemaCache.writes).toBe(0)
   })
 
   test('Given SQL 查询 When 成功 Then 下传取消信号并返回精确查询结果', async () => {

@@ -1,22 +1,38 @@
 import * as React from 'react'
 import { atom, useAtom } from 'jotai'
-import { CircleHelp, Code2, History, LoaderCircle, Play, RotateCw, ShieldCheck, Square, Table2 } from 'lucide-react'
+import { CircleHelp, Code2, History, ListChecks, LoaderCircle, Play, RotateCw, ShieldCheck, Square, Table2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
 import type { ServerOpsDataPanelApi } from './ServerOpsDataServicesPanel'
 import { formatServerOpsSchemaCell } from './ServerOpsSchemaBrowserView'
-import { createServerOpsSqlQueryController, createServerOpsSqlQueryIdleProjection } from './server-ops-sql-query-controller'
+import { createServerOpsSqlQueryController, createServerOpsSqlQueryIdleProjection, isServerOpsSqlQueryContextCurrent } from './server-ops-sql-query-controller'
 import { getServerOpsSqlQueryWarningMessage } from './server-ops-sql-query-controller'
 import type { ServerOpsSqlQueryExecution } from './server-ops-sql-query-controller'
 import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TAB_CLASS, SERVER_OPS_TABLE_CLASS } from './server-ops-ui'
 import { createServerOpsSqlQueryHistoryController, createServerOpsSqlQueryHistoryIdleProjection } from './server-ops-sql-query-history-controller'
 import { ServerOpsSqlQueryHistory } from './ServerOpsSqlQueryHistory'
 import type { ServerOpsDataSchemaCell } from '@proma/shared'
+import { ServerOpsSqlEditor } from './ServerOpsSqlEditor'
+import type { ServerOpsSqlEditorHandle } from './ServerOpsSqlEditor'
+import { createServerOpsSqlCompletionSource } from './server-ops-sql-completion'
+import { createServerOpsSqlCompletionController, createServerOpsSqlCompletionIdleProjection, getServerOpsSqlCompletionContextKey } from './server-ops-sql-completion-controller'
+import type { ServerOpsSqlCompletionApi } from './server-ops-sql-completion-controller'
+import { validateServerOpsSqlDraft } from './server-ops-sql-validation'
+import type { ServerOpsSqlDraftValidation, ServerOpsSqlEditorDiagnostic } from './server-ops-sql-validation'
+
+/** 空诊断保持引用稳定，等待防抖时不反复更新 CodeMirror 扩展。 */
+const EMPTY_DIAGNOSTICS: ServerOpsSqlEditorDiagnostic[] = []
+/** 校验结果绑定原始草稿及连接上下文，迟到结果不能标记新文本。 */
+interface SqlValidationSnapshot {
+  sql: string
+  contextKey: string
+  result: ServerOpsSqlDraftValidation
+}
 
 /** 执行、取消与本地历史使用独立可选接口，兼容尚未升级的 preload。 */
-export type ServerOpsSqlQueryPanelApi = Pick<ServerOpsDataPanelApi, 'queryServerOpsDatabase' | 'cancelServerOpsDatabaseQuery' | 'listServerOpsDatabaseQueryHistory' | 'saveServerOpsDatabaseQueryHistory'>
+export type ServerOpsSqlQueryPanelApi = Pick<ServerOpsDataPanelApi, 'queryServerOpsDatabase' | 'cancelServerOpsDatabaseQuery' | 'listServerOpsDatabaseQueryHistory' | 'saveServerOpsDatabaseQueryHistory'> & ServerOpsSqlCompletionApi
 
 /** SQL 查询页面输入；database 由工作台顶部选库器统一控制。 */
 export interface ServerOpsSqlQueryPanelProps {
@@ -58,11 +74,32 @@ export function ServerOpsSqlQueryResult({ execution, busy }: { execution: Server
 export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationKey, available }: ServerOpsSqlQueryPanelProps): React.ReactElement {
   /** 每个 Pane 使用独立表单标识，标题标签可准确聚焦自己的编辑器。 */
   const editorId = React.useId()
+  /** 独立无障碍说明标识保证双 Pane 中不会引用另一编辑器的诊断。 */
+  const diagnosticsId = React.useId()
   /** 从历史回填后将键盘焦点交回当前 Pane 的编辑器。 */
-  const editorRef = React.useRef<HTMLTextAreaElement>(null)
+  const editorRef = React.useRef<ServerOpsSqlEditorHandle>(null)
+  /** 元数据只保存在当前 Pane 的私有 atom；持久缓存由主进程管理。 */
+  const [completionAtom] = React.useState(() => atom(createServerOpsSqlCompletionIdleProjection()))
+  const [completion, setCompletion] = useAtom(completionAtom)
+  const completionController = React.useMemo(() => createServerOpsSqlCompletionController({ api, publish: setCompletion }), [api, setCompletion])
+  /** 稳定 source 在每次补全时获取最新结构，避免键入时重新配置编辑器。 */
+  const completionSource = React.useMemo(() => createServerOpsSqlCompletionSource({ getSchema: completionController.snapshot, ensureCatalog: completionController.ensureCatalog, ensureColumns: completionController.ensureColumns }), [completionController])
+  const completionContextKey = getServerOpsSqlCompletionContextKey({ sourceId, database, configurationKey, available })
+  const visibleCompletion = React.useMemo(() => completion.contextKey === completionContextKey ? completion : createServerOpsSqlCompletionIdleProjection(), [completion, completionContextKey])
   /** 草稿、查询行和执行快照只存在于当前组件的私有 atom。 */
   const [projectionAtom] = React.useState(() => atom(createServerOpsSqlQueryIdleProjection()))
   const [projection, setProjection] = useAtom(projectionAtom)
+  /** 渲染与事件同时核对目标，防止选库 props 先于控制器 effect 更新时误查旧库。 */
+  const currentQueryContext = { sourceId, database, configurationKey, available }
+  const queryContextMatches = isServerOpsSqlQueryContextCurrent(projection.context, currentQueryContext)
+  /** 输入法组合与诊断只属于当前 Pane；不进入持久草稿或查询历史。 */
+  const [validationAtom] = React.useState(() => atom<SqlValidationSnapshot | null>(null))
+  const [validation, setValidation] = useAtom(validationAtom)
+  const [composingAtom] = React.useState(() => atom(false))
+  const [composing, setComposing] = useAtom(composingAtom)
+  /** 文本或连接一变就隐藏旧结果，等待本次本地校验，不沿用旧的绿色通过状态。 */
+  const visibleValidation = !composing && validation?.sql === projection.draft && validation.contextKey === completionContextKey ? validation.result : null
+  const diagnostics = visibleValidation?.diagnostics ?? EMPTY_DIAGNOSTICS
   /** 输出页签和历史读取独立于查询结果，切换页签不取消在途查询。 */
   const [outputTabAtom] = React.useState(() => atom<'result' | 'history'>('result'))
   const [outputTab, setOutputTab] = useAtom(outputTabAtom)
@@ -84,6 +121,13 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   }), [api, setProjection, historyController])
 
   React.useEffect(() => {
+    completionController.activate()
+    return () => completionController.dispose()
+  }, [completionController])
+  React.useEffect(() => {
+    completionController.setContext({ sourceId, database, configurationKey, available })
+  }, [completionController, sourceId, database, configurationKey, available])
+  React.useEffect(() => {
     historyController.activate()
     return () => historyController.dispose()
   }, [historyController])
@@ -99,22 +143,39 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
     controller.setContext({ sourceId, database, configurationKey, available })
   }, [controller, sourceId, database, configurationKey, available])
 
+  React.useEffect(() => {
+    if (composing || !database || !projection.draft.trim()) return
+    /** 停顿 350ms 后只读取现有结构，快速输入和卸载会清理待执行校验。 */
+    const timer = setTimeout(() => {
+      setValidation({ sql: projection.draft, contextKey: completionContextKey, result: validateServerOpsSqlDraft(projection.draft, database, visibleCompletion) })
+    }, 350)
+    return () => clearTimeout(timer)
+  }, [projection.draft, database, completionContextKey, visibleCompletion, composing, setValidation])
+
+  /** 手动校验及执行前检查共用纯函数，不调用查询或历史接口。 */
+  const validateDraft = (locate: boolean): ServerOpsSqlDraftValidation => {
+    const sql = controller.snapshot().draft
+    const result = validateServerOpsSqlDraft(sql, database, visibleCompletion)
+    setValidation({ sql, contextKey: completionContextKey, result })
+    if (locate && result.diagnostics[0]) editorRef.current?.reveal(result.diagnostics[0])
+    return result
+  }
+
   /** 点击、快捷键与错误重试使用同一入口，真正执行时自动切回结果页签。 */
   const executeQuery = (): void => {
-    if (!controller.snapshot().canExecute) return
+    if (composing || !isServerOpsSqlQueryContextCurrent(controller.snapshot().context, currentQueryContext) || !controller.snapshot().canExecute) return
+    const result = validateDraft(false)
+    if (result.status === 'invalid') {
+      if (result.diagnostics[0]) editorRef.current?.reveal(result.diagnostics[0])
+      return
+    }
     setOutputTab('result')
-    void controller.execute()
+    void controller.execute(currentQueryContext)
   }
   /** 历史回填不执行 SQL，也不改变上次成功结果的执行快照。 */
   const useHistorySql = (sql: string): void => {
     controller.setDraft(sql)
     editorRef.current?.focus()
-  }
-  /** Ctrl/Cmd + Enter 只执行当前快照，不因普通换行自动查询。 */
-  const handleEditorKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>): void => {
-    if (event.key !== 'Enter' || (!event.ctrlKey && !event.metaKey) || event.nativeEvent.isComposing) return
-    event.preventDefault()
-    executeQuery()
   }
   /** 接口、选库和连接状态按最具体原因提示。 */
   const unavailableReason = !api.queryServerOpsDatabase || !api.cancelServerOpsDatabaseQuery
@@ -129,7 +190,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   /** 结果尚未出现时仍明确区分等待执行、执行中、取消和不可用原因。 */
   const emptyTitle = unavailableReason ? '暂时无法查询' : projection.status === 'cancelling' ? '正在取消查询' : busy ? '正在执行查询' : projection.error ? '查询未完成' : '等待执行查询'
   /** 空白区只显示当前最相关的操作提示，详细语法规则放入查询说明。 */
-  const emptyDescription = unavailableReason ?? (projection.status === 'cancelling' ? '正在释放本次查询，完成后可重新执行。' : busy ? '查询完成后，结果会显示在这里。' : projection.error ? '请根据上方提示调整 SQL 后重试。' : '在上方输入 SQL，点击「执行」或使用快捷键。')
+  const emptyDescription = unavailableReason ?? (projection.status === 'cancelling' ? '正在释放本次查询，完成后可重新执行。' : busy ? '查询完成后，结果会显示在这里。' : projection.error ? '请根据上方提示处理后重试。' : '在上方输入 SQL，点击「执行」或使用快捷键。')
   return <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto" data-server-ops-sql-query>
     <section className="m-3 shrink-0 overflow-hidden rounded-xl border border-border/60 bg-content-area" aria-label="SQL 查询编辑区" data-server-ops-sql-editor-region>
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border/40 bg-muted/20 px-3 py-1.5">
@@ -145,20 +206,39 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
           </PopoverContent>
         </Popover>
       </div>
-      <textarea
+      <ServerOpsSqlEditor
         id={editorId}
         ref={editorRef}
-        className="block h-32 min-h-24 max-h-64 w-full resize-y bg-transparent px-3 py-2.5 font-mono text-xs leading-6 outline-none transition-colors placeholder:text-muted-foreground/50 focus-visible:bg-muted/10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
-        aria-label="SQL 编辑器"
-        spellCheck={false}
-        placeholder={'SELECT id, name\nFROM users\nORDER BY id DESC'}
+        contextKey={completionContextKey}
+        completionSource={completionSource}
+        diagnostics={diagnostics}
+        diagnosticsId={diagnosticsId}
         value={projection.draft}
-        onChange={(event) => controller.setDraft(event.target.value)}
-        onKeyDown={handleEditorKeyDown}
+        onChange={(value) => controller.setDraft(value)}
+        onExecute={executeQuery}
+        onCompositionChange={setComposing}
       />
+      <div className="flex min-w-0 items-center gap-2 border-t border-border/30 px-3 py-1 text-[10px] text-muted-foreground" data-server-ops-sql-schema-status>
+        {visibleCompletion.status === 'loading' || visibleCompletion.pendingTables > 0 ? <LoaderCircle className="size-3 shrink-0 animate-spin" aria-hidden="true" /> : null}
+        <span className="min-w-0 flex-1 truncate" role="status" title={visibleCompletion.error ?? undefined}>{visibleCompletion.error ?? (visibleCompletion.status === 'loading' ? '正在读取表目录…' : visibleCompletion.pendingTables > 0 ? '正在读取字段…' : visibleCompletion.status === 'ready' ? `${visibleCompletion.tables.length} 张表${visibleCompletion.tablesTruncated ? '（目录已截断）' : ''} · 字段按需加载 · Tab 接受联想` : '选择数据库后可联想表名和字段')}</span>
+        <Button type="button" variant="ghost" size="sm" className="h-6 shrink-0 gap-1 px-1.5 text-[10px]" disabled={!database || !available || visibleCompletion.status === 'loading'} onClick={() => { void completionController.refresh() }} aria-label="刷新数据库结构"><RotateCw className="size-3" aria-hidden="true" />刷新结构</Button>
+      </div>
+      <div id={diagnosticsId} className="max-h-28 overflow-y-auto border-t border-border/30 px-3 py-1.5 text-[11px] leading-5" data-server-ops-sql-validation>
+        {diagnostics.length > 0 ? <ul className="space-y-1" aria-label="SQL 校验提示">{diagnostics.map((diagnostic, index) => {
+          /** 用户看到的行列从 1 开始，位置不泄漏 SQL 中的常量。 */
+          const before = projection.draft.slice(0, diagnostic.from).split('\n')
+          const location = `第 ${before.length} 行，第 ${(before.at(-1)?.length ?? 0) + 1} 列`
+          const category = diagnostic.category === 'schema' ? '结构提醒' : diagnostic.category === 'unsupported' ? '暂不支持' : diagnostic.category === 'policy' ? '查询限制' : '语法错误'
+          return <li key={`${diagnostic.code}:${diagnostic.from}:${index}`}><button type="button" className={cn('w-full rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40', diagnostic.severity === 'error' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400')} onClick={() => editorRef.current?.reveal(diagnostic)} title={`点击定位：${location}`}><span className="font-medium">{category}</span><span className="ml-2 text-muted-foreground">{location}</span><span className="block break-words">{diagnostic.message}</span></button></li>
+        })}</ul> : null}
+        <p role="status" aria-live="polite" className={cn('text-muted-foreground', diagnostics.length > 0 && 'sr-only')}>
+          {diagnostics.length > 0 ? `${diagnostics.length} 条校验提示：${diagnostics[0]?.message}` : !database ? '选择数据库后可校验 SQL' : !projection.draft.trim() ? '输入 SQL 后自动校验，也可点击「校验」' : composing ? '输入完成后自动校验' : !visibleValidation ? '等待输入完成后校验…' : '语法校验通过，执行时仍会检查结构与权限。'}
+        </p>
+      </div>
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-t border-border/40 bg-muted/10 px-3 py-2" data-server-ops-sql-actions>
         <div className="flex shrink-0 items-center gap-1.5">
-          <Button type="button" size="sm" aria-label="执行查询" disabled={!projection.canExecute} onClick={executeQuery}>
+          <Button type="button" size="sm" variant="outline" aria-label="校验 SQL" disabled={!database || !projection.draft.trim() || composing} onClick={() => { validateDraft(true) }}><ListChecks className="size-3.5" aria-hidden="true" />校验</Button>
+          <Button type="button" size="sm" aria-label="执行查询" disabled={!queryContextMatches || !projection.canExecute || composing} onClick={executeQuery}>
             {projection.status === 'running' ? <LoaderCircle className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}执行
           </Button>
           <Button type="button" size="sm" variant="outline" aria-label="取消查询" disabled={projection.status !== 'running'} onClick={() => { void controller.cancel() }}>

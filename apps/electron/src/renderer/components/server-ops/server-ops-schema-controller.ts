@@ -126,7 +126,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     ? { sourceId: projection.sourceId, database: projection.database, table: projection.selectedTable } : null
 
   /** 读取表描述；结构/索引共享一次结果。 */
-  const loadStructure = (): void => {
+  const loadStructure = (cacheMode: 'prefer-cache' | 'refresh' = 'prefer-cache'): void => {
     const selected = target()
     if (!selected || !active || !readable || projection.structure.status === 'loading') return
     const owner = ownerRevision
@@ -134,8 +134,10 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     const revision = ++structureRevision
     const valid = (): boolean => active && owner === ownerRevision && table === tableRevision && revision === structureRevision
     patch({ structure: { ...projection.structure, status: 'loading', error: null } })
-    void enqueueServerOpsDataRead(options.api, `${selected.sourceId}:schema-table`, JSON.stringify([sourceKey, selected]),
-      () => options.api.describeServerOpsDataSchemaTable(selected), valid).then((result) => {
+    /** 只有结构读取携带缓存策略；数据行 target 保持原有实时合同。 */
+    const input = { ...selected, cacheMode }
+    void enqueueServerOpsDataRead(options.api, `${selected.sourceId}:schema-table`, JSON.stringify([sourceKey, input]),
+      () => options.api.describeServerOpsDataSchemaTable(input), valid).then((result) => {
       if (valid()) patch({ structure: { ...result, status: 'ready', error: null, collectedAt: Date.now() } })
     }, (error: unknown) => {
       if (valid()) patch({ structure: { ...projection.structure, status: 'error', error: getServerOpsDataErrorMessage(error) } })
@@ -173,13 +175,13 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
   }
 
   /** 读取目录；首次省略库名，由主进程只在配置库有效时预选。 */
-  const loadTables = (database: string | null, initial = false): void => {
+  const loadTables = (database: string | null, initial = false, cacheMode: 'prefer-cache' | 'refresh' = 'prefer-cache'): void => {
     const sourceId = projection.sourceId
     if (!sourceId || !active || !readable || projection.engine !== 'mysql') return
     const owner = ownerRevision
     const revision = ++catalogRevision
     const valid = (): boolean => active && owner === ownerRevision && revision === catalogRevision
-    const input = database === null || initial ? { sourceId } : { sourceId, database }
+    const input = database === null || initial ? { sourceId, cacheMode } : { sourceId, database, cacheMode }
     initialCatalog = initial
     patch({ status: 'loading', error: null })
     void enqueueServerOpsDataRead(options.api, `${sourceId}:schema-tables`, JSON.stringify([sourceKey, input]),
@@ -189,6 +191,13 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       patch({ status: 'ready', error: null, collectedAt: Date.now(), databases: result.databases, database: result.database ?? null,
         tables: result.tables, tablesTruncated: result.tablesTruncated, databasesTruncated: result.databasesTruncated })
       if (projection.selectedTable && !result.tables.some((entry) => entry.name === projection.selectedTable)) resetTable()
+      /** 先完成目录失效，再刷新当前结构，避免并发失效把新字段缓存抹掉。 */
+      if (cacheMode === 'refresh' && projection.selectedTable && (projection.detailTab === 'structure' || projection.detailTab === 'indexes')) {
+        /** 刷新目录期间可能刚切入结构页，必须同时撤销那次旧缓存请求的发布权。 */
+        structureRevision += 1
+        patch({ structure: createServerOpsSchemaIdleProjection().structure })
+        loadStructure('refresh')
+      }
       if (resume) {
         /** 只有恢复的库仍可见才继续，不猜另一库。 */
         const saved = resume
@@ -259,12 +268,18 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       if ((tab === 'structure' || tab === 'indexes') && projection.structure.status === 'idle') loadStructure()
     },
     loadRows,
-    refreshTables(): void { if (projection.status !== 'loading') loadTables(projection.database, projection.database === null) },
+    refreshTables(): void {
+      if (projection.status === 'loading') return
+      /** 目录刷新会使后端字段失效，页面也同步清除已展示的旧描述。 */
+      structureRevision += 1
+      patch({ structure: createServerOpsSchemaIdleProjection().structure })
+      loadTables(projection.database, projection.database === null, 'refresh')
+    },
     refresh(): void {
-      if (!target()) { if (projection.status !== 'loading') loadTables(projection.database, initialCatalog); return }
+      if (!target()) { if (projection.status !== 'loading') loadTables(projection.database, initialCatalog, 'refresh'); return }
       if (projection.detailTab === 'data') loadRows(projection.rows.offset)
-      else if (projection.detailTab === 'properties') { if (projection.status !== 'loading') loadTables(projection.database) }
-      else loadStructure()
+      else if (projection.detailTab === 'properties') { if (projection.status !== 'loading') loadTables(projection.database, false, 'refresh') }
+      else loadStructure('refresh')
     },
   }
 }

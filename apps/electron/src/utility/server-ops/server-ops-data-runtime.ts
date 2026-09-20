@@ -17,7 +17,12 @@ import type {
   ServerOpsDataQueryResult,
 } from '@proma/shared'
 import type { ServerOpsRuntimeDataReadResult } from './server-ops-runtime-protocol'
-import { bindServerOpsSqlQueryAbort, executeServerOpsSqlQuery } from './server-ops-query-runtime'
+import {
+  bindServerOpsSqlQueryAbort,
+  executeServerOpsSqlQuery,
+  getServerOpsSqlQueryPublicError,
+  normalizeServerOpsSqlQueryError,
+} from './server-ops-query-runtime'
 
 /** 数据服务在 utility process 内执行的一次数据读取输入；含秘密，禁止回传主进程之外。 */
 /** 所有数据读取模式共享的真实连接字段。 */
@@ -694,7 +699,10 @@ async function readMySql(
     }
   } catch (error) {
     if (input.mode === 'sql-query') {
-      if (error instanceof Error && (error.message.startsWith('SERVER_OPS_DATA_QUERY_') || error.message === 'SERVER_OPS_DATA_CANCELLED')) throw error
+      /** 建连与执行共用同一分类器，再以公开白名单限制跨 utility 边界的错误。 */
+      const normalized = normalizeServerOpsSqlQueryError(error)
+      if (getServerOpsSqlQueryPublicError(normalized) !== undefined
+        || normalized.message === 'SERVER_OPS_DATA_CANCELLED') throw normalized
       throw new Error('SERVER_OPS_DATA_QUERY_FAILED')
     }
     /** 连接失败统一映射为稳定能力状态，不泄露连接串与堆栈。 */

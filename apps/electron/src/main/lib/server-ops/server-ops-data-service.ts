@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
   ServerOpsDataDiagnoseInput,
   ServerOpsDataDiagnosticsResult,
@@ -21,11 +22,24 @@ import type {
   ServerOpsDataSourceUpsertInput,
   ServerOpsDataSourceUpsertResult,
 } from '@proma/shared'
-import { isServerOpsPlaintextDirectAddress, parseServerOpsDataDiagnoseInput, parseServerOpsDataQueryInput } from '@proma/shared'
+import {
+  isServerOpsPlaintextDirectAddress,
+  parseServerOpsDataDiagnoseInput,
+  parseServerOpsDataQueryInput,
+  parseServerOpsDataSourceTableInput,
+  parseServerOpsDataSourceTableResult,
+  parseServerOpsDataSourceTablesInput,
+  parseServerOpsDataSourceTablesResult,
+} from '@proma/shared'
 import type { ServerOpsActiveConnectionIdentity } from './server-ops-connection-service'
 import type { ServerOpsDataSourceStore, ServerOpsStoredDataSource } from './server-ops-data-source-store'
 import type { ServerOpsDataSourceCredentialStore } from './server-ops-data-credential-store'
 import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
+import type {
+  ServerOpsDataSchemaCache,
+  ServerOpsDataSchemaCacheScope,
+  ServerOpsDataSchemaCacheValue,
+} from './server-ops-data-schema-cache'
 import type {
   ServerOpsRuntimeDataDiagnosticsResult,
   ServerOpsRuntimeDataReadRequest,
@@ -56,6 +70,7 @@ export interface ServerOpsDataServiceDependencies {
   store: Pick<ServerOpsDataSourceStore, 'list' | 'getById' | 'create' | 'update' | 'move' | 'remove' | 'removeByHost'>
   /** 数据库密码密文 Store，与 SSH 凭据完全分离。 */
   credentials: Pick<ServerOpsDataSourceCredentialStore, 'setSecret' | 'resolveSecret' | 'removeSecret' | 'removeByHost'>
+    & Partial<Pick<ServerOpsDataSourceCredentialStore, 'getSecretVersion'>>
   /** 当前活跃 SSH 连接身份。 */
   connection: ServerOpsDataConnectionContract
   /** 通过 SSH 隧道执行只读读取的 runtime 客户端。 */
@@ -66,6 +81,8 @@ export interface ServerOpsDataServiceDependencies {
   uuid?: () => string
   /** 编辑数据源时覆盖归属预检、密文和元数据写入的同步配置事务。 */
   transaction?: ServerOpsConfigTransaction
+  /** 可选的 schema 派生缓存；未注入时所有读取保持实时。 */
+  schemaCache?: Pick<ServerOpsDataSchemaCache, 'lookup' | 'setIfRevision' | 'invalidate'>
 }
 
 /** 数据服务编排结果：数据源增删改查与只读读取。 */
@@ -80,6 +97,10 @@ export class ServerOpsDataService {
   private readonly transaction: ServerOpsConfigTransaction
   /** 每个数据源最多一个在途读取。 */
   private readonly activeReads = new Set<string>()
+  /** 仅 opt-in 缓存请求使用的同身份同范围在途读取。 */
+  private readonly activeSchemaCacheReads = new Map<string, Promise<ServerOpsDataSchemaCacheValue>>()
+  /** 缓存异常后本实例 fail closed；服务重建前不再恢复缓存读写。 */
+  private schemaCacheDisabled = false
   /** dispose 后进入终态，拒绝新的读取。 */
   private disposed = false
 
@@ -216,6 +237,7 @@ export class ServerOpsDataService {
     if (!existing) throw new Error('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
     this.dependencies.credentials.removeSecret(input.sourceId)
     this.dependencies.store.remove(input.sourceId)
+    this.invalidateSchemaCache({ sourceId: input.sourceId })
   }
 
   /**
@@ -344,19 +366,57 @@ export class ServerOpsDataService {
    */
   async listSchemaTables(input: ServerOpsDataSourceTablesInput): Promise<ServerOpsDataSourceTablesResult> {
     this.assertUsable()
+    const parsedInput = parseServerOpsDataSourceTablesInput(input)
     /** 数据源记录；同时用于推导默认库与连接方式。 */
-    const record = this.requireSource(input.sourceId)
+    const record = this.requireSource(parsedInput.sourceId)
     /** 目标库：显式优先，其次数据源配置的库；两者都缺失时只列可见库。 */
-    const database = input.database ?? record.database
+    const database = parsedInput.database ?? record.database
+    const cache = this.dependencies.schemaCache
+    if (parsedInput.cacheMode === undefined || cache === undefined) {
+      return this.readSchemaTablesLive(record, parsedInput.database, database)
+    }
+    const context = this.createSchemaCacheContext(record)
+    if (context === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database)
+    /** 目录范围按实际请求库隔离；未选库时只缓存可见库目录。 */
+    const scope: ServerOpsDataSchemaCacheScope = {
+      kind: 'tables', sourceId: record.id, ...(database === undefined ? {} : { database }),
+    }
+    if (parsedInput.cacheMode === 'refresh') {
+      this.invalidateSchemaCache({ sourceId: record.id, ...(parsedInput.database === undefined ? {} : { database: parsedInput.database }) })
+    }
+    const lookup = this.readSchemaCache(scope, context.identity)
+    if (lookup === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database, context.connection)
+    if (parsedInput.cacheMode === 'prefer-cache' && lookup.value !== undefined) {
+      this.assertSchemaCacheContextCurrent(context)
+      return parseServerOpsDataSourceTablesResult(lookup.value)
+    }
+    return this.coalesceSchemaCacheRead(scope, context.identity, lookup.revision, async () => {
+      const result = await this.readSchemaTablesLive(record, parsedInput.database, database, context.connection)
+      this.assertSchemaCacheContextCurrent(context)
+      this.writeSchemaCache(scope, context.identity, result, lookup.revision)
+      return result
+    })
+  }
+
+  /** 执行一次实时目录读取并投影公开结果。 */
+  private async readSchemaTablesLive(
+    record: ServerOpsStoredDataSource,
+    explicitDatabase: string | undefined,
+    database: string | undefined,
+    expectedConnection?: ServerOpsActiveConnectionIdentity | null,
+  ): Promise<ServerOpsDataSourceTablesResult> {
     /** 已保存密码只在本次请求内解密。 */
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
-    const { result } = await this.runReadTarget('schema-tables', record, password, `${record.id}:schema-tables`, { database })
+    const { result } = await this.runReadTarget(
+      'schema-tables', record, password, `${record.id}:schema-tables`, { database }, undefined, undefined, undefined, undefined,
+      expectedConnection ?? undefined,
+    )
     if (!isSchemaTablesResult(result) || result.capability !== 'available') {
       throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: ${readSchemaWarning(result)}`)
     }
     /** 显式库必须由 runtime 的参数化查询精确确认，不能用截断目录中的同名项推断。 */
-    if (input.database !== undefined && result.database !== input.database) {
-      throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: 库 ${input.database} 不存在或当前账号不可见`)
+    if (explicitDatabase !== undefined && result.database !== explicitDatabase) {
+      throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: 库 ${explicitDatabase} 不存在或当前账号不可见`)
     }
     /** 默认库同样只信任 runtime 的精确验证回执；不可见时保留目录但不选择其它库。 */
     const visibleDatabase = database !== undefined && result.database === database ? database : undefined
@@ -377,12 +437,43 @@ export class ServerOpsDataService {
    */
   async describeSchemaTable(input: ServerOpsDataSourceTableInput): Promise<ServerOpsDataSourceTableResult> {
     this.assertUsable()
-    const record = this.requireSource(input.sourceId)
-    const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
-    const { result } = await this.runReadTarget('schema-table', record, password, `${record.id}:schema-table`, {
-      database: input.database,
-      table: input.table,
+    const parsedInput = parseServerOpsDataSourceTableInput(input)
+    const record = this.requireSource(parsedInput.sourceId)
+    const cache = this.dependencies.schemaCache
+    if (parsedInput.cacheMode === undefined || cache === undefined) return this.readSchemaTableLive(record, parsedInput)
+    const context = this.createSchemaCacheContext(record)
+    if (context === undefined) return this.readSchemaTableLive(record, parsedInput)
+    const scope: ServerOpsDataSchemaCacheScope = {
+      kind: 'table', sourceId: record.id, database: parsedInput.database, table: parsedInput.table,
+    }
+    if (parsedInput.cacheMode === 'refresh') {
+      this.invalidateSchemaCache({ sourceId: record.id, database: parsedInput.database, table: parsedInput.table })
+    }
+    const lookup = this.readSchemaCache(scope, context.identity)
+    if (lookup === undefined) return this.readSchemaTableLive(record, parsedInput, context.connection)
+    if (parsedInput.cacheMode === 'prefer-cache' && lookup.value !== undefined) {
+      this.assertSchemaCacheContextCurrent(context)
+      return parseServerOpsDataSourceTableResult(lookup.value)
+    }
+    return this.coalesceSchemaCacheRead(scope, context.identity, lookup.revision, async () => {
+      const result = await this.readSchemaTableLive(record, parsedInput, context.connection)
+      this.assertSchemaCacheContextCurrent(context)
+      this.writeSchemaCache(scope, context.identity, result, lookup.revision)
+      return result
     })
+  }
+
+  /** 执行一次实时单表结构读取。 */
+  private async readSchemaTableLive(
+    record: ServerOpsStoredDataSource,
+    input: Pick<ServerOpsDataSourceTableInput, 'database' | 'table'>,
+    expectedConnection?: ServerOpsActiveConnectionIdentity | null,
+  ): Promise<ServerOpsDataSourceTableResult> {
+    const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
+    const { result } = await this.runReadTarget(
+      'schema-table', record, password, `${record.id}:schema-table`, { database: input.database, table: input.table },
+      undefined, undefined, undefined, undefined, expectedConnection ?? undefined,
+    )
     if (!isSchemaTableResult(result) || result.capability !== 'available') {
       throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: ${readSchemaWarning(result)}`)
     }
@@ -492,6 +583,124 @@ export class ServerOpsDataService {
   dispose(): void {
     this.disposed = true
     this.activeReads.clear()
+    this.activeSchemaCacheReads.clear()
+  }
+
+  /** 构造不含明文秘密的完整缓存身份；无法证明密文版本时禁用缓存。 */
+  private createSchemaCacheContext(record: ServerOpsStoredDataSource): ServerOpsDataSchemaCacheContext | undefined {
+    /** 没有凭据用 null 明确参与身份；有凭据则必须能取得当前密文版本。 */
+    let credentialVersion: string | null
+    if (record.credentialRef === undefined) {
+      credentialVersion = null
+    } else {
+      const resolvedVersion = this.dependencies.credentials.getSecretVersion?.(record.credentialRef)
+      if (resolvedVersion === undefined) return undefined
+      credentialVersion = resolvedVersion
+    }
+    const connection = record.transport === 'ssh'
+      ? this.dependencies.connection.getActiveIdentity(record.hostId ?? '')
+      : null
+    const identity = createHash('sha256').update(JSON.stringify({
+      source: {
+        id: record.id,
+        transport: record.transport,
+        hostId: record.hostId ?? null,
+        engine: record.engine,
+        address: record.address,
+        port: record.port,
+        database: record.database ?? null,
+        username: record.username ?? null,
+        tlsMode: record.tlsMode,
+        tlsServerName: record.tlsServerName ?? null,
+        credentialVersion,
+      },
+      connection: connection === null ? null : {
+        hostId: connection.hostId,
+        connectionId: connection.connectionId,
+        generation: connection.generation,
+      },
+    })).digest('hex')
+    return { source: { ...record }, credentialVersion, connection, identity }
+  }
+
+  /** 返回前重新核对数据源、密文版本与 SSH 活跃连接代次。 */
+  private assertSchemaCacheContextCurrent(expected: ServerOpsDataSchemaCacheContext): void {
+    this.assertUsable()
+    const current = this.requireSource(expected.source.id)
+    if (!sameDataReadIdentity(expected.source, current)) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+    const currentCredentialVersion = current.credentialRef === undefined
+      ? null
+      : this.dependencies.credentials.getSecretVersion?.(current.credentialRef)
+    if (currentCredentialVersion !== expected.credentialVersion) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+    if (expected.connection === null) return
+    let currentConnection: ServerOpsActiveConnectionIdentity
+    try {
+      currentConnection = this.dependencies.connection.getActiveIdentity(expected.connection.hostId)
+    } catch {
+      throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+    }
+    if (currentConnection.connectionId !== expected.connection.connectionId
+      || currentConnection.generation !== expected.connection.generation) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+  }
+
+  /** 缓存读取失败降级为 miss，避免派生数据阻断实时读取。 */
+  private readSchemaCache(
+    scope: ServerOpsDataSchemaCacheScope,
+    identity: string,
+  ): { revision: number; value?: ServerOpsDataSchemaCacheValue } | undefined {
+    if (this.schemaCacheDisabled) return undefined
+    try {
+      return this.dependencies.schemaCache?.lookup(scope, identity)
+    } catch {
+      this.schemaCacheDisabled = true
+      return undefined
+    }
+  }
+
+  /** 缓存写入失败只丢缓存，不改变已经成功的实时读取。 */
+  private writeSchemaCache(
+    scope: ServerOpsDataSchemaCacheScope,
+    identity: string,
+    value: ServerOpsDataSchemaCacheValue,
+    expectedRevision: number,
+  ): void {
+    if (this.schemaCacheDisabled) return
+    try {
+      this.dependencies.schemaCache?.setIfRevision(scope, identity, value, expectedRevision)
+    } catch {
+      /** 原文件可能仍含旧值，服务重建前禁用本实例缓存。 */
+      this.schemaCacheDisabled = true
+    }
+  }
+
+  /** 缓存失效失败同样降级；后续完整身份仍会阻止旧缓存串用。 */
+  private invalidateSchemaCache(scope: { sourceId: string; database?: string; table?: string }): void {
+    try {
+      this.dependencies.schemaCache?.invalidate(scope)
+    } catch {
+      /** 失效未提交时旧字段仍可能在磁盘，本实例余下生命周期必须绕过缓存。 */
+      this.schemaCacheDisabled = true
+    }
+  }
+
+  /** 合并同一完整身份与范围的 opt-in 实时读取。 */
+  private coalesceSchemaCacheRead<T extends ServerOpsDataSchemaCacheValue>(
+    scope: ServerOpsDataSchemaCacheScope,
+    identity: string,
+    revision: number,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    const key = JSON.stringify([
+      scope.kind, scope.sourceId, scope.database ?? null, scope.kind === 'table' ? scope.table : null, identity, revision,
+    ])
+    const existing = this.activeSchemaCacheReads.get(key)
+    if (existing !== undefined) return existing as Promise<T>
+    const pending = read()
+    this.activeSchemaCacheReads.set(key, pending)
+    void pending.finally(() => {
+      if (this.activeSchemaCacheReads.get(key) === pending) this.activeSchemaCacheReads.delete(key)
+    }).catch(() => undefined)
+    return pending
   }
 
   /** 读取数据源内部记录，缺失时抛出稳定错误码。 */
@@ -612,6 +821,14 @@ export class ServerOpsDataService {
     if (isServerOpsPlaintextDirectAddress(target.address)) return
     throw new Error('SERVER_OPS_DATA_TLS_REQUIRED')
   }
+}
+
+/** 一次 opt-in 缓存读取固定的完整安全身份。 */
+interface ServerOpsDataSchemaCacheContext {
+  source: ServerOpsStoredDataSource
+  credentialVersion: string | null
+  connection: ServerOpsActiveConnectionIdentity | null
+  identity: string
 }
 
 /** 一次只读读取所需的连接目标字段；已保存记录与未保存草稿都满足它。 */

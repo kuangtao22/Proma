@@ -1,6 +1,8 @@
 import { Buffer } from 'node:buffer'
 import {
   analyzeServerOpsSqlQuery,
+  getServerOpsSqlDiagnostic,
+  isServerOpsSqlParserError,
   isServerOpsSqlSensitiveColumn,
   limitServerOpsSqlQuery,
   parseServerOpsDataQueryResult,
@@ -15,6 +17,104 @@ const MAX_QUERY_CELL_LENGTH = 256
 const MAX_QUERY_FIELD_BYTES = MAX_QUERY_CELL_LENGTH * 4
 /** 单次查询最多公开的字段数。 */
 const MAX_QUERY_COLUMNS = 64
+
+/** 可跨 utility 边界公开的查询运行时错误与安全说明。 */
+const QUERY_PUBLIC_ERROR_MESSAGES = new Map<string, string>([
+  ['SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN', '查询包含不允许直接读取的敏感列'],
+  ['SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE', '查询引用的表不存在、不可见或不是基础表'],
+  ['SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE', '查询引用的列不存在或不可见'],
+  ['SERVER_OPS_DATA_QUERY_TOO_MANY_COLUMNS', '查询结果字段超过限制'],
+  ['SERVER_OPS_DATA_QUERY_COLUMN_TOO_LARGE', '查询字段内容超过读取限制'],
+  ['SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED', '当前数据库版本不支持受控 SQL 查询'],
+  ['SERVER_OPS_DATA_QUERY_SQL_INVALID', '数据库拒绝了 SQL 语法'],
+  ['SERVER_OPS_DATA_QUERY_PERMISSION_DENIED', '数据库账号没有执行该查询的权限'],
+  ['SERVER_OPS_DATA_QUERY_TIMEOUT', 'SQL 查询超时'],
+  ['SERVER_OPS_DATA_QUERY_FAILED', 'SQL 查询失败，请检查语句与读取权限'],
+])
+
+/** 表不存在或不可用的 MySQL 驱动错误码。 */
+const QUERY_TABLE_ERROR_CODES = new Set(['ER_NO_SUCH_TABLE', 'ER_BAD_TABLE_ERROR', 'ER_UNKNOWN_TABLE'])
+/** 字段不存在或不可见的 MySQL 驱动错误码。 */
+const QUERY_COLUMN_ERROR_CODES = new Set(['ER_BAD_FIELD_ERROR'])
+/** 服务端 SQL 解析失败的 MySQL 驱动错误码。 */
+const QUERY_SYNTAX_ERROR_CODES = new Set(['ER_PARSE_ERROR', 'ER_SYNTAX_ERROR'])
+/** 已连接会话执行查询时的权限错误码。 */
+const QUERY_PERMISSION_ERROR_CODES = new Set([
+  'ER_ACCESS_DENIED_ERROR',
+  'ER_ACCESS_DENIED_NO_PASSWORD_ERROR',
+  'ER_DBACCESS_DENIED_ERROR',
+  'ER_TABLEACCESS_DENIED_ERROR',
+  'ER_COLUMNACCESS_DENIED_ERROR',
+  'ER_SPECIFIC_ACCESS_DENIED_ERROR',
+  'ER_HOST_NOT_PRIVILEGED',
+])
+/** 查询阶段可能出现的 Node/mysql2 超时错误码。 */
+const QUERY_TIMEOUT_ERROR_CODES = new Set([
+  'ETIMEDOUT',
+  'ETIMEOUT',
+  'PROTOCOL_SEQUENCE_TIMEOUT',
+  'CONNECT_TIMEOUT',
+  'ER_QUERY_TIMEOUT',
+  'ER_STATEMENT_TIMEOUT',
+])
+
+/** 可安全跨进程展示的 SQL 查询错误。 */
+export interface ServerOpsSqlQueryPublicError {
+  code: string
+  message: string
+}
+
+/**
+ * 从已经收口的查询异常中读取公开稳定码与安全说明。
+ *
+ * @param error 查询执行器抛出的异常
+ * @returns 白名单命中时返回公开错误，否则返回 undefined
+ */
+export function getServerOpsSqlQueryPublicError(error: unknown): ServerOpsSqlQueryPublicError | undefined {
+  if (!(error instanceof Error)) return undefined
+  const queryMessage = QUERY_PUBLIC_ERROR_MESSAGES.get(error.message)
+  if (queryMessage !== undefined) return { code: error.message, message: queryMessage }
+  if (!isServerOpsSqlParserError(error)) return undefined
+  const diagnostic = getServerOpsSqlDiagnostic(error.code)
+  return diagnostic === null ? undefined : { code: error.code, message: diagnostic.message }
+}
+
+/** 读取 mysql2 的稳定 code/errno；不读取可能包含 SQL 或连接信息的 message。 */
+function readQueryDriverErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const record = error as { code?: unknown; errno?: unknown }
+  if (typeof record.code === 'string' && record.code.length > 0) return record.code
+  if (typeof record.errno === 'number' && Number.isSafeInteger(record.errno)) return `ERRNO_${record.errno}`
+  return undefined
+}
+
+/** 把任意查询阶段的异常收口为不含原始正文的稳定码。 */
+export function normalizeServerOpsSqlQueryError(error: unknown): Error {
+  if (isServerOpsSqlParserError(error)) return error
+  if (error instanceof Error) {
+    if (error.message === 'SERVER_OPS_DATA_CANCELLED' || error.message === 'SERVER_OPS_DATA_UNEXPECTED_RESULT') return error
+    if (QUERY_PUBLIC_ERROR_MESSAGES.has(error.message)) return error
+  }
+  const code = readQueryDriverErrorCode(error)
+  if (code !== undefined) {
+    if (QUERY_TABLE_ERROR_CODES.has(code) || code === 'ERRNO_1146' || code === 'ERRNO_1051' || code === 'ERRNO_1109') {
+      return new Error('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
+    }
+    if (QUERY_COLUMN_ERROR_CODES.has(code) || code === 'ERRNO_1054') {
+      return new Error('SERVER_OPS_DATA_QUERY_COLUMN_UNAVAILABLE')
+    }
+    if (QUERY_SYNTAX_ERROR_CODES.has(code) || code === 'ERRNO_1064' || code === 'ERRNO_1149') {
+      return new Error('SERVER_OPS_DATA_QUERY_SQL_INVALID')
+    }
+    if (QUERY_PERMISSION_ERROR_CODES.has(code) || ['ERRNO_1044', 'ERRNO_1045', 'ERRNO_1142', 'ERRNO_1143', 'ERRNO_1227'].includes(code)) {
+      return new Error('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')
+    }
+    if (QUERY_TIMEOUT_ERROR_CODES.has(code) || code === 'ERRNO_3024' || code === 'ERRNO_1969') {
+      return new Error('SERVER_OPS_DATA_QUERY_TIMEOUT')
+    }
+  }
+  return new Error('SERVER_OPS_DATA_QUERY_FAILED')
+}
 
 /** mysql2 core Query 的事件窄接口；查询模式不能使用会缓存完整结果的 Promise query。 */
 export interface ServerOpsSqlQueryCommand {
@@ -389,24 +489,24 @@ export async function executeServerOpsSqlQuery(
   try {
     plan = analyzeServerOpsSqlQuery(input.sql, input.database)
   } catch (error) {
-    if (error instanceof Error && error.message === 'SERVER_OPS_SQL_SENSITIVE_COLUMN') {
+    if (isServerOpsSqlParserError(error) && error.code === 'SERVER_OPS_SQL_SENSITIVE_COLUMN') {
       throw new Error('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN')
     }
+    if (isServerOpsSqlParserError(error)) throw error
     throw new Error('SERVER_OPS_DATA_QUERY_SQL_INVALID')
   }
   /** 语法与显式敏感列判定必须早于第一次数据库调用。 */
   for (const column of plan.columns) {
     if (isServerOpsSqlSensitiveColumn(column.column)) throw new Error('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN')
   }
-  const timeoutDialect = await readQueryTimeoutDialect(connection, signal)
-  const columnsByTable = await validateBaseTables(connection, input.database, plan.tables, !plan.hasWildcard, signal)
-  if (!plan.hasWildcard) validateExplicitColumns(plan.columns, columnsByTable)
-  throwIfAborted(signal)
-
   /** 事务开始后无论查询成功、失败或取消都尝试回滚。 */
   let transactionStarted = false
-  const startedAt = Date.now()
   try {
+    const timeoutDialect = await readQueryTimeoutDialect(connection, signal)
+    const columnsByTable = await validateBaseTables(connection, input.database, plan.tables, !plan.hasWildcard, signal)
+    if (!plan.hasWildcard) validateExplicitColumns(plan.columns, columnsByTable)
+    throwIfAborted(signal)
+    const startedAt = Date.now()
     await queryWithAbort(connection, 'SET SESSION TRANSACTION READ ONLY', undefined, signal)
     throwIfAborted(signal)
     await queryWithAbort(connection, timeoutDialect === 'mysql'
@@ -429,10 +529,7 @@ export async function executeServerOpsSqlQuery(
       warnings,
     }, queryResult.rows, queryResult.truncated || queryResult.cellTruncated)
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith('SERVER_OPS_DATA_QUERY_')) throw error
-    if (error instanceof Error && error.message === 'SERVER_OPS_DATA_CANCELLED') throw error
-    if (error instanceof Error && error.message === 'SERVER_OPS_DATA_UNEXPECTED_RESULT') throw error
-    throw new Error('SERVER_OPS_DATA_QUERY_FAILED')
+    throw normalizeServerOpsSqlQueryError(error)
   } finally {
     if (transactionStarted && !signal?.aborted) {
       try { await queryWithAbort(connection, 'ROLLBACK', undefined, signal) } catch { /* 独占连接随后销毁，回滚失败不覆盖原错误。 */ }

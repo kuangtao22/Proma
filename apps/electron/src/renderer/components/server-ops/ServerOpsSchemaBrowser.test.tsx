@@ -66,6 +66,42 @@ async function flush(): Promise<void> {
 }
 
 describe('数据连接表浏览', () => {
+  test('Given 目录刷新在途 When 切到结构页并收到旧字段 Then 丢弃旧结果并强制刷新结构', async () => {
+    /** 控制目录和字段回执顺序，复现两个页签读取交错。 */
+    const catalog = createDeferred<{ databases: string[]; database: string; tables: { name: string }[] }>()
+    const stale = createDeferred<{ columns: { name: string; type: string; nullable: boolean; primaryKey: boolean }[]; indexes: [] }>()
+    const modes: string[] = []
+    let catalogs = 0
+    const base = createApi()
+    const { controller, projections } = createHarness(createApi({
+      listServerOpsDataSchemaTables: async (input) => ++catalogs === 1 ? base.listServerOpsDataSchemaTables(input) : catalog.promise,
+      describeServerOpsDataSchemaTable: async (input) => {
+        modes.push(input.cacheMode ?? 'live')
+        return input.cacheMode === 'refresh' ? base.describeServerOpsDataSchemaTable(input) : stale.promise
+      },
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql', database: 'app' }); await flush()
+    controller.openTable('users'); await flush(); controller.refreshTables(); controller.setDetailTab('structure'); await flush()
+    catalog.resolve({ database: 'app', databases: ['app'], tables: [{ name: 'users' }] }); await flush()
+    stale.resolve({ columns: [{ name: 'stale', type: 'int', nullable: true, primaryKey: false }], indexes: [] }); await flush()
+    expect(modes).toEqual(['prefer-cache', 'refresh'])
+    expect(projections.some((projection) => projection.structure.columns.some((column) => column.name === 'stale'))).toBe(false)
+    expect(controller.getProjection().structure.columns[0]?.name).toBe('id')
+  })
+  test('Given 缓存浏览 When 手动刷新目录或结构 Then 绕过缓存且数据行保持实时', async () => {
+    /** 按操作记录缓存策略，避免刷新按钮误读旧结构。 */
+    const calls: string[] = []
+    const base = createApi()
+    const { controller } = createHarness(createApi({
+      listServerOpsDataSchemaTables: async (input) => { calls.push(`tables:${input.cacheMode}`); return base.listServerOpsDataSchemaTables(input) },
+      describeServerOpsDataSchemaTable: async (input) => { calls.push(`structure:${input.cacheMode}`); return base.describeServerOpsDataSchemaTable(input) },
+      readServerOpsDataSchemaRows: async (input) => { expect(Object.hasOwn(input, 'cacheMode')).toBe(false); return base.readServerOpsDataSchemaRows(input) },
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql', database: 'app' }); await flush()
+    controller.openTable('users'); await flush(); controller.setDetailTab('structure'); await flush()
+    controller.refresh(); await flush(); controller.refreshTables(); await flush()
+    expect(calls.slice(0, 4)).toEqual(['tables:prefer-cache', 'structure:prefer-cache', 'structure:refresh', 'tables:refresh'])
+  })
   test('Given MySQL 连接 When 绑定 Then 自动读取库与表清单', async () => {
     const { controller } = createHarness(createApi())
     controller.setSource({ id: 'source-1', engine: 'mysql', database: 'app' })

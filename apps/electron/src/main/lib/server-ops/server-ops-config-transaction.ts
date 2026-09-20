@@ -11,6 +11,7 @@ export type ServerOpsConfigFileName =
   | 'data-sources.json'
   | 'data-source-credentials.json'
   | 'query-history.json'
+  | 'schema-cache.json'
   | 'projects.json'
 
 /** 配置事务向上层暴露的稳定错误码。 */
@@ -106,6 +107,8 @@ const CONFIG_FILES: ReadonlySet<string> = new Set<ServerOpsConfigFileName>([
   'data-source-credentials.json',
   // SQL 查询历史与数据源元数据共用锁，防止多窗口或多实例 fresh-read 后相互覆盖。
   'query-history.json',
+  // schema 缓存是可丢弃派生数据，但协作实例仍须通过同一短事务避免相互覆盖。
+  'schema-cache.json',
   // 运维项目是主机与数据源的归属边界，必须与它们共用同一把跨进程写锁。
   'projects.json',
 ])

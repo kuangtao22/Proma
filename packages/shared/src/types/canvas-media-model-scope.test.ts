@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { applyCanvasMutations, createEmptyCanvasDocument, parseCanvasWorkspaceSnapshot } from './canvas'
+import type { ImageGenerationPublicCatalog } from './image-generation'
 import {
   buildCanvasGenerationModelId,
   buildCanvasGenerationModelOptions,
@@ -12,21 +13,21 @@ import {
 
 describe('独立生成配置的画布候选投影', () => {
   /** 目录含一条已接执行器的 OpenAI 配置与一条未接执行器的即梦配置。 */
-  const catalog = {
-    schemaVersion: 1 as const,
+  const catalog: ImageGenerationPublicCatalog = {
+    schemaVersion: 1,
     revision: 1,
     profiles: [
       {
         id: 'image-openai', name: '我的 ChatGPT', provider: 'openai-images' as const,
         baseUrl: 'https://api.openai.com/v1',
-        models: [{ id: 'gpt-image-1', name: 'GPT Image 1', capabilities: ['text-to-image', 'image-to-image'] as const }],
+        models: [{ id: 'gpt-image-1', name: 'GPT Image 1', capabilities: ['text-to-image', 'image-to-image'] }],
         enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
       },
       {
         id: 'image-jimeng', name: '即梦', provider: 'dreamina' as const,
         models: [
-          { id: '5.0', name: '即梦 5.0', capabilities: ['text-to-image'] as const },
-          { id: 'seedance2.5', name: 'Seedance 2.5', capabilities: ['text-to-video', 'image-to-video'] as const },
+          { id: '5.0', name: '即梦 5.0', capabilities: ['text-to-image'] },
+          { id: 'seedance2.5', name: 'Seedance 2.5', capabilities: ['text-to-video', 'image-to-video'] },
         ],
         enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
       },
@@ -34,8 +35,8 @@ describe('独立生成配置的画布候选投影', () => {
         id: 'image-minimax', name: 'MiniMax 图像', provider: 'minimax' as const,
         baseUrl: 'https://api.minimax.cn/v1',
         models: [
-          { id: 'image-01', name: 'Image 01', capabilities: ['text-to-image', 'image-to-image'] as const },
-          { id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3', capabilities: ['text-to-video'] as const },
+          { id: 'image-01', name: 'Image 01', capabilities: ['text-to-image', 'image-to-image'] },
+          { id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3', capabilities: ['text-to-video'] },
         ],
         enabled: true, createdAt: 1, updatedAt: 1, credentialConfigured: true,
       },

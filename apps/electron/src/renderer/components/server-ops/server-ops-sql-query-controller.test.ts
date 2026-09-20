@@ -16,6 +16,40 @@ function result(queryId: string, database = 'app'): ServerOpsDataQueryResult {
 }
 
 describe('SQL 查询控制器', () => {
+  test('Given 选库器已切换但控制器 effect 尚未同步 When 按新上下文执行 Then 不会查询旧库', async () => {
+    /** 模拟 React 新 props 已渲染、passive effect 尚未调用 setContext 的窗口。 */
+    const current = { sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }
+    const calls: ServerOpsDataQueryInput[] = []
+    const controller = createServerOpsSqlQueryController({
+      api: { query: async (input) => { calls.push(input); return result(input.queryId, input.database) }, cancel: async () => undefined }, publish: () => undefined,
+    })
+    controller.activate(); controller.setContext(current); controller.setDraft('SELECT id FROM users')
+    for (const expected of [{ ...current, database: 'archive' }, { ...current, sourceId: 'source-2' }, { ...current, configurationKey: 'v2' }, { ...current, available: false }]) {
+      await controller.execute(expected)
+    }
+    expect(calls).toEqual([])
+    controller.setContext({ ...current, database: 'archive' })
+    await controller.execute({ ...current, database: 'archive' })
+    expect(calls.map((call) => call.database)).toEqual(['archive'])
+  })
+  test('Given 防抖尚未校验的最新错误草稿 When 立即执行 Then 本地拒绝且不调用查询和历史', async () => {
+    /** 两项计数验证本地拒绝不产生外部行为。 */
+    let queries = 0
+    let histories = 0
+    const controller = createServerOpsSqlQueryController({
+      api: { query: async (input) => { queries += 1; return result(input.queryId) }, cancel: async () => undefined },
+      publish: () => undefined, onExecuted: () => { histories += 1 },
+    })
+    controller.activate()
+    controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true })
+    controller.setDraft('SELECT id FROM users')
+    controller.setDraft('SELECT * WHERE users')
+    await controller.execute()
+    expect(queries).toBe(0)
+    expect(histories).toBe(0)
+    expect(controller.snapshot().error).toContain('FROM')
+    expect(controller.snapshot().activeQueryId).toBeNull()
+  })
   test('Given 查询在途仍继续编辑并切库 When 原查询结束 Then 历史通知保留原执行快照且只发一次', async () => {
     /** 受控回执用于在查询完成前改变编辑器与当前数据库。 */
     const query = deferred<ServerOpsDataQueryResult>()
@@ -59,8 +93,27 @@ describe('SQL 查询控制器', () => {
     expect(controller.snapshot()).toMatchObject({ status: 'error', error: 'SQL 查询失败，请稍后重试' })
   })
 
+  test('Given 查询前审计失败 When IPC 包裹错误 Then 明确尚未执行和对应处理方式', () => {
+    /** Electron 会为稳定错误码添加通道上下文，提示仍须准确分类。 */
+    const cases = [
+      ['SERVER_OPS_OTHER_INSTANCE_ACTIVE', '审计记录需要初始化或升级，请先退出其他 Proma 实例后重试；SQL 尚未执行'],
+      ['SERVER_OPS_TRUST_BUSY', '运维配置正在准备，请稍后重试；SQL 尚未执行'],
+      ['SERVER_OPS_CONFIG_BUSY', '运维配置正在写入，请稍后重试；SQL 尚未执行'],
+      ['SERVER_OPS_CONFIG_LOCK_UNAVAILABLE', '运维配置写锁不可用，请重启或更新 Proma 后重试；SQL 尚未执行'],
+      ['SERVER_OPS_CONFIG_OUTCOME_UNKNOWN', '审计写入状态无法确认，请稍后重试，若持续失败再重启 Proma；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_READ_FAILED', '本地审计记录无法读取，需要检查审计文件；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED', '本地审计记录尚未准备完成，请重启 Proma 后重试；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_WRITE_FAILED', '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 Proma；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_START_WRITE_FAILED', '无法记录查询审计，请检查本地运维配置后重试；SQL 尚未执行'],
+    ] as const
+    for (const [code, message] of cases) {
+      expect(getServerOpsSqlQueryErrorMessage(new Error(`Error invoking remote method: Error: ${code}`))).toBe(message)
+    }
+  })
   test('Given 稳定错误码或驱动正文 When 映射 Then 只显示可操作中文且未知信息不透传', () => {
-    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_SQL_INVALID'))).toBe('SQL 语法或查询范围不受支持，请调整后重试')
+    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_SQL_INVALID'))).toBe('数据库未通过 SQL 语法检查，请检查语句和数据库版本')
+    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED'))).toBe('数据库认证失败或账号权限不足')
+    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_TIMEOUT'))).toBe('查询超时，请缩小扫描范围后重试')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN'))).toBe('查询包含敏感字段，无法执行')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_SQL_SENSITIVE_COLUMN'))).toBe('查询包含敏感字段，无法执行')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE'))).toBe('查询中的表不存在、不可见或不是基础表')
@@ -148,7 +201,7 @@ describe('SQL 查询控制器', () => {
       publish: () => undefined,
       createQueryId: () => 'query-1',
     })
-    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT 1')
+    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT id FROM users')
     void controller.execute(); await controller.cancel()
     expect(controller.snapshot()).toMatchObject({ status: 'running', activeQueryId: 'query-1', error: '取消查询失败，请稍后重试', canExecute: false })
     await controller.cancel()
@@ -160,10 +213,10 @@ describe('SQL 查询控制器', () => {
     const query = deferred<ServerOpsDataQueryResult>()
     const cancellation = deferred<void>()
     const controller = createServerOpsSqlQueryController({ api: { query: () => query.promise, cancel: () => cancellation.promise }, publish: () => undefined, createQueryId: () => 'query-1' })
-    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT 1')
+    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT id FROM users')
     const querying = controller.execute(); const cancelling = controller.cancel()
     query.resolve(result('query-1')); await querying
-    expect(controller.snapshot()).toMatchObject({ status: 'success', activeQueryId: null, execution: { sql: 'SELECT 1' } })
+    expect(controller.snapshot()).toMatchObject({ status: 'success', activeQueryId: null, execution: { sql: 'SELECT id FROM users' } })
     cancellation.resolve(); await cancelling
     expect(controller.snapshot()).toMatchObject({ status: 'success', execution: { result: { queryId: 'query-1' } } })
   })
@@ -173,7 +226,7 @@ describe('SQL 查询控制器', () => {
       const query = deferred<ServerOpsDataQueryResult>()
       const cancellation = deferred<void>()
       const controller = createServerOpsSqlQueryController({ api: { query: () => query.promise, cancel: () => cancellation.promise }, publish: () => undefined, createQueryId: () => 'query-1' })
-      controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT 1')
+      controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT id FROM users')
       const querying = controller.execute(); const cancelling = controller.cancel()
       query.reject(new Error(cancellationCode)); await querying
       expect(controller.snapshot()).toMatchObject({ status: 'idle', activeQueryId: null, error: null, canExecute: true })
@@ -186,7 +239,7 @@ describe('SQL 查询控制器', () => {
     const query = deferred<ServerOpsDataQueryResult>()
     const cancellation = deferred<void>()
     const controller = createServerOpsSqlQueryController({ api: { query: () => query.promise, cancel: () => cancellation.promise }, publish: () => undefined, createQueryId: () => 'query-1' })
-    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT 1')
+    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT id FROM users')
     const querying = controller.execute(); const cancelling = controller.cancel()
     query.reject(new Error('QUERY_FAILED')); await querying
     expect(controller.snapshot()).toMatchObject({ status: 'error', activeQueryId: null, error: 'SQL 查询失败，请稍后重试', canExecute: true })
@@ -199,7 +252,7 @@ describe('SQL 查询控制器', () => {
     const cancellation = deferred<void>()
     let queries = 0
     const controller = createServerOpsSqlQueryController({ api: { query: () => { queries += 1; return first.promise }, cancel: () => cancellation.promise }, publish: () => undefined, createQueryId: () => 'query-1' })
-    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT 1')
+    controller.activate(); controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }); controller.setDraft('SELECT id FROM users')
     void controller.execute()
     controller.setContext({ sourceId: 'source-1', database: 'archive', configurationKey: 'v1', available: true })
     expect(controller.snapshot()).toMatchObject({ status: 'cancelling', context: { database: 'archive' }, activeQueryId: 'query-1', canExecute: false })
@@ -233,7 +286,7 @@ describe('SQL 查询控制器', () => {
     let calls = 0
     const controller = createServerOpsSqlQueryController({ api: { query: async () => { calls += 1; return result('x') } }, publish: () => undefined })
     controller.activate()
-    controller.setDraft('SELECT 1')
+    controller.setDraft('SELECT id FROM users')
     await controller.execute()
     controller.setContext({ sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: false })
     await controller.execute()

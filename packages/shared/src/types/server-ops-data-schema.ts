@@ -53,6 +53,8 @@ export interface ServerOpsDataSourceTablesInput {
   sourceId: string
   /** 目标库；省略时使用数据源自身配置的库。 */
   database?: string
+  /** 仅显式请求才使用 schema 派生缓存；省略时保持实时读取。 */
+  cacheMode?: 'prefer-cache' | 'refresh'
 }
 
 /** 库与表清单结果；`databases` 供界面上的库选择器使用。 */
@@ -72,6 +74,8 @@ export interface ServerOpsDataSourceTableInput {
   sourceId: string
   database: string
   table: string
+  /** 仅显式请求才使用 schema 派生缓存；省略时保持实时读取。 */
+  cacheMode?: 'prefer-cache' | 'refresh'
 }
 
 /** 表结构结果。 */
@@ -134,27 +138,43 @@ function isBoundedInteger(value: unknown, maximum: number): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum
 }
 
+/** 判断未知值是否为允许的 schema 缓存模式。 */
+function isSchemaCacheMode(value: unknown): value is NonNullable<ServerOpsDataSourceTablesInput['cacheMode']> {
+  return value === 'prefer-cache' || value === 'refresh'
+}
+
 /** 解析表清单输入。 */
 export function parseServerOpsDataSourceTablesInput(value: unknown): ServerOpsDataSourceTablesInput {
   const errorCode = 'SERVER_OPS_DATA_SCHEMA_TABLES_INPUT_INVALID'
   if (!isRecord(value)) throw new Error(errorCode)
-  const keys = new Set(value.database === undefined ? ['sourceId'] : ['sourceId', 'database'])
+  const keys = new Set(['sourceId']
+    .concat(value.database === undefined ? [] : ['database'])
+    .concat(value.cacheMode === undefined ? [] : ['cacheMode']))
   if (!hasOnlyKeys(value, keys) || !isServerOpsId(value.sourceId)) throw new Error(errorCode)
   if (value.database !== undefined && !isNonEmptySchemaText(value.database, 64)) throw new Error(errorCode)
+  if (value.cacheMode !== undefined && !isSchemaCacheMode(value.cacheMode)) throw new Error(errorCode)
   return {
     sourceId: value.sourceId,
     ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.cacheMode === undefined ? {} : { cacheMode: value.cacheMode }),
   }
 }
 
 /** 解析单张表的标识输入（库 + 表）。 */
 export function parseServerOpsDataSourceTableInput(value: unknown): ServerOpsDataSourceTableInput {
   const errorCode = 'SERVER_OPS_DATA_SCHEMA_TABLE_INPUT_INVALID'
-  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table']))
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table']
+    .concat(value.cacheMode === undefined ? [] : ['cacheMode'])))
     || !isServerOpsId(value.sourceId)
     || !isNonEmptySchemaText(value.database, 64)
-    || !isNonEmptySchemaText(value.table, 128)) throw new Error(errorCode)
-  return { sourceId: value.sourceId, database: value.database, table: value.table }
+    || !isNonEmptySchemaText(value.table, 128)
+    || (value.cacheMode !== undefined && !isSchemaCacheMode(value.cacheMode))) throw new Error(errorCode)
+  return {
+    sourceId: value.sourceId,
+    database: value.database,
+    table: value.table,
+    ...(value.cacheMode === undefined ? {} : { cacheMode: value.cacheMode }),
+  }
 }
 
 /** 解析表数据预览输入；分页偏移必须是页大小的整数倍。 */

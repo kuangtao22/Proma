@@ -318,6 +318,10 @@ describe('数据服务 runtime 解析与指标构造', () => {
             callback(undefined, { code: 1_049, message: 'Unknown database' })
             return
           }
+          if (database === 'denied_app') {
+            callback(undefined, { code: 1_044, message: 'Private access details' })
+            return
+          }
           callback()
         },
       })
@@ -346,12 +350,21 @@ describe('数据服务 runtime 解析与指标构造', () => {
       }, createChannel)
       expect(diagnosticsResult).toMatchObject({ capability: 'available', parameters: [{ name: 'autocommit', value: 'ON' }] })
 
+      /** SQL 查询的权限错误可能发生在 execute 调用前的握手阶段，也必须使用同一稳定分类。 */
+      const queryCountBeforeDeniedHandshake = queries.length
+      await expect(runServerOpsDataRead({
+        mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: address.port,
+        database: 'denied_app', username: 'reader', tlsMode: 'disabled',
+        queryId: 'query-denied-handshake', sql: 'SELECT id FROM users', maxRows: 2,
+      }, createChannel)).rejects.toThrow('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')
+      expect(queries).toHaveLength(queryCountBeforeDeniedHandshake)
+
       const probeResult = await runServerOpsDataRead({
         mode: 'probe', engine: 'mysql', address: '127.0.0.1', port: address.port,
         database: 'deleted_default', tlsMode: 'disabled',
       }, createChannel)
       expect(probeResult.capability).toBe('unreachable')
-      expect(handshakeDatabases).toEqual(['', '', 'deleted_default'])
+      expect(handshakeDatabases).toEqual(['', '', 'denied_app', 'deleted_default'])
       expect(queries.filter((sql) => sql.includes('information_schema.SCHEMATA'))).toHaveLength(1)
       expect(queries).toContain('SHOW GLOBAL VARIABLES')
     } finally {
@@ -361,6 +374,8 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 真实 mysql2 core 查询 When 成功与取消 Then 握手库、流事件和 socket 销毁均生效', async () => {
     const handshakeDatabases: string[] = []
+    /** 服务端真实收到的 SQL，用于证明 parser 拒绝早于第一次查询。 */
+    const serverQueries: string[] = []
     const fixtureStreams = new Set<Duplex>()
     let connectionOrdinal = 0
     let resolveBlockedQuery!: () => void
@@ -383,6 +398,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
         if (currentOrdinal === 4) resolveProductionSocketClosed()
       })
       connection.on('query', (sql) => {
+        serverQueries.push(sql)
         if (sql === 'SELECT id FROM users' && currentOrdinal === 1) {
           writeMySqlFixtureResult(connection, ['id'], [[1], [2]])
           return
@@ -501,6 +517,16 @@ describe('数据服务 runtime 解析与指标构造', () => {
       await expect(cancelledProduction).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
       await productionSocketClosed
       expect(handshakeDatabases).toEqual(['app', 'app', 'app', 'app'])
+
+      /** parser 拒绝必须穿过 data runtime 保留具体稳定码，且不会向数据库发送首条查询。 */
+      const queriesBeforeInvalidSql = serverQueries.length
+      await expect(runServerOpsDataRead({
+        ...productionInput,
+        queryId: 'query-production-invalid',
+        sql: 'DELETE FROM users',
+      }, createChannel)).rejects.toThrow('SERVER_OPS_SQL_EXPECTED_SELECT')
+      expect(serverQueries).toHaveLength(queriesBeforeInvalidSql)
+      expect(handshakeDatabases.at(-1)).toBe('app')
     } finally {
       for (const stream of fixtureStreams) stream.destroy()
       await closeMySqlFixture(server)

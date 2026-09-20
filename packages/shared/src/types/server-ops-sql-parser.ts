@@ -4,6 +4,20 @@ export interface ServerOpsSqlColumnReference {
   column: string
   /** 仅 GROUP BY/HAVING/ORDER BY 可引用的已声明输出别名，不是必须存在的物理列。 */
   outputAlias?: boolean
+  /** 经已验证表名或别名解析出的真实基础表；输出别名不设置此字段。 */
+  sourceTable?: string
+  /** 源 SQL 中列标识符的 UTF-16 起止位置，适配 CodeMirror 文档坐标。 */
+  from: number
+  to: number
+}
+
+/** 查询中基础表及其别名的源位置。 */
+export interface ServerOpsSqlTableReference {
+  table: string
+  alias?: string
+  /** 源 SQL 中基础表标识符的 UTF-16 起止位置。 */
+  from: number
+  to: number
 }
 
 /** 经完整解析和规范重建后的只读查询计划。 */
@@ -12,8 +26,19 @@ export interface ServerOpsSqlQueryPlan {
   /** 供审计哈希的结构化语句；所有常量均已替换为 `?`。 */
   fingerprint: string
   tables: string[]
+  tableReferences: ServerOpsSqlTableReference[]
   columns: ServerOpsSqlColumnReference[]
   hasWildcard: boolean
+}
+
+/** 本地 SQL 校验返回的安全诊断，不包含 SQL 正文或字面值。 */
+export interface ServerOpsSqlDiagnostic {
+  code: string
+  category: 'syntax' | 'unsupported' | 'policy'
+  message: string
+  /** CodeMirror 使用的 UTF-16 文档位置。 */
+  from: number
+  to: number
 }
 
 type TokenKind = 'word' | 'quoted-identifier' | 'number' | 'string' | 'operator' | 'punctuation' | 'eof'
@@ -22,6 +47,9 @@ type TokenKind = 'word' | 'quoted-identifier' | 'number' | 'string' | 'operator'
 interface Token {
   kind: TokenKind
   value: string
+  /** UTF-16 源位置，不保留原 SQL 正文。 */
+  from: number
+  to: number
 }
 
 interface ColumnExpression {
@@ -112,6 +140,10 @@ interface TableReference {
   database?: string
   table: string
   alias?: string
+  from: number
+  to: number
+  aliasFrom?: number
+  aliasTo?: number
 }
 
 interface JoinClause {
@@ -189,9 +221,73 @@ const SYSTEM_SCHEMAS = new Set(['information_schema', 'mysql', 'performance_sche
 /** 公开 plan 与已验证 AST 的进程内关联。 */
 const statementByPlan = new WeakMap<ServerOpsSqlQueryPlan, SelectStatement>()
 
+export interface ServerOpsSqlDiagnosticDescriptor {
+  category: ServerOpsSqlDiagnostic['category']
+  message: string
+}
+
+/** 所有允许跨进程识别的解析错误及固定中文说明。 */
+const SQL_DIAGNOSTICS: Readonly<Record<string, ServerOpsSqlDiagnosticDescriptor>> = {
+  SERVER_OPS_SQL_TOO_LARGE: { category: 'policy', message: 'SQL 长度超过安全上限' },
+  SERVER_OPS_SQL_TOO_COMPLEX: { category: 'policy', message: 'SQL 结构超过安全复杂度上限' },
+  SERVER_OPS_SQL_COMMENTS_UNSUPPORTED: { category: 'unsupported', message: '暂不支持 SQL 注释' },
+  SERVER_OPS_SQL_VARIABLE_UNSUPPORTED: { category: 'unsupported', message: '暂不支持 SQL 变量' },
+  SERVER_OPS_SQL_STRING_MODE_UNSAFE: { category: 'policy', message: '当前字符串写法无法安全解析' },
+  SERVER_OPS_SQL_INVALID_IDENTIFIER: { category: 'syntax', message: '标识符格式不正确' },
+  SERVER_OPS_SQL_UNCLOSED_IDENTIFIER: { category: 'syntax', message: '反引号标识符未闭合' },
+  SERVER_OPS_SQL_INVALID_LITERAL: { category: 'syntax', message: 'SQL 字面值格式不正确' },
+  SERVER_OPS_SQL_UNCLOSED_STRING: { category: 'syntax', message: '字符串未闭合' },
+  SERVER_OPS_SQL_INVALID: { category: 'syntax', message: 'SQL 语法不完整或格式不正确' },
+  SERVER_OPS_SQL_EXPECTED_SELECT: { category: 'syntax', message: '查询必须以 SELECT 开始' },
+  SERVER_OPS_SQL_MISSING_FROM: { category: 'syntax', message: 'SELECT 查询缺少 FROM 表来源' },
+  SERVER_OPS_SQL_FROM_REQUIRED: { category: 'unsupported', message: '当前查询必须通过 FROM 指定数据表' },
+  SERVER_OPS_SQL_MISSING_TABLE: { category: 'syntax', message: 'FROM 后缺少表名' },
+  SERVER_OPS_SQL_EXPECTED_EXPRESSION: { category: 'syntax', message: '此处需要完整表达式' },
+  SERVER_OPS_SQL_UNCLOSED_PAREN: { category: 'syntax', message: '括号未闭合' },
+  SERVER_OPS_SQL_MULTIPLE_STATEMENTS: { category: 'unsupported', message: '每次只能校验和执行一条 SELECT 查询' },
+  SERVER_OPS_SQL_UNSUPPORTED: { category: 'unsupported', message: '当前仅支持受控的单条 SELECT 查询' },
+  SERVER_OPS_SQL_SYSTEM_SCHEMA: { category: 'policy', message: '不允许查询系统数据库' },
+  SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED: { category: 'unsupported', message: '暂不支持子查询' },
+  SERVER_OPS_SQL_CROSS_DATABASE: { category: 'policy', message: '不允许跨数据库查询' },
+  SERVER_OPS_SQL_INVALID_EXPRESSION: { category: 'syntax', message: '表达式格式不正确' },
+  SERVER_OPS_SQL_FUNCTION_UNSUPPORTED: { category: 'unsupported', message: '查询使用了暂不支持的函数' },
+  SERVER_OPS_SQL_FUNCTION_ARGUMENTS: { category: 'syntax', message: '函数参数数量或类型不正确' },
+  SERVER_OPS_SQL_INTERVAL_UNSUPPORTED: { category: 'unsupported', message: '暂不支持该时间间隔写法' },
+  SERVER_OPS_SQL_WILDCARD_POSITION: { category: 'syntax', message: '通配符不能出现在此位置' },
+  SERVER_OPS_SQL_LIMIT_INVALID: { category: 'policy', message: 'LIMIT 或 OFFSET 超出允许范围' },
+  SERVER_OPS_SQL_SENSITIVE_COLUMN: { category: 'policy', message: '查询包含受保护的敏感字段' },
+  SERVER_OPS_SQL_UNKNOWN_TABLE_ALIAS: { category: 'syntax', message: '列引用了未声明的表或别名' },
+  SERVER_OPS_SQL_DUPLICATE_TABLE_ALIAS: { category: 'syntax', message: '表名或别名重复，无法确定列来源' },
+  SERVER_OPS_SQL_PLAN_INVALID: { category: 'policy', message: '查询计划已失效' },
+}
+
+/** 解析器专用错误；message 始终等于白名单稳定码，兼容既有调用方。 */
+export class ServerOpsSqlParserError extends Error {
+  constructor(
+    readonly code: string,
+    readonly from: number,
+    readonly to: number,
+  ) {
+    super(code)
+    this.name = 'ServerOpsSqlParserError'
+  }
+}
+
+/** 读取固定诊断说明；未知码返回 null，禁止透传任意错误文本。 */
+export function getServerOpsSqlDiagnostic(code: string): ServerOpsSqlDiagnosticDescriptor | null {
+  if (!Object.hasOwn(SQL_DIAGNOSTICS, code)) return null
+  const diagnostic = SQL_DIAGNOSTICS[code]
+  return diagnostic === undefined ? null : { ...diagnostic }
+}
+
+/** 判断错误是否由本解析器产生且携带白名单稳定码。 */
+export function isServerOpsSqlParserError(error: unknown): error is ServerOpsSqlParserError {
+  return error instanceof ServerOpsSqlParserError && getServerOpsSqlDiagnostic(error.code) !== null
+}
+
 /** 抛出不携带 SQL 或字面值的稳定错误。 */
-function fail(code: string): never {
-  throw new Error(code)
+function fail(code: string, from = 0, to = from): never {
+  throw new ServerOpsSqlParserError(code, from, to)
 }
 
 /** 判断 ASCII 单词起始字符。MySQL 非 ASCII 标识符须使用反引号。 */
@@ -206,14 +302,14 @@ function isWordPart(character: string): boolean {
 
 /** 将 SQL 完整切分为有界 token；注释、变量和模式相关字符串在此直接拒绝。 */
 function tokenize(sql: string): Token[] {
-  if (new TextEncoder().encode(sql).byteLength > MAX_SQL_BYTES) fail('SERVER_OPS_SQL_TOO_LARGE')
+  if (new TextEncoder().encode(sql).byteLength > MAX_SQL_BYTES) fail('SERVER_OPS_SQL_TOO_LARGE', 0, sql.length)
   const tokens: Token[] = []
   let index = 0
 
   /** 每次压入都检查 token 预算。 */
   const push = (token: Token): void => {
     tokens.push(token)
-    if (tokens.length > MAX_TOKENS) fail('SERVER_OPS_SQL_TOO_COMPLEX')
+    if (tokens.length > MAX_TOKENS) fail('SERVER_OPS_SQL_TOO_COMPLEX', token.from, token.to)
   }
 
   while (index < sql.length) {
@@ -224,12 +320,13 @@ function tokenize(sql: string): Token[] {
     }
     const next = sql[index + 1] ?? ''
     if ((character === '-' && next === '-') || (character === '/' && next === '*') || character === '#') {
-      fail('SERVER_OPS_SQL_COMMENTS_UNSUPPORTED')
+      fail('SERVER_OPS_SQL_COMMENTS_UNSUPPORTED', index, index + (character === '#' ? 1 : 2))
     }
-    if (character === '@') fail('SERVER_OPS_SQL_VARIABLE_UNSUPPORTED')
-    if (character === '\\' || character === '"') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE')
+    if (character === '@') fail('SERVER_OPS_SQL_VARIABLE_UNSUPPORTED', index, index + 1)
+    if (character === '\\' || character === '"') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
 
     if (character === '`') {
+      const start = index
       let value = ''
       index += 1
       let closed = false
@@ -245,22 +342,24 @@ function tokenize(sql: string): Token[] {
           closed = true
           break
         }
-        if (/[\u0000-\u001f\u007f]/u.test(current)) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER')
+        if (/[\u0000-\u001f\u007f]/u.test(current)) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', index, index + 1)
         value += current
         index += 1
       }
-      if (!closed || value.length === 0 || value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER')
-      push({ kind: 'quoted-identifier', value })
+      if (!closed) fail('SERVER_OPS_SQL_UNCLOSED_IDENTIFIER', start, sql.length)
+      if (value.length === 0 || value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      push({ kind: 'quoted-identifier', value, from: start, to: index })
       continue
     }
 
     if (character === "'") {
+      const start = index
       let value = ''
       index += 1
       let closed = false
       while (index < sql.length) {
         const current = sql[index] ?? ''
-        if (current === '\\') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE')
+        if (current === '\\') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
         if (current === "'") {
           if (sql[index + 1] === "'") {
             value += "'"
@@ -271,12 +370,13 @@ function tokenize(sql: string): Token[] {
           closed = true
           break
         }
-        if (current === '\u0000') fail('SERVER_OPS_SQL_INVALID')
+        if (current === '\u0000') fail('SERVER_OPS_SQL_INVALID', index, index + 1)
         value += current
         index += 1
       }
-      if (!closed || new TextEncoder().encode(value).byteLength > 4_096) fail('SERVER_OPS_SQL_INVALID_LITERAL')
-      push({ kind: 'string', value })
+      if (!closed) fail('SERVER_OPS_SQL_UNCLOSED_STRING', start, sql.length)
+      if (new TextEncoder().encode(value).byteLength > 4_096) fail('SERVER_OPS_SQL_INVALID_LITERAL', start, index)
+      push({ kind: 'string', value, from: start, to: index })
       continue
     }
 
@@ -287,7 +387,7 @@ function tokenize(sql: string): Token[] {
         index += 1
         while (/[0-9]/u.test(sql[index] ?? '')) index += 1
       }
-      push({ kind: 'number', value: sql.slice(start, index) })
+      push({ kind: 'number', value: sql.slice(start, index), from: start, to: index })
       continue
     }
 
@@ -296,30 +396,30 @@ function tokenize(sql: string): Token[] {
       index += 1
       while (isWordPart(sql[index] ?? '')) index += 1
       const value = sql.slice(start, index)
-      if (value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER')
-      push({ kind: 'word', value })
+      if (value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      push({ kind: 'word', value, from: start, to: index })
       continue
     }
 
     const twoCharacters = `${character}${next}`
     if (['<=', '>=', '<>', '!='].includes(twoCharacters)) {
-      push({ kind: 'operator', value: twoCharacters })
+      push({ kind: 'operator', value: twoCharacters, from: index, to: index + 2 })
       index += 2
       continue
     }
     if (['=', '<', '>', '+', '-', '*', '/', '%'].includes(character)) {
-      push({ kind: 'operator', value: character })
+      push({ kind: 'operator', value: character, from: index, to: index + 1 })
       index += 1
       continue
     }
     if (['(', ')', ',', '.', ';'].includes(character)) {
-      push({ kind: 'punctuation', value: character })
+      push({ kind: 'punctuation', value: character, from: index, to: index + 1 })
       index += 1
       continue
     }
-    fail('SERVER_OPS_SQL_INVALID')
+    fail('SERVER_OPS_SQL_INVALID', index, index + 1)
   }
-  push({ kind: 'eof', value: '' })
+  push({ kind: 'eof', value: '', from: sql.length, to: sql.length })
   return tokens
 }
 
@@ -330,6 +430,7 @@ class SqlParser {
   private readonly columnReferences: ServerOpsSqlColumnReference[] = []
   private readonly columnReferenceKeys = new Set<string>()
   private readonly tableQualifiers = new Set<string>()
+  private readonly sourceTableByQualifier = new Map<string, string>()
   /** 投影全部解析后建立的别名集合，不用于放行 WHERE 或 JOIN 的源列。 */
   private readonly projectionAliases = new Set<string>()
   /** 只在 MySQL 允许引用输出别名的尾部子句中开启。 */
@@ -343,13 +444,14 @@ class SqlParser {
 
   /** 解析整条单 SELECT，并要求消费全部 token。 */
   parse(): { statement: SelectStatement; columns: ServerOpsSqlColumnReference[]; hasWildcard: boolean } {
-    if (SYSTEM_SCHEMAS.has(this.database.toLowerCase())) fail('SERVER_OPS_SQL_SYSTEM_SCHEMA')
-    if (this.tokens.some((token) => token.kind === 'word' && UNSUPPORTED_KEYWORDS.has(token.value.toUpperCase()))) {
-      fail('SERVER_OPS_SQL_UNSUPPORTED')
+    if (SYSTEM_SCHEMAS.has(this.database.toLowerCase())) this.failAtCurrent('SERVER_OPS_SQL_SYSTEM_SCHEMA')
+    const unsupported = this.tokens.find((token) => token.kind === 'word' && UNSUPPORTED_KEYWORDS.has(token.value.toUpperCase()))
+    if (unsupported !== undefined) {
+      fail('SERVER_OPS_SQL_UNSUPPORTED', unsupported.from, unsupported.to)
     }
-    this.expectWord('SELECT')
+    this.expectWord('SELECT', 'SERVER_OPS_SQL_EXPECTED_SELECT')
     const select = this.parseSelectItems()
-    this.expectWord('FROM')
+    this.expectWord('FROM', this.peek().kind === 'eof' ? 'SERVER_OPS_SQL_FROM_REQUIRED' : 'SERVER_OPS_SQL_MISSING_FROM')
     const from = this.parseTableReference()
     this.registerTableQualifier(from)
 
@@ -397,8 +499,10 @@ class SqlParser {
       } while (this.consumePunctuation(','))
     }
     const limit = this.consumeWord('LIMIT') ? this.parseLimit() : undefined
-    this.consumePunctuation(';')
-    if (this.peek().kind !== 'eof') fail('SERVER_OPS_SQL_UNSUPPORTED')
+    const consumedTerminator = this.consumePunctuation(';')
+    if (this.peek().kind !== 'eof') {
+      this.failAtCurrent(consumedTerminator ? 'SERVER_OPS_SQL_MULTIPLE_STATEMENTS' : 'SERVER_OPS_SQL_UNSUPPORTED')
+    }
     this.validateColumnQualifiers()
     return {
       statement: {
@@ -411,7 +515,7 @@ class SqlParser {
         orderBy,
         ...(limit === undefined ? {} : { limit }),
       },
-      columns: this.columnReferences,
+      columns: this.resolveColumnSources(),
       hasWildcard: this.hasProjectionWildcard,
     }
   }
@@ -423,16 +527,19 @@ class SqlParser {
       let expression: SqlExpression
       let projectionWildcard = false
       if (this.consumeOperator('*')) {
+        const wildcard = this.tokens[this.index - 1] ?? this.peek()
         expression = this.node({ kind: 'wildcard' })
         projectionWildcard = true
-        this.recordColumn(undefined, '*')
+        this.recordColumn(undefined, '*', wildcard)
       } else if (this.isQualifiedWildcard()) {
+        const tableToken = this.peek()
         const table = this.parseIdentifier()
         this.expectPunctuation('.')
+        const wildcard = this.peek()
         this.expectOperator('*')
         expression = this.node({ kind: 'column', table, column: '*' })
         projectionWildcard = true
-        this.recordColumn(table, '*')
+        this.recordColumn(table, '*', wildcard.from >= tableToken.from ? wildcard : tableToken)
       } else {
         expression = this.parseExpression()
       }
@@ -453,29 +560,61 @@ class SqlParser {
 
   /** 解析基础表；仅允许当前库限定，不允许子查询或函数表。 */
   private parseTableReference(): TableReference {
-    if (this.matchesPunctuation('(')) fail('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
+    if (this.matchesPunctuation('(')) this.failAtCurrent('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
+    if (this.peek().kind === 'eof') this.failAtCurrent('SERVER_OPS_SQL_MISSING_TABLE')
+    const firstToken = this.peek()
     const first = this.parseIdentifier()
     let database: string | undefined
     let table = first
+    let tableToken = firstToken
     if (this.consumePunctuation('.')) {
       database = first
+      tableToken = this.peek()
       table = this.parseIdentifier()
-      if (database !== this.database) fail('SERVER_OPS_SQL_CROSS_DATABASE')
+      if (database !== this.database) fail('SERVER_OPS_SQL_CROSS_DATABASE', firstToken.from, tableToken.to)
     }
-    if (SYSTEM_SCHEMAS.has((database ?? this.database).toLowerCase())) fail('SERVER_OPS_SQL_SYSTEM_SCHEMA')
+    if (SYSTEM_SCHEMAS.has((database ?? this.database).toLowerCase())) fail('SERVER_OPS_SQL_SYSTEM_SCHEMA', firstToken.from, tableToken.to)
     let alias: string | undefined
+    let aliasToken: Token | undefined
     if (this.consumeWord('AS')) {
+      aliasToken = this.peek()
       alias = this.parseIdentifier()
     } else if (this.canConsumeAlias()) {
+      aliasToken = this.peek()
       alias = this.parseIdentifier()
     }
-    return { ...(database === undefined ? {} : { database }), table, ...(alias === undefined ? {} : { alias }) }
+    return {
+      ...(database === undefined ? {} : { database }),
+      table,
+      ...(alias === undefined ? {} : { alias }),
+      from: tableToken.from,
+      to: tableToken.to,
+      ...(aliasToken === undefined ? {} : { aliasFrom: aliasToken.from, aliasTo: aliasToken.to }),
+    }
   }
 
   /** 注册表名与别名，供列限定符完整性检查。 */
   private registerTableQualifier(table: TableReference): void {
-    this.tableQualifiers.add(table.table.toLowerCase())
-    if (table.alias !== undefined) this.tableQualifiers.add(table.alias.toLowerCase())
+    const qualifier = table.alias ?? table.table
+    this.registerQualifier(
+      qualifier,
+      table.table,
+      table.aliasFrom ?? table.from,
+      table.aliasTo ?? table.to,
+    )
+  }
+
+  /** 注册 SQL 中真正可见且唯一的限定符；取别名后原表名不再可见。 */
+  private registerQualifier(
+    qualifier: string,
+    sourceTable: string,
+    from: number,
+    to: number,
+  ): void {
+    const key = qualifier.toLowerCase()
+    if (this.tableQualifiers.has(key)) fail('SERVER_OPS_SQL_DUPLICATE_TABLE_ALIAS', from, to)
+    this.tableQualifiers.add(key)
+    this.sourceTableByQualifier.set(key, sourceTable)
   }
 
   /** 解析逗号分隔表达式列表。 */
@@ -490,7 +629,7 @@ class SqlParser {
 
   /** Pratt 解析表达式，并按深度与节点总数双重限流。 */
   private parseExpression(minimumPrecedence = 0, depth = 0): SqlExpression {
-    if (depth > MAX_EXPRESSION_DEPTH) fail('SERVER_OPS_SQL_TOO_COMPLEX')
+    if (depth > MAX_EXPRESSION_DEPTH) this.failAtCurrent('SERVER_OPS_SQL_TOO_COMPLEX')
     let left = this.parsePrefix(depth + 1)
     while (true) {
       /** readInfixOperator 会消费 token；优先级不足时必须恢复到窥视前位置。 */
@@ -510,9 +649,9 @@ class SqlParser {
       }
       if (operator.kind === 'in') {
         this.expectPunctuation('(')
-        if (this.matchesWord('SELECT')) fail('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
+        if (this.matchesWord('SELECT')) this.failAtCurrent('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
         const values = this.parseExpressionList()
-        this.expectPunctuation(')')
+        this.expectPunctuation(')', 'SERVER_OPS_SQL_UNCLOSED_PAREN')
         left = this.node({ kind: 'in', operand: left, values, negated: operator.negated })
         continue
       }
@@ -525,7 +664,7 @@ class SqlParser {
         left = this.node({ kind: 'like', left, right, negated: operator.negated })
         continue
       }
-      if (operator.kind !== 'binary') fail('SERVER_OPS_SQL_INVALID_EXPRESSION')
+      if (operator.kind !== 'binary') this.failAtCurrent('SERVER_OPS_SQL_INVALID_EXPRESSION')
       left = this.node({ kind: 'binary', operator: operator.operator, left, right })
     }
     return left
@@ -538,9 +677,9 @@ class SqlParser {
     if (this.consumeOperator('+')) return this.node({ kind: 'unary', operator: '+', operand: this.parseExpression(6, depth + 1) })
     if (this.consumeOperator('-')) return this.node({ kind: 'unary', operator: '-', operand: this.parseExpression(6, depth + 1) })
     if (this.consumePunctuation('(')) {
-      if (this.matchesWord('SELECT')) fail('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
+      if (this.matchesWord('SELECT')) this.failAtCurrent('SERVER_OPS_SQL_SUBQUERY_UNSUPPORTED')
       const expression = this.parseExpression(0, depth + 1)
-      this.expectPunctuation(')')
+      this.expectPunctuation(')', 'SERVER_OPS_SQL_UNCLOSED_PAREN')
       return this.node({ kind: 'group', expression })
     }
     if (token.kind === 'number') {
@@ -555,8 +694,9 @@ class SqlParser {
     if (this.consumeWord('TRUE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'TRUE' })
     if (this.consumeWord('FALSE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'FALSE' })
     if (this.consumeWord('INTERVAL')) return this.parseInterval()
-    if (token.kind !== 'word' && token.kind !== 'quoted-identifier') fail('SERVER_OPS_SQL_INVALID_EXPRESSION')
+    if (token.kind !== 'word' && token.kind !== 'quoted-identifier') this.failAtCurrent('SERVER_OPS_SQL_EXPECTED_EXPRESSION')
 
+    const firstToken = token
     const first = this.parseIdentifier()
     if (this.matchesPunctuation('(')) {
       // 引用形式可能指向同名存储函数；只有裸白名单内置函数允许执行。
@@ -565,25 +705,26 @@ class SqlParser {
     }
     if (token.kind === 'word' && first.toUpperCase() === 'CURRENT_DATE') return this.node({ kind: 'function', name: 'CURRENT_DATE', arguments: [] })
     if (this.consumePunctuation('.')) {
-      if (this.matchesOperator('*')) fail('SERVER_OPS_SQL_WILDCARD_POSITION')
+      if (this.matchesOperator('*')) this.failAtCurrent('SERVER_OPS_SQL_WILDCARD_POSITION')
+      const columnToken = this.peek()
       const column = this.parseIdentifier()
-      if (this.matchesPunctuation('.')) fail('SERVER_OPS_SQL_CROSS_DATABASE')
-      this.recordColumn(first, column)
+      if (this.matchesPunctuation('.')) this.failAtCurrent('SERVER_OPS_SQL_CROSS_DATABASE')
+      this.recordColumn(first, column, columnToken)
       return this.node({ kind: 'column', table: first, column })
     }
-    this.recordColumn(undefined, first)
+    this.recordColumn(undefined, first, firstToken)
     return this.node({ kind: 'column', column: first })
   }
 
   /** 解析函数调用；未知函数、限定函数和不合法通配参数全部拒绝。 */
   private parseFunction(name: string, depth: number): SqlExpression {
     const normalizedName = name.toUpperCase()
-    if (!SAFE_FUNCTIONS.has(normalizedName)) fail('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED')
+    if (!SAFE_FUNCTIONS.has(normalizedName)) this.failAtCurrent('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED', -1)
     this.expectPunctuation('(')
     const argumentsList: SqlExpression[] = []
     if (!this.consumePunctuation(')')) {
       if (this.consumeOperator('*')) {
-        if (normalizedName !== 'COUNT') fail('SERVER_OPS_SQL_WILDCARD_POSITION')
+        if (normalizedName !== 'COUNT') this.failAtCurrent('SERVER_OPS_SQL_WILDCARD_POSITION', -1)
         argumentsList.push(this.node({ kind: 'wildcard' }))
       } else {
         do {
@@ -591,7 +732,7 @@ class SqlParser {
           if (argumentsList.length > 32) fail('SERVER_OPS_SQL_TOO_COMPLEX')
         } while (this.consumePunctuation(','))
       }
-      this.expectPunctuation(')')
+      this.expectPunctuation(')', 'SERVER_OPS_SQL_UNCLOSED_PAREN')
     }
     this.validateFunctionArguments(normalizedName, argumentsList)
     return this.node({ kind: 'function', name: normalizedName, arguments: argumentsList })
@@ -616,10 +757,10 @@ class SqlParser {
   /** 解析固定整数 INTERVAL。 */
   private parseInterval(): IntervalExpression {
     const value = this.peek()
-    if (value.kind !== 'number' || value.value.includes('.')) fail('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED')
+    if (value.kind !== 'number' || value.value.includes('.')) this.failAtCurrent('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED')
     this.index += 1
     const unit = this.parseIdentifier().toUpperCase()
-    if (!INTERVAL_UNITS.has(unit)) fail('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED')
+    if (!INTERVAL_UNITS.has(unit)) this.failAtCurrent('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED', -1)
     return this.node({ kind: 'interval', value: value.value, unit })
   }
 
@@ -679,31 +820,46 @@ class SqlParser {
   /** 读取安全整数 token。 */
   private parseUnsignedInteger(errorCode: string): number {
     const token = this.peek()
-    if (token.kind !== 'number' || token.value.includes('.')) fail(errorCode)
+    if (token.kind !== 'number' || token.value.includes('.')) this.failAtCurrent(errorCode)
     this.index += 1
     const value = Number(token.value)
-    if (!Number.isSafeInteger(value) || value < 0) fail(errorCode)
+    if (!Number.isSafeInteger(value) || value < 0) fail(errorCode, token.from, token.to)
     return value
   }
 
   /** 记录并去重列引用，敏感字段在首次出现时立即拒绝。 */
-  private recordColumn(table: string | undefined, column: string): void {
-    if (column !== '*' && isServerOpsSqlSensitiveColumn(column)) fail('SERVER_OPS_SQL_SENSITIVE_COLUMN')
+  private recordColumn(table: string | undefined, column: string, token: Token): void {
+    if (column !== '*' && isServerOpsSqlSensitiveColumn(column)) fail('SERVER_OPS_SQL_SENSITIVE_COLUMN', token.from, token.to)
     /** 同名源列和输出别名分别记录，避免后出现的别名吞掉 WHERE/JOIN 校验。 */
     const outputAlias = this.acceptsProjectionAlias && table === undefined && this.projectionAliases.has(column.toLowerCase())
     const key = `${table?.toLowerCase() ?? ''}\u0000${column.toLowerCase()}\u0000${outputAlias}`
     if (this.columnReferenceKeys.has(key)) return
     this.columnReferenceKeys.add(key)
-    this.columnReferences.push({ ...(table === undefined ? {} : { table }), column, ...(outputAlias ? { outputAlias: true } : {}) })
+    this.columnReferences.push({
+      ...(table === undefined ? {} : { table }),
+      column,
+      ...(outputAlias ? { outputAlias: true } : {}),
+      from: token.from,
+      to: token.to,
+    })
   }
 
   /** 全部表解析完成后验证限定列只引用已声明表或别名。 */
   private validateColumnQualifiers(): void {
     for (const column of this.columnReferences) {
       if (column.table !== undefined && !this.tableQualifiers.has(column.table.toLowerCase())) {
-        fail('SERVER_OPS_SQL_UNKNOWN_TABLE_ALIAS')
+        fail('SERVER_OPS_SQL_UNKNOWN_TABLE_ALIAS', column.from, column.to)
       }
     }
+  }
+
+  /** 将已验证限定符解析为真实基础表；不猜测未限定列的来源。 */
+  private resolveColumnSources(): ServerOpsSqlColumnReference[] {
+    return this.columnReferences.map((column) => {
+      if (column.outputAlias === true || column.table === undefined) return column
+      const sourceTable = this.sourceTableByQualifier.get(column.table.toLowerCase())
+      return sourceTable === undefined ? column : { ...column, sourceTable }
+    })
   }
 
   /** 注册 AST 节点并执行总复杂度预算。 */
@@ -731,14 +887,14 @@ class SqlParser {
   /** 读取标识符；未引用关键字仍由所在语法位置控制。 */
   private parseIdentifier(): string {
     const token = this.peek()
-    if (token.kind !== 'word' && token.kind !== 'quoted-identifier') fail('SERVER_OPS_SQL_INVALID_IDENTIFIER')
+    if (token.kind !== 'word' && token.kind !== 'quoted-identifier') this.failAtCurrent('SERVER_OPS_SQL_INVALID_IDENTIFIER')
     this.index += 1
     return token.value
   }
 
   /** 查看相对当前位置 token。 */
   private peek(offset = 0): Token {
-    return this.tokens[this.index + offset] ?? { kind: 'eof', value: '' }
+    return this.tokens[this.index + offset] ?? this.tokens[this.tokens.length - 1] ?? { kind: 'eof', value: '', from: 0, to: 0 }
   }
 
   private matchesWord(word: string): boolean {
@@ -752,8 +908,8 @@ class SqlParser {
     return true
   }
 
-  private expectWord(word: string): void {
-    if (!this.consumeWord(word)) fail('SERVER_OPS_SQL_UNSUPPORTED')
+  private expectWord(word: string, errorCode = 'SERVER_OPS_SQL_UNSUPPORTED'): void {
+    if (!this.consumeWord(word)) this.failAtCurrent(errorCode)
   }
 
   private matchesOperator(operator: string): boolean {
@@ -768,7 +924,7 @@ class SqlParser {
   }
 
   private expectOperator(operator: string): void {
-    if (!this.consumeOperator(operator)) fail('SERVER_OPS_SQL_INVALID_EXPRESSION')
+    if (!this.consumeOperator(operator)) this.failAtCurrent('SERVER_OPS_SQL_INVALID_EXPRESSION')
   }
 
   private matchesPunctuation(punctuation: string): boolean {
@@ -782,8 +938,14 @@ class SqlParser {
     return true
   }
 
-  private expectPunctuation(punctuation: string): void {
-    if (!this.consumePunctuation(punctuation)) fail('SERVER_OPS_SQL_INVALID_EXPRESSION')
+  private expectPunctuation(punctuation: string, errorCode = 'SERVER_OPS_SQL_INVALID_EXPRESSION'): void {
+    if (!this.consumePunctuation(punctuation)) this.failAtCurrent(errorCode)
+  }
+
+  /** 在当前或相对 token 位置抛出白名单诊断。 */
+  private failAtCurrent(code: string, offset = 0): never {
+    const token = this.peek(offset)
+    fail(code, token.from, token.to)
   }
 }
 
@@ -816,11 +978,32 @@ export function analyzeServerOpsSqlQuery(sql: string, database: string): ServerO
     sql: renderStatement(parsed.statement),
     fingerprint: renderStatement(parsed.statement, true),
     tables: collectTables(parsed.statement),
+    tableReferences: collectTableReferences(parsed.statement),
     columns: parsed.columns,
     hasWildcard: parsed.hasWildcard,
   }
   statementByPlan.set(plan, parsed.statement)
   return plan
+}
+
+/** 纯本地校验 SQL；失败只返回固定诊断，不执行查询也不产生外部副作用。 */
+export function validateServerOpsSqlQuery(
+  sql: string,
+  database: string,
+): { plan: ServerOpsSqlQueryPlan | null; diagnostics: ServerOpsSqlDiagnostic[] } {
+  try {
+    return { plan: analyzeServerOpsSqlQuery(sql, database), diagnostics: [] }
+  } catch (error) {
+    if (!isServerOpsSqlParserError(error)) throw error
+    const descriptor = getServerOpsSqlDiagnostic(error.code)
+    if (descriptor === null) throw error
+    const from = Math.max(0, Math.min(sql.length, error.from))
+    const to = Math.max(from, Math.min(sql.length, error.to))
+    return {
+      plan: null,
+      diagnostics: [{ code: error.code, ...descriptor, from, to }],
+    }
+  }
 }
 
 /** 给顶层查询加 `maxRows + 1` 探测行；用户更小 LIMIT 保持原意。 */
@@ -839,6 +1022,16 @@ export function limitServerOpsSqlQuery(plan: ServerOpsSqlQueryPlan, maxRows: num
 function collectTables(statement: SelectStatement): string[] {
   const tables = [statement.from.table, ...statement.joins.map((join) => join.table.table)]
   return tables.filter((table, index) => tables.indexOf(table) === index)
+}
+
+/** 按 SQL 中出现顺序收集基础表、别名与源位置。 */
+function collectTableReferences(statement: SelectStatement): ServerOpsSqlTableReference[] {
+  return [statement.from, ...statement.joins.map((join) => join.table)].map((table) => ({
+    table: table.table,
+    ...(table.alias === undefined ? {} : { alias: table.alias }),
+    from: table.from,
+    to: table.to,
+  }))
 }
 
 /** MySQL 标识符统一反引号输出，内部反引号双写。 */

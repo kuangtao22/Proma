@@ -11,17 +11,33 @@ interface QueryAuditOptions<T extends QueryResult> {
   check: () => void
   execute: () => Promise<T>
 }
+/** 查询前审计失败只透传这些稳定分类，任意磁盘路径、系统异常和正文都不返回。 */
+const AUDIT_START_ERROR_CODES: ReadonlySet<string> = new Set([
+  'SERVER_OPS_OTHER_INSTANCE_ACTIVE', 'SERVER_OPS_TRUST_BUSY', 'SERVER_OPS_CONFIG_BUSY',
+  'SERVER_OPS_CONFIG_LOCK_UNAVAILABLE', 'SERVER_OPS_CONFIG_OUTCOME_UNKNOWN',
+  'SERVER_OPS_AUDIT_READ_FAILED', 'SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED', 'SERVER_OPS_AUDIT_WRITE_FAILED',
+])
+
+/** 将准备或开始写入异常转成安全稳定码；未知原因仍失败关闭，不暴露原始异常。 */
+function getAuditStartErrorCode(error: unknown): string {
+  /** 配置事务以 code 携带分类，普通领域错误才读取完整 message。 */
+  const code = error !== null && typeof error === 'object' && 'code' in error ? error.code : undefined
+  /** 精确匹配白名单，含稳定码前缀的私有正文也不能透传。 */
+  const candidate = typeof code === 'string' ? code : error instanceof Error ? error.message : ''
+  return AUDIT_START_ERROR_CODES.has(candidate) ? candidate : 'SERVER_OPS_AUDIT_START_WRITE_FAILED'
+}
+
 /** 窗口与 Agent 共用审计执行顺序；后续实现不得记录 SQL 或行内容。 */
 export async function runAuditedServerOpsQuery<T extends QueryResult>(options: QueryAuditOptions<T>): Promise<T> {
   options.check()
-  try { await options.audit.prepareForWrites?.() } catch { throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED') }
+  try { await options.audit.prepareForWrites?.() } catch (error) { throw new Error(getAuditStartErrorCode(error)) }
   options.check()
   /** 摘要复制后冻结实际范围，调用方之后修改数组不能污染审计。 */
   const common = { ...options.actor, ...options.summary, tables: [...options.summary.tables],
     operation: 'data-query' as const, resourceType: 'data-query' as const, operationId: randomUUID() }
   /** 墙钟只用于有界耗时，不接收调用方提交的时间。 */
   const startedAt = Date.now()
-  try { options.audit.append({ ...common, phase: 'start', outcome: 'pending' }) } catch { throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED') }
+  try { options.audit.append({ ...common, phase: 'start', outcome: 'pending' }) } catch (error) { throw new Error(getAuditStartErrorCode(error)) }
   let result: T
   try {
     options.check()
