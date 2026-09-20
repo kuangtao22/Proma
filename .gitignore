@@ -65,3 +65,13 @@ pnpm-workspace.yaml
 # Proma 会话/工作区文档（不应入仓，见 AGENTS.md 红线）
 .context/
 .bitfun/
+
+# Agent 运行产物：诊断备份、QA 截图、原型页面、运行时状态与 brainstorm 工作目录，不入仓。
+# .omx/plans 与 .omx/reports 保留可跟踪，仅精选报告需要入仓。
+.omx/diagnostics/
+.omx/qa/
+.omx/artifacts/
+.omx/prototypes/
+.omx/state/
+.omx/context/
+.superpowers/
