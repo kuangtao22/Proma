@@ -1,7 +1,31 @@
 import type { RetryAttempt } from '@proma/shared'
 
-/** 前 N 次 Pi native retry 不通知 UI，与 Claude runtime 的自动恢复体验保持一致。 */
-export const PI_RETRY_VISIBILITY_THRESHOLD = 5
+/**
+ * 前 N 次 Pi native retry 静默处理；0 表示第一次重试就通知 UI。
+ *
+ * 为什么改为 0：上游过载时每次重试都要重新上传整段上下文并等待 20~40 秒，
+ * 静默 5 次会让用户只看到「长时间没有输出」，既不知道 Proma 在做什么，也无法
+ * 在此之前停手；从第一次重试起展示「第 N/M 次继续当前回答」后，用户可据此决定
+ * 是否取消或换渠道。对用户的影响是重试提示会更早出现，重试成功后的收束逻辑不变。
+ */
+export const PI_NATIVE_SILENT_RETRY_ATTEMPTS = 0
+
+/**
+ * Pi 原生重试策略（单个连续失败段）。
+ *
+ * 为什么是 3 次：Pi 把 `overloaded` 视为可重试错误，而一次上游过载通常持续数分钟，
+ * 多试几次既救不回来，又会把一次失败放大成渠道后台的多条 0 token 请求（每条都重传
+ * 当前完整上下文），实测 8 次重试会让一个用户回合在渠道后台变成 9 条连续请求，容易
+ * 触发渠道商风控。取 Pi 上游默认值 3 并把退避基数提高到 2 秒后，一次失败最多产生
+ * 4 次请求、失败窗口从约 8 分钟压到约 1 分钟；代价是需要 20 秒以上才恢复的过载会更早
+ * 失败并提示用户手动重试。退避由 Pi 按 `baseDelayMs * 2 ** (attempt - 1)` 计算，
+ * 即 2 秒、4 秒、8 秒。
+ */
+export const PI_NATIVE_RETRY_POLICY = {
+  enabled: true,
+  maxRetries: 3,
+  baseDelayMs: 2_000,
+} as const
 
 /** 将 Pi native retry 与当前 renderer stream 绑定，拒绝迟到事件污染下一轮。 */
 export interface PiRetryEventContext {
@@ -85,14 +109,14 @@ function retryAttempt(event: PiNativeRetryDetails, timestamp: number, errorMessa
   }
 }
 
-/** Pi 0.84 只暴露连续失败段的 attempt；超过前五次才向 UI 展示重试生命周期。 */
+/** Pi 只暴露连续失败段的 attempt；按静默次数门控后决定是否向 UI 展示重试生命周期。 */
 function shouldExposePiRetry(event: PiNativeRetryDetails): boolean {
-  return event.attempt > PI_RETRY_VISIBILITY_THRESHOLD
+  return event.attempt > PI_NATIVE_SILENT_RETRY_ATTEMPTS
 }
 
 /**
  * 将 Pi native retry 生命周期转换为 Proma UI 已识别的 retry 事件。
- * 前五次恢复的完整生命周期都会被过滤；若最终未恢复，终态 assistant error 仍会正常展示。
+ * 静默次数内的生命周期会被过滤；若最终未恢复，终态 assistant error 仍会正常展示。
  */
 export function mapPiNativeRetryEvent(
   event: PiNativeRetryEvent,

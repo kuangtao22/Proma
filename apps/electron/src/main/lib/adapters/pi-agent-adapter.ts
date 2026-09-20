@@ -83,7 +83,7 @@ import {
 } from './pi-message-adapter'
 import { DEFAULT_CONTEXT_WINDOW, buildModel } from './pi-model-registry'
 import { PendingPromptSkillActivationTracker } from './pi-skill-activation-tracker'
-import { createPiRetryTerminalGate, mapPiNativeRetryEvent } from './pi-retry-control'
+import { createPiRetryTerminalGate, mapPiNativeRetryEvent, PI_NATIVE_RETRY_POLICY } from './pi-retry-control'
 import {
   closePiRequestProxyDispatcher,
   createPiRequestProxyDispatcher,
@@ -104,8 +104,6 @@ type PowerShellToolOptions = {
 }
 type SkillLoadResult = ReturnType<ResourceLoader['getSkills']>
 
-const PI_NATIVE_MAX_RETRIES = 8
-const PI_NATIVE_RETRY_BASE_DELAY_MS = 1_000
 const MAX_AUTOMATIC_COMPACTION_CONTINUATIONS = 20
 
 export function shouldMarkCompactionAfterCompletedTurn(
@@ -1591,11 +1589,8 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         compaction: { enabled: true, reserveTokens: autoCompactionReserveTokens },
         // Pi 原生 retry 通过 agent.continue() 在同一 transcript 中恢复，能保留已完成的
         // tool_result；不能用外层重投原始 prompt 替代，否则会重复执行副作用工具。
-        retry: {
-          enabled: true,
-          maxRetries: PI_NATIVE_MAX_RETRIES,
-          baseDelayMs: PI_NATIVE_RETRY_BASE_DELAY_MS,
-        },
+        // 重试预算与退避基数的取值理由见 pi-retry-control.ts 的 PI_NATIVE_RETRY_POLICY。
+        retry: { ...PI_NATIVE_RETRY_POLICY },
         ...buildPiRemoteConnectionSettings(input),
       })
       const openAIReasoningProfile = (input.provider === 'openai-codex' || input.provider === 'xai' || input.provider === 'openai-responses')
