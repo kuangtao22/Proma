@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, protocol, screen, shell } from 'electron'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync } from 'fs'
 import { resolveAppIdentity } from './lib/app-identity'
@@ -817,7 +817,8 @@ app.whenReady()
     if (!app.isPackaged) app.setName(appIdentity.displayName)
     /** 开发态只做一次新鲜度提示：产物落后于源码时，别让旧合同伪装成业务故障。 */
     if (!app.isPackaged) {
-      const staleBundle = detectStaleDevBundle()
+      /** 打包后的主进程在 `dist/`，根目录必须显式给出，不能依赖源码布局推导。 */
+      const staleBundle = detectStaleDevBundle({ root: resolve(__dirname, '..') })
       if (staleBundle) console.warn(staleBundle)
     }
     return bootstrap()

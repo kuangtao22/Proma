@@ -45,4 +45,41 @@ describe('开发态 bundle 新鲜度', () => {
     touch(join(root, 'packages/shared/src/image-generation.ts'), 2_000)
     expect(detectStaleDevBundle({ root, sourcePaths: ['src/main', 'packages/shared/src'] })).toBeNull()
   })
+
+  test('Given 运行时产物早于 utility 源码 When 检测 Then 点名该产物与重建命令', () => {
+    /**
+     * 这正是真实踩过的坑：`dist/server-ops-runtime.cjs` 停在旧版本、
+     * 而其源码已加上"直连数据源"支持，运行时收到请求后静默丢弃，
+     * 界面表现为"连接测试永远超时"。
+     */
+    const root = createFixture(['src/main', 'src/preload', 'src/utility', 'packages/shared/src'])
+    touch(join(root, 'dist/main.cjs'), 3_000)
+    touch(join(root, 'dist/preload.cjs'), 3_000)
+    touch(join(root, 'dist/server-ops-runtime.cjs'), 1_000)
+    touch(join(root, 'dist/agent-runtime.cjs'), 3_000)
+    touch(join(root, 'dist/terminal-runtime.cjs'), 3_000)
+    mkdirSync(join(root, 'src/utility/server-ops'), { recursive: true })
+    touch(join(root, 'src/utility/server-ops/server-ops-data-runtime.ts'), 2_000)
+
+    const warning = detectStaleDevBundle({ root })
+    expect(warning).not.toBeNull()
+    expect(warning ?? '').toContain('dist/server-ops-runtime.cjs')
+    expect(warning ?? '').toContain('bun run build:server-ops-runtime')
+    /** 只改 utility 时不得把主进程产物也算成过期，否则告警会变成噪音。 */
+    expect(warning ?? '').not.toContain('dist/main.cjs')
+  })
+
+  test('Given 只改主进程源码 When 检测 Then 不牵连运行时产物', () => {
+    const root = createFixture(['src/main', 'src/preload', 'src/utility', 'packages/shared/src'])
+    touch(join(root, 'dist/server-ops-runtime.cjs'), 2_000)
+    touch(join(root, 'dist/agent-runtime.cjs'), 2_000)
+    touch(join(root, 'dist/terminal-runtime.cjs'), 2_000)
+    touch(join(root, 'dist/preload.cjs'), 3_000)
+    touch(join(root, 'dist/main.cjs'), 1_000)
+    touch(join(root, 'src/main/index.ts'), 2_000)
+
+    const warning = detectStaleDevBundle({ root })
+    expect(warning ?? '').toContain('dist/main.cjs')
+    expect(warning ?? '').not.toContain('dist/server-ops-runtime.cjs')
+  })
 })
