@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { getConfigDir } from '../config-paths'
@@ -109,6 +109,8 @@ export class ServerOpsCredentialStore {
   private readonly safeStorageInjected: boolean
   /** 本次应用生命周期内按主机保存的短期凭据。 */
   private readonly volatileByHost = new Map<string, ServerOpsResolvedCredential>()
+  /** 内存凭据每次显式替换生成新版本，不哈希明文密码。 */
+  private readonly volatileVersions = new Map<string, string>()
 
   constructor(configDir = getConfigDir(), dependencies: Partial<ServerOpsCredentialStoreDependencies> = {}) {
     /** 运维模块固定数据目录。 */
@@ -143,6 +145,7 @@ export class ServerOpsCredentialStore {
   /** 设置只在本次主进程生命周期内存在的凭据。 */
   setVolatile(hostId: string, credential: ServerOpsResolvedCredential): void {
     this.volatileByHost.set(hostId, { ...credential })
+    this.volatileVersions.set(hostId, randomUUID())
   }
 
   /** 将凭据保存为 safeStorage 密文并返回非敏感引用。 */
@@ -175,6 +178,16 @@ export class ServerOpsCredentialStore {
     })
     this.setVolatile(hostId, credential)
     return ref
+  }
+
+  /** 捕获主进程内部凭据版本；仅哈希密文和随机版本，不解密或公开材料。 */
+  getVersion(hostId: string, credentialRef?: string): string | null {
+    /** 即使当前使用内存凭据，另一实例原位改密文也必须让旧授权失效。 */
+    const stored = credentialRef ? this.readStoredCredentials().credentials.find((item) => item.hostId === hostId && item.ref === credentialRef) : undefined
+    if (credentialRef && !stored) throw new Error('SERVER_OPS_CREDENTIAL_NOT_FOUND')
+    const volatile = this.volatileVersions.get(hostId)
+    if (!stored && !volatile) return null
+    return createHash('sha256').update(JSON.stringify([stored?.ref ?? null, stored?.ciphertext ?? null, volatile ?? null])).digest('hex')
   }
 
   /** 优先读取短期凭据，否则按主机绑定的密文引用解密。 */
@@ -214,11 +227,13 @@ export class ServerOpsCredentialStore {
       }
     })
     this.volatileByHost.delete(hostId)
+    this.volatileVersions.delete(hostId)
   }
 
   /** 清除所有短期明文引用。 */
   clearVolatile(): void {
     this.volatileByHost.clear()
+    this.volatileVersions.clear()
   }
 
   /** Linux 明文 backend 和不可用状态一律拒绝落盘或解密。 */

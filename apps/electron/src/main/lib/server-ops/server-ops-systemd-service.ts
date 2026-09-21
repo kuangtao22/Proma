@@ -41,7 +41,7 @@ const SERVER_OPS_SYSTEMD_SHOW_FIELDS = [
 /** systemd Service 使用的最小依赖边界。 */
 export interface ServerOpsSystemdServiceDependencies {
   getActiveIdentity: (hostId: string) => ServerOpsActiveConnectionIdentity
-  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number) => Promise<ServerOpsRuntimeExecResult>
+  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal) => Promise<ServerOpsRuntimeExecResult>
   audit: {
     append: (input: ServerOpsAuditAppendInput) => unknown
     prepareForWrites?: () => Promise<void>
@@ -73,6 +73,7 @@ type ServerOpsSystemdErrorCode =
   | 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED'
   | 'SERVER_OPS_AUDIT_READ_FAILED'
   | 'SERVER_OPS_AUDIT_WRITE_FAILED'
+  | 'SERVER_OPS_EXEC_CANCELLED'
 
 /** 判断未知错误消息是否属于允许公开的稳定码。 */
 function isStableSystemdErrorCode(value: unknown): value is ServerOpsSystemdErrorCode {
@@ -83,6 +84,7 @@ function isStableSystemdErrorCode(value: unknown): value is ServerOpsSystemdErro
     || value === 'SERVER_OPS_SERVICE_ACTION_UNKNOWN'
     || value === 'SERVER_OPS_SYSTEMD_PERMISSION_DENIED'
     || value === 'SERVER_OPS_AUDIT_READ_FAILED'
+    || value === 'SERVER_OPS_EXEC_CANCELLED'
     || value === 'SERVER_OPS_AUDIT_WRITE_FAILED'
 }
 
@@ -159,19 +161,20 @@ export class ServerOpsSystemdService {
   }
 
   /** 校验输入并读取当前主机的 systemd 服务列表。 */
-  async listServices(input: ServerOpsServiceListInput): Promise<ServerOpsServiceListResult> {
+  async listServices(input: ServerOpsServiceListInput, signal?: AbortSignal): Promise<ServerOpsServiceListResult> {
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     /** 主进程入口再次执行 Shared exact-key 校验。 */
     const parsedInput = parseServerOpsServiceListInput(input)
     /** 请求开始时捕获的活跃连接身份。 */
     const identity = this.readInitialIdentity(parsedInput.hostId)
     try {
       /** 当前主机的 systemd 能力。 */
-      const capability = await this.discoverCapability(identity)
+      const capability = await this.discoverCapability(identity, signal)
       if (capability !== 'available') {
         return parseServerOpsServiceListResult({ hostId: identity.hostId, capability, services: [], warnings: [] })
       }
       /** 固定 list-units 命令的远程结果或明确权限状态。 */
-      const listExecution = await this.execServiceList(identity)
+      const listExecution = await this.execServiceList(identity, signal)
       if (listExecution.capability === 'permission-denied') {
         return parseServerOpsServiceListResult({
           hostId: identity.hostId, capability: 'permission-denied', services: [], warnings: [],
@@ -183,6 +186,7 @@ export class ServerOpsSystemdService {
       /** 严格解析并限制为前一千项的服务摘要。 */
       const services = this.parseServiceList(result.stdout).slice(0, SERVER_OPS_SYSTEMD_MAX_SERVICES)
       this.assertIdentityUnchanged(identity)
+      if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
       return parseServerOpsServiceListResult({ hostId: identity.hostId, capability, services, warnings: [] })
     } catch (error) {
       throw createPublicSystemdError(error, 'SERVER_OPS_SYSTEMD_OUTPUT_INVALID')
@@ -294,7 +298,7 @@ export class ServerOpsSystemdService {
   }
 
   /** 使用固定命令发现 PID 1 与 systemctl 能力。 */
-  private async discoverCapability(identity: ServerOpsActiveConnectionIdentity): Promise<ServerOpsSystemdCapability> {
+  private async discoverCapability(identity: ServerOpsActiveConnectionIdentity, signal?: AbortSignal): Promise<ServerOpsSystemdCapability> {
     /** 能力命令允许用非零 127 表示没有 systemctl，其他字段仍严格有界。 */
     let result: ServerOpsRuntimeExecResult
     try {
@@ -303,13 +307,16 @@ export class ServerOpsSystemdService {
         identity.connectionId,
         SERVER_OPS_SYSTEMD_CAPABILITY_COMMAND,
         SERVER_OPS_SYSTEMD_READ_TIMEOUT_MS,
+        signal,
       )
     } catch (error) {
       this.assertIdentityUnchanged(identity)
+      if (signal?.aborted || (error instanceof Error && error.message === 'SERVER_OPS_EXEC_CANCELLED')) throw new Error('SERVER_OPS_EXEC_CANCELLED')
       if (error instanceof Error && error.message === 'SERVER_OPS_CONNECTION_NOT_ACTIVE') throw new Error('SERVER_OPS_CONNECTION_CHANGED')
       throw new Error('SERVER_OPS_SYSTEMD_OUTPUT_INVALID')
     }
     this.assertIdentityUnchanged(identity)
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     if (result.signal !== undefined || result.truncated || result.stderr.trim().length > 0 || (result.exitCode !== 0 && result.exitCode !== 127)) {
       throw new Error('SERVER_OPS_SYSTEMD_OUTPUT_INVALID')
     }
@@ -343,7 +350,7 @@ export class ServerOpsSystemdService {
   }
 
   /** 执行固定列表命令，并只识别 LC_ALL=C 下的标准权限拒绝文本。 */
-  private async execServiceList(identity: ServerOpsActiveConnectionIdentity): Promise<ServiceListExecution> {
+  private async execServiceList(identity: ServerOpsActiveConnectionIdentity, signal?: AbortSignal): Promise<ServiceListExecution> {
     /** systemctl list-units 返回的原始结果。 */
     let result: ServerOpsRuntimeExecResult
     try {
@@ -352,13 +359,16 @@ export class ServerOpsSystemdService {
         identity.connectionId,
         SERVER_OPS_SYSTEMD_LIST_COMMAND,
         SERVER_OPS_SYSTEMD_READ_TIMEOUT_MS,
+        signal,
       )
     } catch (error) {
       this.assertIdentityUnchanged(identity)
+      if (signal?.aborted || (error instanceof Error && error.message === 'SERVER_OPS_EXEC_CANCELLED')) throw new Error('SERVER_OPS_EXEC_CANCELLED')
       if (error instanceof Error && error.message === 'SERVER_OPS_CONNECTION_NOT_ACTIVE') throw new Error('SERVER_OPS_CONNECTION_CHANGED')
       throw new Error('SERVER_OPS_SYSTEMD_OUTPUT_INVALID')
     }
     this.assertIdentityUnchanged(identity)
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     if (result.exitCode === 0 && result.signal === undefined && !result.truncated && result.stderr.trim().length === 0) {
       return { capability: 'available', result }
     }

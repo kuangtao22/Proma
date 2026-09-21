@@ -21,7 +21,7 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
   return [
     sdk.defineTool({
       name: 'ops_resources', label: '查看已授权运维资源',
-      description: `List only the servers, MySQL databases/tables and Redis sources explicitly authorized for this Agent run.${UNTRUSTED_EVIDENCE}`,
+      description: `List only the servers, MySQL/SQLite databases/tables and Redis sources explicitly authorized for this session lease. If authorization is required, ask the user to manage Agent read access and start a new message.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() { return jsonToolResult(facade.resources()) },
     }),
@@ -29,23 +29,23 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
       name: 'ops_server_overview', label: '读取服务器概览',
       description: `Read a bounded structured overview from one already connected authorized server.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ hostId: Type.String() }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.serverOverview(params as { hostId: string })) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.serverOverview(params as { hostId: string }, signal)) },
     }),
     sdk.defineTool({
       name: 'ops_server_services', label: '读取服务器服务',
       description: `Read the bounded systemd service list from one already connected authorized server.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ hostId: Type.String() }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.serverServices(params as { hostId: string })) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.serverServices(params as { hostId: string }, signal)) },
     }),
     sdk.defineTool({
       name: 'ops_data_test', label: '测试数据连接',
-      description: `Test one saved authorized MySQL or Redis source using its credentials retained by Proma.${UNTRUSTED_EVIDENCE}`,
+      description: `Test one saved authorized MySQL, SQLite or Redis source using the connection retained by Proma.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ sourceId: Type.String() }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.dataProbe(params as { sourceId: string })) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.dataProbe(params as { sourceId: string }, signal)) },
     }),
     sdk.defineTool({
       name: 'ops_data_diagnose', label: '读取数据服务诊断',
-      description: `Read sanitized MySQL or Redis diagnostics in an explicitly authorized instance or database scope.${UNTRUSTED_EVIDENCE}`,
+      description: `Read sanitized MySQL, SQLite or Redis diagnostics in an explicitly authorized instance or database scope.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(),
         scope: Type.Union([Type.Literal('instance'), Type.Literal('database')]),
@@ -54,36 +54,36 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
           Type.Literal('overview'), Type.Literal('sessions'), Type.Literal('statements'), Type.Literal('parameters'),
         ])),
       }, { additionalProperties: false }),
-      async execute(_id, params) {
-        return jsonToolResult(await facade.dataDiagnose(params as Parameters<ServerOpsAgentReadFacade['dataDiagnose']>[0]))
+      async execute(_id, params, signal) {
+        return jsonToolResult(await facade.dataDiagnose(params as Parameters<ServerOpsAgentReadFacade['dataDiagnose']>[0], signal))
       },
     }),
     sdk.defineTool({
       name: 'ops_database_tables', label: '读取数据库表目录',
-      description: `List only the explicitly authorized tables in one explicitly named MySQL database.${UNTRUSTED_EVIDENCE}`,
+      description: `List only the explicitly authorized tables in one explicitly named MySQL or SQLite database (SQLite uses main).${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }) }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.databaseTables(params as { sourceId: string; database: string })) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.databaseTables(params as { sourceId: string; database: string }, signal)) },
     }),
     sdk.defineTool({
       name: 'ops_database_describe', label: '读取数据库表结构',
-      description: `Read columns and indexes for one explicitly authorized MySQL table.${UNTRUSTED_EVIDENCE}`,
+      description: `Read columns and indexes for one explicitly authorized MySQL or SQLite table.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }), table: Type.String({ minLength: 1, maxLength: 128 }),
       }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.databaseDescribe(params as { sourceId: string; database: string; table: string })) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.databaseDescribe(params as { sourceId: string; database: string; table: string }, signal)) },
     }),
     sdk.defineTool({
       name: 'ops_database_rows', label: '读取数据库表数据',
-      description: `Read one bounded page from an explicitly authorized MySQL table. Sensitive-looking columns are masked by default. If continuation is returned, continue at nextOffset with recommendedLimit to avoid skipping rows.${UNTRUSTED_EVIDENCE}`,
+      description: `Read one bounded page from an explicitly authorized MySQL or SQLite table. Sensitive-looking columns are masked by default. If continuation is returned, continue at nextOffset with recommendedLimit to avoid skipping rows.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }), table: Type.String({ minLength: 1, maxLength: 128 }),
         offset: Type.Integer({ minimum: 0, maximum: 1_000_000 }), limit: Type.Integer({ minimum: 1, maximum: 50 }),
       }, { additionalProperties: false }),
-      async execute(_id, params) { return jsonToolResult(await facade.databaseRows(params as Parameters<ServerOpsAgentReadFacade['databaseRows']>[0])) },
+      async execute(_id, params, signal) { return jsonToolResult(await facade.databaseRows(params as Parameters<ServerOpsAgentReadFacade['databaseRows']>[0], signal)) },
     }),
     sdk.defineTool({
       name: 'ops_database_query', label: '执行只读 SQL 查询',
-      description: `Execute one read-only MySQL SELECT only when the database scope explicitly grants query and row access. Every referenced base table must be authorized. Supports filtering, aggregation and joins within the named database. No comments, subqueries, CTEs, UNION, views, protected fields, writes, locking, user variables or arbitrary functions. Returns at most 50 rows with a bounded execution time and result size. SQL literals are omitted from audit.${UNTRUSTED_EVIDENCE}`,
+      description: `Execute one read-only MySQL or SQLite SELECT only when the database scope explicitly grants query and row access. Every referenced base table must be authorized. Supports filtering, aggregation and joins within the named database. No comments, subqueries, CTEs, UNION, views, protected fields, writes, locking, user variables or arbitrary functions. Returns at most 50 rows with a bounded execution time and result size. SQL literals are omitted from audit.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }),
         sql: Type.String({ minLength: 1, maxLength: 16_384 }), maxRows: Type.Integer({ minimum: 1, maximum: 50 }),

@@ -18,7 +18,7 @@ import { ServerOpsDatabaseDiagnostics } from './ServerOpsDatabaseDiagnostics'
 import { ServerOpsSqlQueryPanel } from './ServerOpsSqlQueryPanel'
 import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
 import { formatServerOpsDataProbeSummary } from './server-ops-data-display'
-import { SERVER_OPS_SEGMENTED_CLASS } from './server-ops-ui'
+import { SERVER_OPS_SEGMENTED_CLASS, SERVER_OPS_TAB_CLASS } from './server-ops-ui'
 
 /** 实例菜单直接对应全局读取，不再嵌套混合范围的运行诊断。 */
 const instancePages = [['overview', '总览'], ['sessions', '会话'], ['statements', '语句分析'], ['parameters', '实例参数']] as const
@@ -34,7 +34,7 @@ const pageTabClass = 'inline-flex h-9 shrink-0 items-center justify-center white
 /** 不含凭据的配置身份；仅展示名称与无关 SSH 状态不参与。 */
 export function getServerOpsDatabaseReadIdentity(source: ServerOpsDataSource): string {
   return JSON.stringify([source.id, source.updatedAt, source.engine, source.transport, source.hostId, source.address, source.port,
-    source.database, source.username, source.tlsMode, source.tlsServerName, source.hasPassword])
+    source.filePath, source.database, source.username, source.tlsMode, source.tlsServerName, source.hasPassword])
 }
 
 /** MySQL 独立工作台输入；连接头由外层统一渲染。 */
@@ -52,6 +52,8 @@ export interface ServerOpsDatabaseWorkbenchProps {
  * 布局展开只改变父容器，不卸载控制器；全局仅保留轻量导航。
  */
 export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, renderHeader, onSourceMutated }: ServerOpsDatabaseWorkbenchProps): React.ReactElement {
+  /** SQLite 固定 main 范围，不提供 MySQL 实例级页面。 */
+  const sqlite = source.engine === 'sqlite'
   /** 从当前 Jotai store 恢复本 Pane 的轻量导航，测试 Provider 也能隔离。 */
   const store = useStore()
   const saveNavigation = useSetAtom(updateServerOpsDatabaseNavigationAtom)
@@ -60,12 +62,15 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
   /** 一次挂载固定初值；同 ID 配置变化通过后续 effect 清理。 */
   const [initial] = React.useState(() => {
     const saved = store.get(serverOpsDatabaseNavigationAtom).get(viewKey)
-    return saved?.configurationKey === identity && (saved.section === 'instance' || saved.section === 'database') ? saved : createServerOpsDatabaseNavigation(identity)
+    const navigation = saved?.configurationKey === identity && (saved.section === 'instance' || saved.section === 'database') ? saved : createServerOpsDatabaseNavigation(identity)
+    return sqlite ? { ...navigation, section: 'database' as const, database: 'main' } : navigation
   })
   /** 所有界面投影使用本组件私有 Jotai atom，不泄漏业务行到全局。 */
   const [navigationAtom] = React.useState(() => atom(initial))
   const [navigation, setNavigation] = useAtom(navigationAtom)
-  const [schemaAtom] = React.useState(() => atom(createServerOpsSchemaIdleProjection()))
+  const [schemaAtom] = React.useState(() => atom(sqlite
+    ? { ...createServerOpsSchemaIdleProjection(), sourceId: source.id, engine: 'sqlite' as const, databases: ['main'], database: 'main' }
+    : createServerOpsSchemaIdleProjection()))
   const [schema, setSchema] = useAtom(schemaAtom)
   /** 实例和当前库分开缓存，切换范围不会把同名页面的快照串用。 */
   const [instanceDiagnosticsAtom] = React.useState(() => atom<ServerOpsDiagnosticsProjection>({ page: null, database: null, pages: {} }))
@@ -112,16 +117,19 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
     instanceDiagnosticsController.setSource(source.id, identity, readable)
     databaseDiagnosticsController.setSource(source.id, identity, readable)
     databaseDiagnosticsController.setDatabase(currentSchema.database)
+    if (sqlite) return
     instanceDiagnosticsController.selectPage(configurationMatches && navigation.section === 'instance' ? navigation.instancePage : null)
     databaseDiagnosticsController.selectPage(configurationMatches && navigation.section === 'database' && !waitingForDatabase && navigation.databasePage !== 'browse' && navigation.databasePage !== 'query' ? navigation.databasePage : null)
-  }, [instanceDiagnosticsController, databaseDiagnosticsController, schemaController, schema.database, schema.status, schema.sourceId, navigation.configurationKey, navigation.section, navigation.instancePage, navigation.databasePage, source.id, identity, readable])
+  }, [instanceDiagnosticsController, databaseDiagnosticsController, schemaController, schema.database, schema.status, schema.sourceId, navigation.configurationKey, navigation.section, navigation.instancePage, navigation.databasePage, source.id, identity, readable, sqlite])
   /** 只在目录已验证后记住库表，初始化空投影不能覆盖恢复目标。 */
   React.useEffect(() => {
     if (schema.status !== 'ready' || schema.sourceId !== source.id) return
-    setNavigation((previous) => previous.database === schema.database && previous.table === schema.selectedTable && previous.detailTab === schema.detailTab && previous.offset === schema.rows.offset ? previous : {
-      ...previous, database: schema.database, table: schema.selectedTable, detailTab: schema.detailTab, offset: schema.rows.offset,
+    /** 筛选仅存在内存；恢复导航时必须从未筛选的首页开始。 */
+    const offset = schema.rowFilters === null ? schema.rows.offset : 0
+    setNavigation((previous) => previous.database === schema.database && previous.table === schema.selectedTable && previous.detailTab === schema.detailTab && previous.offset === offset ? previous : {
+      ...previous, database: schema.database, table: schema.selectedTable, detailTab: schema.detailTab, offset,
     })
-  }, [schema.status, schema.sourceId, schema.database, schema.selectedTable, schema.detailTab, schema.rows.offset, source.id, setNavigation])
+  }, [schema.status, schema.sourceId, schema.database, schema.selectedTable, schema.detailTab, schema.rows.offset, schema.rowFilters, source.id, setNavigation])
   React.useEffect(() => { saveNavigation({ key: viewKey, navigation }) }, [saveNavigation, viewKey, navigation])
   /** 合并轻量导航字段，重复交互不产生额外状态写入。 */
   const updateNavigation = (update: Partial<ServerOpsDatabaseNavigation>): void => setNavigation((previous) => ({ ...previous, ...update }))
@@ -148,11 +156,25 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
     {probe ? <div role="status" className="mx-4 my-2 shrink-0 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">{probe.state === 'running' ? '正在测试连接…' : probe.state === 'error' ? probe.error : probe.result ? formatServerOpsDataProbeSummary(probe.result) : ''}</div> : null}
     {management.error ? <div role="alert" className="mx-4 my-2 shrink-0 rounded-lg bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-destructive">{management.error}</div> : null}
     {!readable ? <div className="mx-4 my-2 shrink-0 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">跳板服务器尚未连接，连接后才能读取数据库。连接设置仍可编辑。</div> : null}
-    <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={navigation.section} onValueChange={(section) => updateNavigation({ section: section as ServerOpsDatabaseSection })}>
-      <div className="flex min-h-11 shrink-0 flex-wrap items-start gap-x-3 gap-y-1 border-b border-border/40 px-3 py-2" data-server-ops-database-scope-toolbar>
-        <TabsList className={SERVER_OPS_SEGMENTED_CLASS} aria-label="工作台范围">
-          <TabsTrigger className="h-7 px-2.5 text-xs" value="instance">实例</TabsTrigger>
-          <TabsTrigger className="h-7 px-2.5 text-xs" value="database">数据库</TabsTrigger>
+    {sqlite ? (
+      <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={navigation.databasePage === 'query' ? 'query' : 'browse'} onValueChange={(databasePage) => updateNavigation({ section: 'database', database: 'main', databasePage: databasePage as ServerOpsDatabasePage })}>
+        <TabsList className={pageTabsListClass} aria-label="数据库功能" data-server-ops-database-page-tabs="database">
+          <TabsTrigger className={pageTabClass} value="browse">数据浏览</TabsTrigger>
+          <TabsTrigger className={pageTabClass} value="query">SQL 查询</TabsTrigger>
+        </TabsList>
+        <TabsContent value="browse" forceMount className={contentClass}>
+          <ServerOpsSchemaBrowserView projection={schema} showDatabaseSelector={false} onSelectDatabase={selectDatabase} onOpenTable={schemaController.openTable} onBackToList={schemaController.backToList} onDetailTabChange={schemaController.setDetailTab} onLoadRows={schemaController.loadRows} onApplyRowFilters={schemaController.applyRowFilters} onLoadFilterFields={schemaController.loadFilterFields} onRefresh={schemaController.refresh} onRefreshTables={schemaController.refreshTables} directoryWidth={navigation.directoryWidth} onDirectoryWidthChange={(directoryWidth) => updateNavigation({ directoryWidth })} />
+        </TabsContent>
+        <TabsContent value="query" className={contentClass}>
+          <ServerOpsSqlQueryPanel api={api} sourceId={source.id} database="main" configurationKey={identity} available={readable} dialect="sqlite" />
+        </TabsContent>
+      </Tabs>
+    ) : <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={navigation.section} onValueChange={(section) => updateNavigation({ section: section as ServerOpsDatabaseSection })}>
+      <div className="flex min-h-12 shrink-0 flex-wrap items-start gap-x-3 gap-y-2 border-b border-border/40 px-3 py-2" data-server-ops-database-scope-toolbar>
+        {/* 范围切换与选库、刷新统一为 32px；状态提示增加高度时仍按第一行对齐。 */}
+        <TabsList className={`${SERVER_OPS_SEGMENTED_CLASS} h-8 shrink-0`} aria-label="工作台范围">
+          <TabsTrigger className={`${SERVER_OPS_TAB_CLASS} min-w-14 focus-visible:ring-inset focus-visible:ring-offset-0`} value="instance">实例</TabsTrigger>
+          <TabsTrigger className={`${SERVER_OPS_TAB_CLASS} min-w-14 focus-visible:ring-inset focus-visible:ring-offset-0`} value="database">数据库</TabsTrigger>
         </TabsList>
         {navigation.section === 'database'
           ? <ServerOpsDatabaseSelector compact projection={schema} onSelectDatabase={selectDatabase} onRefresh={schemaController.refreshTables} />
@@ -174,18 +196,18 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
             {databasePages.map(([page, label]) => <TabsTrigger key={page} className={pageTabClass} value={page}>{label}</TabsTrigger>)}
           </TabsList> : null}
           <TabsContent value="browse" forceMount className={contentClass}>
-            <ServerOpsSchemaBrowserView projection={schema} showDatabaseSelector={false} onSelectDatabase={selectDatabase} onOpenTable={schemaController.openTable} onBackToList={schemaController.backToList} onDetailTabChange={schemaController.setDetailTab} onLoadRows={schemaController.loadRows} onRefresh={schemaController.refresh} onRefreshTables={schemaController.refreshTables} directoryWidth={navigation.directoryWidth} onDirectoryWidthChange={(directoryWidth) => updateNavigation({ directoryWidth })} />
+            <ServerOpsSchemaBrowserView projection={schema} showDatabaseSelector={false} onSelectDatabase={selectDatabase} onOpenTable={schemaController.openTable} onBackToList={schemaController.backToList} onDetailTabChange={schemaController.setDetailTab} onLoadRows={schemaController.loadRows} onApplyRowFilters={schemaController.applyRowFilters} onLoadFilterFields={schemaController.loadFilterFields} onRefresh={schemaController.refresh} onRefreshTables={schemaController.refreshTables} directoryWidth={navigation.directoryWidth} onDirectoryWidthChange={(directoryWidth) => updateNavigation({ directoryWidth })} />
           </TabsContent>
           <TabsContent value="query" className={contentClass}>
-            <ServerOpsSqlQueryPanel api={api} sourceId={source.id} database={schema.database} configurationKey={identity} available={readable} />
+            <ServerOpsSqlQueryPanel api={api} sourceId={source.id} database={schema.database} configurationKey={identity} available={readable} dialect="mysql" />
           </TabsContent>
           {databasePages.map(([page]) => page === 'browse' || page === 'query' ? null : <TabsContent key={page} value={page} className={contentClass}>
             <ServerOpsDatabaseDiagnostics projection={databaseDiagnostics} page={page} scope="database" onRefresh={databaseDiagnosticsController.refresh} />
           </TabsContent>)}
         </Tabs>
       </TabsContent>
-    </Tabs>
-    <ServerOpsDataSourceDialog open={management.dialog !== null} mode="edit" source={management.dialog?.source ?? source} hostId={jumpHost?.id ?? ''} hostLabel={jumpHost?.label ?? ''} submitting={management.submitting} error={management.dialogError} elevated onTest={(draft) => api.probeServerOpsDataSource({ draft })} onRevealPassword={async (sourceId) => (await api.revealServerOpsDataSourcePassword({ sourceId })).password} onSubmit={managementController.submitDialog} onClose={managementController.closeDialog} />
+    </Tabs>}
+    <ServerOpsDataSourceDialog open={management.dialog !== null} mode="edit" source={management.dialog?.source ?? source} hostId={jumpHost?.id ?? ''} hostLabel={jumpHost?.label ?? ''} hostOptions={jumpHost ? [{ id: jumpHost.id, label: jumpHost.label }] : []} submitting={management.submitting} error={management.dialogError} elevated onTest={(draft) => api.probeServerOpsDataSource({ draft })} onRevealPassword={async (sourceId) => (await api.revealServerOpsDataSourcePassword({ sourceId })).password} onSubmit={managementController.submitDialog} onClose={managementController.closeDialog} />
     <Dialog open={management.deleteTarget !== null} onOpenChange={(open) => { if (!open) managementController.cancelDelete() }}><DialogContent className="z-[260]" overlayClassName="z-[250]"><DialogTitle>删除连接</DialogTitle><DialogDescription>删除「{source.label}」的本地连接配置及已保存密码，不会删除数据库中的表和数据。</DialogDescription><DialogFooter><Button variant="outline" onClick={managementController.cancelDelete}>取消</Button><Button variant="destructive" onClick={managementController.confirmDelete}>删除连接</Button></DialogFooter></DialogContent></Dialog>
   </>
 }

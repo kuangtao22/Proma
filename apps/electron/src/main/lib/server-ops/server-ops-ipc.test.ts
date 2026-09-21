@@ -1,3 +1,4 @@
+import { SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS } from '@proma/shared'
 import { describe, expect, spyOn, test } from 'bun:test'
 import { SERVER_OPS_IPC_CHANNELS, SERVER_OPS_TRUST_CHANNELS, SERVER_OPS_DOCKER_CHANNELS, SERVER_OPS_FILE_CHANNELS, SERVER_OPS_CONSOLE_IPC_CHANNELS, SERVER_OPS_TRANSFER_CHANNELS, SERVER_OPS_DATA_CHANNELS, SERVER_OPS_DATA_SCHEMA_CHANNELS, SERVER_OPS_PROJECT_CHANNELS } from '@proma/shared'
 import type { AgentSessionMeta, ServerOpsAuditListResult, ServerOpsConnectionState, ServerOpsHost, ServerOpsLogExitEvent, ServerOpsLogOutputEvent, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputEvent, ServerOpsUpsertHostInput } from '@proma/shared'
@@ -156,11 +157,12 @@ describe('服务器运维 IPC', () => {
   test('Given 查询历史 IPC When sender、输入或数据源不可信 Then 拒绝；合法 MySQL 只访问本地 Store', async () => {
     /** 记录本地历史调用，证明 handler 不经过远端查询服务。 */
     const calls: unknown[] = []
-    const createFixture = (engine: 'mysql' | 'redis' = 'mysql') => createAgentAccessHarness({
+    const createFixture = (engine: 'mysql' | 'redis' | 'sqlite' = 'mysql') => createAgentAccessHarness({
       data: {
         listSources: () => ({ sources: [{
-          id: 'source-1', transport: 'direct', engine, label: '主库', address: '127.0.0.1', port: engine === 'mysql' ? 3306 : 6379,
-          database: 'app', tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1,
+          id: 'source-1', engine, label: '主库',
+          ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: engine === 'mysql' ? 3306 : 6379, database: 'app' }),
+          tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1,
         }] }),
         upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
         probeSource: async () => { throw new Error('NOT_USED') }, diagnoseSource: async () => { throw new Error('NOT_USED') },
@@ -189,11 +191,16 @@ describe('服务器运维 IPC', () => {
     const redis = createFixture('redis')
     await expect(invoke(redis.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, redis.sender, scope))
       .rejects.toThrow('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+    /** SQLite 历史也只读本地 Store，且不得写到附加库名下。 */
+    const sqlite = createFixture('sqlite')
+    await expect(invoke(sqlite.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, sqlite.sender, { ...scope, database: 'main' })).resolves.toEqual({ entries: [] })
+    await expect(invoke(sqlite.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, sqlite.sender, { ...scope, database: 'other' })).rejects.toThrow('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+    sqlite.registration.dispose()
     fixture.registration.dispose()
     redis.registration.dispose()
   })
 
-  test('Given SQL IPC When 授权窗口执行或关闭 Then 验证结果、记录审计并取消真实 signal', async () => {
+  test.each(['mysql', 'sqlite'] as const)('Given %s SQL IPC When 授权窗口执行或关闭 Then 验证结果、记录审计并取消真实 signal', async (engine) => {
     /** 不含网络实现的服务桩，只观察 IPC 到服务的真实取消与审计顺序。 */
     let signal: AbortSignal | undefined
     let finish!: () => void
@@ -201,7 +208,7 @@ describe('服务器运维 IPC', () => {
     const fixture = createAgentAccessHarness({
       auditAppend: (input) => { const record = { ...input, id: 'audit-1', timestamp: Date.now() }; expect(isServerOpsAuditRecord(record)).toBe(true); records.push(record); return record },
       data: {
-        listSources: () => ({ sources: [] }), upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
+        listSources: () => ({ sources: [{ id: 'db-1', engine, label: '查询数据库', ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: 3306, database: 'app' }), tlsMode: 'disabled' as const, hasPassword: false, createdAt: 1, updatedAt: 1 }] }), upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
         probeSource: async () => { throw new Error('NOT_USED') }, diagnoseSource: async () => { throw new Error('NOT_USED') },
         revealSourcePassword: () => ({ password: null }), listSchemaTables: async () => ({ databases: [], tables: [] }),
         describeSchemaTable: async () => ({ columns: [], indexes: [] }), readSchemaRows: async () => ({ columns: [], rows: [], offset: 0, limit: 50, truncated: false }), removeHost: () => undefined,
@@ -212,7 +219,7 @@ describe('服务器运维 IPC', () => {
         },
       },
     })
-    const input = { sourceId: 'db-1', queryId: 'query-1', database: 'app', sql: 'SELECT id FROM users', maxRows: 50 }
+    const input = { sourceId: 'db-1', queryId: 'query-1', database: engine === 'sqlite' ? 'main' : 'app', sql: engine === 'sqlite' ? 'SELECT "id" FROM "users"' : 'SELECT id FROM users', maxRows: 50 }
     await expect(invoke(fixture.handlers, SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, createSender(99), input)).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
     const running = invoke(fixture.handlers, SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, fixture.sender, input)
     /** 两个微任务分别经过 IPC 分派与开始审计准备。 */
@@ -226,20 +233,69 @@ describe('服务器运维 IPC', () => {
     expect(JSON.stringify(records)).not.toContain('SELECT')
     fixture.registration.dispose()
   })
+  test('Given 已有 SSH 操作授权 When 未确认影响直接授予读取 Then 拒绝且保留原授权', async () => {
+    /** 窗口不能静默替换另一任务权限。 */
+    const fixture = createAgentAccessHarness()
+    fixture.access.grant({ sessionId: 'session-1', hostId: 'host-1', granted: true })
+    await expect(invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender,
+      { sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] })).rejects.toThrow('SERVER_OPS_ACCESS_IMPACT_CHANGED')
+    expect(fixture.access.getCurrent()).toBeDefined()
+    fixture.registration.dispose()
+  })
+
+  test('Given 当前会话有只读租约 When 切换会话撤销旧操作授权 Then 保留只读租约', async () => {
+    const fixture = createAgentAccessHarness()
+    await invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender,
+      { sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] })
+    await invoke(fixture.handlers, 'server-ops:revoke-legacy-agent-access-session', fixture.sender, 'session-1')
+    expect(fixture.access.getReadAccess('session-1')).toBeDefined()
+    fixture.registration.dispose()
+  })
+
+  test('Given 窗口已预览影响 When 另一会话新增授权 Then 陈旧操作确认被拒绝且全部只读租约保留', async () => {
+    /** 真实 IPC 快照与 Store 配合验证，不依赖 UI 是否正确显示。 */
+    const fixture = createAgentAccessHarness()
+    const grant = { sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] }
+    await invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender, grant)
+    const preview = await invoke(fixture.handlers, SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.IMPACT, fixture.sender) as { token: string }
+    fixture.access.grantRead({ ...grant, sessionId: 'session-2' } as import('@proma/shared').ServerOpsAgentReadGrant,
+      [{ key: 'ssh:host-1', fingerprint: 'other-host', hostId: 'host-1' }])
+    const access = { sessionId: 'session-1', hostId: 'host-1', granted: true }
+    await expect(invoke(fixture.handlers, SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, fixture.sender, { access, impactToken: preview.token })).rejects.toThrow('SERVER_OPS_ACCESS_IMPACT_CHANGED')
+    expect(fixture.access.listReadAccesses()).toHaveLength(2)
+    /** 用户看到最新影响后才允许撤销两份租约。 */
+    const current = fixture.access.listReadAccesses().sort((left, right) => left.sessionId.localeCompare(right.sessionId))
+    const token = JSON.stringify({ legacy: null, reads: current.map(({ sessionId, revision }) => ({ sessionId, revision })) })
+    await invoke(fixture.handlers, SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, fixture.sender, { access, impactToken: token })
+    expect(fixture.access.listReadAccesses()).toHaveLength(0)
+    expect(fixture.access.getCurrent()).toEqual(access)
+    fixture.registration.dispose()
+  })
+
+  test('Given 非授权窗口或归档会话 When 预览或申请读取 Then 在授权变化前拒绝', async () => {
+    const fixture = createAgentAccessHarness({ session: createAgentSession({ archived: true }) })
+    await expect(invoke(fixture.handlers, SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.IMPACT, createSender(99))).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+    await expect(invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender,
+      { sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] })).rejects.toThrow('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
+    expect(fixture.access.listReadAccesses()).toHaveLength(0)
+    fixture.registration.dispose()
+  })
+
   test('Given 普通会话 When 授予只读资源 Then 互斥广播并沿用会话与主机撤权入口', async () => {
     const fixture = createAgentAccessHarness()
     fixture.access.grant({ sessionId: 'session-1', hostId: 'host-1', granted: true })
     const input = { sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] }
-    const result = await invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender, input)
+    const impact = await invoke(fixture.handlers, SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.IMPACT, fixture.sender) as { token: string }
+    const result = await invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender, { grant: input, impactToken: impact.token })
     expect(result).toMatchObject(input)
     expect(fixture.access.getCurrent()).toBeUndefined()
     expect(fixture.events.some((event) => event.channel === SERVER_OPS_AGENT_READ_CHANNELS.CHANGED)).toBe(true)
     expect(fixture.events.some((event) => event.channel === SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED && (event.payload as { current: unknown }).current === null)).toBe(true)
     fixture.registration.revokeSession('session-1')
-    expect(fixture.access.getReadCurrent()).toBeUndefined()
+    expect(fixture.access.getReadAccess('session-1')).toBeUndefined()
     await invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender, input)
     fixture.registration.revokeHost('host-1')
-    expect(fixture.access.getReadCurrent()).toBeUndefined()
+    expect(fixture.access.getReadAccess('session-1')).toBeUndefined()
     fixture.registration.dispose()
   })
 
@@ -254,7 +310,7 @@ describe('服务器运维 IPC', () => {
     await expect(invoke(invisible.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, invisible.sender, input)).rejects.toThrow('SESSION_NOT_VISIBLE')
     const missing = createAgentAccessHarness({ hostExists: false })
     await expect(invoke(missing.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, missing.sender, input)).rejects.toThrow('SERVER_OPS_HOST_NOT_FOUND')
-    expect(fixture.access.getReadCurrent()).toBeUndefined()
+    expect(fixture.access.getReadAccess('session-1')).toBeUndefined()
     for (const harness of [fixture, hidden, invisible, missing]) harness.registration.dispose()
   })
 
@@ -690,7 +746,7 @@ describe('服务器运维 IPC', () => {
     await expect(invoke(handlers, SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS, sender, target)).resolves.toBeNull()
     await expect(invoke(handlers, SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, sender, { ...target, granted: true })).resolves.toEqual({ ...target, granted: true })
     expect(events.at(-1)).toEqual({ previous: null, current: { ...target, granted: true } })
-    await expect(invoke(handlers, SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, sender, { sessionId: 'session-2', hostId: 'host-1', granted: true })).resolves.toEqual({ sessionId: 'session-2', hostId: 'host-1', granted: true })
+    await expect(invoke(handlers, SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, sender, { access: { sessionId: 'session-2', hostId: 'host-1', granted: true }, impactToken: (await invoke(handlers, SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.IMPACT, sender) as { token: string }).token })).resolves.toEqual({ sessionId: 'session-2', hostId: 'host-1', granted: true })
     expect(events.at(-1)).toEqual({ previous: { ...target, granted: true }, current: { sessionId: 'session-2', hostId: 'host-1', granted: true } })
     visible = false
     await expect(invoke(handlers, SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS, sender, target)).rejects.toThrow('SESSION_NOT_VISIBLE')
@@ -798,7 +854,7 @@ describe('服务器运维 IPC', () => {
       SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED,
       SERVER_OPS_IPC_CHANNELS.LOG_OUTPUT,
       SERVER_OPS_IPC_CHANNELS.LOG_EXIT,
-    ] as readonly string[]).includes(channel)), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
+    ] as readonly string[]).includes(channel)).flatMap((channel) => channel === SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION ? [channel, ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS)] : [channel]), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
       ...Object.values(SERVER_OPS_FILE_CHANNELS),
       ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
       ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS),
@@ -1171,7 +1227,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(71)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(73)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1190,7 +1246,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(71)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(73)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

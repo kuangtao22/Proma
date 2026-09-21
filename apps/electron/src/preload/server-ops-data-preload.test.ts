@@ -1,8 +1,23 @@
 import { describe, expect, test } from 'bun:test'
-import { SERVER_OPS_DATA_CHANNELS, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS } from '@proma/shared'
+import { SERVER_OPS_DATA_CHANNELS, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS, SERVER_OPS_DATA_SCHEMA_CHANNELS } from '@proma/shared'
+import type { ServerOpsDataSourceRowsInput } from '@proma/shared'
 import { createServerOpsDataPreload } from './server-ops-data-preload'
 
 describe('Server Ops 数据服务 preload 边界', () => {
+  test('Given 表数据筛选 When preload 读取 Then 透传有界条件且拒绝原始 SQL 夹带', async () => {
+    /** 记录真实 bridge 下发的结构，验证新增字段不会被旧映射丢弃。 */
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const preload = createServerOpsDataPreload(async (channel, input) => {
+      calls.push({ channel, input })
+      return { columns: ['id'], rows: [['1']], offset: 0, limit: 50, truncated: false }
+    })
+    const input: ServerOpsDataSourceRowsInput = { sourceId: 'source-1', database: 'app', table: 'users', offset: 0, limit: 50,
+      filters: { match: 'all', conditions: [{ column: 'id', operator: 'gt', value: '0' }] } }
+    await expect(preload.readServerOpsDataSchemaRows(input)).resolves.toMatchObject({ rows: [['1']] })
+    expect(calls).toEqual([{ channel: SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_ROWS, input }])
+    await expect(preload.readServerOpsDataSchemaRows({ ...input, filters: { ...input.filters, rawSql: '1=1' } } as never)).rejects.toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
+    expect(calls).toHaveLength(1)
+  })
   test('Given 查询历史 list/save When bridge 调用 Then 输入与回执均走 exact-key parser', async () => {
     /** 记录两个历史通道的严格输入，模拟主进程返回该 scope 的完整列表。 */
     const calls: Array<{ channel: string; input: unknown }> = []

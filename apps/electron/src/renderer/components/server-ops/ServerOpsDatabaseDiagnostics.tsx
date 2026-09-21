@@ -7,6 +7,7 @@ import { ServerOpsDataMetricGrid, ServerOpsDataTable } from './ServerOpsDataServ
 import { ServerOpsDataReadStatus } from './ServerOpsSchemaBrowserView'
 import { cn } from '@/lib/utils'
 import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TABLE_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
+import { formatServerOpsDataTlsStatus } from './server-ops-data-display'
 import type { ServerOpsDiagnosticPage, ServerOpsDiagnosticsProjection } from './server-ops-diagnostics-controller'
 
 /** 数据库诊断正文属性；导航与日志入口由外层工作台持有。 */
@@ -119,7 +120,8 @@ export function ServerOpsDatabaseDiagnostics({
           </table>
           {state.status === 'ready' && !parameters.length ? <p className="p-6 text-center text-xs text-muted-foreground">{search ? '没有匹配的参数名称' : '没有可见参数'}</p> : null}
         </div>
-      </> : <div className="min-h-0 flex-1 overflow-auto" data-server-ops-diagnostic-page={page}>
+      </> : <div className={cn('min-h-0 flex-1 overflow-auto', !result?.metrics.length && 'pt-3')} data-server-ops-diagnostic-page={page}>
+        {/* 指标网格自带顶部留白；仅有结果表时补齐与说明栏之间的间距。 */}
         {result?.metrics.length ? <ServerOpsDataMetricGrid metrics={result.metrics} /> : null}
         {result?.tables.map((table) => <ServerOpsDataTable
           key={table.id}
@@ -130,7 +132,7 @@ export function ServerOpsDatabaseDiagnostics({
         />)}
         {state.status === 'ready' && result && !result.metrics.length && !result.tables.length ? <p className="p-6 text-center text-xs text-muted-foreground">当前页面没有可展示的结果</p> : null}
       </div>}
-      {state.collectedAt || (page === 'parameters' && result) ? <div className={SERVER_OPS_STATUSBAR_CLASS}>{page === 'parameters' && result ? <span>{parameters.length} / {result.parameters?.length ?? 0} 个参数{result.parametersTruncated ? ' · 结果已按上限截断' : ''}</span> : null}{state.collectedAt ? <span>采样时间 {new Date(state.collectedAt).toLocaleString('zh-CN')} · 手动刷新</span> : null}</div> : null}
+      {state.collectedAt || (page === 'parameters' && result) ? <div className={SERVER_OPS_STATUSBAR_CLASS}>{page === 'parameters' && result ? <span>{parameters.length} / {result.parameters?.length ?? 0} 个参数{result.parametersTruncated ? ' · 结果已按上限截断' : ''}</span> : null}{formatServerOpsDataTlsStatus(result?.tlsStatus) ? <span>{formatServerOpsDataTlsStatus(result?.tlsStatus)}</span> : null}{state.collectedAt ? <span>采样时间 {new Date(state.collectedAt).toLocaleString('zh-CN')} · 手动刷新</span> : null}</div> : null}
     </>}
   </div>
 }

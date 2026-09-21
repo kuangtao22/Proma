@@ -138,6 +138,20 @@ async function expectErrorCode(promise: Promise<unknown>, code: string): Promise
 }
 
 describe('服务器运维 systemd Service', () => {
+  test('Given Agent 取消 systemd 能力读取 When runtime 拒绝 Then 停止后续命令并保留取消码', async () => {
+    const controller = new AbortController()
+    let calls = 0
+    const fixture = createFixture({ respond: () => {
+      calls += 1
+      return new Promise<ServerOpsRuntimeExecResult>((_resolve, reject) => {
+        controller.signal.addEventListener('abort', () => reject(new Error('SERVER_OPS_EXEC_CANCELLED')), { once: true })
+      })
+    } })
+    const pending = fixture.service.listServices({ hostId: 'host-1' }, controller.signal)
+    controller.abort()
+    await expect(pending).rejects.toThrow('SERVER_OPS_EXEC_CANCELLED')
+    expect(calls).toBe(1)
+  })
   test('Given 审计 schema guard 等待期间连接变化 When 执行动作 Then 不写 start 审计且不执行远程命令', async () => {
     const prepared = createDeferred<void>()
     const fixture = createFixture({ prepareAudit: () => prepared.promise })

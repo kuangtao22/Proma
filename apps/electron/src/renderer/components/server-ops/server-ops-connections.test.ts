@@ -85,6 +85,26 @@ describe('项目连接模型', () => {
     })
   })
 
+  test('Given SQLite 文件连接 When 构造展示模型 Then 卡片显示文件路径与 SQLite', () => {
+    const connections = buildServerOpsConnections({
+      projects: [createProject('project-1', '生产环境')],
+      hosts: [createHost('host-1', '应用服务器', 'project-1')],
+      dataSources: [createDataSource('source-sqlite', '审计文件', {
+        projectId: 'project-1', transport: 'ssh', hostId: 'host-1', engine: 'sqlite',
+        filePath: '/srv/data/audit.sqlite3', database: 'main',
+      })],
+      connectionStates: {},
+    })
+    expect(connections[1]).toMatchObject({
+      kind: 'database',
+      endpoint: '/srv/data/audit.sqlite3',
+      metadata: 'SQLite · 经跳板',
+      protocol: 'SQLite',
+      detail: '/srv/data/audit.sqlite3 · SQLite · 经跳板',
+      plaintextDirect: false,
+    })
+  })
+
   test('Given 三类连接 When 按类别过滤 Then 分别只返回服务器数据库与 Redis', () => {
     /** 三类连接保持固定顺序，便于同时验证 all 不重排。 */
     const connections = buildServerOpsConnections({
@@ -229,12 +249,14 @@ describe('项目连接模型', () => {
         createDataSource('source-plain', '内网明文库', { transport: 'direct', address: '172.16.10.198', tlsMode: 'disabled' }),
         createDataSource('source-internal-tls', '内网 TLS 库', { transport: 'direct', address: '10.0.0.9', tlsMode: 'verify', tlsServerName: 'db.internal' }),
         createDataSource('source-public-tls', '公网 TLS 库', { transport: 'direct', address: '8.8.8.8', tlsMode: 'verify', tlsServerName: 'db.example.com' }),
+        createDataSource('source-preferred', '优先 TLS 库', { transport: 'direct', address: '10.0.0.8', tlsMode: 'preferred' }),
       ],
       connectionStates: {},
     })
     expect(connections.find((connection) => connection.id === 'data:source-plain')?.plaintextDirect).toBe(true)
     expect(connections.find((connection) => connection.id === 'data:source-internal-tls')?.plaintextDirect).toBe(false)
     expect(connections.find((connection) => connection.id === 'data:source-public-tls')?.plaintextDirect).toBe(false)
+    expect(connections.find((connection) => connection.id === 'data:source-preferred')?.plaintextDirect).toBe(false)
   })
 
   test('Given 停留项目视图或选择某条连接 When 解析中间区域目标 Then 分别渲染项目分组与能力页签', () => {

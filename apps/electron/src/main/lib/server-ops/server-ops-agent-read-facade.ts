@@ -38,7 +38,7 @@ import { isOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import { getServerOpsServiceContext } from './server-ops-service-context'
 import { captureServerOpsReadBindings } from './server-ops-agent-read-identity'
 import type { ServerOpsAgentReadBinding } from './server-ops-agent-access-store'
-import type { ServerOpsDataService } from './server-ops-data-service'
+import type { ServerOpsDataService, ServerOpsReadContext } from './server-ops-data-service'
 import type { ServerOpsHostStoreContract } from './server-ops-ipc'
 import type { ServerOpsOverviewService } from './server-ops-overview-service'
 import type { ServerOpsSystemdService } from './server-ops-systemd-service'
@@ -57,9 +57,12 @@ const RAW_STATEMENT_COLUMN = /(sql|query|statement|digest|command|args?|argument
 /** Facade 服务边界不包含密码读取、任意命令或连接建立能力。 */
 export interface ServerOpsAgentReadFacadeServices {
   hosts: Pick<ServerOpsHostStoreContract, 'get'>
+  /** 仅允许读取不可逆凭据版本，禁止 Facade 解密。 */
+  credentials?: { getVersion?: (hostId: string, credentialRef?: string) => string | null }
   access: {
-    getReadCurrent(): ServerOpsAgentReadAccess | undefined
-    getReadBinding(key: string): ServerOpsAgentReadBinding | undefined
+    getReadAccess(sessionId: string): ServerOpsAgentReadAccess | undefined
+    getReadBinding(sessionId: string, key: string): ServerOpsAgentReadBinding | undefined
+    revokeReadResource?(sessionId: string, key: string, expectedRevision: number): boolean
     revokeHost?(hostId: string): boolean
     revokeSource?(sourceId: string): boolean
     onReadChanged?(listener: (event: ServerOpsAgentReadChanged) => void): () => void
@@ -67,7 +70,7 @@ export interface ServerOpsAgentReadFacadeServices {
   overview: Pick<ServerOpsOverviewService, 'getOverview'>
   systemd: Pick<ServerOpsSystemdService, 'listServices'>
   data?: Pick<ServerOpsDataService, 'listSources' | 'probeSource' | 'diagnoseSource' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows'>
-    & Partial<Pick<ServerOpsDataService, 'querySource'>>
+    & Partial<Pick<ServerOpsDataService, 'querySource' | 'getReadCredentialVersion'>>
   audit: Pick<ServerOpsAuditStore, 'append'> & { prepareForWrites?: () => Promise<void> }
 }
 
@@ -86,13 +89,17 @@ export interface CreateServerOpsAgentReadFacadeInput {
   triggeredBy?: 'user' | 'automation' | 'delegation' | 'external'
   getSession?: (sessionId: string) => AgentSessionMeta | undefined
   dependencies?: ServerOpsAgentReadFacadeDependencies
+  /** 由编排器提供的本轮取消，不改变会话租约。 */
+  runSignal?: AbortSignal
+  /** 主进程复核运行代次；模型与 Renderer 无法提交该闭包。 */
+  assertRunActive?: () => void
 }
 
 /** Agent 可见的授权目录，不公开端点、用户、凭据状态或内部配置摘要。 */
 export type ServerOpsAgentReadResourceSummary =
   | { kind: 'ssh'; hostId: string; projectId?: string; name: string }
   | {
-      kind: 'mysql'
+      kind: 'mysql' | 'sqlite'
       sourceId: string
       projectId?: string
       name: string
@@ -114,19 +121,19 @@ export interface ServerOpsAgentRowsResult extends ServerOpsDataSourceRowsResult 
 
 /** 模型可调用的只读运维能力。 */
 export interface ServerOpsAgentReadFacade {
-  resources(): { resources: ServerOpsAgentReadResourceSummary[]; revision: number; truncated?: boolean }
-  serverOverview(input: { hostId: string }): Promise<ServerOpsOverviewResult>
-  serverServices(input: { hostId: string }): Promise<ServerOpsAgentServiceListResult>
-  dataProbe(input: { sourceId: string }): Promise<ServerOpsDataProbeResult>
+  resources(): { resources: ServerOpsAgentReadResourceSummary[]; revision: number; expiresAt?: number; status?: string; nextStep?: string; truncated?: boolean }
+  serverOverview(input: { hostId: string }, signal?: AbortSignal): Promise<ServerOpsOverviewResult>
+  serverServices(input: { hostId: string }, signal?: AbortSignal): Promise<ServerOpsAgentServiceListResult>
+  dataProbe(input: { sourceId: string }, signal?: AbortSignal): Promise<ServerOpsDataProbeResult>
   dataDiagnose(input: {
     sourceId: string
     scope: ServerOpsAuditReadScope
     database?: string
     section?: ServerOpsDataDiagnosticSection
-  }): Promise<ServerOpsDataDiagnosticsResult>
-  databaseTables(input: { sourceId: string; database: string }): Promise<ServerOpsDataSourceTablesResult>
-  databaseDescribe(input: { sourceId: string; database: string; table: string }): Promise<ServerOpsDataSourceTableResult & { truncated?: boolean }>
-  databaseRows(input: { sourceId: string; database: string; table: string; offset: number; limit: number }): Promise<ServerOpsAgentRowsResult>
+  }, signal?: AbortSignal): Promise<ServerOpsDataDiagnosticsResult>
+  databaseTables(input: { sourceId: string; database: string }, signal?: AbortSignal): Promise<ServerOpsDataSourceTablesResult>
+  databaseDescribe(input: { sourceId: string; database: string; table: string }, signal?: AbortSignal): Promise<ServerOpsDataSourceTableResult & { truncated?: boolean }>
+  databaseRows(input: { sourceId: string; database: string; table: string; offset: number; limit: number }, signal?: AbortSignal): Promise<ServerOpsAgentRowsResult>
   /** SQL 查询没有模型可控会话或查询 ID，取消来自本次真实工具调用。 */
   databaseQuery(input: Omit<ServerOpsDataQueryInput, 'queryId'>, signal?: AbortSignal): Promise<ServerOpsDataQueryResult>
 }
@@ -261,7 +268,7 @@ function sanitizeTableDescription(value: ServerOpsDataSourceTableResult): Server
 }
 
 /** 授权目录按嵌套表、库、资源顺序裁剪，并明确告诉模型范围未完整展示。 */
-function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSummary[]; revision: number }): {
+function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSummary[]; revision: number; expiresAt: number }): {
   resources: ServerOpsAgentReadResourceSummary[]
   revision: number
   truncated?: boolean
@@ -276,7 +283,7 @@ function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSu
   while (resultBytes(output) > SERVER_OPS_AGENT_READ_RESULT_BYTES) {
     /** 优先从最大表白名单裁剪，保留更多资源与数据库身份。 */
     const scopes = output.resources
-      .filter((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' }> => resource.kind === 'mysql')
+      .filter((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' | 'sqlite' }> => resource.kind === 'mysql' || resource.kind === 'sqlite')
       .flatMap((resource) => resource.databases.filter((scope) => scope.tables !== null)
         .map((scope) => ({ resource, scope, size: scope.tables?.length ?? 0 })))
       .filter((entry) => entry.size > 0)
@@ -285,8 +292,8 @@ function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSu
       scopes[0].scope.tables.pop()
       continue
     }
-    const mysql = output.resources.find((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' }> =>
-      resource.kind === 'mysql' && resource.databases.length > 0)
+    const mysql = output.resources.find((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' | 'sqlite' }> =>
+      (resource.kind === 'mysql' || resource.kind === 'sqlite') && resource.databases.length > 0)
     if (mysql) {
       mysql.databases.pop()
       continue
@@ -320,6 +327,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     getSession: input.getSession,
     services: {
       hosts: context.hosts,
+      credentials: context.credentials,
       access: context.access,
       overview: context.overview,
       systemd: context.systemd,
@@ -328,16 +336,23 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     },
   } satisfies ServerOpsAgentReadFacadeDependencies : null)
   if (!dependencies) return null
-  if (!isOrdinaryTopLevelAgentSession(dependencies.getSession(input.sessionId))) return null
+  if (!isOrdinaryTopLevelAgentSession(dependencies.getSession(input.sessionId)) || dependencies.getSession(input.sessionId)?.archived) return null
 
   /** 捕获当前配置事实；测试可替换，生产只读取主进程已保存的公开元数据。 */
   const captureBindings = dependencies.captureBindings ?? ((resources: ServerOpsAgentReadResource[]) =>
-    captureServerOpsReadBindings(resources, { hosts: dependencies.services.hosts, data: dependencies.services.data }))
+    captureServerOpsReadBindings(resources, dependencies.services))
+
+  /** 本轮只能使用创建时的租约代次；重授后需要用户发起新一轮。 */
+  const runRevision = dependencies.services.access.getReadAccess(input.sessionId)?.revision
+  /** 终止后所有旧工具闭包均失效，即使会话租约仍有效。 */
+  const checkRun = (): void => {
+    if (input.runSignal?.aborted) throw new Error('SERVER_OPS_AGENT_RUN_CANCELLED')
+    input.assertRunActive?.()
+  }
 
   /** 配置身份变化时立即撤销对应资源，避免后续调用误把旧授权用于新目标。 */
-  const invalidateResource = (resource: ServerOpsAgentReadResource): void => {
-    if (resource.kind === 'ssh') dependencies.services.access.revokeHost?.(resource.hostId)
-    else dependencies.services.access.revokeSource?.(resource.sourceId)
+  const invalidateResource = (resource: ServerOpsAgentReadResource, revision: number): void => {
+    dependencies.services.access.revokeReadResource?.(input.sessionId, serverOpsReadResourceKey(resource), revision)
   }
 
   /** 每个异步边界前后都复核会话、授权代次、资源范围和配置身份。 */
@@ -346,29 +361,32 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     id: string,
     expectedRevision?: number,
   ): AuthorizedRead => {
+    checkRun()
     if (context && getServerOpsServiceContext() !== context) throw new Error('SERVER_OPS_AGENT_CONTEXT_CHANGED')
     if (!isInteractiveSource(input.triggeredBy)
-      || !isOrdinaryTopLevelAgentSession(dependencies.getSession(input.sessionId))) {
+      || !isOrdinaryTopLevelAgentSession(dependencies.getSession(input.sessionId)) || dependencies.getSession(input.sessionId)?.archived) {
       throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
     }
-    const access = dependencies.services.access.getReadCurrent()
+    const access = dependencies.services.access.getReadAccess(input.sessionId)
     if (!access || access.sessionId !== input.sessionId) {
       throw new Error(expectedRevision === undefined ? 'SERVER_OPS_AGENT_ACCESS_REQUIRED' : 'SERVER_OPS_AGENT_ACCESS_CHANGED')
     }
+    if (runRevision === undefined) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    if (access.revision !== runRevision) throw new Error('SERVER_OPS_AGENT_ACCESS_CHANGED')
     if (expectedRevision !== undefined && access.revision !== expectedRevision) throw new Error('SERVER_OPS_AGENT_ACCESS_CHANGED')
     const resource = access.resources.find((entry) => entry.kind === kind
       && (entry.kind === 'ssh' ? entry.hostId : entry.sourceId) === id)
     if (!resource) throw new Error(expectedRevision === undefined ? 'SERVER_OPS_AGENT_ACCESS_REQUIRED' : 'SERVER_OPS_AGENT_ACCESS_CHANGED')
     const key = serverOpsReadResourceKey(resource)
-    const storedBinding = dependencies.services.access.getReadBinding(key)
+    const storedBinding = dependencies.services.access.getReadBinding(input.sessionId, key)
     let currentBinding: ServerOpsAgentReadBinding | undefined
     try { currentBinding = captureBindings([resource])[0] } catch {
-      invalidateResource(resource)
+      invalidateResource(resource, access.revision)
       throw new Error('SERVER_OPS_AGENT_RESOURCE_CHANGED')
     }
     if (!storedBinding || !currentBinding || storedBinding.key !== currentBinding.key
       || storedBinding.fingerprint !== currentBinding.fingerprint || storedBinding.hostId !== currentBinding.hostId) {
-      invalidateResource(resource)
+      invalidateResource(resource, access.revision)
       throw new Error('SERVER_OPS_AGENT_RESOURCE_CHANGED')
     }
     return { access, resource }
@@ -379,6 +397,35 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     try { return dependencies.services.audit.append(entry).timestamp } catch { return undefined }
   }
 
+  /** 汇合工具/运行取消与该会话撤权，返回检查及清理函数；不订阅其它会话的状态。 */
+  const readLifetime = (kind: ServerOpsAgentReadResource['kind'], id: string, revision: number, signal?: AbortSignal, sql = false) => {
+    /** 真实服务只接收这一条合并后的取消信号。 */
+    const controller = new AbortController()
+    /** Abort listener 必须在所有退出路径移除。 */
+    const abort = (): void => controller.abort()
+    const signals = [signal, input.runSignal].filter((entry): entry is AbortSignal => entry !== undefined)
+    for (const entry of signals) {
+      entry.addEventListener('abort', abort, { once: true })
+      if (entry.aborted) abort()
+    }
+    const unsubscribe = dependencies.services.access.onReadChanged?.((event) => {
+      if ((event.previous?.sessionId ?? event.current?.sessionId) !== input.sessionId) return
+      try { requireAuthorized(kind, id, revision) } catch { abort() }
+    })
+    return {
+      signal: controller.signal,
+      /** 权限原因优先于 runtime 的通用取消，审计与用户看到相同原因。 */
+      check: (): void => {
+        requireAuthorized(kind, id, revision)
+        if (controller.signal.aborted) throw new Error(sql ? 'SERVER_OPS_SQL_CANCELLED' : 'SERVER_OPS_AGENT_READ_CANCELLED')
+      },
+      dispose: (): void => {
+        unsubscribe?.()
+        for (const entry of signals) entry.removeEventListener('abort', abort)
+      },
+    }
+  }
+
   /** 所有远程读取共享同一执行次序和撤销竞态保护。 */
   const executeRead = async <T extends object, R extends object = T>(options: {
     kind: ServerOpsAgentReadResource['kind']
@@ -387,58 +434,66 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     scope?: ServerOpsAuditReadScope
     database?: string
     table?: string
-    read: () => Promise<T>
+    signal?: AbortSignal
+    read: (signal: AbortSignal, context: ServerOpsReadContext) => Promise<T>
     project?: (value: T) => R
   }): Promise<R> => {
     const initial = requireAuthorized(options.kind, options.id)
-    try { await dependencies.services.audit.prepareForWrites?.() } catch { throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED') }
-    requireAuthorized(options.kind, options.id, initial.access.revision)
-    const operationId = (dependencies.uuid ?? randomUUID)()
-    const target = options.kind === 'ssh' ? { hostId: options.id } : { sourceId: options.id }
-    const startedAt = appendAudit({
-      actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
-      readAction: options.readAction, phase: 'start', outcome: 'pending', ...target,
-      ...(options.scope ? { scope: options.scope } : {}),
-      ...(options.database ? { database: options.database } : {}),
-      ...(options.table ? { table: options.table } : {}),
-    })
-    if (startedAt === undefined) throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED')
-    requireAuthorized(options.kind, options.id, initial.access.revision)
-    let projected: R
+    /** 在审计准备之前接通取消，保证等待阶段也能及时失效。 */
+    const lifetime = readLifetime(options.kind, options.id, initial.access.revision, options.signal)
     try {
-      const raw = await options.read()
-      requireAuthorized(options.kind, options.id, initial.access.revision)
-      projected = options.project ? options.project(raw) : raw as unknown as R
-    } catch (error) {
-      /** 授权或配置变化错误也只记录稳定码，不恢复或重试旧请求。 */
-      const errorCode = stableErrorCode(error)
+      lifetime.check()
+      try { await dependencies.services.audit.prepareForWrites?.() } catch { throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED') }
+      lifetime.check()
+      const operationId = (dependencies.uuid ?? randomUUID)()
+      const target = options.kind === 'ssh' ? { hostId: options.id } : { sourceId: options.id }
+      const startedAt = appendAudit({
+        actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
+        readAction: options.readAction, phase: 'start', outcome: 'pending', ...target,
+        ...(options.scope ? { scope: options.scope } : {}),
+        ...(options.database ? { database: options.database } : {}),
+        ...(options.table ? { table: options.table } : {}),
+      })
+      if (startedAt === undefined) throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED')
+      lifetime.check()
+      let projected: R
+      try {
+        const raw = await options.read(lifetime.signal, { ownerSessionId: input.sessionId, check: lifetime.check })
+        lifetime.check()
+        projected = options.project ? options.project(raw) : raw as unknown as R
+      } catch (error) {
+        /** 授权或配置变化错误也只记录稳定码，不恢复或重试旧请求。 */
+        let failure = error
+        try { lifetime.check() } catch (changed) { failure = changed }
+        const errorCode = stableErrorCode(failure)
+        const auditWritten = appendAudit({
+          actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
+          readAction: options.readAction, phase: 'result', outcome: 'error', errorCode, ...target,
+          durationMs: Math.max(0, (dependencies.now ?? Date.now)() - startedAt),
+          ...(options.scope ? { scope: options.scope } : {}),
+          ...(options.database ? { database: options.database } : {}),
+          ...(options.table ? { table: options.table } : {}),
+        })
+        throw createReadError(errorCode, auditWritten === undefined)
+      }
       const auditWritten = appendAudit({
-        actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
-        readAction: options.readAction, phase: 'result', outcome: 'error', errorCode, ...target,
-        durationMs: Math.max(0, (dependencies.now ?? Date.now)() - startedAt),
-        ...(options.scope ? { scope: options.scope } : {}),
-        ...(options.database ? { database: options.database } : {}),
-        ...(options.table ? { table: options.table } : {}),
-      })
-      throw createReadError(errorCode, auditWritten === undefined)
-    }
-    const auditWritten = appendAudit({
-        actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
-        readAction: options.readAction, phase: 'result', outcome: 'success', ...target,
-        durationMs: Math.max(0, (dependencies.now ?? Date.now)() - startedAt),
-        ...(options.scope ? { scope: options.scope } : {}),
-        ...(options.database ? { database: options.database } : {}),
-        ...(options.table ? { table: options.table } : {}),
-      })
-    /** 结果审计回调也可能触发同步撤权；返回前必须做最后一次复核。 */
-    requireAuthorized(options.kind, options.id, initial.access.revision)
-    const result = auditWritten === undefined ? appendAuditWarning(projected) : projected
-    if (resultBytes(result) > SERVER_OPS_AGENT_READ_RESULT_BYTES) throw new Error('SERVER_OPS_AGENT_RESULT_TOO_LARGE')
-    return result
+          actor: 'agent', sessionId: input.sessionId, operationId, operation: 'agent-read', resourceType: 'ops-resource',
+          readAction: options.readAction, phase: 'result', outcome: 'success', ...target,
+          durationMs: Math.max(0, (dependencies.now ?? Date.now)() - startedAt),
+          ...(options.scope ? { scope: options.scope } : {}),
+          ...(options.database ? { database: options.database } : {}),
+          ...(options.table ? { table: options.table } : {}),
+        })
+      /** 结果审计回调也可能触发同步撤权；返回前必须做最后一次复核。 */
+      lifetime.check()
+      const result = auditWritten === undefined ? appendAuditWarning(projected) : projected
+      if (resultBytes(result) > SERVER_OPS_AGENT_READ_RESULT_BYTES) throw new Error('SERVER_OPS_AGENT_RESULT_TOO_LARGE')
+      return result
+    } finally { lifetime.dispose() }
   }
 
   /** 读取已保存数据源；不存在与引擎不匹配都使用稳定权限错误。 */
-  const requireDataSource = (sourceId: string, engine: 'mysql' | 'redis') => {
+  const requireDataSource = (sourceId: string, engine: 'mysql' | 'sqlite' | 'redis') => {
     const data = dependencies.services.data
     if (!data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     const found = data.listSources().sources.find((entry) => entry.id === sourceId && entry.engine === engine)
@@ -446,9 +501,20 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     return { data, source: found }
   }
 
-  /** 查找已授权 MySQL 库，并按需确认全表和行读取能力。 */
+  /** 从当前会话的显式 SQL 资源授权选择引擎，不能把 SSH 或另一引擎权限升级。 */
+  const requireDatabaseAuthorized = (sourceId: string): AuthorizedRead => {
+    /** 这里只确定候选资源，随后仍由共同门禁复核会话、代次和配置身份。 */
+    const current = dependencies.services.access.getReadAccess(input.sessionId)
+    const resource = current?.sessionId === input.sessionId
+      ? current.resources.find((entry) => (entry.kind === 'mysql' || entry.kind === 'sqlite') && entry.sourceId === sourceId)
+      : undefined
+    if (!resource) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    return requireAuthorized(resource.kind, sourceId)
+  }
+
+  /** 查找已授权数据库，并按需确认全表和行读取能力。 */
   const requireDatabaseScope = (
-    resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' }>,
+    resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>,
     database: string,
     table?: string,
     readRows = false,
@@ -466,34 +532,24 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const record = exactRecord(raw, ['sourceId', 'database', 'sql', 'maxRows'])
       const request = parseServerOpsDataQueryInput({ ...record, queryId: randomUUID() })
       if (request.maxRows > SERVER_OPS_AGENT_READ_ROW_LIMIT) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
-      const initial = requireAuthorized('mysql', request.sourceId)
-      const resource = initial.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' }>
+      const initial = requireDatabaseAuthorized(request.sourceId)
+      const resource = initial.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
       const scope = requireDatabaseScope(resource, request.database, undefined, true)
       if (scope.query !== true) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
-      const plan = analyzeServerOpsSqlQuery(request.sql, request.database)
+      const plan = analyzeServerOpsSqlQuery(request.sql, request.database, resource.kind)
       for (const table of plan.tables) requireDatabaseScope(resource, request.database, table, true)
-      const { data } = requireDataSource(request.sourceId, 'mysql')
+      const { data } = requireDataSource(request.sourceId, resource.kind)
       if (!data.querySource) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
-      /** 工具取消和授权变化均送至真实 runtime，避免只丢弃结果却继续占用数据库。 */
-      const controller = new AbortController()
-      const abort = (): void => controller.abort()
-      signal?.addEventListener('abort', abort, { once: true })
-      if (signal?.aborted) abort()
-      const unsubscribe = dependencies.services.access.onReadChanged?.(() => {
-        try { requireAuthorized('mysql', request.sourceId, initial.access.revision) } catch { abort() }
-      })
-      /** 先判授权再判取消，撤权返回原因准确且任何异步等待都不能续用旧代次。 */
-      const check = (): void => {
-        requireAuthorized('mysql', request.sourceId, initial.access.revision)
-        if (controller.signal.aborted) throw new Error('SERVER_OPS_SQL_CANCELLED')
-      }
+      /** SQL 与其它读取共用运行/租约取消边界。 */
+      const lifetime = readLifetime(resource.kind, request.sourceId, initial.access.revision, signal, true)
+      const check = lifetime.check
       try {
         return await runAuditedServerOpsQuery({
           summary: { sourceId: request.sourceId, database: request.database, tables: plan.tables,
             queryHash: `sha256:${createHash('sha256').update(plan.fingerprint).digest('hex')}` },
           actor: { actor: 'agent', sessionId: input.sessionId }, audit: dependencies.services.audit, check,
           execute: async () => {
-            const result = parseServerOpsDataQueryResult(await data.querySource!(request, controller.signal))
+            const result = parseServerOpsDataQueryResult(await data.querySource!(request, lifetime.signal, { ownerSessionId: input.sessionId, check }))
             if (result.queryId !== request.queryId || result.database !== request.database || result.rowCount > request.maxRows) {
               throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
             }
@@ -501,14 +557,14 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
           },
         })
       } finally {
-        unsubscribe?.()
-        signal?.removeEventListener('abort', abort)
+        lifetime.dispose()
       }
     },
 
     resources() {
-      const current = dependencies.services.access.getReadCurrent()
-      if (!current || current.sessionId !== input.sessionId) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+      checkRun()
+      const current = dependencies.services.access.getReadAccess(input.sessionId)
+      if (!current || runRevision === undefined) return { resources: [], revision: 0, status: 'SERVER_OPS_AGENT_ACCESS_REQUIRED', nextStep: '请在聊天输入区或服务器运维详情打开「Agent 只读授权」，保存范围后发送新消息。' }
       /** 每个目录项都 fresh-check，避免仅列目录时保留已经换目标的权限。 */
       const summaries = current.resources.map((resource): ServerOpsAgentReadResourceSummary => {
         requireAuthorized(resource.kind, resource.kind === 'ssh' ? resource.hostId : resource.sourceId, current.revision)
@@ -523,18 +579,19 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
           return { kind: 'redis', sourceId: resource.sourceId, ...(saved.projectId ? { projectId: saved.projectId } : {}), name: saved.label }
         }
         return {
-          kind: 'mysql', sourceId: resource.sourceId, ...(saved.projectId ? { projectId: saved.projectId } : {}),
+          kind: resource.kind, sourceId: resource.sourceId, ...(saved.projectId ? { projectId: saved.projectId } : {}),
           name: saved.label, instance: resource.instance, databases: structuredClone(resource.databases),
         }
       })
-      return boundResourceDirectory({ resources: summaries, revision: current.revision })
+      return boundResourceDirectory({ resources: summaries, revision: current.revision, expiresAt: current.expiresAt })
     },
 
-    async serverOverview(raw) {
+    async serverOverview(raw, signal) {
       const record = exactRecord(raw, ['hostId'])
       const hostId = readId(record.hostId)
       return executeRead({
-        kind: 'ssh', id: hostId, readAction: 'server-overview', read: () => dependencies.services.overview.getOverview({ hostId }),
+        signal,
+        kind: 'ssh', id: hostId, readAction: 'server-overview', read: (readSignal) => dependencies.services.overview.getOverview({ hostId }, readSignal),
         project: (value) => {
           const parsed = validateResult(parseServerOpsOverviewResult, value)
           if (parsed.hostId !== hostId) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -543,11 +600,12 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       })
     },
 
-    async serverServices(raw) {
+    async serverServices(raw, signal) {
       const record = exactRecord(raw, ['hostId'])
       const hostId = readId(record.hostId)
       return executeRead({
-        kind: 'ssh', id: hostId, readAction: 'server-services', read: () => dependencies.services.systemd.listServices({ hostId }),
+        signal,
+        kind: 'ssh', id: hostId, readAction: 'server-services', read: (readSignal) => dependencies.services.systemd.listServices({ hostId }, readSignal),
         project: (value) => {
           const parsed = validateResult(parseServerOpsServiceListResult, value)
           if (parsed.hostId !== hostId) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -556,13 +614,13 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       })
     },
 
-    async dataProbe(raw) {
+    async dataProbe(raw, signal) {
       const record = exactRecord(raw, ['sourceId'])
       const sourceId = readId(record.sourceId)
       /** 先从当前授权快照判定引擎，再进入对应资源的完整身份复核。 */
-      const current = dependencies.services.access.getReadCurrent()
+      const current = dependencies.services.access.getReadAccess(input.sessionId)
       const resource = current?.sessionId === input.sessionId
-        ? current.resources.find((entry): entry is Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'redis' }> =>
+        ? current.resources.find((entry): entry is Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' | 'redis' }> =>
           entry.kind !== 'ssh' && entry.sourceId === sourceId)
         : undefined
       if (!resource) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
@@ -570,7 +628,8 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       requireAuthorized(kind, sourceId)
       const { data } = requireDataSource(sourceId, kind)
       return executeRead({
-        kind, id: sourceId, readAction: 'data-probe', read: () => data.probeSource({ sourceId }),
+        signal,
+        kind, id: sourceId, readAction: 'data-probe', read: (readSignal, readContext) => data.probeSource({ sourceId }, readSignal, readContext),
         project: (value) => {
           const parsed = validateResult(parseServerOpsDataProbeResult, value)
           if (parsed.sourceId !== sourceId || parsed.engine !== kind) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -579,7 +638,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       })
     },
 
-    async dataDiagnose(raw) {
+    async dataDiagnose(raw, signal) {
       const record = exactRecord(raw, ['sourceId', 'scope'], ['database', 'section'])
       const sourceId = readId(record.sourceId)
       if (record.scope !== 'instance' && record.scope !== 'database') throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
@@ -589,7 +648,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       if (section !== undefined && section !== 'overview' && section !== 'sessions' && section !== 'statements' && section !== 'parameters') {
         throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       }
-      const access = dependencies.services.access.getReadCurrent()
+      const access = dependencies.services.access.getReadAccess(input.sessionId)
       const resource = access?.sessionId === input.sessionId
         ? access.resources.find((entry) => entry.kind !== 'ssh' && entry.sourceId === sourceId)
         : undefined
@@ -597,6 +656,9 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const { data } = requireDataSource(sourceId, resource.kind)
       if (resource.kind === 'redis') {
         if (scope !== 'instance' || database !== undefined || section !== undefined) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+      } else if (resource.kind === 'sqlite') {
+        if (scope !== 'database' || database !== 'main' || (section !== undefined && section !== 'overview')) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+        if (requireDatabaseScope(resource, database).tables !== null) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       } else if (scope === 'instance') {
         if (!resource.instance) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
         if (database !== undefined) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
@@ -606,9 +668,10 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
         if (databaseScope.tables !== null) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       }
       return executeRead({
+        signal,
         kind: resource.kind, id: sourceId, readAction: 'data-diagnose', scope,
         ...(database ? { database } : {}),
-        read: () => data.diagnoseSource({ sourceId, ...(section ? { section } : {}), ...(database ? { database } : {}) }),
+        read: (readSignal, readContext) => data.diagnoseSource({ sourceId, ...(section ? { section } : {}), ...(database && resource.kind !== 'sqlite' ? { database } : {}) }, readSignal, readContext),
         project: (value) => {
           const parsed = validateResult(parseServerOpsDataDiagnosticsResult, value)
           if (parsed.sourceId !== sourceId || parsed.engine !== resource.kind) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -617,17 +680,18 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       })
     },
 
-    async databaseTables(raw) {
+    async databaseTables(raw, signal) {
       const record = exactRecord(raw, ['sourceId', 'database'])
       const sourceId = readId(record.sourceId)
       const database = readIdentifier(record.database, 64)
-      const authorized = requireAuthorized('mysql', sourceId)
-      const resource = authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' }>
+      const authorized = requireDatabaseAuthorized(sourceId)
+      const resource = authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
       const scope = requireDatabaseScope(resource, database)
-      const { data } = requireDataSource(sourceId, 'mysql')
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
       return executeRead({
-        kind: 'mysql', id: sourceId, readAction: 'schema-list', scope: 'database', database,
-        read: () => data.listSchemaTables({ sourceId, database }),
+        signal,
+        kind: authorized.resource.kind, id: sourceId, readAction: 'schema-list', scope: 'database', database,
+        read: (readSignal, readContext) => data.listSchemaTables({ sourceId, database }, readSignal, readContext),
         project: (value) => {
           const parsed = validateResult(parseServerOpsDataSourceTablesResult, value)
           if (parsed.database !== database) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -640,24 +704,25 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       })
     },
 
-    async databaseDescribe(raw) {
+    async databaseDescribe(raw, signal) {
       const record = exactRecord(raw, ['sourceId', 'database', 'table'])
       const sourceId = readId(record.sourceId)
       const database = readIdentifier(record.database, 64)
       const table = readIdentifier(record.table, 128)
-      const authorized = requireAuthorized('mysql', sourceId)
-      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' }>, database, table)
-      const { data } = requireDataSource(sourceId, 'mysql')
+      const authorized = requireDatabaseAuthorized(sourceId)
+      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>, database, table)
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
       return executeRead({
-        kind: 'mysql', id: sourceId, readAction: 'schema-describe', scope: 'database', database, table,
-        read: () => data.describeSchemaTable({ sourceId, database, table }),
+        signal,
+        kind: authorized.resource.kind, id: sourceId, readAction: 'schema-describe', scope: 'database', database, table,
+        read: (readSignal, readContext) => data.describeSchemaTable({ sourceId, database, table }, readSignal, readContext),
         project: (value) => boundArrays(sanitizeTableDescription(
           validateResult(parseServerOpsDataSourceTableResult, value),
         ), ['columns', 'indexes']),
       })
     },
 
-    async databaseRows(raw) {
+    async databaseRows(raw, signal) {
       const record = exactRecord(raw, ['sourceId', 'database', 'table', 'offset', 'limit'])
       const sourceId = readId(record.sourceId)
       const database = readIdentifier(record.database, 64)
@@ -667,12 +732,13 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
         || record.offset % record.limit !== 0) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       const offset = record.offset
       const limit = record.limit
-      const authorized = requireAuthorized('mysql', sourceId)
-      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' }>, database, table, true)
-      const { data } = requireDataSource(sourceId, 'mysql')
+      const authorized = requireDatabaseAuthorized(sourceId)
+      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>, database, table, true)
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
       return executeRead({
-        kind: 'mysql', id: sourceId, readAction: 'rows-read', scope: 'database', database, table,
-        read: () => data.readSchemaRows({ sourceId, database, table, offset, limit }),
+        signal,
+        kind: authorized.resource.kind, id: sourceId, readAction: 'rows-read', scope: 'database', database, table,
+        read: (readSignal, readContext) => data.readSchemaRows({ sourceId, database, table, offset, limit }, readSignal, readContext),
         project: (value) => {
           const parsed = validateResult(parseServerOpsDataSourceRowsResult, value)
           if (parsed.offset !== offset || parsed.limit !== limit) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')

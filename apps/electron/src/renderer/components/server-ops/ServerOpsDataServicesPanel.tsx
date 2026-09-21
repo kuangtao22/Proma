@@ -57,6 +57,8 @@ import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
 import {
   SERVER_OPS_DATA_CAPABILITY_LABELS,
   formatServerOpsDataProbeSummary,
+  formatServerOpsDataTlsPolicy,
+  formatServerOpsDataTlsStatus,
   getServerOpsDataErrorMessage,
   isServerOpsDataSourceBusyError,
 } from './server-ops-data-display'
@@ -521,13 +523,13 @@ export function createServerOpsDataServicesController(
 
 /** 按引擎返回列表图标。 */
 function ServerOpsDataEngineIcon({ engine }: { engine: ServerOpsDataSource['engine'] }): React.ReactElement {
-  const Icon = engine === 'mysql' ? Database : DatabaseZap
+  const Icon = engine === 'redis' ? DatabaseZap : Database
   return <Icon className="size-4" aria-hidden="true" />
 }
 
 /** 引擎展示名。 */
 function getEngineLabel(engine: ServerOpsDataSource['engine']): string {
-  return engine === 'mysql' ? 'MySQL' : 'Redis'
+  return engine === 'mysql' ? 'MySQL' : engine === 'sqlite' ? 'SQLite' : 'Redis'
 }
 
 /** 指标卡网格。 */
@@ -694,6 +696,7 @@ export function ServerOpsDataDiagnostics({
       {result === undefined ? null : (
         <>
           <Badge variant="outline" className="font-normal">{SERVER_OPS_DATA_CAPABILITY_LABELS[result.capability]}</Badge>
+          {formatServerOpsDataTlsStatus(result.tlsStatus) ? <span>{formatServerOpsDataTlsStatus(result.tlsStatus)}</span> : null}
           <span>{new Date(result.collectedAt).toLocaleTimeString('zh-CN')}</span>
         </>
       )}
@@ -950,13 +953,13 @@ export function ServerOpsDataServicesPanelView({
                       <div className="flex items-center gap-2">
                         <span className="truncate text-sm font-medium">{source.label}</span>
                         <Badge variant="outline" className="shrink-0 font-normal">{getEngineLabel(source.engine)}</Badge>
-                        {source.tlsMode === 'verify' ? <Badge variant="outline" className="shrink-0 font-normal">TLS 校验</Badge> : null}
+                        {formatServerOpsDataTlsPolicy(source.tlsMode) ? <Badge variant="outline" className="shrink-0 font-normal" title="连接设置；实际加密状态以最近一次连接测试或诊断为准">{formatServerOpsDataTlsPolicy(source.tlsMode)}</Badge> : null}
                       </div>
                       <div className="truncate text-xs text-muted-foreground">
-                        {source.address}:{source.port}
-                        {source.database === undefined ? '' : ` · 库 ${source.database}`}
-                        {source.username === undefined ? '' : ` · ${source.username}`}
-                        {source.hasPassword ? ' · 已保存密码' : ''}
+                        {source.engine === 'sqlite' ? source.filePath : `${source.address}:${source.port}`}
+                        {source.engine === 'sqlite' || source.database === undefined ? '' : ` · 库 ${source.database}`}
+                        {source.engine === 'sqlite' || source.username === undefined ? '' : ` · ${source.username}`}
+                        {source.engine !== 'sqlite' && source.hasPassword ? ' · 已保存密码' : ''}
                       </div>
                       {probe ? (
                         <div className="mt-0.5 truncate text-[11px] text-muted-foreground" data-server-ops-data-probe={source.id}>
@@ -968,14 +971,14 @@ export function ServerOpsDataServicesPanelView({
                     </div>
                     <TooltipProvider delayDuration={200}>
                       <div className="flex shrink-0 items-center gap-0.5">
-                        <Tooltip>
+                        {source.engine === 'sqlite' ? null : <Tooltip>
                           <TooltipTrigger asChild>
                             <Button type="button" variant="ghost" size="icon-sm" aria-label={`测试 ${source.label} 的连接`} disabled={probe?.state === 'running'} onClick={() => onProbe(source)}>
                               {probe?.state === 'running' ? <LoaderCircle className="size-3.5 animate-spin" /> : <PlugZap className="size-3.5" />}
                             </Button>
                           </TooltipTrigger>
                           <TooltipContent>连接测试</TooltipContent>
-                        </Tooltip>
+                        </Tooltip>}
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Button type="button" variant="ghost" size="icon-sm" aria-label={`读取 ${source.label} 的只读诊断`} disabled={diagnosing} onClick={() => onDiagnose(source)}>
@@ -1016,6 +1019,7 @@ export function ServerOpsDataServicesPanelView({
         source={projection.dialog?.source ?? null}
         hostId={context?.hostId ?? ''}
         hostLabel={context?.hostLabel ?? ''}
+        hostOptions={context?.hostId ? [{ id: context.hostId, label: context.hostLabel }] : []}
         submitting={projection.submitting}
         error={projection.dialogError}
         onTest={onTestDraft}
@@ -1028,7 +1032,7 @@ export function ServerOpsDataServicesPanelView({
           <AlertDialogHeader>
             <AlertDialogTitle>删除数据源</AlertDialogTitle>
             <AlertDialogDescription>
-              将删除「{projection.deleteTarget?.label}」（{projection.deleteTarget?.address}:{projection.deleteTarget?.port}），保存的密码密文将一并删除。此操作不可撤销。
+              将删除「{projection.deleteTarget?.label}」（{projection.deleteTarget?.engine === 'sqlite' ? projection.deleteTarget.filePath : `${projection.deleteTarget?.address}:${projection.deleteTarget?.port}`}），保存的连接配置将一并删除。此操作不可撤销。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

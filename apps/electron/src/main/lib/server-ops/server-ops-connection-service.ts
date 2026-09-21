@@ -62,7 +62,7 @@ export interface ServerOpsConnectionTrustStore {
 /** 连接 Service 所需的 SSH utility runtime 边界。 */
 export interface ServerOpsConnectionRuntime {
   connect: (input: ServerOpsRuntimeConnectionInput) => Promise<ServerOpsRuntimeConnectResult>
-  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number) => Promise<ServerOpsRuntimeExecResult>
+  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal) => Promise<ServerOpsRuntimeExecResult>
   sftp?: (input: ServerOpsSftpCall) => Promise<ServerOpsSftpResult>
   closeSftpOwner?: (ownerKey: string) => void | Promise<void>
   startLog: (hostId: string, connectionId: string, streamId: string, command: string) => Promise<void>
@@ -472,13 +472,13 @@ export class ServerOpsConnectionService {
   }
 
   /** 在当前 SSH 连接上执行结构化非 PTY 命令。 */
-  async exec(hostId: string, connectionId: string, command: string, timeoutMs: number): Promise<ServerOpsRuntimeExecResult> {
+  async exec(hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal): Promise<ServerOpsRuntimeExecResult> {
     this.assertActiveConnection(hostId, connectionId)
     if (!command || command.length > 8192 || command.includes('\0')) throw new Error('SERVER_OPS_EXEC_COMMAND_INVALID')
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 120000) throw new Error('SERVER_OPS_EXEC_TIMEOUT_INVALID')
     this.pendingOperations.set(hostId, (this.pendingOperations.get(hostId) ?? 0) + 1)
     try {
-      return await this.dependencies.runtime.exec(hostId, connectionId, command, timeoutMs)
+      return await this.dependencies.runtime.exec(hostId, connectionId, command, timeoutMs, signal)
     } finally {
       const remaining = (this.pendingOperations.get(hostId) ?? 1) - 1
       if (remaining > 0) this.pendingOperations.set(hostId, remaining)

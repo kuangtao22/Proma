@@ -361,6 +361,21 @@ describe('Agent 会话 JSONL 读取', () => {
 })
 
 describe('Agent 会话 runtime 元数据', () => {
+  test('Given 历史会话无工具模式 When 保存运维只读并重读 Then 保留模式且拒绝非法值', () => {
+    writeAgentSessionsIndex([{
+      id: 'session-tool-mode', title: '运维会话', workspaceId: 'workspace-a',
+      createdAt: 1, updatedAt: 1,
+    }])
+    expect(manager.getAgentSessionMeta('session-tool-mode')?.toolMode).toBeUndefined()
+    expect(manager.updateAgentSessionMeta('session-tool-mode', { toolMode: 'server-ops-read' }).toolMode)
+      .toBe('server-ops-read')
+    expect(manager.getAgentSessionMeta('session-tool-mode')?.toolMode).toBe('server-ops-read')
+    expect(() => manager.updateAgentSessionMeta('session-tool-mode', {
+      toolMode: 'server_exec' as 'standard',
+    })).toThrow('Agent 工具运行模式非法')
+    expect(manager.getAgentSessionMeta('session-tool-mode')?.toolMode).toBe('server-ops-read')
+  })
+
   test('Given 项目迁移包含内外部会话引用 When 重写工作区会话路径 Then 仅根内路径变化且 Pi 三字段保持', () => {
     /** 旧项目根、新项目根和不得改写的外部根。 */
     const sourceRoot = join(tempHome, 'old-project')

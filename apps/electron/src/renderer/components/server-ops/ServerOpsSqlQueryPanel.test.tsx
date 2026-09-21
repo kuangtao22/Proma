@@ -20,6 +20,11 @@ describe('ServerOpsSqlQueryPanel', () => {
     expect(html).toContain('role="tabpanel"')
   })
 
+  test('Given SQLite 查询页 When 渲染 Then 编辑器标记 SQLite 方言并显示对应大字段函数', () => {
+    const html = renderToStaticMarkup(<ServerOpsSqlQueryPanel api={{}} sourceId="source-1" database="main" configurationKey="v1" available dialect="sqlite" />)
+    expect(html).toContain('data-server-ops-sql-dialect="sqlite"')
+  })
+
   test('Given 查询接口缺失 When 渲染 Then 执行入口不可用且说明升级原因', () => {
     const html = renderToStaticMarkup(<ServerOpsSqlQueryPanel api={{}} sourceId="source-1" database="app" configurationKey="v1" available />)
     expect(html).toMatch(/disabled=""[^>]*aria-label="执行查询"|aria-label="执行查询"[^>]*disabled=""/)

@@ -50,7 +50,7 @@ function dependencies(options: {
 } = {}): ServerOpsAgentReadFacadeDependencies {
   /** 当前授权可在测试过程中原子替换，模拟撤销与重新授权。 */
   const access = options.access ?? {
-    sessionId: 'session-1', revision: 7, grantedAt: 10,
+    sessionId: 'session-1', revision: 7, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
     resources: [
       { kind: 'ssh' as const, hostId: 'host-1' },
       {
@@ -68,10 +68,11 @@ function dependencies(options: {
     getSession: () => options.session ?? session(),
     captureBindings: (resources) => resources.map((resource) => bindings.get(resource.kind === 'ssh' ? `ssh:${resource.hostId}` : `data:${resource.sourceId}`)!).filter(Boolean),
     services: {
+      credentials: { getVersion: () => 'host-credential-version' },
       hosts: { get: (hostId) => hostId === 'host-1' ? host() : undefined },
       access: {
-        getReadCurrent: () => access,
-        getReadBinding: (key) => bindings.get(key),
+        getReadAccess: () => access,
+        getReadBinding: (_sessionId, key) => bindings.get(key),
       },
       overview: {
         getOverview: async ({ hostId }) => ({
@@ -84,6 +85,7 @@ function dependencies(options: {
         listServices: async ({ hostId }) => ({ hostId, capability: 'available' as const, services: [], warnings: [] }),
       },
       data: {
+        getReadCredentialVersion: () => 'data-credential-version',
         listSources: () => ({ sources: [source()] }),
         probeSource: async (input) => {
           if (!('sourceId' in input)) throw new Error('unexpected draft')
@@ -123,6 +125,85 @@ function dependencies(options: {
 }
 
 describe('Server Ops Agent 多资源只读 Facade', () => {
+  test('Given 停止本轮运行 When 再次调用工具 Then 保留会话租约但拒绝旧闭包', async () => {
+    /** 运行取消与授权生命周期相互独立。 */
+    const deps = dependencies()
+    const controller = new AbortController()
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps, runSignal: controller.signal })!
+    controller.abort()
+    await expect(facade.databaseTables({ sourceId: 'source-1', database: 'app' })).rejects.toThrow('SERVER_OPS_AGENT_RUN_CANCELLED')
+    expect(deps.services.access.getReadAccess('session-1')).toBeDefined()
+  })
+
+  test('Given 结构读取已执行 When 工具取消 Then 信号到服务且底层拒绝归因明确', async () => {
+    /** 服务主动响应 abort，避免迟到成功桩掩盖取消错误。 */
+    const deps = dependencies()
+    const entered = Promise.withResolvers<void>()
+    deps.services.data!.listSchemaTables = async (_request, signal) => {
+      entered.resolve()
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('SERVER_OPS_DATA_CANCELLED')), { once: true })
+      })
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const controller = new AbortController()
+    const result = facade.databaseTables({ sourceId: 'source-1', database: 'app' }, controller.signal).catch((error: Error) => error.message)
+    await entered.promise
+    controller.abort()
+    expect(await Promise.race([result, new Promise((resolve) => setTimeout(() => resolve('cancel did not reach runtime'), 50))])).toBe('SERVER_OPS_AGENT_READ_CANCELLED')
+  })
+
+  test('Given 本轮已绑定租约 When 重授或新增授权 Then 旧闭包不继承，新运行才可读取', async () => {
+    /** 保存授权生成新代次，不能让正在运行的模型静默获得扩权。 */
+    const deps = dependencies()
+    let current = deps.services.access.getReadAccess('session-1')
+    deps.services.access.getReadAccess = () => current
+    const old = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    current = { ...current!, revision: current!.revision + 1 }
+    await expect(old.databaseTables({ sourceId: 'source-1', database: 'app' })).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_CHANGED')
+    const fresh = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(fresh.databaseTables({ sourceId: 'source-1', database: 'app' })).resolves.toMatchObject({ database: 'app' })
+    current = undefined
+    const ungranted = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    expect(ungranted.resources()).toMatchObject({ resources: [], status: 'SERVER_OPS_AGENT_ACCESS_REQUIRED' })
+    current = dependencies().services.access.getReadAccess('session-1')
+    await expect(ungranted.databaseTables({ sourceId: 'source-1', database: 'app' })).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+  })
+
+  test('Given SDK 结构工具 When 传入取消信号 Then execute 将信号传至 Facade', async () => {
+    const deps = dependencies()
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const sdk = { defineTool: (definition: ToolDefinition) => definition } as typeof import('@earendil-works/pi-coding-agent')
+    const controller = new AbortController()
+    const seen: AbortSignal[] = []
+    facade.databaseTables = async (_request, signal) => { if (signal) seen.push(signal); return { database: 'app', databases: ['app'], tables: [] } }
+    const tool = buildServerOpsReadTools(sdk, facade).find((entry) => entry.name === 'ops_database_tables')!
+    const execute = tool.execute as unknown as (id: string, request: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>
+    await execute('call-1', { sourceId: 'source-1', database: 'app' }, controller.signal)
+    expect(seen).toEqual([controller.signal])
+  })
+
+  test('Given 独立 SQLite 授权 When 读取 main 与执行 SQL Then 保留范围和遮罩且不继承其他库表权限', async () => {
+    /** 显式的 SQLite 授权不借用 MySQL 或 SSH 能力。 */
+    const deps = dependencies({ access: { sessionId: 'session-1', revision: 7, grantedAt: 10, expiresAt: Date.now() + 1_800_000, resources: [{ kind: 'sqlite', sourceId: 'source-1', instance: false, databases: [{ database: 'main', tables: ['users'], readRows: true, query: true }] }] } })
+    deps.services.data!.listSources = () => ({ sources: [{ id: 'source-1', label: '业务 SQLite', transport: 'ssh', hostId: 'host-1', engine: 'sqlite', filePath: '/srv/data.db', database: 'main', tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1 }] })
+    deps.services.data!.listSchemaTables = async () => ({ database: 'main', databases: ['main'], tables: [{ name: 'users' }, { name: 'private_data' }] })
+    /** 仅记录真正到达执行服务的语句数量。 */
+    let queries = 0
+    deps.services.data!.querySource = async (input) => {
+      queries += 1
+      return { queryId: input.queryId, database: input.database, columns: ['id'], rows: [['1']], rowCount: 1, durationMs: 1, truncated: false, warnings: [] }
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })
+    if (!facade) throw new Error('SQLite 测试会话未创建 Facade')
+    expect(facade.resources().resources[0]).toMatchObject({ kind: 'sqlite', instance: false })
+    expect((await facade.databaseTables({ sourceId: 'source-1', database: 'main' })).tables).toEqual([{ name: 'users' }])
+    expect((await facade.databaseRows({ sourceId: 'source-1', database: 'main', table: 'users', offset: 0, limit: 50 })).rows[0]).toEqual(['1', '[MASKED]'])
+    await expect(facade.databaseQuery({ sourceId: 'source-1', database: 'main', sql: 'SELECT "id" FROM "users"', maxRows: 10 })).resolves.toMatchObject({ rowCount: 1 })
+    await expect(facade.databaseQuery({ sourceId: 'source-1', database: 'main', sql: 'SELECT id FROM private_data', maxRows: 10 })).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseTables({ sourceId: 'source-1', database: 'temp' })).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    expect(queries).toBe(1)
+  })
   test('Given SQL 独立权限 When 查询授权表 Then 旧行权限不升级，JOIN 全表必须授权', async () => {
     /** 实际 Facade 服务调用计数，证明越界在数据库执行前被阻断。 */
     const deps = dependencies()
@@ -136,7 +217,7 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
     await expect(facade.databaseQuery(input)).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
     expect(calls).toBe(0)
     /** 测试桩保持同一授权对象，显式模拟用户启用新查询开关。 */
-    const access = deps.services.access.getReadCurrent()!
+    const access = deps.services.access.getReadAccess('session-1')!
     const mysql = access.resources.find((resource) => resource.kind === 'mysql')!
     if (mysql.kind !== 'mysql') throw new Error('expected mysql')
     mysql.databases[0]!.query = true
@@ -197,7 +278,8 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
     entered = Promise.withResolvers<void>()
     finish = Promise.withResolvers<void>()
     const controller = new AbortController()
-    const cancelledQuery = execute('query-3', input, controller.signal).then(() => 'unexpected success', (error: unknown) => error instanceof Error ? error.message : 'unexpected error')
+    const newFacade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const cancelledQuery = newFacade.databaseQuery(input, controller.signal).then(() => 'unexpected success', (error: unknown) => error instanceof Error ? error.message : 'unexpected error')
     await entered.promise
     controller.abort()
     expect(actualSignal?.aborted).toBe(true)
@@ -292,7 +374,7 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
 
   test('Given 授权范围本身超过工具预算 When 查询目录 Then 显式截断且最终 JSON 不超限', () => {
     const access: ServerOpsAgentReadAccess = {
-      sessionId: 'session-1', revision: 9, grantedAt: 10,
+      sessionId: 'session-1', revision: 9, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
       resources: [{
         kind: 'mysql', sourceId: 'source-1', instance: false,
         databases: Array.from({ length: 20 }, (_, databaseIndex) => ({
@@ -330,7 +412,7 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
 
   test('Given 仅授权 Redis 数据源 When 测试连接 Then 不会先按 MySQL 权限拒绝', async () => {
     const access: ServerOpsAgentReadAccess = {
-      sessionId: 'session-1', revision: 8, grantedAt: 10,
+      sessionId: 'session-1', revision: 8, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
       resources: [{ kind: 'redis', sourceId: 'source-1' }],
     }
     const deps = dependencies({ access })
@@ -356,8 +438,8 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
 
   test('Given 读取期间撤销或重新授权 When 迟到结果返回 Then 不发布旧数据', async () => {
     const deps = dependencies()
-    let current = deps.services.access.getReadCurrent()
-    deps.services.access.getReadCurrent = () => current
+    let current = deps.services.access.getReadAccess('session-1')
+    deps.services.access.getReadAccess = () => current
     deps.services.overview.getOverview = async ({ hostId }) => {
       current = current ? { ...current, revision: current.revision + 1 } : undefined
       return { hostId, capturedAt: 1, sampleWindowMs: 1, filesystems: [], processes: [], warnings: [] }
@@ -413,8 +495,8 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
 
   test('Given 结果审计写入时撤权 When 即将返回 Then 最后一次复核阻止发布结果', async () => {
     const deps = dependencies()
-    let current = deps.services.access.getReadCurrent()
-    deps.services.access.getReadCurrent = () => current
+    let current = deps.services.access.getReadAccess('session-1')
+    deps.services.access.getReadAccess = () => current
     deps.services.audit.append = (input) => {
       if (input.phase === 'result') current = undefined
       return { id: 'audit-1', timestamp: 1, ...input }

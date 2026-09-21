@@ -128,6 +128,24 @@ describe('数据连接详情视图', () => {
     expect(html).toContain('Redis')
   })
 
+  test('Given SQLite 连接 When 渲染 Then 显示文件路径且工作台只保留数据浏览与 SQL 查询', () => {
+    const html = renderView({
+      source: createDirectSource({
+        transport: 'ssh', hostId: 'host-1', engine: 'sqlite', label: '审计文件',
+        filePath: '/srv/data/audit.sqlite3', database: 'main', address: undefined, port: undefined,
+      }),
+      jumpHost: { id: 'host-1', label: '生产 API', description: 'deploy@10.0.0.8:22', connected: true },
+    })
+    expect(html).toContain('SQLite')
+    expect(html).toContain('/srv/data/audit.sqlite3')
+    expect(html).toContain('数据浏览')
+    expect(html).toContain('SQL 查询')
+    expect(html).not.toContain('aria-label="工作台范围"')
+    expect(html).not.toContain('会话')
+    expect(html).not.toContain('语句分析')
+    expect(html).not.toContain('实例参数')
+  })
+
   test('Given 经跳板连接 When 渲染 Then 第二行说明跳板主机而不是只写"经跳板"', () => {
     const withHost = renderView({
       source: createDirectSource({ transport: 'ssh', hostId: 'host-1' }),
@@ -149,6 +167,11 @@ describe('数据连接详情视图', () => {
     const html = renderView({
       source: createDirectSource({ address: '8.8.8.8', tlsMode: 'verify', tlsServerName: 'db.example.com' }),
     })
+    expect(html).not.toContain('data-server-ops-plaintext-direct')
+  })
+
+  test('Given 内网选择优先 TLS When 渲染 Then 不将可能的回退当成已发生的明文', () => {
+    const html = renderView({ source: createDirectSource({ address: '172.16.10.198', tlsMode: 'preferred' }) })
     expect(html).not.toContain('data-server-ops-plaintext-direct')
   })
 })

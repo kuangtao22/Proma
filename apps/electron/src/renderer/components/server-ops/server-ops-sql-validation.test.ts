@@ -65,4 +65,9 @@ describe('SQL 草稿本地校验', () => {
       expect(validateServerOpsSqlDraft(sql, 'app', schema)).toMatchObject({ status: 'invalid', diagnostics: [{ severity: 'error', category: 'policy' }] })
     }
   })
+
+  test('Given SQLite 方言 SQL When 校验 Then 使用 SQLite 规则且 MySQL 默认行为保持不变', () => {
+    expect(validateServerOpsSqlDraft("SELECT strftime('%Y', created_at) FROM users", 'main', undefined, 'sqlite')).toMatchObject({ status: 'valid' })
+    expect(validateServerOpsSqlDraft('SELECT * FROM users', 'app', schema)).toMatchObject({ status: 'valid' })
+  })
 })

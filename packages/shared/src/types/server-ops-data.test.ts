@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  isServerOpsSqliteFilePath,
   isServerOpsPlaintextDirectAddress,
+  isServerOpsDataTlsMode,
+  isServerOpsDataTlsStatus,
+  isServerOpsMySqlTlsServerName,
   parseServerOpsDataDiagnoseInput,
   parseServerOpsDataDiagnosticsResult,
   parseServerOpsDataMetric,
@@ -18,6 +22,7 @@ import {
   parseServerOpsDataTable,
   parseServerOpsDataTableList,
 } from './server-ops-data'
+import { isServerOpsSqliteFilePath as exportedSqliteFilePathGuard } from '../index'
 
 /** 公开数据源测试样本，已保存密码但绝不携带明文。 */
 const source = {
@@ -48,6 +53,82 @@ const table = {
 }
 
 describe('服务器运维数据服务公开合同', () => {
+  test('Given SQLite 远端文件 When 解析公开投影 Then 固定 SSH、main 与无凭据合同', () => {
+    /** 合法 SQLite 公开投影允许空格和引号，并把省略的数据库归一为 main。 */
+    const sqliteSource = {
+      id: 'source-sqlite', transport: 'ssh' as const, hostId: 'host-1', engine: 'sqlite' as const,
+      label: '业务归档', filePath: '/srv/data/app "archive".db', tlsMode: 'disabled' as const,
+      hasPassword: false, createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000,
+    }
+    expect(parseServerOpsDataSource(sqliteSource)).toEqual({ ...sqliteSource, database: 'main' })
+    expect(parseServerOpsDataSource({ ...sqliteSource, database: 'main' }).database).toBe('main')
+    expect(isServerOpsSqliteFilePath("/srv/data/it's ready.db")).toBe(true)
+    expect(exportedSqliteFilePathGuard('/srv/data/app.db')).toBe(true)
+  })
+
+  test('Given SQLite 文件路径或网络字段越界 When 解析 Then fail closed', () => {
+    /** SQLite 的文件身份只接受有界 POSIX 绝对路径，拒绝 URI、内存库、相对路径与控制字符。 */
+    for (const filePath of ['', 'app.db', ':memory:', 'file:/srv/app.db', 'FILE:/srv/app.db', '/srv/app\n.db', `/${'x'.repeat(4096)}`]) {
+      expect(isServerOpsSqliteFilePath(filePath)).toBe(false)
+    }
+    /** SQLite 公开投影不得夹带网络端点、凭据或 TLS 参数。 */
+    const base = {
+      id: 'source-sqlite', transport: 'ssh' as const, hostId: 'host-1', engine: 'sqlite' as const,
+      label: '业务归档', filePath: '/srv/data/app.db', tlsMode: 'disabled' as const,
+      hasPassword: false, createdAt: 1_700_000_000_000, updatedAt: 1_700_000_000_000,
+    }
+    for (const extra of [
+      { address: '127.0.0.1' }, { port: 3306 }, { username: 'root' }, { tlsServerName: 'db.internal' },
+      { address: undefined }, { database: 'other' }, { transport: 'direct' }, { hasPassword: true },
+    ]) expect(() => parseServerOpsDataSource({ ...base, ...extra })).toThrow('SERVER_OPS_DATA_SOURCE_INVALID')
+    for (const tlsMode of ['preferred', 'required', 'verify']) {
+      expect(() => parseServerOpsDataSource({ ...base, tlsMode })).toThrow('SERVER_OPS_DATA_SOURCE_INVALID')
+    }
+  })
+
+  test('Given SQLite 写入与探测草稿 When 解析 Then 仅接受远端文件参数并归一 main', () => {
+    /** 合法 SQLite 写入与探测草稿共用相同端点约束。 */
+    const sqliteUpsert = {
+      transport: 'ssh' as const, hostId: 'host-1', engine: 'sqlite' as const,
+      label: '业务归档', filePath: '/srv/data/app.db', tlsMode: 'disabled' as const,
+    }
+    expect(parseServerOpsDataSourceUpsertInput(sqliteUpsert)).toEqual({ ...sqliteUpsert, database: 'main' })
+    /** 探测草稿没有 label，但同样归一到 main。 */
+    const sqliteDraft = {
+      transport: 'ssh' as const, hostId: 'host-1', engine: 'sqlite' as const,
+      filePath: '/srv/data/app.db', tlsMode: 'disabled' as const,
+    }
+    expect(parseServerOpsDataSourceProbeInput({ draft: sqliteDraft })).toEqual({
+      draft: { ...sqliteDraft, database: 'main' },
+    })
+    for (const extra of [
+      { address: 'localhost' }, { port: 0 }, { username: 'root' }, { password: 'secret' },
+      { clearPassword: true }, { clearPassword: undefined }, { tlsServerName: 'db.internal' }, { database: 'other' }, { transport: 'direct' },
+    ]) expect(() => parseServerOpsDataSourceUpsertInput({ ...sqliteUpsert, ...extra }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+    for (const tlsMode of ['preferred', 'required', 'verify']) {
+      expect(() => parseServerOpsDataSourceUpsertInput({ ...sqliteUpsert, tlsMode }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+      expect(() => parseServerOpsDataSourceProbeInput({ draft: { ...sqliteDraft, tlsMode } }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID')
+    }
+    for (const extra of [
+      { address: 'localhost' }, { port: 3306 }, { username: 'root' }, { password: 'secret' },
+      { savedSourceId: 'source-1' }, { savedSourceId: undefined }, { tlsServerName: 'db.internal' }, { database: 'other' }, { transport: 'direct' },
+    ]) expect(() => parseServerOpsDataSourceProbeInput({ draft: { ...sqliteDraft, ...extra } }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID')
+  })
+
+  test('Given 网络引擎 When 夹带 SQLite 文件路径 Then 保持旧端点必填并拒绝混用', () => {
+    /** 网络引擎必须继续提供地址和端口。 */
+    const mysql = { transport: 'direct' as const, engine: 'mysql' as const, label: '主库', tlsMode: 'disabled' as const }
+    expect(() => parseServerOpsDataSourceUpsertInput(mysql)).toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+    expect(() => parseServerOpsDataSourceUpsertInput({ ...mysql, address: '127.0.0.1', port: 3306, filePath: '/srv/app.db' }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+    expect(() => parseServerOpsDataSourceUpsertInput({ ...mysql, address: '127.0.0.1', port: 3306, filePath: undefined }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+  })
+
   test('Given 合法数据源 When 投影解析 Then 深复制且不携带凭据引用', () => {
     const parsed = parseServerOpsDataSource(source)
     expect(parsed).toEqual(source)
@@ -71,6 +152,72 @@ describe('服务器运维数据服务公开合同', () => {
       .toThrow('SERVER_OPS_DATA_SOURCE_INVALID')
     expect(parseServerOpsDataSource({ ...source, tlsMode: 'verify', tlsServerName: 'redis.internal' }).tlsServerName)
       .toBe('redis.internal')
+  })
+
+  test('Given MySQL verify 主机名 When 新操作解析 Then 接受 DNS 且拒绝 IP，但旧来源仍可读取', () => {
+    const mysql = { ...source, engine: 'mysql' as const, tlsMode: 'verify' as const }
+    const upsert = { transport: 'ssh' as const, hostId: 'host-1', engine: 'mysql' as const,
+      label: '主库', address: '127.0.0.1', port: 3306, tlsMode: 'verify' as const }
+    const draft = { transport: 'ssh' as const, hostId: 'host-1', engine: 'mysql' as const,
+      address: '127.0.0.1', port: 3306, tlsMode: 'verify' as const }
+    for (const name of ['localhost', 'db.example.com', 'DB-01.internal']) {
+      expect(isServerOpsMySqlTlsServerName(name)).toBe(true)
+      expect(parseServerOpsDataSourceUpsertInput({ ...upsert, tlsServerName: name }).tlsServerName).toBe(name)
+      expect(parseServerOpsDataSourceProbeInput({ draft: { ...draft, tlsServerName: name } }))
+        .toMatchObject({ draft: { tlsServerName: name } })
+    }
+    for (const name of ['127.0.0.1', '001.002.003.004', '::1', '[::1]', 'db.example.com:3306',
+      'db..example', '-db.example', 'db-.example', 'db.example.', '1234']) {
+      expect(isServerOpsMySqlTlsServerName(name)).toBe(false)
+      expect(() => parseServerOpsDataSourceUpsertInput({ ...upsert, tlsServerName: name }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+      expect(() => parseServerOpsDataSourceProbeInput({ draft: { ...draft, tlsServerName: name } }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID')
+    }
+    /** 历史 IP 校验配置需要保留可读投影，供界面打开后纠正。 */
+    expect(parseServerOpsDataSource({ ...mysql, tlsServerName: '127.0.0.1' }).tlsServerName).toBe('127.0.0.1')
+  })
+
+  test('Given 网络数据库 TLS 模式 When 解析来源、写入和测试草稿 Then MySQL 支持协商而 Redis 不允许降级', () => {
+    const mysql = { ...source, engine: 'mysql' as const }
+    expect(isServerOpsDataTlsMode('preferred')).toBe(true)
+    expect(isServerOpsDataTlsMode('required')).toBe(true)
+    for (const mode of ['preferred', 'required'] as const) {
+      expect(parseServerOpsDataSource({ ...mysql, tlsMode: mode }).tlsMode).toBe(mode)
+      expect(parseServerOpsDataSourceUpsertInput({ transport: 'ssh', hostId: 'host-1', engine: 'mysql',
+        label: '主库', address: '127.0.0.1', port: 3306, tlsMode: mode })).toMatchObject({ tlsMode: mode })
+      expect(parseServerOpsDataSourceProbeInput({ draft: {
+        transport: 'ssh', hostId: 'host-1', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: mode,
+      } })).toMatchObject({ draft: { tlsMode: mode } })
+    }
+    expect(parseServerOpsDataSource({ ...source, tlsMode: 'required' }).tlsMode).toBe('required')
+    for (const parse of [
+      () => parseServerOpsDataSource({ ...source, tlsMode: 'preferred' }),
+      () => parseServerOpsDataSourceUpsertInput({ transport: 'ssh', hostId: 'host-1', engine: 'redis',
+        label: '缓存', address: '127.0.0.1', port: 6379, tlsMode: 'preferred' }),
+      () => parseServerOpsDataSourceProbeInput({ draft: { transport: 'ssh', hostId: 'host-1', engine: 'redis',
+        address: '127.0.0.1', port: 6379, tlsMode: 'preferred' } }),
+    ]) expect(parse).toThrow()
+  })
+
+  test('Given 成功连接的 TLS 实际状态 When 解析测试及诊断回执 Then 保留状态且拒绝失败或 SQLite 声称加密', () => {
+    expect(isServerOpsDataTlsStatus('verified')).toBe(true)
+    const probe = { engine: 'mysql', capability: 'available', serverVersion: '8.0.36', warnings: [] }
+    const diagnostics = { sourceId: 'source-1', engine: 'redis', capability: 'available',
+      collectedAt: 1_700_000_000_000, metrics: [], tables: [], warnings: [] }
+    for (const tlsStatus of ['plaintext', 'encrypted', 'verified'] as const) {
+      expect(parseServerOpsDataProbeResult({ ...probe, tlsStatus }).tlsStatus).toBe(tlsStatus)
+      expect(parseServerOpsDataDiagnosticsResult({ ...diagnostics, tlsStatus }).tlsStatus).toBe(tlsStatus)
+    }
+    expect(() => parseServerOpsDataProbeResult({ ...probe, tlsStatus: 'unknown' })).toThrow('SERVER_OPS_DATA_PROBE_RESULT_INVALID')
+    expect(() => parseServerOpsDataProbeResult({ ...probe, capability: 'tls-failed', serverVersion: undefined,
+      tlsStatus: 'plaintext' })).toThrow('SERVER_OPS_DATA_PROBE_RESULT_INVALID')
+    expect(() => parseServerOpsDataDiagnosticsResult({ ...diagnostics, capability: 'timeout',
+      tlsStatus: 'encrypted' })).toThrow('SERVER_OPS_DATA_DIAGNOSTICS_RESULT_INVALID')
+    expect(() => parseServerOpsDataProbeResult({ ...probe, engine: 'sqlite', tlsStatus: 'verified' }))
+      .toThrow('SERVER_OPS_DATA_PROBE_RESULT_INVALID')
+    expect(() => parseServerOpsDataDiagnosticsResult({ ...diagnostics, engine: 'sqlite', tlsStatus: 'plaintext' }))
+      .toThrow('SERVER_OPS_DATA_DIAGNOSTICS_RESULT_INVALID')
   })
 
   test('Given 未知字段或越界字段 When 解析数据源 Then 拒绝', () => {

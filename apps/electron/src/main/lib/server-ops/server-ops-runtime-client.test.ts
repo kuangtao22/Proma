@@ -316,6 +316,29 @@ async function connectRotatingFixture(
 }
 
 describe('服务器运维 runtime client exec', () => {
+  test('Given exec 在途 When signal 取消 Then 请求 utility 关闭通道并等终态确认', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const controller = new AbortController()
+    const executing = fixture.client.exec('host-1', 'connection-1', 'sleep 10', 1_000, controller.signal)
+    await flushRuntimeClient()
+    controller.abort()
+    expect(fixture.port.messages.at(-1)).toEqual({ type: 'server-ops.exec-cancel', requestId: 'exec-1', hostId: 'host-1', connectionId: 'connection-1' })
+    fixture.port.emit({ type: 'server-ops.exec-cancelled', requestId: 'exec-1', hostId: 'host-1', connectionId: 'connection-1' })
+    await expect(executing).rejects.toMatchObject({ code: 'SERVER_OPS_EXEC_CANCELLED' })
+  })
+
+  test('Given 取消消息无法送达 utility When signal 取消 Then 终止 runtime 并拒绝悬挂请求', async () => {
+    const fixture = createFixture()
+    await connectFixture(fixture)
+    const controller = new AbortController()
+    const executing = fixture.client.exec('host-1', 'connection-1', 'sleep 10', 1_000, controller.signal)
+    await flushRuntimeClient()
+    fixture.port.throwOnPostMessage = true
+    expect(() => controller.abort()).not.toThrow()
+    await expect(executing).rejects.toMatchObject({ code: 'SERVER_OPS_RUNTIME_STOPPED' })
+    expect(fixture.runtimeProcess.killCalls).toBe(1)
+  })
   test('已连接后按 requestId 返回结构化 exec 结果', async () => {
     const fixture = createFixture()
     await connectFixture(fixture)

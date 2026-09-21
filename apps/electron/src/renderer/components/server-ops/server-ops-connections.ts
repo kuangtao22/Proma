@@ -23,6 +23,8 @@ export interface ServerOpsConnection {
   endpoint?: string
   /** 卡片单独展示的连接说明；兼容旧调用方，因此保持可选。 */
   metadata?: string
+  /** 卡片展示的真实协议或引擎名称；旧调用方缺省时由类别回退。 */
+  protocol?: 'SSH' | 'MySQL' | 'SQLite' | 'Redis'
   /** SSH 连接对应的主机 ID。 */
   hostId?: string
   /** 数据库/Redis 连接对应的数据源 ID。 */
@@ -104,34 +106,46 @@ export function buildServerOpsConnections(source: ServerOpsConnectionSource): Se
       detail: `${host.username}@${host.address}:${host.port}`,
       endpoint: `${host.address}:${host.port}`,
       metadata: `${host.username} · SSH`,
+      protocol: 'SSH',
       hostId: host.id,
       connected: state?.phase === 'connected',
     }
   })
   /** 数据库与 Redis 连接条目。 */
-  const dataConnections: ServerOpsConnection[] = source.dataSources.map((dataSource) => ({
-    id: createServerOpsDataConnectionId(dataSource.id),
-    kind: toConnectionKind(dataSource.engine),
-    projectId: dataSource.projectId ?? legacyProjectId,
-    label: dataSource.label,
-    detail: [
-      `${dataSource.address}:${dataSource.port}`,
-      dataSource.database === undefined ? undefined : `库 ${dataSource.database}`,
-      dataSource.transport === 'direct' ? '本机直连' : '经跳板',
-    ].filter((part): part is string => part !== undefined).join(' · '),
-    endpoint: `${dataSource.address}:${dataSource.port}`,
-    metadata: [
-      dataSource.database === undefined
+  const dataConnections: ServerOpsConnection[] = source.dataSources.map((dataSource) => {
+    /** SQLite 用远端文件路径作为可识别端点；网络引擎继续展示地址和端口。 */
+    const endpoint = dataSource.engine === 'sqlite'
+      ? dataSource.filePath
+      : `${dataSource.address}:${dataSource.port}`
+    /** SQLite 的 main 是固定内部库名，卡片只需说明引擎与 SSH 链路。 */
+    const databaseLabel = dataSource.engine === 'sqlite'
+      ? 'SQLite'
+      : dataSource.database === undefined
         ? undefined
-        : dataSource.engine === 'redis' ? `DB ${dataSource.database}` : `库 ${dataSource.database}`,
-      dataSource.transport === 'direct' ? '本机直连' : '经跳板',
-    ].filter((part): part is string => part !== undefined).join(' · '),
-    sourceId: dataSource.id,
-    /** 直连 + 未校验证书 + 私有网段/回环：属于"允许但明文"的形态。 */
-    plaintextDirect: dataSource.transport === 'direct'
-      && dataSource.tlsMode !== 'verify'
-      && isServerOpsPlaintextDirectAddress(dataSource.address),
-  }))
+        : dataSource.engine === 'redis' ? `DB ${dataSource.database}` : `库 ${dataSource.database}`
+    /** 兼容既有卡片详情：Redis 详情仍使用“库”，metadata 使用“DB”。 */
+    const detailDatabaseLabel = dataSource.engine === 'redis' && dataSource.database !== undefined
+      ? `库 ${dataSource.database}`
+      : databaseLabel
+    const transportLabel = dataSource.transport === 'direct' ? '本机直连' : '经跳板'
+    return {
+      id: createServerOpsDataConnectionId(dataSource.id),
+      kind: toConnectionKind(dataSource.engine),
+      projectId: dataSource.projectId ?? legacyProjectId,
+      label: dataSource.label,
+      detail: [endpoint, detailDatabaseLabel, transportLabel].filter((part): part is string => part !== undefined).join(' · '),
+      endpoint,
+      metadata: [databaseLabel, transportLabel].filter((part): part is string => part !== undefined).join(' · '),
+      protocol: dataSource.engine === 'sqlite' ? 'SQLite' : dataSource.engine === 'redis' ? 'Redis' : 'MySQL',
+      sourceId: dataSource.id,
+      /** 只有明确关闭 TLS 的私网直连才可由配置判定为明文；优先 TLS 需看实测结果。 */
+      plaintextDirect: dataSource.engine !== 'sqlite'
+        && dataSource.transport === 'direct'
+        && dataSource.tlsMode === 'disabled'
+        && dataSource.address !== undefined
+        && isServerOpsPlaintextDirectAddress(dataSource.address),
+    }
+  })
   /** 类别顺序固定，避免不同数据类型混排后难以扫描。 */
   const order: Record<ServerOpsConnectionKind, number> = { ssh: 0, database: 1, redis: 2 }
   return [...sshConnections, ...dataConnections].sort((left, right) => order[left.kind] - order[right.kind])

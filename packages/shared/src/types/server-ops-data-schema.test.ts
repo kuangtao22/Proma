@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import type { ServerOpsDataRowFilters } from './server-ops-data-schema'
 import {
+  isServerOpsSchemaBrowsableEngine,
+  parseServerOpsDataRowFilters,
   parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceRowsResult,
   parseServerOpsDataSourceTableInput,
@@ -9,6 +12,37 @@ import {
 } from './server-ops-data-schema'
 
 describe('数据源表浏览公开合同', () => {
+  test('Given 多字段筛选 When 解析 Then 保留 AND/OR、空比较值及 NULL 条件', () => {
+    const filters = { match: 'any', conditions: [
+      { column: 'name', operator: 'contains', value: '' },
+      { column: 'deleted_at', operator: 'is-null' },
+    ] } satisfies ServerOpsDataRowFilters
+    expect(parseServerOpsDataRowFilters(filters)).toEqual(filters)
+    expect(parseServerOpsDataSourceRowsInput({
+      sourceId: 'source-1', database: 'app', table: 'users', offset: 0, limit: 50, filters,
+    }).filters).toEqual(filters)
+  })
+
+  test('Given 非法筛选合同 When 解析 Then 在访问数据库之前拒绝', () => {
+    const valid = { column: 'name', operator: 'eq', value: 'Alice' }
+    for (const filters of [
+      { match: 'all', conditions: [] },
+      { match: 'any', conditions: Array.from({ length: 13 }, () => valid) },
+      { match: 'all', conditions: [valid], unexpected: true },
+      { match: 'all', conditions: [{ ...valid, column: 'x\n' }] },
+      { match: 'all', conditions: [{ ...valid, operator: 'raw-sql' }] },
+      { match: 'all', conditions: [{ ...valid, value: 'x'.repeat(1025) }] },
+      { match: 'all', conditions: [{ column: 'name', operator: 'eq' }] },
+      { match: 'all', conditions: [{ column: 'name', operator: 'is-null', value: '' }] },
+      { match: 'all', conditions: [{ ...valid, nested: [] }] },
+    ]) expect(() => parseServerOpsDataRowFilters(filters)).toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
+  })
+  test('Given 关系型引擎 When 判断结构浏览能力 Then MySQL 与 SQLite 均开放', () => {
+    expect(isServerOpsSchemaBrowsableEngine('mysql')).toBe(true)
+    expect(isServerOpsSchemaBrowsableEngine('sqlite')).toBe(true)
+    expect(isServerOpsSchemaBrowsableEngine('redis')).toBe(false)
+  })
+
   test('Given 表浏览输入 When 解析 Then 只接受 exact-key 且分页必须整页对齐', () => {
     expect(parseServerOpsDataSourceTablesInput({ sourceId: 'source-1' })).toEqual({ sourceId: 'source-1' })
     expect(parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', database: 'chebenben' }))

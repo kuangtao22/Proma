@@ -9,7 +9,7 @@ import type {
   ServerOpsDataTlsMode,
   ServerOpsDataTransport,
 } from '@proma/shared'
-import { isServerOpsPlaintextDirectAddress } from '@proma/shared'
+import { isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -35,7 +35,7 @@ import {
 } from './server-ops-data-display'
 
 /** 引擎到默认端口的映射，切换引擎时带入避免用户手填常见值。 */
-const DEFAULT_ENGINE_PORTS: Record<ServerOpsDataEngine, number> = { mysql: 3306, redis: 6379 }
+const DEFAULT_ENGINE_PORTS: Partial<Record<ServerOpsDataEngine, number>> = { mysql: 3306, redis: 6379 }
 
 /** Renderer 在提交阶段同步失效旧会话；SSR 静态测试使用普通 Effect 避免无意义警告。 */
 const useServerOpsDialogLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
@@ -44,10 +44,15 @@ const useServerOpsDialogLayoutEffect = typeof window === 'undefined' ? React.use
 export interface ServerOpsDataSourceDraft {
   /** 连接方式：本机直连或经由跳板主机。 */
   transport: ServerOpsDataTransport
+  /** SQLite 所在的 SSH 服务器；网络数据库继续由弹窗外的兼容字段提供默认值。 */
+  hostId: string
   engine: ServerOpsDataEngine
   label: string
   address: string
   port: string
+  /** SQLite 在远端服务器上的绝对文件路径。 */
+  filePath: string
+  /** 仅用于 Redis 逻辑库和 SQLite 固定 main；MySQL 连接后再选库。 */
   database: string
   username: string
   password: string
@@ -61,7 +66,10 @@ export interface ServerOpsDataSourceFormErrors {
   label?: string
   address?: string
   port?: string
+  hostId?: string
+  filePath?: string
   database?: string
+  tlsMode?: string
   tlsServerName?: string
 }
 
@@ -79,21 +87,23 @@ export function createServerOpsDataSourceDraft(
   /** 初始引擎。 */
   const engine = source?.engine ?? initialEngine
   return {
-    transport: source?.transport ?? 'direct',
+    transport: engine === 'sqlite' ? 'ssh' : source?.transport ?? 'direct',
+    hostId: source?.hostId ?? '',
     engine,
     label: source?.label ?? '',
-    address: source?.address ?? '127.0.0.1',
-    port: String(source?.port ?? DEFAULT_ENGINE_PORTS[engine]),
-    database: source?.database ?? '',
+    address: source?.address ?? (engine === 'sqlite' ? '' : '127.0.0.1'),
+    port: source?.port === undefined ? String(DEFAULT_ENGINE_PORTS[engine] ?? '') : String(source.port),
+    filePath: source?.filePath ?? '',
+    database: engine === 'sqlite' ? 'main' : engine === 'redis' ? source?.database ?? '' : '',
     username: source?.username ?? '',
     password: '',
     clearPassword: false,
-    tlsMode: source?.tlsMode ?? 'disabled',
-    tlsServerName: source?.tlsServerName ?? '',
+    tlsMode: source?.tlsMode ?? (engine === 'mysql' ? 'preferred' : 'disabled'),
+    tlsServerName: source?.tlsServerName ?? (source?.tlsMode === 'verify' ? source.address ?? '' : ''),
   }
 }
 
-/** 切换引擎：带入默认端口，并在切到 Redis 时清空不适用于逻辑库的库名。 */
+/** 切换引擎：带入默认端口，并清空不适用于目标引擎的数据库选择。 */
 export function applyServerOpsDataSourceEngineChange(
   draft: ServerOpsDataSourceDraft,
   engine: ServerOpsDataEngine,
@@ -101,16 +111,39 @@ export function applyServerOpsDataSourceEngineChange(
   return {
     ...draft,
     engine,
-    port: String(DEFAULT_ENGINE_PORTS[engine]),
-    ...(engine === 'redis' ? { database: '' } : {}),
+    ...(engine === 'sqlite' ? {
+      transport: 'ssh' as const,
+      address: '',
+      port: '',
+      database: 'main',
+      username: '',
+      password: '',
+      clearPassword: false,
+      tlsMode: 'disabled' as const,
+      tlsServerName: '',
+    } : {
+      port: String(DEFAULT_ENGINE_PORTS[engine]),
+      filePath: '',
+      database: '',
+      ...(engine === 'redis' && draft.tlsMode === 'preferred' ? { tlsMode: 'required' as const } : {}),
+      ...(engine === 'mysql' && draft.engine === 'sqlite' ? { tlsMode: 'preferred' as const } : {}),
+    }),
   }
 }
 
-/** 校验草稿并返回字段级错误；规则必须与共享合同保持一致。 */
-export function validateServerOpsDataSourceDraft(draft: ServerOpsDataSourceDraft): ServerOpsDataSourceFormErrors {
+/** 校验草稿及网络连接的跳板身份，返回字段错误；TLS 规则与主进程保持一致。 */
+export function validateServerOpsDataSourceDraft(draft: ServerOpsDataSourceDraft, hostId = draft.hostId): ServerOpsDataSourceFormErrors {
   /** 待返回的字段错误。 */
   const errors: ServerOpsDataSourceFormErrors = {}
   if (draft.label.trim().length === 0 || draft.label.length > 64) errors.label = '名称必填且不超过 64 个字符'
+  if (draft.engine === 'sqlite') {
+    if (draft.hostId === '') errors.hostId = '请选择 SQLite 文件所在的服务器'
+    if (!isServerOpsSqliteFilePath(draft.filePath)) errors.filePath = '请输入服务器上的绝对路径，不能使用 URI、相对路径或内存数据库'
+    return errors
+  }
+  if (draft.transport === 'ssh' && hostId === '') {
+    errors.hostId = '经由 SSH 需要一台跳板服务器；请先添加服务器，或改选「直接连接」'
+  }
   if (draft.address.trim().length === 0 || draft.address.length > 255 || /\s/u.test(draft.address)) {
     errors.address = '地址必填、不超过 255 个字符且不能包含空白'
   }
@@ -119,20 +152,27 @@ export function validateServerOpsDataSourceDraft(draft: ServerOpsDataSourceDraft
   if (!/^\d+$/u.test(draft.port) || !Number.isInteger(port) || port < 1 || port > 65_535) {
     errors.port = '端口必须是 1 到 65535 之间的整数'
   }
-  if (draft.database.trim() !== '') {
-    if (draft.engine === 'redis') {
-      /** Redis 逻辑库序号的数字形式。 */
-      const databaseIndex = Number(draft.database)
-      if (!/^\d{1,2}$/u.test(draft.database) || databaseIndex < 0 || databaseIndex > 15) {
-        errors.database = 'Redis 逻辑库必须是 0 到 15 之间的数字'
-      }
-    } else if (draft.database.length > 64) {
-      errors.database = '库名不超过 64 个字符'
+  if (draft.engine === 'redis' && draft.database.trim() !== '') {
+    /** Redis 逻辑库序号的数字形式。 */
+    const databaseIndex = Number(draft.database)
+    if (!/^\d{1,2}$/u.test(draft.database) || databaseIndex < 0 || databaseIndex > 15) {
+      errors.database = 'Redis 逻辑库必须是 0 到 15 之间的数字'
     }
   }
+  if (draft.engine === 'redis' && draft.tlsMode === 'preferred') {
+    errors.tlsMode = 'Redis 不支持优先 TLS 协商，请选择必须 TLS 或校验证书'
+  }
   if (draft.tlsMode === 'verify'
-    && (draft.tlsServerName.trim().length === 0 || draft.tlsServerName.length > 255 || /\s/u.test(draft.tlsServerName))) {
-    errors.tlsServerName = '校验证书时必须填写数据库真实主机名，且不能包含空白'
+    && ((draft.tlsServerName.trim() || draft.address.trim()).length > 255 || /\s/u.test(draft.tlsServerName.trim() || draft.address.trim()))) {
+    errors.tlsServerName = '证书主机名不能超过 255 个字符或包含空白'
+  }
+  if (draft.engine === 'mysql' && draft.tlsMode === 'verify' && errors.tlsServerName === undefined
+    && !isServerOpsMySqlTlsServerName(draft.tlsServerName.trim() || draft.address.trim())) {
+    errors.tlsServerName = '请填写证书中的 DNS 主机名；数据库地址仍可使用 IP'
+  }
+  if (!errors.address && draft.transport === 'direct' && draft.tlsMode === 'disabled'
+    && !isServerOpsPlaintextDirectAddress(draft.address)) {
+    errors.tlsMode = '该域名或公网地址直连需要开启 TLS；关闭 TLS 只适用于回环或私有网段'
   }
   return errors
 }
@@ -155,6 +195,18 @@ export function buildServerOpsDataSourceProbeDraft(options: {
   passwordFromStore?: boolean
 }): ServerOpsDataSourceProbeDraft | null {
   const { source, draft } = options
+  if (draft.engine === 'sqlite') {
+    const jumpHostId = source?.hostId ?? draft.hostId ?? options.hostId
+    if (jumpHostId === '' || !isServerOpsSqliteFilePath(draft.filePath)) return null
+    return {
+      transport: 'ssh',
+      hostId: jumpHostId,
+      engine: 'sqlite',
+      filePath: draft.filePath.trim(),
+      database: 'main',
+      tlsMode: 'disabled',
+    }
+  }
   /** 归一化后的端口；非法时无法构造运行时请求。 */
   const port = Number(draft.port)
   if (!/^\d+$/u.test(draft.port) || !Number.isInteger(port) || port < 1 || port > 65_535) return null
@@ -173,12 +225,12 @@ export function buildServerOpsDataSourceProbeDraft(options: {
     engine: draft.engine,
     address: draft.address.trim(),
     port,
-    ...(draft.database.trim() === '' ? {} : { database: draft.database.trim() }),
+    ...(draft.engine === 'redis' && draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
     ...(draft.username.trim() === '' ? {} : { username: draft.username.trim() }),
     ...(usesInlinePassword ? { password: draft.password } : {}),
     ...(reusesSavedPassword ? { savedSourceId: source!.id } : {}),
     tlsMode: draft.tlsMode,
-    ...(draft.tlsMode === 'verify' ? { tlsServerName: draft.tlsServerName.trim() } : {}),
+    ...(draft.tlsMode === 'verify' ? { tlsServerName: draft.tlsServerName.trim() || draft.address.trim() } : {}),
   }
 }
 
@@ -201,6 +253,18 @@ export function buildServerOpsDataSourceUpsertInput(options: {
   passwordFromStore?: boolean
 }): ServerOpsDataSourceUpsertInput {
   const { hostId, source, draft } = options
+  if (draft.engine === 'sqlite') {
+    return {
+      transport: 'ssh',
+      hostId: source?.hostId ?? draft.hostId ?? hostId,
+      ...(source ? { sourceId: source.id } : {}),
+      engine: 'sqlite',
+      label: draft.label,
+      filePath: draft.filePath.trim(),
+      database: 'main',
+      tlsMode: 'disabled',
+    }
+  }
   /** 是否应当把密码框内容当作"本次新密码"提交。 */
   const submitsPassword = draft.password !== '' && options.passwordFromStore !== true
   return {
@@ -211,12 +275,12 @@ export function buildServerOpsDataSourceUpsertInput(options: {
     label: draft.label,
     address: draft.address,
     port: Number(draft.port),
-    ...(draft.database.trim() === '' ? {} : { database: draft.database.trim() }),
+    ...(draft.engine === 'redis' && draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
     ...(draft.username.trim() === '' ? {} : { username: draft.username.trim() }),
     ...(submitsPassword ? { password: draft.password } : {}),
     ...(draft.clearPassword ? { clearPassword: true } : {}),
     tlsMode: draft.tlsMode,
-    ...(draft.tlsMode === 'verify' ? { tlsServerName: draft.tlsServerName } : {}),
+    ...(draft.tlsMode === 'verify' ? { tlsServerName: draft.tlsServerName.trim() || draft.address.trim() } : {}),
   }
 }
 
@@ -242,8 +306,18 @@ export interface ServerOpsDataSourceFieldsProps {
   revealingPassword?: boolean
   /** 当前明文是否来自"已保存密码"（而不是用户新输入的）。 */
   passwordFromStore?: boolean
+  /** 网络连接当前可用的跳板身份；为空时禁选无效的 SSH 路径。 */
+  hostId: string
   /** 跳板主机展示名；用于连接方式选项文案。 */
   hostLabel: string
+  /** 当前项目内可作为 SQLite 文件宿主的服务器。 */
+  hostOptions?: readonly ServerOpsDataSourceHostOption[]
+}
+
+/** SQLite 服务器选择只需要稳定 ID 与可辨认名称。 */
+export interface ServerOpsDataSourceHostOption {
+  id: string
+  label: string
 }
 
 /** 数据源表单字段集合。 */
@@ -258,42 +332,81 @@ export function ServerOpsDataSourceFields({
   onShowPasswordChange,
   revealingPassword = false,
   passwordFromStore = false,
+  hostId,
   hostLabel,
+  hostOptions = [],
 }: ServerOpsDataSourceFieldsProps): React.ReactElement {
+  /** 固定星号只表示已有凭据，不读取真实密码，也不作为草稿提交。 */
+  const hasRetainedPassword = mode === 'edit' && hasSavedPassword && !draft.clearPassword
   return (
-    <div className="grid gap-4 py-1 [&_label]:text-xs" data-server-ops-data-source-form="true">
-      <div className="text-[11px] font-medium text-muted-foreground">连接信息</div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="grid gap-1.5">
+    <div className="grid gap-4 [&_label]:text-xs" data-server-ops-data-source-form="true">
+      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+        {draft.engine === 'sqlite' ? null : <div className="grid gap-1.5">
           <Label htmlFor="server-ops-data-transport">连接方式</Label>
           <Select value={draft.transport} onValueChange={(value) => onChange({ transport: value as ServerOpsDataTransport })}>
             <SelectTrigger id="server-ops-data-transport" aria-label="连接方式"><SelectValue /></SelectTrigger>
             <SelectContent className="z-[280]">
-              <SelectItem value="direct">本机直连</SelectItem>
-              <SelectItem value="ssh">经由 {hostLabel}</SelectItem>
+              <SelectItem value="direct">直接连接（本机发起）</SelectItem>
+              <SelectItem value="ssh" disabled={!hostId}>{hostLabel ? `经由 SSH · ${hostLabel}` : '经由 SSH 服务器'}</SelectItem>
             </SelectContent>
           </Select>
-        </div>
+          {errors.hostId ? <p className="text-[11px] text-destructive">{errors.hostId}</p> : null}
+        </div>}
         <div className="grid gap-1.5">
           <Label htmlFor="server-ops-data-engine">引擎</Label>
           <Select value={draft.engine} onValueChange={(value) => onEngineChange(value as ServerOpsDataEngine)}>
             <SelectTrigger id="server-ops-data-engine" aria-label="引擎"><SelectValue /></SelectTrigger>
             <SelectContent className="z-[280]">
               <SelectItem value="mysql">MySQL</SelectItem>
+              <SelectItem value="sqlite">SQLite</SelectItem>
               <SelectItem value="redis">Redis</SelectItem>
             </SelectContent>
           </Select>
         </div>
-        <div className="grid gap-1.5 sm:col-span-2">
+        {/* 网络数据库将名称与 TLS 同排；SQLite 无 TLS，名称继续占满行宽。 */}
+        <div className={cn('grid min-w-0 gap-1.5', draft.engine === 'sqlite' && 'sm:col-span-2')}>
           <Label htmlFor="server-ops-data-label">名称</Label>
           <Input id="server-ops-data-label" value={draft.label} placeholder="业务主库" onChange={(event) => onChange({ label: event.target.value })} />
           {errors.label ? <p className="text-[11px] text-destructive">{errors.label}</p> : null}
         </div>
+        {draft.engine !== 'sqlite' ? <div className="grid min-w-0 gap-1.5">
+          <Label htmlFor="server-ops-data-tls">TLS</Label>
+          <Select value={draft.tlsMode} onValueChange={(value) => onChange({ tlsMode: value as ServerOpsDataTlsMode })}>
+            <SelectTrigger id="server-ops-data-tls" aria-label="TLS 模式"><SelectValue /></SelectTrigger>
+            <SelectContent className="z-[280]">
+              <SelectItem value="disabled">关闭（仅 SSH / 内网直连）</SelectItem>
+              {draft.engine === 'mysql' ? <SelectItem value="preferred">优先 TLS</SelectItem> : null}
+              <SelectItem value="required">必须 TLS</SelectItem>
+              <SelectItem value="verify">校验证书</SelectItem>
+            </SelectContent>
+          </Select>
+          {errors.tlsMode ? <p className="text-[11px] text-destructive">{errors.tlsMode}</p> : null}
+        </div> : null}
       </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,2fr)_minmax(5.5rem,1fr)]">
-        <div className="grid gap-1.5">
-          <Label htmlFor="server-ops-data-address">服务器视角地址</Label>
-          <Input id="server-ops-data-address" value={draft.address} placeholder="127.0.0.1" onChange={(event) => onChange({ address: event.target.value })} />
+      {draft.engine === 'sqlite' ? (
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="server-ops-data-host">服务器</Label>
+            <Select value={draft.hostId} disabled={mode === 'edit'} onValueChange={(hostId) => onChange({ hostId })}>
+              <SelectTrigger id="server-ops-data-host" aria-label="服务器"><SelectValue placeholder="选择文件所在服务器" /></SelectTrigger>
+              <SelectContent className="z-[280]">
+                {hostOptions.map((host) => <SelectItem key={host.id} value={host.id}>{host.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            {errors.hostId ? <p className="text-[11px] text-destructive">{errors.hostId}</p> : null}
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="server-ops-data-file-path">SQLite 文件路径</Label>
+            <Input id="server-ops-data-file-path" value={draft.filePath} placeholder="/srv/data/app.sqlite3" onChange={(event) => onChange({ filePath: event.target.value })} />
+            <p className="text-[11px] text-muted-foreground">填写服务器上的绝对路径；服务器需安装 Python 3.11+ 并包含 sqlite3 标准库。</p>
+            {errors.filePath ? <p className="text-[11px] text-destructive">{errors.filePath}</p> : null}
+          </div>
+        </div>
+      ) : <>
+      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-[minmax(0,1fr)_6rem]">
+        <div className="grid min-w-0 gap-1.5">
+          <Label htmlFor="server-ops-data-address">{draft.transport === 'ssh' ? '数据库地址（跳板服务器视角）' : '数据库地址'}</Label>
+          <Input id="server-ops-data-address" value={draft.address} title={draft.address} placeholder="数据库域名或 IP" onChange={(event) => onChange({ address: event.target.value })} />
           {errors.address ? <p className="text-[11px] text-destructive">{errors.address}</p> : null}
         </div>
         <div className="grid gap-1.5">
@@ -301,86 +414,34 @@ export function ServerOpsDataSourceFields({
           <Input id="server-ops-data-port" inputMode="numeric" value={draft.port} onChange={(event) => onChange({ port: event.target.value })} />
           {errors.port ? <p className="text-[11px] text-destructive">{errors.port}</p> : null}
         </div>
-      </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <div className="grid gap-1.5">
-          <Label htmlFor="server-ops-data-database">{draft.engine === 'redis' ? '逻辑库（0-15）' : '库名'}</Label>
-          <Input
-            id="server-ops-data-database"
-            value={draft.database}
-            placeholder={draft.engine === 'redis' ? '0' : '可选'}
-            onChange={(event) => onChange({ database: event.target.value })}
-          />
-          {errors.database ? <p className="text-[11px] text-destructive">{errors.database}</p> : null}
-        </div>
-        <div className="grid gap-1.5">
-          <Label htmlFor="server-ops-data-username">用户名</Label>
-          <Input id="server-ops-data-username" value={draft.username} placeholder="可选" onChange={(event) => onChange({ username: event.target.value })} />
+        <div className="text-[11px] leading-5 text-muted-foreground sm:col-span-2">
+          {draft.transport === 'direct' ? <p>直接连接支持远程域名与 IP，无需添加服务器。</p>
+            : !hostId ? <p>当前项目没有可用的 SSH 服务器，请先添加服务器或选择直接连接。</p>
+              : <p>填写跳板服务器能够访问的数据库域名或 IP。</p>}
         </div>
       </div>
-      <div className="grid gap-1.5 border-t border-border/40 pt-4">
-        <div className="text-[11px] font-medium text-muted-foreground">登录凭据</div>
-        <Label htmlFor="server-ops-data-password">密码</Label>
-        <div className="flex items-center gap-2">
-          <Input
-            id="server-ops-data-password"
-            type={showPassword ? 'text' : 'password'}
-            value={draft.password}
-            placeholder={mode === 'edit' && hasSavedPassword ? '留空表示保留已保存密码' : '可选'}
-            disabled={draft.clearPassword}
-            onChange={(event) => onChange({ password: event.target.value })}
-          />
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label={showPassword ? '隐藏密码' : '显示密码'}
-            disabled={revealingPassword}
-            onClick={() => { void onShowPasswordChange(!showPassword) }}
-          >
-            {revealingPassword
-              ? <LoaderCircle className="size-3.5 animate-spin" />
-              : showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-          </Button>
-        </div>
-        {passwordFromStore ? (
-          <p className="text-[11px] text-muted-foreground" data-server-ops-data-password-from-store>
-            正在显示已保存的密码；不改动密码框则保存时仍保留原密码。
-          </p>
-        ) : null}
-        {mode === 'edit' && hasSavedPassword ? (
-          <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={draft.clearPassword}
-              onChange={(event) => onChange({ clearPassword: event.target.checked, ...(event.target.checked ? { password: '' } : {}) })}
-              aria-label="清除已保存密码"
-            />
-            清除已保存密码
-          </label>
-        ) : null}
-      </div>
-      <div className="grid gap-1.5 border-t border-border/40 pt-4">
-        <div className="text-[11px] font-medium text-muted-foreground">传输安全</div>
-        <Label htmlFor="server-ops-data-tls">TLS</Label>
-        <Select value={draft.tlsMode} onValueChange={(value) => onChange({ tlsMode: value as ServerOpsDataTlsMode })}>
-          <SelectTrigger id="server-ops-data-tls" aria-label="TLS 模式"><SelectValue /></SelectTrigger>
-          <SelectContent className="z-[280]">
-            <SelectItem value="disabled">关闭</SelectItem>
-            <SelectItem value="verify">校验证书</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
+      {draft.engine === 'redis' ? <div className="grid gap-1.5">
+        <Label htmlFor="server-ops-data-database">逻辑库（0-15）</Label>
+        <Input
+          id="server-ops-data-database"
+          value={draft.database}
+          placeholder="0"
+          onChange={(event) => onChange({ database: event.target.value })}
+        />
+        {errors.database ? <p className="text-[11px] text-destructive">{errors.database}</p> : null}
+      </div> : null}
+      {draft.tlsMode === 'preferred' ? <p className="rounded-lg bg-muted/30 px-3 py-2.5 text-xs leading-5 text-muted-foreground">优先使用 TLS；仅服务器明确不支持时允许明文回退。</p> : null}
+      {draft.tlsMode === 'required' ? <p className="rounded-lg bg-muted/30 px-3 py-2.5 text-xs leading-5 text-muted-foreground">必须加密连接，不校验证书身份；需要验证身份时选择「校验证书」。</p> : null}
       {draft.tlsMode === 'verify' ? (
-        <div className="grid gap-1.5">
+        <div className="grid gap-1.5 rounded-lg bg-muted/30 p-3">
           <Label htmlFor="server-ops-data-tls-name">数据库真实主机名</Label>
           <Input
             id="server-ops-data-tls-name"
             value={draft.tlsServerName}
-            placeholder="db.internal"
+            placeholder={draft.address ? `默认：${draft.address}` : 'db.internal'}
             onChange={(event) => onChange({ tlsServerName: event.target.value })}
           />
-          <p className="text-[11px] text-muted-foreground">证书里签发的名字，不是 SSH 跳板地址；隧道不改变证书校验目标。</p>
+          <p className="text-[11px] leading-5 text-muted-foreground">校验名默认跟随数据库地址，可按证书手动修改；不要填写 SSH 跳板地址。{draft.engine === 'mysql' ? 'MySQL 此处需填写证书中的 DNS 主机名。' : ''}</p>
           {errors.tlsServerName ? <p className="text-[11px] text-destructive">{errors.tlsServerName}</p> : null}
         </div>
       ) : null}
@@ -388,15 +449,75 @@ export function ServerOpsDataSourceFields({
         关闭 TLS 时提前把后果讲清楚：私有网段允许明文直连（会有可见标记），
         其它地址则会被主进程拒绝，避免用户保存了一个永远连不上的配置。
       */}
-      {draft.tlsMode === 'verify' ? null : draft.transport === 'direct' && isServerOpsPlaintextDirectAddress(draft.address) ? (
-        <p className="text-[11px] text-amber-600 dark:text-amber-400" data-server-ops-data-plaintext-hint>
+      {draft.tlsMode !== 'disabled' ? null : draft.transport === 'direct' && isServerOpsPlaintextDirectAddress(draft.address) ? (
+        <p className="rounded-lg bg-amber-500/5 px-3 py-2.5 text-xs leading-5 text-amber-700 dark:text-amber-400" data-server-ops-data-plaintext-hint>
           该地址属于内网私有网段：允许关闭 TLS 直连，但密码与查询结果会以内网明文传输，连接列表会标记「内网明文」。
         </p>
       ) : draft.transport === 'direct' ? (
-        <p className="text-[11px] text-destructive" data-server-ops-data-tls-required-hint>
-          该地址不在私有网段内（主机名也无法离线判定归属）：关闭 TLS 会被拒绝，请开启证书校验或改用 10./172.16-31./192.168. 这类内网地址。
+        <p className="rounded-lg bg-destructive/5 px-3 py-2.5 text-xs leading-5 text-destructive" data-server-ops-data-tls-required-hint>
+          域名和公网 IP 支持直连，但需要开启 TLS；关闭 TLS 仅允许回环或私有网段地址。
         </p>
       ) : null}
+      <div className="grid gap-3 border-t border-border/40 pt-4">
+        <div className="text-xs font-medium text-muted-foreground">登录凭据</div>
+        {/* 用户名与密码顶端对齐，说明和清除入口只占密码列；窄窗口自动换行。 */}
+        <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+          <div className="grid min-w-0 gap-1.5">
+            <Label htmlFor="server-ops-data-username">用户名</Label>
+            <Input id="server-ops-data-username" value={draft.username} placeholder="可选" onChange={(event) => onChange({ username: event.target.value })} />
+          </div>
+          <div className="grid min-w-0 gap-1.5">
+            <Label htmlFor="server-ops-data-password">密码</Label>
+            <div className="relative">
+              <Input
+                id="server-ops-data-password"
+                type={showPassword ? 'text' : 'password'}
+                value={draft.password}
+                placeholder={hasRetainedPassword && !showPassword ? '********' : '可选'}
+                autoComplete="new-password"
+                spellCheck={false}
+                className="pr-10"
+                disabled={draft.clearPassword}
+                onChange={(event) => onChange({ password: event.target.value })}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="absolute right-1 top-1 text-muted-foreground hover:text-foreground"
+                aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                aria-pressed={showPassword}
+                disabled={revealingPassword || draft.clearPassword}
+                onClick={() => { void onShowPasswordChange(!showPassword) }}
+              >
+                {revealingPassword
+                  ? <LoaderCircle className="size-3.5 animate-spin" />
+                  : showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+              </Button>
+            </div>
+            {passwordFromStore ? (
+              <p className="text-[11px] leading-5 text-muted-foreground" data-server-ops-data-password-from-store>
+                正在显示已保存密码，修改后才会替换。
+              </p>
+            ) : hasRetainedPassword && draft.password === '' ? (
+              <p className="text-[11px] leading-5 text-muted-foreground">已保存密码，输入新密码可替换。</p>
+            ) : null}
+            {mode === 'edit' && hasSavedPassword ? (
+              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5 rounded border-border accent-primary"
+                  checked={draft.clearPassword}
+                  onChange={(event) => onChange({ clearPassword: event.target.checked, ...(event.target.checked ? { password: '' } : {}) })}
+                  aria-label="清除已保存密码"
+                />
+                清除已保存密码
+              </label>
+            ) : null}
+          </div>
+        </div>
+      </div>
+      </>}
     </div>
   )
 }
@@ -412,6 +533,8 @@ export interface ServerOpsDataSourceDialogProps {
   initialEngine?: ServerOpsDataEngine
   hostId: string
   hostLabel: string
+  /** 新建 SQLite 时列出当前项目全部服务器；编辑态只展示原宿主。 */
+  hostOptions?: readonly ServerOpsDataSourceHostOption[]
   submitting: boolean
   error?: string | null
   /**
@@ -506,6 +629,8 @@ export function useServerOpsDataSourceDialogController(
   const [testError, setTestError] = React.useState<string | null>(null)
   /** 当前打开代次的异步身份。 */
   const asyncSessionRef = React.useRef<ServerOpsDataSourceDialogAsyncSession>(createServerOpsDataSourceDialogAsyncSession(false))
+  /** 是否已手动指定与数据库地址不同的证书名；仅在当前弹窗会话内有效。 */
+  const manualTlsNameRef = React.useRef(source?.tlsServerName !== undefined && source.tlsServerName !== source.address)
 
   useServerOpsDialogLayoutEffect(() => {
     /** 上一代所有在途回执从此失效。 */
@@ -514,6 +639,7 @@ export function useServerOpsDataSourceDialogController(
     const session = createServerOpsDataSourceDialogAsyncSession(open)
     asyncSessionRef.current = session
     if (open) {
+      manualTlsNameRef.current = source?.tlsServerName !== undefined && source.tlsServerName !== source.address
       // 每次打开都按当前数据源重建草稿，避免把上一次编辑的半成品带进新表单。
       setDraft(createServerOpsDataSourceDraft(source, initialEngine))
       setErrors({})
@@ -534,7 +660,18 @@ export function useServerOpsDataSourceDialogController(
     asyncSessionRef.current.draftRevision += 1
     /** 用户亲手改过密码框后，明文的来源就不再是"已保存密码"。 */
     if ('password' in patch) setPasswordFromStore(false)
-    setDraft((current) => ({ ...current, ...patch }))
+    if (patch.clearPassword) setShowPassword(false)
+    if ('tlsServerName' in patch) manualTlsNameRef.current = patch.tlsServerName !== ''
+    setDraft((current) => {
+      /** 数据库地址与证书名保持同步，直到用户明确手动覆盖后停止跟随。 */
+      const followAddress = !manualTlsNameRef.current && 'address' in patch
+        ? { tlsServerName: patch.address ?? '' } : {}
+      const next = { ...current, ...followAddress, ...patch }
+      if (patch.tlsMode === 'verify' && !('tlsServerName' in patch) && next.tlsServerName === '') next.tlsServerName = next.address
+      return next
+    })
+    // 切换路径或改正字段后清除旧校验，避免仍提示已不存在的跳板/TLS 问题。
+    setErrors({})
     setTestResult(null)
     setTestError(null)
   }, [])
@@ -542,6 +679,7 @@ export function useServerOpsDataSourceDialogController(
   /** 切换引擎并推进草稿代次。 */
   const changeEngine = React.useCallback((engine: ServerOpsDataEngine): void => {
     asyncSessionRef.current.draftRevision += 1
+    if (engine === 'sqlite') manualTlsNameRef.current = false
     setDraft((current) => applyServerOpsDataSourceEngineChange(current, engine))
     setErrors({})
     setTestResult(null)
@@ -551,9 +689,18 @@ export function useServerOpsDataSourceDialogController(
   /** 按当前会话读取已保存密码；任何身份或草稿变化都会丢弃迟到回执。 */
   const setPasswordVisibility = async (nextShowPassword: boolean): Promise<void> => {
     if (!nextShowPassword) {
+      /** 隐藏动作立即作废在途回显，迟到密码不得重新打开明文状态。 */
+      asyncSessionRef.current.revealRequestRevision += 1
+      setRevealingPassword(false)
       setShowPassword(false)
+      if (passwordFromStore) {
+        /** 只释放取回的旧密码；用户正在编辑的新密码继续保留在草稿里。 */
+        setDraft((current) => ({ ...current, password: '' }))
+        setPasswordFromStore(false)
+      }
       return
     }
+    if (draft.clearPassword) return
     if (draft.password !== '' || passwordFromStore) {
       setShowPassword(true)
       return
@@ -595,11 +742,22 @@ export function useServerOpsDataSourceDialogController(
   /** 执行一次不落盘的连接测试，并只接纳同一会话、同一草稿的最新回执。 */
   const testConnection = async (): Promise<void> => {
     if (!onTest) return
+    /** 测试只校验连接字段，不要求先给尚未保存的连接命名。 */
+    const nextErrors = validateServerOpsDataSourceDraft(draft, source?.hostId ?? hostId)
+    delete nextErrors.label
+    setErrors(nextErrors)
+    if (Object.keys(nextErrors).length > 0) {
+      setTestResult(null)
+      setTestError(Object.values(nextErrors)[0] ?? '请检查连接设置')
+      return
+    }
     /** 本次测试使用的草稿输入。 */
     const probeDraft = buildServerOpsDataSourceProbeDraft({ hostId, source, draft, passwordFromStore })
     if (probeDraft === null) {
       setTestResult(null)
-      setTestError('请先填写有效的服务器视角地址与端口；经由跳板时还需要一条可用的服务器')
+      setTestError(draft.engine === 'sqlite'
+        ? '请先选择服务器，并填写有效的 SQLite 绝对文件路径'
+        : '请检查连接方式、数据库地址与端口')
       return
     }
     /** 本次测试绑定的弹窗会话。 */
@@ -659,6 +817,7 @@ export function ServerOpsDataSourceDialog({
   initialEngine = 'mysql',
   hostId,
   hostLabel,
+  hostOptions = [],
   submitting,
   error,
   onTest,
@@ -695,7 +854,7 @@ export function ServerOpsDataSourceDialog({
   /** 校验后提交。 */
   const submit = (): void => {
     /** 校验后的字段错误。 */
-    const nextErrors = validateServerOpsDataSourceDraft(draft)
+    const nextErrors = validateServerOpsDataSourceDraft(draft, source?.hostId ?? hostId)
     setErrors(nextErrors)
     if (Object.keys(nextErrors).length > 0) return
     onSubmit(buildServerOpsDataSourceUpsertInput({ hostId, source, draft, passwordFromStore }))
@@ -703,17 +862,17 @@ export function ServerOpsDataSourceDialog({
 
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) onClose() }}>
-      <DialogContent className={cn('max-h-[min(90vh,44rem)] w-[calc(100vw-1rem)] max-w-xl overflow-hidden p-0', elevated && 'z-[260]')} overlayClassName={elevated ? 'z-[250]' : undefined}>
+      <DialogContent className={cn('max-h-[min(90vh,44rem)] w-[calc(100vw-2rem)] max-w-xl gap-0 overflow-hidden p-0', elevated && 'z-[260]')} overlayClassName={elevated ? 'z-[250]' : undefined}>
         <div className="grid max-h-[min(90vh,44rem)] min-h-0 grid-rows-[auto_minmax(0,1fr)_auto]">
-          <DialogHeader className="px-4 pt-4 sm:px-5 sm:pt-5">
-            <DialogTitle className="text-base">{mode === 'create' ? '新建数据源' : '编辑数据源'}</DialogTitle>
-            <DialogDescription className="text-xs">
-              {draft.transport === 'direct'
-                ? '直接在本机访问该地址与端口，密码经系统安全存储加密保存。'
-                : `经由 ${hostLabel === '' ? '所选跳板服务器' : hostLabel} 的 SSH 连接访问服务器视角的数据库地址，密码经系统安全存储加密保存。`}
+          <DialogHeader className="space-y-2 px-5 pb-5 pt-5 text-left sm:px-6 sm:pt-6">
+            <DialogTitle className="pr-6 text-lg leading-6">{mode === 'create' ? '新建数据源' : '编辑数据源'}</DialogTitle>
+            <DialogDescription className="text-xs leading-5">
+              {draft.engine === 'sqlite'
+                ? '通过所选服务器的 SSH 连接只读访问 SQLite 文件；不会下载、复制或创建数据库。'
+                : '配置连接信息，密码通过系统安全存储加密保存在本机。'}
             </DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 overflow-y-auto px-4 py-4 sm:px-5">
+          <div className="min-h-0 overflow-y-auto overscroll-contain px-5 pb-5 sm:px-6 sm:pb-6">
           <div className="grid gap-4">
             <ServerOpsDataSourceFields
               draft={draft}
@@ -721,7 +880,9 @@ export function ServerOpsDataSourceDialog({
               mode={mode}
               hasSavedPassword={source?.hasPassword === true}
               showPassword={showPassword}
+              hostId={source?.hostId ?? hostId}
               hostLabel={hostLabel}
+              hostOptions={hostOptions}
               onChange={patchDraft}
               onEngineChange={changeEngine}
               onShowPasswordChange={setPasswordVisibility}
@@ -733,7 +894,7 @@ export function ServerOpsDataSourceDialog({
             {testResult ? (
               <div
                 className={cn(
-                  'flex flex-wrap items-center gap-2 rounded-sm border px-2 py-1.5 text-[11px]',
+                  'flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2.5 text-xs leading-5',
                   testResult.capability === 'available'
                     ? 'border-emerald-600/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400'
                     : testResult.capability === 'auth-failed' || testResult.capability === 'permission-denied'
@@ -751,7 +912,7 @@ export function ServerOpsDataSourceDialog({
             {testError ? <p className="text-xs text-destructive" data-server-ops-data-test-error>{testError}</p> : null}
           </div>
           </div>
-          <DialogFooter className="flex-row flex-wrap gap-2 space-x-0 border-t border-border/40 bg-background px-4 py-3 sm:px-5">
+          <DialogFooter className="flex-row flex-wrap items-center gap-2 border-t border-border/40 bg-muted/20 px-5 py-4 sm:space-x-0 sm:px-6">
           {onTest ? (
             /**
              * 与「编辑服务器」弹窗保持一致：测试是次要动作，靠 `sm:mr-auto` 贴在底部左侧，
@@ -759,7 +920,7 @@ export function ServerOpsDataSourceDialog({
              */
             <Button
               type="button"
-              variant="outline"
+              variant="ghost"
               className="mr-auto"
               data-server-ops-data-test
               disabled={submitting || testing}
@@ -769,8 +930,8 @@ export function ServerOpsDataSourceDialog({
               {testing ? '测试中...' : '测试'}
             </Button>
           ) : null}
-          <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>取消</Button>
-          <Button type="button" onClick={submit} disabled={submitting}>{submitting ? '保存中...' : '保存'}</Button>
+          <Button type="button" variant="outline" className="min-w-20" onClick={onClose} disabled={submitting}>取消</Button>
+          <Button type="button" className="min-w-20" onClick={submit} disabled={submitting}>{submitting ? '保存中...' : '保存'}</Button>
           </DialogFooter>
         </div>
       </DialogContent>

@@ -155,6 +155,16 @@ function findButtonByLabel(node: React.ReactNode, ariaLabel: string): React.Reac
 const connectedContext = { hostId: 'host-1', hostLabel: 'web-prod-01', hostDescription: 'deploy@10.0.0.8:22', active: true, connected: true }
 
 describe('数据服务面板', () => {
+  test('Given 诊断结果携带实际 TLS 状态 When 渲染管理面板 Then 标示本次状态', () => {
+    const html = renderToStaticMarkup(<ServerOpsDataDiagnostics
+      diagnostics={{ sourceId: 'source-1', state: 'done', result: createDiagnostics({ tlsStatus: 'plaintext' }) }}
+      source={createSource({ tlsMode: 'preferred' })}
+      tab="metrics"
+      onTabChange={() => undefined}
+      onDiagnose={() => undefined}
+    />)
+    expect(html).toContain('本次数据库未启用 TLS')
+  })
   test('Given 工作台自行按页读取 When 连接管理绑定与重放 Then 不自动请求全量诊断且编辑仍可用', async () => {
     /** 全量诊断不应因连接菜单存在而触发。 */
     let reads = 0
@@ -212,7 +222,7 @@ describe('数据服务面板', () => {
     expect(html).toContain('已保存密码')
     expect(html).toContain('会话缓存')
     expect(html).toContain('Redis')
-    expect(html).toContain('TLS 校验')
+    expect(html).toContain('校验证书')
     expect(html).toContain('aria-label="测试 业务主库 的连接"')
     expect(html).toContain('aria-label="读取 业务主库 的只读诊断"')
     expect(html).toContain('aria-label="编辑 业务主库"')

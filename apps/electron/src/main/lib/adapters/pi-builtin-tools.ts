@@ -109,6 +109,8 @@ type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 // ===== 通用 =====
 
 export interface PiBuiltinToolsContext {
+  /** 本轮冻结的工具模式，决定能否构建普通工具。 */
+  toolMode?: import('@proma/shared').AgentToolMode
   sessionId: string
   channelId: string
   modelId?: string
@@ -1674,6 +1676,13 @@ export async function buildPiBuiltinTools(
   sdk: PiSdk,
   ctx: PiBuiltinToolsContext,
 ): Promise<PiBuiltinToolsResult> {
+  if (ctx.toolMode === 'server-ops-read') {
+    /** 无授权时不构建空壳受限运行；须重新授权并发起新一轮。 */
+    if (!ctx.serverOpsReadFacade || (ctx.triggeredBy !== undefined && ctx.triggeredBy !== 'user')) {
+      throw new Error('运维只读模式需要当前用户会话的有效授权')
+    }
+    return { tools: buildServerOpsReadTools(sdk, ctx.serverOpsReadFacade), collaborationAvailable: false }
+  }
   browserController.configureSession(ctx.sessionId, {
     profileKey: resolveBrowserProfileKey(ctx.workspaceId, ctx.sessionId),
     allowedRoots: ctx.allowedRoots,

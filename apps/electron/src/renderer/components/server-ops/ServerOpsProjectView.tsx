@@ -14,7 +14,7 @@ import type { ServerOpsProjectsStatus } from './server-ops-project-controller'
 /** 类型筛选与添加菜单共用元数据，防止两处类别不一致。 */
 const SERVER_OPS_PROJECT_KINDS: readonly { kind: ServerOpsConnectionKind; label: string; caption: string }[] = [
   { kind: 'ssh', label: '服务器', caption: '服务器 · SSH' },
-  { kind: 'database', label: '数据库', caption: '数据库 · MySQL' },
+  { kind: 'database', label: '数据库', caption: '数据库' },
   { kind: 'redis', label: 'Redis', caption: 'Redis' },
 ]
 
@@ -218,8 +218,9 @@ export function ServerOpsProjectView({
                   <CollapsibleContent>
                     <ul className="grid grid-cols-1 gap-3" data-server-ops-project-cards>
                       {groupConnections.map((connection) => {
-                        /** 同名连接依靠类型和地址区分，显示文案与无障碍名称共用同一事实。 */
-                        const caption = entry.caption
+                        /** 同名连接依靠真实协议和地址区分，SQLite 不能沿用 MySQL 标识。 */
+                        const protocol = connection.protocol ?? (connection.kind === 'ssh' ? 'SSH' : connection.kind === 'redis' ? 'Redis' : 'MySQL')
+                        const caption = connection.kind === 'database' ? `${entry.caption} · ${protocol}` : entry.caption
                         /** 补充说明保留连接状态与明文提示，键盘聚焦卡片时同样可感知。 */
                         const accessibleDescription = [connection.metadata, connection.kind === 'ssh' ? connection.connected === true ? '已连接' : '未连接' : undefined, connection.plaintextDirect === true ? '内网明文' : undefined].filter(Boolean).join('，')
                         return (
@@ -235,7 +236,7 @@ export function ServerOpsProjectView({
                             </div>
                             <p className="pointer-events-none min-h-5 truncate text-xs leading-5 text-muted-foreground">{connection.metadata ?? caption}</p>
                             <div className="pointer-events-none mt-auto flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-                              <span className="rounded-md bg-muted px-1.5 py-0.5">{connection.kind === 'ssh' ? 'SSH' : connection.kind === 'database' ? 'MySQL' : 'Redis'}</span>
+                              <span className="rounded-md bg-muted px-1.5 py-0.5">{protocol}</span>
                               {connection.kind === 'ssh' ? <span className={cn('flex items-center gap-1.5', connection.connected === true && 'text-emerald-600 dark:text-emerald-400')}><span className={cn('size-1.5 rounded-full', connection.connected === true ? 'bg-emerald-500' : 'bg-muted-foreground/40')} />{connection.connected === true ? '已连接' : '未连接'}</span> : null}
                               {connection.plaintextDirect === true ? <span className="rounded-md bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-400" data-server-ops-plaintext-direct={connection.id}>内网明文</span> : null}
                               <ArrowUpRight className="ml-auto size-3.5 text-foreground/30 transition-colors group-hover/card:text-foreground/60" aria-hidden="true" />

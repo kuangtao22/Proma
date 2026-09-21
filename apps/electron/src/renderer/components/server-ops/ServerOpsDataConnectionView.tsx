@@ -44,7 +44,7 @@ export interface ServerOpsDataConnectionViewProps {
 
 /** 引擎展示名。 */
 function getEngineLabel(engine: ServerOpsDataSource['engine']): string {
-  return engine === 'redis' ? 'Redis' : 'MySQL'
+  return engine === 'redis' ? 'Redis' : engine === 'sqlite' ? 'SQLite' : 'MySQL'
 }
 
 /**
@@ -100,8 +100,12 @@ export function ServerOpsDataConnectionView({
    * 避免界面声称安全、主进程却拒绝发起连接。
    */
   const plaintextDirect = source.transport === 'direct'
-    && source.tlsMode !== 'verify'
+    && source.engine !== 'sqlite'
+    && source.tlsMode === 'disabled'
+    && source.address !== undefined
     && isServerOpsPlaintextDirectAddress(source.address)
+  /** SQLite 的连接身份是远端文件；网络引擎仍使用地址和端口。 */
+  const connectionDetail = source.engine === 'sqlite' ? source.filePath : `${source.address}:${source.port}`
 
   /** 连接头只出现一次，MySQL 的菜单由工作台管理控制器提供。 */
   const renderHeader = (actions?: React.ReactNode): React.ReactNode => (
@@ -137,7 +141,7 @@ export function ServerOpsDataConnectionView({
             </span>
           </div>
           <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" data-server-ops-connection-detail>
-            {source.address}:{source.port}
+            {connectionDetail}
             {` · ${transportLabel}`}
           </div>
         </div>
@@ -167,14 +171,14 @@ export function ServerOpsDataConnectionView({
             </Tooltip>
           </TooltipProvider>
         ) : null}
-        {source.engine === 'mysql' ? <Button type="button" size="icon-sm" variant="ghost" aria-label={expanded ? '还原工作台' : '展开工作台'} onClick={() => setExpanded((previous) => !previous)}>{expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button> : null}
+        {source.engine !== 'redis' ? <Button type="button" size="icon-sm" variant="ghost" aria-label={expanded ? '还原工作台' : '展开工作台'} onClick={() => setExpanded((previous) => !previous)}>{expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button> : null}
         {actions}
       </div>
   )
   return (
     <div className={cn('server-ops-workspace-container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-content-area', expanded && 'fixed inset-0 z-[200]')} style={{ paddingTop: titlebarHeight }} data-server-ops-data-connection-view={source.id} data-server-ops-workbench-expanded={expanded}>
       {expanded ? <div className="titlebar-drag-region absolute inset-x-0 top-0" style={{ height: titlebarHeight }} aria-hidden="true" /> : null}
-      {source.engine === 'mysql' ? <ServerOpsDatabaseWorkbench key={`${viewScope}:${source.id}`} api={api} source={source} jumpHost={jumpHost} viewScope={viewScope} renderHeader={renderHeader} onSourceMutated={onSourceMutated} /> : <>
+      {source.engine !== 'redis' ? <ServerOpsDatabaseWorkbench key={`${viewScope}:${source.id}`} api={api} source={source} jumpHost={jumpHost} viewScope={viewScope} renderHeader={renderHeader} onSourceMutated={onSourceMutated} /> : <>
       {renderHeader()}
       <ServerOpsDataServicesPanel
         api={api}

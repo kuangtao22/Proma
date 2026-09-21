@@ -27,6 +27,7 @@ import type { LucideIcon } from 'lucide-react'
 import type {
   AgentSessionMeta,
   ServerOpsAgentAccess,
+  ServerOpsAgentAccessImpact,
   ServerOpsAgentAccessChanged,
   ServerOpsAgentAccessTarget,
   ServerOpsConnectionState,
@@ -113,6 +114,26 @@ import { getServerOpsDataErrorMessage } from './server-ops-data-display'
 import { ServerOpsFilesWorkspace } from './ServerOpsFilesWorkspace'
 import { ServerOpsDockerConsole } from './ServerOpsDockerConsole'
 import { useServerOpsTransferLeave } from './useServerOpsTransferLeave'
+
+/** 新建数据源需要的项目服务器上下文。 */
+export interface ServerOpsProjectDataSourceHosts {
+  /** 网络数据源沿用的默认跳板，保持既有 MySQL/Redis 创建流程。 */
+  defaultHost: { id: string; label: string } | null
+  /** SQLite 文件宿主必须由用户从项目服务器中明确选择。 */
+  hostOptions: { id: string; label: string }[]
+}
+
+/** 从项目连接投影生成数据源表单的默认跳板和完整服务器选项。 */
+export function resolveServerOpsProjectDataSourceHosts(
+  connections: readonly ServerOpsConnection[],
+  projectId: string | null,
+): ServerOpsProjectDataSourceHosts {
+  /** 只保留目标项目中具有真实主机 ID 的服务器连接。 */
+  const hostOptions = connections
+    .filter((connection) => connection.projectId === projectId && connection.kind === 'ssh' && connection.hostId !== undefined)
+    .map((connection) => ({ id: connection.hostId!, label: connection.label }))
+  return { defaultHost: hostOptions[0] ?? null, hostOptions }
+}
 import type { ServerOpsFilesPreload } from '../../../preload/server-ops-files-preload'
 import type { ServerOpsConsolePreloadApi } from '../../../preload/server-ops-console-preload'
 import type { ServerOpsTransferPreload } from '../../../preload/server-ops-transfer-preload'
@@ -885,7 +906,7 @@ export function createServerOpsAuditController(options: ServerOpsAuditController
 /** 授权控制器依赖的最小 IPC 合同，便于独立验证异步竞态。 */
 interface ServerOpsAgentAccessControllerOptions {
   getAccess: (target: ServerOpsAgentAccessTarget) => Promise<ServerOpsAgentAccess | null>
-  setAccess: (access: ServerOpsAgentAccess) => Promise<ServerOpsAgentAccess | null>
+  setAccess: (access: ServerOpsAgentAccess, impactToken?: string) => Promise<ServerOpsAgentAccess | null>
   publish: (projection: ServerOpsAgentAccessProjection) => void
   reportError: (message: string) => void
 }
@@ -895,7 +916,7 @@ export interface ServerOpsAgentAccessController {
   activate: () => void
   dispose: () => void
   select: (target: ServerOpsAgentAccessTarget | null) => Promise<void>
-  toggle: () => Promise<void>
+  toggle: (impactToken?: string) => Promise<boolean>
   handleChanged: (event: ServerOpsAgentAccessChanged) => void
   resetAfterDisconnect: (target: ServerOpsAgentAccessTarget) => void
 }
@@ -1120,8 +1141,8 @@ export function createServerOpsAgentAccessController(
         options.reportError(message)
       }
     },
-    toggle: async () => {
-      if (!active || !target) return
+    toggle: async (impactToken) => {
+      if (!active || !target) return false
       /** 捕获点击时的稳定身份，切换期间不得跟随外部选择漂移。 */
       const operationTarget = target
       const operationRevision = ++revision
@@ -1129,20 +1150,22 @@ export function createServerOpsAgentAccessController(
       const currentlyGranted = isAgentAccessForTarget(projection.access, operationTarget) && projection.access.granted
       publish({ ...projection, target: operationTarget, status: 'loading', error: null })
       try {
-        const current = await options.setAccess({ ...operationTarget, granted: !currentlyGranted })
-        if (!isCurrent(operationRevision, operationTarget)) return
+        const current = await options.setAccess({ ...operationTarget, granted: !currentlyGranted }, impactToken)
+        if (!isCurrent(operationRevision, operationTarget)) return false
         publish({
           target: operationTarget,
           access: projectAccess(current, operationTarget),
           status: 'ready',
           error: null,
         })
+        return true
       } catch (error) {
-        if (!isCurrent(operationRevision, operationTarget)) return
+        if (!isCurrent(operationRevision, operationTarget)) return false
         /** 失败时保留操作前事实，绝不做乐观授权。 */
         const message = getErrorMessage(error)
         publish({ ...projection, target: operationTarget, status: 'error', error: message })
         options.reportError(message)
+        return false
       }
     },
     handleChanged: (event) => {
@@ -1347,6 +1370,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   const agentReadApi = React.useMemo(() => typeof window.electronAPI.getServerOpsAgentReadAccess === 'function' && typeof window.electronAPI.setServerOpsAgentReadAccess === 'function' ? {
     get: window.electronAPI.getServerOpsAgentReadAccess,
     set: window.electronAPI.setServerOpsAgentReadAccess,
+    impact: window.electronAPI.getServerOpsAgentAccessImpact,
     onChanged: window.electronAPI.onServerOpsAgentReadAccessChanged,
   } : undefined, [])
   /** 当前控制台页签。 */
@@ -1416,10 +1440,12 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   /** 单组件生命周期内稳定的授权代次控制器，StrictMode effect 演练不会重建。 */
   const [agentAccessController] = React.useState(() => createServerOpsAgentAccessController({
     getAccess: (target) => window.electronAPI.getServerOpsAgentAccess(target),
-    setAccess: (access) => window.electronAPI.setServerOpsAgentAccess(access),
+    setAccess: (access, impactToken) => window.electronAPI.setServerOpsAgentAccess(access, impactToken),
     publish: setAgentAccessProjection,
     reportError: (message) => toast.error('服务器授权同步失败', { description: message }),
   }))
+  /** 旧 SSH 授权覆盖只读租约前展示的权威影响与原始 token。 */
+  const [pendingLegacyImpact, setPendingLegacyImpact] = React.useState<{ impact: ServerOpsAgentAccessImpact; target: ServerOpsAgentAccessTarget; error: string | null } | null>(null)
 
   /** 当前生效的项目；选择失效时回落到列表第一项，界面不停留在已删除项目上。 */
   const currentProjectId = resolveServerOpsCurrentProjectId(projects, selectedProjectId)
@@ -1610,6 +1636,9 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     selectedConnectionId,
     connections,
   })
+  /** 异步影响读取完成时核对最新渲染目标，拒绝旧连接迟到回执。 */
+  const latestAgentAccessTarget = React.useRef(agentAccessTarget)
+  latestAgentAccessTarget.current = agentAccessTarget
   /** render 同步门禁早于 effect，旧目标投影不会产生可点击窗口。 */
   const agentAccessViewState = resolveServerOpsAgentAccessViewState({
     projection: agentAccessProjection,
@@ -1617,6 +1646,37 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     hostId: selectedHost?.id ?? null,
     ...(agentAccessSession.unavailableReason === undefined ? {} : { sessionUnavailableReason: agentAccessSession.unavailableReason }),
   })
+  /** 旧授权入口先展示跨会话撤权影响，确认时只提交所见快照的 token。 */
+  const handleToggleAgentAccess = async (): Promise<void> => {
+    if (!agentAccessTarget) return
+    if (agentAccessViewState.agentAccessGranted) { await agentAccessController.toggle(); return }
+    try {
+      const impact = await window.electronAPI.getServerOpsAgentAccessImpact()
+      if (!isSameAgentAccessTarget(agentAccessTarget, latestAgentAccessTarget.current)) return
+      if (impact.legacy || impact.reads.length > 0) {
+        setPendingLegacyImpact({ impact, target: agentAccessTarget, error: null })
+      } else {
+        await agentAccessController.toggle(impact.token)
+      }
+    } catch (error) {
+      toast.error('读取授权影响失败', { description: getErrorMessage(error) })
+    }
+  }
+  /** CAS 冲突仍停留在确认对话框，刷新影响供重新审阅。 */
+  const confirmLegacyImpact = async (): Promise<void> => {
+    const pending = pendingLegacyImpact
+    if (!pending || !isSameAgentAccessTarget(pending.target, latestAgentAccessTarget.current)) { setPendingLegacyImpact(null); return }
+    const saved = await agentAccessController.toggle(pending.impact.token)
+    if (!isSameAgentAccessTarget(pending.target, latestAgentAccessTarget.current)) { setPendingLegacyImpact(null); return }
+    if (saved) { setPendingLegacyImpact(null); return }
+    try {
+      const impact = await window.electronAPI.getServerOpsAgentAccessImpact()
+      if (!isSameAgentAccessTarget(pending.target, latestAgentAccessTarget.current)) { setPendingLegacyImpact(null); return }
+      setPendingLegacyImpact({ ...pending, impact, error: '授权影响已变化，请核对后再次确认' })
+    } catch (error) {
+      setPendingLegacyImpact({ ...pending, error: getErrorMessage(error) })
+    }
+  }
 
   React.useEffect(() => {
     /** 每次真实挂载或 StrictMode setup 重放都建立新的 Renderer owner 代次。 */
@@ -1868,14 +1928,20 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     }
   }
 
-  /**
-   * 新增数据连接时表单里的唯一跳板选项。
-   *
-   * 数据源弹窗当前只支持一个跳板主机，项目视图里没有"当前服务器"，
-   * 因此取本项目第一台服务器；本项目还没有服务器时留空，用户可以选"本机直连"。
-   */
-  const projectJumpHost = connections.find((connection) => connection.projectId === creatingDataSourceProjectId && connection.kind === 'ssh')
+  /** 网络数据库保持首台服务器默认跳板；SQLite 仍展示全部服务器并要求显式选择。 */
+  const projectDataSourceHosts = resolveServerOpsProjectDataSourceHosts(connections, creatingDataSourceProjectId)
   /** 项目分组视图；连接不存在或身份失效时作为中间区域的稳定回退。 */
+  /** 两种视图复用同一只读授权入口，切换视图仅卸载编辑器，不撤销租约。 */
+  const readAccessControl = currentProject ? <ServerOpsAgentReadAccess
+    sessionId={agentAccessSession.sessionId}
+    unavailableReason={agentAccessSession.unavailableReason}
+    projectId={currentProject.id}
+    projects={projects}
+    connections={projectConnections}
+    allConnections={connections}
+    dataSources={dataSources}
+    api={agentReadApi}
+  /> : undefined
   const projectPane = (
     <ServerOpsProjectView
       project={currentProject}
@@ -1892,16 +1958,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       onFilterKindChange={(kind) => setProjectBrowseState({ ...projectBrowse, kind })}
       onSearchQueryChange={(query) => setProjectBrowseState({ ...projectBrowse, query })}
       onMoveConnection={projectsStatus === 'ready' ? handleMoveConnection : undefined}
-      toolbarActions={currentProject ? <ServerOpsAgentReadAccess
-        sessionId={agentAccessSession.sessionId}
-        unavailableReason={agentAccessSession.unavailableReason}
-        projectId={currentProject.id}
-        projects={projects}
-        connections={projectConnections}
-        allConnections={connections}
-        dataSources={dataSources}
-        api={agentReadApi}
-      /> : undefined}
+      toolbarActions={readAccessControl}
     />
   )
 
@@ -1946,7 +2003,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
           onSectionChange={setActiveSection}
           onConnect={handleOpenConnect}
           onDisconnect={() => { void handleDisconnect() }}
-          onToggleAgentAccess={() => { void agentAccessController.toggle() }}
+          onToggleAgentAccess={() => { void handleToggleAgentAccess() }}
           onManageTrust={() => setTrustDialogOpen(true)}
           onRefresh={() => void loadHosts()}
           onAuditHostFilterChange={setAuditHostFilter}
@@ -1983,7 +2040,19 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   return (
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       {/* 中间区域三选一：项目分组列表、SSH 能力页签、数据连接详情。 */}
-      {connectionPane ?? projectPane}
+      {connectionPane ? <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="flex shrink-0 justify-end border-b border-border/40 px-3 py-1">{readAccessControl}</div>
+        {connectionPane}
+      </div> : projectPane}
+      <AlertDialog open={pendingLegacyImpact !== null} onOpenChange={(open) => { if (!open) setPendingLegacyImpact(null) }}>
+        <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>替换现有运维授权？</AlertDialogTitle>
+          <AlertDialogDescription>授权当前服务器操作权限将撤销 {pendingLegacyImpact?.impact.reads.length ?? 0} 个会话的只读授权{pendingLegacyImpact?.impact.legacy ? `，并替换会话 ${pendingLegacyImpact.impact.legacy.sessionId} 的旧操作权限` : ''}。</AlertDialogDescription>
+        </AlertDialogHeader>
+          {pendingLegacyImpact?.impact.reads.length ? <ul className="max-h-36 overflow-auto text-xs text-muted-foreground">{pendingLegacyImpact.impact.reads.map((read) => <li key={read.sessionId}>{read.sessionId} · {read.resources.length} 项</li>)}</ul> : null}
+          {pendingLegacyImpact?.error ? <p role="alert" className="text-xs text-destructive">{pendingLegacyImpact.error}</p> : null}
+          <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={(event) => { event.preventDefault(); void confirmLegacyImpact() }}>确认替换授权</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <ServerOpsProjectDrawer
         open={drawerOpen}
         projects={projects}
@@ -2025,17 +2094,15 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
         onSubmit={handleSaveHost}
         onTest={(input) => window.electronAPI.testServerOpsConnection(input)}
       />
-      {/*
-        项目视图的"添加数据库 / 添加 Redis"入口。
-        数据源弹窗当前只支持一个跳板选项，取打开表单时项目内的第一台服务器。
-      */}
+      {/* 项目视图的"添加数据库 / 添加 Redis"入口；SQLite 在表单内明确选择项目服务器。 */}
       <ServerOpsDataSourceDialog
         open={creatingDataSourceEngine !== null}
         mode="create"
         source={null}
         initialEngine={creatingDataSourceEngine ?? 'mysql'}
-        hostId={projectJumpHost?.hostId ?? ''}
-        hostLabel={projectJumpHost?.label ?? ''}
+        hostId={projectDataSourceHosts.defaultHost?.id ?? ''}
+        hostLabel={projectDataSourceHosts.defaultHost?.label ?? ''}
+        hostOptions={projectDataSourceHosts.hostOptions}
         submitting={savingDataSource}
         error={dataSourceFormError}
         onTest={(draft) => serverOpsDataApi.probeServerOpsDataSource({ draft })}

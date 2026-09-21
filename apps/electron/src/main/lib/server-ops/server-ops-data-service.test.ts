@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ServerOpsDataSourceUpsertInput } from '@proma/shared'
+import type { ServerOpsDataRowFilters, ServerOpsDataSourceUpsertInput } from '@proma/shared'
 import { ServerOpsDataService } from './server-ops-data-service'
 import type { ServerOpsStoredDataSource } from './server-ops-data-source-store'
 import { ServerOpsDataSchemaCache } from './server-ops-data-schema-cache'
@@ -39,6 +39,7 @@ class FakeSourceStore {
       label: input.label,
       address: input.address,
       port: input.port,
+      ...(input.filePath === undefined ? {} : { filePath: input.filePath }),
       ...(input.database === undefined ? {} : { database: input.database }),
       ...(input.username === undefined ? {} : { username: input.username }),
       tlsMode: input.tlsMode,
@@ -55,7 +56,7 @@ class FakeSourceStore {
     sourceId: string,
     patch: {
       projectId?: string; transport?: ServerOpsStoredDataSource['transport']; hostId?: string | null; label?: string
-      address?: string; port?: number; database?: string | null; username?: string | null
+      address?: string; port?: number; filePath?: string; database?: string | null; username?: string | null
       tlsMode?: ServerOpsStoredDataSource['tlsMode']; tlsServerName?: string | null; credentialRef?: string | null
     },
   ): ServerOpsStoredDataSource {
@@ -73,6 +74,7 @@ class FakeSourceStore {
     else if (patch.hostId !== undefined) updated.hostId = patch.hostId
     if (patch.address !== undefined) updated.address = patch.address
     if (patch.port !== undefined) updated.port = patch.port
+    if (patch.filePath !== undefined) updated.filePath = patch.filePath
     if (patch.database === null) delete updated.database
     else if (patch.database !== undefined) updated.database = patch.database
     if (patch.username === null) delete updated.username
@@ -321,6 +323,26 @@ function createInput(overrides: Partial<ServerOpsDataSourceUpsertInput> = {}): S
 }
 
 describe('服务器运维数据服务编排', () => {
+  test('Given SQLite 连接 When 探测和查询 Then 保留文件路径与取消信号并拒绝路径变更后的结果', async () => {
+    /** 本用例只替换远程执行，连接身份使用真实服务逻辑。 */
+    const { service, runtime } = createService()
+    const input: ServerOpsDataSourceUpsertInput = { transport: 'ssh', hostId: 'host-1', engine: 'sqlite', label: 'SQLite', filePath: '/srv/app.db', database: 'main', tlsMode: 'disabled' }
+    const created = service.upsertSource(input)
+    expect(created.source.filePath).toBe('/srv/app.db')
+    /** 草稿测试不落库且无需数据库密码。 */
+    const probe = service.probeSource({ draft: { transport: 'ssh', hostId: 'host-1', engine: 'sqlite', filePath: '/srv/test.db', tlsMode: 'disabled' } })
+    expect(runtime.requests[0]?.filePath).toBe('/srv/test.db')
+    runtime.settle({ ...availableResult, serverVersion: '3.45.0' })
+    await expect(probe).resolves.toMatchObject({ engine: 'sqlite', capability: 'available' })
+    /** 查询结果迟到时必须检查文件身份，而非仅比较连接 ID。 */
+    const controller = new AbortController()
+    const pending = service.querySource({ sourceId: created.source.id, database: 'main', queryId: 'query-1', sql: 'SELECT id FROM users', maxRows: 20 }, controller.signal)
+    expect(runtime.requests[1]).toMatchObject({ filePath: '/srv/app.db', mode: 'sql-query', database: 'main' })
+    expect(runtime.signals[1]).toBe(controller.signal)
+    service.upsertSource({ ...input, sourceId: created.source.id, filePath: '/srv/other.db' })
+    runtime.settle({ queryId: 'query-1', database: 'main', columns: ['id'], rows: [['1']], rowCount: 1, durationMs: 5, truncated: false, warnings: [] })
+    await expect(pending).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+  })
   test('Given 新建数据源 When 带密码 Then 只暴露 hasPassword 且密码可解密复用', () => {
     const { service, credentials } = createService()
     const created = service.upsertSource(createInput({ password: 'p@ss' }))
@@ -331,6 +353,19 @@ describe('服务器运维数据服务编排', () => {
     /** 未归属任何主机的直连数据源同样出现在全局列表里。 */
     service.upsertSource(createInput({ transport: 'direct', hostId: undefined, label: '本机库' }))
     expect(service.listSources().sources.map((source) => source.label)).toEqual(['业务主库', '本机库'])
+  })
+
+  test('Given 数据源凭据同 ref 原位更新 When 捕获读取身份 Then 版本变化且无凭据返回 null', () => {
+    const { service, credentials } = createService()
+    const source = service.upsertSource(createInput({ password: 'old' })).source
+    const original = service.getReadCredentialVersion(source.id)
+    expect(original).toContain('ref-1')
+    credentials.setSecret('host-1', source.id, 'new')
+    expect(service.getReadCredentialVersion(source.id)).not.toBe(original)
+    const noPassword = service.upsertSource(createInput()).source
+    expect(service.getReadCredentialVersion(noPassword.id)).toBeNull()
+    Object.defineProperty(credentials, 'getSecretVersion', { value: undefined })
+    expect(() => service.getReadCredentialVersion(source.id)).toThrow('SERVER_OPS_DATA_CREDENTIAL_VERSION_UNAVAILABLE')
   })
 
   test('Given 编辑数据源 When 不提供密码 Then 保留原密文；提供清除则删除', () => {
@@ -402,6 +437,33 @@ describe('服务器运维数据服务编排', () => {
     expect(result).toMatchObject({ capability: 'available', serverVersion: '8.0.36', latencyMs: 0, engine: 'mysql' })
   })
 
+  test('Given runtime 已报告 TLS 协商状态 When 测试来源及诊断 Then 公开结果保持真实状态', async () => {
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({ tlsMode: 'required' }))
+    const stored = service.probeSource({ sourceId: created.source.id })
+    runtime.settle({ ...availableResult, tlsStatus: 'encrypted' })
+    expect(await stored).toMatchObject({ tlsStatus: 'encrypted' })
+    const draft = service.probeSource({ draft: { transport: 'direct', engine: 'mysql', address: 'db.example.com',
+      port: 3306, tlsMode: 'preferred' } })
+    runtime.settle({ ...availableResult, tlsStatus: 'plaintext' })
+    expect(await draft).toMatchObject({ tlsStatus: 'plaintext' })
+    const diagnostics = service.diagnoseSource({ sourceId: created.source.id })
+    runtime.settle({ ...availableResult, tlsStatus: 'encrypted' })
+    expect(await diagnostics).toMatchObject({ tlsStatus: 'encrypted' })
+  })
+
+  test('Given 已保存 MySQL verify IP 主机名 When 测试或诊断 Then 给出可修正错误且不建立通道', async () => {
+    const { service, runtime, store } = createService()
+    const created = service.upsertSource(createInput({ tlsMode: 'verify', tlsServerName: 'db.example.com' })).source
+    store.update(created.id, { tlsServerName: '127.0.0.1' })
+    expect(service.listSources().sources[0]?.tlsServerName).toBe('127.0.0.1')
+    await expect(service.probeSource({ sourceId: created.id }))
+      .rejects.toThrow('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
+    await expect(service.diagnoseSource({ sourceId: created.id }))
+      .rejects.toThrow('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
+    expect(runtime.requests).toEqual([])
+  })
+
   test('Given 只读诊断 When 成功 Then 返回指标表格与采集时间', async () => {
     const { service, runtime } = createService({ now: () => 7_777 })
     /** 先建数据源。 */
@@ -414,28 +476,32 @@ describe('服务器运维数据服务编排', () => {
     expect(result.tables[0]!.rows).toEqual([['app']])
   })
 
-  test('Given 分区诊断 When 读取 Then section 进入 runtime 且单飞键按分区隔离', async () => {
+  test('Given 分区诊断 When 同源读取 Then section 保留且串行执行', async () => {
     const { service, runtime } = createService()
     const created = service.upsertSource(createInput())
     const sessions = service.diagnoseSource({ sourceId: created.source.id, section: 'sessions' })
     expect(runtime.requests[0]).toMatchObject({ mode: 'diagnostics', diagnosticSection: 'sessions' })
     const parameters = service.diagnoseSource({ sourceId: created.source.id, section: 'parameters' })
-    expect(runtime.requests[1]).toMatchObject({ mode: 'diagnostics', diagnosticSection: 'parameters' })
+    expect(runtime.requests).toHaveLength(1)
     runtime.settle(availableResult)
-    runtime.settle({ ...availableResult, parameters: [{ name: 'autocommit', value: 'ON', scope: 'global' }], parametersTruncated: false })
     await sessions
+    await Promise.resolve()
+    expect(runtime.requests[1]).toMatchObject({ mode: 'diagnostics', diagnosticSection: 'parameters' })
+    runtime.settle({ ...availableResult, parameters: [{ name: 'autocommit', value: 'ON', scope: 'global' }], parametersTruncated: false })
     await expect(parameters).resolves.toMatchObject({ parameters: [{ name: 'autocommit', value: 'ON', scope: 'global' }] })
   })
 
-  test('Given MySQL 会话按库诊断 When 并发读取不同库 Then runtime 参数与单飞键均按库隔离', async () => {
+  test('Given MySQL 会话按库诊断 When 并发读取不同库 Then 两次读取按来源排队并保留参数', async () => {
     const { service, runtime } = createService()
     const created = service.upsertSource(createInput())
     const app = service.diagnoseSource({ sourceId: created.source.id, section: 'sessions', database: 'app' })
     const audit = service.diagnoseSource({ sourceId: created.source.id, section: 'sessions', database: 'audit log' })
-    expect(runtime.requests).toHaveLength(2)
+    expect(runtime.requests).toHaveLength(1)
     expect(runtime.requests[0]).toMatchObject({ diagnosticSection: 'sessions', diagnosticDatabase: 'app' })
-    expect(runtime.requests[1]).toMatchObject({ diagnosticSection: 'sessions', diagnosticDatabase: 'audit log' })
     runtime.settle(availableResult)
+    await app
+    await Promise.resolve()
+    expect(runtime.requests[1]).toMatchObject({ diagnosticSection: 'sessions', diagnosticDatabase: 'audit log' })
     runtime.settle(availableResult)
     await Promise.all([app, audit])
   })
@@ -454,27 +520,113 @@ describe('服务器运维数据服务编排', () => {
     expect(redis.runtime.requests).toEqual([])
   })
 
-  test('Given 同数据源重复读取 When 前一次未完成 Then 拒绝而不是排队', async () => {
+  test('Given 同数据源重复读取 When 前一次未完成 Then 排队且等待前一次结束', async () => {
     const { service, runtime } = createService()
     /** 先建数据源。 */
     const created = service.upsertSource(createInput())
     const first = service.diagnoseSource({ sourceId: created.source.id })
-    await expect(service.diagnoseSource({ sourceId: created.source.id }))
-      .rejects.toThrow('SERVER_OPS_DATA_SOURCE_BUSY')
+    const second = service.diagnoseSource({ sourceId: created.source.id })
+    expect(runtime.requests).toHaveLength(1)
+    runtime.settle(availableResult)
+    await first
+    await Promise.resolve()
+    expect(runtime.requests).toHaveLength(2)
+    runtime.settle(availableResult)
+    await second
+  })
+
+  test('Given Agent 等待同源读取 When 撤权取消 Then 立即移出且 runtime 不收到第二次读取', async () => {
+    const { service, runtime } = createService()
+    const source = service.upsertSource(createInput()).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const controller = new AbortController()
+    let revoked = false
+    const second = service.listSchemaTables({ sourceId: source.id }, controller.signal, {
+      ownerSessionId: 'session-1', check: () => { if (revoked) throw new Error('SERVER_OPS_AGENT_GRANT_CHANGED') },
+    })
+    revoked = true
+    controller.abort()
+    await expect(second).rejects.toThrow('SERVER_OPS_AGENT_GRANT_CHANGED')
     runtime.settle(availableResult)
     await first
     expect(runtime.requests).toHaveLength(1)
   })
 
-  test('Given 全局并发已满 When 新读取 Then 拒绝而不是排队', async () => {
+  test('Given 排队读取 When 数据源在另一入口变更 Then 旧请求及时取消且不触达 runtime', async () => {
+    const { service, runtime, store } = createService()
+    const source = service.upsertSource(createInput()).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const second = service.readSchemaRows({ sourceId: source.id, database: 'app', table: 'users', offset: 0, limit: 50 })
+    store.update(source.id, { address: '127.0.0.2' })
+    await expect(second).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    runtime.settle(availableResult)
+    await expect(first).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    expect(runtime.requests).toHaveLength(1)
+  })
+
+  test('Given 排队读取 When 跨实例仅改名或移动项目 Then 仍在原连接上顺序执行', async () => {
+    const { service, runtime, store } = createService()
+    const source = service.upsertSource(createInput({ projectId: 'project-a' })).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const queued = service.probeSource({ sourceId: source.id })
+    store.update(source.id, { label: '新连接名称' })
+    service.moveSource(source.id, 'project-a', 'project-b')
+    runtime.settle(availableResult)
+    await first
+    expect(runtime.requests).toHaveLength(2)
+    runtime.settle(availableResult)
+    await expect(queued).resolves.toMatchObject({ capability: 'available' })
+  })
+
+  test('Given 同源读取排队 When 本服务仅改名 Then 不取消队列', async () => {
+    const { service, runtime } = createService()
+    const source = service.upsertSource(createInput()).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const queued = service.probeSource({ sourceId: source.id })
+    service.upsertSource(createInput({ sourceId: source.id, label: '新连接名称' }))
+    runtime.settle(availableResult)
+    await first
+    expect(runtime.requests).toHaveLength(2)
+    runtime.settle(availableResult)
+    await expect(queued).resolves.toMatchObject({ capability: 'available' })
+  })
+
+  test('Given 同源读取排队 When 本服务变更端点 Then 立即拒绝排队且不访问新目标', async () => {
+    const { service, runtime } = createService()
+    const source = service.upsertSource(createInput()).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const queued = service.probeSource({ sourceId: source.id })
+    service.upsertSource(createInput({ sourceId: source.id, address: '127.0.0.2' }))
+    await expect(queued).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    runtime.settle(availableResult)
+    await expect(first).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    expect(runtime.requests).toHaveLength(1)
+  })
+
+  test('Given 同源读取排队 When 原位替换密码 Then 立即拒绝旧凭据请求', async () => {
+    const { service, runtime } = createService()
+    const source = service.upsertSource(createInput({ password: 'old' })).source
+    const first = service.diagnoseSource({ sourceId: source.id })
+    const queued = service.probeSource({ sourceId: source.id })
+    service.upsertSource(createInput({ sourceId: source.id, password: 'new' }))
+    await expect(queued).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    runtime.settle(availableResult)
+    await expect(first).rejects.toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+    expect(runtime.requests).toHaveLength(1)
+  })
+
+  test('Given 全局并发已满 When 新读取 Then 排队并在名额释放后执行', async () => {
     const { service, runtime } = createService()
     /** 建立四个不同数据源以突破全局上限。 */
     const sources = [1, 2, 3, 4].map(() => service.upsertSource(createInput()).source)
     const pending = sources.slice(0, 3).map((source) => service.diagnoseSource({ sourceId: source.id }))
-    await expect(service.diagnoseSource({ sourceId: sources[3]!.id }))
-      .rejects.toThrow('SERVER_OPS_DATA_BUSY')
+    const fourth = service.diagnoseSource({ sourceId: sources[3]!.id })
+    expect(runtime.requests).toHaveLength(3)
     for (let index = 0; index < 3; index += 1) runtime.settle(availableResult)
     await Promise.all(pending)
+    expect(runtime.requests).toHaveLength(4)
+    runtime.settle(availableResult)
+    await fourth
   })
 
   test('Given SSH 未连接 When 读取 Then 直接拒绝且不消耗并发', async () => {
@@ -543,7 +695,8 @@ describe('服务器运维数据服务编排', () => {
     const pending = service.probeSource({ draft: {
       transport: 'ssh', hostId: 'host-1', engine: 'mysql', address: '10.0.0.9', port: 3306, tlsMode: 'disabled',
     } })
-    expect(identityCalls).toEqual(['host-1'])
+    expect(identityCalls.length).toBeGreaterThanOrEqual(1)
+    expect(identityCalls.every((hostId) => hostId === 'host-1')).toBe(true)
     expect(runtime.requests[0]).toMatchObject({ transport: 'ssh', hostId: 'host-1', connectionId: 'connection-1' })
     runtime.settle(availableResult)
     expect((await pending).capability).toBe('available')
@@ -712,6 +865,32 @@ describe('服务器运维数据服务编排', () => {
     expect(await rowsPending).toMatchObject({ rows: [['51']], offset: 50, limit: 50 })
   })
 
+  test('Given 多条件筛选 When 主进程读取行 Then 转发独立条件快照且不返回整表估算', async () => {
+    /** 以直连替身验证主进程到 utility 的合同，不访问真实数据库。 */
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined }))
+    const filters: ServerOpsDataRowFilters = { match: 'any', conditions: [
+      { column: 'name', operator: 'contains', value: "%' OR 1=1 --" },
+      { column: 'deleted_at', operator: 'is-null' },
+    ] }
+    const pending = service.readSchemaRows({ sourceId: created.source.id, database: 'app', table: 'users', offset: 0, limit: 50, filters })
+    expect(runtime.requests[0]).toMatchObject({ mode: 'schema-rows', rowFilters: filters, rowOffset: 0, rowLimit: 50 })
+    filters.conditions[0]!.value = 'changed-after-call'
+    expect(runtime.requests[0]!.rowFilters!.conditions[0]!.value).toBe("%' OR 1=1 --")
+    runtime.settle({ mode: 'schema-rows', capability: 'available', columns: ['id'], rows: [['1']], offset: 0, limit: 50, totalEstimate: 9000, truncated: false, warnings: [] })
+    expect(await pending).not.toHaveProperty('totalEstimate')
+  })
+
+  test('Given 非法筛选或分页 When 直接调用服务 Then 在 runtime 请求前拒绝', async () => {
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined }))
+    /** 内部调用也必须经过 shared 校验，不能依赖外层 IPC 已经处理。 */
+    const input = { sourceId: created.source.id, database: 'app', table: 'users', offset: 0, limit: 50 }
+    await expect(service.readSchemaRows({ ...input, filters: { match: 'all', conditions: [] } })).rejects.toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
+    await expect(service.readSchemaRows({ ...input, limit: 201 })).rejects.toThrow()
+    expect(runtime.requests).toHaveLength(0)
+  })
+
   test('Given 未显式启用缓存 When 连续读取目录 Then 每次都实时访问 runtime', async () => {
     const { service, runtime } = createService({ cache: true })
     const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
@@ -744,6 +923,40 @@ describe('服务器运维数据服务编排', () => {
     expect(runtime.requests).toHaveLength(1)
     runtime.settle({ mode: 'schema-table', capability: 'available', columns: [], indexes: [], warnings: [] })
     await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+  })
+
+  test('Given 共享缓存未命中 When 一个调用者取消 Then 另一个仍取得结果且 runtime 不被取消', async () => {
+    const { service, runtime } = createService({ cache: true })
+    const source = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' })).source
+    const input = { sourceId: source.id, database: 'app', cacheMode: 'prefer-cache' as const }
+    const controller = new AbortController()
+    const cancelled = service.listSchemaTables(input, controller.signal)
+    const retained = service.listSchemaTables(input)
+    expect(runtime.requests).toHaveLength(1)
+    expect(runtime.signals[0]).toBeUndefined()
+    controller.abort()
+    await expect(cancelled).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
+    await expect(retained).resolves.toMatchObject({ tables: [{ name: 'users' }] })
+  })
+
+  test('Given SQLite 结构缓存 When 文件路径变化 Then 不复用上一个文件的表目录', async () => {
+    /** 在同一 SSH 与 sourceId 下切换文件，专门覆盖文件端点的身份隔离。 */
+    const { service, runtime } = createService({ cache: true })
+    const sourceInput: ServerOpsDataSourceUpsertInput = { transport: 'ssh', hostId: 'host-1', engine: 'sqlite', label: 'SQLite', filePath: '/srv/first.db', database: 'main', tlsMode: 'disabled' }
+    const created = service.upsertSource(sourceInput)
+    const input = { sourceId: created.source.id, database: 'main', cacheMode: 'prefer-cache' as const }
+    const first = service.listSchemaTables(input)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'main', databases: ['main'], tables: [{ name: 'first_table' }], warnings: [] })
+    await first
+    await expect(service.listSchemaTables(input)).resolves.toMatchObject({ tables: [{ name: 'first_table' }] })
+    expect(runtime.requests).toHaveLength(1)
+    service.upsertSource({ ...sourceInput, sourceId: created.source.id, filePath: '/srv/second.db' })
+    const second = service.listSchemaTables(input)
+    expect(runtime.requests).toHaveLength(2)
+    expect(runtime.requests[1]?.filePath).toBe('/srv/second.db')
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'main', databases: ['main'], tables: [{ name: 'second_table' }], warnings: [] })
+    await expect(second).resolves.toMatchObject({ tables: [{ name: 'second_table' }] })
   })
 
   test('Given 有凭据但缺少密文版本能力 When prefer-cache Then 禁用缓存并保持实时读取', async () => {
@@ -789,11 +1002,12 @@ describe('服务器运维数据服务编排', () => {
       sourceId: created.source.id, database: 'app', table: 'users', cacheMode: 'prefer-cache',
     })
     const refreshedDirectory = service.listSchemaTables({ sourceId: created.source.id, database: 'app', cacheMode: 'refresh' })
-    expect(runtime.requests.map((request) => request.mode)).toEqual(['schema-table', 'schema-tables'])
+    expect(runtime.requests.map((request) => request.mode)).toEqual(['schema-table'])
 
     runtime.settle({ mode: 'schema-table', capability: 'available', columns: [{ name: 'old', type: 'int', nullable: false, primaryKey: false }], indexes: [], warnings: [] })
     await oldTable
     expect(schemaCache.writes).toBe(0)
+    expect(runtime.requests.map((request) => request.mode)).toEqual(['schema-table', 'schema-tables'])
     runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'users' }], warnings: [] })
     await refreshedDirectory
     expect(schemaCache.writes).toBe(1)
@@ -936,9 +1150,13 @@ describe('服务器运维数据服务编排', () => {
     const first = service.querySource(input, controller.signal)
 
     controller.abort()
-    await expect(service.querySource({ ...input, queryId: 'query-2' })).rejects.toThrow('SERVER_OPS_DATA_SOURCE_BUSY')
+    const second = service.querySource({ ...input, queryId: 'query-2' })
+    expect(runtime.requests).toHaveLength(1)
     runtime.fail(new Error('SERVER_OPS_DATA_CANCELLED'))
     await expect(first).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
+    expect(runtime.requests).toHaveLength(2)
+    runtime.settle({ queryId: 'query-2', database: 'app', columns: ['id'], rows: [['2']], rowCount: 1, durationMs: 1, truncated: false, warnings: [] })
+    await second
 
     const next = service.querySource({ ...input, queryId: 'query-3' })
     expect(runtime.requests.at(-1)?.queryId).toBe('query-3')

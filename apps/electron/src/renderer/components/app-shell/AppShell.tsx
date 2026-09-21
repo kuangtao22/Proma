@@ -82,7 +82,7 @@ export function AppShell(): React.ReactElement {
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
   /** 常驻于 AppShell 的会话撤权守卫，不依赖 Server Ops 工作区是否挂载。 */
   const [serverOpsAgentAccessSessionGuard] = React.useState(() => createServerOpsAgentAccessSessionGuard({
-    revokeSession: (sessionId) => window.electronAPI.revokeServerOpsAgentAccessSession(sessionId),
+    revokeSession: (sessionId) => window.electronAPI.revokeServerOpsLegacyAgentAccessSession(sessionId),
     reportError: (message) => {
       console.error('[Server Ops] 切换会话撤销 Agent 授权失败:', message)
       toast.error('服务器 Agent 授权撤销失败，请返回运维面板检查授权')

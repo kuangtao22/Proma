@@ -4,8 +4,11 @@ import { connect as connectTcp } from 'node:net'
 import { ServerOpsSftpRuntime, ServerOpsSftpRuntimeError } from './server-ops/server-ops-sftp-runtime'
 import type { ServerOpsSftpRequest } from './server-ops/server-ops-sftp-runtime'
 import { runServerOpsDataRead } from './server-ops/server-ops-data-runtime'
+import { runServerOpsSqliteRead, getServerOpsSqlitePublicError } from './server-ops/server-ops-sqlite-runtime'
+import type { ServerOpsSqliteChannelFactory } from './server-ops/server-ops-sqlite-runtime'
 import type { ServerOpsDataRuntimeInput } from './server-ops/server-ops-data-runtime'
 import { getServerOpsSqlQueryPublicError } from './server-ops/server-ops-query-runtime'
+import { getServerOpsRowFilterPublicError } from './server-ops/server-ops-row-filter-sql'
 import type { ServerOpsRuntimeDataReadRequest } from './server-ops/server-ops-runtime-protocol'
 import type { ServerOpsTerminalExitEvent } from '@proma/shared'
 import { ServerOpsConsoleRuntimeController } from './server-ops/server-ops-console-runtime'
@@ -74,6 +77,8 @@ const OUTPUT_FLUSH_DELAY_MS = 16
 const connections = new Map<string, ManagedSshConnection>()
 /** 尚在握手或认证阶段、还未创建 PTY 的 SSH client。 */
 const pendingClients = new Map<string, Client>()
+/** 单次 SSH exec 的主动取消句柄，仅在远程通道确实收束后移除。 */
+const activeExecs = new Map<string, { hostId: string; connectionId: string; cancel: () => void }>()
 /** Electron 注入的父进程消息端口。 */
 const parentPort = (process as typeof process & { parentPort?: RuntimeParentPort }).parentPort
 /** 主进程传入的专用 MessagePort。 */
@@ -128,6 +133,11 @@ function handleRequest(raw: unknown): void {
     case 'server-ops.exec':
       exec(request.input)
       return
+    case 'server-ops.exec-cancel': {
+      const active = activeExecs.get(request.requestId)
+      if (active?.hostId === request.hostId && active.connectionId === request.connectionId) active.cancel()
+      return
+    }
     case 'server-ops.data-read':
       dataRead(request.input)
       return
@@ -396,17 +406,37 @@ function exec(input: import('./server-ops/server-ops-runtime-protocol').ServerOp
   }
   const output = createExecOutputCollector()
   let settled = false
+  let cancelRequested = false
   let channelRef: ClientChannel | undefined
+  /** 先向远端进程发送 TERM，再关闭 SSH channel；close 后不再能可靠发送 signal。 */
+  const stopRemoteExec = (channel: ClientChannel): void => {
+    try { channel.signal('TERM') } catch { /* SSH 信号失败仍需关闭通道。 */ }
+    channel.close()
+  }
+  /** SSH channel 的 close 事件表示底层请求已收束，此后才向主进程确认取消。 */
+  const finishCancelled = (): void => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    activeExecs.delete(input.requestId)
+    post({ type: 'server-ops.exec-cancelled', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId })
+  }
   const finishError = (code: string, message: string): void => {
     if (settled) return
     settled = true
     clearTimeout(timer)
+    activeExecs.delete(input.requestId)
     channelRef?.close()
     post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code, message })
   }
   const timer = setTimeout(() => {
     finishError('SERVER_OPS_EXEC_TIMEOUT', '远程命令执行超时')
   }, input.timeoutMs)
+  activeExecs.set(input.requestId, { hostId: input.hostId, connectionId: input.connectionId, cancel: () => {
+    if (settled || cancelRequested) return
+    cancelRequested = true
+    if (channelRef) stopRemoteExec(channelRef)
+  } })
   try {
     connection.client.exec(input.command, (error, channel) => {
       if (connections.get(input.connectionId) !== connection) {
@@ -417,7 +447,7 @@ function exec(input: import('./server-ops/server-ops-runtime-protocol').ServerOp
         channel?.close()
         return
       }
-      if (error) { finishError('SERVER_OPS_EXEC_FAILED', '远程命令执行失败'); return }
+      if (error) { if (cancelRequested) finishCancelled(); else finishError('SERVER_OPS_EXEC_FAILED', '远程命令执行失败'); return }
       channelRef = channel
       connection.execChannels.add(channel)
       channel.on('data', (data: Buffer | string) => { appendExecOutput(output, 'stdout', data); if (output.truncated) channel.close() })
@@ -425,9 +455,12 @@ function exec(input: import('./server-ops/server-ops-runtime-protocol').ServerOp
       channel.once('close', (code?: number, signal?: string) => {
         connection.execChannels.delete(channel)
         if (settled) return
+        if (cancelRequested) { finishCancelled(); return }
         settled = true; clearTimeout(timer)
+        activeExecs.delete(input.requestId)
         post({ type: 'server-ops.exec-result', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, result: { ...formatExecOutput(output), ...(typeof code === 'number' ? { exitCode: code } : {}), ...(signal ? { signal } : {}) } })
       })
+      if (cancelRequested) stopRemoteExec(channel)
     })
   } catch {
     finishError('SERVER_OPS_EXEC_FAILED', '远程命令执行失败')
@@ -466,6 +499,10 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       activeSshChannel = undefined
     }
     if (channel && !channel.destroyed) {
+      /** SQLite 是远程进程，先请求终止，不能只关闭本地流。 */
+      if (input.engine === 'sqlite' && 'signal' in channel && typeof channel.signal === 'function') {
+        try { channel.signal('TERM') } catch { /* 已退出的远端无需再次终止。 */ }
+      }
       try { channel.destroy() } catch { /* 通道可能已被驱动或远端关闭。 */ }
     }
   }
@@ -511,6 +548,10 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
   const createChannel = (): Promise<Duplex> => new Promise<Duplex>((resolve, reject) => {
     if (settled || controller.signal.aborted) {
       reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+      return
+    }
+    if (typeof input.address !== 'string' || typeof input.port !== 'number') {
+      reject(new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID'))
       return
     }
     if (input.transport === 'direct') {
@@ -564,8 +605,45 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       reject(error instanceof Error ? error : new Error('SERVER_OPS_DATA_CHANNEL_FAILED'))
     }
   })
-  /** protocol parser 已按 mode 强制 query 字段完整性，这里只收窄成执行器判别 union。 */
-  void runServerOpsDataRead(input as ServerOpsDataRuntimeInput, createChannel, controller.signal).then((result) => {
+  /** SQLite 直接在已认证的服务器执行固定脚本，不建立 TCP 转发。 */
+  const createSqliteChannel: ServerOpsSqliteChannelFactory = (command) => new Promise((resolve, reject) => {
+    if (!connection || controller.signal.aborted || settled) {
+      reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+      return
+    }
+    /** 建链期间也响应取消；迟到的 exec 回调仍负责终止它创建的进程。 */
+    const abortOpening = (): void => { reject(new Error('SERVER_OPS_DATA_CANCELLED')) }
+    controller.signal.addEventListener('abort', abortOpening, { once: true })
+    try {
+      connection.client.exec(command, (error, channel) => {
+        controller.signal.removeEventListener('abort', abortOpening)
+        if (error) { reject(error); return }
+        if (controller.signal.aborted || settled || connections.get(input.connectionId) !== connection) {
+          try { channel.signal('TERM') } catch { /* 迟到通道可能已经退出。 */ }
+          channel.destroy()
+          reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+          return
+        }
+        activeChannel = channel
+        activeSshChannel = channel
+        connection.dataChannels.add(channel)
+        channel.once('close', () => {
+          connection.dataChannels.delete(channel)
+          if (activeChannel === channel) activeChannel = undefined
+          if (activeSshChannel === channel) activeSshChannel = undefined
+        })
+        resolve(channel)
+      })
+    } catch (error) {
+      controller.signal.removeEventListener('abort', abortOpening)
+      reject(error)
+    }
+  })
+  /** protocol parser 已校验端点分支；SQLite 与网络驱动共享在途身份和终态收束。 */
+  const read = input.engine === 'sqlite'
+    ? runServerOpsSqliteRead(input, createSqliteChannel, controller.signal)
+    : runServerOpsDataRead(input as ServerOpsDataRuntimeInput, createChannel, controller.signal)
+  void read.then((result) => {
     if (settled) return
     if (controller.signal.aborted) {
       if (terminalError) finishError(terminalError.code, terminalError.message)
@@ -587,7 +665,7 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       return
     }
     /** 仅透传执行器与共享解析器确认过的稳定码，绝不按前缀接受驱动正文。 */
-    const publicError = getServerOpsSqlQueryPublicError(error)
+    const publicError = getServerOpsSqlQueryPublicError(error) ?? getServerOpsSqlitePublicError(error) ?? getServerOpsRowFilterPublicError(error)
     finishError(
       publicError?.code ?? 'SERVER_OPS_DATA_CHANNEL_FAILED',
       publicError?.message ?? '无法建立到数据库的通道',

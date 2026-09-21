@@ -1,3 +1,4 @@
+import type { AgentToolMode } from '@proma/shared'
 /**
  * Preload 脚本
  *
@@ -324,7 +325,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   onServerOpsTerminalOutput: (callback: (event: ServerOpsTerminalOutputEvent) => void) => () => void
   onServerOpsTerminalExit: (callback: (event: ServerOpsTerminalExitEvent) => void) => () => void
   getServerOpsAgentAccess: (input: ServerOpsAgentAccessTarget) => Promise<ServerOpsAgentAccess | null>
-  setServerOpsAgentAccess: (input: ServerOpsAgentAccess) => Promise<ServerOpsAgentAccess | null>
+  setServerOpsAgentAccess: (input: ServerOpsAgentAccess, impactToken?: string) => Promise<ServerOpsAgentAccess | null>
   revokeServerOpsAgentAccessSession: (sessionId: string) => Promise<void>
   onServerOpsAgentAccessChanged: (callback: (event: ServerOpsAgentAccessChanged) => void) => () => void
   listServerOpsAudit: (input: ServerOpsAuditListInput) => Promise<ServerOpsAuditListResult>
@@ -950,6 +951,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
 
   /** 热切换指定会话的权限模式（运行中生效，仅影响该 session） */
   updateSessionPermissionMode: (sessionId: string, mode: PromaPermissionMode) => Promise<void>
+  /** 停止旧运行并为后续运行保存工具边界。 */
+  updateAgentSessionToolMode: (sessionId: string, mode: AgentToolMode) => Promise<AgentSessionMeta>
 
   // ===== Chat 工具管理 =====
 
@@ -1585,7 +1588,7 @@ const electronAPI: ElectronAPI = {
     return () => ipcRenderer.removeListener(SERVER_OPS_IPC_CHANNELS.TERMINAL_EXIT, listener)
   },
   getServerOpsAgentAccess: (input: ServerOpsAgentAccessTarget) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS, input),
-  setServerOpsAgentAccess: (input: ServerOpsAgentAccess) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, input),
+  setServerOpsAgentAccess: (input: ServerOpsAgentAccess, impactToken?: string) => ipcRenderer.invoke(SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, impactToken === undefined ? input : { access: input, impactToken }),
   revokeServerOpsAgentAccessSession: (sessionId: string) => ipcRenderer.invoke(
     SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION,
     sessionId,
@@ -2498,6 +2501,7 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.PERMISSION_RESPOND, response)
   },
 
+  updateAgentSessionToolMode: (sessionId: string, mode: AgentToolMode) => ipcRenderer.invoke(AGENT_IPC_CHANNELS.UPDATE_SESSION_TOOL_MODE, sessionId, mode),
   updateSessionPermissionMode: (sessionId: string, mode: PromaPermissionMode) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.UPDATE_SESSION_PERMISSION_MODE, sessionId, mode)
   },

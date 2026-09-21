@@ -76,6 +76,16 @@ export type AgentEffort = 'low' | 'medium' | 'high' | 'max'
 /** Agent 思考等级（用于 Pi runtime；Claude runtime 继续使用 ThinkingConfig/AgentEffort） */
 export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
+/** Agent 工具运行模式与权限审批模式彼此独立。 */
+export type AgentToolMode = 'standard' | 'server-ops-read'
+/** 历史会话缺少字段时保留完整普通工具能力。 */
+export const AGENT_DEFAULT_TOOL_MODE: AgentToolMode = 'standard'
+
+/** 严格校验外部或磁盘上的工具模式，不把非法值降级为普通模式。 */
+export function isAgentToolMode(value: unknown): value is AgentToolMode {
+  return value === 'standard' || value === 'server-ops-read'
+}
+
 // Model-specific reasoning profiles and level normalization live in reasoning-profile.ts.
 
 /** 支持 ChatGPT Codex Fast Mode（priority service tier）的模型。 */
@@ -808,6 +818,8 @@ export interface AgentSessionMeta {
   stoppedByUser?: boolean
   /** 该会话当前的权限模式（持久化到磁盘，重启后恢复）。未设置时新会话默认 auto */
   permissionMode?: PromaPermissionMode
+  /** 会话选择的工具运行模式；本轮启动时冻结，缺失时为 standard。 */
+  toolMode?: AgentToolMode
   /** 来源定时任务 ID（该会话由定时任务自动创建/复用时标记，用于侧栏显示钟表图标 + 跳转设置） */
   sourceAutomationId?: string
   /** 来源设计项目 ID；仅 Design Job 可见会话设置。 */
@@ -1275,6 +1287,8 @@ export interface AgentMediaAttachment {
 export interface AgentSendInput {
   /** 会话 ID */
   sessionId: string
+  /** Renderer 捕获的会话模式快照；主进程必须核对持久化模式。 */
+  toolMode?: AgentToolMode
   /** 用户消息内容（传给 Agent 的 SDK 文本；@file 引用路径已解码为真实路径） */
   userMessage: string
   /** 仅用于持久化/展示的原始用户输入（保留 @file 编码原文，省略时回退到 userMessage） */
@@ -2183,6 +2197,8 @@ export const AGENT_IPC_CHANNELS = {
   PERMISSION_RESPOND: 'agent:permission:respond',
   /** 热切换指定会话的权限模式（运行中生效，不广播到其他会话） */
   UPDATE_SESSION_PERMISSION_MODE: 'agent:update-session-permission-mode',
+  /** 变更会话工具运行模式；主进程先停止当前运行再保存。 */
+  UPDATE_SESSION_TOOL_MODE: 'agent:update-session-tool-mode',
   /** 切换指定会话的 Agent runtime（下一轮生效，跨 runtime 时清空 SDK resume ID） */
   /** 切换指定会话的 ChatGPT Codex Fast Mode（下一轮 Pi 请求生效） */
   UPDATE_SESSION_CODEX_FAST_MODE: 'agent:update-session-codex-fast-mode',

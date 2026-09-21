@@ -56,6 +56,27 @@ const sdk = {
 } as typeof import('@earendil-works/pi-coding-agent')
 
 describe('Pi Server Ops 工具合同', () => {
+  test('Given 会话恢复为运维只读模式 When 重建工具 Then 每轮仅有九项独立工具实例', async () => {
+    const facade = {} as ServerOpsAgentReadFacade
+    const context = {
+      sessionId: 'session-1', channelId: 'channel-1', toolMode: 'server-ops-read' as const, serverOpsReadFacade: facade,
+      serverOpsFacade: {} as ServerOpsAgentFacade,
+    }
+    const first = await buildPiBuiltinTools(sdk, context)
+    const resumed = await buildPiBuiltinTools(sdk, context)
+    expect(first.tools.map((tool) => tool.name)).toEqual([
+      'ops_resources', 'ops_server_overview', 'ops_server_services',
+      'ops_data_test', 'ops_data_diagnose', 'ops_database_tables',
+      'ops_database_describe', 'ops_database_rows', 'ops_database_query',
+    ])
+    expect(first.collaborationAvailable).toBe(false)
+    expect(first.tools[0]).not.toBe(resumed.tools[0])
+    await expect(buildPiBuiltinTools(sdk, { sessionId: 'session-1', channelId: 'channel-1', toolMode: 'server-ops-read' }))
+      .rejects.toThrow('需要当前用户会话的有效授权')
+    await expect(buildPiBuiltinTools(sdk, { ...context, triggeredBy: 'automation' }))
+      .rejects.toThrow('需要当前用户会话的有效授权')
+  })
+
   test('Given 文件与 Docker 服务已接通 When 构建工具 Then 只公开受限字段且内部运行不注册新能力', async () => {
     /** 用已存在的窄 Facade 方法证明能力按真实服务注册。 */
     const facade = {

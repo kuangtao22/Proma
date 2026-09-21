@@ -2,6 +2,13 @@ import { describe, expect, test } from 'bun:test'
 import { formatServerOpsDataProbeSummary, getServerOpsDataErrorMessage } from './server-ops-data-display'
 
 describe('数据服务展示文案', () => {
+  test('Given 新筛选请求被旧后台合同拒绝 When 显示错误 Then 提示完整重启且不误判普通请求', () => {
+    /** 现场旧主进程的 IPC 错误，不包含筛选值或数据库内容。 */
+    const error = new Error("Error invoking remote method 'server-ops:read-data-schema-rows': Error: SERVER_OPS_DATA_SCHEMA_ROWS_INPUT_INVALID")
+    expect(getServerOpsDataErrorMessage(error, 'filtered-rows')).toBe('当前后台尚不支持筛选参数，请完整退出并重新启动客户端后重试')
+    expect(getServerOpsDataErrorMessage(error)).not.toContain('尚不支持筛选')
+    expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID'), 'filtered-rows')).toBe('筛选条件无效或字段不可筛选，请刷新字段后调整条件')
+  })
   test('Given 主进程错误 When 映射 Then 稳定错误码收敛成可操作中文', () => {
     /** 主进程经 IPC 抛出时的真实原文形态。 */
     const invokeError = new Error("Error invoking remote method 'server-ops:upsert-data-source': Error: SERVER_OPS_SECURE_STORAGE_UNAVAILABLE")
@@ -10,7 +17,9 @@ describe('数据服务展示文案', () => {
     expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_SAFE_STORAGE_NOT_INJECTED')))
       .toBe('当前客户端未接入系统密钥库，请重启客户端后再试')
     expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_DATA_TLS_REQUIRED')))
-      .toBe('直连该地址必须开启 TLS 证书校验：只有回环与私有网段（10./172.16-31./192.168./ULA）允许明文，主机名无法判定归属')
+      .toBe('直连该地址必须开启 TLS：仅回环与私有网段允许关闭 TLS，域名无法离线判定归属')
+    expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')))
+      .toBe('请填写证书中的 DNS 主机名；数据库地址仍可使用 IP')
     expect(getServerOpsDataErrorMessage(new Error('无法识别的底层错误'))).toBe('操作失败，请稍后重试')
   })
 
@@ -21,6 +30,8 @@ describe('数据服务展示文案', () => {
       ['SERVER_OPS_DATA_SOURCE_FILE_INVALID', '本机数据源文件损坏，请检查数据根后重启客户端'],
       ['SERVER_OPS_DATA_CREDENTIAL_INVALID', '密码格式不合法：需要 1–8192 个字符且不能包含空字符'],
       ['SERVER_OPS_DATA_DISPATCH_FAILED', '数据库读取没能下发到运行时，请稍后重试'],
+      ['SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID', '筛选条件无效或字段不可筛选，请刷新字段后调整条件'],
+      ['SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE', '当前连接不支持安全筛选，请更新客户端后重试'],
       ['SERVER_OPS_RUNTIME_STOPPED', 'SSH 运行时已停止，请重新连接服务器后再试'],
     ]
     for (const [code, text] of expectations) {
@@ -52,5 +63,14 @@ describe('数据服务展示文案', () => {
     })).toBe('认证失败 · 认证失败（NOAUTH）')
     expect(formatServerOpsDataProbeSummary({ engine: 'redis', capability: 'timeout', warnings: [] }))
       .toBe('超时')
+  })
+
+  test('Given 测试明确返回 TLS 协商状态 When 格式化 Then 展示本次事实；旧结果不推断加密', () => {
+    for (const [tlsStatus, label] of [
+      ['plaintext', '本次数据库未启用 TLS'], ['encrypted', '本次 TLS 加密（未校验证书）'], ['verified', '本次 TLS 加密（已校验证书）'],
+    ] as const) {
+      expect(formatServerOpsDataProbeSummary({ engine: 'mysql', capability: 'available', tlsStatus, warnings: [] })).toContain(label)
+    }
+    expect(formatServerOpsDataProbeSummary({ engine: 'mysql', capability: 'available', warnings: [] })).toBe('已连接')
   })
 })

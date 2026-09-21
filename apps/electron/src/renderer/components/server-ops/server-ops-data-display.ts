@@ -1,4 +1,4 @@
-import type { ServerOpsDataCapability, ServerOpsDataProbeResult } from '@proma/shared'
+import type { ServerOpsDataCapability, ServerOpsDataProbeResult, ServerOpsDataTlsMode } from '@proma/shared'
 
 /** 能力状态到中文说明的稳定映射。 */
 export const SERVER_OPS_DATA_CAPABILITY_LABELS: Record<ServerOpsDataCapability, string> = {
@@ -6,7 +6,7 @@ export const SERVER_OPS_DATA_CAPABILITY_LABELS: Record<ServerOpsDataCapability, 
   'auth-failed': '认证失败',
   'permission-denied': '权限不足',
   unreachable: '无法连接',
-  'tls-failed': 'TLS 校验失败',
+  'tls-failed': 'TLS 连接失败',
   timeout: '超时',
   unsupported: '不支持',
 }
@@ -31,6 +31,8 @@ const SERVER_OPS_DATA_ERROR_MESSAGES: ReadonlyArray<{ match: string; text: strin
   { match: 'SERVER_OPS_SAFE_STORAGE_NOT_INJECTED', text: '当前客户端未接入系统密钥库，请重启客户端后再试' },
   { match: 'SERVER_OPS_DATA_CREDENTIAL_CORRUPTED', text: '保存的密码无法解密，请重新输入' },
   { match: 'SERVER_OPS_DATA_TIMEOUT', text: '读取超时' },
+  { match: 'SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID', text: '筛选条件无效或字段不可筛选，请刷新字段后调整条件' },
+  { match: 'SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE', text: '当前连接不支持安全筛选，请更新客户端后重试' },
   /* 运行时侧的错误：读取没下发成功、运行时正在重启或已经退出。 */
   { match: 'SERVER_OPS_DATA_DISPATCH_FAILED', text: '数据库读取没能下发到运行时，请稍后重试' },
   { match: 'SERVER_OPS_RUNTIME_STOPPED', text: 'SSH 运行时已停止，请重新连接服务器后再试' },
@@ -38,8 +40,9 @@ const SERVER_OPS_DATA_ERROR_MESSAGES: ReadonlyArray<{ match: string; text: strin
   { match: 'SERVER_OPS_RUNTIME_FAILED', text: 'SSH 运行时异常退出，请重新连接服务器后再试' },
   {
     match: 'SERVER_OPS_DATA_TLS_REQUIRED',
-    text: '直连该地址必须开启 TLS 证书校验：只有回环与私有网段（10./172.16-31./192.168./ULA）允许明文，主机名无法判定归属',
+    text: '直连该地址必须开启 TLS：仅回环与私有网段允许关闭 TLS，域名无法离线判定归属',
   },
+  { match: 'SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED', text: '请填写证书中的 DNS 主机名；数据库地址仍可使用 IP' },
 ]
 
 /**
@@ -77,11 +80,16 @@ const SERVER_OPS_DATA_STALE_CLIENT_HINTS = [
  * 直接展示给用户既不可读也无法判断下一步，因此这里统一收敛成中文说明。
  *
  * @param error 主进程抛出的错误
+ * @param context 可选的已校验请求场景，用于区分旧后台合同与普通输入错误
  * @returns 面向用户的中文说明
  */
-export function getServerOpsDataErrorMessage(error: unknown): string {
+export function getServerOpsDataErrorMessage(error: unknown, context?: 'filtered-rows'): string {
   /** 原始错误消息文本。 */
   const text = error instanceof Error ? error.message : String(error)
+  /** 新筛选请求在旧行合同入口被拒绝时，查询尚未送达数据库；重复重试无法恢复。 */
+  if (context === 'filtered-rows' && text.includes('SERVER_OPS_DATA_SCHEMA_ROWS_INPUT_INVALID')) {
+    return '当前后台尚不支持筛选参数，请完整退出并重新启动客户端后重试'
+  }
   for (const entry of SERVER_OPS_DATA_ERROR_MESSAGES) {
     if (text.includes(entry.match)) return entry.text
   }
@@ -111,9 +119,25 @@ export function getServerOpsDataErrorMessage(error: unknown): string {
  */
 export function formatServerOpsDataProbeSummary(result: ServerOpsDataProbeResult): string {
   if (result.capability === 'available') {
-    return ['已连接', result.serverVersion, result.latencyMs === undefined ? undefined : `${result.latencyMs}ms`]
+    return ['已连接', formatServerOpsDataTlsStatus(result.tlsStatus), result.serverVersion, result.latencyMs === undefined ? undefined : `${result.latencyMs}ms`]
       .filter((part): part is string => part !== undefined && part !== '').join(' · ')
   }
   return [SERVER_OPS_DATA_CAPABILITY_LABELS[result.capability], result.warnings[0]]
     .filter((part): part is string => part !== undefined && part !== '').join(' · ')
+}
+
+/** 根据本次握手的实测状态生成文案；缺失状态的旧结果保持未知。 */
+export function formatServerOpsDataTlsStatus(status: ServerOpsDataProbeResult['tlsStatus']): string | undefined {
+  if (status === 'plaintext') return '本次数据库未启用 TLS'
+  if (status === 'encrypted') return '本次 TLS 加密（未校验证书）'
+  if (status === 'verified') return '本次 TLS 加密（已校验证书）'
+  return undefined
+}
+
+/** 将保存的连接策略与实际握手结果区分，避免列表上的设置标记冒充实测状态。 */
+export function formatServerOpsDataTlsPolicy(mode: ServerOpsDataTlsMode): string | undefined {
+  if (mode === 'preferred') return '优先 TLS'
+  if (mode === 'required') return '必须 TLS'
+  if (mode === 'verify') return '校验证书'
+  return undefined
 }

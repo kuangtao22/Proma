@@ -25,7 +25,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, normalizePathForCompare, removeMcpServerFromConfig, TERMINAL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, CANVAS_IPC_CHANNELS, DESIGN_IPC_CHANNELS, isPromaPermissionMode, isAgentToolMode, normalizePathForCompare, removeMcpServerFromConfig, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import { buildCanvasGenerationModelOptions, isCanvasMediaModelAllowed } from '@proma/shared'
 import type {
@@ -2464,7 +2464,7 @@ export function registerIpcHandlers(): void {
   /** systemd 读取、动作与审计复用唯一连接和 Store。 */
   const serverOpsSystemdService = new ServerOpsSystemdService({
     getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
-    exec: (hostId, connectionId, command, timeoutMs) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs),
+    exec: (hostId, connectionId, command, timeoutMs, signal) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs, signal),
     audit: serverOpsAudit,
     now: Date.now,
   })
@@ -4594,6 +4594,7 @@ export function registerIpcHandlers(): void {
       const current = conversations.find((c) => c.id === id)
       if (!current) throw new Error(`对话不存在: ${id}`)
       const newArchived = !current.archived
+      if (newArchived) { serverOpsIpcRegistration.revokeSession(id); stopAgent(id) }
       // 归档时自动取消置顶
       const updates: Partial<ConversationMeta> = { archived: newArchived }
       if (newArchived && current.pinned) {
@@ -5340,6 +5341,8 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.DELETE_SESSION,
     async (_, id: string): Promise<void> => {
       const deletingSession = requireVisibleSession(id)
+      serverOpsIpcRegistration.revokeSession(id)
+      stopAgent(id)
       const attachedFiles = deletingSession.attachedFiles
       // 清理权限服务中该会话的白名单
       permissionService.clearSessionWhitelist(id)
@@ -5415,6 +5418,7 @@ export function registerIpcHandlers(): void {
     async (_, id: string): Promise<AgentSessionMeta> => {
       const current = requireVisibleSession(id)
       const newArchived = !current.archived
+      if (newArchived) { serverOpsIpcRegistration.revokeSession(id); stopAgent(id) }
       // 归档时自动取消置顶
       const updates: Partial<AgentSessionMeta> = { archived: newArchived }
       if (newArchived && current.pinned) {
@@ -6263,6 +6267,14 @@ export function registerIpcHandlers(): void {
       }
     }
   )
+
+  /** 工具模式不能热扩权；停止当前代次后持久化，下一轮重新构建工具集。 */
+  ipcMain.handle(AGENT_IPC_CHANNELS.UPDATE_SESSION_TOOL_MODE, async (_, sessionId: string, mode: unknown): Promise<AgentSessionMeta> => {
+    const current = requireVisibleSession(sessionId)
+    if (!isAgentToolMode(mode)) throw new Error('AGENT_TOOL_MODE_INVALID')
+    if ((current.toolMode ?? 'standard') !== mode) stopAgent(sessionId)
+    return updateAgentSessionMeta(sessionId, { toolMode: mode })
+  })
 
   // 热切换指定会话的权限模式（运行中生效，不广播）
   ipcMain.handle(

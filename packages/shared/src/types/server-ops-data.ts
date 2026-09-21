@@ -11,7 +11,7 @@ export const SERVER_OPS_DATA_CHANNELS = {
 } as const
 
 /** 首批支持的数据服务引擎；新增引擎必须同时补齐 runtime adapter 与页面文案。 */
-export type ServerOpsDataEngine = 'mysql' | 'redis'
+export type ServerOpsDataEngine = 'mysql' | 'redis' | 'sqlite'
 
 /**
  * 数据源连接方式。
@@ -21,8 +21,11 @@ export type ServerOpsDataEngine = 'mysql' | 'redis'
  */
 export type ServerOpsDataTransport = 'ssh' | 'direct'
 
-/** 数据源 TLS 模式。`verify` 表示使用数据库真实主机名校验证书，绝不因 SSH 跳板降级。 */
-export type ServerOpsDataTlsMode = 'disabled' | 'verify'
+/** TLS 策略：MySQL preferred 仅在服务端明确不支持 TLS 时回退；Redis 不支持该策略。 */
+export type ServerOpsDataTlsMode = 'disabled' | 'preferred' | 'required' | 'verify'
+
+/** 本次连接实际协商状态，与保存的 TLS 策略分开显示。 */
+export type ServerOpsDataTlsStatus = 'plaintext' | 'encrypted' | 'verified'
 
 /** 数据源公开能力状态；不可用原因必须可区分，不能用统一失败掩盖真实语义。 */
 export type ServerOpsDataCapability =
@@ -85,8 +88,10 @@ export interface ServerOpsDataSource {
   /** 用户可读名称。 */
   label: string
   /** 服务器视角地址，例如 `127.0.0.1`。 */
-  address: string
-  port: number
+  address?: string
+  port?: number
+  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  filePath?: string
   /** MySQL 库名；Redis 为逻辑库序号文本。 */
   database?: string
   username?: string
@@ -121,8 +126,10 @@ export interface ServerOpsDataSourceUpsertInput {
   sourceId?: string
   engine: ServerOpsDataEngine
   label: string
-  address: string
-  port: number
+  address?: string
+  port?: number
+  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  filePath?: string
   database?: string
   username?: string
   /** 仅写入路径使用；不提供表示保留已保存密码。 */
@@ -163,8 +170,10 @@ export interface ServerOpsDataSourceProbeDraft {
   /** 经由的跳板主机；`ssh` 方式必填。 */
   hostId?: string
   engine: ServerOpsDataEngine
-  address: string
-  port: number
+  address?: string
+  port?: number
+  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  filePath?: string
   database?: string
   username?: string
   /** 本次表单里新填的密码；只在这一次测试中使用。 */
@@ -189,6 +198,8 @@ export interface ServerOpsDataProbeResult {
   serverVersion?: string
   /** 建立连接与读取版本的往返耗时。 */
   latencyMs?: number
+  /** 成功连接后由驱动报告的实际状态；SQLite 不使用网络 TLS。 */
+  tlsStatus?: ServerOpsDataTlsStatus
   warnings: string[]
 }
 
@@ -216,6 +227,8 @@ export interface ServerOpsDataDiagnosticsResult {
   engine: ServerOpsDataEngine
   capability: ServerOpsDataCapability
   collectedAt: number
+  /** 本次只读诊断连接的实际状态。 */
+  tlsStatus?: ServerOpsDataTlsStatus
   metrics: ServerOpsDataMetric[]
   tables: ServerOpsDataTable[]
   parameters?: ServerOpsDataParameter[]
@@ -271,12 +284,41 @@ function isPort(value: unknown): value is number {
 
 /** 判断引擎枚举。 */
 export function isServerOpsDataEngine(value: unknown): value is ServerOpsDataEngine {
-  return value === 'mysql' || value === 'redis'
+  return value === 'mysql' || value === 'redis' || value === 'sqlite'
+}
+
+/** 判断 SQLite 文件身份是否为有界 POSIX 绝对路径，允许普通空格与引号。 */
+export function isServerOpsSqliteFilePath(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length >= 1
+    && value.length <= 4_096
+    && value.startsWith('/')
+    && !/^file:/iu.test(value)
+    && value !== ':memory:'
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+}
+
+/** 判断 SQLite 合同中的数据库是否省略或固定为 main。 */
+function isSqliteMainDatabase(value: unknown): boolean {
+  return value === undefined || value === 'main'
 }
 
 /** 判断 TLS 模式枚举。 */
 export function isServerOpsDataTlsMode(value: unknown): value is ServerOpsDataTlsMode {
-  return value === 'disabled' || value === 'verify'
+  return value === 'disabled' || value === 'preferred' || value === 'required' || value === 'verify'
+}
+
+/** 判断 MySQL 证书校验主机名是否为 DNS 名称；mysql2 对 IP 关闭 SNI，不能将其当作校验目标。 */
+export function isServerOpsMySqlTlsServerName(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 253
+    || /^\d+(?:\.\d+){3}$/u.test(value) || /^\d+$/u.test(value)) return false
+  return value.split('.').every((label) => label.length <= 63
+    && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/iu.test(label))
+}
+
+/** 校验 runtime 报告的实际 TLS 连接状态。 */
+export function isServerOpsDataTlsStatus(value: unknown): value is ServerOpsDataTlsStatus {
+  return value === 'plaintext' || value === 'encrypted' || value === 'verified'
 }
 
 /** 判断连接方式枚举。 */
@@ -437,23 +479,33 @@ export function isServerOpsPlaintextDirectAddress(address: string): boolean {
 /** 严格解析数据源公开投影。 */
 export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
   const errorCode = 'SERVER_OPS_DATA_SOURCE_INVALID'
-  const keys = new Set(['id', 'projectId', 'transport', 'hostId', 'engine', 'label', 'address', 'port', 'database', 'username',
+  const keys = new Set(['id', 'projectId', 'transport', 'hostId', 'engine', 'label', 'address', 'port', 'filePath', 'database', 'username',
     'tlsMode', 'tlsServerName', 'hasPassword', 'createdAt', 'updatedAt'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsId(value.id)
     || (value.projectId !== undefined && !isServerOpsId(value.projectId))
     || !isServerOpsDataTransport(value.transport)
     || (value.hostId !== undefined && !isServerOpsId(value.hostId))
     || !isServerOpsDataEngine(value.engine) || !isDisplayString(value.label, 64)
-    || !isAddressText(value.address, 255) || !isPort(value.port)
+    || (value.address !== undefined && !isAddressText(value.address, 255))
+    || (value.port !== undefined && !isPort(value.port))
+    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isAddressText(value.tlsServerName, 255))
     || typeof value.hasPassword !== 'boolean'
     || !isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt)) throw new Error(errorCode)
-  if (value.tlsMode === 'verify' && value.tlsServerName === undefined) throw new Error(errorCode)
+  if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
+    || (value.engine === 'redis' && value.tlsMode === 'preferred')) throw new Error(errorCode)
   /** 连接方式与跳板主机的组合必须自洽。 */
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
+  /** SQLite 只绑定 SSH 远端文件；网络引擎继续严格要求地址和端口。 */
+  if (value.engine === 'sqlite') {
+    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+      || Object.hasOwn(value, 'username') || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
+      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)
+      || value.hasPassword !== false) throw new Error(errorCode)
+  } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   return {
     id: value.id,
     ...(value.projectId === undefined ? {} : { projectId: value.projectId }),
@@ -461,9 +513,10 @@ export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
     ...(value.hostId === undefined ? {} : { hostId: value.hostId }),
     engine: value.engine,
     label: value.label,
-    address: value.address,
-    port: value.port,
-    ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.address === undefined ? {} : { address: value.address }),
+    ...(value.port === undefined ? {} : { port: value.port }),
+    ...(value.filePath === undefined ? {} : { filePath: value.filePath }),
+    ...(value.engine === 'sqlite' ? { database: 'main' } : value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     tlsMode: value.tlsMode,
     ...(value.tlsServerName === undefined ? {} : { tlsServerName: value.tlsServerName }),
@@ -492,24 +545,36 @@ export function parseServerOpsDataSourceListResult(value: unknown): ServerOpsDat
 /** 严格解析数据源新建或编辑输入。 */
 export function parseServerOpsDataSourceUpsertInput(value: unknown): ServerOpsDataSourceUpsertInput {
   const errorCode = 'SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID'
-  const keys = new Set(['projectId', 'transport', 'hostId', 'sourceId', 'engine', 'label', 'address', 'port', 'database', 'username',
+  const keys = new Set(['projectId', 'transport', 'hostId', 'sourceId', 'engine', 'label', 'address', 'port', 'filePath', 'database', 'username',
     'password', 'clearPassword', 'tlsMode', 'tlsServerName'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsDataTransport(value.transport)
     || (value.projectId !== undefined && !isServerOpsId(value.projectId))
     || (value.hostId !== undefined && !isServerOpsId(value.hostId))
     || (value.sourceId !== undefined && !isServerOpsId(value.sourceId))
     || !isServerOpsDataEngine(value.engine) || !isDisplayString(value.label, 64)
-    || !isAddressText(value.address, 255) || !isPort(value.port)
+    || (value.address !== undefined && !isAddressText(value.address, 255))
+    || (value.port !== undefined && !isPort(value.port))
+    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || (value.password !== undefined && !isSecretText(value.password))
     || (value.clearPassword !== undefined && typeof value.clearPassword !== 'boolean')
     || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isAddressText(value.tlsServerName, 255))) throw new Error(errorCode)
-  if (value.tlsMode === 'verify' && value.tlsServerName === undefined) throw new Error(errorCode)
+  if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
+    || (value.engine === 'redis' && value.tlsMode === 'preferred')
+    || (value.engine === 'mysql' && value.tlsMode === 'verify'
+      && !isServerOpsMySqlTlsServerName(value.tlsServerName))) throw new Error(errorCode)
   if (value.password !== undefined && value.clearPassword === true) throw new Error(errorCode)
   /** `ssh` 必须绑定跳板主机，`direct` 不允许携带主机。 */
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
+  /** SQLite 不接受任何网络、凭据或 TLS 参数。 */
+  if (value.engine === 'sqlite') {
+    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+      || Object.hasOwn(value, 'username') || Object.hasOwn(value, 'password') || Object.hasOwn(value, 'clearPassword')
+      || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
+      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
+  } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   if (value.engine === 'redis' && value.database !== undefined && !/^(?:1[0-5]|[0-9])$/u.test(value.database)) throw new Error(errorCode)
   return {
     ...(value.projectId === undefined ? {} : { projectId: value.projectId }),
@@ -518,9 +583,10 @@ export function parseServerOpsDataSourceUpsertInput(value: unknown): ServerOpsDa
     ...(value.sourceId === undefined ? {} : { sourceId: value.sourceId }),
     engine: value.engine,
     label: value.label,
-    address: value.address,
-    port: value.port,
-    ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.address === undefined ? {} : { address: value.address }),
+    ...(value.port === undefined ? {} : { port: value.port }),
+    ...(value.filePath === undefined ? {} : { filePath: value.filePath }),
+    ...(value.engine === 'sqlite' ? { database: 'main' } : value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     ...(value.password === undefined ? {} : { password: value.password }),
     ...(value.clearPassword === undefined ? {} : { clearPassword: value.clearPassword }),
@@ -570,30 +636,43 @@ export function parseServerOpsDataSourcePasswordResult(value: unknown): ServerOp
  */
 export function parseServerOpsDataSourceProbeDraft(value: unknown): ServerOpsDataSourceProbeDraft {
   const errorCode = 'SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID'
-  const keys = new Set(['transport', 'hostId', 'engine', 'address', 'port', 'database', 'username',
+  const keys = new Set(['transport', 'hostId', 'engine', 'address', 'port', 'filePath', 'database', 'username',
     'password', 'savedSourceId', 'tlsMode', 'tlsServerName'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsDataTransport(value.transport)
     || (value.hostId !== undefined && !isServerOpsId(value.hostId))
     || !isServerOpsDataEngine(value.engine)
-    || !isAddressText(value.address, 255) || !isPort(value.port)
+    || (value.address !== undefined && !isAddressText(value.address, 255))
+    || (value.port !== undefined && !isPort(value.port))
+    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || (value.password !== undefined && !isSecretText(value.password))
     || (value.savedSourceId !== undefined && !isServerOpsId(value.savedSourceId))
     || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isAddressText(value.tlsServerName, 255))) throw new Error(errorCode)
-  if (value.tlsMode === 'verify' && value.tlsServerName === undefined) throw new Error(errorCode)
+  if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
+    || (value.engine === 'redis' && value.tlsMode === 'preferred')
+    || (value.engine === 'mysql' && value.tlsMode === 'verify'
+      && !isServerOpsMySqlTlsServerName(value.tlsServerName))) throw new Error(errorCode)
   /** 内联密码与复用已保存密码只能二选一，避免"看起来在用新密码、实际用旧密文"。 */
   if (value.password !== undefined && value.savedSourceId !== undefined) throw new Error(errorCode)
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
+  /** SQLite 探测也只接受 SSH 文件身份，禁止复用任何已保存数据库密码。 */
+  if (value.engine === 'sqlite') {
+    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+      || Object.hasOwn(value, 'username') || Object.hasOwn(value, 'password') || Object.hasOwn(value, 'savedSourceId')
+      || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
+      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
+  } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   if (value.engine === 'redis' && value.database !== undefined && !/^(?:1[0-5]|[0-9])$/u.test(value.database)) throw new Error(errorCode)
   return {
     transport: value.transport,
     ...(value.hostId === undefined ? {} : { hostId: value.hostId }),
     engine: value.engine,
-    address: value.address,
-    port: value.port,
-    ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.address === undefined ? {} : { address: value.address }),
+    ...(value.port === undefined ? {} : { port: value.port }),
+    ...(value.filePath === undefined ? {} : { filePath: value.filePath }),
+    ...(value.engine === 'sqlite' ? { database: 'main' } : value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     ...(value.password === undefined ? {} : { password: value.password }),
     ...(value.savedSourceId === undefined ? {} : { savedSourceId: value.savedSourceId }),
@@ -617,14 +696,17 @@ export function parseServerOpsDataSourceProbeInput(value: unknown): ServerOpsDat
 /** 严格解析连接测试结果。 */
 export function parseServerOpsDataProbeResult(value: unknown): ServerOpsDataProbeResult {
   const errorCode = 'SERVER_OPS_DATA_PROBE_RESULT_INVALID'
-  const keys = new Set(['sourceId', 'engine', 'capability', 'serverVersion', 'latencyMs', 'warnings'])
+  const keys = new Set(['sourceId', 'engine', 'capability', 'serverVersion', 'latencyMs', 'tlsStatus', 'warnings'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys)
     || (value.sourceId !== undefined && !isServerOpsId(value.sourceId))
     || !isServerOpsDataEngine(value.engine) || !isServerOpsDataCapability(value.capability)
     || (value.serverVersion !== undefined && !isDisplayString(value.serverVersion, 128))
+    || (value.tlsStatus !== undefined && !isServerOpsDataTlsStatus(value.tlsStatus))
     || (value.latencyMs !== undefined && (typeof value.latencyMs !== 'number' || !Number.isSafeInteger(value.latencyMs)
       || value.latencyMs < 0 || value.latencyMs > 600_000))) throw new Error(errorCode)
-  if (value.capability !== 'available' && (value.serverVersion !== undefined || value.latencyMs !== undefined)) throw new Error(errorCode)
+  if (value.capability !== 'available' && (value.serverVersion !== undefined || value.latencyMs !== undefined
+    || value.tlsStatus !== undefined)) throw new Error(errorCode)
+  if (value.engine === 'sqlite' && value.tlsStatus !== undefined) throw new Error(errorCode)
   if (value.capability === 'available' && value.serverVersion === undefined) throw new Error(errorCode)
   return {
     ...(value.sourceId === undefined ? {} : { sourceId: value.sourceId }),
@@ -632,6 +714,7 @@ export function parseServerOpsDataProbeResult(value: unknown): ServerOpsDataProb
     capability: value.capability,
     ...(value.serverVersion === undefined ? {} : { serverVersion: value.serverVersion }),
     ...(value.latencyMs === undefined ? {} : { latencyMs: value.latencyMs }),
+    ...(value.tlsStatus === undefined ? {} : { tlsStatus: value.tlsStatus }),
     warnings: parseWarnings(value.warnings, errorCode),
   }
 }
@@ -655,10 +738,11 @@ export function parseServerOpsDataDiagnoseInput(value: unknown): ServerOpsDataDi
 /** 严格解析只读诊断结果。 */
 export function parseServerOpsDataDiagnosticsResult(value: unknown): ServerOpsDataDiagnosticsResult {
   const errorCode = 'SERVER_OPS_DATA_DIAGNOSTICS_RESULT_INVALID'
-  const keys = new Set(['sourceId', 'engine', 'capability', 'collectedAt', 'metrics', 'tables', 'parameters', 'parametersTruncated', 'warnings'])
+  const keys = new Set(['sourceId', 'engine', 'capability', 'collectedAt', 'tlsStatus', 'metrics', 'tables', 'parameters', 'parametersTruncated', 'warnings'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsId(value.sourceId)
     || !isServerOpsDataEngine(value.engine) || !isServerOpsDataCapability(value.capability)
     || !isTimestamp(value.collectedAt)
+    || (value.tlsStatus !== undefined && !isServerOpsDataTlsStatus(value.tlsStatus))
     || !Array.isArray(value.metrics) || value.metrics.length > 24
     || !Array.isArray(value.tables) || value.tables.length > 4
     || (value.parameters !== undefined && (!Array.isArray(value.parameters) || value.parameters.length > 1_000))
@@ -673,11 +757,13 @@ export function parseServerOpsDataDiagnosticsResult(value: unknown): ServerOpsDa
   })
   if (parameters !== undefined && new TextEncoder().encode(JSON.stringify(parameters)).byteLength > 262_144) throw new Error(errorCode)
   if (value.capability !== 'available' && (value.metrics.length > 0 || value.tables.length > 0 || (parameters?.length ?? 0) > 0)) throw new Error(errorCode)
+  if ((value.capability !== 'available' || value.engine === 'sqlite') && value.tlsStatus !== undefined) throw new Error(errorCode)
   return {
     sourceId: value.sourceId,
     engine: value.engine,
     capability: value.capability,
     collectedAt: value.collectedAt,
+    ...(value.tlsStatus === undefined ? {} : { tlsStatus: value.tlsStatus }),
     metrics: value.metrics.map((entry) => parseServerOpsDataMetric(entry, errorCode)),
     tables: value.tables.map((entry) => parseServerOpsDataTable(entry, errorCode)),
     ...(parameters === undefined ? {} : { parameters }),

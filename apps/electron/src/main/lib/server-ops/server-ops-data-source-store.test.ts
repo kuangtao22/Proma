@@ -76,6 +76,19 @@ afterEach(() => {
 })
 
 describe('服务器运维数据源 Store', () => {
+  test('Given 服务器 SQLite 文件 When 保存重载并改路径 Then 保留文件端点且不生成网络字段', () => {
+    /** 独占配置目录与真实持久化 Store。 */
+    const configDir = createConfigDir()
+    const store = new ServerOpsDataSourceStore(configDir, { uuid: () => 'sqlite-1', now: () => 1_000 })
+    /** SQLite 只绑定 SSH 主机和服务器上的文件。 */
+    const input: ServerOpsDataSourceUpsertInput = { transport: 'ssh', hostId: 'host-1', engine: 'sqlite', label: 'SQLite 业务库', filePath: '/srv/data/app.db', database: 'main', tlsMode: 'disabled' }
+    expect(store.create(input)).toMatchObject({ filePath: '/srv/data/app.db', engine: 'sqlite' })
+    const reopened = new ServerOpsDataSourceStore(configDir)
+    expect(reopened.getById('sqlite-1')).toMatchObject({ filePath: '/srv/data/app.db' })
+    expect(reopened.getById('sqlite-1')).not.toHaveProperty('address')
+    expect(reopened.getById('sqlite-1')).not.toHaveProperty('port')
+    expect(reopened.update('sqlite-1', { filePath: '/srv/data/next.db' }).filePath).toBe('/srv/data/next.db')
+  })
   test('生产依赖固定使用 safe-file 读取与安全原子 JSON 写入边界', () => {
     /** Store 的生产默认依赖。 */
     const dependencies = createServerOpsDataSourceStoreDependencies()

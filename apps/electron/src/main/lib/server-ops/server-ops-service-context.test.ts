@@ -36,9 +36,9 @@ describe('Server Ops 共享服务上下文', () => {
     const first = registerServerOpsServiceContext({ ...createContext(), access })
     const second = registerServerOpsServiceContext({ ...createContext(), access })
     await first.dispose()
-    expect(access.getReadCurrent()).toBeDefined()
+    expect(access.getReadAccess('session-1')).toBeDefined()
     const closing = second.dispose()
-    expect(access.getReadCurrent()).toBeUndefined()
+    expect(access.getReadAccess('session-1')).toBeUndefined()
     await closing
   })
 

@@ -1,4 +1,24 @@
 import type { PermissionResult } from './agent-permission-service'
+import type { AgentToolMode } from '@proma/shared'
+
+/** 受限运行唯一能注册与分派的九个既有只读工具。 */
+const SERVER_OPS_READ_TOOL_NAMES = [
+  'ops_resources', 'ops_server_overview', 'ops_server_services',
+  'ops_data_test', 'ops_data_diagnose', 'ops_database_tables',
+  'ops_database_describe', 'ops_database_rows', 'ops_database_query',
+] as const
+const SERVER_OPS_READ_TOOL_SET = new Set<string>(SERVER_OPS_READ_TOOL_NAMES)
+
+/** 返回模式限定的 Pi 工具集合；普通模式继续使用现有注册策略。 */
+export function resolveAgentModeToolNames(mode: AgentToolMode): string[] | undefined {
+  return mode === 'server-ops-read' ? [...SERVER_OPS_READ_TOOL_NAMES] : undefined
+}
+
+/** 宿主分派边界再次拒绝非只读工具，即使模型伪造调用也不能执行。 */
+export function denyToolOutsideAgentMode(toolName: string, mode: AgentToolMode): PermissionResult | undefined {
+  if (mode === 'standard' || SERVER_OPS_READ_TOOL_SET.has(toolName)) return undefined
+  return { behavior: 'deny', message: `运维只读模式不允许使用工具: ${toolName}` }
+}
 
 /** Proma 对外工具名到 Pi runtime 注册名的稳定映射。 */
 const PI_TOOL_NAME_BY_DISPLAY_NAME: Readonly<Record<string, string>> = {

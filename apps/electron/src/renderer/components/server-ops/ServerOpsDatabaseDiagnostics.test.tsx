@@ -55,6 +55,12 @@ function renderPage(options: {
 }
 
 describe('数据库诊断正文范围', () => {
+  test('Given 诊断快照携带协商状态 When 显示状态栏 Then 展示本次加密结果；旧快照保持未知', () => {
+    const encrypted = renderPage({ page: 'overview', scope: 'instance', result: createResult({ tlsStatus: 'encrypted' }) })
+    expect(encrypted).toContain('本次 TLS 加密（未校验证书）')
+    const legacy = renderPage({ page: 'overview', scope: 'instance', result: createResult() })
+    expect(legacy).not.toContain('本次 TLS 加密')
+  })
   test('Given 实例级会话未限定数据库 When 渲染正文 Then 展示全部可见会话且允许刷新', () => {
     const html = renderPage({
       page: 'sessions',

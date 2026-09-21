@@ -5,6 +5,7 @@ import type {
   ServerOpsDataProbeResult,
   ServerOpsDataQueryInput,
   ServerOpsDataQueryResult,
+  ServerOpsDataRowFilters,
   ServerOpsDataSource,
   ServerOpsDataSourceDeleteInput,
   ServerOpsDataSourceListInput,
@@ -23,9 +24,11 @@ import type {
   ServerOpsDataSourceUpsertResult,
 } from '@proma/shared'
 import {
+  isServerOpsMySqlTlsServerName,
   isServerOpsPlaintextDirectAddress,
   parseServerOpsDataDiagnoseInput,
   parseServerOpsDataQueryInput,
+  parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceTableInput,
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesInput,
@@ -35,6 +38,7 @@ import type { ServerOpsActiveConnectionIdentity } from './server-ops-connection-
 import type { ServerOpsDataSourceStore, ServerOpsStoredDataSource } from './server-ops-data-source-store'
 import type { ServerOpsDataSourceCredentialStore } from './server-ops-data-credential-store'
 import type { ServerOpsConfigTransaction } from './server-ops-config-transaction'
+import { ServerOpsReadScheduler } from './server-ops-read-scheduler'
 import type {
   ServerOpsDataSchemaCache,
   ServerOpsDataSchemaCacheScope,
@@ -51,8 +55,11 @@ import type {
 
 /** 单次数据库读取的固定超时；与设计文档的 15 秒预算一致。 */
 const SERVER_OPS_DATA_READ_TIMEOUT_MS = 15_000
-/** 全局同时进行的数据库读取上限；超出时拒绝而不是排队，避免连接堆积。 */
-const SERVER_OPS_DATA_MAX_CONCURRENT_READS = 3
+/** Agent 会话和 UI 读取共享调度器，调用者提供授权复核回调。 */
+export interface ServerOpsReadContext {
+  ownerSessionId?: string
+  check?: () => void
+}
 
 /** 数据服务依赖的主机连接能力；只读取当前活跃连接身份。 */
 interface ServerOpsDataConnectionContract {
@@ -95,8 +102,8 @@ export class ServerOpsDataService {
   private readonly uuid: () => string
   /** 数据源编辑使用的同步配置事务。 */
   private readonly transaction: ServerOpsConfigTransaction
-  /** 每个数据源最多一个在途读取。 */
-  private readonly activeReads = new Set<string>()
+  /** 同源串行、全局有界的读取队列。 */
+  private readonly scheduler = new ServerOpsReadScheduler()
   /** 仅 opt-in 缓存请求使用的同身份同范围在途读取。 */
   private readonly activeSchemaCacheReads = new Map<string, Promise<ServerOpsDataSchemaCacheValue>>()
   /** 缓存异常后本实例 fail closed；服务重建前不再恢复缓存读写。 */
@@ -120,8 +127,9 @@ export class ServerOpsDataService {
       ...(record.hostId === undefined ? {} : { hostId: record.hostId }),
       engine: record.engine,
       label: record.label,
-      address: record.address,
-      port: record.port,
+      ...(record.address === undefined ? {} : { address: record.address }),
+      ...(record.port === undefined ? {} : { port: record.port }),
+      ...(record.filePath === undefined ? {} : { filePath: record.filePath }),
       ...(record.database === undefined ? {} : { database: record.database }),
       ...(record.username === undefined ? {} : { username: record.username }),
       tlsMode: record.tlsMode,
@@ -193,10 +201,14 @@ export class ServerOpsDataService {
     }
     /** 分支收窄后的稳定数据源 ID，供事务回调复用。 */
     const sourceId = input.sourceId
-    return this.transaction(() => {
+    /** 仅真实读取目标或认证材料改变时取消旧目标的待排队请求。 */
+    let cancelQueued = false
+    const updated = this.transaction(() => {
       /** 锁内读取现有归属，必须在任何凭据副作用前拒绝迁移。 */
       const existing = this.dependencies.store.getById(sourceId)
       if (!existing) throw new Error('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
+      /** 编辑不能把既有引擎改成另一种端点，避免保留不兼容凭据与旧字段。 */
+      if (existing.engine !== input.engine) throw new Error('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
       if (input.projectId !== undefined && input.projectId !== existing.projectId) {
         throw new Error('SERVER_OPS_DATA_SOURCE_PROJECT_MISMATCH')
       }
@@ -216,14 +228,19 @@ export class ServerOpsDataService {
         label: input.label,
         address: input.address,
         port: input.port,
+        ...(input.filePath === undefined ? {} : { filePath: input.filePath }),
         database: input.database ?? null,
         username: input.username ?? null,
         tlsMode: input.tlsMode,
         tlsServerName: input.tlsServerName ?? null,
         ...(credentialRef === undefined ? {} : { credentialRef }),
       })
+      cancelQueued = input.password !== undefined || input.clearPassword === true
+        || !sameDataReadIdentity(existing, updated)
       return { source: this.toPublicSource(updated) }
     })
+    if (cancelQueued) this.scheduler.cancelQueued(sourceId)
+    return updated
   }
 
   /**
@@ -237,6 +254,7 @@ export class ServerOpsDataService {
     if (!existing) throw new Error('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
     this.dependencies.credentials.removeSecret(input.sourceId)
     this.dependencies.store.remove(input.sourceId)
+    this.scheduler.cancelQueued(input.sourceId)
     this.invalidateSchemaCache({ sourceId: input.sourceId })
   }
 
@@ -258,6 +276,16 @@ export class ServerOpsDataService {
     return { password: this.dependencies.credentials.resolveSecret(record.credentialRef) ?? null }
   }
 
+  /** 从权威配置捕获凭据引用与密文版本；不解密且不进入公开 DTO。 */
+  getReadCredentialVersion(sourceId: string): string | null {
+    this.assertUsable()
+    const record = this.requireSource(sourceId)
+    if (record.credentialRef === undefined) return null
+    const version = this.dependencies.credentials.getSecretVersion?.(record.credentialRef)
+    if (typeof version !== 'string' || version.length === 0) throw new Error('SERVER_OPS_DATA_CREDENTIAL_VERSION_UNAVAILABLE')
+    return JSON.stringify([record.credentialRef, version])
+  }
+
   /**
    * 测试数据源连通性：既支持已保存的记录，也支持弹窗里的未保存草稿。
    *
@@ -267,18 +295,19 @@ export class ServerOpsDataService {
    * @param input 已保存的数据源身份，或一份未保存草稿
    * @returns 连接测试结果
    */
-  async probeSource(input: ServerOpsDataSourceProbeInput): Promise<ServerOpsDataProbeResult> {
-    if ('draft' in input) return this.probeDraft(input.draft)
+  async probeSource(input: ServerOpsDataSourceProbeInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataProbeResult> {
+    if ('draft' in input) return this.probeDraft(input.draft, signal, context)
     /** 读取前固定数据源身份，避免读取期间被删除后回执出现不一致的引擎字段。 */
     const engine = this.requireSource(input.sourceId).engine
     /** 实际读取结果与耗时。 */
-    const { result, latencyMs } = await this.runRead('probe', input.sourceId)
+    const { result, latencyMs } = await this.runRead('probe', input.sourceId, undefined, undefined, signal, context)
     if (!isDiagnosticsReadResult(result)) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
     return {
       sourceId: input.sourceId,
       engine,
       capability: result.capability,
       ...(result.serverVersion === undefined ? {} : { serverVersion: result.serverVersion }),
+      ...(result.tlsStatus === undefined ? {} : { tlsStatus: result.tlsStatus }),
       ...(result.capability === 'available' ? { latencyMs } : {}),
       warnings: result.warnings,
     }
@@ -292,7 +321,7 @@ export class ServerOpsDataService {
    * @param draft 共享合同已校验的草稿
    * @returns 连接测试结果；不带 `sourceId`
    */
-  private async probeDraft(draft: ServerOpsDataSourceProbeDraft): Promise<ServerOpsDataProbeResult> {
+  private async probeDraft(draft: ServerOpsDataSourceProbeDraft, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataProbeResult> {
     this.assertUsable()
     /** 复用已保存密文时先在锁外解析；缺失或解密失败都按稳定错误码上报。 */
     const saved = draft.savedSourceId === undefined ? undefined : this.dependencies.store.getById(draft.savedSourceId)
@@ -309,19 +338,21 @@ export class ServerOpsDataService {
       transport: draft.transport,
       ...(draft.hostId === undefined ? {} : { hostId: draft.hostId }),
       engine: draft.engine,
-      address: draft.address,
-      port: draft.port,
+      ...(draft.address === undefined ? {} : { address: draft.address }),
+      ...(draft.port === undefined ? {} : { port: draft.port }),
+      ...(draft.filePath === undefined ? {} : { filePath: draft.filePath }),
       ...(draft.database === undefined ? {} : { database: draft.database }),
       ...(draft.username === undefined ? {} : { username: draft.username }),
       tlsMode: draft.tlsMode,
       ...(draft.tlsServerName === undefined ? {} : { tlsServerName: draft.tlsServerName }),
-    }, password, readKey)
+    }, password, readKey, undefined, undefined, undefined, undefined, signal, undefined, context)
     /** 草稿测试与已保存记录一样只接受诊断类回执。 */
     if (!isDiagnosticsReadResult(result)) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
     return {
       engine: draft.engine,
       capability: result.capability,
       ...(result.serverVersion === undefined ? {} : { serverVersion: result.serverVersion }),
+      ...(result.tlsStatus === undefined ? {} : { tlsStatus: result.tlsStatus }),
       ...(result.capability === 'available' ? { latencyMs } : {}),
       warnings: result.warnings,
     }
@@ -333,20 +364,21 @@ export class ServerOpsDataService {
    * @param input 主机与数据源身份
    * @returns 结构化只读诊断结果
    */
-  async diagnoseSource(input: ServerOpsDataDiagnoseInput): Promise<ServerOpsDataDiagnosticsResult> {
+  async diagnoseSource(input: ServerOpsDataDiagnoseInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataDiagnosticsResult> {
     /** 服务边界同样严格解析，避免内部调用绕过 IPC 合同。 */
     const parsedInput = parseServerOpsDataDiagnoseInput(input)
     /** 读取前固定数据源身份，避免读取期间被删除后回执出现不一致的引擎字段。 */
     const engine = this.requireSource(parsedInput.sourceId).engine
     if (parsedInput.database !== undefined && engine !== 'mysql') throw new Error('SERVER_OPS_DATA_DIAGNOSE_INPUT_INVALID')
     /** 实际读取结果与耗时；诊断不对外暴露时延指标。 */
-    const { result } = await this.runRead('diagnostics', parsedInput.sourceId, parsedInput.section, parsedInput.database)
+    const { result } = await this.runRead('diagnostics', parsedInput.sourceId, parsedInput.section, parsedInput.database, signal, context)
     if (!isDiagnosticsReadResult(result)) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
     return {
       sourceId: parsedInput.sourceId,
       engine,
       capability: result.capability,
       collectedAt: this.now(),
+      ...(result.tlsStatus === undefined ? {} : { tlsStatus: result.tlsStatus }),
       metrics: result.metrics,
       tables: result.tables,
       ...(result.parameters === undefined ? {} : { parameters: result.parameters }),
@@ -364,8 +396,9 @@ export class ServerOpsDataService {
    * @param input 数据源与目标库
    * @returns 库清单与目标库的表清单
    */
-  async listSchemaTables(input: ServerOpsDataSourceTablesInput): Promise<ServerOpsDataSourceTablesResult> {
+  async listSchemaTables(input: ServerOpsDataSourceTablesInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataSourceTablesResult> {
     this.assertUsable()
+    this.checkReadCaller(signal, context)
     const parsedInput = parseServerOpsDataSourceTablesInput(input)
     /** 数据源记录；同时用于推导默认库与连接方式。 */
     const record = this.requireSource(parsedInput.sourceId)
@@ -373,10 +406,10 @@ export class ServerOpsDataService {
     const database = parsedInput.database ?? record.database
     const cache = this.dependencies.schemaCache
     if (parsedInput.cacheMode === undefined || cache === undefined) {
-      return this.readSchemaTablesLive(record, parsedInput.database, database)
+      return this.readSchemaTablesLive(record, parsedInput.database, database, undefined, signal, context)
     }
-    const context = this.createSchemaCacheContext(record)
-    if (context === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database)
+    const cacheContext = this.createSchemaCacheContext(record)
+    if (cacheContext === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database, undefined, signal, context)
     /** 目录范围按实际请求库隔离；未选库时只缓存可见库目录。 */
     const scope: ServerOpsDataSchemaCacheScope = {
       kind: 'tables', sourceId: record.id, ...(database === undefined ? {} : { database }),
@@ -384,18 +417,20 @@ export class ServerOpsDataService {
     if (parsedInput.cacheMode === 'refresh') {
       this.invalidateSchemaCache({ sourceId: record.id, ...(parsedInput.database === undefined ? {} : { database: parsedInput.database }) })
     }
-    const lookup = this.readSchemaCache(scope, context.identity)
-    if (lookup === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database, context.connection)
+    const lookup = this.readSchemaCache(scope, cacheContext.identity)
+    if (lookup === undefined) return this.readSchemaTablesLive(record, parsedInput.database, database, cacheContext.connection, signal, context)
     if (parsedInput.cacheMode === 'prefer-cache' && lookup.value !== undefined) {
-      this.assertSchemaCacheContextCurrent(context)
+      this.checkReadCaller(signal, context)
+      this.assertSchemaCacheContextCurrent(cacheContext)
       return parseServerOpsDataSourceTablesResult(lookup.value)
     }
-    return this.coalesceSchemaCacheRead(scope, context.identity, lookup.revision, async () => {
-      const result = await this.readSchemaTablesLive(record, parsedInput.database, database, context.connection)
-      this.assertSchemaCacheContextCurrent(context)
-      this.writeSchemaCache(scope, context.identity, result, lookup.revision)
+    const pending = this.coalesceSchemaCacheRead(scope, cacheContext.identity, lookup.revision, async () => {
+      const result = await this.readSchemaTablesLive(record, parsedInput.database, database, cacheContext.connection)
+      this.assertSchemaCacheContextCurrent(cacheContext)
+      this.writeSchemaCache(scope, cacheContext.identity, result, lookup.revision)
       return result
     })
+    return this.waitForSharedRead(pending, signal, context, () => this.assertSchemaCacheContextCurrent(cacheContext))
   }
 
   /** 执行一次实时目录读取并投影公开结果。 */
@@ -404,12 +439,14 @@ export class ServerOpsDataService {
     explicitDatabase: string | undefined,
     database: string | undefined,
     expectedConnection?: ServerOpsActiveConnectionIdentity | null,
+    signal?: AbortSignal,
+    context?: ServerOpsReadContext,
   ): Promise<ServerOpsDataSourceTablesResult> {
     /** 已保存密码只在本次请求内解密。 */
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
     const { result } = await this.runReadTarget(
-      'schema-tables', record, password, `${record.id}:schema-tables`, { database }, undefined, undefined, undefined, undefined,
-      expectedConnection ?? undefined,
+      'schema-tables', record, password, `${record.id}:schema-tables`, { database }, undefined, undefined, undefined,
+      signal, expectedConnection ?? undefined, context,
     )
     if (!isSchemaTablesResult(result) || result.capability !== 'available') {
       throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: ${readSchemaWarning(result)}`)
@@ -435,32 +472,35 @@ export class ServerOpsDataService {
    * @param input 数据源、库与表
    * @returns 列与索引定义
    */
-  async describeSchemaTable(input: ServerOpsDataSourceTableInput): Promise<ServerOpsDataSourceTableResult> {
+  async describeSchemaTable(input: ServerOpsDataSourceTableInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataSourceTableResult> {
     this.assertUsable()
+    this.checkReadCaller(signal, context)
     const parsedInput = parseServerOpsDataSourceTableInput(input)
     const record = this.requireSource(parsedInput.sourceId)
     const cache = this.dependencies.schemaCache
-    if (parsedInput.cacheMode === undefined || cache === undefined) return this.readSchemaTableLive(record, parsedInput)
-    const context = this.createSchemaCacheContext(record)
-    if (context === undefined) return this.readSchemaTableLive(record, parsedInput)
+    if (parsedInput.cacheMode === undefined || cache === undefined) return this.readSchemaTableLive(record, parsedInput, undefined, signal, context)
+    const cacheContext = this.createSchemaCacheContext(record)
+    if (cacheContext === undefined) return this.readSchemaTableLive(record, parsedInput, undefined, signal, context)
     const scope: ServerOpsDataSchemaCacheScope = {
       kind: 'table', sourceId: record.id, database: parsedInput.database, table: parsedInput.table,
     }
     if (parsedInput.cacheMode === 'refresh') {
       this.invalidateSchemaCache({ sourceId: record.id, database: parsedInput.database, table: parsedInput.table })
     }
-    const lookup = this.readSchemaCache(scope, context.identity)
-    if (lookup === undefined) return this.readSchemaTableLive(record, parsedInput, context.connection)
+    const lookup = this.readSchemaCache(scope, cacheContext.identity)
+    if (lookup === undefined) return this.readSchemaTableLive(record, parsedInput, cacheContext.connection, signal, context)
     if (parsedInput.cacheMode === 'prefer-cache' && lookup.value !== undefined) {
-      this.assertSchemaCacheContextCurrent(context)
+      this.checkReadCaller(signal, context)
+      this.assertSchemaCacheContextCurrent(cacheContext)
       return parseServerOpsDataSourceTableResult(lookup.value)
     }
-    return this.coalesceSchemaCacheRead(scope, context.identity, lookup.revision, async () => {
-      const result = await this.readSchemaTableLive(record, parsedInput, context.connection)
-      this.assertSchemaCacheContextCurrent(context)
-      this.writeSchemaCache(scope, context.identity, result, lookup.revision)
+    const pending = this.coalesceSchemaCacheRead(scope, cacheContext.identity, lookup.revision, async () => {
+      const result = await this.readSchemaTableLive(record, parsedInput, cacheContext.connection)
+      this.assertSchemaCacheContextCurrent(cacheContext)
+      this.writeSchemaCache(scope, cacheContext.identity, result, lookup.revision)
       return result
     })
+    return this.waitForSharedRead(pending, signal, context, () => this.assertSchemaCacheContextCurrent(cacheContext))
   }
 
   /** 执行一次实时单表结构读取。 */
@@ -468,11 +508,13 @@ export class ServerOpsDataService {
     record: ServerOpsStoredDataSource,
     input: Pick<ServerOpsDataSourceTableInput, 'database' | 'table'>,
     expectedConnection?: ServerOpsActiveConnectionIdentity | null,
+    signal?: AbortSignal,
+    context?: ServerOpsReadContext,
   ): Promise<ServerOpsDataSourceTableResult> {
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
     const { result } = await this.runReadTarget(
       'schema-table', record, password, `${record.id}:schema-table`, { database: input.database, table: input.table },
-      undefined, undefined, undefined, undefined, expectedConnection ?? undefined,
+      undefined, undefined, undefined, signal, expectedConnection ?? undefined, context,
     )
     if (!isSchemaTableResult(result) || result.capability !== 'available') {
       throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: ${readSchemaWarning(result)}`)
@@ -486,8 +528,11 @@ export class ServerOpsDataService {
    * @param input 数据源、库、表与分页参数
    * @returns 列名与行数据
    */
-  async readSchemaRows(input: ServerOpsDataSourceRowsInput): Promise<ServerOpsDataSourceRowsResult> {
+  async readSchemaRows(input: ServerOpsDataSourceRowsInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataSourceRowsResult> {
     this.assertUsable()
+    this.checkReadCaller(signal, context)
+    /** 内部调用也验证并复制分页与筛选参数，不能只依赖 renderer 的 IPC 门禁。 */
+    input = parseServerOpsDataSourceRowsInput(input)
     const record = this.requireSource(input.sourceId)
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
     const { result } = await this.runReadTarget('schema-rows', record, password, `${record.id}:schema-rows`, {
@@ -495,7 +540,8 @@ export class ServerOpsDataService {
       table: input.table,
       offset: input.offset,
       limit: input.limit,
-    })
+      ...(input.filters === undefined ? {} : { filters: input.filters }),
+    }, undefined, undefined, undefined, signal, undefined, context)
     if (!isSchemaRowsResult(result) || result.capability !== 'available') {
       throw new Error(`SERVER_OPS_DATA_SCHEMA_UNAVAILABLE: ${readSchemaWarning(result)}`)
     }
@@ -509,7 +555,7 @@ export class ServerOpsDataService {
       truncated: result.truncated,
       ...(result.hasMore === undefined ? {} : { hasMore: result.hasMore }),
       ...(result.orderedByPrimaryKey === undefined ? {} : { orderedByPrimaryKey: result.orderedByPrimaryKey }),
-      ...(result.totalEstimate === undefined ? {} : { totalEstimate: result.totalEstimate }),
+      ...(input.filters !== undefined || result.totalEstimate === undefined ? {} : { totalEstimate: result.totalEstimate }),
     }
   }
 
@@ -520,12 +566,13 @@ export class ServerOpsDataService {
    * @param signal 页面关闭、Agent 撤权或用户取消时的真实取消信号
    * @returns 已由 utility 完成来源校验、遮罩与预算裁剪的查询结果
    */
-  async querySource(input: ServerOpsDataQueryInput, signal?: AbortSignal): Promise<ServerOpsDataQueryResult> {
+  async querySource(input: ServerOpsDataQueryInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataQueryResult> {
     this.assertUsable()
+    this.checkReadCaller(signal, context)
     const parsedInput = parseServerOpsDataQueryInput(input)
     /** 查询前固定真实连接配置；label、projectId 与 updatedAt 不属于安全身份。 */
     const expectedSource = this.requireSource(parsedInput.sourceId)
-    if (expectedSource.engine !== 'mysql') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+    if (expectedSource.engine !== 'mysql' && expectedSource.engine !== 'sqlite') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
     const expectedConnection = expectedSource.transport === 'ssh'
       ? this.dependencies.connection.getActiveIdentity(expectedSource.hostId ?? '')
       : undefined
@@ -535,7 +582,7 @@ export class ServerOpsDataService {
     const { result } = await this.runReadTarget(
       'sql-query', expectedSource, password, `${expectedSource.id}:sql-query`, undefined, undefined, undefined,
       { database: parsedInput.database, queryId: parsedInput.queryId, sql: parsedInput.sql, maxRows: parsedInput.maxRows },
-      signal, expectedConnection,
+      signal, expectedConnection, context,
     )
     /** 配置变化后旧回执不得回流到新目标；改名与项目移动不影响身份。 */
     const currentSource = this.requireSource(parsedInput.sourceId)
@@ -563,8 +610,8 @@ export class ServerOpsDataService {
 
   /** 主机删除或退出清理时丢弃该主机全部在途读取归属。 */
   forgetHost(hostId: string): void {
-    for (const key of this.activeReads) {
-      if (key.startsWith(`${hostId}\u0000`)) this.activeReads.delete(key)
+    for (const source of this.dependencies.store.list()) {
+      if (source.hostId === hostId) this.scheduler.cancelQueued(source.id)
     }
   }
 
@@ -582,7 +629,7 @@ export class ServerOpsDataService {
   /** 进入终态并清空在途读取标记。 */
   dispose(): void {
     this.disposed = true
-    this.activeReads.clear()
+    this.scheduler.dispose()
     this.activeSchemaCacheReads.clear()
   }
 
@@ -606,8 +653,9 @@ export class ServerOpsDataService {
         transport: record.transport,
         hostId: record.hostId ?? null,
         engine: record.engine,
-        address: record.address,
-        port: record.port,
+        ...(record.address === undefined ? {} : { address: record.address }),
+        ...(record.port === undefined ? {} : { port: record.port }),
+        ...(record.filePath === undefined ? {} : { filePath: record.filePath }),
         database: record.database ?? null,
         username: record.username ?? null,
         tlsMode: record.tlsMode,
@@ -703,6 +751,40 @@ export class ServerOpsDataService {
     return pending
   }
 
+  /** 缓存共享读取仅共享底层工作，各调用者的取消与授权检查保持独立。 */
+  private async waitForSharedRead<T>(
+    pending: Promise<T>, signal?: AbortSignal, context?: ServerOpsReadContext, validate?: () => void,
+  ): Promise<T> {
+    this.checkReadCaller(signal, context)
+    if (signal === undefined) {
+      const value = await pending
+      this.checkReadCaller(signal, context)
+      validate?.()
+      return value
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        signal.removeEventListener('abort', onAbort)
+        try { this.checkReadCaller(signal, context) } catch (error) { reject(error) }
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) { onAbort(); return }
+      void pending.then((value) => {
+        signal.removeEventListener('abort', onAbort)
+        try { this.checkReadCaller(signal, context); validate?.(); resolve(value) } catch (error) { reject(error) }
+      }, (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        try { this.checkReadCaller(signal, context); reject(error) } catch (checkError) { reject(checkError) }
+      })
+    })
+  }
+
+  /** 调用者授权比底层取消优先，防止撤权被笼统取消错误覆盖。 */
+  private checkReadCaller(signal?: AbortSignal, context?: ServerOpsReadContext): void {
+    context?.check?.()
+    if (signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+  }
+
   /** 读取数据源内部记录，缺失时抛出稳定错误码。 */
   private requireSource(sourceId: string): ServerOpsStoredDataSource {
     const record = this.dependencies.store.getById(sourceId)
@@ -728,17 +810,16 @@ export class ServerOpsDataService {
     sourceId: string,
     diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection,
     diagnosticDatabase?: string,
+    signal?: AbortSignal,
+    context?: ServerOpsReadContext,
   ): Promise<{ result: ServerOpsRuntimeDataReadResult; latencyMs: number }> {
     this.assertUsable()
     /** 数据源身份必须在读取前存在。 */
     const record = this.requireSource(sourceId)
     /** 已保存密码只在本次请求内解密。 */
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
-    /** JSON 元组避免合法库名中的分隔符造成单飞键碰撞。 */
-    const readKey = diagnosticSection === undefined
-      ? sourceId
-      : JSON.stringify([sourceId, 'diagnostics', diagnosticSection, diagnosticDatabase ?? null])
-    return this.runReadTarget(mode, record, password, readKey, undefined, diagnosticSection, diagnosticDatabase)
+    return this.runReadTarget(mode, record, password, sourceId, undefined, diagnosticSection, diagnosticDatabase,
+      undefined, signal, undefined, context)
   }
 
   /**
@@ -759,34 +840,56 @@ export class ServerOpsDataService {
     password: string | undefined,
     readKey: string,
     /** 表浏览参数；诊断模式下必须为空，由 runtime 协议再校验一次。 */
-    schema?: { database?: string; table?: string; offset?: number; limit?: number },
+    schema?: { database?: string; table?: string; offset?: number; limit?: number; filters?: ServerOpsDataRowFilters },
     diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection,
     diagnosticDatabase?: string,
     query?: { database: string; queryId: string; sql: string; maxRows: number },
     signal?: AbortSignal,
     expectedConnection?: ServerOpsActiveConnectionIdentity,
+    context?: ServerOpsReadContext,
   ): Promise<{ result: ServerOpsRuntimeDataReadResult; latencyMs: number }> {
     this.assertUsable()
-    /** 同一数据源的在途读取标记。 */
-    if (this.activeReads.has(readKey)) throw new Error('SERVER_OPS_DATA_SOURCE_BUSY')
-    if (this.activeReads.size >= SERVER_OPS_DATA_MAX_CONCURRENT_READS) throw new Error('SERVER_OPS_DATA_BUSY')
+    this.checkReadCaller(signal, context)
     /** 只有经由 SSH 的数据源才要求活跃连接；直连不依赖任何主机。 */
     const identity = target.transport === 'ssh'
       ? expectedConnection ?? this.dependencies.connection.getActiveIdentity(target.hostId ?? '')
       : null
     this.assertDirectTransportIsSafe(target)
-    this.activeReads.add(readKey)
-    /** 主进程侧往返耗时起点。 */
-    const startedAt = this.now()
-    try {
+    /** SQLite 的文件连接只开放主库，不允许调用者切入附加库。 */
+    if (target.engine === 'sqlite' && ((query?.database !== undefined && query.database !== 'main')
+      || (schema?.database !== undefined && schema.database !== 'main'))) throw new Error('SERVER_OPS_DATA_QUERY_INPUT_INVALID')
+    /** 保存的来源目标在排队期间也须与文件及当前密文一致；草稿没有持久目标。 */
+    const source = 'id' in target ? target as ServerOpsStoredDataSource : undefined
+    const validate = (): void => {
+      this.assertUsable()
+      if (source !== undefined) {
+        const current = this.requireSource(source.id)
+        if (!sameDataReadIdentity(source, current)) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+        const currentPassword = current.credentialRef === undefined
+          ? undefined : this.dependencies.credentials.resolveSecret(current.credentialRef)
+        if (currentPassword !== password) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+      }
+      if (identity !== null) {
+        let current: ServerOpsActiveConnectionIdentity
+        try { current = this.dependencies.connection.getActiveIdentity(identity.hostId) }
+        catch { throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED') }
+        if (current.connectionId !== identity.connectionId || current.generation !== identity.generation) {
+          throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+        }
+      }
+    }
+    return this.scheduler.run(source?.id ?? readKey, async () => {
+      /** 主进程侧往返耗时只统计实际执行，不包含排队等待。 */
+      const startedAt = this.now()
       const result = await this.dependencies.runtime.dataRead({
         hostId: identity?.hostId ?? SERVER_OPS_DATA_DIRECT_HOST_ID,
         connectionId: identity?.connectionId ?? this.uuid(),
         transport: target.transport,
         mode,
         engine: target.engine,
-        address: target.address,
-        port: target.port,
+        ...(target.address === undefined ? {} : { address: target.address }),
+        ...(target.port === undefined ? {} : { port: target.port }),
+        ...(target.filePath === undefined ? {} : { filePath: target.filePath }),
         ...((query?.database ?? target.database) === undefined ? {} : { database: query?.database ?? target.database }),
         ...(target.username === undefined ? {} : { username: target.username }),
         ...(password === undefined ? {} : { password }),
@@ -800,25 +903,30 @@ export class ServerOpsDataService {
           ...(schema.table === undefined ? {} : { schemaTable: schema.table }),
           ...(schema.offset === undefined ? {} : { rowOffset: schema.offset }),
           ...(schema.limit === undefined ? {} : { rowLimit: schema.limit }),
+          ...(schema.filters === undefined ? {} : { rowFilters: schema.filters }),
         }),
         ...(query === undefined ? {} : { queryId: query.queryId, sql: query.sql, maxRows: query.maxRows }),
       }, signal)
       return { result, latencyMs: Math.max(0, this.now() - startedAt) }
-    } finally {
-      this.activeReads.delete(readKey)
-    }
+    }, { signal, ownerSessionId: context?.ownerSessionId, check: context?.check, validate })
   }
 
   /**
-   * 直连只允许对回环与私有网段关闭 TLS。
+   * 直连仅允许对回环与私有网段显式关闭 TLS。
    *
    * 经由 SSH 时链路本身已加密，关掉数据库 TLS 尚可接受；从本机直连公网数据库时
-   * 明文链路等于把密码和数据暴露在网络上，因此保留强制 TLS。判据与界面标注共用
+   * 明文链路等于把密码和数据暴露在网络上，因此保留旧配置的强制 TLS 边界。显式
+   * preferred 可能在服务端明确不支持 TLS 时回退，结果页必须展示实际连接状态。判据与界面标注共用
    * `isServerOpsPlaintextDirectAddress()`，避免"界面说可以、主进程说不行"。
    */
   private assertDirectTransportIsSafe(target: ServerOpsDataReadTarget): void {
-    if (target.transport !== 'direct' || target.tlsMode === 'verify') return
-    if (isServerOpsPlaintextDirectAddress(target.address)) return
+    /** 历史 IP 校验配置仍可列出，但在发送凭据与开通道前明确要求用户改为 DNS 名称。 */
+    if (target.engine === 'mysql' && target.tlsMode === 'verify'
+      && !isServerOpsMySqlTlsServerName(target.tlsServerName)) {
+      throw new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
+    }
+    if (target.transport !== 'direct' || target.tlsMode !== 'disabled') return
+    if (isServerOpsPlaintextDirectAddress(target.address ?? '')) return
     throw new Error('SERVER_OPS_DATA_TLS_REQUIRED')
   }
 }
@@ -834,7 +942,7 @@ interface ServerOpsDataSchemaCacheContext {
 /** 一次只读读取所需的连接目标字段；已保存记录与未保存草稿都满足它。 */
 type ServerOpsDataReadTarget = Pick<
   ServerOpsStoredDataSource,
-  'transport' | 'hostId' | 'engine' | 'address' | 'port' | 'database' | 'username' | 'tlsMode' | 'tlsServerName'
+  'transport' | 'hostId' | 'engine' | 'address' | 'port' | 'filePath' | 'database' | 'username' | 'tlsMode' | 'tlsServerName'
 >
 
 /**
@@ -864,6 +972,7 @@ function sameDataReadIdentity(left: ServerOpsStoredDataSource, right: ServerOpsS
     && left.engine === right.engine
     && left.address === right.address
     && left.port === right.port
+    && left.filePath === right.filePath
     && left.database === right.database
     && left.username === right.username
     && left.tlsMode === right.tlsMode

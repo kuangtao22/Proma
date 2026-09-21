@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { Buffer } from 'node:buffer'
+import { PassThrough } from 'node:stream'
 import { connect as connectTcp, type AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import { createServer as createMySqlServer } from 'mysql2'
 import { createConnection as createMysqlClient } from 'mysql2/promise'
 import { parseServerOpsDataSourceRowsResult } from '@proma/shared'
+import type { ServerOpsDataRuntimeNonQueryInput } from './server-ops-data-runtime'
 import {
   buildMySqlDatabaseTable,
   buildMySqlMetrics,
@@ -23,19 +25,106 @@ import {
   runServerOpsDataRead,
 } from './server-ops-data-runtime'
 
+for (const engine of ['mysql', 'redis'] as const) {
+  test(`Given ${engine} 通道回调尚未返回 When 撤销读取 Then 不等待回调且释放随后返回的通道`, async () => {
+    /** 模拟尚未返回的 SSH 转发调用，验证撤销不依赖网络回调。 */
+    const controller = new AbortController()
+    /** 撤销之后才交付的通道。 */
+    const channel = new PassThrough()
+    /** 测试主动控制通道工厂何时返回。 */
+    let deliverChannel!: (value: Duplex) => void
+    /** 尚未完成的通道请求，随后交付时必须自行回收。 */
+    const opening = new Promise<Duplex>((resolve) => { deliverChannel = resolve })
+    /** 保留结果 Promise，以验证撤销先于通道返回完成。 */
+    const reading = runServerOpsDataRead({
+      mode: 'probe', engine, address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    }, () => opening, controller.signal)
+    controller.abort()
+    await expect(reading).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
+    deliverChannel(channel)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(channel.destroyed).toBe(true)
+  })
+
+  test(`Given ${engine} 请求已取消 When 开始连接 Then 不创建网络通道`, async () => {
+    /** 预先撤销的读取不应消耗连接资源。 */
+    const controller = new AbortController()
+    controller.abort()
+    /** 记录通道创建次数，防止取消后继续认证。 */
+    let opened = 0
+    await expect(runServerOpsDataRead({
+      mode: 'probe', engine, address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    }, async () => {
+      opened += 1
+      throw new Error('CHANNEL_MUST_NOT_OPEN')
+    }, controller.signal)).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
+    expect(opened).toBe(0)
+  })
+
+  test(`Given ${engine} 正在等待通道 When 请求取消后通道迟到 Then 立即释放并终止读取`, async () => {
+    /** 用可控的异步边界复现 SSH 转发回调晚于撤销的情况。 */
+    const controller = new AbortController()
+    /** 本次独占通道，在取消后返回时也必须被销毁。 */
+    const channel = new PassThrough()
+    /** 取消发生在创建通道的异步阶段，早于驱动发送认证。 */
+    const reading = runServerOpsDataRead({
+      mode: 'probe', engine, address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    }, async () => {
+      controller.abort()
+      return channel
+    }, controller.signal)
+    try {
+      await expect(reading).rejects.toThrow('SERVER_OPS_DATA_CANCELLED')
+      expect(channel.destroyed).toBe(true)
+    } finally {
+      channel.destroy()
+    }
+  })
+}
+
+test('Given SQLite 被误传入网络驱动 When 读取 Then 拒绝且不创建 Redis 通道', async () => {
+  /** 模拟绕过 TypeScript 的非法内部调用，验证网络驱动仍会守住引擎边界。 */
+  const input = { engine: 'sqlite', mode: 'probe', address: '127.0.0.1', port: 6379, tlsMode: 'disabled' } as unknown as ServerOpsDataRuntimeNonQueryInput
+  let opened = false
+  await expect(runServerOpsDataRead(input, async () => {
+    opened = true
+    throw new Error('TEST_CHANNEL_MUST_NOT_OPEN')
+  })).rejects.toThrow('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+  expect(opened).toBe(false)
+})
+
 /** 构造可按 SQL 返回 mysql2 `[rows, fields]` 的内存连接。 */
 function createMySqlConnection(resolve: (sql: string, values: unknown[]) => unknown) {
   /** 记录实际执行的 SQL，验证诊断分区没有多发查询。 */
   const queries: Array<{ sql: string; values: unknown[] }> = []
+  /** 单独记录服务端 prepared 调用，避免只检查 SQL 文本却漏掉 query 客户端插值。 */
+  const executions: Array<{ sql: string; values: unknown[] }> = []
   return {
     queries,
+    executions,
     connection: {
       query: async (sql: string, values: unknown[] = []) => {
         queries.push({ sql, values })
         return resolve(sql, values)
       },
+      execute: async (sql: string, values: unknown[] = []) => {
+        executions.push({ sql, values })
+        return resolve(sql, values)
+      },
     },
   }
+}
+
+/** 行预览夹具模拟 TABLES LEFT JOIN COLUMNS 的真实字段、类型和估算回执。 */
+function createPreviewColumns(table: string, names: string[], rowsEstimate: number | null = null, types: Record<string, string> = {}, primary: string[] = []): Record<string, unknown>[] {
+  return names.map((name) => ({ table_name: table, name, data_type: types[name] ?? 'varchar', extra: '', rows_estimate: rowsEstimate,
+    primary_seq: primary.includes(name) ? primary.indexOf(name) + 1 : null }))
+}
+
+/** 行 SQL 只识别已转义的目标表，不把 information_schema 元数据查询算作数据读取。 */
+function isPreviewRowsSql(sql: string): boolean {
+  return sql.startsWith('SELECT ') && sql.includes(' FROM `')
 }
 
 /** mysql2 实验性服务端连接在握手级回归中使用的窄接口。 */
@@ -700,19 +789,19 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 空表与混合单元格 When 读取分页 Then fields 保留列头并精确区分值类型', async () => {
     const fixture = createMySqlConnection((sql, values) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'odd`table' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [[{ name: 'PRIMARY', non_unique: 0, seq: 1, column_name: 'id`part' }], []]
-      if (sql.startsWith('SELECT * FROM')) {
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('odd`table', ['id`part', 'empty', 'nullable', 'payload', 'note'], null, { 'id`part': 'int', payload: 'blob' }, ['id`part']), []]
+      if (isPreviewRowsSql(sql)) {
+        expect(sql).toContain('OCTET_LENGTH(`payload`) AS `payload`')
+        expect(sql).toContain('LEFT(`note`, 257) AS `note`')
         expect(sql).toContain('`db``name`.`odd``table` ORDER BY `id``part`')
-        expect(values).toEqual([3, 0])
+        expect(sql).toContain('LIMIT 3 OFFSET 0')
+        expect(values).toEqual([])
         return [[
-          { id: 1, empty: '', nullable: null, payload: Buffer.from([1, 2]), note: 'x'.repeat(300) },
-          { id: 2, empty: '', nullable: null, payload: Buffer.alloc(0), note: 'ok' },
-          { id: 3, empty: '', nullable: null, payload: Buffer.from([3]), note: 'more' },
-        ], [{ name: 'id' }, { name: 'empty' }, { name: 'nullable' }, { name: 'payload' }, { name: 'note' }]]
+          { 'id`part': 1, empty: '', nullable: null, payload: 2, note: 'x'.repeat(257) },
+          { 'id`part': 2, empty: '', nullable: null, payload: 0, note: 'ok' },
+          { 'id`part': 3, empty: '', nullable: null, payload: 1, note: 'more' },
+        ], [{ name: 'id`part' }, { name: 'empty' }, { name: 'nullable' }, { name: 'payload' }, { name: 'note' }]]
       }
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: null }], []]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {
@@ -720,7 +809,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
       engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
     })
     expect(result).toMatchObject({
-      columns: ['id', 'empty', 'nullable', 'payload', 'note'],
+      columns: ['id`part', 'empty', 'nullable', 'payload', 'note'],
       rows: [[
         '1', '', null, { kind: 'binary', bytes: 2 }, { kind: 'text', text: 'x'.repeat(256), truncated: true },
       ], ['2', '', null, { kind: 'binary', bytes: 0 }, 'ok']],
@@ -731,13 +820,68 @@ describe('数据服务 runtime 解析与指标构造', () => {
     expect('totalEstimate' in result).toBe(false)
   })
 
+  test('Given 多条件与字面通配符 When MySQL 预览 Then 实时列白名单、参数绑定且不查询全表估算', async () => {
+    const fixture = createMySqlConnection((sql, values) => {
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('orders', ['id', 'label', 'price'], 120, { id: 'int', price: 'decimal' }, ['id']), []]
+      if (isPreviewRowsSql(sql)) {
+        expect(sql).toContain("WHERE (`label` LIKE ? ESCAPE '!' AND `price` >= ?) ORDER BY `id` LIMIT 2 OFFSET 1")
+        expect(values).toEqual(["%a!%!_!!' OR 1=1%", '20'])
+        return [[{ id: 2, label: "a%_!' OR 1=1", price: 20 }, { id: 3, label: 'next', price: 40 }],
+          [{ name: 'id' }, { name: 'label' }, { name: 'price' }]]
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`)
+    })
+    const result = await readMySqlWithConnection(fixture.connection, {
+      mode: 'schema-rows', schemaDatabase: 'app', schemaTable: 'orders', rowOffset: 1, rowLimit: 1,
+      rowFilters: { match: 'all', conditions: [
+        { column: 'label', operator: 'contains', value: "a%_!' OR 1=1" },
+        { column: 'price', operator: 'gte', value: '20' },
+      ] },
+      engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    })
+    expect(result).toMatchObject({ rows: [['2', "a%_!' OR 1=1", '20']], hasMore: true, orderedByPrimaryKey: true })
+    expect('totalEstimate' in result).toBe(false)
+    expect(fixture.queries).toEqual([])
+    expect(fixture.executions).toEqual([
+      expect.objectContaining({ sql: expect.stringContaining('information_schema.TABLES AS t'), values: ['app', 'orders'] }),
+      expect.objectContaining({ sql: expect.stringContaining(' FROM `app`.`orders`'), values: ["%a!%!_!!' OR 1=1%", '20'] }),
+    ])
+  })
+
+  test('Given 字段不在真实表或属于敏感列 When MySQL 筛选 Then 查询前拒绝', async () => {
+    const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('users', ['id', 'authorization']), []]
+      throw new Error(`UNEXPECTED_QUERY:${sql}`)
+    })
+    for (const column of ['unknown', 'authorization']) {
+      await expect(readMySqlWithConnection(fixture.connection, {
+        mode: 'schema-rows', schemaDatabase: 'app', schemaTable: 'users', rowOffset: 0, rowLimit: 10,
+        rowFilters: { match: 'all', conditions: [{ column, operator: 'eq', value: 'secret' }] },
+        engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+      })).rejects.toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
+    }
+    expect(fixture.queries).toEqual([])
+    expect(fixture.executions.some((item) => isPreviewRowsSql(item.sql))).toBe(false)
+  })
+
+  test('Given MySQL 驱动缺少 execute When 请求筛选 Then 不退回 query 的客户端插值', async () => {
+    /** mock 只实现 query，记录筛选请求绝不以用户值访问它。 */
+    const queries: Array<{ sql: string; values: unknown[] }> = []
+    await expect(readMySqlWithConnection({ query: async (sql, values = []) => {
+      queries.push({ sql, values })
+      return [[{ version: '8.0.36' }], []]
+    } }, {
+      mode: 'schema-rows', schemaDatabase: "app' OR 1=1", schemaTable: 'users', rowOffset: 0, rowLimit: 10,
+      rowFilters: { match: 'all', conditions: [{ column: 'name', operator: 'eq', value: "' OR 1=1 --" }] },
+      engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    })).rejects.toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
+    expect(queries).toEqual([])
+  })
+
   test('Given 空表 When 读取分页 Then mysql2 fields 仍返回列头', async () => {
     const fixture = createMySqlConnection((sql) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'empty_table' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [[], []]
-      if (sql.startsWith('SELECT * FROM')) return [[], [{ name: 'id' }, { name: 'note' }]]
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: 0 }], []]
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('empty_table', ['id', 'note'], 0), []]
+      if (isPreviewRowsSql(sql)) return [[], [{ name: 'id' }, { name: 'note' }]]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {
@@ -749,18 +893,13 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 九列复合主键 When 读取分页 Then 使用完整主键排序并声明稳定顺序', async () => {
     /** 九列用于覆盖旧实现只取前八列的非唯一排序缺口。 */
-    const primaryRows = Array.from({ length: 9 }, (_, index) => ({
-      name: 'PRIMARY', non_unique: 0, seq: index + 1, column_name: `key_${index + 1}`,
-    }))
+    const primary = Array.from({ length: 9 }, (_, index) => `key_${index + 1}`)
     const fixture = createMySqlConnection((sql) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'compound' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [primaryRows, []]
-      if (sql.startsWith('SELECT * FROM')) {
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('compound', primary, 1, {}, primary), []]
+      if (isPreviewRowsSql(sql)) {
         expect(sql).toContain('ORDER BY `key_1`, `key_2`, `key_3`, `key_4`, `key_5`, `key_6`, `key_7`, `key_8`, `key_9`')
-        return [[Object.fromEntries(primaryRows.map((row) => [row.column_name, row.seq]))], primaryRows.map((row) => ({ name: row.column_name }))]
+        return [[Object.fromEntries(primary.map((name, index) => [name, index + 1]))], primary.map((name) => ({ name }))]
       }
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: 1 }], []]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {
@@ -772,18 +911,13 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 主键列超过安全上限 When 读取分页 Then 不使用不完整排序也不声明稳定顺序', async () => {
     /** 十七列超过公开索引合同的 16 列上限，必须整体放弃主键排序。 */
-    const primaryRows = Array.from({ length: 17 }, (_, index) => ({
-      name: 'PRIMARY', non_unique: 0, seq: index + 1, column_name: `key_${index + 1}`,
-    }))
+    const primary = Array.from({ length: 17 }, (_, index) => `key_${index + 1}`)
     const fixture = createMySqlConnection((sql) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'compound' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [primaryRows, []]
-      if (sql.startsWith('SELECT * FROM')) {
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('compound', primary, 1, {}, primary), []]
+      if (isPreviewRowsSql(sql)) {
         expect(sql).not.toContain('ORDER BY')
-        return [[{ id: 1 }], [{ name: 'id' }]]
+        return [[Object.fromEntries(primary.map((name, index) => [name, index + 1]))], primary.map((name) => ({ name }))]
       }
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: 1 }], []]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {
@@ -813,14 +947,11 @@ describe('数据服务 runtime 解析与指标构造', () => {
   test('Given 行预览命中总字节预算 When 裁剪 Then 保留全部页内行且显式标记文本截断', async () => {
     const fields = Array.from({ length: 64 }, (_, index) => ({ name: `column_${index}` }))
     const sourceRows = Array.from({ length: 201 }, (_, rowIndex) => Object.fromEntries(
-      fields.map((field) => [field.name, `第${rowIndex}行`.repeat(100)]),
+      fields.map((field) => [field.name, `第${rowIndex}行`.repeat(100).slice(0, 257)]),
     ))
     const fixture = createMySqlConnection((sql) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'wide_table' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [[], []]
-      if (sql.startsWith('SELECT * FROM')) return [sourceRows, fields]
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: null }], []]
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('wide_table', fields.map((field) => field.name)), []]
+      if (isPreviewRowsSql(sql)) return [sourceRows, fields]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {
@@ -839,14 +970,11 @@ describe('数据服务 runtime 解析与指标构造', () => {
     const fields = Array.from({ length: 64 }, (_, index) => ({ name: `column_${index}` }))
     /** 混合字符同时覆盖 JSON 转义膨胀和 UTF-8 多字节计量。 */
     const sourceRows = Array.from({ length: 200 }, () => Object.fromEntries(
-      fields.map((field) => [field.name, '\\\"界'.repeat(100)]),
+      fields.map((field) => [field.name, '\\\"界'.repeat(100).slice(0, 257)]),
     ))
     const fixture = createMySqlConnection((sql) => {
-      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
-      if (sql.includes('TABLE_NAME AS name') && sql.includes('LIMIT 1')) return [[{ name: 'escaped_table' }], []]
-      if (sql.includes('information_schema.STATISTICS')) return [[], []]
-      if (sql.startsWith('SELECT * FROM')) return [sourceRows, fields]
-      if (sql.includes('TABLE_ROWS AS rows_estimate')) return [[{ rows_estimate: 200 }], []]
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('escaped_table', fields.map((field) => field.name), 200), []]
+      if (isPreviewRowsSql(sql)) return [sourceRows, fields]
       return [[], []]
     })
     const result = await readMySqlWithConnection(fixture.connection, {

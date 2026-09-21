@@ -1,20 +1,25 @@
 import type { Duplex } from 'node:stream'
-import { connect as connectTls } from 'node:tls'
-import type { TLSSocket } from 'node:tls'
-import { createConnection as createMysqlConnection } from 'mysql2/promise'
+import { checkServerIdentity, connect as connectTls } from 'node:tls'
+import { isIP } from 'node:net'
+import type { PeerCertificate, TLSSocket } from 'node:tls'
+import { createConnection as createMysqlConnection } from 'mysql2'
+import type { Connection as MySqlConnection } from 'mysql2'
 import { AbstractConnector, Redis } from 'ioredis'
+import { isServerOpsMySqlTlsServerName } from '@proma/shared'
 import type {
   ServerOpsDataCapability,
   ServerOpsDataEngine,
   ServerOpsDataMetric,
   ServerOpsDataTable,
   ServerOpsDataTlsMode,
+  ServerOpsDataTlsStatus,
   ServerOpsDataSchemaColumn,
   ServerOpsDataSchemaCell,
   ServerOpsDataSchemaIndex,
   ServerOpsDataSchemaTableSummary,
   ServerOpsDataParameter,
   ServerOpsDataQueryResult,
+  ServerOpsDataRowFilters,
 } from '@proma/shared'
 import type { ServerOpsRuntimeDataReadResult } from './server-ops-runtime-protocol'
 import {
@@ -23,11 +28,13 @@ import {
   getServerOpsSqlQueryPublicError,
   normalizeServerOpsSqlQueryError,
 } from './server-ops-query-runtime'
+import { buildServerOpsRowFilterSql, getServerOpsRowFilterPublicError } from './server-ops-row-filter-sql'
 
 /** 数据服务在 utility process 内执行的一次数据读取输入；含秘密，禁止回传主进程之外。 */
 /** 所有数据读取模式共享的真实连接字段。 */
 interface ServerOpsDataRuntimeInputBase {
-  engine: ServerOpsDataEngine
+  /** 本适配器仅处理网络协议；SQLite 由独立 SSH 文件适配器读取。 */
+  engine: Exclude<ServerOpsDataEngine, 'sqlite'>
   address: string
   port: number
   database?: string
@@ -42,6 +49,8 @@ interface ServerOpsDataRuntimeInputBase {
   /** 行预览偏移与页大小；`schema-rows` 使用。 */
   rowOffset?: number
   rowLimit?: number
+  /** 行预览的受控字段条件；仅 schema-rows 使用。 */
+  rowFilters?: ServerOpsDataRowFilters
   /** MySQL 诊断分区；省略时保持旧版全量诊断。 */
   diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection
   /** MySQL 会话或慢语句的库级筛选；不参与握手默认库。 */
@@ -77,6 +86,12 @@ export type ServerOpsDataRuntimeInput = ServerOpsDataRuntimeNonQueryInput | Serv
 export type ServerOpsDataRuntimeOutput = ServerOpsRuntimeDataReadResult
 /** 旧诊断与表浏览的结果，排除没有 capability/mode 的 SQL 查询结果。 */
 type ServerOpsDataRuntimeNonQueryOutput = Exclude<ServerOpsRuntimeDataReadResult, ServerOpsDataQueryResult>
+
+/** MySQL 读取接口；绑定值只接收已校验的标识文本、筛选文本或分页整数。 */
+interface MySqlReadConnection {
+  query: (sql: string, values?: (string | number)[]) => Promise<unknown>
+  execute?: (sql: string, values?: (string | number)[]) => Promise<unknown>
+}
 
 /** 建立到目标数据库的单条 SSH 转发通道；由调用方保证生命周期。 */
 export type ServerOpsDataChannelFactory = () => Promise<Duplex>
@@ -299,7 +314,7 @@ const TIMEOUT_ERROR_CODES = new Set(['ETIMEDOUT', 'ETIMEOUT', 'PROTOCOL_SEQUENCE
 export function classifyServerOpsDataError(error: unknown, engine: ServerOpsDataEngine): { capability: ServerOpsDataCapability; message: string } {
   /** 驱动错误的稳定错误码。 */
   const code = readErrorCode(error)
-  if (TLS_ERROR_CODES.has(code)) return { capability: 'tls-failed', message: `TLS 校验失败（${code}）` }
+  if (TLS_ERROR_CODES.has(code)) return { capability: 'tls-failed', message: `TLS 连接失败（${code}）` }
   if (AUTH_ERROR_CODES.has(code)) return { capability: 'auth-failed', message: `认证失败（${code}）` }
   if (PERMISSION_ERROR_CODES.has(code)) return { capability: 'permission-denied', message: `权限不足（${code}）` }
   if (TIMEOUT_ERROR_CODES.has(code)) return { capability: 'timeout', message: `连接超时（${code}）` }
@@ -664,42 +679,107 @@ async function runOptionalRead<T>(
   }
 }
 
-/** 在单条 SSH 隧道通道上执行 MySQL 只读读取。 */
+/**
+ * 等待 MySQL 完成认证；取消会立即结算，避免 destroy 后驱动不再发 connect/error 导致悬挂。
+ * @param connection 本次尝试独占的底层连接
+ * @param signal 共享总时限与用户撤销信号
+ * @returns 认证完成；失败或取消时拒绝
+ */
+async function waitForMySqlConnection(connection: MySqlConnection, signal?: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    /** 移除握手阶段监听，后续查询由 promise 驱动处理错误。 */
+    const cleanup = (): void => {
+      signal?.removeEventListener('abort', onAbort)
+      connection.removeListener('connect', onConnect)
+      connection.removeListener('error', onError)
+    }
+    /** 连接成功时解除仅用于握手的监听。 */
+    const onConnect = (): void => { cleanup(); resolve() }
+    /** 握手失败保留原始驱动错误码，用于判定是否允许 preferred 回退。 */
+    const onError = (error: Error): void => { cleanup(); reject(error) }
+    /** 先结算再销毁，防止同步 close/error 竞争改变取消原因。 */
+    const onAbort = (): void => {
+      cleanup()
+      reject(new Error('SERVER_OPS_DATA_CANCELLED'))
+      connection.destroy()
+    }
+    connection.once('connect', onConnect)
+    connection.once('error', onError)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+  })
+}
+
+/** 在独占通道上执行 MySQL 读取；preferred 仅在认证前明确无 TLS 时允许一次新通道回退。 */
 async function readMySql(
   input: ServerOpsDataRuntimeInput,
   dependencies: ServerOpsMySqlAdapterDependencies,
 ): Promise<ServerOpsDataRuntimeOutput> {
-  /** SSH 转发通道由驱动全程持有，结束时统一销毁。 */
+  /** 当前尝试的底层通道与驱动连接，失败回退前必须同时释放。 */
   let channel: Duplex | undefined
+  let connection: MySqlConnection | undefined
+  /** 初次连接按配置请求 TLS；只有明确无 TLS 才能把下一次尝试设为明文。 */
+  let useTls = input.tlsMode !== 'disabled'
   try {
-    channel = await dependencies.createChannel()
-    /** TLS 校验使用数据库真实主机名，关闭 TLS 时该字段只用于错误信息。 */
-    const tlsServerName = input.tlsMode === 'verify' ? input.tlsServerName : undefined
-    /** mysql2 连接直接消费隧道通道，不在本机创建监听端口。 */
-    const connection = await createMysqlConnection({
-      host: tlsServerName ?? input.address,
-      port: input.port,
-      user: input.username,
-      password: input.password,
-      /** probe 验证完整配置；SQL 查询必须绑定已授权库，实例级 schema/diagnostics 则不绑定默认库。 */
-      ...(resolveServerOpsMySqlHandshakeDatabase(input) !== undefined
-        ? { database: resolveServerOpsMySqlHandshakeDatabase(input) }
-        : {}),
-      stream: channel,
-      connectTimeout: dependencies.timeoutMs,
-      ...(input.tlsMode === 'verify' ? { ssl: { rejectUnauthorized: true, verifyIdentity: true } } : {}),
-    })
-    /** 取消时立即销毁驱动连接，socket/隧道通道由外层 finally 再兜底。 */
-    const releaseAbortBinding = bindServerOpsSqlQueryAbort(dependencies.signal, () => { connection.destroy() })
+    for (;;) {
+      channel = await dependencies.createChannel()
+      if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+      connection = createMysqlConnection({
+        host: input.tlsMode === 'verify' ? input.tlsServerName : input.address,
+        port: input.port,
+        user: input.username,
+        password: input.password,
+        /** probe 验证完整配置；SQL 绑定已授权库，其余读取不受默认库失效影响。 */
+        ...(resolveServerOpsMySqlHandshakeDatabase(input) === undefined
+          ? {} : { database: resolveServerOpsMySqlHandshakeDatabase(input) }),
+        stream: channel,
+        connectTimeout: dependencies.timeoutMs,
+        ...(useTls ? { ssl: {
+          rejectUnauthorized: input.tlsMode === 'verify',
+          verifyIdentity: input.tlsMode === 'verify',
+        } } : {}),
+      })
+      // 取消/销毁后迟到的驱动错误也必须被消费，不能使 utility 进程崩溃。
+      connection.on('error', () => undefined)
+      try {
+        await waitForMySqlConnection(connection, dependencies.signal)
+        break
+      } catch (error) {
+        connection.destroy()
+        connection = undefined
+        channel.destroy()
+        channel = undefined
+        if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+        if (input.tlsMode !== 'preferred' || !useTls || readErrorCode(error) !== 'HANDSHAKE_NO_SSL_SUPPORT') throw error
+        // 此错误只在 mysql2 检查服务端 capability 且尚未发送认证材料时产生。
+        useTls = false
+      }
+    }
+    /** mysql2 在升级 TLS 后把 stream 替换成 TLSSocket，以实际流识别加密状态。 */
+    const stream = (connection as unknown as { stream: Duplex & { encrypted?: boolean } }).stream
+    if (useTls && stream.encrypted !== true) throw Object.assign(new Error('TLS 未建立'), { code: 'HANDSHAKE_SSL_ERROR' })
+    /** verified 只在真实 TLS 流且驱动已完成证书与主机名验证后报告。 */
+    const tlsStatus: ServerOpsDataTlsStatus = stream.encrypted === true
+      ? input.tlsMode === 'verify' ? 'verified' : 'encrypted'
+      : 'plaintext'
+    /** 在查询阶段继续响应撤销；循环外执行保证不会因 SQL 错误回退或重放。 */
+    const releaseAbortBinding = bindServerOpsSqlQueryAbort(dependencies.signal, () => { connection?.destroy() })
     try {
-      return await readMySqlWithConnection(connection, input, dependencies.signal)
+      /** 仅 probe/diagnostics 合同包含实际 TLS 状态，表浏览与 SQL 维持既有严格合同。 */
+      const result = await readMySqlWithConnection(connection.promise(), input, dependencies.signal)
+      if ((input.mode === 'probe' || input.mode === 'diagnostics') && 'capability' in result && result.capability === 'available') {
+        return { ...result, tlsStatus }
+      }
+      return result
     } finally {
       releaseAbortBinding()
-      connection.destroy()
     }
   } catch (error) {
+    if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+    /** 筛选字段无效属于用户输入错误，不能被诊断连接失败分类器吞掉。 */
+    if (input.mode === 'schema-rows' && getServerOpsRowFilterPublicError(error) !== null) throw error
     if (input.mode === 'sql-query') {
-      /** 建连与执行共用同一分类器，再以公开白名单限制跨 utility 边界的错误。 */
+      /** 建连与执行共用公开错误白名单，不向主进程泄露驱动原始详情。 */
       const normalized = normalizeServerOpsSqlQueryError(error)
       if (getServerOpsSqlQueryPublicError(normalized) !== undefined
         || normalized.message === 'SERVER_OPS_DATA_CANCELLED') throw normalized
@@ -709,28 +789,29 @@ async function readMySql(
     const classified = classifyServerOpsDataError(error, 'mysql')
     return { capability: classified.capability, metrics: [], tables: [], warnings: createWarnings([classified.message]) }
   } finally {
+    connection?.destroy()
     if (channel && !channel.destroyed) channel.destroy()
   }
 }
 
 /** 在已连接的 mysql2 连接上执行一次受控读取，便于按协议独立验证查询边界。 */
 export function readMySqlWithConnection(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   input: ServerOpsDataRuntimeNonQueryInput,
   signal?: AbortSignal,
 ): Promise<ServerOpsDataRuntimeNonQueryOutput>
 export function readMySqlWithConnection(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   input: ServerOpsDataRuntimeQueryInput,
   signal?: AbortSignal,
 ): Promise<ServerOpsDataQueryResult>
 export function readMySqlWithConnection(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   input: ServerOpsDataRuntimeInput,
   signal?: AbortSignal,
 ): Promise<ServerOpsDataRuntimeOutput>
 export async function readMySqlWithConnection(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   input: ServerOpsDataRuntimeInput,
   signal?: AbortSignal,
 ): Promise<ServerOpsDataRuntimeOutput> {
@@ -758,13 +839,24 @@ export async function readMySqlWithConnection(
       maxRows: input.maxRows,
     }, signal)
   }
-  /** 版本查询是连接成功的唯一凭据。 */
+  /** 表浏览直接以实时元数据读取验证连接，避免每次翻页重复获取未使用的版本。 */
+  if (input.mode === 'schema-tables' || input.mode === 'schema-table' || input.mode === 'schema-rows') {
+    if (input.mode === 'schema-rows') {
+      if (typeof connection.execute !== 'function') throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
+      /** 表预览元数据同样含用户标识符，所有行读取统一使用服务端绑定。 */
+      const preparedConnection: MySqlReadConnection = {
+        query: (sql, values) => connection.execute!(sql, values),
+        execute: (sql, values) => connection.execute!(sql, values),
+      }
+      return readMySqlSchema(preparedConnection, input)
+    }
+    return readMySqlSchema(connection, input)
+  }
+
+  /** 探测与诊断仍读取版本，用于原有连接状态和服务版本展示。 */
   const versionRows = await readRows(connection, MYSQL_VERSION_QUERY, [])
   const version = toDisplayText(versionRows[0]?.version ?? '', 128)
   if (input.mode === 'probe') return { capability: 'available', serverVersion: version, metrics: [], tables: [], warnings: [] }
-  if (input.mode === 'schema-tables' || input.mode === 'schema-table' || input.mode === 'schema-rows') {
-    return readMySqlSchema(connection, input)
-  }
 
   /** 省略 section 时保留旧版全量诊断；指定后只执行当前页所需语句。 */
   const section = input.diagnosticSection
@@ -863,6 +955,50 @@ const MYSQL_SCHEMA_INDEXES_QUERY = 'SELECT INDEX_NAME AS name, NON_UNIQUE AS non
 /** 表浏览：白名单校验。只有命中这里返回的表名才允许拼进后续语句。 */
 const MYSQL_SCHEMA_TABLE_EXISTS_QUERY = 'SELECT TABLE_NAME AS name FROM information_schema.TABLES '
   + 'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1'
+/** 行预览一次取得实时表身份、列类型和估算；覆盖 MySQL 4096 列上限，避免隐藏列占满预览窗口。 */
+const MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY = 'SELECT t.TABLE_NAME AS table_name, t.TABLE_ROWS AS rows_estimate, '
+  + 'c.COLUMN_NAME AS name, c.DATA_TYPE AS data_type, c.EXTRA AS extra, s.SEQ_IN_INDEX AS primary_seq '
+  + 'FROM information_schema.TABLES AS t LEFT JOIN information_schema.COLUMNS AS c '
+  + 'ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME '
+  + 'LEFT JOIN information_schema.STATISTICS AS s ON s.TABLE_SCHEMA = c.TABLE_SCHEMA AND s.TABLE_NAME = c.TABLE_NAME '
+  + "AND s.COLUMN_NAME = c.COLUMN_NAME AND s.INDEX_NAME = 'PRIMARY' "
+  + 'WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ? ORDER BY c.ORDINAL_POSITION LIMIT 4097'
+
+/** 单列预览表达式以及二进制大小的解码方式；名称只来自本次实时元数据。 */
+interface MySqlPreviewColumn {
+  name: string
+  expression: string
+  binarySize: boolean
+}
+
+/** 可在数据库端安全截取前缀的文本类型；复杂 JSON、空间类型和数值保留驱动原有语义。 */
+const MYSQL_PREVIEW_TEXT_TYPES = new Set(['char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext', 'enum', 'set'])
+/** 这些类型在 mysql2 中原本返回 Buffer；预览只需要大小，不传输完整内容。 */
+const MYSQL_PREVIEW_BINARY_TYPES = new Set(['binary', 'varbinary', 'tinyblob', 'blob', 'mediumblob', 'longblob'])
+
+/** 根据实时列类型生成有界预览；入参为列元数据，返回前 64 个可见列的安全表达式。 */
+function buildMySqlPreviewColumns(rows: readonly Record<string, unknown>[]): MySqlPreviewColumn[] {
+  return rows.filter((row) => typeof row.name === 'string' && !/\bINVISIBLE\b/iu.test(String(row.extra ?? ''))).slice(0, 64).map((row) => {
+    /** 标识符保持原名，只做 MySQL 反引号转义，不把元数据内容当 SQL。 */
+    const name = row.name as string
+    const identifier = quoteMySqlIdentifier(name)
+    const dataType = String(row.data_type ?? '').toLowerCase()
+    const binarySize = MYSQL_PREVIEW_BINARY_TYPES.has(dataType)
+    /** 257 个数据库字符足以判断 256 UTF-16 单元是否截断；最终仍沿用客户端文本归一化。 */
+    const expression = binarySize ? `OCTET_LENGTH(${identifier})`
+      : MYSQL_PREVIEW_TEXT_TYPES.has(dataType) ? `LEFT(${identifier}, 257)` : identifier
+    return { name, expression: `${expression} AS ${identifier}`, binarySize }
+  })
+}
+
+/** 还原预览字段的公开类型；二进制仅接收大小，NULL 与零字节严格区分。 */
+function formatMySqlPreviewCell(value: unknown, column: MySqlPreviewColumn): ServerOpsDataSchemaCell {
+  if (!column.binarySize || value === null || value === undefined) return formatMySqlCell(value)
+  /** MySQL OCTET_LENGTH 返回可安全表示的非负整数，拒绝异常驱动结果。 */
+  const bytes = toFiniteNumber(value)
+  if (bytes === undefined || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+  return { kind: 'binary', bytes }
+}
 
 /**
  * 执行表浏览读取。
@@ -870,12 +1006,12 @@ const MYSQL_SCHEMA_TABLE_EXISTS_QUERY = 'SELECT TABLE_NAME AS name FROM informat
  * 安全边界：库名与表名**先经 information_schema 白名单命中**，命中后仍按 MySQL 规则
  * 转义反引号再拼进语句；没有命中就返回 `unsupported` 而不是把任意标识符送进 SQL。
  *
- * @param connection 已完成版本校验的 MySQL 连接
+ * @param connection 已完成认证的 MySQL 连接
  * @param input 表浏览请求
  * @returns 结构化的表浏览结果
  */
 async function readMySqlSchema(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   input: ServerOpsDataRuntimeInput,
 ): Promise<ServerOpsDataRuntimeOutput> {
   const schemaDatabase = input.schemaDatabase
@@ -954,8 +1090,9 @@ async function readMySqlSchema(
   if (schemaTable === undefined) {
     return { mode: 'schema-table', capability: 'unsupported', columns: [], indexes: [], warnings: createWarnings(['缺少目标表']) }
   }
-  const existsRows = await readRows(connection, MYSQL_SCHEMA_TABLE_EXISTS_QUERY, [schemaDatabase, schemaTable])
-  if (existsRows.length === 0) {
+  /** 行读取复用本次元数据里的表白名单、列类型与估算，不缓存授权事实。 */
+  const existsRows = await readRows(connection, input.mode === 'schema-rows' ? MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY : MYSQL_SCHEMA_TABLE_EXISTS_QUERY, [schemaDatabase, schemaTable])
+  if (existsRows.length === 0 || input.mode === 'schema-rows' && !existsRows.every((row) => row.table_name === schemaTable)) {
     /** 白名单未命中：按当前模式返回对应的空结果，界面据此提示"表不存在或不可见"。 */
     const warnings = createWarnings([`表 ${schemaDatabase}.${schemaTable} 不存在或当前账号不可见`])
     if (input.mode === 'schema-rows') {
@@ -1001,28 +1138,58 @@ async function readMySqlSchema(
     }
   }
 
-  /** 行预览：优先按主键排序，保证分页稳定；没有主键时按存储顺序返回。 */
-  const primaryKey = await readMySqlPrimaryKeyColumns(connection, schemaDatabase, schemaTable)
+  /** 显式选择可见列，保持 SELECT * 的隐藏列语义；无法取得列元数据时不得退回无界读取。 */
+  const previewColumns = buildMySqlPreviewColumns(existsRows)
+  if (previewColumns.length === 0 || existsRows.length > 4096) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+  /** 元数据未截断，主键可安全复用同一次查询；排序顺序不能用列的物理位置替代。 */
+  const primaryColumns = existsRows.filter((row) => toFiniteNumber(row.primary_seq) !== undefined)
+    .sort((left, right) => Number(left.primary_seq) - Number(right.primary_seq))
+  const orderedByPrimaryKey = primaryColumns.length > 0 && primaryColumns.length <= 16
+    && primaryColumns.every((row, index) => typeof row.name === 'string' && Number(row.primary_seq) === index + 1)
   const offset = input.rowOffset ?? 0
   const limit = input.rowLimit ?? 50
-  const orderClause = !primaryKey.complete || primaryKey.columns.length === 0
-    ? ''
-    : ` ORDER BY ${primaryKey.columns.map(quoteMySqlIdentifier).join(', ')}`
+  const orderClause = orderedByPrimaryKey
+    ? ` ORDER BY ${primaryColumns.map((column) => quoteMySqlIdentifier(column.name as string)).join(', ')}` : ''
+  /** 筛选复用同次实时列元数据；字段范围与结构面板的前 256 列一致。 */
+  const filterSql = input.rowFilters === undefined ? { clause: '', values: [] }
+    : buildServerOpsRowFilterSql(
+      input.rowFilters,
+      existsRows.slice(0, 256)
+        .map((row) => row.name).filter((name): name is string => typeof name === 'string'),
+      'mysql',
+    )
+  /** 所有行读取通过服务端 prepared execute；分页数字先独立校验再写入固定 SQL。 */
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000
+    || !Number.isSafeInteger(limit) || limit < 1 || limit > 200 || offset % limit !== 0) {
+    throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
+  }
+  if (typeof connection.execute !== 'function') {
+    throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
+  }
+  /** mysql2 execute 绑定所有用户值；LIMIT/OFFSET 只采用上方已校验的安全整数。 */
+  const rowSql = `SELECT ${previewColumns.map((column) => column.expression).join(', ')} FROM ${quoteMySqlIdentifier(schemaDatabase)}.${quoteMySqlIdentifier(schemaTable)}`
+    + filterSql.clause + orderClause
+    + ` LIMIT ${limit + 1} OFFSET ${offset}`
   const rowsQuery = await readQueryResult(
     connection,
-    `SELECT * FROM ${quoteMySqlIdentifier(schemaDatabase)}.${quoteMySqlIdentifier(schemaTable)}${orderClause} LIMIT ? OFFSET ?`,
-    [limit + 1, offset],
+    rowSql,
+    filterSql.values,
+    'execute',
   )
-  /** mysql2 fields 在空表上仍携带列名；最多公开 64 列并给出明确 warning。 */
-  const allColumnNames = rowsQuery.fields.map((field) => field.name).filter((name) => name.length > 0)
-  const columnNames = allColumnNames.slice(0, 64)
-  const columnTruncated = allColumnNames.length > columnNames.length
+  /** 空表也保留列头；核对字段顺序，避免异常结果与本次列类型错配。 */
+  const columnNames = previewColumns.map((column) => toDisplayText(column.name, 128))
+  if (rowsQuery.fields.length !== columnNames.length || rowsQuery.fields.some((field, index) => field.name !== columnNames[index])) {
+    throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+  }
+  const columnTruncated = existsRows.filter((row) => typeof row.name === 'string' && !/\bINVISIBLE\b/iu.test(String(row.extra ?? ''))).length > columnNames.length
   const hasMore = rowsQuery.rows.length > limit
   const normalizedRows = rowsQuery.rows.slice(0, limit)
-    .map((row) => columnNames.map((column) => formatMySqlCell(row[column])))
+    .map((row) => previewColumns.map((column) => formatMySqlPreviewCell(row[column.name], column)))
   const budgetedRows = fitSchemaRowsToBudget(normalizedRows)
   const cellTruncated = normalizedRows.some((row) => row.some((cell) => typeof cell === 'object' && cell !== null && cell.kind === 'text'))
-  const totalEstimate = await readMySqlTableRowEstimate(connection, schemaDatabase, schemaTable)
+  /** 同次表元数据已携带估算，避免数据返回后再多发一次查询。 */
+  const rawEstimate = input.rowFilters === undefined ? toFiniteNumber(existsRows[0]?.rows_estimate) : undefined
+  const totalEstimate = rawEstimate === undefined ? undefined : Math.min(Math.max(0, Math.trunc(rawEstimate)), Number.MAX_SAFE_INTEGER)
   return {
     mode: 'schema-rows',
     capability: 'available',
@@ -1032,7 +1199,7 @@ async function readMySqlSchema(
     limit,
     truncated: columnTruncated || cellTruncated || budgetedRows.truncated,
     hasMore,
-    orderedByPrimaryKey: primaryKey.complete && primaryKey.columns.length > 0,
+    orderedByPrimaryKey,
     ...(totalEstimate === undefined ? {} : { totalEstimate }),
     warnings: columnTruncated ? createWarnings(['表列数超过 64，当前预览只显示前 64 列']) : [],
   }
@@ -1046,11 +1213,15 @@ interface MySqlQueryResult {
 
 /** 读取查询行集与 fields；空表也必须保留列头。 */
 async function readQueryResult(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: MySqlReadConnection,
   sql: string,
-  values: unknown[],
+  values: (string | number)[],
+  method: 'query' | 'execute' = 'query',
 ): Promise<MySqlQueryResult> {
-  const result = await connection.query(sql, values)
+  /** 表预览统一使用服务端参数绑定；调用方须确认 execute 可用，不能降级为客户端插值。 */
+  const result = method === 'execute'
+    ? await connection.execute!(sql, values)
+    : await connection.query(sql, values)
   if (!Array.isArray(result)) return { rows: [], fields: [] }
   const rawRows = Array.isArray(result[0]) ? result[0] as unknown[] : []
   const rawFields = Array.isArray(result[1]) ? result[1] as unknown[] : []
@@ -1065,9 +1236,9 @@ async function readQueryResult(
 
 /** 读取查询行集；mysql2 的 SELECT 返回 `[rows, fields]`。 */
 async function readRows(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
+  connection: { query: (sql: string, values?: (string | number)[]) => Promise<unknown> },
   sql: string,
-  values: unknown[],
+  values: (string | number)[],
 ): Promise<Record<string, unknown>[]> {
   return (await readQueryResult(connection, sql, values)).rows
 }
@@ -1090,35 +1261,6 @@ function buildMySqlIndexes(rows: readonly Record<string, unknown>[]): ServerOpsD
     if (existing.columns.length < 16) existing.columns.push(column)
   }
   return [...byName.values()]
-}
-
-/** 读取表的主键列；没有主键时返回空数组。 */
-async function readMySqlPrimaryKeyColumns(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
-  database: string,
-  table: string,
-): Promise<{ columns: string[]; complete: boolean }> {
-  const rows = await readRows(connection, MYSQL_SCHEMA_INDEXES_QUERY, [database, table])
-  /** 完整主键列按数据库序号排序；超过公开索引合同的 16 列时整体放弃排序。 */
-  const columns = rows
-    .filter((row) => toDisplayText(row.name, 128).toUpperCase() === 'PRIMARY')
-    .sort((left, right) => (toFiniteNumber(left.seq) ?? 0) - (toFiniteNumber(right.seq) ?? 0))
-    .map((row) => toDisplayText(row.column_name, 128))
-    .filter((column) => column.length > 0)
-  return columns.length <= 16 ? { columns, complete: true } : { columns: [], complete: false }
-}
-
-/** 读取表行数估算；缺失时返回 undefined。 */
-async function readMySqlTableRowEstimate(
-  connection: { query: (sql: string, values?: unknown[]) => Promise<unknown> },
-  database: string,
-  table: string,
-): Promise<number | undefined> {
-  const rows = await readRows(connection, 'SELECT TABLE_ROWS AS rows_estimate FROM information_schema.TABLES '
-    + 'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1', [database, table])
-  const estimate = rows.length === 0 ? undefined : toFiniteNumber(rows[0]!.rows_estimate)
-  if (estimate === undefined) return undefined
-  return Math.min(Math.max(0, Math.trunc(estimate)), Number.MAX_SAFE_INTEGER)
 }
 
 /** 按 MySQL 规则转义标识符；调用方必须已确认它来自 information_schema。 */
@@ -1207,7 +1349,8 @@ function toTimestampMs(value: unknown): number | undefined {
 /** 构造只在当前读取期间存活的 ioredis 连接器类。 */
 function createRedisTunnelConnector(
   createChannel: ServerOpsDataChannelFactory,
-  tlsServerName: string | undefined,
+  input: Pick<ServerOpsDataRuntimeInput, 'tlsMode' | 'tlsServerName' | 'address'>,
+  onStream: (stream: Duplex & { encrypted?: boolean }) => void,
 ): RedisConnectorConstructor {
   /** 自定义连接器不读取 ioredis 选项，隧道参数由闭包捕获。 */
   class ServerOpsRedisTunnelConnector extends AbstractConnector {
@@ -1220,17 +1363,26 @@ function createRedisTunnelConnector(
     async connect(): Promise<TLSSocket> {
       /** 本次连接持有的 SSH 转发通道。 */
       const tunnel = await createChannel()
-      if (tlsServerName === undefined) {
+      if (input.tlsMode === 'disabled') {
         /**
          * ioredis 只使用 Duplex 的读写与事件语义，不会访问 net.Socket 专有字段，
          * 因此这里把 ssh2 转发通道按 ioredis 的流类型标注。
          */
         this.stream = tunnel as unknown as TLSSocket
+        onStream(tunnel)
         return tunnel as unknown as TLSSocket
       }
       /** TLS 校验使用数据库真实主机名，不使用跳板地址。 */
-      const secureSocket = connectTls({ socket: tunnel, servername: tlsServerName, rejectUnauthorized: true })
+      const tlsServerName = input.tlsServerName ?? input.address
+      /** IP 仅参与证书身份校验，不能被误用为 TLS SNI。 */
+      const secureSocket = connectTls({
+        socket: tunnel,
+        ...(isIP(tlsServerName) === 0 ? { servername: tlsServerName } : {}),
+        rejectUnauthorized: input.tlsMode === 'verify',
+        checkServerIdentity: (_hostname: string, certificate: PeerCertificate) => checkServerIdentity(tlsServerName, certificate),
+      })
       this.stream = secureSocket
+      onStream(secureSocket)
       return secureSocket
     }
   }
@@ -1242,10 +1394,17 @@ async function readRedis(
   input: ServerOpsDataRuntimeInput,
   dependencies: ServerOpsMySqlAdapterDependencies,
 ): Promise<ServerOpsDataRuntimeOutput> {
+  /** 连接器记录真实流，成功读取后才能报告协商结果。 */
+  let stream: (Duplex & { encrypted?: boolean }) | undefined
+  /** ioredis 可能用 Connection is closed 覆盖 TLS 原因，保留首个底层错误用于准确分类。 */
+  let streamError: Error | undefined
   /** 每条读取独占一条隧道通道，结束后由连接器 destroy 释放。 */
   const redis = new Redis({
-    Connector: createRedisTunnelConnector(dependencies.createChannel, input.tlsMode === 'verify' ? input.tlsServerName : undefined),
-    ...(input.tlsMode === 'verify' ? { tls: {} } : {}),
+    Connector: createRedisTunnelConnector(dependencies.createChannel, input, (connectedStream) => {
+      stream = connectedStream
+      connectedStream.once('error', (error: Error) => { streamError ??= error })
+    }),
+    ...(input.tlsMode !== 'disabled' ? { tls: {} } : {}),
     ...(input.username === undefined ? {} : { username: input.username }),
     ...(input.password === undefined ? {} : { password: input.password }),
     ...(input.database === undefined ? {} : { db: Number(input.database) }),
@@ -1259,10 +1418,13 @@ async function readRedis(
     retryStrategy: () => null,
     maxRetriesPerRequest: 1,
   })
+  /** 建连和命令读取期间都响应撤销，并保持禁止自动重连。 */
+  const releaseAbortBinding = bindServerOpsSqlQueryAbort(dependencies.signal, () => { redis.disconnect() })
   try {
     /** ioredis 在连接失败时会发出 error 事件；必须显式消费，否则会升级为未捕获异常并终止 utility 进程。 */
     redis.on('error', () => undefined)
     await redis.connect()
+    if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
     /** INFO 是 Redis 版本与运行指标的唯一来源；无参数调用保证兼容旧版本。 */
     const infoText = await redis.call('INFO')
     /** 归一化后的 INFO 键值映射。 */
@@ -1272,8 +1434,15 @@ async function readRedis(
     if (version === '') {
       return { capability: 'unsupported', metrics: [], tables: [], warnings: createWarnings(['无法从 INFO 读取 redis_version']) }
     }
+    if (input.tlsMode !== 'disabled' && stream?.encrypted !== true) {
+      throw Object.assign(new Error('TLS 未建立'), { code: 'HANDSHAKE_SSL_ERROR' })
+    }
+    /** 实际加密的连接才可显示 encrypted；verify 已通过 TLS 证书校验。 */
+    const tlsStatus: ServerOpsDataTlsStatus = stream?.encrypted === true
+      ? input.tlsMode === 'verify' ? 'verified' : 'encrypted'
+      : 'plaintext'
     if (input.mode === 'probe') {
-      return { capability: 'available', serverVersion: version, metrics: [], tables: [], warnings: [] }
+      return { capability: 'available', serverVersion: version, tlsStatus, metrics: [], tables: [], warnings: [] }
     }
     /** 诊断阶段允许单项失败。 */
     const warnings: string[] = []
@@ -1293,15 +1462,18 @@ async function readRedis(
     return {
       capability: 'available',
       serverVersion: version,
+      tlsStatus,
       metrics: metrics.slice(0, MAX_DATA_METRICS),
       tables: tables.slice(0, MAX_DATA_TABLES),
       warnings: createWarnings(warnings),
     }
   } catch (error) {
     /** Redis 失败同样只暴露稳定能力状态。 */
-    const classified = classifyServerOpsDataError(error, 'redis')
+    if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+    const classified = classifyServerOpsDataError(streamError ?? error, 'redis')
     return { capability: classified.capability, metrics: [], tables: [], warnings: createWarnings([classified.message]) }
   } finally {
+    releaseAbortBinding()
     try {
       redis.disconnect()
     } catch {
@@ -1337,7 +1509,63 @@ export async function runServerOpsDataRead(
   createChannel: ServerOpsDataChannelFactory,
   signal?: AbortSignal,
 ): Promise<ServerOpsDataRuntimeOutput> {
-  /** 驱动层与整体调度使用同一份超时预算。 */
-  const dependencies: ServerOpsMySqlAdapterDependencies = { createChannel, timeoutMs: 15_000, ...(signal === undefined ? {} : { signal }) }
-  return input.engine === 'mysql' ? readMySql(input, dependencies) : readRedis(input, dependencies)
+  if (input.engine !== 'mysql' && input.engine !== 'redis') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+  if (signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+  if (input.engine === 'redis' && input.tlsMode === 'preferred') throw new Error('SERVER_OPS_DATA_TLS_MODE_UNSUPPORTED')
+  if (input.tlsMode === 'verify' && !input.tlsServerName) throw new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
+  // mysql2 会省略 IP 的 SNI，必须在认证前拒绝，不能把 localhost 校验误报为目标 IP 已验证。
+  if (input.engine === 'mysql' && input.tlsMode === 'verify' && !isServerOpsMySqlTlsServerName(input.tlsServerName)) {
+    throw new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
+  }
+  /** 全部连接尝试和查询共用一个时限；preferred 回退不能获得额外的 15 秒。 */
+  const controller = new AbortController()
+  /** 记录主动超时与外部撤销的区别，避免向用户误报取消。 */
+  let timedOut = false
+  /** 保存当前通道，撤销时立即销毁，迟到通道在工厂回调中兜底释放。 */
+  let activeChannel: Duplex | undefined
+  /** 外部撤销同时覆盖通道建立、握手和查询。 */
+  const releaseAbortBinding = bindServerOpsSqlQueryAbort(signal, () => { controller.abort() })
+  /** 总时限从首次开通道前开始，贯穿 preferred 的第二次握手。 */
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, 15_000)
+  /** 在驱动缺少终态事件时也保证读取按时结束。 */
+  let rejectCancelled: (reason: Error) => void = () => undefined
+  /** 提前绑定拒绝处理，避免等待通道时撤销产生未消费的 rejection。 */
+  const cancelled = new Promise<never>((_resolve, reject) => { rejectCancelled = reject })
+  /** 先发出取消再销毁底层通道，不依赖驱动是否触发 close/error。 */
+  const onAbort = (): void => {
+    rejectCancelled(new Error('SERVER_OPS_DATA_CANCELLED'))
+    activeChannel?.destroy()
+  }
+  controller.signal.addEventListener('abort', onAbort, { once: true })
+  /** 驱动共享同一撤销信号；通道工厂检查异步返回后的状态。 */
+  const dependencies: ServerOpsMySqlAdapterDependencies = {
+    createChannel: async () => {
+      if (controller.signal.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
+      /** 迟到通道不再交给驱动，避免撤销后发送认证。 */
+      const channel = await createChannel()
+      if (controller.signal.aborted) {
+        channel.destroy()
+        throw new Error('SERVER_OPS_DATA_CANCELLED')
+      }
+      activeChannel = channel
+      return channel
+    },
+    timeoutMs: 15_000,
+    signal: controller.signal,
+  }
+  try {
+    return await Promise.race([
+      cancelled,
+      input.engine === 'mysql' ? readMySql(input, dependencies) : readRedis(input, dependencies),
+    ])
+  } catch (error) {
+    if (!timedOut) throw error
+    if (input.mode === 'sql-query') throw new Error('SERVER_OPS_DATA_QUERY_TIMEOUT')
+    return { capability: 'timeout', metrics: [], tables: [], warnings: ['数据库读取超时'] }
+  } finally {
+    clearTimeout(timer)
+    releaseAbortBinding()
+    controller.signal.removeEventListener('abort', onAbort)
+    activeChannel?.destroy()
+  }
 }

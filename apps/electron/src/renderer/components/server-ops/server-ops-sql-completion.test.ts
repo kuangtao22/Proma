@@ -17,13 +17,17 @@ const schema: ServerOpsSqlCompletionSchema = {
 }
 
 /** 标记竖线为光标位置，调用真实补全源而不模拟 parser。 */
-async function complete(marked: string, current = schema, explicit = true) {
+async function complete(marked: string, current = schema, explicit = true, dialect: 'mysql' | 'sqlite' = 'mysql') {
   const pos = marked.indexOf('|')
   const state = EditorState.create({ doc: marked.replace('|', ''), extensions: [sql({ dialect: MySQL })] })
-  return createServerOpsSqlCompletionSource({ getSchema: () => current, ensureColumns: async () => undefined })(new CompletionContext(state, pos, explicit))
+  return createServerOpsSqlCompletionSource({ dialect, getSchema: () => current, ensureColumns: async () => undefined })(new CompletionContext(state, pos, explicit))
 }
 
 describe('运维 SQL 联想', () => {
+  test('Given SQLite 方言 When 补全关键字 Then 不提示 MySQL 专属 SHOW', async () => {
+    const labels = (await complete('SH|', schema, true, 'sqlite'))?.options.map((item) => item.label.toUpperCase()) ?? []
+    expect(labels).not.toContain('SHOW')
+  })
   test('Given 中文前缀 When 自动联想 Then 不必手动按快捷键且后续汉字仍能过滤', async () => {
     const table = await complete('SELECT * FROM 用|', schema, false)
     expect(table?.options.map((item) => item.label)).toContain('用户资料')

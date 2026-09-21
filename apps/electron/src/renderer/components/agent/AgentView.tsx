@@ -135,6 +135,7 @@ import { useOpenSession } from '@/hooks/useOpenSession'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
+import { resolveAgentSendToolMode } from './AgentOpsAccessControl'
 import type { AgentDeferredQueueMessageInput, AgentMediaAttachment, AgentSendInput, AgentPendingFile, AgentThinkingLevel, CanvasNodeReference, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
 import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
@@ -1162,6 +1163,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         modelId: agentModelId || undefined,
         workspaceId: currentWorkspaceId || undefined,
         additionalDirectories: message.additionalDirectories,
+        toolMode: resolveAgentSendToolMode(store.get(agentSessionsAtom), sessionId),
         permissionModeOverride: permissionMode,
         dispatch: 'now',
         interrupt: streaming,
@@ -2403,6 +2405,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       modelId: agentModelId || undefined,
       workspaceId: currentWorkspaceId || undefined,
       startedAt: streamStartedAt,
+      toolMode: resolveAgentSendToolMode(store.get(agentSessionsAtom), sessionId),
       permissionModeOverride: permissionMode,
       ...(additionalDirectoriesForRun.size > 0 && { additionalDirectories: Array.from(additionalDirectoriesForRun) }),
       ...(mentions.mentionedSkills.length > 0 && { mentionedSkills: mentions.mentionedSkills }),
@@ -2525,6 +2528,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       modelId: agentModelId || undefined,
       workspaceId: currentWorkspaceId || undefined,
       startedAt: streamStartedAt,
+      toolMode: resolveAgentSendToolMode(store.get(agentSessionsAtom), sessionId),
       permissionModeOverride: permissionMode,
     }).catch((error) => {
       console.error('[AgentView] /compact 发送失败:', error)
@@ -2646,6 +2650,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       modelId: agentModelId || undefined,
       workspaceId: currentWorkspaceId || undefined,
       startedAt: streamStartedAt,
+      toolMode: resolveAgentSendToolMode(store.get(agentSessionsAtom), sessionId),
       permissionModeOverride: permissionMode,
       ...(retryOfErrorUuid && { retryOfErrorUuid }),
       ...(lastUserSDKMessage.mediaAttachments?.length
@@ -2696,6 +2701,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         workspaceId: currentWorkspaceId || undefined,
         mentionedSessionIds: [sessionId],
         startedAt: streamStartedAt,
+        toolMode: meta.toolMode ?? 'standard',
         permissionModeOverride: permissionMode,
       }).catch(console.error)
     } catch (error) {

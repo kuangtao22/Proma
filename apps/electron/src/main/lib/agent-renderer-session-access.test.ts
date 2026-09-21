@@ -1,3 +1,4 @@
+import { isAgentToolMode } from '@proma/shared'
 import { describe, expect, test } from 'bun:test'
 import { closeSync, constants, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -498,6 +499,7 @@ const RENDERER_HANDLER_POLICIES: Record<FullChannelKey, RendererHandlerPolicy> =
     'UPDATE_SESSION_CODEX_FAST_MODE',
     'UPDATE_SESSION_MODEL',
     'UPDATE_SESSION_PERMISSION_MODE',
+    'UPDATE_SESSION_TOOL_MODE',
     'UPDATE_SESSION_REASONING_LEVEL',
     'UPDATE_TITLE',
   ], { kind: 'agent-session', guards: ['requireVisibleSession'] }),
@@ -839,6 +841,40 @@ describe('普通 Renderer Agent IPC 会话访问矩阵', () => {
       const guardIndex = calls.findIndex((name) => policy.guards.includes(name))
       expect(guardIndex, `${key} 缺少声明的 ${policy.kind} guard`).toBeGreaterThanOrEqual(0)
     }
+  })
+
+  test('Given 持久化工具模式 When Renderer 切换或伪造模式 Then 先停止旧运行再保存，非法值无副作用', async () => {
+    const registered = loadAgentHandlers().handlers.find(({ channel }) => channel === 'UPDATE_SESSION_TOOL_MODE')!
+    const effects: string[] = []
+    const handler = compileHandler<(event: object, sessionId: string, mode: unknown) => Promise<unknown>>(registered, {
+      requireVisibleSession: (id: string) => { if (id !== 'visible') throw new Error('not-visible'); return { toolMode: 'standard' } },
+      isAgentToolMode,
+      stopAgent: () => effects.push('stop'),
+      updateAgentSessionMeta: (_id: string, update: object) => { effects.push('persist'); return update },
+    })
+    await expect(handler({}, 'hidden', 'server-ops-read')).rejects.toThrow('not-visible')
+    await expect(handler({}, 'visible', 'shell-unrestricted')).rejects.toThrow('AGENT_TOOL_MODE_INVALID')
+    expect(effects).toEqual([])
+    await expect(handler({}, 'visible', 'server-ops-read')).resolves.toEqual({ toolMode: 'server-ops-read' })
+    expect(effects).toEqual(['stop', 'persist'])
+  })
+
+  test('Given 有效只读授权 When 主进程归档会话 Then 先撤权取消再保存归档，恢复不自动重授', async () => {
+    /** Chat 与 Agent 存在同名归档通道，此处必须执行 Agent 的实际 handler。 */
+    const registered = loadAgentHandlers().handlers.find(({ namespace, channel }) => namespace === 'AGENT_IPC_CHANNELS' && channel === 'TOGGLE_ARCHIVE')!
+    const effects: string[] = []
+    let archived = false
+    const handler = compileHandler<(event: object, sessionId: string) => Promise<unknown>>(registered, {
+      requireVisibleSession: () => ({ archived }),
+      serverOpsIpcRegistration: { revokeSession: () => effects.push('revoke') },
+      stopAgent: () => effects.push('stop'),
+      updateAgentSessionMeta: (_id: string, update: { archived: boolean }) => { effects.push('persist'); archived = update.archived; return update },
+    })
+    await handler({}, 'visible')
+    expect(effects).toEqual(['revoke', 'stop', 'persist'])
+    effects.length = 0
+    await handler({}, 'visible')
+    expect(effects).toEqual(['persist'])
   })
 
   test('Given 策略被删除或源码新增 handler key When 校验完整覆盖 Then 都明确失败', () => {

@@ -58,3 +58,23 @@ test('Given 真实 Pi custom tool wrapper When updatedInput 篡改 hostId Then �
   }])
   expect(statusCalls).toEqual(['host-2'])
 })
+
+test('Given 恶意模型尝试宿主分派 When 运维只读模式 Then Bash/MCP/server_* 都拒绝执行', async () => {
+  const executed: string[] = []
+  const tools = ['ops_resources', 'Bash', 'mcp__other__tool', 'server_exec'].map((name) => sdk.defineTool({
+    name,
+    label: name,
+    description: name,
+    parameters: { type: 'object', properties: {} },
+    async execute() {
+      executed.push(name)
+      return { content: [{ type: 'text', text: 'executed' }], details: name }
+    },
+  }))
+  const wrapped = wrapCustomToolDefinitions(tools, async () => ({ behavior: 'allow', updatedInput: {} }), 'server-ops-read')
+  expect(wrapped.map((tool) => tool.name)).toEqual(['ops_resources'])
+  const forbidden = wrapCustomToolDefinitions(tools.slice(1), async () => ({ behavior: 'allow', updatedInput: {} }), 'server-ops-read')
+  expect(forbidden).toHaveLength(0)
+  expect(executed).toEqual([])
+  expect(wrapCustomToolDefinitions(tools, undefined, 'standard')).toHaveLength(4)
+})

@@ -1,6 +1,7 @@
 import { validateServerOpsSqlQuery } from '@proma/shared'
 import type { ServerOpsSqlDiagnostic } from '@proma/shared'
 import type { ServerOpsSqlCompletionProjection } from './server-ops-sql-completion-controller'
+import type { ServerOpsSqlDialect } from './server-ops-sql-completion'
 
 /** 编辑器诊断包含阻断错误与仅供参考的缓存提醒；位置沿用 parser 的 UTF-16 偏移。 */
 export interface ServerOpsSqlEditorDiagnostic extends Omit<ServerOpsSqlDiagnostic, 'category'> {
@@ -15,11 +16,16 @@ export interface ServerOpsSqlDraftValidation {
 }
 
 /** 校验当前草稿与已有结构快照，返回诊断；不加载结构、不执行 SQL、不写历史。 */
-export function validateServerOpsSqlDraft(sql: string, database: string | null, schema?: ServerOpsSqlCompletionProjection): ServerOpsSqlDraftValidation {
+export function validateServerOpsSqlDraft(
+  sql: string,
+  database: string | null,
+  schema?: ServerOpsSqlCompletionProjection,
+  dialect: ServerOpsSqlDialect = 'mysql',
+): ServerOpsSqlDraftValidation {
   if (!sql.trim()) return { status: 'empty', diagnostics: [] }
   if (!database) return { status: 'unavailable', diagnostics: [] }
   /** 与主进程共用同一 parser；前端校验不会扩展后台允许的语法。 */
-  const parsed = validateServerOpsSqlQuery(sql, database)
+  const parsed = validateServerOpsSqlQuery(sql, database, dialect)
   if (!parsed.plan) return { status: 'invalid', diagnostics: parsed.diagnostics.map((diagnostic) => ({ ...diagnostic, severity: 'error' })) }
   /** 只核对当前库已就绪的快照，加载失败、刷新中或切库时不作缺失推断。 */
   const diagnostics: ServerOpsSqlEditorDiagnostic[] = []

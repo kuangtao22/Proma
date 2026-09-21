@@ -90,6 +90,24 @@ async function expectErrorCode(promise: Promise<unknown>, code: string): Promise
 }
 
 describe('服务器运维 Overview Service', () => {
+  test('Given Agent 取消概览读取 When runtime 拒绝 Then 向 exec 传递信号并保留取消归因', async () => {
+    const controller = new AbortController()
+    const service = new ServerOpsOverviewService({
+      connections: {
+        getActiveIdentity: () => ({ hostId: 'host-1', connectionId: 'connection-1', generation: 1 }),
+        exec: async (_hostId, _connectionId, _command, _timeoutMs, signal) => {
+          expect(signal).toBe(controller.signal)
+          return new Promise<ServerOpsRuntimeExecResult>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('SERVER_OPS_EXEC_CANCELLED')), { once: true })
+          })
+        },
+      },
+      now: () => 1,
+    })
+    const pending = service.getOverview({ hostId: 'host-1' }, controller.signal)
+    controller.abort()
+    await expect(pending).rejects.toThrow('SERVER_OPS_EXEC_CANCELLED')
+  })
   test('Given 同一活跃身份的两个并发请求 When 采集完成 Then 单飞一次并返回固定参数与 capturedAt', async () => {
     /** 保持唯一 exec 在途以证明并发复用。 */
     const pendingExec = createDeferred<ServerOpsRuntimeExecResult>()

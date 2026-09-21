@@ -22,13 +22,14 @@ const dataSources: readonly ServerOpsDataSource[] = [
 describe('ServerOpsAgentReadAccess', () => {
   test('展示当前项目入口并保留跨项目已授权资源管理入口', () => {
     const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId="session-1" projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources} />)
-    expect(html).toContain('授权给当前 Agent')
-    expect(html).toContain('授权给当前 Agent')
+    expect(html).toContain('aria-label="Agent 只读授权"')
+    expect(html).not.toContain('结构/行/SQL 未启用')
+    expect(html).not.toContain('无租约')
   })
 
   test('无会话时入口不可用且不加载资源目录', () => {
     const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId={null} projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources} />)
-    expect(html).toMatch(/disabled=""[^>]*aria-label="授权给当前 Agent"|aria-label="授权给当前 Agent"[^>]*disabled=""/)
+    expect(html).toMatch(/disabled=""[^>]*aria-label="Agent 只读授权"|aria-label="Agent 只读授权"[^>]*disabled=""/)
   })
 
   test('授权说明明确SQL查询独立授权且仍受表范围约束', () => {

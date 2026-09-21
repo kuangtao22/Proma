@@ -157,6 +157,52 @@ describe('MySQL 只读 SQL 解析器', () => {
   })
 })
 
+describe('SQLite 只读 SQL 方言', () => {
+  test('Given SQLite 引用标识符与反斜杠字符串 When 分析 Then 安全重建且保留字面值', () => {
+    /** SQLite 接受双引号、方括号与兼容反引号标识符，反斜杠不是字符串转义符。 */
+    const plan = analyzeServerOpsSqlQuery(
+      'SELECT "u".[display name], `u`.`id` FROM [user records] AS "u" WHERE "u".[path] = \'C:\\\\tmp\'',
+      'main',
+      'sqlite',
+    )
+    expect(plan.tables).toEqual(['user records'])
+    expect(plan.sql).toContain("WHERE `u`.`path` = 'C:\\\\tmp'")
+    expect(validateServerOpsSqlQuery('SELECT [id] FROM [users]', 'main', 'sqlite').diagnostics).toEqual([])
+  })
+
+  test('Given SQLite 安全内置函数 When 分析 Then 允许列表并拒绝 MySQL 专属能力', () => {
+    /** 覆盖 SQLite 工作台开放的聚合、文本、日期和空值函数。 */
+    const sql = "SELECT COUNT(*), ROUND(ABS(score), 2), COALESCE(name, ''), IFNULL(alias, ''), NULLIF(code, ''), LOWER(name), UPPER(name), LENGTH(name), SUBSTR(name, 1, 2), SUBSTRING(name, 1, 2), DATE(created_at), DATETIME(created_at), STRFTIME('%Y', created_at), TRIM(name), LTRIM(name), RTRIM(name), REPLACE(name, 'a', 'b') FROM users"
+    expect(validateServerOpsSqlQuery(sql, 'main', 'sqlite').diagnostics).toEqual([])
+    for (const rejected of [
+      'SELECT NOW() FROM users',
+      'SELECT DATE_FORMAT(created_at, \'%Y\') FROM users',
+      'SELECT DATE_ADD(created_at, INTERVAL 1 DAY) FROM users',
+      'SELECT CONCAT(first_name, last_name) FROM users',
+    ]) expect(() => analyzeServerOpsSqlQuery(rejected, 'main', 'sqlite')).toThrow(/^SERVER_OPS_SQL_[A-Z_]+$/)
+  })
+
+  test('Given SQLite 库范围与只读边界 When 分析 Then 仅允许 main 单条 SELECT', () => {
+    expect(() => analyzeServerOpsSqlQuery('SELECT id FROM users', 'other', 'sqlite'))
+      .toThrow('SERVER_OPS_SQL_CROSS_DATABASE')
+    expect(analyzeServerOpsSqlQuery('SELECT id FROM main.users LIMIT 10 OFFSET 2', 'main', 'sqlite').tables)
+      .toEqual(['users'])
+    for (const sql of [
+      'ATTACH DATABASE \'/tmp/other.db\' AS other',
+      'SELECT id FROM other.users',
+      'SELECT id FROM users; SELECT id FROM orders',
+      'UPDATE users SET name = \'changed\'',
+    ]) expect(() => analyzeServerOpsSqlQuery(sql, 'main', 'sqlite')).toThrow(/^SERVER_OPS_SQL_[A-Z_]+$/)
+  })
+
+  test('Given 未指定方言 When 分析 Then 默认 MySQL 行为保持不变', () => {
+    expect(analyzeServerOpsSqlQuery('SELECT NOW() FROM users', 'app').sql).toBe('SELECT NOW() FROM `users`')
+    expect(() => analyzeServerOpsSqlQuery('SELECT [id] FROM [users]', 'app')).toThrow('SERVER_OPS_SQL_INVALID')
+    expect(() => analyzeServerOpsSqlQuery("SELECT id FROM users WHERE path = 'C:\\\\tmp'", 'app'))
+      .toThrow('SERVER_OPS_SQL_STRING_MODE_UNSAFE')
+  })
+})
+
 describe('MySQL 只读 SQL 诊断', () => {
   test('Given SELECT 缺少 FROM When 校验 Then 返回具体语法原因与 WHERE 位置', () => {
     const sql = 'SELECT * WHERE cbb_admin_account'

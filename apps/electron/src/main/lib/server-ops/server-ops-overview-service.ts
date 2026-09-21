@@ -8,7 +8,7 @@ import type { ServerOpsRuntimeExecResult } from '../../../utility/server-ops/ser
 /** Overview Service 使用的最小连接能力边界。 */
 export interface ServerOpsOverviewConnections {
   getActiveIdentity: (hostId: string) => ServerOpsActiveConnectionIdentity
-  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number) => Promise<ServerOpsRuntimeExecResult>
+  exec: (hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal) => Promise<ServerOpsRuntimeExecResult>
 }
 
 /** Overview Service 可替换依赖。 */
@@ -22,12 +22,14 @@ type ServerOpsOverviewErrorCode =
   | 'SERVER_OPS_CONNECTION_CHANGED'
   | 'SERVER_OPS_OVERVIEW_OUTPUT_INVALID'
   | 'SERVER_OPS_OVERVIEW_FAILED'
+  | 'SERVER_OPS_EXEC_CANCELLED'
 
 /** 判断错误是否属于允许原样保留的 Overview 稳定错误码。 */
 function isStableOverviewErrorCode(value: unknown): value is ServerOpsOverviewErrorCode {
   return value === 'SERVER_OPS_CONNECTION_CHANGED'
     || value === 'SERVER_OPS_OVERVIEW_OUTPUT_INVALID'
     || value === 'SERVER_OPS_OVERVIEW_FAILED'
+    || value === 'SERVER_OPS_EXEC_CANCELLED'
 }
 
 /** 将未知错误收敛为只含稳定 code 的公开 Error。 */
@@ -61,7 +63,8 @@ export class ServerOpsOverviewService {
   }
 
   /** 校验请求并复用相同连接身份的在途采集。 */
-  async getOverview(input: ServerOpsOverviewInput): Promise<ServerOpsOverviewResult> {
+  async getOverview(input: ServerOpsOverviewInput, signal?: AbortSignal): Promise<ServerOpsOverviewResult> {
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     /** 再次执行 Shared exact-key 输入校验，拒绝 Renderer 侧绕过。 */
     const parsedInput = parseServerOpsOverviewInput(input)
     /** 请求开始时捕获的完整活跃连接身份。 */
@@ -70,6 +73,7 @@ export class ServerOpsOverviewService {
     const key = createIdentityKey(identity)
     /** 同一身份已经存在的在途采集。 */
     const existing = this.pending.get(key)
+    if (signal !== undefined) return this.collect(identity, signal)
     if (existing) return existing
 
     /** 新身份独占的底层采集 Promise。 */
@@ -83,7 +87,7 @@ export class ServerOpsOverviewService {
   }
 
   /** 执行远程采集，并在三个边界复核连接身份。 */
-  private async collect(identity: ServerOpsActiveConnectionIdentity): Promise<ServerOpsOverviewResult> {
+  private async collect(identity: ServerOpsActiveConnectionIdentity, signal?: AbortSignal): Promise<ServerOpsOverviewResult> {
     this.assertIdentityUnchanged(identity)
     /** runtime 返回的完整 exec 结果。 */
     let execResult: ServerOpsRuntimeExecResult
@@ -93,6 +97,7 @@ export class ServerOpsOverviewService {
         identity.connectionId,
         SERVER_OPS_OVERVIEW_COMMAND,
         10_000,
+        signal,
       )
     } catch (error) {
       /** transport 失败时仍先确认是否实为连接切换竞态。 */
@@ -104,6 +109,7 @@ export class ServerOpsOverviewService {
     }
 
     this.assertIdentityUnchanged(identity)
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     if (!this.isValidExecResult(execResult)) throw new Error('SERVER_OPS_OVERVIEW_OUTPUT_INVALID')
 
     /** now() 生成的单次采集时间戳。 */

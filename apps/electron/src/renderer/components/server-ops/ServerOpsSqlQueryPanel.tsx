@@ -17,6 +17,7 @@ import type { ServerOpsDataSchemaCell } from '@proma/shared'
 import { ServerOpsSqlEditor } from './ServerOpsSqlEditor'
 import type { ServerOpsSqlEditorHandle } from './ServerOpsSqlEditor'
 import { createServerOpsSqlCompletionSource } from './server-ops-sql-completion'
+import type { ServerOpsSqlDialect } from './server-ops-sql-completion'
 import { createServerOpsSqlCompletionController, createServerOpsSqlCompletionIdleProjection, getServerOpsSqlCompletionContextKey } from './server-ops-sql-completion-controller'
 import type { ServerOpsSqlCompletionApi } from './server-ops-sql-completion-controller'
 import { validateServerOpsSqlDraft } from './server-ops-sql-validation'
@@ -41,6 +42,8 @@ export interface ServerOpsSqlQueryPanelProps {
   database: string | null
   configurationKey: string
   available: boolean
+  /** 查询解析、编辑与补全使用的数据源方言。 */
+  dialect?: ServerOpsSqlDialect
 }
 
 /** 查询结果纯视图，固定显示执行快照并让空结果保留真实列头。 */
@@ -71,7 +74,7 @@ export function ServerOpsSqlQueryResult({ execution, busy }: { execution: Server
 }
 
 /** 当前数据库下的按需只读 SQL 查询页面。 */
-export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationKey, available }: ServerOpsSqlQueryPanelProps): React.ReactElement {
+export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationKey, available, dialect = 'mysql' }: ServerOpsSqlQueryPanelProps): React.ReactElement {
   /** 每个 Pane 使用独立表单标识，标题标签可准确聚焦自己的编辑器。 */
   const editorId = React.useId()
   /** 独立无障碍说明标识保证双 Pane 中不会引用另一编辑器的诊断。 */
@@ -83,7 +86,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   const [completion, setCompletion] = useAtom(completionAtom)
   const completionController = React.useMemo(() => createServerOpsSqlCompletionController({ api, publish: setCompletion }), [api, setCompletion])
   /** 稳定 source 在每次补全时获取最新结构，避免键入时重新配置编辑器。 */
-  const completionSource = React.useMemo(() => createServerOpsSqlCompletionSource({ getSchema: completionController.snapshot, ensureCatalog: completionController.ensureCatalog, ensureColumns: completionController.ensureColumns }), [completionController])
+  const completionSource = React.useMemo(() => createServerOpsSqlCompletionSource({ dialect, getSchema: completionController.snapshot, ensureCatalog: completionController.ensureCatalog, ensureColumns: completionController.ensureColumns }), [completionController, dialect])
   const completionContextKey = getServerOpsSqlCompletionContextKey({ sourceId, database, configurationKey, available })
   const visibleCompletion = React.useMemo(() => completion.contextKey === completionContextKey ? completion : createServerOpsSqlCompletionIdleProjection(), [completion, completionContextKey])
   /** 草稿、查询行和执行快照只存在于当前组件的私有 atom。 */
@@ -147,15 +150,15 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
     if (composing || !database || !projection.draft.trim()) return
     /** 停顿 350ms 后只读取现有结构，快速输入和卸载会清理待执行校验。 */
     const timer = setTimeout(() => {
-      setValidation({ sql: projection.draft, contextKey: completionContextKey, result: validateServerOpsSqlDraft(projection.draft, database, visibleCompletion) })
+      setValidation({ sql: projection.draft, contextKey: completionContextKey, result: validateServerOpsSqlDraft(projection.draft, database, visibleCompletion, dialect) })
     }, 350)
     return () => clearTimeout(timer)
-  }, [projection.draft, database, completionContextKey, visibleCompletion, composing, setValidation])
+  }, [projection.draft, database, completionContextKey, visibleCompletion, composing, dialect, setValidation])
 
   /** 手动校验及执行前检查共用纯函数，不调用查询或历史接口。 */
   const validateDraft = (locate: boolean): ServerOpsSqlDraftValidation => {
     const sql = controller.snapshot().draft
-    const result = validateServerOpsSqlDraft(sql, database, visibleCompletion)
+    const result = validateServerOpsSqlDraft(sql, database, visibleCompletion, dialect)
     setValidation({ sql, contextKey: completionContextKey, result })
     if (locate && result.diagnostics[0]) editorRef.current?.reveal(result.diagnostics[0])
     return result
@@ -191,7 +194,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   const emptyTitle = unavailableReason ? '暂时无法查询' : projection.status === 'cancelling' ? '正在取消查询' : busy ? '正在执行查询' : projection.error ? '查询未完成' : '等待执行查询'
   /** 空白区只显示当前最相关的操作提示，详细语法规则放入查询说明。 */
   const emptyDescription = unavailableReason ?? (projection.status === 'cancelling' ? '正在释放本次查询，完成后可重新执行。' : busy ? '查询完成后，结果会显示在这里。' : projection.error ? '请根据上方提示处理后重试。' : '在上方输入 SQL，点击「执行」或使用快捷键。')
-  return <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto" data-server-ops-sql-query>
+  return <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto" data-server-ops-sql-query data-server-ops-sql-dialect={dialect}>
     <section className="m-3 shrink-0 overflow-hidden rounded-xl border border-border/60 bg-content-area" aria-label="SQL 查询编辑区" data-server-ops-sql-editor-region>
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-border/40 bg-muted/20 px-3 py-1.5">
         <label htmlFor={editorId} className="flex items-center gap-1.5 text-xs font-medium"><Code2 className="size-3.5 text-muted-foreground" aria-hidden="true" />SQL 编辑器</label>
@@ -201,7 +204,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
           <PopoverContent align="end" className="z-[260] w-80 max-w-[calc(100vw-2rem)] space-y-2 text-xs leading-5">
             <h3 className="font-medium">只读查询说明</h3>
             <p className="text-muted-foreground">支持当前库基础表的单条 SELECT、筛选、排序、分组聚合与受控 JOIN，不修改数据库。暂不支持子查询、UNION、视图和跨库查询。</p>
-            <p className="text-muted-foreground">每次最多返回 200 行。大字段请明确选择字段，或使用 <code className="break-words font-mono text-foreground">SUBSTRING(字段, 1, 256)</code>。</p>
+            <p className="text-muted-foreground">每次最多返回 200 行。大字段请明确选择字段，或使用 <code className="break-words font-mono text-foreground">{dialect === 'sqlite' ? 'substr(字段, 1, 256)' : 'SUBSTRING(字段, 1, 256)'}</code>。</p>
             <p className="text-muted-foreground">查询结果不会自动刷新，修改 SQL 后需要重新执行。</p>
           </PopoverContent>
         </Popover>
@@ -213,6 +216,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
         completionSource={completionSource}
         diagnostics={diagnostics}
         diagnosticsId={diagnosticsId}
+        dialect={dialect}
         value={projection.draft}
         onChange={(value) => controller.setDraft(value)}
         onExecute={executeQuery}

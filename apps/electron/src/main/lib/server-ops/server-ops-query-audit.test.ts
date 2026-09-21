@@ -103,6 +103,27 @@ describe('SQL 查询先审计后执行', () => {
     expect(records.at(-1)?.errorCode).toBe('SERVER_OPS_DATA_QUERY_COLUMN_TOO_LARGE')
     expect(JSON.stringify(records)).not.toContain('private SQL payload')
   })
+  test('Given runtime 监听取消并拒绝 When 授权已撤销 Then 审计和调用方优先收到撤权原因', async () => {
+    const controller = new AbortController()
+    const records: ServerOpsAuditRecord[] = []
+    let revoked = false
+    const operation = runAuditedServerOpsQuery({ summary, actor: { actor: 'agent', sessionId: 's-1' },
+      check: () => { if (revoked) throw new Error('SERVER_OPS_AGENT_GRANT_CHANGED') },
+      audit: { append: (input) => {
+        const record = { ...input, id: `a-${records.length}`, timestamp: Date.now() }
+        records.push(record)
+        return record
+      } },
+      execute: () => new Promise<ServerOpsDataQueryResult>((_resolve, reject) => {
+        controller.signal.addEventListener('abort', () => reject(new ServerOpsRuntimeError('SERVER_OPS_DATA_CANCELLED', 'runtime abort')), { once: true })
+      }),
+    })
+    await Promise.resolve()
+    revoked = true
+    controller.abort()
+    await expect(operation).rejects.toThrow('SERVER_OPS_AGENT_GRANT_CHANGED')
+    expect(records.at(-1)?.errorCode).toBe('SERVER_OPS_AGENT_GRANT_CHANGED')
+  })
   test('Given 授权检查与审计正常 When 查询 Then 按开始/执行/结果顺序记录且不含业务值', async () => {
     const records: ServerOpsAuditRecord[] = []
     const output = await runAuditedServerOpsQuery({ summary, actor: { actor: 'agent', sessionId: 's-1' }, check: () => {},

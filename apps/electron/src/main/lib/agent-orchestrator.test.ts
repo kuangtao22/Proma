@@ -131,11 +131,11 @@ describe('Agent sendMessage 准入顺序合同', () => {
     const body = source.slice(sendStart, sendEnd)
 
     expect(body).toContain("const runSkillsEnabled = extensions.skillsMode !== 'disabled'")
-    expect(body).toContain('for (const slug of runSkillsEnabled ? mentionedSkills ?? [] : [])')
-    expect(body).toContain('...(workspaceSlug && runSkillsEnabled ? {')
-    expect(body).toContain('...(runSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {})')
-    expect(body).toContain('...(runSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {})')
-    expect(body).toContain('activeToolNames: resolvePiActiveToolNames(')
+    expect(body).toContain('for (const slug of runWorkspaceSkillsEnabled ? mentionedSkills ?? [] : [])')
+    expect(body).toContain('...(workspaceSlug && runWorkspaceSkillsEnabled ? {')
+    expect(body).toContain('...(runWorkspaceSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {})')
+    expect(body).toContain('...(runWorkspaceSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {})')
+    expect(body).toContain("activeToolNames: runToolMode === 'server-ops-read' ? resolveAgentModeToolNames(runToolMode) : resolvePiActiveToolNames(")
   })
 
   test('Given sendMessage 实现 When 检查迁移拒绝分支 Then 它早于 active、retry 删除、消息落盘和首次 await', () => {

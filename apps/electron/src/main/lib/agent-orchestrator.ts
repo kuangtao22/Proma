@@ -19,9 +19,12 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { accessSync, constants, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { app } from 'electron'
-import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentActiveSessionSnapshot, AgentMediaAttachment, CanvasNodeReference, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
+import type { AgentSendInput, AgentMessage, AgentGenerateTitleInput, AgentProviderAdapter, AgentSessionMeta, AgentToolMode, AgentActiveSessionSnapshot, AgentMediaAttachment, CanvasNodeReference, CodexOAuthCredentials, XaiOAuthCredentials, TypedError, SDKMessage, SDKAssistantMessage, AgentStreamPayload, AgentAssistantDeltaPayload, RewindSessionResult, SkillActivation } from '@proma/shared'
 import {
   PROMA_DEFAULT_PERMISSION_MODE,
+  AGENT_DEFAULT_TOOL_MODE,
+  isAgentToolMode,
+  isOrdinaryTopLevelAgentSession,
   PROMA_PERMISSION_MODE_CONFIG,
   THINKING_SIGNATURE_ERROR_CODE,
   THINKING_SIGNATURE_ERROR_MESSAGE,
@@ -41,6 +44,7 @@ import { getMainRepoRoot } from './git-diff-service'
 import { getPiAssistantErrorDetails, hasPiAssistantTextContent, stripPiAssistantError } from './adapters/pi-message-adapter'
 import { friendlyErrorMessage, isPromptTooLongError, isThinkingSignatureError, mapAgentErrorToTypedError } from './agent-error-utils'
 import { getActiveRunRejectionMessage, shouldPersistInitialUserMessage } from './agent-send-message-policy'
+import { createAgentRunIdentity, type AgentRunIdentity } from './agent-run-identity'
 import { isSessionNotFoundError } from './error-patterns'
 import { AgentEventBus } from './agent-event-bus'
 import { isStaleActiveQueueError } from './agent-queue-routing'
@@ -66,7 +70,9 @@ import { askUserService } from './agent-ask-user-service'
 import { exitPlanService, type ExitPlanPermissionResult } from './agent-exit-plan-service'
 import {
   createRunToolCallLimiter,
+  denyToolOutsideAgentMode,
   denyToolOutsideRunAllowlist,
+  resolveAgentModeToolNames,
   resolvePiActiveToolNames,
 } from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
@@ -271,6 +277,8 @@ export class AgentOrchestrator {
   private adapter: AgentProviderAdapter
   private eventBus: AgentEventBus
   private activeSessions = new Map<string, number>()
+  /** 当前代际的远端只读调用取消控制器；旧代际收尾不得清除新代际。 */
+  private activeRunControllers = new Map<string, AgentRunIdentity>()
   private activeSessionStartedAt = new Map<string, number>()
   private nextRunGenerationBySession = new Map<string, number>()
 
@@ -740,7 +748,7 @@ export class AgentOrchestrator {
     let userMessagePersisted = false
     let initialUserMessageUuid: string | undefined
     let sessionMeta = getAgentSessionMeta(sessionId)
-    /** 隔离外部 terminal callback 异常并保证完成通知 exactly-once。 */
+    /** 即使入参非法，也通过单次终态通知器隔离调用方回调异常。 */
     const terminalNotifier = createAgentRunTerminalNotifier<AgentMessage[], AgentRunCompleteOptions>({
       onError: callbacks.onError,
       onComplete: callbacks.onComplete,
@@ -748,6 +756,31 @@ export class AgentOrchestrator {
         console.error(`[Agent 编排] terminal ${kind} callback 执行失败:`, error)
       },
     })
+    /** 会话模式是主进程持久化事实；发送快照不允许隐式切换工具权限。 */
+    const persistedToolMode = sessionMeta?.toolMode ?? AGENT_DEFAULT_TOOL_MODE
+    if (!isAgentToolMode(persistedToolMode) || (input.toolMode !== undefined && !isAgentToolMode(input.toolMode))) {
+      terminalNotifier.onError('Agent 工具运行模式非法')
+      terminalNotifier.onComplete([], { startedAt: streamStartedAt })
+      return
+    }
+    if (input.toolMode !== undefined && input.toolMode !== persistedToolMode) {
+      if (this.isActive(sessionId)) this.stop(sessionId)
+      terminalNotifier.onError('Agent 工具模式已变化，请重新发送消息')
+      terminalNotifier.onComplete([], { startedAt: streamStartedAt })
+      return
+    }
+    /** 非交互与内部会话无权使用用户会话的受限运维身份。 */
+    const runToolMode: AgentToolMode = persistedToolMode
+    /** 受限运行不加载可携带额外指令或动态工具的工作区 Skills。 */
+    const runWorkspaceSkillsEnabled = runSkillsEnabled && runToolMode === 'standard'
+    if (runToolMode === 'server-ops-read' && (
+      (input.triggeredBy !== undefined && input.triggeredBy !== 'user')
+      || !sessionMeta || !isOrdinaryTopLevelAgentSession(sessionMeta)
+    )) {
+      terminalNotifier.onError('运维只读模式仅供用户显式授权的独立会话使用')
+      terminalNotifier.onComplete([], { startedAt: streamStartedAt })
+      return
+    }
     /** 当前请求同步占用的运行代际；0 表示尚未持有运行槽。 */
     let runGeneration = 0
 
@@ -756,6 +789,11 @@ export class AgentOrchestrator {
       if (runGeneration === 0) return
       const ownsActiveRun = this.activeSessions.get(sessionId) === runGeneration
       if (ownsActiveRun) {
+        const activeController = this.activeRunControllers.get(sessionId)
+        if (activeController && activeController.generation === runGeneration) {
+          activeController.abort()
+          this.activeRunControllers.delete(sessionId)
+        }
         this.activeSessions.delete(sessionId)
         this.activeSessionStartedAt.delete(sessionId)
         this.sessionPermissionModes.delete(sessionId)
@@ -837,6 +875,12 @@ export class AgentOrchestrator {
       return
     }
     runGeneration = this.reserveRunGeneration(sessionId)
+    const runIdentity = createAgentRunIdentity(sessionId, runGeneration, () => (
+      this.activeSessions.get(sessionId) === runGeneration
+      && isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)
+      && (getAgentSessionMeta(sessionId)?.toolMode ?? AGENT_DEFAULT_TOOL_MODE) === runToolMode
+    ))
+    this.activeRunControllers.set(sessionId, runIdentity)
     this.activeSessions.set(sessionId, runGeneration)
     this.activeSessionStartedAt.set(sessionId, streamStartedAt)
     this.latestRunGenerations.set(sessionId, runGeneration)
@@ -1141,20 +1185,24 @@ export class AgentOrchestrator {
       }
 
       // 10. 构建 MCP 服务器配置 + 记忆工具 + 生图工具 + 自定义工具
-      const mcpServers = await this.buildMcpServers(workspaceSlug, proxyUrl)
+      const mcpServers = runToolMode === 'server-ops-read' ? {} : await this.buildMcpServers(workspaceSlug, proxyUrl)
       let piBuiltinTools: unknown[] = []
       let piMcpTools: unknown[] = []
       const piSdk = await import('@earendil-works/pi-coding-agent')
       checkpoint()
       /** 仅已初始化 Server Ops 上下文与普通交互来源会得到非空会话级 Facade。 */
-      const serverOpsFacade = createServerOpsAgentFacade({
+      const serverOpsFacade = runToolMode === 'standard' ? createServerOpsAgentFacade({
         sessionId,
         triggeredBy: input.triggeredBy,
         getSession: getAgentSessionMeta,
-      })
+      }) : undefined
       /** 只读多资源能力复用同一真实运行身份，内部/自动化来源不继承用户临时授权。 */
-      const serverOpsReadFacade = createServerOpsAgentReadFacade({ sessionId, triggeredBy: input.triggeredBy, getSession: getAgentSessionMeta })
+      const serverOpsReadFacade = createServerOpsAgentReadFacade({
+        sessionId, triggeredBy: input.triggeredBy, getSession: getAgentSessionMeta,
+        runSignal: runIdentity.signal, assertRunActive: runIdentity.assertActive,
+      })
       const builtinMcpResult = await buildPiBuiltinTools(piSdk, {
+        toolMode: runToolMode,
         sessionId,
         channelId,
         modelId: selectedModelId,
@@ -1208,9 +1256,9 @@ export class AgentOrchestrator {
         enrichedMessage = `${referencedSessionsBlock}\n\n${enrichedMessage}`
         console.log(`[Agent 编排] 注入 referenced_sessions: ${mentionedSessionIds?.length ?? 0} sessions`)
       }
-      if ((runSkillsEnabled && mentionedSkills?.length) || mentionedMcpServers?.length) {
+      if ((runWorkspaceSkillsEnabled && mentionedSkills?.length) || (runToolMode === 'standard' && mentionedMcpServers?.length)) {
         const toolLines: string[] = ['用户在消息中明确引用了以下工具，请在本次回复中主动调用：']
-        for (const slug of runSkillsEnabled ? mentionedSkills ?? [] : []) {
+        for (const slug of runWorkspaceSkillsEnabled ? mentionedSkills ?? [] : []) {
           const qualifiedName = workspaceSlug
             ? `proma-workspace-${workspaceSlug}:${slug}`
             : slug
@@ -1361,7 +1409,10 @@ export class AgentOrchestrator {
 
       /** 旧代际在异步审批返回后统一得到拒绝，防止迟到工具继续执行。 */
       const denyStaleToolRun = (): PermissionResult | undefined => (
-        isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)
+        !runIdentity.signal.aborted
+          && this.activeSessions.get(sessionId) === runGeneration
+          && isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)
+          && (getAgentSessionMeta(sessionId)?.toolMode ?? AGENT_DEFAULT_TOOL_MODE) === runToolMode
           ? undefined
           : { behavior: 'deny', message: '当前 Agent 运行已停止，拒绝执行迟到工具调用' }
       )
@@ -1386,6 +1437,9 @@ export class AgentOrchestrator {
         /** 工具调用进入权限边界时的代际检查。 */
         const staleAtEntry = denyStaleToolRun()
         if (staleAtEntry) return staleAtEntry
+        /** 与 Pi 注册层独立的真实宿主分派白名单。 */
+        const modeDenial = denyToolOutsideAgentMode(toolName, runToolMode)
+        if (modeDenial) return modeDenial
         /** 单次运行白名单先于参数解析生效，bypassPermissions 也不能绕过。 */
         /** 普通 Agent 的 Canvas 工具采用追加模式，不能用局部名单删除既有工具能力。 */
         const runPolicyDenial = extensions.allowedToolNamesMode === 'extend'
@@ -1809,9 +1863,12 @@ export class AgentOrchestrator {
           event: { type: 'context_window', contextWindow },
         })
       }
-      const piCustomTools = [...piBuiltinTools, ...piMcpTools, ...(extensions.piCustomTools ?? [])]
+      const piCustomTools = runToolMode === 'server-ops-read'
+        ? piBuiltinTools
+        : [...piBuiltinTools, ...piMcpTools, ...(extensions.piCustomTools ?? [])]
       const queryOptions: PiAgentQueryOptions = {
         sessionId,
+        toolMode: runToolMode,
         prompt: finalPrompt,
         // 旧持久化模型 ID 可能带 `[1m]` 上下文后缀；Pi runtime 不支持该变体：
         // 智谱等端点不识别 glm-5.2[1m] 这类后缀，会返回 1211「模型不存在」。
@@ -1840,17 +1897,17 @@ export class AgentOrchestrator {
         initialUserMessageUuid,
         piAgentDir: getSdkConfigDir(),
         piSessionDir: join(getSdkConfigDir(), 'sessions'),
-        activeToolNames: resolvePiActiveToolNames(
+        activeToolNames: runToolMode === 'server-ops-read' ? resolveAgentModeToolNames(runToolMode) : resolvePiActiveToolNames(
           extensions.allowedToolNames,
           extensions.allowedToolNamesMode,
         ),
         ...(allAdditionalDirectories.length > 0 && { additionalDirectories: allAdditionalDirectories }),
-        ...(workspaceSlug && runSkillsEnabled ? {
+        ...(workspaceSlug && runWorkspaceSkillsEnabled ? {
           additionalSkillPaths: [getWorkspaceSkillsDir(workspaceSlug)],
           skillWorkspaceSlug: workspaceSlug,
         } : {}),
-        ...(runSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
-        ...(runSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {}),
+        ...(runWorkspaceSkillsEnabled && mentionedSkills?.length ? { skillMentions: mentionedSkills } : {}),
+        ...(runWorkspaceSkillsEnabled ? { onSkillActivated: recordSkillActivation } : {}),
         ...(isCompactCommand ? { compactRequest: true } : {}),
         ...(sessionMeta?.codexFastMode && channel.provider === 'openai-codex' ? { codexFastMode: true } : {}),
         ...(codexOAuthCredentials && {
@@ -2514,6 +2571,11 @@ export class AgentOrchestrator {
    */
   stop(sessionId: string, stopBeforeRun = false): void {
     const runGeneration = this.activeSessions.get(sessionId)
+    const activeController = this.activeRunControllers.get(sessionId)
+    if (activeController && activeController.generation === runGeneration) {
+      activeController.abort()
+      this.activeRunControllers.delete(sessionId)
+    }
     this.activeSessions.delete(sessionId)
     this.activeSessionStartedAt.delete(sessionId)
     this.sessionPermissionModes.delete(sessionId)

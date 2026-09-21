@@ -19,8 +19,10 @@ describe('运维只读授权合同', () => {
     const parsed = parseServerOpsAgentReadGrant(grant)
     expect(parsed).toEqual(grant)
     expect(parsed.resources).not.toBe(grant.resources)
-    expect(parseServerOpsAgentReadAccess({ ...grant, revision: 1, grantedAt: 1 })).toEqual({ ...grant, revision: 1, grantedAt: 1 })
+    expect(parseServerOpsAgentReadAccess({ ...grant, revision: 1, grantedAt: 1, expiresAt: 1_800_001 })).toEqual({ ...grant, revision: 1, grantedAt: 1, expiresAt: 1_800_001 })
     expect(parseServerOpsAgentReadAccess(null)).toBeNull()
+    expect(() => parseServerOpsAgentReadAccess({ ...grant, revision: 1, grantedAt: 1 })).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+    expect(() => parseServerOpsAgentReadAccess({ ...grant, revision: 1, grantedAt: 1, expiresAt: 1 })).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
   })
   test('Given 未知字段、重复资源、空表授权或非布尔权限 Then 拒绝', () => {
     for (const input of [
@@ -40,5 +42,22 @@ describe('运维只读授权合同', () => {
     const resources = Array.from({ length: 20 }, (_, index) => ({ kind: 'mysql', sourceId: `db-${index}`, instance: false,
       databases: [{ database: 'app', tables: Array.from({ length: 30 }, (_, table) => `${table}-${'名'.repeat(120)}`), readRows: false }] }))
     expect(() => parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources })).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+  })
+  test('Given SQLite 资源 When 授权 Then 仅允许 main 且禁止实例范围', () => {
+    /** SQLite 仍需显式授予表、行和 SQL 查询，不能从 SSH 或 MySQL 权限继承。 */
+    const sqliteGrant: ServerOpsAgentReadGrant = {
+      sessionId: 'session-1',
+      resources: [{
+        kind: 'sqlite', sourceId: 'sqlite-1', instance: false,
+        databases: [{ database: 'main', tables: ['orders'], readRows: true, query: true }],
+      }],
+    }
+    expect(parseServerOpsAgentReadGrant(sqliteGrant)).toEqual(sqliteGrant)
+    for (const resource of [
+      { ...sqliteGrant.resources[0], instance: true },
+      { ...sqliteGrant.resources[0], databases: [{ database: 'other', tables: ['orders'], readRows: true }] },
+      { ...sqliteGrant.resources[0], databases: [] },
+    ]) expect(() => parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [resource] }))
+      .toThrow('SERVER_OPS_READ_ACCESS_INVALID')
   })
 })

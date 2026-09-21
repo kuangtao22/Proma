@@ -14,6 +14,21 @@ import type {
   ServerOpsLogStartResult,
   ServerOpsOverviewResult,
 } from '@proma/shared'
+
+test('Given 旧SSH授权覆盖只读租约 When 用户已确认影响 Then 提交原影响token', async () => {
+  const calls: Array<{ token?: string; granted: boolean }> = []
+  const controller = createServerOpsAgentAccessController({
+    getAccess: async () => null,
+    setAccess: async (access, token) => { calls.push({ token, granted: access.granted }); return access },
+    publish: () => undefined,
+    reportError: () => undefined,
+  })
+  controller.activate()
+  await controller.select({ sessionId: 'session-1', hostId: 'host-1' })
+  await controller.toggle('captured-impact-token')
+  expect(calls).toEqual([{ token: 'captured-impact-token', granted: true }])
+  controller.dispose()
+})
 import {
   createServerOpsAuditController,
   createServerOpsAgentAccessController,
@@ -21,6 +36,7 @@ import {
   resolveServerOpsAgentAccessSession,
   resolveServerOpsAgentAccessTarget,
   resolveServerOpsAgentAccessViewState,
+  resolveServerOpsProjectDataSourceHosts,
   shouldPromptForServerOpsCredential,
   ServerOpsWorkspaceView,
   serverOpsDataApi,
@@ -33,6 +49,7 @@ import { ServerOpsServicesPanel } from './ServerOpsServicesPanel'
 import { createServerOpsLogsController, ServerOpsLogsPanel } from './ServerOpsLogsPanel'
 import type { ServerOpsLogsController, ServerOpsLogsProjection } from './ServerOpsLogsPanel'
 import { buildServerOpsConnections, resolveServerOpsWorkspaceTarget } from './server-ops-connections'
+import type { ServerOpsConnection } from './server-ops-connections'
 import { createServerOpsSqlQueryHistoryController } from './server-ops-sql-query-history-controller'
 import { createServerOpsSqlQueryController } from './server-ops-sql-query-controller'
 
@@ -64,6 +81,18 @@ test('Given 实际工作区加载旧 preload When 进入 SQL 工作台 Then 禁�
     if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow)
     else Reflect.deleteProperty(globalThis, 'window')
   }
+})
+
+test('Given 项目有多台服务器 When 新建数据源 Then 网络引擎沿用首台跳板且 SQLite 可选择全部服务器', () => {
+  const connections: ServerOpsConnection[] = [
+    { id: 'ssh:host-a', kind: 'ssh', projectId: 'project-1', label: '应用服务器', detail: 'ops@10.0.0.8:22', hostId: 'host-a' },
+    { id: 'ssh:host-b', kind: 'ssh', projectId: 'project-1', label: '审计服务器', detail: 'ops@10.0.0.9:22', hostId: 'host-b' },
+    { id: 'ssh:host-c', kind: 'ssh', projectId: 'project-2', label: '其他项目', detail: 'ops@10.0.1.8:22', hostId: 'host-c' },
+  ]
+  expect(resolveServerOpsProjectDataSourceHosts(connections, 'project-1')).toEqual({
+    defaultHost: { id: 'host-a', label: '应用服务器' },
+    hostOptions: [{ id: 'host-a', label: '应用服务器' }, { id: 'host-b', label: '审计服务器' }],
+  })
 })
 
 test('Given 新 preload 已加载 When 实际工作区读取历史 Then 保留桥接返回值与原始数据库范围', async () => {

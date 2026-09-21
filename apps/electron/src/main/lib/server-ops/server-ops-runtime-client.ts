@@ -80,6 +80,10 @@ interface PendingExec {
   resolve: (result: ServerOpsRuntimeExecResult) => void
   reject: (error: ServerOpsRuntimeError) => void
   timeout: ReturnType<typeof setTimeout>
+  /** abort 后保留占位，直到 utility 确认 SSH channel 已关闭。 */
+  cancelRequested: boolean
+  /** 完成后卸载监听，避免在长会话内持有调用者。 */
+  removeAbortListener: () => void
 }
 /** 在途的数据服务读取请求；结果只允许回给发起它的完整连接身份。 */
 interface PendingDataRead {
@@ -311,6 +315,7 @@ export class ServerOpsRuntimeClient {
     for (const [requestId, pending] of this.pendingExecs) {
       if (pending.hostId !== hostId || pending.connectionId !== connectionId) continue
       clearTimeout(pending.timeout)
+      pending.removeAbortListener()
       pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       this.pendingExecs.delete(requestId)
     }
@@ -450,19 +455,33 @@ export class ServerOpsRuntimeClient {
   }
 
   /** 在已连接 SSH 上执行无 PTY 命令，并返回结构化结果。 */
-  async exec(hostId: string, connectionId: string, command: string, timeoutMs: number): Promise<ServerOpsRuntimeExecResult> {
+  async exec(hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal): Promise<ServerOpsRuntimeExecResult> {
     if (this.activeConnections.get(connectionId) !== hostId) {
       throw new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_NOT_ACTIVE', 'SSH 连接未激活')
     }
     await this.start()
+    if (signal?.aborted) throw new ServerOpsRuntimeError('SERVER_OPS_EXEC_CANCELLED', '远程读取已取消')
     const requestId = this.dependencies.uuid()
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingExecs.delete(requestId)
-        reject(new ServerOpsRuntimeError('SERVER_OPS_EXEC_TIMEOUT', '远程命令执行超时'))
+        pending.removeAbortListener()
+        if (pending.cancelRequested) this.stop()
+        reject(new ServerOpsRuntimeError(pending.cancelRequested ? 'SERVER_OPS_EXEC_CANCELLED' : 'SERVER_OPS_EXEC_TIMEOUT', '远程命令执行已结束'))
       }, timeoutMs + 1000)
-      this.pendingExecs.set(requestId, { hostId, connectionId, resolve, reject, timeout })
+      const onAbort = (): void => {
+        const pending = this.pendingExecs.get(requestId)
+        if (!pending || pending.cancelRequested) return
+        pending.cancelRequested = true
+        try { this.port?.postMessage({ type: 'server-ops.exec-cancel', requestId, hostId, connectionId }) }
+        catch { this.stop() }
+      }
+      const pending: PendingExec = { hostId, connectionId, resolve, reject, timeout, cancelRequested: false,
+        removeAbortListener: () => signal?.removeEventListener('abort', onAbort) }
+      this.pendingExecs.set(requestId, pending)
       this.port?.postMessage({ type: 'server-ops.exec', input: { requestId, hostId, connectionId, command, timeoutMs } })
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
@@ -711,7 +730,18 @@ export class ServerOpsRuntimeClient {
       if (!pending || pending.hostId !== message.hostId || pending.connectionId !== message.connectionId) return
       clearTimeout(pending.timeout)
       this.pendingExecs.delete(message.requestId)
-      pending.resolve(message.result)
+      pending.removeAbortListener()
+      if (pending.cancelRequested) pending.reject(new ServerOpsRuntimeError('SERVER_OPS_EXEC_CANCELLED', '远程读取已取消'))
+      else pending.resolve(message.result)
+      return
+    }
+    if (message.type === 'server-ops.exec-cancelled') {
+      const pending = this.pendingExecs.get(message.requestId)
+      if (!pending || !pending.cancelRequested || pending.hostId !== message.hostId || pending.connectionId !== message.connectionId) return
+      clearTimeout(pending.timeout)
+      this.pendingExecs.delete(message.requestId)
+      pending.removeAbortListener()
+      pending.reject(new ServerOpsRuntimeError('SERVER_OPS_EXEC_CANCELLED', '远程读取已取消'))
       return
     }
     if (message.type === 'server-ops.data-read-result') {
@@ -738,7 +768,7 @@ export class ServerOpsRuntimeClient {
       const pending = this.pendingConnects.get(message.requestId)
       if (pending && pending.hostId === message.hostId && pending.connectionId === message.connectionId) { clearTimeout(pending.timeout); this.pendingConnects.delete(message.requestId); pending.reject(new ServerOpsRuntimeError(message.code, message.message)) }
       const exec = this.pendingExecs.get(message.requestId)
-      if (exec && exec.hostId === message.hostId && exec.connectionId === message.connectionId) { clearTimeout(exec.timeout); this.pendingExecs.delete(message.requestId); exec.reject(new ServerOpsRuntimeError(message.code, message.message)) }
+      if (exec && exec.hostId === message.hostId && exec.connectionId === message.connectionId) { clearTimeout(exec.timeout); this.pendingExecs.delete(message.requestId); exec.removeAbortListener(); exec.reject(exec.cancelRequested ? new ServerOpsRuntimeError('SERVER_OPS_EXEC_CANCELLED', '远程读取已取消') : new ServerOpsRuntimeError(message.code, message.message)) }
       const dataRead = this.pendingDataReads.get(message.requestId)
       if (dataRead && dataRead.hostId === message.hostId && dataRead.connectionId === message.connectionId) {
         clearTimeout(dataRead.timeout)
@@ -837,6 +867,7 @@ export class ServerOpsRuntimeClient {
       for (const [requestId, pending] of this.pendingExecs) {
         if (pending.connectionId !== message.event.connectionId) continue
         clearTimeout(pending.timeout)
+        pending.removeAbortListener()
         this.pendingExecs.delete(requestId)
         pending.reject(new ServerOpsRuntimeError('SERVER_OPS_CONNECTION_CLOSED', 'SSH 连接已断开'))
       }
@@ -957,6 +988,7 @@ export class ServerOpsRuntimeClient {
   private rejectPendingExec(error: ServerOpsRuntimeError): void {
     for (const pending of this.pendingExecs.values()) {
       clearTimeout(pending.timeout)
+      pending.removeAbortListener()
       pending.reject(error)
     }
     this.pendingExecs.clear()

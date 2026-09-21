@@ -4,11 +4,11 @@ import type { ServerOpsSftpRequest, ServerOpsSftpResult } from './server-ops-sft
 import type { ServerOpsHostKey, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck, ServerOpsTerminalOutputEvent } from '@proma/shared'
 import { parseServerOpsConsoleAck, parseServerOpsConsoleExitEvent, parseServerOpsConsoleIdentity,
   parseServerOpsConsoleInput, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleResizeInput } from '@proma/shared'
-import { isServerOpsDataCapability, isServerOpsDataEngine, parseServerOpsDataMetricList,
+import { isServerOpsDataCapability, isServerOpsDataEngine, isServerOpsDataTlsMode, isServerOpsDataTlsStatus, isServerOpsMySqlTlsServerName, isServerOpsSqliteFilePath, parseServerOpsDataMetricList,
   parseServerOpsDataTableList, parseServerOpsDataWarnings, parseServerOpsDataDiagnosticsResult, parseServerOpsDataSourceRowsResult,
-  parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult } from '@proma/shared'
-import type { ServerOpsConsoleIdentity, ServerOpsDataCapability, ServerOpsDataEngine, ServerOpsDataMetric, ServerOpsDataTable } from '@proma/shared'
-import type { ServerOpsDataDiagnosticSection, ServerOpsDataParameter, ServerOpsDataQueryResult, ServerOpsDataSchemaCell } from '@proma/shared'
+  parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult, parseServerOpsDataRowFilters } from '@proma/shared'
+import type { ServerOpsConsoleIdentity, ServerOpsDataCapability, ServerOpsDataEngine, ServerOpsDataMetric, ServerOpsDataTable, ServerOpsDataTlsMode, ServerOpsDataTlsStatus } from '@proma/shared'
+import type { ServerOpsDataDiagnosticSection, ServerOpsDataParameter, ServerOpsDataQueryResult, ServerOpsDataSchemaCell, ServerOpsDataRowFilters } from '@proma/shared'
 import type { ServerOpsConsoleRuntimeStart } from './server-ops-console-runtime'
 
 /** utility process 接收的 SSH 认证材料。 */
@@ -60,12 +60,15 @@ export interface ServerOpsRuntimeDataReadRequest {
   transport: 'ssh' | 'direct'
   mode: ServerOpsRuntimeDataReadMode
   engine: ServerOpsDataEngine
-  address: string
-  port: number
+  /** 仅网络数据库携带 TCP 端点。 */
+  address?: string
+  port?: number
+  /** SQLite 使用 SSH 服务器上的绝对文件路径。 */
+  filePath?: string
   database?: string
   username?: string
   password?: string
-  tlsMode: 'disabled' | 'verify'
+  tlsMode: ServerOpsDataTlsMode
   tlsServerName?: string
   timeoutMs: number
   /** MySQL 诊断分区；省略保持旧版全量诊断，Redis 忽略分区能力。 */
@@ -79,6 +82,8 @@ export interface ServerOpsRuntimeDataReadRequest {
   /** 行预览偏移与页大小；`schema-rows` 使用。 */
   rowOffset?: number
   rowLimit?: number
+  /** 仅关系表分页读取可携带的有界筛选条件。 */
+  rowFilters?: ServerOpsDataRowFilters
   /** SQL 查询公开身份与受控正文；只允许 `sql-query` 模式携带。 */
   queryId?: string
   sql?: string
@@ -96,6 +101,8 @@ export type ServerOpsRuntimeDataReadResult =
 export interface ServerOpsRuntimeDataDiagnosticsResult {
   capability: ServerOpsDataCapability
   serverVersion?: string
+  /** 实际连通后的 TLS 状态，由数据库驱动报告。 */
+  tlsStatus?: ServerOpsDataTlsStatus
   metrics: ServerOpsDataMetric[]
   tables: ServerOpsDataTable[]
   warnings: string[]
@@ -159,6 +166,7 @@ export type ServerOpsRuntimeRequest =
   | { type: 'server-ops.sftp'; input: ServerOpsSftpRequest }
   | { type: 'server-ops.connect'; input: ServerOpsRuntimeConnectRequest }
   | { type: 'server-ops.exec'; input: ServerOpsRuntimeExecRequest }
+  | { type: 'server-ops.exec-cancel'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.data-read'; input: ServerOpsRuntimeDataReadRequest }
   | { type: 'server-ops.data-cancel'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.disconnect'; hostId: string; connectionId: string }
@@ -181,6 +189,7 @@ export type ServerOpsRuntimeMessage =
   | { type: 'server-ops.ready'; pid: number }
   | { type: 'server-ops.connect-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeConnectResult }
   | { type: 'server-ops.exec-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeExecResult }
+  | { type: 'server-ops.exec-cancelled'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.data-read-result'; requestId: string; hostId: string; connectionId: string; result: ServerOpsRuntimeDataReadResult }
   | { type: 'server-ops.data-read-cancelled'; requestId: string; hostId: string; connectionId: string }
   | { type: 'server-ops.error'; requestId?: string; hostId: string; connectionId: string; code: string; message: string }
@@ -344,7 +353,10 @@ function parseExecRequest(value: unknown): ServerOpsRuntimeExecRequest {
 function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   if (!isRecord(value)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   /** 可选字段按实际存在情况参与 exact-key 校验。 */
-  const keys = ['requestId', 'hostId', 'connectionId', 'mode', 'engine', 'address', 'port', 'tlsMode', 'timeoutMs']
+  const keys = ['requestId', 'hostId', 'connectionId', 'mode', 'engine', 'tlsMode', 'timeoutMs']
+    .concat(value.address === undefined ? [] : ['address'])
+    .concat(value.port === undefined ? [] : ['port'])
+    .concat(value.filePath === undefined ? [] : ['filePath'])
     .concat(['transport'])
     .concat(value.database === undefined ? [] : ['database'])
     .concat(value.username === undefined ? [] : ['username'])
@@ -354,6 +366,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     .concat(value.schemaTable === undefined ? [] : ['schemaTable'])
     .concat(value.rowOffset === undefined ? [] : ['rowOffset'])
     .concat(value.rowLimit === undefined ? [] : ['rowLimit'])
+    .concat(value.rowFilters === undefined ? [] : ['rowFilters'])
     .concat(value.diagnosticSection === undefined ? [] : ['diagnosticSection'])
     .concat(value.diagnosticDatabase === undefined ? [] : ['diagnosticDatabase'])
     .concat(value.queryId === undefined ? [] : ['queryId'])
@@ -366,19 +379,32 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
       && value.mode !== 'sql-query')
     || (value.transport !== 'ssh' && value.transport !== 'direct')
     || !isServerOpsDataEngine(value.engine)
-    || !isConnectionText(value.address, 255) || !isPort(value.port)
+    || (value.engine !== 'sqlite' && (!isConnectionText(value.address, 255) || !isPort(value.port) || value.filePath !== undefined))
     || (value.database !== undefined && (!isConnectionText(value.database, 64)
       || (value.engine === 'redis' && !/^\d{1,2}$/u.test(value.database))))
     || (value.username !== undefined && !isConnectionText(value.username, 128))
     || (value.password !== undefined && !isSecretText(value.password))
-    || (value.tlsMode !== 'disabled' && value.tlsMode !== 'verify')
+    || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isConnectionText(value.tlsServerName, 255))
     || typeof value.timeoutMs !== 'number' || !Number.isSafeInteger(value.timeoutMs)
     || value.timeoutMs < 1_000 || value.timeoutMs > 120_000) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
+  /** SQLite 只能读取已认证服务器上的单个主库文件，网络认证字段不得混入。 */
+  if (value.engine === 'sqlite' && (value.transport !== 'ssh' || !isServerOpsSqliteFilePath(value.filePath)
+    || value.address !== undefined || value.port !== undefined || value.username !== undefined || value.password !== undefined
+    || value.tlsMode !== 'disabled' || value.tlsServerName !== undefined
+    || (value.database !== undefined && value.database !== 'main')
+    || (value.schemaDatabase !== undefined && value.schemaDatabase !== 'main')
+    || (value.diagnosticSection !== undefined && value.diagnosticSection !== 'overview'))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
   /** TLS 校验必须绑定数据库真实主机名，否则拒绝该请求。 */
-  if (value.tlsMode === 'verify' && value.tlsServerName === undefined) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  if (value.tlsMode === 'verify' && (value.tlsServerName === undefined
+    || (value.engine === 'mysql' && !isServerOpsMySqlTlsServerName(value.tlsServerName)))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  if (value.engine === 'redis' && value.tlsMode === 'preferred') throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   if (value.diagnosticSection !== undefined && (value.mode !== 'diagnostics'
     || (value.diagnosticSection !== 'overview' && value.diagnosticSection !== 'sessions'
       && value.diagnosticSection !== 'statements' && value.diagnosticSection !== 'parameters'))) {
@@ -398,6 +424,11 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   const isSchemaTable = value.mode === 'schema-table'
   const isSchemaRows = value.mode === 'schema-rows'
   const isSqlQuery = value.mode === 'sql-query'
+  if (value.rowFilters !== undefined && (!isSchemaRows || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  /** 严格重建筛选条件，禁止额外字段或原始 SQL 跨进程传入。 */
+  const rowFilters = value.rowFilters === undefined ? undefined : parseServerOpsDataRowFilters(value.rowFilters)
   if (!isSchemaTables && !isSchemaTable && !isSchemaRows
     && (value.schemaDatabase !== undefined || value.schemaTable !== undefined
       || value.rowOffset !== undefined || value.rowLimit !== undefined)) {
@@ -416,7 +447,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   if (isSqlQuery) {
-    if (value.engine !== 'mysql' || typeof value.database !== 'string'
+    if ((value.engine !== 'mysql' && value.engine !== 'sqlite') || typeof value.database !== 'string'
       || !isRuntimeId(value.queryId) || typeof value.sql !== 'string' || value.sql.trim().length === 0
       || value.sql.includes('\0') || getUtf8ByteLength(value.sql) > 16_384
       || typeof value.maxRows !== 'number' || !Number.isSafeInteger(value.maxRows) || value.maxRows < 1 || value.maxRows > 200
@@ -428,14 +459,16 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   return {
+    ...(rowFilters === undefined ? {} : { rowFilters }),
     requestId: value.requestId,
     hostId: value.hostId,
     connectionId: value.connectionId,
     transport: value.transport,
     mode: value.mode,
     engine: value.engine,
-    address: value.address,
-    port: value.port,
+    ...(value.address === undefined ? {} : { address: value.address as string }),
+    ...(value.port === undefined ? {} : { port: value.port as number }),
+    ...(value.filePath === undefined ? {} : { filePath: value.filePath as string }),
     ...(value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     ...(value.password === undefined ? {} : { password: value.password }),
@@ -486,7 +519,8 @@ export function parseServerOpsRuntimeRequest(value: unknown): ServerOpsRuntimeRe
     if (value.type === 'server-ops.data-read' && hasExactKeys(value, ['type', 'input'])) {
       return { type: value.type, input: parseDataReadRequest(value.input) }
     }
-    if (value.type === 'server-ops.data-cancel' && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId'])
+    if ((value.type === 'server-ops.data-cancel' || value.type === 'server-ops.exec-cancel')
+      && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId'])
       && isRuntimeId(value.requestId) && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
       return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId }
     }
@@ -595,10 +629,12 @@ function parseDataReadResult(value: unknown): ServerOpsRuntimeDataReadResult {
   /** 版本字段可选，其余字段必须齐全。 */
   const keys = ['capability', 'metrics', 'tables', 'warnings']
     .concat(value.serverVersion === undefined ? [] : ['serverVersion'])
+    .concat(value.tlsStatus === undefined ? [] : ['tlsStatus'])
     .concat(value.parameters === undefined ? [] : ['parameters'])
     .concat(value.parametersTruncated === undefined ? [] : ['parametersTruncated'])
   if (!hasExactKeys(value, keys)
     || !isServerOpsDataCapability(value.capability)
+    || (value.tlsStatus !== undefined && !isServerOpsDataTlsStatus(value.tlsStatus))
     || (value.serverVersion !== undefined && (typeof value.serverVersion !== 'string'
       || value.serverVersion.length < 1 || value.serverVersion.length > 128 || /[\u0000-\u001f\u007f]/u.test(value.serverVersion)))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
@@ -611,12 +647,13 @@ function parseDataReadResult(value: unknown): ServerOpsRuntimeDataReadResult {
   /** 能力状态与结果内容必须自洽，未连通时不允许携带诊断数据。 */
   if (value.capability === 'available') {
     if (value.serverVersion === undefined) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
-  } else if (value.serverVersion !== undefined || metrics.length > 0 || tables.length > 0) {
+  } else if (value.serverVersion !== undefined || value.tlsStatus !== undefined || metrics.length > 0 || tables.length > 0) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   return {
     capability: value.capability,
     ...(value.serverVersion === undefined ? {} : { serverVersion: value.serverVersion }),
+    ...(value.tlsStatus === undefined ? {} : { tlsStatus: value.tlsStatus }),
     metrics,
     tables,
     ...(parsedDiagnostics.parameters === undefined ? {} : { parameters: parsedDiagnostics.parameters }),
@@ -772,7 +809,7 @@ export function parseServerOpsRuntimeMessage(value: unknown): ServerOpsRuntimeMe
       if (value.type === 'server-ops.exec-result') return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseExecResult(value.result) }
       return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId, result: parseDataReadResult(value.result) }
     }
-    if (value.type === 'server-ops.data-read-cancelled'
+    if ((value.type === 'server-ops.data-read-cancelled' || value.type === 'server-ops.exec-cancelled')
       && hasExactKeys(value, ['type', 'requestId', 'hostId', 'connectionId'])
       && isRuntimeId(value.requestId) && isRuntimeId(value.hostId) && isRuntimeId(value.connectionId)) {
       return { type: value.type, requestId: value.requestId, hostId: value.hostId, connectionId: value.connectionId }

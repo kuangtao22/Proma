@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import type { ServerOpsDataRowFilters } from '@proma/shared'
 import {
   parseServerOpsRuntimeMessage,
   parseServerOpsRuntimeRequest,
@@ -24,11 +25,59 @@ function createConnectRequest(): unknown {
 }
 
 describe('Server Ops utility runtime 请求协议', () => {
+  test('Given 行筛选 When 进入 utility Then 重建有界条件且禁止其它模式夹带筛选', () => {
+    /** 不含 schema 参数的有效连接，便于逐模式检测夹带条件。 */
+    const connection = { requestId: 'filtered-rows', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000 } as const
+    const rowFilters: ServerOpsDataRowFilters = { match: 'all', conditions: [{ column: 'name', operator: 'contains', value: "a%' OR 1=1 --" }] }
+    const input = { ...connection, mode: 'schema-rows' as const, schemaDatabase: 'app', schemaTable: 'users', rowOffset: 0, rowLimit: 50, rowFilters }
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    for (const mode of ['probe', 'diagnostics', 'schema-tables']) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...connection, mode, rowFilters } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+    }
+    for (const invalid of [{ ...rowFilters, rawSql: '1=1' }, { match: 'all', conditions: [] }, { match: 'all', conditions: [{ column: 'id', operator: 'raw', value: '1' }] }]) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, rowFilters: invalid } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+    }
+    expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, engine: 'redis' } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+  })
+  test('Given TLS 协商请求 When MySQL 与 Redis 进入 utility Then 只放行支持协商的引擎', () => {
+    const input = { requestId: 'tls-1', hostId: 'host-1', connectionId: 'connection-1',
+      transport: 'direct', mode: 'probe', engine: 'mysql', address: 'db.example.com', port: 3306,
+      tlsMode: 'preferred', timeoutMs: 15_000 } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, tlsMode: 'required' } }))
+      .toMatchObject({ input: { tlsMode: 'required' } })
+    expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: {
+      ...input, engine: 'redis', tlsMode: 'preferred', port: 6379,
+    } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+  })
+  test('Given MySQL verify 请求 When hostname 是 IP 或带端口 Then utility 在开通道前拒绝', () => {
+    const input = { requestId: 'tls-verify', hostId: 'host-1', connectionId: 'connection-1',
+      transport: 'direct', mode: 'probe', engine: 'mysql', address: '127.0.0.1', port: 3306,
+      tlsMode: 'verify', tlsServerName: 'db.example.com', timeoutMs: 15_000 } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    for (const name of ['127.0.0.1', '::1', '[::1]', 'db.example.com:3306']) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: {
+        ...input, tlsServerName: name,
+      } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+    }
+  })
+  test('Given SSH SQLite 文件 When 读取与查询 Then 传递文件路径并拒绝网络参数或附加库', () => {
+    /** 不含网络端点的 SQLite 请求。 */
+    const input = { requestId: 'sqlite-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'ssh', mode: 'schema-tables', engine: 'sqlite', filePath: "/srv/业务 data/app's.db", database: 'main', tlsMode: 'disabled', timeoutMs: 15_000 } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    /** SQL 请求仍复用既有取消身份和结果预算。 */
+    const query = { ...input, mode: 'sql-query', queryId: 'query-1', sql: 'SELECT id FROM users', maxRows: 50 } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: query })).toEqual({ type: 'server-ops.data-read', input: query })
+    for (const patch of [{ transport: 'direct' }, { filePath: ':memory:' }, { address: '127.0.0.1', port: 3306 }, { username: 'root' }, { password: 'secret' }, { database: 'temp' }, { schemaDatabase: 'other' }]) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, ...patch } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+    }
+  })
   test('严格重建所有合法请求分支', () => {
     const consoleIdentity = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
     const requests: unknown[] = [
       createConnectRequest(),
       { type: 'server-ops.exec', input: { requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', command: 'uname -a', timeoutMs: 1_000 } },
+      { type: 'server-ops.exec-cancel', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.disconnect', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.terminal-input', hostId: 'host-1', connectionId: 'connection-1', data: 'pwd\n' },
       { type: 'server-ops.terminal-resize', hostId: 'host-1', connectionId: 'connection-1', cols: 80, rows: 24 },
@@ -82,6 +131,7 @@ describe('Server Ops utility runtime 请求协议', () => {
       { type: 'server-ops.data-read', input: { requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'sql-query', engine: 'redis', address: '127.0.0.1', port: 6379, database: '0', tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 50 } },
       { type: 'server-ops.data-read', input: { requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', mode: 'sql-query', engine: 'mysql', address: '127.0.0.1', port: 3306, database: 'app', tlsMode: 'disabled', timeoutMs: 15_000, queryId: 'query-1', sql: 'SELECT 1', maxRows: 50, rowLimit: 50 } },
       { type: 'server-ops.data-cancel', requestId: 'data-3', hostId: 'host-1', connectionId: 'connection-1', extra: true },
+      { type: 'server-ops.exec-cancel', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', extra: true },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, address: 'bad host' } },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, port: 65_536 } },
       { type: 'server-ops.connect', input: { ...(createConnectRequest() as { input: object }).input, username: '' } },
@@ -95,6 +145,18 @@ describe('Server Ops utility runtime 请求协议', () => {
 })
 
 describe('Server Ops utility runtime 返回协议', () => {
+  test('Given runtime 回执包含实际 TLS 状态 When 解析 Then 成功保留，失败拒绝状态', () => {
+    const message = { type: 'server-ops.data-read-result' as const, requestId: 'tls-1', hostId: 'host-1',
+      connectionId: 'connection-1', result: { capability: 'available' as const, serverVersion: '8.0.36',
+        tlsStatus: 'encrypted' as const, metrics: [], tables: [], warnings: [] } }
+    expect(parseServerOpsRuntimeMessage(message)).toEqual(message)
+    expect(() => parseServerOpsRuntimeMessage({ ...message, result: {
+      ...message.result, capability: 'tls-failed', serverVersion: undefined,
+    } })).toThrow('SERVER_OPS_RUNTIME_MESSAGE_INVALID')
+    expect(() => parseServerOpsRuntimeMessage({ ...message, result: {
+      ...message.result, tlsStatus: 'unknown',
+    } })).toThrow('SERVER_OPS_RUNTIME_MESSAGE_INVALID')
+  })
   test('严格重建所有合法消息分支', () => {
     const consoleIdentity = { consoleId: 'console-1', hostId: 'host-1', connectionId: 'connection-1', containerId: 'a'.repeat(64) }
     const messages: unknown[] = [
@@ -102,6 +164,7 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.connect-result', requestId: 'request-1', hostId: 'host-1', connectionId: 'connection-1', result: { status: 'connected', hostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } } },
       { type: 'server-ops.connect-result', requestId: 'request-1', hostId: 'host-1', connectionId: 'connection-1', result: { status: 'host-key-rejected', observedHostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } } },
       { type: 'server-ops.exec-result', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', result: { stdout: 'Linux\n', stderr: '', exitCode: 0, truncated: false } },
+      { type: 'server-ops.exec-cancelled', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1' },
       { type: 'server-ops.error', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', code: 'SERVER_OPS_EXEC_FAILED', message: '远程命令执行失败' },
       { type: 'server-ops.error', hostId: 'host-1', connectionId: 'connection-1', code: 'SERVER_OPS_CONNECTION_CLOSED', message: 'SSH 连接已关闭' },
       { type: 'server-ops.terminal-output', event: { hostId: 'host-1', connectionId: 'connection-1', sequence: 1, data: 'hello' } },
@@ -131,6 +194,7 @@ describe('Server Ops utility runtime 返回协议', () => {
       { type: 'server-ops.ready', pid: 100, extra: true },
       { type: 'server-ops.connect-result', requestId: 'request-1', hostId: 'host-1', connectionId: 'connection-1', result: { status: 'connected', observedHostKey: { algorithm: 'ssh-ed25519', fingerprint: 'SHA256:test' } } },
       { type: 'server-ops.exec-result', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', result: { stdout: '', stderr: '', truncated: false, secret: 'leak' } },
+      { type: 'server-ops.exec-cancelled', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', extra: true },
       { type: 'server-ops.exec-result', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', result: { stdout: 'x'.repeat(1_048_577), stderr: '', truncated: true } },
       { type: 'server-ops.exec-result', requestId: 'request-2', hostId: 'host-1', connectionId: 'connection-1', result: { stdout: '界'.repeat(349_526), stderr: '', truncated: true } },
       { type: 'server-ops.error', requestId: '', hostId: 'host-1', connectionId: 'connection-1', code: 'SERVER_OPS_EXEC_FAILED', message: '失败' },

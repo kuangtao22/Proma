@@ -20,6 +20,7 @@ export interface ServerOpsAgentDatabaseScope {
 export type ServerOpsAgentReadResource =
   | { kind: 'ssh'; hostId: string }
   | { kind: 'mysql'; sourceId: string; instance: boolean; databases: ServerOpsAgentDatabaseScope[] }
+  | { kind: 'sqlite'; sourceId: string; instance: false; databases: ServerOpsAgentDatabaseScope[] }
   | { kind: 'redis'; sourceId: string }
 
 /** UI 显式提交完整资源集合；空集合表示撤销该会话的只读权限。 */
@@ -32,6 +33,7 @@ export interface ServerOpsAgentReadGrant {
 export interface ServerOpsAgentReadAccess extends ServerOpsAgentReadGrant {
   revision: number
   grantedAt: number
+  expiresAt: number
 }
 
 /** 跨窗口同步的公开授权快照。 */
@@ -85,7 +87,7 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
       return { kind: 'redis', sourceId: item.sourceId }
     }
     const item = record(entry, ['kind', 'sourceId', 'instance', 'databases'])
-    if (item.kind !== 'mysql' || !isServerOpsId(item.sourceId) || typeof item.instance !== 'boolean'
+    if ((item.kind !== 'mysql' && item.kind !== 'sqlite') || !isServerOpsId(item.sourceId) || typeof item.instance !== 'boolean'
       || !Array.isArray(item.databases) || item.databases.length > 20 || (!item.instance && item.databases.length === 0)) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
     const databases = item.databases.map((entry): ServerOpsAgentDatabaseScope => {
       const scope = record(entry, typeof entry === 'object' && entry !== null && 'query' in entry
@@ -98,6 +100,11 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
       return { database, tables, readRows: scope.readRows, ...(typeof scope.query === 'boolean' ? { query: scope.query } : {}) }
     })
     if (new Set(databases.map((scope) => scope.database)).size !== databases.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+    /** SQLite 只有 main，且文件级授权不能扩大为 MySQL 式实例范围。 */
+    if (item.kind === 'sqlite') {
+      if (item.instance || databases.some((scope) => scope.database !== 'main')) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+      return { kind: 'sqlite', sourceId: item.sourceId, instance: false, databases }
+    }
     return { kind: 'mysql', sourceId: item.sourceId, instance: item.instance, databases }
   })
   if (new Set(resources.map(serverOpsReadResourceKey)).size !== resources.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
@@ -113,12 +120,13 @@ export function parseServerOpsAgentReadSession(value: unknown): string {
 /** 解析公开快照，null 为无授权。 */
 export function parseServerOpsAgentReadAccess(value: unknown): ServerOpsAgentReadAccess | null {
   if (value === null) return null
-  const input = record(value, ['sessionId', 'resources', 'revision', 'grantedAt'])
+  const input = record(value, ['sessionId', 'resources', 'revision', 'grantedAt', 'expiresAt'])
   if (typeof input.revision !== 'number' || !Number.isSafeInteger(input.revision) || input.revision < 1
-    || typeof input.grantedAt !== 'number' || !Number.isSafeInteger(input.grantedAt) || input.grantedAt < 0) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+    || typeof input.grantedAt !== 'number' || !Number.isSafeInteger(input.grantedAt) || input.grantedAt < 0
+    || typeof input.expiresAt !== 'number' || !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= input.grantedAt) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
   const grant = parseServerOpsAgentReadGrant({ sessionId: input.sessionId, resources: input.resources })
   if (grant.resources.length === 0) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
-  return { ...grant, revision: input.revision, grantedAt: input.grantedAt }
+  return { ...grant, revision: input.revision, grantedAt: input.grantedAt, expiresAt: input.expiresAt }
 }
 
 /** 解析广播，阻止污染或携带内部信息的事件进入渲染层。 */

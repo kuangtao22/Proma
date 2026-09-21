@@ -13,6 +13,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type {
   AgentThinkingLevel,
+  AgentToolMode,
   AgentProviderAdapter,
   CodexOAuthCredentials,
   XaiOAuthCredentials,
@@ -40,6 +41,7 @@ import {
 } from '@proma/shared'
 import type { CanUseToolOptions, PermissionResult } from '../agent-permission-service'
 import { isPromptTooLongError } from '../agent-error-utils'
+import { resolveAgentModeToolNames } from '../agent-run-tool-policy'
 
 import type {
   AgentSession,
@@ -182,6 +184,8 @@ export async function finalizePiAgentCompletionTurns(
 
 /** Pi SDK 查询选项（扩展通用 AgentQueryInput） */
 export interface PiAgentQueryOptions extends AgentQueryInput {
+  /** 主进程为本次运行冻结的工具模式；缺失时维持普通 Agent 行为。 */
+  toolMode?: AgentToolMode
   apiKey: string
   baseUrl?: string
   provider: ProviderType
@@ -1420,8 +1424,10 @@ function appendWindowsBaseModeInstruction(systemPrompt: string, runtimeEnv: Agen
 export function wrapCustomToolDefinitions(
   tools: ToolDefinition[] | undefined,
   canUseTool: PiAgentQueryOptions['canUseTool'],
+  toolMode: AgentToolMode = 'standard',
 ): ToolDefinition[] {
-  return (tools ?? []).map((tool) =>
+  const allowedNames = resolveAgentModeToolNames(toolMode)
+  return (tools ?? []).filter((tool) => !allowedNames || allowedNames.includes(tool.name)).map((tool) =>
     wrapToolWithPermission(tool as unknown as ToolDefinition<TSchema, unknown, unknown>, { canUseTool }) as ToolDefinition)
 }
 
@@ -1566,7 +1572,9 @@ export class PiAgentAdapter implements AgentProviderAdapter {
       let pendingTerminalResult: SDKMessage | undefined
       /** 当前压缩是否紧随一个成功完成的主 Agent turn。 */
       let completedAgentTurnPendingCompaction = false
-      const customTools = [
+      const customTools = input.toolMode === 'server-ops-read'
+        ? wrapCustomToolDefinitions(input.customTools, input.canUseTool, 'server-ops-read')
+        : [
         buildCurrentSessionCompactionTool(
           sdk,
           () => { compactContextRequested = true },
@@ -1660,7 +1668,9 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         model,
         thinkingLevel: input.thinkingLevel ?? 'off',
         noTools: 'builtin',
-        ...(input.activeToolNames ? { tools: input.activeToolNames } : {}),
+        ...(input.toolMode === 'server-ops-read'
+          ? { tools: resolveAgentModeToolNames('server-ops-read') }
+          : input.activeToolNames ? { tools: input.activeToolNames } : {}),
         customTools,
       })
       session.agent.toolExecution = 'sequential'

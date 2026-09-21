@@ -10,9 +10,9 @@ const project: ServerOpsProject = { id: 'project-1', name: '生产环境', creat
 
 /** 连接样本：一台已连接服务器、一个数据库、一个 Redis。 */
 const connections: ServerOpsConnection[] = [
-  { id: 'ssh:host-1', kind: 'ssh', projectId: 'project-1', label: '应用服务器', detail: 'deploy@10.0.0.8:22', hostId: 'host-1', connected: true },
-  { id: 'data:source-1', kind: 'database', projectId: 'project-1', label: '业务主库', detail: '127.0.0.1:13306 · 本机直连', sourceId: 'source-1', plaintextDirect: true },
-  { id: 'data:source-2', kind: 'redis', projectId: 'project-1', label: '会话缓存', detail: '127.0.0.1:16379 · 本机直连', sourceId: 'source-2' },
+  { id: 'ssh:host-1', kind: 'ssh', projectId: 'project-1', label: '应用服务器', detail: 'deploy@10.0.0.8:22', protocol: 'SSH', hostId: 'host-1', connected: true },
+  { id: 'data:source-1', kind: 'database', projectId: 'project-1', label: '业务主库', detail: '127.0.0.1:13306 · 本机直连', protocol: 'MySQL', sourceId: 'source-1', plaintextDirect: true },
+  { id: 'data:source-2', kind: 'redis', projectId: 'project-1', label: '会话缓存', detail: '127.0.0.1:16379 · 本机直连', protocol: 'Redis', sourceId: 'source-2' },
 ]
 
 /** 渲染项目视图。 */
@@ -162,6 +162,24 @@ describe('项目视图', () => {
     expect(html).toContain('aria-description="已连接"')
     expect(html).toContain('aria-description="内网明文"')
     expect(html).toContain('title="生产连接 · deploy@10.0.0.8:22"')
+  })
+
+  test('Given SQLite 文件连接 When 渲染项目卡片 Then 使用 SQLite 徽章与无障碍描述', () => {
+    const sqliteConnection: ServerOpsConnection = {
+      id: 'data:sqlite-1',
+      kind: 'database',
+      projectId: 'project-1',
+      label: '审计文件',
+      detail: '/srv/data/audit.sqlite3 · SQLite · 经跳板',
+      endpoint: '/srv/data/audit.sqlite3',
+      metadata: 'SQLite · 经跳板',
+      protocol: 'SQLite',
+      sourceId: 'sqlite-1',
+    }
+    const html = renderView({ connections: [sqliteConnection], selectedConnectionId: null })
+    expect(html).toContain('aria-label="打开连接：审计文件，数据库 · SQLite，/srv/data/audit.sqlite3"')
+    expect(html).toContain('>SQLite</span>')
+    expect(html).not.toContain('>MySQL</span>')
   })
 
   test('Given 筛选得到零条连接 When 更新结果 Then 结果状态仍保留以播报零数量', () => {

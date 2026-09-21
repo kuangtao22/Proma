@@ -92,6 +92,30 @@ export interface ServerOpsDataSourceRowsInput {
   offset: number
   /** 每页行数；共享合同限制为 1–200。 */
   limit: number
+  /** 多条件过滤，仅用于当前表的服务端行预览。 */
+  filters?: ServerOpsDataRowFilters
+}
+
+/** 单次预览最多允许的条件数，限制远端 SQL 复杂度。 */
+export const MAX_SERVER_OPS_ROW_FILTERS = 12
+/** 单个条件值的最大字符数。 */
+export const MAX_SERVER_OPS_ROW_FILTER_VALUE_LENGTH = 1024
+
+/** 行预览筛选支持的受控操作符。 */
+export type ServerOpsDataRowFilterOperator = 'eq' | 'ne' | 'contains' | 'not-contains'
+  | 'starts-with' | 'ends-with' | 'gt' | 'gte' | 'lt' | 'lte' | 'is-null' | 'is-not-null'
+
+/** 单个筛选条件；空字符串是有效比较值，NULL 判断不得提供 value。 */
+export interface ServerOpsDataRowFilter {
+  column: string
+  operator: ServerOpsDataRowFilterOperator
+  value?: string
+}
+
+/** 受控多条件筛选；不允许嵌套条件。 */
+export interface ServerOpsDataRowFilters {
+  match: 'all' | 'any'
+  conditions: ServerOpsDataRowFilter[]
 }
 
 /** 表数据预览单元格；二进制只暴露字节数，文本截断显式携带状态。 */
@@ -143,6 +167,32 @@ function isSchemaCacheMode(value: unknown): value is NonNullable<ServerOpsDataSo
   return value === 'prefer-cache' || value === 'refresh'
 }
 
+/** 严格解析行筛选输入；入参为任意 IPC 值，返回可安全继续核验列元数据的条件。 */
+export function parseServerOpsDataRowFilters(value: unknown): ServerOpsDataRowFilters {
+  const errorCode = 'SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['match', 'conditions']))
+    || (value.match !== 'all' && value.match !== 'any')
+    || !Array.isArray(value.conditions) || value.conditions.length < 1
+    || value.conditions.length > MAX_SERVER_OPS_ROW_FILTERS) throw new Error(errorCode)
+  /** 明确枚举，防止外部将操作符当 SQL 片段注入。 */
+  const operators = new Set<ServerOpsDataRowFilterOperator>([
+    'eq', 'ne', 'contains', 'not-contains', 'starts-with', 'ends-with',
+    'gt', 'gte', 'lt', 'lte', 'is-null', 'is-not-null',
+  ])
+  const conditions = value.conditions.map((entry): ServerOpsDataRowFilter => {
+    if (!isRecord(entry) || !hasOnlyKeys(entry, new Set(['column', 'operator']
+      .concat(entry.value === undefined ? [] : ['value'])))
+      || !isNonEmptySchemaText(entry.column, 128)
+      || !operators.has(entry.operator as ServerOpsDataRowFilterOperator)) throw new Error(errorCode)
+    const operator = entry.operator as ServerOpsDataRowFilterOperator
+    const nullOperator = operator === 'is-null' || operator === 'is-not-null'
+    if ((nullOperator && 'value' in entry) || (!nullOperator && (typeof entry.value !== 'string'
+      || entry.value.length > MAX_SERVER_OPS_ROW_FILTER_VALUE_LENGTH))) throw new Error(errorCode)
+    return { column: entry.column, operator, ...(nullOperator ? {} : { value: entry.value as string }) }
+  })
+  return { match: value.match, conditions }
+}
+
 /** 解析表清单输入。 */
 export function parseServerOpsDataSourceTablesInput(value: unknown): ServerOpsDataSourceTablesInput {
   const errorCode = 'SERVER_OPS_DATA_SCHEMA_TABLES_INPUT_INVALID'
@@ -180,7 +230,8 @@ export function parseServerOpsDataSourceTableInput(value: unknown): ServerOpsDat
 /** 解析表数据预览输入；分页偏移必须是页大小的整数倍。 */
 export function parseServerOpsDataSourceRowsInput(value: unknown): ServerOpsDataSourceRowsInput {
   const errorCode = 'SERVER_OPS_DATA_SCHEMA_ROWS_INPUT_INVALID'
-  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table', 'offset', 'limit']))
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table', 'offset', 'limit']
+    .concat(value.filters === undefined ? [] : ['filters'])))
     || !isServerOpsId(value.sourceId)
     || !isNonEmptySchemaText(value.database, 64)
     || !isNonEmptySchemaText(value.table, 128)
@@ -189,7 +240,10 @@ export function parseServerOpsDataSourceRowsInput(value: unknown): ServerOpsData
     throw new Error(errorCode)
   }
   if (value.offset % value.limit !== 0) throw new Error(errorCode)
-  return { sourceId: value.sourceId, database: value.database, table: value.table, offset: value.offset, limit: value.limit }
+  return {
+    sourceId: value.sourceId, database: value.database, table: value.table, offset: value.offset, limit: value.limit,
+    ...(value.filters === undefined ? {} : { filters: parseServerOpsDataRowFilters(value.filters) }),
+  }
 }
 
 /** 解析库与表清单结果。 */
@@ -336,5 +390,5 @@ export function parseServerOpsDataSourceRowsResult(value: unknown): ServerOpsDat
 
 /** 表浏览只支持关系型引擎；Redis 等键值引擎走各自的后续能力。 */
 export function isServerOpsSchemaBrowsableEngine(engine: ServerOpsDataEngine): boolean {
-  return engine === 'mysql'
+  return engine === 'mysql' || engine === 'sqlite'
 }

@@ -80,6 +80,27 @@ describe('服务器运维凭据 Store', () => {
     expect(reloaded.resolve('host-1', ref)).toEqual({ kind: 'password', password: 'password-canary' })
   })
 
+  test('Given 凭据引用原位更新 When 另一实例读取版本 Then 无须解密也能发现变化', () => {
+    const configDir = createConfigDir()
+    let decryptCalls = 0
+    const safeStorage = {
+      isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'unknown' as const,
+      encryptString: (value: string) => Buffer.from(`cipher:${value}`),
+      decryptString: (_value: Buffer): string => { decryptCalls++; throw new Error('不应解密') },
+    }
+    const first = new ServerOpsCredentialStore(configDir, { platform: 'darwin', safeStorage, uuid: () => 'credential-1' })
+    const second = new ServerOpsCredentialStore(configDir, { platform: 'darwin', safeStorage })
+    const ref = first.remember('host-1', { kind: 'password', password: 'first-secret' })
+    const initial = second.getVersion('host-1', ref)
+    first.remember('host-1', { kind: 'password', password: 'second-secret' })
+    expect(second.getVersion('host-1', ref)).not.toBe(initial)
+    const volatile = first.getVersion('host-1', ref)
+    first.setVolatile('host-1', { kind: 'password', password: 'third-secret' })
+    expect(first.getVersion('host-1', ref)).not.toBe(volatile)
+    expect(decryptCalls).toBe(0)
+    expect(initial).not.toMatch(/secret|cipher/)
+  })
+
   test('Linux basic_text backend 拒绝持久化但仍允许本次内存凭据', () => {
     /** 使用不安全 Linux backend 的 Store。 */
     const store = new ServerOpsCredentialStore(createConfigDir(), {

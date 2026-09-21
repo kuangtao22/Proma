@@ -41,6 +41,9 @@ export interface ServerOpsSqlDiagnostic {
   to: number
 }
 
+/** SQL 解析方言；省略时保持既有 MySQL 行为。 */
+export type ServerOpsSqlDialect = 'mysql' | 'sqlite'
+
 type TokenKind = 'word' | 'quoted-identifier' | 'number' | 'string' | 'operator' | 'punctuation' | 'eof'
 
 /** tokenizer 的最小 token；不保留原 SQL，避免错误路径回显字面值。 */
@@ -185,10 +188,17 @@ const MAX_LIST_ITEMS = 256
 const MAX_OFFSET = 1_000_000
 
 /** 安全内置函数白名单；名称统一按大写比较与渲染。 */
-const SAFE_FUNCTIONS = new Set([
+const MYSQL_SAFE_FUNCTIONS = new Set([
   'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROUND', 'ABS', 'COALESCE', 'IFNULL', 'NULLIF',
   'LOWER', 'UPPER', 'LENGTH', 'CHAR_LENGTH', 'CONCAT', 'SUBSTRING', 'DATE', 'DATE_FORMAT',
   'YEAR', 'MONTH', 'DAY', 'NOW', 'CURRENT_DATE', 'DATE_ADD', 'DATE_SUB',
+])
+
+/** SQLite 远端只读执行允许的内置函数白名单。 */
+const SQLITE_SAFE_FUNCTIONS = new Set([
+  'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROUND', 'ABS', 'COALESCE', 'IFNULL', 'NULLIF',
+  'LOWER', 'UPPER', 'LENGTH', 'SUBSTR', 'SUBSTRING', 'DATE', 'DATETIME', 'STRFTIME',
+  'TRIM', 'LTRIM', 'RTRIM', 'REPLACE',
 ])
 
 /** INTERVAL 只接受固定时间单位，不允许表达式或动态单位。 */
@@ -301,7 +311,7 @@ function isWordPart(character: string): boolean {
 }
 
 /** 将 SQL 完整切分为有界 token；注释、变量和模式相关字符串在此直接拒绝。 */
-function tokenize(sql: string): Token[] {
+function tokenize(sql: string, dialect: ServerOpsSqlDialect): Token[] {
   if (new TextEncoder().encode(sql).byteLength > MAX_SQL_BYTES) fail('SERVER_OPS_SQL_TOO_LARGE', 0, sql.length)
   const tokens: Token[] = []
   let index = 0
@@ -323,18 +333,23 @@ function tokenize(sql: string): Token[] {
       fail('SERVER_OPS_SQL_COMMENTS_UNSUPPORTED', index, index + (character === '#' ? 1 : 2))
     }
     if (character === '@') fail('SERVER_OPS_SQL_VARIABLE_UNSUPPORTED', index, index + 1)
-    if (character === '\\' || character === '"') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
+    if (character === '\\') {
+      fail(dialect === 'mysql' ? 'SERVER_OPS_SQL_STRING_MODE_UNSAFE' : 'SERVER_OPS_SQL_INVALID', index, index + 1)
+    }
+    if (character === '"' && dialect === 'mysql') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
 
-    if (character === '`') {
+    if (character === '`' || (dialect === 'sqlite' && (character === '"' || character === '['))) {
       const start = index
+      /** 当前方言标识符的闭合字符。 */
+      const closing = character === '[' ? ']' : character
       let value = ''
       index += 1
       let closed = false
       while (index < sql.length) {
         const current = sql[index] ?? ''
-        if (current === '`') {
-          if (sql[index + 1] === '`') {
-            value += '`'
+        if (current === closing) {
+          if (sql[index + 1] === closing) {
+            value += closing
             index += 2
             continue
           }
@@ -359,7 +374,7 @@ function tokenize(sql: string): Token[] {
       let closed = false
       while (index < sql.length) {
         const current = sql[index] ?? ''
-        if (current === '\\') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
+        if (current === '\\' && dialect === 'mysql') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
         if (current === "'") {
           if (sql[index + 1] === "'") {
             value += "'"
@@ -440,11 +455,13 @@ class SqlParser {
   constructor(
     private readonly tokens: Token[],
     private readonly database: string,
+    private readonly dialect: ServerOpsSqlDialect,
   ) {}
 
   /** 解析整条单 SELECT，并要求消费全部 token。 */
   parse(): { statement: SelectStatement; columns: ServerOpsSqlColumnReference[]; hasWildcard: boolean } {
-    if (SYSTEM_SCHEMAS.has(this.database.toLowerCase())) this.failAtCurrent('SERVER_OPS_SQL_SYSTEM_SCHEMA')
+    if (this.dialect === 'sqlite' && this.database !== 'main') this.failAtCurrent('SERVER_OPS_SQL_CROSS_DATABASE')
+    if (this.dialect === 'mysql' && SYSTEM_SCHEMAS.has(this.database.toLowerCase())) this.failAtCurrent('SERVER_OPS_SQL_SYSTEM_SCHEMA')
     const unsupported = this.tokens.find((token) => token.kind === 'word' && UNSUPPORTED_KEYWORDS.has(token.value.toUpperCase()))
     if (unsupported !== undefined) {
       fail('SERVER_OPS_SQL_UNSUPPORTED', unsupported.from, unsupported.to)
@@ -573,7 +590,9 @@ class SqlParser {
       table = this.parseIdentifier()
       if (database !== this.database) fail('SERVER_OPS_SQL_CROSS_DATABASE', firstToken.from, tableToken.to)
     }
-    if (SYSTEM_SCHEMAS.has((database ?? this.database).toLowerCase())) fail('SERVER_OPS_SQL_SYSTEM_SCHEMA', firstToken.from, tableToken.to)
+    if (this.dialect === 'mysql' && SYSTEM_SCHEMAS.has((database ?? this.database).toLowerCase())) {
+      fail('SERVER_OPS_SQL_SYSTEM_SCHEMA', firstToken.from, tableToken.to)
+    }
     let alias: string | undefined
     let aliasToken: Token | undefined
     if (this.consumeWord('AS')) {
@@ -693,7 +712,10 @@ class SqlParser {
     if (this.consumeWord('NULL')) return this.node({ kind: 'literal', literalKind: 'null', value: 'NULL' })
     if (this.consumeWord('TRUE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'TRUE' })
     if (this.consumeWord('FALSE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'FALSE' })
-    if (this.consumeWord('INTERVAL')) return this.parseInterval()
+    if (this.consumeWord('INTERVAL')) {
+      if (this.dialect === 'sqlite') this.failAtCurrent('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED', -1)
+      return this.parseInterval()
+    }
     if (token.kind !== 'word' && token.kind !== 'quoted-identifier') this.failAtCurrent('SERVER_OPS_SQL_EXPECTED_EXPRESSION')
 
     const firstToken = token
@@ -703,7 +725,10 @@ class SqlParser {
       if (token.kind !== 'word') fail('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED')
       return this.parseFunction(first, depth + 1)
     }
-    if (token.kind === 'word' && first.toUpperCase() === 'CURRENT_DATE') return this.node({ kind: 'function', name: 'CURRENT_DATE', arguments: [] })
+    if (token.kind === 'word' && first.toUpperCase() === 'CURRENT_DATE') {
+      if (this.dialect === 'sqlite') this.failAtCurrent('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED', -1)
+      return this.node({ kind: 'function', name: 'CURRENT_DATE', arguments: [] })
+    }
     if (this.consumePunctuation('.')) {
       if (this.matchesOperator('*')) this.failAtCurrent('SERVER_OPS_SQL_WILDCARD_POSITION')
       const columnToken = this.peek()
@@ -719,7 +744,9 @@ class SqlParser {
   /** 解析函数调用；未知函数、限定函数和不合法通配参数全部拒绝。 */
   private parseFunction(name: string, depth: number): SqlExpression {
     const normalizedName = name.toUpperCase()
-    if (!SAFE_FUNCTIONS.has(normalizedName)) this.failAtCurrent('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED', -1)
+    /** 当前方言使用独立白名单，防止同名或专属函数跨方言放行。 */
+    const safeFunctions = this.dialect === 'sqlite' ? SQLITE_SAFE_FUNCTIONS : MYSQL_SAFE_FUNCTIONS
+    if (!safeFunctions.has(normalizedName)) this.failAtCurrent('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED', -1)
     this.expectPunctuation('(')
     const argumentsList: SqlExpression[] = []
     if (!this.consumePunctuation(')')) {
@@ -741,6 +768,19 @@ class SqlParser {
   /** 对函数参数个数和特殊 INTERVAL 位置做保守校验。 */
   private validateFunctionArguments(name: string, argumentsList: SqlExpression[]): void {
     const count = argumentsList.length
+    if (this.dialect === 'sqlite') {
+      if (['LOWER', 'UPPER', 'LENGTH', 'ABS'].includes(name) && count !== 1) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['IFNULL', 'NULLIF'].includes(name) && count !== 2) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'ROUND' && (count < 1 || count > 2)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['SUBSTR', 'SUBSTRING'].includes(name) && (count < 2 || count > 3)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(name) && count !== 1) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'COALESCE' && count < 1) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['DATE', 'DATETIME'].includes(name) && count > 16) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'STRFTIME' && (count < 1 || count > 16)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['TRIM', 'LTRIM', 'RTRIM'].includes(name) && (count < 1 || count > 2)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'REPLACE' && count !== 3) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      return
+    }
     if ((name === 'NOW' || name === 'CURRENT_DATE') && count !== 0) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
     if (['LOWER', 'UPPER', 'LENGTH', 'CHAR_LENGTH', 'DATE', 'YEAR', 'MONTH', 'DAY', 'ABS'].includes(name) && count !== 1) {
       fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
@@ -964,15 +1004,20 @@ export function isServerOpsSqlSensitiveColumn(name: string): boolean {
 }
 
 /** 分析一条单 SELECT，并返回从 AST 规范重建的查询计划。 */
-export function analyzeServerOpsSqlQuery(sql: string, database: string): ServerOpsSqlQueryPlan {
+export function analyzeServerOpsSqlQuery(
+  sql: string,
+  database: string,
+  dialect: ServerOpsSqlDialect = 'mysql',
+): ServerOpsSqlQueryPlan {
   if (typeof sql !== 'string'
     || typeof database !== 'string'
     || database.length === 0
     || database.length > 64
-    || /[\u0000-\u001f\u007f]/u.test(database)) {
+    || /[\u0000-\u001f\u007f]/u.test(database)
+    || (dialect !== 'mysql' && dialect !== 'sqlite')) {
     fail('SERVER_OPS_SQL_INVALID')
   }
-  const parser = new SqlParser(tokenize(sql), database)
+  const parser = new SqlParser(tokenize(sql, dialect), database, dialect)
   const parsed = parser.parse()
   const plan: ServerOpsSqlQueryPlan = {
     sql: renderStatement(parsed.statement),
@@ -990,9 +1035,10 @@ export function analyzeServerOpsSqlQuery(sql: string, database: string): ServerO
 export function validateServerOpsSqlQuery(
   sql: string,
   database: string,
+  dialect: ServerOpsSqlDialect = 'mysql',
 ): { plan: ServerOpsSqlQueryPlan | null; diagnostics: ServerOpsSqlDiagnostic[] } {
   try {
-    return { plan: analyzeServerOpsSqlQuery(sql, database), diagnostics: [] }
+    return { plan: analyzeServerOpsSqlQuery(sql, database, dialect), diagnostics: [] }
   } catch (error) {
     if (!isServerOpsSqlParserError(error)) throw error
     const descriptor = getServerOpsSqlDiagnostic(error.code)
@@ -1034,7 +1080,7 @@ function collectTableReferences(statement: SelectStatement): ServerOpsSqlTableRe
   }))
 }
 
-/** MySQL 标识符统一反引号输出，内部反引号双写。 */
+/** 两种方言都支持反引号，统一输出并将内部反引号双写。 */
 function renderIdentifier(identifier: string): string {
   return `\`${identifier.replaceAll('`', '``')}\``
 }

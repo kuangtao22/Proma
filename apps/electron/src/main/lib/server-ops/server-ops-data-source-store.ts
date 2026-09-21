@@ -30,8 +30,11 @@ export interface ServerOpsStoredDataSource {
   hostId?: string
   engine: ServerOpsDataEngine
   label: string
-  address: string
-  port: number
+  /** 网络引擎使用地址与端口；SQLite 使用服务器文件路径。 */
+  address?: string
+  port?: number
+  /** SSH 服务器上的 SQLite 绝对文件路径。 */
+  filePath?: string
   database?: string
   username?: string
   tlsMode: ServerOpsDataTlsMode
@@ -119,8 +122,9 @@ function parseStoredDataSource(value: unknown): ServerOpsStoredDataSource {
       ...(parsed.hostId === undefined ? {} : { hostId: parsed.hostId }),
       engine: parsed.engine,
       label: parsed.label,
-      address: parsed.address,
-      port: parsed.port,
+      ...(parsed.address === undefined ? {} : { address: parsed.address }),
+      ...(parsed.port === undefined ? {} : { port: parsed.port }),
+      ...(parsed.filePath === undefined ? {} : { filePath: parsed.filePath }),
       ...(parsed.database === undefined ? {} : { database: parsed.database }),
       ...(parsed.username === undefined ? {} : { username: parsed.username }),
       tlsMode: parsed.tlsMode,
@@ -243,8 +247,9 @@ export class ServerOpsDataSourceStore {
         ...(input.hostId === undefined ? {} : { hostId: input.hostId }),
         engine: input.engine,
         label: input.label,
-        address: input.address,
-        port: input.port,
+        ...(input.address === undefined ? {} : { address: input.address }),
+        ...(input.port === undefined ? {} : { port: input.port }),
+        ...(input.filePath === undefined ? {} : { filePath: input.filePath }),
         ...(input.database === undefined ? {} : { database: input.database }),
         ...(input.username === undefined ? {} : { username: input.username }),
         tlsMode: input.tlsMode,
@@ -275,6 +280,8 @@ export class ServerOpsDataSourceStore {
       label?: string
       address?: string
       port?: number
+      /** 编辑 SQLite 文件目标时参与原子配置更新。 */
+      filePath?: string
       database?: string | null
       username?: string | null
       tlsMode?: ServerOpsDataTlsMode
@@ -308,6 +315,7 @@ export class ServerOpsDataSourceStore {
         ...(patch.label === undefined ? {} : { label: patch.label }),
         ...(patch.address === undefined ? {} : { address: patch.address }),
         ...(patch.port === undefined ? {} : { port: patch.port }),
+        ...(patch.filePath === undefined ? {} : { filePath: patch.filePath }),
         ...(patch.tlsMode === undefined ? {} : { tlsMode: patch.tlsMode }),
         updatedAt: Math.max(now, existing.updatedAt),
       }

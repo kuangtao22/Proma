@@ -44,6 +44,8 @@ export async function runAuditedServerOpsQuery<T extends QueryResult>(options: Q
     result = await options.execute()
     options.check()
   } catch (error) {
+    /** runtime 的取消拒绝可能晚于撤权；优先归因当前授权或用户取消原因。 */
+    try { options.check() } catch (checkError) { error = checkError }
     /** 错误仅保留本模块稳定码，不泄露驱动错误里的 SQL、密码或字面值。 */
     const runtimeCode = error !== null && typeof error === 'object' && 'code' in error ? error.code : undefined
     /** runtime 错误用 code 承载分类，普通领域错误才以 message 承载稳定码。 */

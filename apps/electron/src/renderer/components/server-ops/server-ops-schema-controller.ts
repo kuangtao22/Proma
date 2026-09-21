@@ -1,8 +1,10 @@
 import type {
+  ServerOpsDataRowFilters,
   ServerOpsDataSourceRowsInput, ServerOpsDataSourceRowsResult,
   ServerOpsDataSourceTableInput, ServerOpsDataSourceTableResult,
   ServerOpsDataSourceTablesInput, ServerOpsDataSourceTablesResult,
 } from '@proma/shared'
+import { parseServerOpsDataRowFilters } from '@proma/shared'
 import { enqueueServerOpsDataRead } from './server-ops-data-request-queue'
 import { getServerOpsDataErrorMessage } from './server-ops-data-display'
 
@@ -26,7 +28,7 @@ export interface ServerOpsSchemaLoadState {
 /** 不含凭据的来源身份，配置版本更新即作废旧结果。 */
 export interface ServerOpsSchemaSource {
   id: string
-  engine: 'mysql' | 'redis'
+  engine: 'mysql' | 'sqlite' | 'redis'
   database?: string
   updatedAt?: number
   /** 完整有效连接配置，避免同 ID / 同时间戳的地址变更复用旧请求。 */
@@ -36,7 +38,7 @@ export interface ServerOpsSchemaSource {
 /** 完整浏览投影只保留当前目录、当前表描述及当前页。 */
 export interface ServerOpsSchemaBrowserProjection extends ServerOpsSchemaLoadState {
   sourceId: string | null
-  engine: 'mysql' | 'redis' | null
+  engine: 'mysql' | 'sqlite' | 'redis' | null
   databases: string[]
   database: string | null
   tables: ServerOpsDataSourceTablesResult['tables']
@@ -44,6 +46,8 @@ export interface ServerOpsSchemaBrowserProjection extends ServerOpsSchemaLoadSta
   tablesTruncated?: boolean
   selectedTable: string | null
   detailTab: ServerOpsSchemaDetailTab
+  /** 仅当前表内存保留的已应用条件，不写入导航持久化。 */
+  rowFilters: ServerOpsDataRowFilters | null
   structure: ServerOpsSchemaLoadState & ServerOpsDataSourceTableResult
   rows: ServerOpsSchemaLoadState & ServerOpsDataSourceRowsResult
 }
@@ -75,6 +79,8 @@ export interface ServerOpsSchemaBrowserController {
   backToList(): void
   setDetailTab(tab: ServerOpsSchemaDetailTab): void
   loadRows(offset: number): void
+  loadFilterFields(): void
+  applyRowFilters(filters: ServerOpsDataRowFilters | null): void
   refresh(): void
   refreshTables(): void
 }
@@ -83,7 +89,7 @@ export interface ServerOpsSchemaBrowserController {
 export function createServerOpsSchemaIdleProjection(): ServerOpsSchemaBrowserProjection {
   return {
     sourceId: null, engine: null, status: 'idle', error: null,
-    databases: [], database: null, tables: [], selectedTable: null, detailTab: 'data',
+    databases: [], database: null, tables: [], selectedTable: null, detailTab: 'data', rowFilters: null,
     structure: { status: 'idle', error: null, columns: [], indexes: [] },
     rows: { status: 'idle', error: null, columns: [], rows: [], offset: 0, limit: 50, truncated: false },
   }
@@ -118,7 +124,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
   /** 清空目标正文，绝不把前一个库/表的数据留在新标题下。 */
   const resetTable = (): void => {
     tableRevision += 1
-    patch({ selectedTable: null, detailTab: 'data', structure: createServerOpsSchemaIdleProjection().structure,
+    patch({ selectedTable: null, detailTab: 'data', rowFilters: null, structure: createServerOpsSchemaIdleProjection().structure,
       rows: { ...createServerOpsSchemaIdleProjection().rows, limit: pageSize } })
   }
   /** 单表描述和数据的共同身份；每次发起时固定，不读取后来的选择。 */
@@ -153,14 +159,15 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     const table = tableRevision
     const revision = ++rowsRevision
     const valid = (): boolean => active && owner === ownerRevision && table === tableRevision && revision === rowsRevision
-    const input = { ...selected, offset, limit: pageSize }
+    const input = { ...selected, offset, limit: pageSize,
+      ...(projection.rowFilters === null ? {} : { filters: parseServerOpsDataRowFilters(projection.rowFilters) }) }
     patch({ rows: { ...(projection.rows.offset === offset ? projection.rows : createServerOpsSchemaIdleProjection().rows),
       status: 'loading', error: null, offset, limit: pageSize } })
     void enqueueServerOpsDataRead(options.api, `${selected.sourceId}:schema-rows`, JSON.stringify([sourceKey, input]),
       () => options.api.readServerOpsDataSchemaRows(input), valid).then((result) => {
       if (valid()) patch({ rows: { ...result, status: 'ready', error: null, collectedAt: Date.now() } })
     }, (error: unknown) => {
-      if (valid()) patch({ rows: { ...projection.rows, status: 'error', error: getServerOpsDataErrorMessage(error) } })
+      if (valid()) patch({ rows: { ...projection.rows, status: 'error', error: getServerOpsDataErrorMessage(error, input.filters ? 'filtered-rows' : undefined) } })
     })
   }
 
@@ -177,7 +184,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
   /** 读取目录；首次省略库名，由主进程只在配置库有效时预选。 */
   const loadTables = (database: string | null, initial = false, cacheMode: 'prefer-cache' | 'refresh' = 'prefer-cache'): void => {
     const sourceId = projection.sourceId
-    if (!sourceId || !active || !readable || projection.engine !== 'mysql') return
+    if (!sourceId || !active || !readable || projection.engine === 'redis') return
     const owner = ownerRevision
     const revision = ++catalogRevision
     const valid = (): boolean => active && owner === ownerRevision && revision === catalogRevision
@@ -235,25 +242,33 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     setSource(source, nextReadable = true): void {
       /** 相同配置只改变可达性时保留轻导航；真实配置变更必须丢弃。 */
       const key = source ? JSON.stringify([source.id, source.engine, source.database, source.updatedAt, source.readIdentity]) : null
-      const canRead = source?.engine === 'mysql' && nextReadable
+      const canRead = source !== null && source.engine !== 'redis' && nextReadable
       const configurationChanged = key !== sourceKey
       if (!configurationChanged && readable === canRead) return
       /** 初始化之外的配置变更不允许恢复旧配置的库表导航。 */
       if (configurationChanged && sourceKey !== null) resume = undefined
       /** 多段目录恢复尚未结束时，完整 resume 优先于当前半成品投影。 */
       else if (!configurationChanged && readable && !canRead && projection.database && !resume) {
-        resume = { database: projection.database, table: projection.selectedTable, detailTab: projection.detailTab, offset: projection.rows.offset }
+        resume = { database: projection.database, table: projection.selectedTable, detailTab: projection.detailTab,
+          offset: projection.rowFilters === null ? projection.rows.offset : 0 }
       }
       sourceKey = key
       readable = canRead
       ownerRevision += 1
       catalogRevision += 1
       tableRevision += 1
-      projection = { ...createServerOpsSchemaIdleProjection(), sourceId: source?.id ?? null, engine: source?.engine ?? null }
+      projection = {
+        ...createServerOpsSchemaIdleProjection(),
+        sourceId: source?.id ?? null,
+        engine: source?.engine ?? null,
+        database: source?.engine === 'sqlite' ? 'main' : null,
+        databases: source?.engine === 'sqlite' ? ['main'] : [],
+      }
       patch({})
       if (readable) loadTables(null, true)
     },
     selectDatabase(database): void {
+      if (projection.engine === 'sqlite' && database !== 'main') return
       if (!database || database === projection.database) return
       resume = undefined
       resetTable()
@@ -268,6 +283,19 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       if ((tab === 'structure' || tab === 'indexes') && projection.structure.status === 'idle') loadStructure()
     },
     loadRows,
+    loadFilterFields(): void {
+      if (projection.status === 'loading' || (projection.structure.status !== 'idle' && projection.structure.status !== 'error')) return
+      loadStructure(projection.structure.status === 'error' ? 'refresh' : 'prefer-cache')
+    },
+    applyRowFilters(filters): void {
+      if (!target() || !active || !readable) return
+      /** 复制条件快照，避免面板草稿变化污染已提交请求和分页身份。 */
+      const rowFilters = filters === null ? null : parseServerOpsDataRowFilters(filters)
+      if (JSON.stringify(rowFilters) === JSON.stringify(projection.rowFilters)) return
+      rowsRevision += 1
+      patch({ rowFilters, rows: { ...createServerOpsSchemaIdleProjection().rows, limit: pageSize } })
+      loadRows(0)
+    },
     refreshTables(): void {
       if (projection.status === 'loading') return
       /** 目录刷新会使后端字段失效，页面也同步清除已展示的旧描述。 */

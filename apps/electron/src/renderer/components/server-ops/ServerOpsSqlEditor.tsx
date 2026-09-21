@@ -4,10 +4,11 @@ import { Decoration, EditorView, drawSelection, highlightActiveLine, keymap, lin
 import { bracketMatching, HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
-import { MySQL, sql } from '@codemirror/lang-sql'
+import { MySQL, SQLite, sql } from '@codemirror/lang-sql'
 import { acceptCompletion, autocompletion, closeCompletion, closeBrackets, closeBracketsKeymap, startCompletion } from '@codemirror/autocomplete'
 import type { CompletionSource } from '@codemirror/autocomplete'
 import type { ServerOpsSqlEditorDiagnostic } from './server-ops-sql-validation'
+import type { ServerOpsSqlDialect } from './server-ops-sql-completion'
 
 /** 历史回填通过此窄接口聚焦编辑器，不泄漏内部文档状态。 */
 export interface ServerOpsSqlEditorHandle {
@@ -24,6 +25,8 @@ interface ServerOpsSqlEditorProps {
   completionSource: CompletionSource
   diagnostics: ServerOpsSqlEditorDiagnostic[]
   diagnosticsId: string
+  /** 当前数据源的 SQL 方言。 */
+  dialect: ServerOpsSqlDialect
   onChange: (value: string) => void
   onExecute: () => void
   onCompositionChange: (composing: boolean) => void
@@ -120,7 +123,7 @@ export const ServerOpsSqlEditor = React.forwardRef<ServerOpsSqlEditorHandle, Ser
     const view = new EditorView({ parent, state: EditorState.create({
       doc: propsRef.current.value,
       extensions: [
-        sql({ dialect: MySQL, upperCaseKeywords: true }),
+        sql({ dialect: propsRef.current.dialect === 'sqlite' ? SQLite : MySQL, upperCaseKeywords: true }),
         syntaxHighlighting(sqlHighlight),
         lineNumbers(), drawSelection(), highlightActiveLine(), bracketMatching(), closeBrackets(), history(),
         shortcuts, keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap]),
@@ -170,5 +173,5 @@ export const ServerOpsSqlEditor = React.forwardRef<ServerOpsSqlEditorHandle, Ser
     view.dispatch({ effects: setSqlDiagnostics.of(diagnostics) })
   }, [props.diagnostics, props.contextKey])
 
-  return <div ref={hostRef} className="h-36 min-h-28 max-h-80 resize-y overflow-hidden focus-within:bg-muted/5 dark:[--sql-keyword:#d2a8ff] dark:[--sql-string:#a5d6ff] dark:[--sql-number:#79c0ff]" data-server-ops-codemirror />
+  return <div ref={hostRef} className="h-36 min-h-28 max-h-80 resize-y overflow-hidden focus-within:bg-muted/5 dark:[--sql-keyword:#d2a8ff] dark:[--sql-string:#a5d6ff] dark:[--sql-number:#79c0ff]" data-server-ops-codemirror data-server-ops-sql-dialect={props.dialect} />
 })

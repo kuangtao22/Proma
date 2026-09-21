@@ -1,3 +1,5 @@
+import { SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS } from '@proma/shared'
+import type { ServerOpsAgentAccessImpact } from '@proma/shared'
 import { createHash } from 'node:crypto'
 import {
   SERVER_OPS_DATA_QUERY_CHANNELS,
@@ -188,6 +190,8 @@ export interface ServerOpsHostStoreContract {
 
 /** 安全凭据 Store 暴露给 IPC 层的窄接口。 */
 export interface ServerOpsCredentialStoreContract {
+  /** 内部身份版本，永远不通过公开 IPC 返回。 */
+  getVersion?: (hostId: string, credentialRef?: string) => string | null
   remember: (hostId: string, credential: ServerOpsSavedCredentialInput) => string
   forgetHost: (hostId: string) => void
 }
@@ -270,7 +274,7 @@ export interface ServerOpsIpcOptions {
   transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
   fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
   data?: Pick<ServerOpsDataService, 'listSources' | 'upsertSource' | 'deleteSource' | 'probeSource' | 'diagnoseSource' | 'revealSourcePassword' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows' | 'removeHost'>
-    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource'>>
+    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource' | 'getReadCredentialVersion'>>
   /** 本地 SQL 查询历史；不经过数据库 runtime、Agent 或审计。 */
   queryHistory?: Pick<ServerOpsDataQueryHistoryStore, 'list' | 'save'>
   /** 运维项目：侧栏分组与连接归属的边界。 */
@@ -304,13 +308,13 @@ function assertAuthorizedSender(event: IpcMainInvokeEvent, options: ServerOpsIpc
   if (!authorized) throw new Error('SERVER_OPS_ACCESS_DENIED')
 }
 
-/** 查询历史只允许绑定到仍存在的 MySQL 数据源，避免陈旧或 Redis scope 落盘。 */
-function assertQueryHistorySource(sourceId: string, options: ServerOpsIpcOptions): void {
+/** 查询历史只允许绑定到仍存在的 SQL 数据源，避免陈旧或 Redis scope 落盘。 */
+function assertQueryHistorySource(sourceId: string, database: string, options: ServerOpsIpcOptions): void {
   const data = options.data
   if (!data) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
   const result = parseServerOpsDataSourceListResult(data.listSources({}))
   const source = result.sources.find((candidate) => candidate.id === sourceId)
-  if (!source || source.engine !== 'mysql') throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+  if (!source || (source.engine !== 'mysql' && source.engine !== 'sqlite') || (source.engine === 'sqlite' && database !== 'main')) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
 }
 
 /** 判断主机 ID 是否满足跨进程稳定标识约束。 */
@@ -375,6 +379,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS,
     SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS,
     SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION,
+    ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS),
     SERVER_OPS_IPC_CHANNELS.LIST_AUDIT,
     SERVER_OPS_IPC_CHANNELS.GET_OVERVIEW,
     SERVER_OPS_IPC_CHANNELS.LIST_SERVICES,
@@ -639,7 +644,10 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     if (!data?.querySource) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     if (!options.audit.append) throw new Error('SERVER_OPS_AUDIT_START_WRITE_FAILED')
     /** 完整语法解析先于远端执行，审计只写无字面值的结构摘要。 */
-    const plan = analyzeServerOpsSqlQuery(request.sql, request.database)
+    /** 以主进程保存的真实引擎选择方言，窗口不能伪造执行器类型。 */
+    const source = data.listSources({}).sources.find((entry) => entry.id === request.sourceId)
+    if (!source || source.engine === 'redis') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+    const plan = analyzeServerOpsSqlQuery(request.sql, request.database, source.engine)
     return queries.run(window.id, request, (signal) => runAuditedServerOpsQuery({
       actor: { actor: 'user', windowId: window.id },
       summary: { sourceId: request.sourceId, database: request.database, tables: plan.tables,
@@ -662,13 +670,13 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const { window } = requireOwner(event)
     await queries.cancel(window.id, request)
   })
-  /** 查询历史只访问本地配置，但仍要求授权窗口与仍存在的 MySQL 数据源。 */
+  /** 查询历史只访问本地配置，但仍要求授权窗口与仍存在的 SQL 数据源。 */
   installHandler(SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, (event, input) => {
     assertAuthorizedSender(event, options)
     const scope = parseServerOpsDataQueryHistoryScope(input)
     const history = options.queryHistory
     if (!history) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_UNAVAILABLE')
-    assertQueryHistorySource(scope.sourceId, options)
+    assertQueryHistorySource(scope.sourceId, scope.database, options)
     return parseServerOpsDataQueryHistoryResultForScope(history.list(scope), scope)
   })
   installHandler(SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.SAVE, (event, input) => {
@@ -676,7 +684,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const record = parseServerOpsDataQueryHistoryRecordInput(input)
     const history = options.queryHistory
     if (!history) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_UNAVAILABLE')
-    assertQueryHistorySource(record.sourceId, options)
+    assertQueryHistorySource(record.sourceId, record.database, options)
     return parseServerOpsDataQueryHistoryResultForScope(
       history.save(record),
       { sourceId: record.sourceId, database: record.database },
@@ -934,6 +942,33 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     return options.connections.getTerminalSnapshot(parseTerminalIdentity(input))
   })
 
+  /** 主进程生成当前授权影响快照，用 token 阻止陈旧窗口静默替换新权限。 */
+  const accessImpact = (): ServerOpsAgentAccessImpact => {
+    const reads = options.access.listReadAccesses().sort((left, right) => left.sessionId.localeCompare(right.sessionId))
+    const legacy = options.access.getCurrent() ?? null
+    const token = JSON.stringify({ legacy, reads: reads.map(({ sessionId, revision }) => ({ sessionId, revision })) })
+    return { legacy, reads, token }
+  }
+  /** 新桥接提交预览 token；旧桥接只在不覆盖其它授权时兼容。 */
+  const unpackAccess = (input: unknown, key: 'grant' | 'access'): { value: unknown; token?: string } => {
+    if (!isRecord(input) || !(key in input)) return { value: input }
+    if (Object.keys(input).length !== 2 || typeof input.impactToken !== 'string' || input.impactToken.length > 8192) throw new Error('SERVER_OPS_ACCESS_IMPACT_INVALID')
+    return { value: input[key], token: input.impactToken }
+  }
+  installHandler(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.IMPACT, (event) => {
+    assertAuthorizedSender(event, options)
+    revalidateServerOpsReadBindings(options.access, options)
+    return accessImpact()
+  })
+  installHandler(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS.REVOKE_LEGACY_SESSION, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const sessionId = parseServerOpsAgentReadSession(input)
+    const previous = options.access.getCurrent() ?? null
+    if (options.access.revokeLegacySession(sessionId)) {
+      broadcast(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, { previous, current: null } satisfies ServerOpsAgentAccessChanged)
+    }
+  })
+
   installHandler(SERVER_OPS_IPC_CHANNELS.GET_AGENT_ACCESS, (event, input) => {
     assertAuthorizedSender(event, options)
     const target = parseServerOpsAgentAccessTarget(input)
@@ -946,29 +981,34 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const sessionId = parseServerOpsAgentReadSession(input)
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(sessionId))
     revalidateServerOpsReadBindings(options.access, options)
-    const current = options.access.getReadCurrent()
-    return current?.sessionId === sessionId ? current : null
+    return options.access.getReadAccess(sessionId) ?? null
   })
   installHandler(SERVER_OPS_AGENT_READ_CHANNELS.SET, (event, input) => {
     assertAuthorizedSender(event, options)
-    const grant = parseServerOpsAgentReadGrant(input)
+    const submitted = unpackAccess(input, 'grant')
+    const grant = parseServerOpsAgentReadGrant(submitted.value)
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(grant.sessionId))
+    if (options.requireUserVisibleSession(grant.sessionId).archived && grant.resources.length) throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
     /** 先验证整组事实再一次替换，任一资源失效不能清除现有有效授权。 */
     const bindings = captureServerOpsReadBindings(grant.resources, options)
     const previous = options.access.getCurrent() ?? null
+    if (grant.resources.length && previous && submitted.token !== accessImpact().token) throw new Error('SERVER_OPS_ACCESS_IMPACT_CHANGED')
     options.access.grantRead(grant, bindings)
     if (previous && !options.access.getCurrent()) {
       broadcast(SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED, { previous, current: null } satisfies ServerOpsAgentAccessChanged)
     }
-    const current = options.access.getReadCurrent()
-    return current?.sessionId === grant.sessionId ? current : null
+    return options.access.getReadAccess(grant.sessionId) ?? null
   })
   installHandler(SERVER_OPS_IPC_CHANNELS.SET_AGENT_ACCESS, (event, input) => {
     assertAuthorizedSender(event, options)
-    const access = parseServerOpsAgentAccessInput(input)
+    const submitted = unpackAccess(input, 'access')
+    const access = parseServerOpsAgentAccessInput(submitted.value)
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(access.sessionId))
     if (!options.hosts.get(access.hostId)) throw new Error('SERVER_OPS_HOST_NOT_FOUND')
     const previous = options.access.getCurrent() ?? null
+    const impact = accessImpact()
+    if (access.granted && (impact.reads.length || (previous && (previous.sessionId !== access.sessionId || previous.hostId !== access.hostId)))
+      && submitted.token !== impact.token) throw new Error('SERVER_OPS_ACCESS_IMPACT_CHANGED')
     if (access.granted) options.access.grant(access)
     else options.access.revoke(access.sessionId, access.hostId)
     const current = options.access.getCurrent() ?? null
