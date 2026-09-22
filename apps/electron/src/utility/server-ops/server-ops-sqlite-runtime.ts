@@ -140,6 +140,8 @@ function validateInput(input: ServerOpsRuntimeDataReadRequest): void {
     || input.tlsMode !== 'disabled' || input.tlsServerName !== undefined) throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
   if (input.database !== undefined && input.database !== 'main') throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
   if (input.schemaDatabase !== undefined && input.schemaDatabase !== 'main') throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
+  if (input.schemaTableSearch !== undefined && (input.mode !== 'schema-tables' || input.schemaDatabase !== 'main'
+    || !isBoundedText(input.schemaTableSearch, 128))) throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 600_000) {
     throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
   }
@@ -178,11 +180,14 @@ function createRemotePayload(input: ServerOpsRuntimeDataReadRequest): Record<str
       Math.max(250, input.timeoutMs),
     ),
   }
-  if (input.mode === 'schema-tables' || input.mode === 'diagnostics' || input.mode === 'probe') return base
-  if (input.mode === 'schema-table') return { ...base, schemaTable: input.schemaTable }
+  if (input.mode === 'schema-tables') return { ...base, ...(input.schemaTableSearch === undefined ? {} : { schemaTableSearch: input.schemaTableSearch }) }
+  if (input.mode === 'diagnostics' || input.mode === 'probe') return base
+  if (input.mode === 'schema-table') return { ...base, schemaTable: input.schemaTable,
+    ...(input.baseTablesOnly ? { baseTablesOnly: true } : {}) }
   if (input.mode === 'schema-rows') {
     return {
       ...base, schemaTable: input.schemaTable, rowOffset: input.rowOffset, rowLimit: input.rowLimit,
+      ...(input.baseTablesOnly ? { baseTablesOnly: true } : {}),
       ...(input.rowFilters === undefined ? {} : { rowFilters: input.rowFilters }),
     }
   }

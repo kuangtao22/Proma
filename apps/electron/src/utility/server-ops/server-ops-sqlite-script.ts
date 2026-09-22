@@ -184,12 +184,14 @@ def read_bounded_rows(cursor, column_names, maximum_rows, maximum_bytes, preserv
         result_truncated = result_truncated or budget_truncated
     return rows, has_more, cell_truncated, result_truncated
 
-def table_summary():
-    """读取用户表与视图目录；无入参，返回最多 501 条有序元数据行。"""
+def table_summary(search=None):
+    """读取用户表与视图目录；有搜索词时按名称绑定过滤，返回最多 501 条。"""
     rows = connection.execute(
         "SELECT name, type FROM main.sqlite_schema WHERE type IN ('table', 'view') "
-        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name LIMIT ?",
-        (MAX_TABLES + 1,),
+        "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+        + ("AND instr(lower(name), lower(?)) > 0 " if search is not None else "")
+        + "ORDER BY name LIMIT ?",
+        (search, MAX_TABLES + 1) if search is not None else (MAX_TABLES + 1,),
     ).fetchall()
     return rows
 
@@ -282,7 +284,7 @@ def execute_request(payload):
         return {'capability': 'available', 'serverVersion': version, 'metrics': metrics, 'tables': tables, 'warnings': []}
 
     if mode == 'schema-tables':
-        rows = table_summary()
+        rows = table_summary(payload.get('schemaTableSearch'))
         return {
             'mode': mode, 'capability': 'available', 'database': 'main', 'databases': ['main'],
             'tables': [{'name': clean_text(row[0], 128), 'type': 'view' if row[1] == 'view' else 'table'} for row in rows[:MAX_TABLES]],
@@ -317,6 +319,11 @@ def execute_request(payload):
     if not isinstance(table_name, str):
         fail('SERVER_OPS_SQLITE_TABLE_REQUIRED')
     table_object = read_object(table_name)
+    # Agent 只接受普通物理表；视图和虚拟表可能间接引用禁用表。
+    if payload.get('baseTablesOnly') and (
+        table_object[1] != 'table' or str(table_object[2] or '').upper().startswith('CREATE VIRTUAL TABLE')
+    ):
+        fail('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
     column_rows = read_columns(table_name)
 
     if mode == 'schema-table':

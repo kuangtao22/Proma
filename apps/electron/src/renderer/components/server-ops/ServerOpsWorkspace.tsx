@@ -1410,6 +1410,17 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     onChanged: window.electronAPI.onServerOpsAgentReadAccessChanged,
     listServerOpsDataSchemaTables: window.electronAPI.listServerOpsDataSchemaTables,
   } : undefined, [])
+  /** 数据库持久禁用策略和会话租约分别使用独立桥接。 */
+  const databaseAgentPolicyApi = React.useMemo(() => typeof window.electronAPI.getServerOpsDatabaseAgentPolicy === 'function' && typeof window.electronAPI.setServerOpsDatabaseAgentPolicy === 'function' ? {
+    get: window.electronAPI.getServerOpsDatabaseAgentPolicy,
+    set: window.electronAPI.setServerOpsDatabaseAgentPolicy,
+    onChanged: window.electronAPI.onServerOpsDatabaseAgentPolicyChanged,
+  } : undefined, [])
+  /** 卡片只记录当前编辑目标；一个弹窗按需挂载，避免每张卡片订阅和读取授权。 */
+  const readAccessTargetAtom = React.useMemo(() => atom<{ connectionId: string; projectId: string; sessionId: string | null } | null>(null), [])
+  const [readAccessTarget, setReadAccessTarget] = useAtom(readAccessTargetAtom)
+  /** 弹窗关闭后恢复到发起操作的卡片按钮。 */
+  const readAccessTriggerRef = React.useRef<HTMLElement | null>(null)
   /** 当前控制台页签。 */
   const [activeSection, setActiveSection] = React.useState<ServerOpsSection>('overview')
   /**
@@ -2020,9 +2031,29 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   const draftedHostId = requestedDraftHostId && projectDataSourceHosts.hostOptions.some((host) => host.id === requestedDraftHostId)
     ? requestedDraftHostId : undefined
   const draftedHost = projectDataSourceHosts.hostOptions.find((host) => host.id === draftedHostId)
-  /** 项目分组视图；连接不存在或身份失效时作为中间区域的稳定回退。 */
-  /** 两种视图复用同一只读授权入口，切换视图仅卸载编辑器，不撤销租约。 */
-  const readAccessControl = currentProject ? <ServerOpsAgentReadAccess
+  /** 卡片和连接详情都显式绑定连接，不从项目级入口猜测目标。 */
+  const openReadAccess = (connection: ServerOpsConnection): void => {
+    readAccessTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setReadAccessTarget({ connectionId: connection.id, projectId: currentProjectId ?? '', sessionId: currentAgentSessionId })
+  }
+  /** 关闭只丢弃编辑器，既有授权与持久禁用项保持原样。 */
+  const closeReadAccess = (): void => {
+    setReadAccessTarget(null)
+    if (readAccessTriggerRef.current?.isConnected) readAccessTriggerRef.current.focus()
+  }
+  /** 项目、会话或连接失效时不展示旧目标弹窗。 */
+  const readAccessConnection = readAccessTarget?.projectId === currentProjectId && readAccessTarget.sessionId === currentAgentSessionId
+    ? projectConnections.find((connection) => connection.id === readAccessTarget.connectionId) : undefined
+  React.useEffect(() => {
+    // 身份切走后清除旧目标，切回项目或会话时不能自动重开上次的弹窗。
+    if (readAccessTarget && !readAccessConnection) setReadAccessTarget(null)
+  }, [readAccessTarget, readAccessConnection, setReadAccessTarget])
+  /** 全部卡片共用一个实际编辑器，只在用户点击后读取权限事实。 */
+  const readAccessEditor = currentProject && readAccessConnection ? <ServerOpsAgentReadAccess
+    key={JSON.stringify([currentProject.id, currentAgentSessionId, readAccessConnection.id])}
+    dialogOnly
+    connectionId={readAccessConnection.id}
+    onClosed={closeReadAccess}
     sessionId={agentAccessSession.sessionId}
     unavailableReason={agentAccessSession.unavailableReason}
     projectId={currentProject.id}
@@ -2031,9 +2062,13 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     allConnections={connections}
     dataSources={dataSources}
     viewScope={viewScope}
-    activeSourceId={selectedDataSource?.id}
+    activeSourceId={!projectViewActive && selectedDataSource !== null && selectedDataSource.id === readAccessConnection.sourceId ? selectedDataSource.id : undefined}
     api={agentReadApi}
+    policyApi={databaseAgentPolicyApi}
   /> : undefined
+  /** 详情页保留当前服务的快捷入口，项目外层不再放授权按钮。 */
+  const readAccessControl = selectedConnection ? <Button type="button" variant="outline" size="sm" className="h-8 gap-1.5 text-xs"
+    aria-label={`Agent 只读授权：${selectedConnection.label}`} onClick={() => openReadAccess(selectedConnection)}><ShieldCheck className="size-3.5" />Agent 只读授权</Button> : undefined
   /** 顶部导航只组合现有状态；数据库工作台展开时由其内部调用，避免导航被遮住。 */
   const renderWorkspaceToolbar = (content: ServerOpsWorkspaceToolbarContent = {}): React.ReactNode => (
     <ServerOpsWorkspaceToolbar projects={projects} projectId={currentProjectId} onSelectProject={handleSelectProject} onManageProjects={() => setDrawerOpen(true)} {...content} actions={readAccessControl} />
@@ -2073,7 +2108,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       onFilterKindChange={(kind) => setProjectBrowseState({ ...projectBrowse, kind })}
       onSearchQueryChange={(query) => setProjectBrowseState({ ...projectBrowse, query })}
       onMoveConnection={projectsStatus === 'ready' ? handleMoveConnection : undefined}
-      toolbarActions={readAccessControl}
+      onAgentReadAccess={openReadAccess}
     />
   )
 
@@ -2161,6 +2196,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
         {pendingDraftPanel}
         {connectionPane}
       </div> : projectPane}
+      {readAccessEditor}
       <AlertDialog open={pendingLegacyImpact !== null} onOpenChange={(open) => { if (!open) setPendingLegacyImpact(null) }}>
         <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>替换现有运维授权？</AlertDialogTitle>
           <AlertDialogDescription>授权当前服务器操作权限将撤销 {pendingLegacyImpact?.impact.reads.length ?? 0} 个会话的只读授权{pendingLegacyImpact?.impact.legacy ? `，并替换会话 ${pendingLegacyImpact.impact.legacy.sessionId} 的旧操作权限` : ''}。</AlertDialogDescription>

@@ -207,7 +207,7 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 - 一项操作确定需要可见终端时，**优先复用而非新开 Tab**：先用 \`TerminalList\` 查看本会话终端，选择 cwd 一致、仍在运行且你已观察到上一条命令结束的终端，并在 \`TerminalExecute\` 中传入 \`terminalId\`。仅在没有这种安全候选、cwd 或 shell 必须改变、或需要让用户独立观察并行会话时，才新开终端。交互式、长驻或忙碌状态不明的终端不可复用；需要确认完成状态或命令结果时使用 \`TerminalRead\`。`,
     WORKFLOW_PROMPT,
     ctx.serverOpsAvailable
-      ? `## 服务器运维与数据库变更\n- 新增连接使用 \`ops_connection_prepare\` 生成草稿；在运维面板选择项目、填写凭据、测试并保存，草稿成功不代表已保存或已连接。不要索取聊天中的密码或私钥。\n- 运维授权只在运维面板管理；日志须单独授权，发现服务不会自动建立或授权连接。\n- 数据库的数据、字段、索引、备注等变更只交付可审查脚本或程序。先使用 \`ops_database_change_context\` 取得授权结构证据。\n${SERVER_OPS_DATABASE_CHANGE_WORKFLOW.map((step) => `- ${step}`).join('\n')}\n- 运维只读模式没有项目文件读写能力时，明确缺少程序上下文，并以代码块交付待完善草稿；不能切换工具或自动扩大权限。`
+      ? `## 服务器运维与数据库变更\n- 新增连接使用 \`ops_connection_prepare\` 生成草稿；在运维面板选择项目、填写凭据、测试并保存，草稿成功不代表已保存或已连接。不要索取聊天中的密码或私钥。\n- 已保存的 MySQL/SQLite 连接默认允许只读访问未禁用的业务表；可在运维面板设置持久禁用表，MySQL 系统库不可访问。库名未知时用 \`ops_database_tables\` 按需发现，不猜测目标。SSH、Redis 和日志仍须分别在运维面板授权；发现服务不会自动建立或授权连接。\n- 数据库的数据、字段、索引、备注等变更只交付可审查脚本或程序。先使用 \`ops_database_change_context\` 取得允许读取的结构证据。\n${SERVER_OPS_DATABASE_CHANGE_WORKFLOW.map((step) => `- ${step}`).join('\n')}\n- 运维只读模式没有项目文件读写能力时，明确缺少程序上下文，并以代码块交付待完善草稿；不能切换工具或自动扩大权限。`
       : undefined,
     planningPrompt,
     ctx.collaborationAvailable

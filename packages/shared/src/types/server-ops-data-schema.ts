@@ -53,6 +53,8 @@ export interface ServerOpsDataSourceTablesInput {
   sourceId: string
   /** 目标库；省略时使用数据源自身配置的库。 */
   database?: string
+  /** 截断目录的按需表名搜索；仅指定库可用，最多 128 字符。 */
+  tableSearch?: string
   /** 仅显式请求才使用 schema 派生缓存；省略时保持实时读取。 */
   cacheMode?: 'prefer-cache' | 'refresh'
 }
@@ -199,13 +201,16 @@ export function parseServerOpsDataSourceTablesInput(value: unknown): ServerOpsDa
   if (!isRecord(value)) throw new Error(errorCode)
   const keys = new Set(['sourceId']
     .concat(value.database === undefined ? [] : ['database'])
+    .concat(value.tableSearch === undefined ? [] : ['tableSearch'])
     .concat(value.cacheMode === undefined ? [] : ['cacheMode']))
   if (!hasOnlyKeys(value, keys) || !isServerOpsId(value.sourceId)) throw new Error(errorCode)
   if (value.database !== undefined && !isNonEmptySchemaText(value.database, 64)) throw new Error(errorCode)
+  if (value.tableSearch !== undefined && (value.database === undefined || !isNonEmptySchemaText(value.tableSearch, 128))) throw new Error(errorCode)
   if (value.cacheMode !== undefined && !isSchemaCacheMode(value.cacheMode)) throw new Error(errorCode)
   return {
     sourceId: value.sourceId,
     ...(value.database === undefined ? {} : { database: value.database }),
+    ...(value.tableSearch === undefined ? {} : { tableSearch: value.tableSearch }),
     ...(value.cacheMode === undefined ? {} : { cacheMode: value.cacheMode }),
   }
 }

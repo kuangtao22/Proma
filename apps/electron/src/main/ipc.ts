@@ -477,6 +477,7 @@ import { createMediaToolRun } from './lib/media/media-tool-provider'
 import { createMediaImageCatalog } from './lib/media/media-image-catalog'
 import { createMediaDesignImageExecution } from './lib/media/media-design-execution'
 import { ServerOpsAgentAccessStore } from './lib/server-ops/server-ops-agent-access-store'
+import { ServerOpsDatabaseAgentPolicyStore } from './lib/server-ops/server-ops-database-agent-policy-store'
 import { ServerOpsAuditStore } from './lib/server-ops/server-ops-audit-store'
 import { disposeServerOpsLifecycle, registerServerOpsBeforeQuitBarrier, registerServerOpsServiceContext } from './lib/server-ops/server-ops-service-context'
 import { ServerOpsHostStore } from './lib/server-ops/server-ops-host-store'
@@ -2376,6 +2377,8 @@ export function registerIpcHandlers(): void {
   })
   /** Agent 服务器授权仅存在主进程内存，并复用同一运维服务实例。 */
   const serverOpsAgentAccessStore = new ServerOpsAgentAccessStore()
+  /** 持久禁用项跨普通会话共享；复用配置事务防止多窗口覆盖。 */
+  const serverOpsDatabaseAgentPolicyStore = new ServerOpsDatabaseAgentPolicyStore(getConfigDir(), { transaction: serverOpsConfigTransaction })
   /** Agent 远程动作审计与 Facade、IPC 共享唯一持久化实例。 */
   const serverOpsAuditStore = new ServerOpsAuditStore(undefined, { requirePreparedSchema: true })
   /** 所有领域共享同一 Store；schema 升级统一通过实例准入守卫。 */
@@ -2507,6 +2510,7 @@ export function registerIpcHandlers(): void {
         connections: serverOpsConnectionService,
         credentials: serverOpsCredentialStore,
         access: serverOpsAgentAccessStore,
+        databasePolicy: serverOpsDatabaseAgentPolicyStore,
         audit: serverOpsAudit,
         overview: serverOpsOverviewService,
         systemd: serverOpsSystemdService,
@@ -2540,6 +2544,7 @@ export function registerIpcHandlers(): void {
         trust: serverOpsHostTrustStore,
         connections: serverOpsConnectionService,
         access: serverOpsAgentAccessStore,
+        databasePolicy: serverOpsDatabaseAgentPolicyStore,
         audit: serverOpsAudit,
         overview: serverOpsOverviewService,
         systemd: serverOpsSystemdService,

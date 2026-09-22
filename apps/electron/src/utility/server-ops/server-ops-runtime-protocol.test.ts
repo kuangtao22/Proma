@@ -25,6 +25,27 @@ function createConnectRequest(): unknown {
 }
 
 describe('Server Ops utility runtime 请求协议', () => {
+  test('Given 指定库目录搜索 When 解析协议 Then 只允许 schema-tables 携带有界搜索词', () => {
+    const base = { requestId: 'search-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000 } as const
+    const input = { ...base, mode: 'schema-tables', schemaDatabase: 'app', schemaTableSearch: "table_%'" }
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toMatchObject({ input })
+    for (const invalid of [{ ...input, schemaDatabase: undefined }, { ...input, schemaTableSearch: '' }, { ...input, schemaTableSearch: 'x'.repeat(129) }, { ...input, mode: 'schema-rows', schemaTable: 'users', rowOffset: 0, rowLimit: 10 }]) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: invalid })).toThrow()
+    }
+  })
+  test('Given Agent 仅物理表标记 When 解析 Then 只接受结构与行模式的布尔值', () => {
+    const base = { requestId: 'base-table-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000 } as const
+    for (const mode of ['schema-table', 'schema-rows'] as const) {
+      const input = { ...base, mode, schemaDatabase: 'app', schemaTable: 'public_view', baseTablesOnly: true,
+        ...(mode === 'schema-rows' ? { rowOffset: 0, rowLimit: 50 } : {}) }
+      expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+      expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, baseTablesOnly: false } })).toMatchObject({ input: { baseTablesOnly: false } })
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, baseTablesOnly: 'true' } })).toThrow()
+    }
+    for (const mode of ['probe', 'diagnostics', 'schema-tables', 'sql-query']) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...base, mode, baseTablesOnly: true } })).toThrow()
+    }
+  })
   test('Given 行筛选 When 进入 utility Then 重建有界条件且禁止其它模式夹带筛选', () => {
     /** 不含 schema 参数的有效连接，便于逐模式检测夹带条件。 */
     const connection = { requestId: 'filtered-rows', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000 } as const

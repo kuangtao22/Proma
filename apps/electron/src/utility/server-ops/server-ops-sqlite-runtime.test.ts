@@ -122,6 +122,33 @@ afterEach(() => {
 })
 
 describe('远程 SQLite 只读运行时', () => {
+  test('Given 超过500张表 When 搜索SQLite目录 Then 能按字面匹配尾部表', async () => {
+    const database = new Database(databasePath)
+    for (let index = 0; index < 505; index += 1) database.exec(`CREATE TABLE table_${String(index).padStart(3, '0')} (id INTEGER)`)
+    database.close()
+    const channel = createLocalChannelFactory([])
+    const first = await runServerOpsSqliteRead(createInput({ mode: 'schema-tables', schemaDatabase: 'main' }), channel)
+    expect(first).toMatchObject({ tablesTruncated: true })
+    const searched = await runServerOpsSqliteRead(createInput({ mode: 'schema-tables', schemaDatabase: 'main', schemaTableSearch: 'table_504' }), channel)
+    expect(searched).toMatchObject({ tables: [{ name: 'table_504', type: 'table' }] })
+    for (const invalid of [{ mode: 'schema-table' as const, schemaTable: 'users' }, { schemaTableSearch: '' }, { schemaTableSearch: 'x'.repeat(129) }]) {
+      await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-tables', schemaDatabase: 'main', schemaTableSearch: 'table_504', ...invalid }), channel))
+        .rejects.toThrow('SERVER_OPS_SQLITE_REQUEST_INVALID')
+    }
+  })
+  test('Given 视图读取敏感基表 When Agent 请求结构或行预览 Then 两者在读取列前拒绝', async () => {
+    const database = new Database(databasePath)
+    database.exec("CREATE VIEW public_view AS SELECT authorization FROM users")
+    database.close()
+    for (const mode of ['schema-table', 'schema-rows'] as const) {
+      await expect(runServerOpsSqliteRead(createInput({ mode, schemaDatabase: 'main', schemaTable: 'public_view', baseTablesOnly: true,
+        ...(mode === 'schema-rows' ? { rowOffset: 0, rowLimit: 10 } : {}) }), createLocalChannelFactory([])))
+        .rejects.toThrow('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
+    }
+    /** UI 仍可正常查看视图结构，避免扩大本次 Agent 权限变更范围。 */
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-table', schemaDatabase: 'main', schemaTable: 'public_view' }), createLocalChannelFactory([])))
+      .resolves.toMatchObject({ capability: 'available' })
+  })
   test('Given 多字段与字面通配符 When 服务端筛选并分页 Then AND/OR、NULL 与 hasMore 保持准确', async () => {
     const database = new Database(databasePath)
     const insert = database.prepare('INSERT INTO users (name, note) VALUES (?, ?)')

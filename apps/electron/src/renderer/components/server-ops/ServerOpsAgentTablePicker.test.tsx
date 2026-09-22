@@ -22,6 +22,17 @@ test('Given 已有屏蔽项且目录未打开 When 渲染 Then 标签保留、�
   expect(html).not.toContain('type="text"')
 })
 
+test('Given 没有预选数据库 When 渲染选择器 Then 可以展开选择数据库但不会提前读取目录', () => {
+  /** 首屏仅呈现入口，展开后才由目录接口列出可见库。 */
+  let reads = 0
+  const api = { listServerOpsDataSchemaTables: async () => { reads++; return { databases: ['app'], tables: [] } } }
+  const html = renderToStaticMarkup(<ServerOpsAgentTableExclusions source={source} api={api} disabled={false} onChange={() => undefined} onDatabaseChange={() => undefined} />)
+  expect(html).toContain('选择禁用表')
+  expect(html).toContain('aria-expanded="false"')
+  expect(html).not.toContain('disabled=""')
+  expect(reads).toBe(0)
+})
+
 test('Given 工作台已有当前库 When 渲染连接授权 Then 第一入口直接多选禁用表而不是再次选库', () => {
   /** 直接使用当前库范围，不再展示授权数据库添加器。 */
   const database = renderToStaticMarkup(<ServerOpsAgentDatabaseExclusions source={source} resource={{ kind: 'mysql', sourceId: 'db', instance: false, databases: [createServerOpsQueryableScope('app')] }} currentDatabase="app" disabled={false} onChange={() => undefined} />)

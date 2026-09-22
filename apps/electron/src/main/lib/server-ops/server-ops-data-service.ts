@@ -405,6 +405,10 @@ export class ServerOpsDataService {
     /** 目标库：显式优先，其次数据源配置的库；两者都缺失时只列可见库。 */
     const database = parsedInput.database ?? record.database
     const cache = this.dependencies.schemaCache
+    /** 搜索独立于普通目录缓存，避免把一个查询词的结果误当作全量表目录。 */
+    if (parsedInput.tableSearch !== undefined) {
+      return this.readSchemaTablesLive(record, parsedInput.database, database, undefined, signal, context, parsedInput.tableSearch)
+    }
     if (parsedInput.cacheMode === undefined || cache === undefined) {
       return this.readSchemaTablesLive(record, parsedInput.database, database, undefined, signal, context)
     }
@@ -441,11 +445,12 @@ export class ServerOpsDataService {
     expectedConnection?: ServerOpsActiveConnectionIdentity | null,
     signal?: AbortSignal,
     context?: ServerOpsReadContext,
+    tableSearch?: string,
   ): Promise<ServerOpsDataSourceTablesResult> {
     /** 已保存密码只在本次请求内解密。 */
     const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
     const { result } = await this.runReadTarget(
-      'schema-tables', record, password, `${record.id}:schema-tables`, { database }, undefined, undefined, undefined,
+      'schema-tables', record, password, `${record.id}:schema-tables`, { database, ...(tableSearch === undefined ? {} : { tableSearch }) }, undefined, undefined, undefined,
       signal, expectedConnection ?? undefined, context,
     )
     if (!isSchemaTablesResult(result) || result.capability !== 'available') {
@@ -478,7 +483,8 @@ export class ServerOpsDataService {
     const parsedInput = parseServerOpsDataSourceTableInput(input)
     const record = this.requireSource(parsedInput.sourceId)
     const cache = this.dependencies.schemaCache
-    if (parsedInput.cacheMode === undefined || cache === undefined) return this.readSchemaTableLive(record, parsedInput, undefined, signal, context)
+    // Agent 必须经过 runtime 实时物理表校验，不沿用 UI 可能已缓存的视图结构。
+    if (context?.ownerSessionId || parsedInput.cacheMode === undefined || cache === undefined) return this.readSchemaTableLive(record, parsedInput, undefined, signal, context)
     const cacheContext = this.createSchemaCacheContext(record)
     if (cacheContext === undefined) return this.readSchemaTableLive(record, parsedInput, undefined, signal, context)
     const scope: ServerOpsDataSchemaCacheScope = {
@@ -840,7 +846,7 @@ export class ServerOpsDataService {
     password: string | undefined,
     readKey: string,
     /** 表浏览参数；诊断模式下必须为空，由 runtime 协议再校验一次。 */
-    schema?: { database?: string; table?: string; offset?: number; limit?: number; filters?: ServerOpsDataRowFilters },
+    schema?: { database?: string; tableSearch?: string; table?: string; offset?: number; limit?: number; filters?: ServerOpsDataRowFilters },
     diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection,
     diagnosticDatabase?: string,
     query?: { database: string; queryId: string; sql: string; maxRows: number },
@@ -896,10 +902,12 @@ export class ServerOpsDataService {
         tlsMode: target.tlsMode,
         ...(target.tlsServerName === undefined ? {} : { tlsServerName: target.tlsServerName }),
         timeoutMs: SERVER_OPS_DATA_READ_TIMEOUT_MS,
+        ...(context?.ownerSessionId && (mode === 'schema-table' || mode === 'schema-rows') ? { baseTablesOnly: true } : {}),
         ...(diagnosticSection === undefined ? {} : { diagnosticSection }),
         ...(diagnosticDatabase === undefined ? {} : { diagnosticDatabase }),
         ...(schema === undefined ? {} : {
           ...(schema.database === undefined ? {} : { schemaDatabase: schema.database }),
+          ...(schema.tableSearch === undefined ? {} : { schemaTableSearch: schema.tableSearch }),
           ...(schema.table === undefined ? {} : { schemaTable: schema.table }),
           ...(schema.offset === undefined ? {} : { rowOffset: schema.offset }),
           ...(schema.limit === undefined ? {} : { rowLimit: schema.limit }),

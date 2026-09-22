@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { ArrowUpRight, Blocks, ChevronDown, Database, DatabaseZap, FolderInput, FolderOpen, LoaderCircle, MoreHorizontal, Plus, Search, Server } from 'lucide-react'
+import { ArrowUpRight, Blocks, ChevronDown, Database, DatabaseZap, FolderInput, FolderOpen, LoaderCircle, MoreHorizontal, Plus, Search, Server, ShieldCheck } from 'lucide-react'
 import type { ServerOpsProject } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -22,8 +22,8 @@ const SERVER_OPS_PROJECT_KINDS: readonly { kind: ServerOpsConnectionKind; label:
 export interface ServerOpsProjectViewProps {
   /** 顶部直接切换项目的入口；抽屉继续负责项目管理。 */
   projectSelector?: React.ReactNode
-  /** 工具栏右侧附加操作，例如 Agent 只读授权。 */
-  toolbarActions?: React.ReactNode
+  /** 卡片内管理当前连接的 Agent 只读授权，不触发连接导航。 */
+  onAgentReadAccess?: (connection: ServerOpsConnection) => void
   /** 当前会话 Agent 生成的待审核连接草稿；项目归属由用户在这里确定。 */
   pendingDrafts?: React.ReactNode
   /** 当前项目；为空表示项目列表尚未就绪。 */
@@ -116,7 +116,7 @@ export function ServerOpsProjectView({
   searchQuery = '',
   onFilterKindChange,
   onSearchQueryChange,
-  toolbarActions,
+  onAgentReadAccess,
   pendingDrafts,
   projectSelector,
 }: ServerOpsProjectViewProps): React.ReactElement {
@@ -177,7 +177,6 @@ export function ServerOpsProjectView({
             <Input type="search" value={searchQuery} onChange={(event) => onSearchQueryChange?.(event.target.value)} aria-label="搜索连接名称或地址" placeholder="搜索连接名称或地址..." className="h-8 rounded-lg border-border/60 bg-content-area pl-9 pr-3 text-[13px]" />
           </label>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            {toolbarActions}
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
                 <Button type="button" variant="outline" size="sm" className="gap-1.5 rounded-lg bg-content-area text-[13px] text-foreground/80" aria-label="添加连接"><Plus className="size-3.5" aria-hidden="true" />添加连接</Button>
@@ -238,7 +237,7 @@ export function ServerOpsProjectView({
                           <li key={connection.id} className={cn('group/card relative flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-content-area p-4 transition-colors hover:border-border hover:bg-muted/20', connection.id === selectedConnectionId && 'border-border bg-muted/30')}>
                             <button type="button" className="absolute inset-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" aria-label={`打开连接：${connection.label}，${caption}，${connection.endpoint ?? connection.detail}`} aria-description={accessibleDescription || undefined} title={`${connection.label} · ${connection.detail}`}
                               aria-current={connection.id === selectedConnectionId ? 'true' : undefined} data-server-ops-connection={connection.id} onClick={() => onSelectConnection(connection)} />
-                            <div className="pointer-events-none flex min-w-0 items-start gap-3 pr-5">
+                            <div className={cn('pointer-events-none flex min-w-0 items-start gap-3', onAgentReadAccess ? 'pr-12' : 'pr-5')}>
                               <span className={cn('flex size-9 shrink-0 items-center justify-center rounded-xl shadow-sm', connection.kind === 'ssh' ? 'bg-blue-500/10 text-blue-500' : connection.kind === 'database' ? 'bg-amber-500/10 text-amber-500' : 'bg-rose-500/10 text-rose-500')}><GroupIcon kind={connection.kind} className="size-[18px]" /></span>
                               <div className="min-w-0 flex-1">
                                 <h4 className="truncate text-sm font-medium">{connection.label}</h4>
@@ -252,16 +251,21 @@ export function ServerOpsProjectView({
                               {connection.plaintextDirect === true ? <span className="rounded-md bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-400" data-server-ops-plaintext-direct={connection.id}>内网明文</span> : null}
                               <ArrowUpRight className="ml-auto size-3.5 text-foreground/30 transition-colors group-hover/card:text-foreground/60" aria-hidden="true" />
                             </div>
+                            <div className="absolute right-2 top-3 flex items-center gap-0.5">
+                            {onAgentReadAccess ? <Button type="button" variant="ghost" size="icon-sm" className="size-7 rounded-md text-muted-foreground focus-visible:ring-2"
+                              aria-label={`Agent 只读授权：${connection.label}`} title="Agent 只读授权" data-server-ops-agent-access={connection.id}
+                              onClick={() => onAgentReadAccess(connection)}><ShieldCheck className="size-3.5" aria-hidden="true" /></Button> : null}
                             {onMoveConnection ? (
                               <DropdownMenu modal={false}>
                                 <DropdownMenuTrigger asChild>
-                                  <Button type="button" variant="ghost" size="icon-sm" className="absolute right-2 top-3 size-7 rounded-md text-muted-foreground focus-visible:ring-2" aria-label={`管理连接：${connection.label}`}><MoreHorizontal className="size-3.5" aria-hidden="true" /></Button>
+                                  <Button type="button" variant="ghost" size="icon-sm" className="size-7 rounded-md text-muted-foreground focus-visible:ring-2" aria-label={`管理连接：${connection.label}`}><MoreHorizontal className="size-3.5" aria-hidden="true" /></Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end" className="z-[9999] min-w-36">
                                   <DropdownMenuItem data-server-ops-move-connection={connection.id} onSelect={() => onMoveConnection(connection)}><FolderInput className="size-3.5" aria-hidden="true" />移动到项目</DropdownMenuItem>
                                 </DropdownMenuContent>
                               </DropdownMenu>
                             ) : null}
+                            </div>
                           </li>
                         )
                       })}

@@ -98,6 +98,7 @@ function createAgentAccessHarness(options: {
   fileLeases?: ServerOpsIpcOptions['fileLeases']
   data?: ServerOpsIpcOptions['data']
   queryHistory?: ServerOpsIpcOptions['queryHistory']
+  databasePolicy?: ServerOpsIpcOptions['databasePolicy']
   auditAppend?: NonNullable<ServerOpsIpcOptions['audit']['append']>
   moveHost?: ServerOpsIpcOptions['hosts']['move']
 } = {}) {
@@ -145,6 +146,7 @@ function createAgentAccessHarness(options: {
     fileLeases: options.fileLeases,
     data: options.data,
     queryHistory: options.queryHistory,
+    databasePolicy: options.databasePolicy,
     resolveOwnerWindow: () => ({ id: 70, webContents: sender, isDestroyed: () => false,
       once: (_event, callback) => { closeOwner = callback }, removeListener: () => undefined }),
     requireUserVisibleSession: () => {
@@ -156,6 +158,41 @@ function createAgentAccessHarness(options: {
 }
 
 describe('服务器运维 IPC', () => {
+  test('Given 数据库持久规则 When 无会话主窗口读取保存 Then 可管理且陌生窗口被拒绝', async () => {
+    /** 本地策略替身不读取任何真实配置或数据库。 */
+    const policy = { revision: 0, exclusions: [] }
+    const fixture = createAgentAccessHarness({ visible: false, databasePolicy: {
+      get: () => policy,
+      set: (input) => ({ revision: input.expectedRevision + 1, exclusions: input.exclusions }),
+      onChanged: () => () => {},
+    } })
+    try {
+      await expect(invoke(fixture.handlers, 'server-ops:get-database-agent-policy', fixture.sender)).resolves.toEqual(policy)
+      await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', fixture.sender, { expectedRevision: 0, exclusions: [] })).resolves.toEqual({ revision: 1, exclusions: [] })
+      await expect(invoke(fixture.handlers, 'server-ops:get-database-agent-policy', createSender(99))).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', createSender(99), { expectedRevision: 0, exclusions: [] })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', fixture.sender, { expectedRevision: 0, exclusions: [], password: 'bad' })).rejects.toThrow()
+    } finally { fixture.registration.dispose() }
+  })
+  test('Given 旧客户端提交数据库会话授权 When 保存 Then 明确要求使用持久禁用名单而非假装生效', async () => {
+    const fixture = createAgentAccessHarness()
+    try {
+      await expect(invoke(fixture.handlers, SERVER_OPS_AGENT_READ_CHANNELS.SET, fixture.sender, { sessionId: 'session-1', resources: [{ kind: 'mysql', sourceId: 'source-1', instance: false, databases: [{ database: 'app', tables: null, excludedTables: ['secret'], readRows: true, query: true }] }] })).rejects.toThrow('SERVER_OPS_DATABASE_AGENT_POLICY_REQUIRED')
+    } finally { fixture.registration.dispose() }
+  })
+  test('Given 已删除连接的禁用项 When 保存其他设置 Then 保留旧禁用项但拒绝伪造新连接', async () => {
+    /** 模拟连接删除后保留的长期禁用规则，不要求重新连接远端。 */
+    const exclusion = { sourceId: 'removed-source', database: 'app', excludedTables: ['secret'] }
+    const fixture = createAgentAccessHarness({ databasePolicy: {
+      get: () => ({ revision: 1, exclusions: [exclusion] }),
+      set: (input) => ({ revision: input.expectedRevision + 1, exclusions: input.exclusions }),
+      onChanged: () => () => {},
+    } })
+    try {
+      await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', fixture.sender, { expectedRevision: 1, exclusions: [exclusion] })).resolves.toEqual({ revision: 2, exclusions: [exclusion] })
+      await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', fixture.sender, { expectedRevision: 1, exclusions: [{ ...exclusion, sourceId: 'unknown-source' }] })).rejects.toThrow('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+    } finally { fixture.registration.dispose() }
+  })
   test('Given Agent 草稿已生成 When 授权面板读取、忽略或伪造会话 Then 仅按可见会话领取', async () => {
     const fixture = createAgentAccessHarness()
     const draft = serverOpsConnectionDraftStore.prepare('session-a', { kind: 'ssh', name: '测试服务器', address: '10.0.0.8', port: 22, username: 'ops' })
@@ -869,7 +906,7 @@ describe('服务器运维 IPC', () => {
       SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED,
       SERVER_OPS_IPC_CHANNELS.LOG_OUTPUT,
       SERVER_OPS_IPC_CHANNELS.LOG_EXIT,
-    ] as readonly string[]).includes(channel)).flatMap((channel) => channel === SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION ? [channel, ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS)] : [channel]), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
+    ] as readonly string[]).includes(channel)).flatMap((channel) => channel === SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION ? [channel, ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS)] : [channel]), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, 'server-ops:get-database-agent-policy', 'server-ops:set-database-agent-policy', SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
       ...Object.values(SERVER_OPS_FILE_CHANNELS),
       ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
       ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS),
@@ -1242,7 +1279,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(75)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(77)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1261,7 +1298,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(75)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(77)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

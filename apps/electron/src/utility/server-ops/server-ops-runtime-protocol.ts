@@ -77,8 +77,12 @@ export interface ServerOpsRuntimeDataReadRequest {
   diagnosticDatabase?: string
   /** 表浏览目标库；`schema-*` 模式使用，必须已在 information_schema 内校验过。 */
   schemaDatabase?: string
+  /** 按需搜索当前库的表目录；其他读取模式不可携带。 */
+  schemaTableSearch?: string
   /** 表浏览目标表；`schema-table` 与 `schema-rows` 使用。 */
   schemaTable?: string
+  /** 仅主进程可注入：Agent 结构与行预览必须读取基础表，禁止视图间接读取禁用表。 */
+  baseTablesOnly?: boolean
   /** 行预览偏移与页大小；`schema-rows` 使用。 */
   rowOffset?: number
   rowLimit?: number
@@ -363,7 +367,9 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     .concat(value.password === undefined ? [] : ['password'])
     .concat(value.tlsServerName === undefined ? [] : ['tlsServerName'])
     .concat(value.schemaDatabase === undefined ? [] : ['schemaDatabase'])
+    .concat(value.schemaTableSearch === undefined ? [] : ['schemaTableSearch'])
     .concat(value.schemaTable === undefined ? [] : ['schemaTable'])
+    .concat(value.baseTablesOnly === undefined ? [] : ['baseTablesOnly'])
     .concat(value.rowOffset === undefined ? [] : ['rowOffset'])
     .concat(value.rowLimit === undefined ? [] : ['rowLimit'])
     .concat(value.rowFilters === undefined ? [] : ['rowFilters'])
@@ -423,6 +429,12 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   const isSchemaTables = value.mode === 'schema-tables'
   const isSchemaTable = value.mode === 'schema-table'
   const isSchemaRows = value.mode === 'schema-rows'
+  if (value.schemaTableSearch !== undefined && (!isSchemaTables || (value.engine !== 'mysql' && value.engine !== 'sqlite')
+    || value.schemaDatabase === undefined)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  if (value.baseTablesOnly !== undefined && (typeof value.baseTablesOnly !== 'boolean'
+    || (!isSchemaTable && !isSchemaRows) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
   const isSqlQuery = value.mode === 'sql-query'
   if (value.rowFilters !== undefined && (!isSchemaRows || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
@@ -439,6 +451,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     ? parseSchemaIdentifier(value.schemaDatabase, 64)
     : undefined
   const schemaTable = isSchemaTable || isSchemaRows ? parseSchemaIdentifier(value.schemaTable, 128) : undefined
+  const schemaTableSearch = value.schemaTableSearch === undefined ? undefined : parseSchemaIdentifier(value.schemaTableSearch, 128)
   if (isSchemaRows) {
     if (typeof value.rowOffset !== 'number' || !Number.isSafeInteger(value.rowOffset) || value.rowOffset < 0 || value.rowOffset > 1_000_000
       || typeof value.rowLimit !== 'number' || !Number.isSafeInteger(value.rowLimit) || value.rowLimit < 1 || value.rowLimit > 200
@@ -478,7 +491,9 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     ...(value.diagnosticSection === undefined ? {} : { diagnosticSection: value.diagnosticSection }),
     ...(value.diagnosticDatabase === undefined ? {} : { diagnosticDatabase: value.diagnosticDatabase }),
     ...(schemaDatabase === undefined ? {} : { schemaDatabase }),
+    ...(schemaTableSearch === undefined ? {} : { schemaTableSearch }),
     ...(schemaTable === undefined ? {} : { schemaTable }),
+    ...(value.baseTablesOnly === undefined ? {} : { baseTablesOnly: value.baseTablesOnly }),
     ...(value.rowOffset === undefined ? {} : { rowOffset: value.rowOffset }),
     ...(value.rowLimit === undefined ? {} : { rowLimit: value.rowLimit }),
     ...(value.queryId === undefined ? {} : { queryId: value.queryId }),

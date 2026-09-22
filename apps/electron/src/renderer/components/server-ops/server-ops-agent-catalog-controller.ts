@@ -12,6 +12,7 @@ export interface ServerOpsAgentCatalogProjection {
   status: 'idle' | 'loading' | 'ready' | 'error'
   result: ServerOpsDataSourceTablesResult | null
   error: string | null
+  tableSearch?: string
 }
 
 /** 授权弹窗目录操作；目标绑定与实际读取分离。 */
@@ -19,7 +20,7 @@ export interface ServerOpsAgentCatalogController {
   activate(): void
   dispose(): void
   select(sourceId: string, identity: string, database?: string): void
-  load(refresh?: boolean): Promise<void>
+  load(refresh?: boolean, tableSearch?: string): Promise<void>
   snapshot(): ServerOpsAgentCatalogProjection
 }
 
@@ -35,6 +36,7 @@ export function createServerOpsAgentCatalogController(options: {
   let projection: ServerOpsAgentCatalogProjection = { status: 'idle', result: null, error: null }
   let loading: Promise<void> | null = null
   let loadingRefresh = false
+  let currentSearch: string | undefined
 
   /** 替换当前投影，仅向已挂载的订阅者推送。 */
   const update = (next: ServerOpsAgentCatalogProjection): void => {
@@ -43,10 +45,16 @@ export function createServerOpsAgentCatalogController(options: {
   }
 
   /** 只有显式加载或卸载后的读取重放才进入连接的表目录队列。 */
-  const read = async (refresh = false): Promise<void> => {
+  const read = async (refresh = false, tableSearch?: string): Promise<void> => {
     if (!active || !target?.sourceId) return
+    const searchChanged = tableSearch !== currentSearch
+    if (searchChanged) {
+      revision += 1
+      loading = null
+      currentSearch = tableSearch
+    }
     if (projection.status === 'loading' && loading) return loading
-    if (projection.status === 'ready' && !refresh) return
+    if (projection.status === 'ready' && !refresh && !searchChanged) return
 
     /** 固定本次目标，等待队列时也不读取后来选择的新库。 */
     const selected = target
@@ -55,9 +63,9 @@ export function createServerOpsAgentCatalogController(options: {
     const input: ServerOpsDataSourceTablesInput = {
       sourceId: selected.sourceId,
       ...(selected.database === undefined ? {} : { database: selected.database }),
-      cacheMode: refresh ? 'refresh' : 'prefer-cache',
+      ...(tableSearch === undefined ? { cacheMode: refresh ? 'refresh' as const : 'prefer-cache' as const } : { tableSearch }),
     }
-    update({ status: 'loading', result: null, error: null })
+    update({ status: 'loading', result: null, error: null, ...(tableSearch === undefined ? {} : { tableSearch }) })
     loadingRefresh = refresh
     const request = enqueueServerOpsDataRead(options.api, `${selected.sourceId}:schema-tables`,
       JSON.stringify([selected.identity, input]), () => options.api.listServerOpsDataSchemaTables(input), valid)
@@ -67,10 +75,10 @@ export function createServerOpsAgentCatalogController(options: {
           update({ status: 'error', result: null, error: '目标数据库不可用，请刷新连接后重试' })
           return
         }
-        update({ status: 'ready', result, error: null })
+        update({ status: 'ready', result, error: null, ...(tableSearch === undefined ? {} : { tableSearch }) })
       }, (error: unknown) => {
         if (!valid()) return
-        update({ status: 'error', result: null, error: getServerOpsDataErrorMessage(error) })
+        update({ status: 'error', result: null, error: getServerOpsDataErrorMessage(error), ...(tableSearch === undefined ? {} : { tableSearch }) })
       })
     loading = request
     await request
@@ -89,7 +97,7 @@ export function createServerOpsAgentCatalogController(options: {
         loading = null
       }
       options.publish(projection)
-      if (replay) void read(loadingRefresh)
+      if (replay) void read(loadingRefresh, currentSearch)
     },
     dispose(): void {
       active = false
@@ -100,6 +108,7 @@ export function createServerOpsAgentCatalogController(options: {
       target = { sourceId, identity, ...(database === undefined ? {} : { database }) }
       revision += 1
       loading = null
+      currentSearch = undefined
       update({ status: 'idle', result: null, error: null })
     },
     load: read,

@@ -49,6 +49,12 @@ describe('数据源表浏览公开合同', () => {
       .toEqual({ sourceId: 'source-1', database: 'chebenben' })
     expect(parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', database: 'chebenben', cacheMode: 'prefer-cache' }))
       .toEqual({ sourceId: 'source-1', database: 'chebenben', cacheMode: 'prefer-cache' })
+    expect(parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', database: 'app', tableSearch: "users_%'" }))
+      .toEqual({ sourceId: 'source-1', database: 'app', tableSearch: "users_%'" })
+    for (const search of ['', 'x'.repeat(129), 'a\nb']) {
+      expect(() => parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', database: 'app', tableSearch: search })).toThrow()
+    }
+    expect(() => parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', tableSearch: 'users' })).toThrow()
     expect(parseServerOpsDataSourceTablesInput({ sourceId: 'source-1', cacheMode: 'refresh' }))
       .toEqual({ sourceId: 'source-1', cacheMode: 'refresh' })
     /** 库名与表名必须是有界文本，且不允许控制字符。 */

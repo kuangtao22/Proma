@@ -865,6 +865,25 @@ describe('服务器运维数据服务编排', () => {
     expect(await rowsPending).toMatchObject({ rows: [['51']], offset: 50, limit: 50 })
   })
 
+  test('Given Agent 与 UI 请求同一表 When 下发 utility Then 只有 Agent 结构及行预览携带物理表限制', async () => {
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const input = { sourceId: created.source.id, database: 'app', table: 'public_view' }
+    const agent = { ownerSessionId: 'session-1', check: () => {} }
+    const agentStructure = service.describeSchemaTable(input, undefined, agent)
+    expect(runtime.requests.at(-1)).toMatchObject({ mode: 'schema-table', baseTablesOnly: true })
+    runtime.settle({ mode: 'schema-table', capability: 'available', columns: [], indexes: [], warnings: [] })
+    await agentStructure
+    const uiStructure = service.describeSchemaTable(input)
+    expect(runtime.requests.at(-1)).not.toHaveProperty('baseTablesOnly')
+    runtime.settle({ mode: 'schema-table', capability: 'available', columns: [], indexes: [], warnings: [] })
+    await uiStructure
+    const agentRows = service.readSchemaRows({ ...input, offset: 0, limit: 50 }, undefined, agent)
+    expect(runtime.requests.at(-1)).toMatchObject({ mode: 'schema-rows', baseTablesOnly: true })
+    runtime.settle({ mode: 'schema-rows', capability: 'available', columns: [], rows: [], offset: 0, limit: 50, truncated: false, warnings: [] })
+    await agentRows
+  })
+
   test('Given 多条件筛选 When 主进程读取行 Then 转发独立条件快照且不返回整表估算', async () => {
     /** 以直连替身验证主进程到 utility 的合同，不访问真实数据库。 */
     const { service, runtime } = createService()
@@ -912,6 +931,22 @@ describe('服务器运维数据服务编排', () => {
     await expect(service.listSchemaTables(input)).resolves.toMatchObject({ tables: [{ name: 'users' }] })
     expect(runtime.requests).toHaveLength(1)
     expect(schemaCache.writes).toBe(1)
+  })
+
+  test('Given 普通目录有缓存 When 搜索第501张表 Then 服务端绑定搜索且不污染缓存', async () => {
+    const { service, runtime, schemaCache } = createService({ cache: true })
+    const created = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' }))
+    const input = { sourceId: created.source.id, database: 'app', cacheMode: 'prefer-cache' as const }
+    const first = service.listSchemaTables(input)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'table_1' }], tablesTruncated: true, warnings: [] })
+    await first
+    const searched = service.listSchemaTables({ ...input, tableSearch: 'table_501' })
+    expect(runtime.requests.at(-1)).toMatchObject({ mode: 'schema-tables', schemaDatabase: 'app', schemaTableSearch: 'table_501' })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [{ name: 'table_501' }], warnings: [] })
+    await expect(searched).resolves.toMatchObject({ tables: [{ name: 'table_501' }] })
+    expect(schemaCache.writes).toBe(1)
+    await expect(service.listSchemaTables(input)).resolves.toMatchObject({ tables: [{ name: 'table_1' }] })
+    expect(runtime.requests).toHaveLength(2)
   })
 
   test('Given 两个相同 prefer-cache 请求并发未命中 When 实时结果返回 Then 共用一次 runtime 读取', async () => {

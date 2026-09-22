@@ -20,15 +20,20 @@ const dataSources: readonly ServerOpsDataSource[] = [
 ]
 
 describe('ServerOpsAgentReadAccess', () => {
-  test('展示当前项目入口并保留跨项目已授权资源管理入口', () => {
+  test('Given 运维工具栏 When 渲染 Then 保留单个只读授权入口，不拆分数据库和服务器按钮', () => {
     const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId="session-1" projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources} />)
     expect(html).toContain('aria-label="Agent 只读授权"')
+    expect(html.match(/<button\b/g)?.length).toBe(1)
+    expect(html).not.toContain('aria-label="Agent 禁用表"')
+    expect(html).not.toContain('aria-label="Agent 服务器授权"')
     expect(html).not.toContain('结构/行/SQL 未启用')
     expect(html).not.toContain('无租约')
   })
 
-  test('无会话时入口不可用且不加载资源目录', () => {
-    const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId={null} projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources} />)
-    expect(html).toMatch(/disabled=""[^>]*aria-label="Agent 只读授权"|aria-label="Agent 只读授权"[^>]*disabled=""/)
+  test('Given 无会话但持久规则可用 When 渲染 Then 同一个入口仍可管理禁用表', () => {
+    const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId={null} projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources}
+      policyApi={{ get: async () => ({ revision: 0, exclusions: [] }), set: async () => ({ revision: 1, exclusions: [] }) }} />)
+    expect(html).toContain('aria-label="Agent 只读授权"')
+    expect(html).not.toMatch(/aria-label="Agent 只读授权"[^>]*disabled=""/)
   })
 })

@@ -48,6 +48,48 @@ async function readPreviewFixture(metadata: Record<string, unknown>[], rows: Rec
 }
 
 describe('MySQL 表预览读取预算', () => {
+  test('Given 表在首500张之外 When 搜索目录 Then 参数化匹配且百分号按字面处理', async () => {
+    const calls: Array<{ sql: string; values: (string | number)[] }> = []
+    const connection = { query: async (sql: string, values: (string | number)[] = []) => {
+      calls.push({ sql, values })
+      if (sql.includes('information_schema.SCHEMATA')) return [[{ name: 'app' }], []]
+      return [[{ name: 'table_501', table_type: 'BASE TABLE' }], []]
+    } }
+    const result = await readMySqlWithConnection(connection, {
+      mode: 'schema-tables', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', schemaDatabase: 'app', schemaTableSearch: "table_%'",
+    })
+    expect(calls.at(-1)?.sql).toContain('TABLE_NAME LIKE ?')
+    expect(calls.at(-1)?.sql).not.toContain("table_%'")
+    expect(calls.at(-1)?.values).toEqual(['app', "%table!_!%'%"])
+    expect(result).toMatchObject({ tables: [{ name: 'table_501' }] })
+  })
+  test('Given 视图映射敏感基表 When Agent 请求结构或预览 Then 元数据阶段拒绝且不执行列查询和业务 SELECT', async () => {
+    for (const mode of ['schema-table', 'schema-rows'] as const) {
+      const calls: string[] = []
+      const connection = {
+        query: async (sql: string) => {
+          calls.push(sql)
+          return [sql.includes('VERSION()') ? [{ version: '8.0.36' }]
+            : sql.includes('information_schema.') ? [{ name: 'public_view', table_name: 'public_view', table_type: 'VIEW' }] : [], []]
+        },
+        execute: async (sql: string) => {
+          calls.push(sql)
+          return [[{ name: 'public_view', table_name: 'public_view', table_type: 'VIEW', name_of_hidden_base: 'secret' }], []]
+        },
+      }
+      await expect(readMySqlWithConnection(connection, {
+        mode, engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', schemaDatabase: 'app', schemaTable: 'public_view',
+        baseTablesOnly: true, ...(mode === 'schema-rows' ? { rowOffset: 0, rowLimit: 10 } : {}),
+      })).rejects.toThrow('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
+      expect(calls.filter((sql) => sql.includes('information_schema.'))).toHaveLength(1)
+      expect(calls.some((sql) => sql.includes('FROM `app`.`public_view`'))).toBe(false)
+    }
+    const ui = await readMySqlWithConnection({
+      query: async (sql: string) => [sql.includes('information_schema.TABLES') ? [{ name: 'public_view', table_type: 'VIEW' }] : [], []],
+      execute: async () => [[{ name: 'authorization', column_type: 'text', nullable: 'YES' }], []],
+    }, { mode: 'schema-table', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', schemaDatabase: 'app', schemaTable: 'public_view' })
+    expect(ui).toMatchObject({ capability: 'available' })
+  })
   test('Given 单表数据预览 When 读取元数据或行 Then MySQL和MariaDB均先设置十秒执行与两秒锁等待', async () => {
     for (const version of ['8.0.36', '10.11.8-MariaDB']) {
       /** 记录固定策略配置；含用户标识的查询仍只走服务端绑定。 */

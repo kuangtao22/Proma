@@ -45,8 +45,12 @@ interface ServerOpsDataRuntimeInputBase {
   tlsServerName?: string
   /** 表浏览目标库；必须已在 information_schema 内校验过。 */
   schemaDatabase?: string
+  /** 只在指定库的 schema-tables 模式按需过滤表名。 */
+  schemaTableSearch?: string
   /** 表浏览目标表；`schema-table` 与 `schema-rows` 使用。 */
   schemaTable?: string
+  /** Agent 表浏览只读取基础表；UI 默认不附加此限制。 */
+  baseTablesOnly?: boolean
   /** 行预览偏移与页大小；`schema-rows` 使用。 */
   rowOffset?: number
   rowLimit?: number
@@ -782,6 +786,7 @@ async function readMySql(
     if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
     /** 筛选字段无效属于用户输入错误，不能被诊断连接失败分类器吞掉。 */
     if (input.mode === 'schema-rows' && getServerOpsRowFilterPublicError(error) !== null) throw error
+    if (input.baseTablesOnly && getServerOpsSqlQueryPublicError(error)?.code === 'SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE') throw error
     if (input.mode === 'sql-query') {
       /** 建连与执行共用公开错误白名单，不向主进程泄露驱动原始详情。 */
       const normalized = normalizeServerOpsSqlQueryError(error)
@@ -949,6 +954,8 @@ const MYSQL_SCHEMA_DATABASE_EXISTS_QUERY = 'SELECT SCHEMA_NAME AS name FROM info
 const MYSQL_SCHEMA_TABLES_QUERY = 'SELECT TABLE_NAME AS name, TABLE_TYPE AS table_type, ENGINE AS engine, TABLE_ROWS AS rows_estimate, '
   + '(DATA_LENGTH + INDEX_LENGTH) AS size_bytes, COALESCE(UPDATE_TIME, CREATE_TIME) AS updated_at, TABLE_COMMENT AS comment '
   + 'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME LIMIT 501'
+/** LIKE 使用固定 ! 转义符；所有搜索文本作为绑定参数，百分号与下划线按字面匹配。 */
+const MYSQL_SCHEMA_TABLE_SEARCH_QUERY = MYSQL_SCHEMA_TABLES_QUERY.replace(' ORDER BY TABLE_NAME', " AND TABLE_NAME LIKE ? ESCAPE '!' ORDER BY TABLE_NAME")
 /** 表浏览：表结构列定义。 */
 const MYSQL_SCHEMA_COLUMNS_QUERY = 'SELECT COLUMN_NAME AS name, COLUMN_TYPE AS column_type, IS_NULLABLE AS nullable, '
   + 'COLUMN_KEY AS column_key, COLUMN_DEFAULT AS default_text, EXTRA AS extra, COLUMN_COMMENT AS comment '
@@ -958,10 +965,10 @@ const MYSQL_SCHEMA_INDEXES_QUERY = 'SELECT INDEX_NAME AS name, NON_UNIQUE AS non
   + 'COLUMN_NAME AS column_name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? '
   + 'ORDER BY INDEX_NAME, SEQ_IN_INDEX LIMIT 1024'
 /** 表浏览：白名单校验。只有命中这里返回的表名才允许拼进后续语句。 */
-const MYSQL_SCHEMA_TABLE_EXISTS_QUERY = 'SELECT TABLE_NAME AS name FROM information_schema.TABLES '
+const MYSQL_SCHEMA_TABLE_EXISTS_QUERY = 'SELECT TABLE_NAME AS name, TABLE_TYPE AS table_type FROM information_schema.TABLES '
   + 'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1'
 /** 行预览一次取得实时表身份、列类型和估算；覆盖 MySQL 4096 列上限，避免隐藏列占满预览窗口。 */
-const MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY = 'SELECT t.TABLE_NAME AS table_name, t.TABLE_ROWS AS rows_estimate, '
+const MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY = 'SELECT t.TABLE_NAME AS table_name, t.TABLE_TYPE AS table_type, t.TABLE_ROWS AS rows_estimate, '
   + 'c.COLUMN_NAME AS name, c.DATA_TYPE AS data_type, c.EXTRA AS extra, s.SEQ_IN_INDEX AS primary_seq '
   + 'FROM information_schema.TABLES AS t LEFT JOIN information_schema.COLUMNS AS c '
   + 'ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME '
@@ -1050,7 +1057,9 @@ async function readMySqlSchema(
         ? [...databases.slice(0, 199), schemaDatabase]
         : [...databases, schemaDatabase]
     }
-    const tableRows = await readRows(connection, MYSQL_SCHEMA_TABLES_QUERY, [schemaDatabase])
+    const search = input.schemaTableSearch
+    const tableRows = await readRows(connection, search === undefined ? MYSQL_SCHEMA_TABLES_QUERY : MYSQL_SCHEMA_TABLE_SEARCH_QUERY,
+      search === undefined ? [schemaDatabase] : [schemaDatabase, `%${search.replace(/[!%_]/gu, (character) => `!${character}`)}%`])
     const tablesTruncated = tableRows.length > 500
     const tables: ServerOpsDataSchemaTableSummary[] = tableRows.slice(0, 500).map((row) => {
       /** 行数估算可能是字符串（大表），统一转成有界数字。 */
@@ -1113,6 +1122,10 @@ async function readMySqlSchema(
       }
     }
     return { mode: 'schema-table', capability: 'unsupported', columns: [], indexes: [], warnings }
+  }
+  /** 视图可能引用禁用表；Agent 的结构和预览仅在实时元数据确认物理表后继续。 */
+  if (input.baseTablesOnly && !existsRows.every((row) => row.table_type === 'BASE TABLE')) {
+    throw new Error('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
   }
 
   if (input.mode === 'schema-table') {

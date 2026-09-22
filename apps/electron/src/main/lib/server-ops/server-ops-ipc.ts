@@ -154,6 +154,8 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { requireOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import type { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { SERVER_OPS_AGENT_READ_CHANNELS, parseServerOpsAgentReadGrant, parseServerOpsAgentReadSession } from '@proma/shared'
+import { SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS, parseServerOpsDatabaseAgentPolicyUpdate } from '@proma/shared'
+import type { ServerOpsDatabaseAgentPolicyStore } from './server-ops-database-agent-policy-store'
 import { SERVER_OPS_CONNECTION_DRAFT_CHANNELS, parseServerOpsConnectionDraftDismiss, parseServerOpsConnectionDraftSession } from '@proma/shared'
 import { serverOpsConnectionDraftStore } from './server-ops-connection-draft-store'
 import { captureServerOpsReadBindings, revalidateServerOpsReadBindings } from './server-ops-agent-read-identity'
@@ -264,6 +266,8 @@ export interface ServerOpsIpcOptions {
   connections: ServerOpsConnectionContract
   credentials: ServerOpsCredentialStoreContract
   access: ServerOpsAgentAccessStore
+  /** 持久数据库禁用项由主窗口管理，不依赖临时会话租约。 */
+  databasePolicy?: Pick<ServerOpsDatabaseAgentPolicyStore, 'get' | 'set' | 'onChanged'>
   audit: { list: (input: ServerOpsAuditListInput) => ServerOpsAuditListResult; prepareForWrites?: () => Promise<void> }
     & Partial<Pick<ServerOpsAuditStore, 'append'>>
   overview?: ServerOpsOverviewContract
@@ -393,6 +397,8 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.EXPORT_LOG,
     SERVER_OPS_AGENT_READ_CHANNELS.GET,
     SERVER_OPS_AGENT_READ_CHANNELS.SET,
+    SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.GET,
+    SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.SET,
     SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST,
     SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS,
     ...Object.values(SERVER_OPS_TRUST_CHANNELS),
@@ -1001,10 +1007,35 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     revalidateServerOpsReadBindings(options.access, options)
     return options.access.getReadAccess(sessionId) ?? null
   })
+  installHandler(SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.GET, (event) => {
+    assertAuthorizedSender(event, options)
+    if (!options.databasePolicy) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_UNAVAILABLE')
+    return options.databasePolicy.get()
+  })
+  installHandler(SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.SET, (event, input) => {
+    assertAuthorizedSender(event, options)
+    if (!options.databasePolicy) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_UNAVAILABLE')
+    /** 精确解析后才读取目标目录；不用会话存在性限制全局禁用设置。 */
+    const update = parseServerOpsDatabaseAgentPolicyUpdate(input)
+    const sources = options.data?.listSources().sources ?? []
+    /** 连接删除后仍保留禁用事实；编辑其它连接不能因此被阻塞或清空旧规则。 */
+    const previous = options.databasePolicy.get()
+    for (const exclusion of update.exclusions) {
+      const source = sources.find((entry) => entry.id === exclusion.sourceId)
+      if (!source && previous.exclusions.some((entry) => entry.sourceId === exclusion.sourceId
+        && entry.database === exclusion.database && JSON.stringify(entry.excludedTables) === JSON.stringify(exclusion.excludedTables))) continue
+      if (!source || (source.engine !== 'mysql' && source.engine !== 'sqlite') || (source.engine === 'sqlite' && exclusion.database !== 'main')) {
+        throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+      }
+    }
+    return options.databasePolicy.set(update)
+  })
   installHandler(SERVER_OPS_AGENT_READ_CHANNELS.SET, (event, input) => {
     assertAuthorizedSender(event, options)
     const submitted = unpackAccess(input, 'grant')
     const grant = parseServerOpsAgentReadGrant(submitted.value)
+    /** 旧界面不能把已失效的数据库租约当作禁用规则保存成功。 */
+    if (grant.resources.some((resource) => resource.kind === 'mysql' || resource.kind === 'sqlite')) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_REQUIRED')
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(grant.sessionId))
     if (options.requireUserVisibleSession(grant.sessionId).archived && grant.resources.length) throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
     /** 先验证整组事实再一次替换，任一资源失效不能清除现有有效授权。 */
@@ -1167,6 +1198,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   }
   /** 逐项安装 runtime 与日志订阅，使中途失败可精确逆序回滚。 */
   installSubscription(() => options.access.onReadChanged((event) => broadcast(SERVER_OPS_AGENT_READ_CHANNELS.CHANGED, event)))
+  if (options.databasePolicy) installSubscription(() => options.databasePolicy!.onChanged((policy) => broadcast(SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.CHANGED, policy)))
   /** 广播只包含会话和草稿 ID，具体字段仍经有权限检查的定向读取入口获取。 */
   installSubscription(() => serverOpsConnectionDraftStore.subscribe((event) => broadcast(SERVER_OPS_CONNECTION_DRAFT_CHANNELS.CHANGED, event)))
   installSubscription(() => options.connections.onState((state) => {

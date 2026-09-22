@@ -12,6 +12,7 @@ import type { ServerOpsDockerConsoleService } from './server-ops-docker-console-
 import type { ServerOpsFileTransferService } from './server-ops-file-transfer-service'
 import type { ServerOpsLocalFileLeaseRegistry } from './server-ops-local-file-leases'
 import type { ServerOpsDataService } from './server-ops-data-service'
+import type { ServerOpsDatabaseAgentPolicyStore } from './server-ops-database-agent-policy-store'
 
 /** Server Ops 主进程唯一服务实例边界。 */
 export interface ServerOpsServiceContext {
@@ -20,6 +21,8 @@ export interface ServerOpsServiceContext {
   trust: ServerOpsHostTrustStore
   connections: ServerOpsConnectionContract
   access: ServerOpsAgentAccessStore
+  /** 数据库长期禁用规则；与会话授权 Store 的生命周期独立。 */
+  databasePolicy?: ServerOpsDatabaseAgentPolicyStore
   audit: Pick<ServerOpsAuditStore, 'append' | 'list'> & { prepareForWrites?: () => Promise<void> }
   overview: ServerOpsOverviewService
   systemd: ServerOpsSystemdService

@@ -13,6 +13,7 @@ export type ServerOpsConfigFileName =
   | 'query-history.json'
   | 'schema-cache.json'
   | 'projects.json'
+  | 'database-agent-policy.json'
 
 /** 配置事务向上层暴露的稳定错误码。 */
 export type ServerOpsConfigTransactionErrorCode =
@@ -111,6 +112,8 @@ const CONFIG_FILES: ReadonlySet<string> = new Set<ServerOpsConfigFileName>([
   'schema-cache.json',
   // 运维项目是主机与数据源的归属边界，必须与它们共用同一把跨进程写锁。
   'projects.json',
+  // Agent 数据库禁用表必须与连接配置共享跨进程短事务。
+  'database-agent-policy.json',
 ])
 
 /** 当前 JS isolate 内唯一的外层事务；同步调用不会在中途交出事件循环。 */

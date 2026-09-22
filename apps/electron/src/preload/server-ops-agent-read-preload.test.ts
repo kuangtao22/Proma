@@ -3,6 +3,27 @@ import { SERVER_OPS_AGENT_READ_CHANNELS } from '@proma/shared'
 import { createServerOpsAgentReadPreload } from './server-ops-agent-read-preload'
 
 describe('只读授权 preload', () => {
+  test('Given 无会话的持久禁用规则 When 读取保存订阅 Then 校验完整合同并保留代次', async () => {
+    /** 合成策略只包含资源标识与表名，不包含连接秘密。 */
+    const policy = { revision: 1, exclusions: [{ sourceId: 'source-1', database: 'app', excludedTables: ['private_data'] }] }
+    /** 收集桥接请求及广播，验证会话授权不参与数据库配置。 */
+    const calls: unknown[] = []
+    let callback: ((value: unknown) => void) | undefined
+    const api = createServerOpsAgentReadPreload(async (channel, input) => { calls.push([channel, input]); return policy }, (_channel, listener) => { callback = listener; return () => {} })
+    expect(await api.getServerOpsDatabaseAgentPolicy()).toEqual(policy)
+    expect(await api.setServerOpsDatabaseAgentPolicy({ expectedRevision: 0, exclusions: policy.exclusions })).toEqual(policy)
+    const events: unknown[] = []
+    api.onServerOpsDatabaseAgentPolicyChanged((event) => events.push(event))
+    callback?.({ ...policy, password: 'forbidden' })
+    callback?.(policy)
+    expect(events).toEqual([policy])
+    expect(calls).toEqual([
+      ['server-ops:get-database-agent-policy', undefined],
+      ['server-ops:set-database-agent-policy', { expectedRevision: 0, exclusions: policy.exclusions }],
+    ])
+    await expect(api.setServerOpsDatabaseAgentPolicy({ expectedRevision: -1, exclusions: [] })).rejects.toThrow()
+    expect(calls).toHaveLength(2)
+  })
   test('Given 正常会话 When 保存/读取/订阅 Then 使用严格公开合同', async () => {
     const calls: unknown[] = []
     const input = { sessionId: 'session-1', resources: [{ kind: 'ssh' as const, hostId: 'host-1' }] }

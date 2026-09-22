@@ -16,6 +16,41 @@ function catalog(database = 'app', tables = ['users']): ServerOpsDataSourceTable
 }
 
 describe('Agent 授权表目录按需读取', () => {
+  test('首页没有目标库时展开只列可见库，选库后才读取目标表且旧目录不得覆盖', async () => {
+    /** 无目标目录回执只供弹窗选库，具体表仍按选择的库读取。 */
+    const inputs: Array<{ sourceId: string; database?: string; cacheMode?: string }> = []
+    const api = { listServerOpsDataSchemaTables: async (input: typeof inputs[number]) => {
+      inputs.push(input)
+      return input.database ? catalog(input.database, ['users']) : { databases: ['app', 'audit'], tables: [] }
+    } }
+    const controller = createServerOpsAgentCatalogController({ api, publish: () => undefined })
+    controller.activate(); controller.select('source-1', 'v1')
+    expect(inputs).toEqual([])
+    await controller.load()
+    expect(inputs[0]).toEqual({ sourceId: 'source-1', cacheMode: 'prefer-cache' })
+    expect(controller.snapshot().result?.databases).toEqual(['app', 'audit'])
+    controller.select('source-1', 'v1', 'audit')
+    expect(controller.snapshot().result).toBeNull()
+    await controller.load()
+    expect(inputs[1]?.database).toBe('audit')
+    expect(controller.snapshot().result?.tables[0]?.name).toBe('users')
+  })
+  test('截断表目录按需搜索后可选择第501张表，清空搜索恢复初始目录', async () => {
+    const inputs: Array<{ tableSearch?: string; database?: string; cacheMode?: string }> = []
+    const api = { listServerOpsDataSchemaTables: async (input: typeof inputs[number]) => {
+      inputs.push(input)
+      return input.tableSearch ? catalog('app', ['table_501']) : { ...catalog('app', ['table_1']), tablesTruncated: true }
+    } }
+    const controller = createServerOpsAgentCatalogController({ api, publish: () => undefined })
+    controller.activate(); controller.select('source-1', 'v1', 'app')
+    await controller.load()
+    expect(controller.snapshot().result?.tables[0]?.name).toBe('table_1')
+    await controller.load(false, 'table_501')
+    expect(inputs[1]).toMatchObject({ database: 'app', tableSearch: 'table_501' })
+    expect(controller.snapshot().result?.tables[0]?.name).toBe('table_501')
+    await controller.load()
+    expect(controller.snapshot().result?.tables[0]?.name).toBe('table_1')
+  })
   test('选择目标不读取，显式加载使用缓存策略并保留截断标志', async () => {
     const inputs: Array<{ sourceId: string; database?: string; cacheMode?: string }> = []
     const api = { listServerOpsDataSchemaTables: async (input: typeof inputs[number]) => {
