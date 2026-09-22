@@ -103,6 +103,8 @@ import type { ProductivityToolsSettings } from '../../../types'
 import type { ServerOpsAgentFacade } from '../server-ops/server-ops-agent-facade'
 import type { ServerOpsAgentReadFacade } from '../server-ops/server-ops-agent-read-facade'
 import { buildServerOpsReadTools } from './pi-server-ops-read-tools'
+import { buildServerOpsConnectionTools } from './pi-server-ops-connection-tools'
+import type { ServerOpsConnectionDraftAgent } from '../server-ops/server-ops-connection-draft-agent'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -146,6 +148,8 @@ export interface PiBuiltinToolsContext {
   serverOpsFacade?: ServerOpsAgentFacade
   /** 多资源只读接口独立于单服务器操作接口，授权由主进程逐次验证。 */
   serverOpsReadFacade?: ServerOpsAgentReadFacade
+  /** 只生成待审阅连接草稿的会话闭包，不拥有保存或连接权限。 */
+  serverOpsConnectionDrafts?: ServerOpsConnectionDraftAgent
 }
 
 function jsonToolResult(payload: unknown): AgentToolResult<unknown> {
@@ -1693,6 +1697,9 @@ export async function buildPiBuiltinTools(
 
   /** 工具构建层独立复核运行来源，防止上游错误传入 Facade。 */
   const serverOpsSourceAllowed = ctx.triggeredBy === undefined || ctx.triggeredBy === 'user'
+  if (ctx.serverOpsConnectionDrafts && serverOpsSourceAllowed) {
+    tools.push(...buildServerOpsConnectionTools(sdk, ctx.serverOpsConnectionDrafts))
+  }
   if (ctx.serverOpsFacade && serverOpsSourceAllowed) {
     try {
       tools.push(...buildServerOpsTools(sdk, ctx.serverOpsFacade))

@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { atom, useAtom } from 'jotai'
-import { Database, DatabaseZap, Maximize2, Minimize2, PanelLeft } from 'lucide-react'
+import { ArrowLeft, Database, DatabaseZap, Maximize2, Minimize2 } from 'lucide-react'
 import type { ServerOpsDataSource } from '@proma/shared'
 import { isServerOpsPlaintextDirectAddress } from '@proma/shared'
 import { Badge } from '@/components/ui/badge'
@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { ServerOpsDataServicesPanel } from './ServerOpsDataServicesPanel'
 import type { ServerOpsDataPanelApi, ServerOpsDataSourceMutation } from './ServerOpsDataServicesPanel'
 import { ServerOpsDatabaseWorkbench } from './ServerOpsDatabaseWorkbench'
+import type { ServerOpsWorkspaceToolbarContent } from './ServerOpsWorkspaceToolbar'
 import { cn } from '@/lib/utils'
 import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { getCanvasExpandedTitlebarHeight } from '@/lib/window-titlebar-layout'
@@ -35,6 +36,8 @@ export interface ServerOpsDataConnectionViewProps {
   viewScope?: string
   /** 非聚焦 Pane 不消费 Escape，也不展开遮挡正在使用的 Pane。 */
   paneActive?: boolean
+  /** 顶层统一项目、连接身份与授权导航，展开后仍保留在同一容器中。 */
+  renderWorkspaceToolbar: (content?: ServerOpsWorkspaceToolbarContent) => React.ReactNode
   onOpenDrawer: () => void
   /** 返回项目视图的分组列表。 */
   onBackToProject: () => void
@@ -63,6 +66,7 @@ export function ServerOpsDataConnectionView({
   jumpHost,
   viewScope = 'default',
   paneActive = true,
+  renderWorkspaceToolbar,
   onOpenDrawer,
   onBackToProject,
   onSourceMutated,
@@ -107,45 +111,37 @@ export function ServerOpsDataConnectionView({
   /** SQLite 的连接身份是远端文件；网络引擎仍使用地址和端口。 */
   const connectionDetail = source.engine === 'sqlite' ? source.filePath : `${source.address}:${source.port}`
 
-  /** 连接头只出现一次，MySQL 的菜单由工作台管理控制器提供。 */
-  const renderHeader = (actions?: React.ReactNode): React.ReactNode => (
-      <div className="flex min-h-14 shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2" data-server-ops-toolbar>
+  /** 连接身份合入项目导航，不再单独重复项目名；MySQL 菜单仍由原控制器提供。 */
+  const renderHeader = (actions?: React.ReactNode): React.ReactNode => renderWorkspaceToolbar({
+    onManageProjects: () => { setExpanded(false); onOpenDrawer() },
+    connection: (
+      <div className="flex min-w-0 items-center gap-2">
         <TooltipProvider delayDuration={200}>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button type="button" variant="ghost" size="icon-sm" aria-label="打开项目列表" onClick={() => { setExpanded(false); onOpenDrawer() }}>
-                <PanelLeft className="size-3.5" aria-hidden="true" />
+              <Button type="button" variant="ghost" size="icon-sm" className="shrink-0" aria-label="返回项目连接" onClick={onBackToProject}>
+                <ArrowLeft className="size-3.5" aria-hidden="true" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom">项目列表</TooltipContent>
+            <TooltipContent side="bottom">返回{projectLabel}的连接列表</TooltipContent>
           </Tooltip>
         </TooltipProvider>
         <div className="min-w-0 flex-1">
-          {/*
-            身份只写一遍：第一行是"项目 › 连接"面包屑（项目段可点，代替独立的返回按钮），
-            第二行是这条连接的完整身份。面板里不再重复这一段。
-          */}
-          <div className="flex min-w-0 items-center gap-1 text-xs font-medium">
-            <button
-              type="button"
-              className="truncate rounded-sm px-0.5 text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-              data-server-ops-connection-project
-              onClick={onBackToProject}
-            >
-              {projectLabel}
-            </button>
-            <span className="shrink-0 text-muted-foreground" aria-hidden="true">›</span>
-            <span className="flex min-w-0 items-center gap-1.5 truncate" data-server-ops-connection-module>
+          <div className="flex min-w-0 items-center gap-2 text-xs font-medium">
+            <span className="flex min-w-0 items-center gap-1.5" data-server-ops-connection-module>
               <EngineIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-              {source.label}
+              <span className="truncate" title={source.label}>{source.label}</span>
             </span>
+            <span className="shrink-0 text-[10px] font-normal text-muted-foreground" data-server-ops-engine-badge>{getEngineLabel(source.engine)}</span>
           </div>
-          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" data-server-ops-connection-detail>
+          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={`${connectionDetail} · ${transportLabel}`} data-server-ops-connection-detail>
             {connectionDetail}
             {` · ${transportLabel}`}
           </div>
         </div>
-        <Badge variant="secondary" className="shrink-0 px-2 py-0.5 text-[10px] font-normal" data-server-ops-engine-badge>{getEngineLabel(source.engine)}</Badge>
+      </div>
+    ),
+    connectionActions: <>
         {plaintextDirect ? (
           <TooltipProvider delayDuration={200}>
             <Tooltip>
@@ -173,8 +169,8 @@ export function ServerOpsDataConnectionView({
         ) : null}
         {source.engine !== 'redis' ? <Button type="button" size="icon-sm" variant="ghost" aria-label={expanded ? '还原工作台' : '展开工作台'} onClick={() => setExpanded((previous) => !previous)}>{expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button> : null}
         {actions}
-      </div>
-  )
+    </>,
+  })
   return (
     <div className={cn('server-ops-workspace-container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-content-area', expanded && 'fixed inset-0 z-[200]')} style={{ paddingTop: titlebarHeight }} data-server-ops-data-connection-view={source.id} data-server-ops-workbench-expanded={expanded}>
       {expanded ? <div className="titlebar-drag-region absolute inset-x-0 top-0" style={{ height: titlebarHeight }} aria-hidden="true" /> : null}

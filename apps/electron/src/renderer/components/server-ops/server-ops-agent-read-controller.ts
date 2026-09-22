@@ -1,12 +1,16 @@
 import { parseServerOpsAgentReadGrant } from '@proma/shared'
 import type { ServerOpsAgentAccessImpact, ServerOpsAgentReadAccess, ServerOpsAgentReadChanged, ServerOpsAgentReadGrant, ServerOpsAgentReadResource } from '@proma/shared'
+import type { ServerOpsAgentCatalogApi } from './server-ops-agent-catalog-controller'
+import { prepareServerOpsReadEditorResources } from './server-ops-agent-table-scope'
 
-/** 只读权限页面仅使用这三个受控主进程接口。 */
+/** 只读权限页面使用受控主进程接口，目录读取与授权保存保持分离。 */
 export interface ServerOpsAgentReadAccessApi {
   get(sessionId: string): Promise<ServerOpsAgentReadAccess | null>
   set(grant: ServerOpsAgentReadGrant, impactToken?: string): Promise<ServerOpsAgentReadAccess | null>
   impact?: () => Promise<ServerOpsAgentAccessImpact>
   onChanged?: (listener: (event: ServerOpsAgentReadChanged) => void) => () => void
+  /** 用户点开禁用表选择器时按需读取元数据，不自动授权。 */
+  listServerOpsDataSchemaTables?: ServerOpsAgentCatalogApi['listServerOpsDataSchemaTables']
 }
 
 /** 权威快照与编辑草稿分离，未保存选择不计入授权数。 */
@@ -46,7 +50,7 @@ export function createServerOpsAgentReadController(options: { api: ServerOpsAgen
   /** 把匹配会话的主进程回执应用为权威事实。 */
   const adopt = (access: ServerOpsAgentReadAccess | null): void => {
     state.access = access?.sessionId === state.sessionId ? structuredClone(access) : null
-    state.resources = structuredClone(state.access?.resources ?? [])
+    state.resources = state.open ? prepareServerOpsReadEditorResources(state.access?.resources ?? []) : structuredClone(state.access?.resources ?? [])
     if (state.access) knownRevision = Math.max(knownRevision, state.access.revision)
   }
   /** 使用已展示的影响 token 提交；CAS 冲突刷新预览但保留草稿。 */
@@ -57,11 +61,13 @@ export function createServerOpsAgentReadController(options: { api: ServerOpsAgen
     try {
       const access = await options.api.set(grant, token)
       if (!active || epoch !== revision) return
-      adopt(access); state.open = false
+      state.open = false; adopt(access)
     } catch (error) {
       if (!active || epoch !== revision) return
       const conflict = error instanceof Error && error.message.includes('SERVER_OPS_ACCESS_IMPACT_CHANGED')
-      state.error = conflict ? '授权范围已变化，请检查新的影响范围后重试' : error instanceof Error ? error.message : '保存授权失败'
+      state.error = conflict ? '授权范围已变化，请检查新的影响范围后重试'
+        : error instanceof Error && error.message.includes('SERVER_OPS_READ_ACCESS_INVALID') ? '后台尚未接受新的授权格式，请完整重启客户端后重试'
+          : error instanceof Error ? error.message : '保存授权失败'
       if (conflict && options.api.impact) {
         try {
           const impact = await options.api.impact()
@@ -107,9 +113,9 @@ export function createServerOpsAgentReadController(options: { api: ServerOpsAgen
       }
     },
     /** 打开时从已保存事实重建草稿，取消残留不会被再次提交。 */
-    open(): void {
+    open(databaseTargets: ReadonlyMap<string, string> = new Map()): void {
       if (!active || !state.sessionId || state.loading || state.saving) return
-      state.open = true; state.error = null; state.resources = structuredClone(state.access?.resources ?? [])
+      state.open = true; state.error = null; state.resources = prepareServerOpsReadEditorResources(state.access?.resources ?? [], databaseTargets)
       publish()
     },
     /** 打开编辑器时取得影响快照；刷新后 token 必须重新由用户确认。 */
@@ -179,7 +185,7 @@ export function createServerOpsAgentReadController(options: { api: ServerOpsAgen
       if (!active || !state.sessionId || state.loading || state.saving || !state.open) return
       let grant: ServerOpsAgentReadGrant
       try { grant = parseServerOpsAgentReadGrant({ sessionId: state.sessionId, resources }) } catch {
-        state.error = '请检查授权范围：MySQL 需选择实例或数据库，SQLite 仅支持 main 库，指定表不能为空，最多 32 个连接、每连接 20 个库、每库 100 张表。'
+        state.error = '请检查授权范围：MySQL 需选择数据库，SQLite 仅支持 main 库；最多 32 个连接、每连接 20 个库、每库 100 张禁用表。'
         publish(); return
       }
       if (options.api.impact && !state.impact) {

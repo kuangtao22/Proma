@@ -34,10 +34,14 @@ function createInput(overrides: Partial<ServerOpsRuntimeDataReadRequest> = {}): 
 }
 
 /** 把本地 shell 子进程适配为 SSH ClientChannel 的最小测试替身。 */
-function createLocalChannelFactory(commands: string[]): ServerOpsSqliteChannelFactory {
+function createLocalChannelFactory(commands: string[], states: Array<{ exited: boolean }> = [], payloads: Array<Record<string, unknown>> = []): ServerOpsSqliteChannelFactory {
   return async (command) => {
     commands.push(command)
     const child = spawn('/bin/sh', ['-c', command], { stdio: ['pipe', 'pipe', 'pipe'] })
+    /** close 事件同时证明进程退出及标准流关闭，区别于只收到 JSON 结果。 */
+    const state = { exited: false }
+    states.push(state)
+    child.once('close', () => { state.exited = true })
     if (child.stdin === null || child.stdout === null || child.stderr === null) throw new Error('TEST_CHILD_STREAM_MISSING')
     /** 显式标注 channel，避免对象方法中的 this 被异步返回类型宽化。 */
     const channel: ServerOpsSqliteChannel = {
@@ -51,7 +55,12 @@ function createLocalChannelFactory(commands: string[]): ServerOpsSqliteChannelFa
         else child.once('error', listener)
         return channel
       },
-      write(data) { return child.stdin.write(data) },
+      write(data) {
+        /** 捕获真正传给 Python 的请求，验证调用方不能延长预算。 */
+        const line = Buffer.from(data).toString('utf8').trim()
+        if (line.length > 0) payloads.push(JSON.parse(line) as Record<string, unknown>)
+        return child.stdin.write(data)
+      },
       destroy() { child.kill('SIGKILL') },
       signal(_name, callback) {
         child.kill('SIGTERM')
@@ -372,7 +381,10 @@ describe('远程 SQLite 只读运行时', () => {
   })
 
   test('Given 查询尝试调用高消耗函数 When 超过远端预算 Then 以固定超时错误结束', async () => {
-    const createChannel = createLocalChannelFactory([])
+    /** 记录每次独占远端进程的退出状态。 */
+    const states: Array<{ exited: boolean }> = []
+    /** 使用真实本地 shell/Python 模拟 SSH，验证进程生命周期。 */
+    const createChannel = createLocalChannelFactory([], states)
     await expect(runServerOpsSqliteRead(createInput({
       mode: 'sql-query', queryId: 'query-timeout', timeoutMs: 1_000,
       sql: 'SELECT COUNT(*) FROM users a JOIN users b ON a.id >= b.id JOIN users c ON b.id >= c.id', maxRows: 10,
@@ -381,10 +393,50 @@ describe('远程 SQLite 只读运行时', () => {
     const database = new Database(databasePath)
     database.exec('WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 3000) INSERT INTO users (name) SELECT printf(\'user-%d\', value) FROM sequence')
     database.close()
+    /** 高消耗联表会先触发 VM 指令预算，墙钟只负责检测意外悬挂。 */
+    const startedAt = performance.now()
     await expect(runServerOpsSqliteRead(createInput({
-      mode: 'sql-query', queryId: 'query-budget', timeoutMs: 1_000,
+      mode: 'sql-query', queryId: 'query-budget', timeoutMs: 15_000,
       sql: 'SELECT COUNT(*) FROM users a JOIN users b ON a.id >= b.id JOIN users c ON b.id >= c.id', maxRows: 10,
     }), createChannel)).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_QUERY_TIMEOUT' })
+    /** 不让预算失败后挂起；精确十秒封顶由下面的实际 payload 断言验证。 */
+    expect(performance.now() - startedAt).toBeLessThan(13_000)
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'probe', timeoutMs: 1_000 }), createChannel))
+      .resolves.toMatchObject({ capability: 'available' })
+    expect(states.every((state) => state.exited)).toBe(true)
+  })
+
+  test('Given SQLite 数据库被独占锁定 When Agent 查询 Then 锁等待有界并返回锁定错误', async () => {
+    /** 仅锁定临时夹具数据库，模拟其他程序正在修改数据。 */
+    const writer = new Database(databasePath)
+    writer.exec('BEGIN EXCLUSIVE')
+    /** 统计忙等待的实际墙钟时间，不依赖 mock 计时器。 */
+    const startedAt = performance.now()
+    try {
+      await expect(runServerOpsSqliteRead(createInput({ mode: 'sql-query', queryId: 'locked', timeoutMs: 10_000,
+        sql: 'SELECT id FROM users', maxRows: 10 }), createLocalChannelFactory([])))
+        .rejects.toMatchObject({ code: 'SERVER_OPS_SQLITE_DATABASE_LOCKED' })
+    } finally {
+      writer.exec('ROLLBACK')
+      writer.close()
+    }
+    expect(performance.now() - startedAt).toBeLessThan(4_000)
+  })
+
+  test('Given 调用方请求超过上限的预算 When 执行查询和行预览 Then 远端 payload 按模式收敛预算', async () => {
+    /** 收集真实发送内容，防止只改变文案而未压缩超时参数。 */
+    const payloads: Array<Record<string, unknown>> = []
+    /** 在正常返回路径核对预算，不需要故意等待十秒。 */
+    const createChannel = createLocalChannelFactory([], [], payloads)
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'sql-query', queryId: 'budget-payload', timeoutMs: 15_000,
+      sql: 'SELECT id FROM users', maxRows: 1 }), createChannel)).resolves.toMatchObject({ queryId: 'budget-payload' })
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-rows', schemaDatabase: 'main', schemaTable: 'users',
+      rowOffset: 0, rowLimit: 1, timeoutMs: 15_000 }), createChannel)).resolves.toMatchObject({ mode: 'schema-rows' })
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'probe', timeoutMs: 15_000 }), createChannel))
+      .resolves.toMatchObject({ capability: 'available' })
+    expect(payloads.map((payload) => [payload.mode, payload.timeoutMs])).toEqual([
+      ['sql-query', 10_000], ['schema-rows', 10_000], ['probe', 15_000],
+    ])
   })
 
   test('Given 在途远端进程 When 用户取消 Then 发送 TERM、关闭通道并返回取消码', async () => {

@@ -9,6 +9,8 @@ import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { ServerOpsFileService } from './server-ops-file-service'
 import { ServerOpsSftpRuntimeError } from '../../../utility/server-ops/server-ops-sftp-runtime'
 import { SERVER_OPS_AGENT_READ_CHANNELS, SERVER_OPS_DATA_QUERY_CHANNELS, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS, isServerOpsAuditRecord } from '@proma/shared'
+import { SERVER_OPS_CONNECTION_DRAFT_CHANNELS } from '@proma/shared'
+import { serverOpsConnectionDraftStore } from './server-ops-connection-draft-store'
 
 /** 测试 IPC handler 的最小签名。 */
 type TestHandler = (event: IpcMainInvokeEvent, input?: unknown) => unknown
@@ -154,6 +156,19 @@ function createAgentAccessHarness(options: {
 }
 
 describe('服务器运维 IPC', () => {
+  test('Given Agent 草稿已生成 When 授权面板读取、忽略或伪造会话 Then 仅按可见会话领取', async () => {
+    const fixture = createAgentAccessHarness()
+    const draft = serverOpsConnectionDraftStore.prepare('session-a', { kind: 'ssh', name: '测试服务器', address: '10.0.0.8', port: 22, username: 'ops' })
+    try {
+      await expect(invoke(fixture.handlers, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, createSender(99), 'session-a')).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(fixture.handlers, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, fixture.sender, 'session-a')).resolves.toEqual([draft])
+      await expect(invoke(fixture.handlers, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS, fixture.sender, { sessionId: 'session-b', id: draft.id })).resolves.toBe(false)
+      await expect(invoke(fixture.handlers, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, fixture.sender, 'session-a')).resolves.toEqual([draft])
+    } finally {
+      serverOpsConnectionDraftStore.dismiss('session-a', draft.id)
+      fixture.registration.dispose()
+    }
+  })
   test('Given 查询历史 IPC When sender、输入或数据源不可信 Then 拒绝；合法 MySQL 只访问本地 Store', async () => {
     /** 记录本地历史调用，证明 handler 不经过远端查询服务。 */
     const calls: unknown[] = []
@@ -854,7 +869,7 @@ describe('服务器运维 IPC', () => {
       SERVER_OPS_IPC_CHANNELS.AGENT_ACCESS_CHANGED,
       SERVER_OPS_IPC_CHANNELS.LOG_OUTPUT,
       SERVER_OPS_IPC_CHANNELS.LOG_EXIT,
-    ] as readonly string[]).includes(channel)).flatMap((channel) => channel === SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION ? [channel, ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS)] : [channel]), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
+    ] as readonly string[]).includes(channel)).flatMap((channel) => channel === SERVER_OPS_IPC_CHANNELS.REVOKE_AGENT_ACCESS_SESSION ? [channel, ...Object.values(SERVER_OPS_AGENT_ACCESS_MANAGEMENT_CHANNELS)] : [channel]), SERVER_OPS_AGENT_READ_CHANNELS.GET, SERVER_OPS_AGENT_READ_CHANNELS.SET, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS, ...Object.values(SERVER_OPS_TRUST_CHANNELS), ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
       ...Object.values(SERVER_OPS_FILE_CHANNELS),
       ...Object.values(SERVER_OPS_CONSOLE_IPC_CHANNELS).filter((channel) => channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.OUTPUT && channel !== SERVER_OPS_CONSOLE_IPC_CHANNELS.EXIT),
       ...Object.values(SERVER_OPS_TRANSFER_CHANNELS).filter((channel) => channel !== SERVER_OPS_TRANSFER_CHANNELS.PROGRESS),
@@ -1227,7 +1242,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(73)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(75)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1246,7 +1261,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(73)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(75)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

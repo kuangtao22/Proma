@@ -46,6 +46,8 @@ function createFixture() {
   const service = new ServerOpsLogService({ connection, uuid: () => `stream-${++nextStream}` })
   return {
     service,
+    /** 测试中只替换一次性读取，保持生产日志流桩不变。 */
+    setSnapshotExec: (exec: NonNullable<ServerOpsLogConnection['exec']>) => { connection.exec = exec },
     starts,
     stops,
     acks,
@@ -181,5 +183,52 @@ describe('服务器运维日志 Service', () => {
       hostId: 'host-1', source: { kind: 'unit', unitId: "nginx.service'; touch /tmp/pwned; echo '" }, since: '15m', priority: 'info', tailLines: 10,
     })).rejects.toThrow('SERVER_OPS_SYSTEMD_UNIT_INVALID')
     expect(fixture.starts).toHaveLength(1)
+  })
+
+  test('Given 日志读取权限 When 快照 Then 固定模板无 follow、遮罩凭据并限制输出大小', async () => {
+    const fixture = createFixture()
+    const commands: string[] = []
+    fixture.setSnapshotExec(async (_hostId, _connectionId, command, timeoutMs) => {
+      commands.push(command)
+      expect(timeoutMs).toBe(10_000)
+      return { stdout: `${'正常日志\n'.repeat(210)}token=secret Authorization: Bearer abc\n{"password":"json-secret"}\nmysql://user:db-pass@localhost/app\n-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-body\n-----END OPENSSH PRIVATE KEY-----\n`, stderr: '', exitCode: 0, truncated: false }
+    })
+    const result = await fixture.service.snapshot({ hostId: 'host-1', source: { kind: 'system' }, since: '15m', priority: 'warning', tailLines: 200 })
+    expect(commands[0]).toContain('journalctl --no-pager')
+    expect(commands[0]).not.toContain('--follow')
+    expect(result.truncated).toBe(true)
+    expect(result.lines.length).toBeLessThanOrEqual(200)
+    expect(JSON.stringify(result)).not.toContain('secret')
+    expect(JSON.stringify(result)).not.toContain('abc')
+    expect(JSON.stringify(result)).not.toContain('json-secret')
+    expect(JSON.stringify(result)).not.toContain('db-pass')
+    expect(JSON.stringify(result)).not.toContain('private-body')
+    expect(Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8')).toBeLessThanOrEqual(32_768)
+  })
+
+  test('Given 在途读取 When 取消或连接换代 Then 丢弃日志正文', async () => {
+    const fixture = createFixture()
+    const gate = Promise.withResolvers<void>()
+    fixture.setSnapshotExec(async () => { await gate.promise; return { stdout: 'private', stderr: '', exitCode: 0, truncated: false } })
+    const request = { hostId: 'host-1', source: { kind: 'system' } as const, since: '1h' as const, priority: 'info' as const, tailLines: 1 }
+    const controller = new AbortController()
+    const cancelled = fixture.service.snapshot(request, controller.signal)
+    controller.abort()
+    gate.resolve()
+    await expect(cancelled).rejects.toThrow('SERVER_OPS_AGENT_READ_CANCELLED')
+    const changed = fixture.service.snapshot(request)
+    fixture.setIdentity({ hostId: 'host-1', connectionId: 'connection-2', generation: 2 })
+    await expect(changed).rejects.toThrow('SERVER_OPS_LOG_CONNECTION_CHANGED')
+  })
+
+  test('Given 连接方法使用 this When 快照 Then 保留实例接收者且末尾换行不误报截断', async () => {
+    const fixture = createFixture()
+    fixture.setSnapshotExec(function(this: ServerOpsLogConnection) {
+      if (typeof this.getActiveIdentity !== 'function') throw new Error('lost this')
+      return Promise.resolve({ stdout: 'one\n', stderr: '', exitCode: 0, truncated: false })
+    })
+    const result = await fixture.service.snapshot({ hostId: 'host-1', source: { kind: 'system' }, since: '15m', priority: 'info', tailLines: 1 })
+    expect(result.lines).toEqual(['one'])
+    expect(result.truncated).toBe(false)
   })
 })

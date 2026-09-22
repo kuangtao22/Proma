@@ -6,6 +6,7 @@ import {
   isServerOpsSqlSensitiveColumn,
   limitServerOpsSqlQuery,
   parseServerOpsDataQueryResult,
+  SERVER_OPS_DATA_QUERY_TIMEOUT_MS,
 } from '@proma/shared'
 import type { ServerOpsDataQueryResult, ServerOpsDataSchemaCell } from '@proma/shared'
 
@@ -56,6 +57,7 @@ const QUERY_TIMEOUT_ERROR_CODES = new Set([
   'CONNECT_TIMEOUT',
   'ER_QUERY_TIMEOUT',
   'ER_STATEMENT_TIMEOUT',
+  'ER_LOCK_WAIT_TIMEOUT',
 ])
 
 /** 可安全跨进程展示的 SQL 查询错误。 */
@@ -109,7 +111,7 @@ export function normalizeServerOpsSqlQueryError(error: unknown): Error {
     if (QUERY_PERMISSION_ERROR_CODES.has(code) || ['ERRNO_1044', 'ERRNO_1045', 'ERRNO_1142', 'ERRNO_1143', 'ERRNO_1227'].includes(code)) {
       return new Error('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')
     }
-    if (QUERY_TIMEOUT_ERROR_CODES.has(code) || code === 'ERRNO_3024' || code === 'ERRNO_1969') {
+    if (QUERY_TIMEOUT_ERROR_CODES.has(code) || code === 'ERRNO_3024' || code === 'ERRNO_1969' || code === 'ERRNO_1205') {
       return new Error('SERVER_OPS_DATA_QUERY_TIMEOUT')
     }
   }
@@ -353,13 +355,24 @@ function parseQueryTimeoutDialect(version: string): QueryTimeoutDialect {
   throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
 }
 
-/** 读取 `SELECT VERSION()` 的唯一版本字符串。 */
-async function readQueryTimeoutDialect(connection: ServerOpsSqlQueryConnection, signal?: AbortSignal): Promise<QueryTimeoutDialect> {
+/**
+ * 在元数据和业务 SELECT 前启用服务端执行上限与元数据锁等待上限。
+ * @param query 当前独占连接的固定语句执行函数，不含用户输入。
+ * @param signal 外层总请求时限和用户取消信号。
+ * @returns 完成策略设置；版本不支持或设置失败时拒绝，调用方不得继续读取。
+ */
+export async function configureServerOpsMySqlReadLimits(query: (statement: string) => Promise<unknown>, signal?: AbortSignal): Promise<void> {
   throwIfAborted(signal)
-  const rows = readObjectRows(await queryWithAbort(connection, 'SELECT VERSION() AS version', undefined, signal))
+  /** 仅用真实服务端版本选择语法，不缓存跨连接的能力假设。 */
+  const rows = readObjectRows(await query('SELECT VERSION() AS version'))
   throwIfAborted(signal)
   if (rows.length !== 1 || typeof rows[0]?.version !== 'string') throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
-  return parseQueryTimeoutDialect(rows[0].version)
+  /** 两个会话变量合并在同一 SET 中，减少表预览的额外往返。 */
+  const dialect = parseQueryTimeoutDialect(rows[0].version)
+  await query(dialect === 'mysql'
+    ? `SET SESSION MAX_EXECUTION_TIME = ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS}, lock_wait_timeout = 2`
+    : `SET SESSION max_statement_time = ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS / 1_000}, lock_wait_timeout = 2`)
+  throwIfAborted(signal)
 }
 
 /** 流式查询的已收口结果。 */
@@ -502,16 +515,12 @@ export async function executeServerOpsSqlQuery(
   /** 事务开始后无论查询成功、失败或取消都尝试回滚。 */
   let transactionStarted = false
   try {
-    const timeoutDialect = await readQueryTimeoutDialect(connection, signal)
+    await configureServerOpsMySqlReadLimits((statement) => queryWithAbort(connection, statement, undefined, signal), signal)
     const columnsByTable = await validateBaseTables(connection, input.database, plan.tables, !plan.hasWildcard, signal)
     if (!plan.hasWildcard) validateExplicitColumns(plan.columns, columnsByTable)
     throwIfAborted(signal)
     const startedAt = Date.now()
     await queryWithAbort(connection, 'SET SESSION TRANSACTION READ ONLY', undefined, signal)
-    throwIfAborted(signal)
-    await queryWithAbort(connection, timeoutDialect === 'mysql'
-      ? 'SET SESSION MAX_EXECUTION_TIME = 10000'
-      : 'SET SESSION max_statement_time = 10', undefined, signal)
     throwIfAborted(signal)
     await queryWithAbort(connection, 'START TRANSACTION READ ONLY', undefined, signal)
     transactionStarted = true

@@ -81,6 +81,11 @@ function findDataElement(
 }
 
 describe('项目视图', () => {
+  test('Given 当前会话有 Agent 连接草稿 When 查看项目 Then 提示位于连接列表之前', () => {
+    const html = renderView({ pendingDrafts: <section aria-label="Agent 连接草稿">待确认的 SSH 连接</section> })
+    expect(html).toContain('Agent 连接草稿')
+    expect(html.indexOf('待确认的 SSH 连接')).toBeLessThan(html.indexOf('搜索连接名称或地址'))
+  })
   test('Given 三类连接 When 渲染 Then 按类型分组展示且各组可折叠、分类计数正确', () => {
     const html = renderView()
     expect(html).toContain('data-server-ops-project-view="project-1"')

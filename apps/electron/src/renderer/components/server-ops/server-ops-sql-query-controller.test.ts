@@ -113,7 +113,7 @@ describe('SQL 查询控制器', () => {
   test('Given 稳定错误码或驱动正文 When 映射 Then 只显示可操作中文且未知信息不透传', () => {
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_SQL_INVALID'))).toBe('数据库未通过 SQL 语法检查，请检查语句和数据库版本')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED'))).toBe('数据库认证失败或账号权限不足')
-    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_TIMEOUT'))).toBe('查询超时，请缩小扫描范围后重试')
+    expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_TIMEOUT'))).toBe('查询达到执行或锁等待上限，已结束本次请求；请缩小范围或优化条件后重试')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN'))).toBe('查询包含敏感字段，无法执行')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_SQL_SENSITIVE_COLUMN'))).toBe('查询包含敏感字段，无法执行')
     expect(getServerOpsSqlQueryErrorMessage(new Error('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE'))).toBe('查询中的表不存在、不可见或不是基础表')

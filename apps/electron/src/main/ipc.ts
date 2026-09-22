@@ -2397,7 +2397,7 @@ export function registerIpcHandlers(): void {
   /** Docker 固定命令复用 SSH 身份与审计；不读取客户端 Docker context。 */
   const serverOpsDockerService = new ServerOpsDockerService({
     getActiveIdentity: (hostId) => serverOpsConnectionService.getActiveIdentity(hostId),
-    exec: (hostId, connectionId, command, timeoutMs) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs),
+    exec: (hostId, connectionId, command, timeoutMs, signal) => serverOpsConnectionService.exec(hostId, connectionId, command, timeoutMs, signal),
     audit: serverOpsAudit,
   })
   /** 文件服务共用 SSH 代次和审计，不向 Renderer 暴露底层 SFTP 句柄。 */

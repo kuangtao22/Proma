@@ -5,8 +5,14 @@ import { createStore, Provider } from 'jotai'
 import type { ServerOpsDataSource } from '@proma/shared'
 import { ServerOpsDataConnectionView } from './ServerOpsDataConnectionView'
 import type { ServerOpsDataPanelApi } from './ServerOpsDataServicesPanel'
-import { createServerOpsDatabaseNavigation, serverOpsDatabaseNavigationAtom } from '@/atoms/server-ops-database-atoms'
-import { getServerOpsDatabaseReadIdentity } from './ServerOpsDatabaseWorkbench'
+import { createServerOpsDatabaseNavigation, getServerOpsDatabaseReadIdentity, serverOpsDatabaseNavigationAtom } from '@/atoms/server-ops-database-atoms'
+import { ServerOpsWorkspaceToolbar } from './ServerOpsWorkspaceToolbar'
+import type { ServerOpsWorkspaceToolbarContent } from './ServerOpsWorkspaceToolbar'
+
+/** 复用生产顶部导航，静态夹具不发起项目或授权读取。 */
+function renderWorkspaceToolbar(content: ServerOpsWorkspaceToolbarContent = {}): React.ReactNode {
+  return <ServerOpsWorkspaceToolbar projects={[{ id: 'project-1', name: '生产环境', createdAt: 1, updatedAt: 1 }]} projectId="project-1" onSelectProject={() => undefined} {...content} actions={<button>Agent 只读授权</button>} />
+}
 
 /** 直连的数据库连接。 */
 function createDirectSource(overrides: Partial<ServerOpsDataSource> = {}): ServerOpsDataSource {
@@ -50,6 +56,7 @@ function renderView(overrides: Partial<React.ComponentProps<typeof ServerOpsData
       source={createDirectSource()}
       projectLabel="生产环境"
       jumpHost={null}
+      renderWorkspaceToolbar={renderWorkspaceToolbar}
       onOpenDrawer={() => undefined}
       onBackToProject={() => undefined}
       {...overrides}
@@ -58,14 +65,22 @@ function renderView(overrides: Partial<React.ComponentProps<typeof ServerOpsData
 }
 
 describe('数据连接详情视图', () => {
-  test('Given MySQL 工作台 When 首次渲染 Then 先区分实例与数据库且选库器只在数据库区', () => {
-    /** 对象范围必须位于选库器之前，避免全局指标被理解为当前库。 */
+  test('Given MySQL 数据库工作台 When 首次渲染 Then 依次展示项目连接、范围选库、功能页签', () => {
+    /** 身份在前、范围在后；选库器只出现一次，未选库不展示空表目录。 */
     const html = renderView()
+    expect(html.match(/aria-label="切换运维项目"/g)).toHaveLength(1)
     expect(html.match(/aria-label="选择数据库"/g)).toHaveLength(1)
     expect(html).toContain('aria-label="工作台范围"')
     expect(html).toContain('data-server-ops-database-scope-toolbar')
     expect(html).toContain('data-server-ops-database-selector-compact="true"')
+    expect(html.indexOf('data-server-ops-data-connection-view')).toBeLessThan(html.indexOf('data-server-ops-workspace-toolbar'))
+    expect(html.indexOf('aria-label="切换运维项目"')).toBeLessThan(html.indexOf('aria-label="选择数据库"'))
+    expect(html.indexOf('data-server-ops-connection-module')).toBeLessThan(html.indexOf('aria-label="工作台范围"'))
     expect(html.indexOf('aria-label="工作台范围"')).toBeLessThan(html.indexOf('aria-label="选择数据库"'))
+    expect(html.indexOf('aria-label="选择数据库"')).toBeLessThan(html.indexOf('aria-label="数据库功能"'))
+    expect(html).not.toContain('aria-label="打开表目录"')
+    expect(html).not.toContain('aria-label="表目录宽度"')
+    expect(html).toContain('从上方选择数据库，再选择表查看数据与结构。')
     expect(html).toContain('aria-label="数据库功能"')
     expect(html).toContain('data-server-ops-database-page-tabs="database"')
     expect(html).not.toContain('运行诊断')
@@ -80,8 +95,9 @@ describe('数据连接详情视图', () => {
     const source = createDirectSource()
     const navigation = { ...createServerOpsDatabaseNavigation(getServerOpsDatabaseReadIdentity(source)), section: 'instance' as const, instancePage: 'sessions' as const }
     store.set(serverOpsDatabaseNavigationAtom, new Map([[JSON.stringify(['scope-test', source.id]), navigation]]))
-    const html = renderToStaticMarkup(<Provider store={store}><ServerOpsDataConnectionView api={api} source={source} projectLabel="生产环境" jumpHost={null} viewScope="scope-test" onOpenDrawer={() => undefined} onBackToProject={() => undefined} /></Provider>)
+    const html = renderToStaticMarkup(<Provider store={store}><ServerOpsDataConnectionView api={api} source={source} projectLabel="生产环境" jumpHost={null} renderWorkspaceToolbar={renderWorkspaceToolbar} viewScope="scope-test" onOpenDrawer={() => undefined} onBackToProject={() => undefined} /></Provider>)
     expect(html).not.toContain('aria-label="选择数据库"')
+    expect(html).toContain('aria-label="切换运维项目"')
     expect(html).toContain('aria-label="实例功能"')
     expect(html).toContain('data-server-ops-database-page-tabs="instance"')
     expect(html).toContain('总览')
@@ -95,8 +111,8 @@ describe('数据连接详情视图', () => {
   test('Given 直连的数据库连接 When 渲染 Then 展示连接身份、项目与返回项目入口', () => {
     const html = renderView()
     expect(html).toContain('data-server-ops-data-connection-view="source-1"')
-    /** 工具栏第一行是所属项目，第二行是进入的连接（模块）名。 */
-    expect(html).toContain('data-server-ops-connection-project')
+    /** 项目只在统一选择器出现，连接身份不再重复项目面包屑。 */
+    expect(html).not.toContain('data-server-ops-connection-project')
     expect(html).toContain('data-server-ops-connection-module')
     expect(html).toContain('生产环境')
     expect(html).toContain('业务主库')
@@ -111,9 +127,7 @@ describe('数据连接详情视图', () => {
     expect(html).toContain('aria-label="连接操作"')
     expect(html).toContain('aria-label="展开工作台"')
     expect(html).toContain('MySQL')
-    expect(html).toContain('aria-label="打开项目列表"')
-    /** 面包屑的项目段就是返回入口，不再单独占一个返回按钮。 */
-    expect(html).not.toContain('aria-label="返回项目视图"')
+    expect(html).toContain('aria-label="返回项目连接"')
     /** 数据连接直接进入只读诊断，不出现 SSH 能力页签（页签导航的 aria-label 是"服务器控制台"）。 */
     expect(html).not.toContain('aria-label="服务器控制台"')
     /**
@@ -126,6 +140,8 @@ describe('数据连接详情视图', () => {
     const html = renderView({ source: createDirectSource({ engine: 'redis', label: '会话缓存', port: 16379, database: '0' }) })
     expect(html).toContain('会话缓存')
     expect(html).toContain('Redis')
+    expect(html).toContain('aria-label="切换运维项目"')
+    expect(html).not.toContain('aria-label="选择数据库"')
   })
 
   test('Given SQLite 连接 When 渲染 Then 显示文件路径且工作台只保留数据浏览与 SQL 查询', () => {
@@ -140,6 +156,8 @@ describe('数据连接详情视图', () => {
     expect(html).toContain('/srv/data/audit.sqlite3')
     expect(html).toContain('数据浏览')
     expect(html).toContain('SQL 查询')
+    expect(html).toContain('aria-label="切换运维项目"')
+    expect(html).not.toContain('aria-label="选择数据库"')
     expect(html).not.toContain('aria-label="工作台范围"')
     expect(html).not.toContain('会话')
     expect(html).not.toContain('语句分析')

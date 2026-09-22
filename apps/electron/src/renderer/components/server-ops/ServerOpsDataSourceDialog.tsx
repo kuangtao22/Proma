@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { Eye, EyeOff, LoaderCircle, PlugZap } from 'lucide-react'
 import type {
+  ServerOpsConnectionDraftInput,
   ServerOpsDataEngine,
   ServerOpsDataProbeResult,
   ServerOpsDataSource,
@@ -83,10 +84,11 @@ export interface ServerOpsDataSourceFormErrors {
 export function createServerOpsDataSourceDraft(
   source: ServerOpsDataSource | null,
   initialEngine: ServerOpsDataEngine = 'mysql',
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null,
 ): ServerOpsDataSourceDraft {
   /** 初始引擎。 */
   const engine = source?.engine ?? initialEngine
-  return {
+  const base: ServerOpsDataSourceDraft = {
     transport: engine === 'sqlite' ? 'ssh' : source?.transport ?? 'direct',
     hostId: source?.hostId ?? '',
     engine,
@@ -100,6 +102,22 @@ export function createServerOpsDataSourceDraft(
     clearPassword: false,
     tlsMode: source?.tlsMode ?? (engine === 'mysql' ? 'preferred' : 'disabled'),
     tlsServerName: source?.tlsServerName ?? (source?.tlsMode === 'verify' ? source.address ?? '' : ''),
+  }
+  if (source || !initialDraft) return base
+  return {
+    ...base,
+    engine: initialDraft.kind,
+    label: initialDraft.label,
+    transport: initialDraft.transport,
+    hostId: initialDraft.hostId ?? '',
+    ...(initialDraft.kind === 'sqlite' ? { filePath: initialDraft.filePath } : {
+      address: initialDraft.address,
+      port: String(initialDraft.port),
+      username: initialDraft.username ?? '',
+      database: initialDraft.kind === 'redis' ? initialDraft.database ?? '' : '',
+      tlsMode: initialDraft.tlsMode ?? (initialDraft.kind === 'mysql' ? 'preferred' : 'disabled'),
+      tlsServerName: initialDraft.tlsServerName ?? '',
+    }),
   }
 }
 
@@ -531,6 +549,8 @@ export interface ServerOpsDataSourceDialogProps {
   source: ServerOpsDataSource | null
   /** 新建时的初始引擎；由"添加数据库 / 添加 Redis"入口指定。 */
   initialEngine?: ServerOpsDataEngine
+  /** Agent 草稿只包含公开字段，用户仍在原弹窗提供凭据并测试。 */
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null
   hostId: string
   hostLabel: string
   /** 新建 SQLite 时列出当前项目全部服务器；编辑态只展示原宿主。 */
@@ -561,6 +581,7 @@ export interface ServerOpsDataSourceDialogControllerOptions {
   mode: 'create' | 'edit'
   source: ServerOpsDataSource | null
   initialEngine?: ServerOpsDataEngine
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null
   hostId: string
   onTest?: (draft: ServerOpsDataSourceProbeDraft) => Promise<ServerOpsDataProbeResult>
   onRevealPassword?: (sourceId: string) => Promise<string | null>
@@ -610,9 +631,9 @@ function createServerOpsDataSourceDialogAsyncSession(alive: boolean): ServerOpsD
 export function useServerOpsDataSourceDialogController(
   options: ServerOpsDataSourceDialogControllerOptions,
 ): ServerOpsDataSourceDialogController {
-  const { open, mode, source, initialEngine = 'mysql', hostId, onTest, onRevealPassword } = options
+  const { open, mode, source, initialEngine = 'mysql', initialDraft, hostId, onTest, onRevealPassword } = options
   /** 当前草稿。 */
-  const [draft, setDraft] = React.useState<ServerOpsDataSourceDraft>(() => createServerOpsDataSourceDraft(source, initialEngine))
+  const [draft, setDraft] = React.useState<ServerOpsDataSourceDraft>(() => createServerOpsDataSourceDraft(source, initialEngine, initialDraft))
   /** 字段级错误。 */
   const [errors, setErrors] = React.useState<ServerOpsDataSourceFormErrors>({})
   /** 密码是否明文显示。 */
@@ -641,7 +662,7 @@ export function useServerOpsDataSourceDialogController(
     if (open) {
       manualTlsNameRef.current = source?.tlsServerName !== undefined && source.tlsServerName !== source.address
       // 每次打开都按当前数据源重建草稿，避免把上一次编辑的半成品带进新表单。
-      setDraft(createServerOpsDataSourceDraft(source, initialEngine))
+      setDraft(createServerOpsDataSourceDraft(source, initialEngine, initialDraft))
       setErrors({})
       setShowPassword(false)
       setPasswordFromStore(false)
@@ -653,7 +674,7 @@ export function useServerOpsDataSourceDialogController(
     return () => {
       session.alive = false
     }
-  }, [hostId, initialEngine, mode, open, source])
+  }, [hostId, initialEngine, initialDraft, mode, open, source])
 
   /** 合并草稿字段，并推进草稿代次使旧异步结果立即失效。 */
   const patchDraft = React.useCallback((patch: Partial<ServerOpsDataSourceDraft>): void => {
@@ -815,6 +836,7 @@ export function ServerOpsDataSourceDialog({
   mode,
   source,
   initialEngine = 'mysql',
+  initialDraft,
   hostId,
   hostLabel,
   hostOptions = [],
@@ -831,6 +853,7 @@ export function ServerOpsDataSourceDialog({
     mode,
     source,
     initialEngine,
+    initialDraft,
     hostId,
     onTest,
     onRevealPassword,

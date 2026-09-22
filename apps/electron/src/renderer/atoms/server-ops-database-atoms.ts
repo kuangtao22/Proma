@@ -1,4 +1,5 @@
 import { atom } from 'jotai'
+import type { ServerOpsDataSource } from '@proma/shared'
 import type { ServerOpsSchemaNavigation } from '@/components/server-ops/server-ops-schema-controller'
 import type { ServerOpsDiagnosticPage } from '@/components/server-ops/server-ops-diagnostics-controller'
 
@@ -20,6 +21,12 @@ export interface ServerOpsDatabaseNavigation extends ServerOpsSchemaNavigation {
 
 /** 最近访问的连接导航，键包含会话、Pane 和数据源 ID。 */
 export const serverOpsDatabaseNavigationAtom = atom(new Map<string, ServerOpsDatabaseNavigation>())
+
+/** 不含凭据的读取身份，用于隔离工作台选库与授权弹窗；输入公开连接，返回稳定配置键。 */
+export function getServerOpsDatabaseReadIdentity(source: ServerOpsDataSource): string {
+  return JSON.stringify([source.id, source.updatedAt, source.engine, source.transport, source.hostId, source.address, source.port,
+    source.filePath, source.database, source.username, source.tlsMode, source.tlsServerName, source.hasPassword])
+}
 
 /** 初次进入默认数据浏览，等待库目录验证配置库。 */
 export function createServerOpsDatabaseNavigation(configurationKey: string): ServerOpsDatabaseNavigation {

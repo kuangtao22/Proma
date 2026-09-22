@@ -106,6 +106,8 @@ function createMySqlConnection(resolve: (sql: string, values: unknown[]) => unkn
     connection: {
       query: async (sql: string, values: unknown[] = []) => {
         queries.push({ sql, values })
+        /** 数据预览现在先配置固定会话保护，不把此步骤当作业务数据响应。 */
+        if (sql.startsWith('SET SESSION MAX_EXECUTION_TIME')) return [[], []]
         return resolve(sql, values)
       },
       execute: async (sql: string, values: unknown[] = []) => {
@@ -509,7 +511,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
           writeMySqlFixtureResult(connection, ['name'], [['id']])
           return
         }
-        if (currentOrdinal === 3 && (sql.startsWith('SET SESSION ') || sql === 'START TRANSACTION READ ONLY' || sql === 'ROLLBACK')) {
+        if (currentOrdinal >= 3 && (sql.startsWith('SET SESSION ') || sql === 'START TRANSACTION READ ONLY' || sql === 'ROLLBACK')) {
           writeMySqlFixtureOk(connection)
           return
         }
@@ -524,7 +526,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
         }
       })
       connection.on('stmt_prepare', (sql) => {
-        if (currentOrdinal === 3 && sql.startsWith('SET SESSION ')) {
+        if (currentOrdinal >= 3 && sql.startsWith('SET SESSION ')) {
           writeMySqlFixtureOk(connection)
           return
         }
@@ -789,6 +791,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 空表与混合单元格 When 读取分页 Then fields 保留列头并精确区分值类型', async () => {
     const fixture = createMySqlConnection((sql, values) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('odd`table', ['id`part', 'empty', 'nullable', 'payload', 'note'], null, { 'id`part': 'int', payload: 'blob' }, ['id`part']), []]
       if (isPreviewRowsSql(sql)) {
         expect(sql).toContain('OCTET_LENGTH(`payload`) AS `payload`')
@@ -822,6 +825,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 多条件与字面通配符 When MySQL 预览 Then 实时列白名单、参数绑定且不查询全表估算', async () => {
     const fixture = createMySqlConnection((sql, values) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('orders', ['id', 'label', 'price'], 120, { id: 'int', price: 'decimal' }, ['id']), []]
       if (isPreviewRowsSql(sql)) {
         expect(sql).toContain("WHERE (`label` LIKE ? ESCAPE '!' AND `price` >= ?) ORDER BY `id` LIMIT 2 OFFSET 1")
@@ -841,7 +845,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
     })
     expect(result).toMatchObject({ rows: [['2', "a%_!' OR 1=1", '20']], hasMore: true, orderedByPrimaryKey: true })
     expect('totalEstimate' in result).toBe(false)
-    expect(fixture.queries).toEqual([])
+    expect(fixture.queries.every(({ sql, values }) => (sql === 'SELECT VERSION() AS version' || sql === 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2') && values.length === 0)).toBe(true)
     expect(fixture.executions).toEqual([
       expect.objectContaining({ sql: expect.stringContaining('information_schema.TABLES AS t'), values: ['app', 'orders'] }),
       expect.objectContaining({ sql: expect.stringContaining(' FROM `app`.`orders`'), values: ["%a!%!_!!' OR 1=1%", '20'] }),
@@ -850,6 +854,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 字段不在真实表或属于敏感列 When MySQL 筛选 Then 查询前拒绝', async () => {
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('users', ['id', 'authorization']), []]
       throw new Error(`UNEXPECTED_QUERY:${sql}`)
     })
@@ -860,7 +865,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
         engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
       })).rejects.toThrow('SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID')
     }
-    expect(fixture.queries).toEqual([])
+    expect(fixture.queries.every(({ sql, values }) => (sql === 'SELECT VERSION() AS version' || sql === 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2') && values.length === 0)).toBe(true)
     expect(fixture.executions.some((item) => isPreviewRowsSql(item.sql))).toBe(false)
   })
 
@@ -880,6 +885,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 空表 When 读取分页 Then mysql2 fields 仍返回列头', async () => {
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('empty_table', ['id', 'note'], 0), []]
       if (isPreviewRowsSql(sql)) return [[], [{ name: 'id' }, { name: 'note' }]]
       return [[], []]
@@ -895,6 +901,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
     /** 九列用于覆盖旧实现只取前八列的非唯一排序缺口。 */
     const primary = Array.from({ length: 9 }, (_, index) => `key_${index + 1}`)
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('compound', primary, 1, {}, primary), []]
       if (isPreviewRowsSql(sql)) {
         expect(sql).toContain('ORDER BY `key_1`, `key_2`, `key_3`, `key_4`, `key_5`, `key_6`, `key_7`, `key_8`, `key_9`')
@@ -913,6 +920,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
     /** 十七列超过公开索引合同的 16 列上限，必须整体放弃主键排序。 */
     const primary = Array.from({ length: 17 }, (_, index) => `key_${index + 1}`)
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('compound', primary, 1, {}, primary), []]
       if (isPreviewRowsSql(sql)) {
         expect(sql).not.toContain('ORDER BY')
@@ -950,6 +958,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
       fields.map((field) => [field.name, `第${rowIndex}行`.repeat(100).slice(0, 257)]),
     ))
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('wide_table', fields.map((field) => field.name)), []]
       if (isPreviewRowsSql(sql)) return [sourceRows, fields]
       return [[], []]
@@ -973,6 +982,7 @@ describe('数据服务 runtime 解析与指标构造', () => {
       fields.map((field) => [field.name, '\\\"界'.repeat(100).slice(0, 257)]),
     ))
     const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('escaped_table', fields.map((field) => field.name), 200), []]
       if (isPreviewRowsSql(sql)) return [sourceRows, fields]
       return [[], []]

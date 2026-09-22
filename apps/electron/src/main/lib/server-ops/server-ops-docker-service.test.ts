@@ -30,7 +30,7 @@ const containerId = 'a'.repeat(64)
 const replacementId = 'b'.repeat(64)
 
 /** 一次远程命令调用。 */
-interface ExecCall { hostId: string; connectionId: string; command: string; timeoutMs: number }
+interface ExecCall { hostId: string; connectionId: string; command: string; timeoutMs: number; signal?: AbortSignal }
 
 /** 创建成功且未截断的远程结果。 */
 function result(stdout = '', overrides: Partial<ServerOpsRuntimeExecResult> = {}): ServerOpsRuntimeExecResult {
@@ -80,8 +80,8 @@ function fixture(options: {
       if (identity.hostId !== hostId) throw new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE')
       return { ...identity }
     },
-    exec: async (hostId, connectionId, command, timeoutMs) => {
-      const call = { hostId, connectionId, command, timeoutMs }
+    exec: async (hostId, connectionId, command, timeoutMs, signal) => {
+      const call = { hostId, connectionId, command, timeoutMs, signal }
       calls.push(call)
       return await (options.respond ?? defaultResponse)(call)
     },
@@ -101,6 +101,17 @@ async function expectCode(promise: Promise<unknown>, code: string): Promise<void
 }
 
 describe('服务器运维 Docker Service', () => {
+  test('Given Agent 服务发现 When 列容器 Then 仅运行探测和容器命令并传递取消', async () => {
+    const f = fixture()
+    const controller = new AbortController()
+    const listed = await f.service.listContainers({ hostId: 'host-1' }, controller.signal)
+    expect(listed).toMatchObject({ capability: 'available', containers: [{ names: ['web-1'] }] })
+    expect(f.calls.map((call) => call.command)).toEqual([SERVER_OPS_DOCKER_CAPABILITY_COMMAND, SERVER_OPS_DOCKER_CONTAINERS_COMMAND])
+    expect(f.calls.every((call) => call.signal === controller.signal)).toBe(true)
+    controller.abort()
+    await expect(f.service.listContainers({ hostId: 'host-1' }, controller.signal)).rejects.toThrow('SERVER_OPS_EXEC_CANCELLED')
+    expect(f.calls).toHaveLength(2)
+  })
   test('Given 逐次批准的 Agent 动作 When 执行 Then 复用容器核验并记录真实 session', async () => {
     const f = fixture()
     await f.service.runAgentAction('session-1', { hostId: 'host-1', containerId, action: 'restart' }, () => undefined)

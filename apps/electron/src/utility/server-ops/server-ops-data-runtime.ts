@@ -24,6 +24,7 @@ import type {
 import type { ServerOpsRuntimeDataReadResult } from './server-ops-runtime-protocol'
 import {
   bindServerOpsSqlQueryAbort,
+  configureServerOpsMySqlReadLimits,
   executeServerOpsSqlQuery,
   getServerOpsSqlQueryPublicError,
   normalizeServerOpsSqlQueryError,
@@ -308,16 +309,19 @@ const PERMISSION_ERROR_CODES = new Set([
 ])
 
 /** 需要判定为超时的驱动错误码集合。 */
-const TIMEOUT_ERROR_CODES = new Set(['ETIMEDOUT', 'ETIMEOUT', 'PROTOCOL_SEQUENCE_TIMEOUT', 'CONNECT_TIMEOUT'])
+const TIMEOUT_ERROR_CODES = new Set(['ETIMEDOUT', 'ETIMEOUT', 'PROTOCOL_SEQUENCE_TIMEOUT', 'CONNECT_TIMEOUT', 'ER_QUERY_TIMEOUT', 'ER_STATEMENT_TIMEOUT', 'ER_LOCK_WAIT_TIMEOUT'])
 
 /** 把驱动错误映射为稳定的能力状态与中文说明。 */
 export function classifyServerOpsDataError(error: unknown, engine: ServerOpsDataEngine): { capability: ServerOpsDataCapability; message: string } {
+  if (error instanceof Error && error.message === 'SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED') {
+    return { capability: 'unsupported', message: '当前数据库版本不支持受控查询超时，已停止读取' }
+  }
   /** 驱动错误的稳定错误码。 */
   const code = readErrorCode(error)
   if (TLS_ERROR_CODES.has(code)) return { capability: 'tls-failed', message: `TLS 连接失败（${code}）` }
   if (AUTH_ERROR_CODES.has(code)) return { capability: 'auth-failed', message: `认证失败（${code}）` }
   if (PERMISSION_ERROR_CODES.has(code)) return { capability: 'permission-denied', message: `权限不足（${code}）` }
-  if (TIMEOUT_ERROR_CODES.has(code)) return { capability: 'timeout', message: `连接超时（${code}）` }
+  if (TIMEOUT_ERROR_CODES.has(code)) return { capability: 'timeout', message: `数据库读取或锁等待超时（${code}）` }
   if (code === 'ECONNREFUSED') return { capability: 'unreachable', message: '目标端口拒绝连接' }
   if (code === 'ENOTFOUND' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH') {
     return { capability: 'unreachable', message: `目标地址不可达（${code}）` }
@@ -839,10 +843,11 @@ export async function readMySqlWithConnection(
       maxRows: input.maxRows,
     }, signal)
   }
-  /** 表浏览直接以实时元数据读取验证连接，避免每次翻页重复获取未使用的版本。 */
+  /** 结构目录保持按需读取；行预览先安装与 SQL 相同的服务端保护。 */
   if (input.mode === 'schema-tables' || input.mode === 'schema-table' || input.mode === 'schema-rows') {
     if (input.mode === 'schema-rows') {
       if (typeof connection.execute !== 'function') throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
+      await configureServerOpsMySqlReadLimits((statement) => connection.query(statement), signal)
       /** 表预览元数据同样含用户标识符，所有行读取统一使用服务端绑定。 */
       const preparedConnection: MySqlReadConnection = {
         query: (sql, values) => connection.execute!(sql, values),

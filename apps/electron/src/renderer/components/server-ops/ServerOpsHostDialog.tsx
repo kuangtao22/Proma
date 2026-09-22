@@ -8,6 +8,7 @@ import type {
   ServerOpsTestConnectionInput,
   ServerOpsTestConnectionResult,
   ServerOpsUpsertHostInput,
+  ServerOpsConnectionDraftInput,
 } from '@proma/shared'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -33,6 +34,8 @@ import {
 export interface ServerOpsHostDialogProps {
   open: boolean
   host: ServerOpsHost | null
+  /** Agent 建议的公开字段，仅在新建打开时预填，不包含凭据。 */
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'ssh' }> | null
   saving: boolean
   onOpenChange: (open: boolean) => void
   onSubmit: (input: ServerOpsSaveHostInput) => Promise<void>
@@ -255,6 +258,7 @@ export function describeServerOpsHostTestFailure(error: unknown): string {
 export function ServerOpsHostDialog({
   open,
   host,
+  initialDraft,
   saving,
   onOpenChange,
   onSubmit,
@@ -290,11 +294,11 @@ export function ServerOpsHostDialog({
   React.useEffect(() => {
     if (!open) return
     /** 打开弹窗时使用主机现有认证方式或新建默认值。 */
-    const nextAuthMethod = host?.authMethod ?? 'ssh-agent'
-    setName(host?.name ?? '')
-    setAddress(host?.address ?? '')
-    setPort(String(host?.port ?? 22))
-    setUsername(host?.username ?? '')
+    const nextAuthMethod = host?.authMethod ?? initialDraft?.authMethod ?? 'ssh-agent'
+    setName(host?.name ?? initialDraft?.name ?? '')
+    setAddress(host?.address ?? initialDraft?.address ?? '')
+    setPort(String(host?.port ?? initialDraft?.port ?? 22))
+    setUsername(host?.username ?? initialDraft?.username ?? '')
     setAuthMethod(nextAuthMethod)
     setTags(host?.tags.join(', ') ?? '')
     setCredentialAction(resolveInitialCredentialAction(host, nextAuthMethod))
@@ -304,7 +308,7 @@ export function ServerOpsHostDialog({
     setShowPassword(false)
     setTesting(false)
     setTestResult(null)
-  }, [host, open])
+  }, [host, initialDraft, open])
 
   /** 切换认证方式并按现有安全凭据状态重置编辑动作。 */
   const handleAuthMethodChange = (nextAuthMethod: ServerOpsAuthMethod): void => {

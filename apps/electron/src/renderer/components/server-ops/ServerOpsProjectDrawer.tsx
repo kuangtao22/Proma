@@ -106,7 +106,9 @@ export function resolveServerOpsProjectDrawerReturnFocus(
   paneRoot: HTMLElement | null,
 ): HTMLElement | null {
   if (previousFocus?.isConnected) return previousFocus
-  return paneRoot?.querySelector<HTMLElement>('button[aria-label="打开项目列表"]') ?? null
+  return paneRoot?.querySelector<HTMLElement>('button[aria-label="打开项目列表"]')
+    ?? paneRoot?.querySelector<HTMLElement>('button[aria-label="切换运维项目"]')
+    ?? null
 }
 
 /**

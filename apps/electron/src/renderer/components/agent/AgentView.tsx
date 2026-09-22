@@ -104,6 +104,8 @@ import {
   setSessionMessagesCache,
   agentDiffRefreshVersionAtom,
   agentSessionsAtom,
+  currentAgentSessionIdAtom,
+  openWorkspaceComponentAtom,
   agentAttachedDirectoriesMapAtom,
   agentAttachedFilesMapAtom,
   workspaceAttachedDirectoriesMapAtom,
@@ -542,6 +544,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     const action = operation.action === 'created' ? '创建' : operation.action === 'updated' ? '更新' : '删除'
     toast.success(`已${action}${target}`, { description: `「${operation.title}」` })
   }), [sessionId])
+  /** 只有前台会话收到新草稿时打开运维面板；后台会话的草稿仍可之后领取。 */
+  React.useEffect(() => {
+    const subscribe = window.electronAPI.onServerOpsConnectionDraftChanged
+    if (!subscribe) return
+    return subscribe((event) => {
+      if (event.sessionId !== sessionId || store.get(currentAgentSessionIdAtom) !== sessionId) return
+      store.set(openWorkspaceComponentAtom, 'server-ops')
+    })
+  }, [sessionId, store])
   const sessionMeta = React.useMemo(
     () => sessions.find((s) => s.id === sessionId),
     [sessions, sessionId],

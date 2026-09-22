@@ -74,12 +74,14 @@ import {
   denyToolOutsideRunAllowlist,
   resolveAgentModeToolNames,
   resolvePiActiveToolNames,
+  isServerOpsReadToolName,
 } from './agent-run-tool-policy'
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
 import { createServerOpsAgentFacade } from './server-ops/server-ops-agent-facade'
 import { createServerOpsAgentReadFacade } from './server-ops/server-ops-agent-read-facade'
+import { createServerOpsConnectionDraftAgent } from './server-ops/server-ops-connection-draft-agent'
 import { getAgentVaultRoots, getVaultUserContext } from './vault-service'
 import { buildPiMcpTools } from './adapters/pi-mcp-tools'
 import { buildAgentRuntimeEnv, type AgentRuntimeEnv } from './agent-runtime-env'
@@ -1201,6 +1203,11 @@ export class AgentOrchestrator {
         sessionId, triggeredBy: input.triggeredBy, getSession: getAgentSessionMeta,
         runSignal: runIdentity.signal, assertRunActive: runIdentity.assertActive,
       })
+      /** 连接建议独立于已有主机授权，只在当前普通用户运行中生成待审阅草稿。 */
+      const serverOpsConnectionDrafts = createServerOpsConnectionDraftAgent({
+        sessionId, toolMode: runToolMode, triggeredBy: input.triggeredBy, getSession: getAgentSessionMeta,
+        runSignal: runIdentity.signal, assertRunActive: runIdentity.assertActive,
+      })
       const builtinMcpResult = await buildPiBuiltinTools(piSdk, {
         toolMode: runToolMode,
         sessionId,
@@ -1224,6 +1231,7 @@ export class AgentOrchestrator {
         captureDesignImageRequest: extensions.captureDesignImageRequest,
         ...(serverOpsFacade ? { serverOpsFacade } : {}),
         ...(serverOpsReadFacade ? { serverOpsReadFacade } : {}),
+        ...(serverOpsConnectionDrafts ? { serverOpsConnectionDrafts } : {}),
       })
       checkpoint()
       piBuiltinTools = builtinMcpResult.tools
@@ -1567,7 +1575,12 @@ export class AgentOrchestrator {
         }
 
         // 专用只读工具在 Facade 内逐次验证会话、配置身份与具体资源/库表授权。
-        if (['ops_resources', 'ops_server_overview', 'ops_server_services', 'ops_data_test', 'ops_data_diagnose', 'ops_database_tables', 'ops_database_describe', 'ops_database_rows', 'ops_database_query'].includes(toolName)) {
+        if (isServerOpsReadToolName(toolName)) {
+          return { behavior: 'allow' as const, updatedInput: input }
+        }
+
+        // 只创建无凭据内存草稿，最终配置仍由运维面板的测试与保存流程处理。
+        if (toolName === 'ops_connection_prepare') {
           return { behavior: 'allow' as const, updatedInput: input }
         }
 
@@ -1779,6 +1792,7 @@ export class AgentOrchestrator {
         sessionWorkbenchLayout: getSessionWorkbenchLayout(sessionMeta),
         permissionMode: initialPermissionMode,
         collaborationAvailable,
+        serverOpsAvailable: Boolean(serverOpsReadFacade || serverOpsFacade || serverOpsConnectionDrafts),
         currentModelId: selectedModelId,
         projectInstructions,
         projectKnowledgeMaintenanceApproved,

@@ -1,24 +1,19 @@
 import * as React from 'react'
+import { useStore } from 'jotai'
 import { LoaderCircle, ShieldCheck } from 'lucide-react'
 import { serverOpsReadResourceKey } from '@proma/shared'
-import type { ServerOpsAgentReadResource, ServerOpsDataSource, ServerOpsProject } from '@proma/shared'
+import type { ServerOpsAgentDatabaseScope, ServerOpsDataSource, ServerOpsProject } from '@proma/shared'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
+import { serverOpsDatabaseNavigationAtom } from '@/atoms/server-ops-database-atoms'
 import type { ServerOpsConnection } from './server-ops-connections'
 import { createServerOpsAgentReadController, emptyServerOpsAgentReadProjection } from './server-ops-agent-read-controller'
 import type { ServerOpsAgentReadAccessApi } from './server-ops-agent-read-controller'
 import { AgentOpsAccessControl } from '../agent/AgentOpsAccessControl'
 import { summarizeServerOpsReadAccess } from './server-ops-agent-read-summary'
-
-/** SQL 查询权限使用独立文案，明确它不突破当前库表白名单。 */
-export const SERVER_OPS_AGENT_QUERY_PERMISSION_LABEL = '允许只读 SQL 查询（仍限制在上述库表范围）'
-
-/** 行读取是 SQL 查询的前置权限；关闭时必须同步撤销查询权限。 */
-export function updateServerOpsAgentScopeReadRows<T extends { readRows: boolean; query?: boolean }>(scope: T, readRows: boolean): T {
-  return { ...scope, readRows, ...(readRows ? {} : { query: false }) }
-}
+import { ServerOpsAgentDatabaseExclusions } from './ServerOpsAgentTablePicker'
+import { createServerOpsQueryableScope, resolveServerOpsAgentDatabase } from './server-ops-agent-table-scope'
 
 /** 授权编辑器只接收公开连接目录，不接触密码或隐式项目权限。 */
 export interface ServerOpsAgentReadAccessProps {
@@ -28,6 +23,10 @@ export interface ServerOpsAgentReadAccessProps {
   connections: readonly ServerOpsConnection[]
   allConnections: readonly ServerOpsConnection[]
   dataSources: readonly ServerOpsDataSource[]
+  /** 与数据库工作台一致的 Pane 导航范围，避免跨会话或面板复用选库。 */
+  viewScope?: string
+  /** 仅当前正在查看的连接可沿用选库，其他连接的浏览历史不能扩大授权。 */
+  activeSourceId?: string
   api?: ServerOpsAgentReadAccessApi
   unavailableReason?: string
 }
@@ -36,13 +35,15 @@ export interface ServerOpsAgentReadAccessProps {
 const UNAVAILABLE_API: ServerOpsAgentReadAccessApi = { get: async () => null, set: async () => { throw new Error('只读授权接口尚未就绪，请更新客户端') } }
 
 /** 项目工具栏入口与当前 Agent 的多资源只读授权编辑器。 */
-export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, connections, allConnections, dataSources, api, unavailableReason }: ServerOpsAgentReadAccessProps): React.ReactElement {
+export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, connections, allConnections, dataSources, viewScope = 'default', activeSourceId, api, unavailableReason }: ServerOpsAgentReadAccessProps): React.ReactElement {
+  /** 只在用户打开弹窗时读取导航快照，不订阅浏览器翻页或后台查询。 */
+  const store = useStore()
+  /** 打开编辑器时捕获选库，后续渲染与勾选共用同一草稿目标。 */
+  const databaseTargetsRef = React.useRef<ReadonlyMap<string, string>>(new Map())
   /** 权威数量与编辑草稿由实际使用的控制器分开维护。 */
   const [projection, setProjection] = React.useState(emptyServerOpsAgentReadProjection)
-  /** 保留正在输入的尾随换行，表数组则单独归一化。 */
-  const [tableDrafts, setTableDrafts] = React.useState<Record<string, string>>({})
-  /** 每个连接待添加的库名，必须由用户明确输入。 */
-  const [databaseDrafts, setDatabaseDrafts] = React.useState<Record<string, string>>({})
+  /** 目录桥接仅用于用户点选，不参与授权事实读取或保存。 */
+  const catalogApi = React.useMemo(() => api?.listServerOpsDataSchemaTables ? { listServerOpsDataSchemaTables: api.listServerOpsDataSchemaTables } : undefined, [api])
   /** 到期显示仅按分钟刷新本地时间，不触发连接目录或后台轮询。 */
   const [now, setNow] = React.useState(() => Date.now())
   /** 只有桥接引用变化才重建控制器，不在普通渲染时重新请求。 */
@@ -57,12 +58,11 @@ export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, conne
     controller.activate()
     const unsubscribe = api?.onChanged?.((event) => {
       if (event.current?.sessionId !== targetSession && event.previous?.sessionId !== targetSession) return
-      controller.changed(event); setTableDrafts({}); setDatabaseDrafts({})
+      controller.changed(event)
     })
     return () => { unsubscribe?.(); controller.dispose() }
   }, [api, controller, targetSession])
   React.useEffect(() => {
-    setTableDrafts({}); setDatabaseDrafts({})
     void controller.select(targetSession, projectId)
   }, [controller, targetSession, projectId])
   React.useEffect(() => {
@@ -72,24 +72,48 @@ export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, conne
     return () => clearInterval(timer)
   }, [view.access?.expiresAt])
   /** 只替换精确数据源的权限，其它项目的已有范围保持原样。 */
-  const updateDatabaseResource = (sourceId: string, patch: Partial<Pick<Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>, 'instance' | 'databases'>>): void => {
+  const updateDatabaseScopes = (sourceId: string, databases: ServerOpsAgentDatabaseScope[]): void => {
     controller.edit(view.resources.map((resource) => {
       if ((resource.kind !== 'mysql' && resource.kind !== 'sqlite') || resource.sourceId !== sourceId) return resource
-      /** SQLite 没有实例权限，表单局部更新也不能意外将它开启。 */
-      return resource.kind === 'sqlite' ? { ...resource, ...patch, instance: false } : { ...resource, ...patch }
+      /** 默认查询仅限选中库，不隐式开放跨库实例诊断。 */
+      return { ...resource, databases, instance: false }
     }))
   }
-  /** 勾选只添加最小权限；MySQL 还需明确实例或库才能保存。 */
+  /** 打开时固定当前 Pane 选库；后续勾选只改草稿，保存前不产生授权。 */
+  const openEditor = (): void => {
+    /** 只使用正在查看的连接，其他连接或项目首页不从浏览历史新增授权库。 */
+    const targets = new Map<string, string>()
+    const navigation = store.get(serverOpsDatabaseNavigationAtom)
+    const source = dataSources.find((entry) => entry.id === activeSourceId
+      && connections.some((connection) => connection.sourceId === entry.id))
+    if (source) {
+      const database = resolveServerOpsAgentDatabase(source, navigation.get(JSON.stringify([viewScope, source.id])))
+      if (database) targets.set(source.id, database)
+    }
+    databaseTargetsRef.current = targets
+    controller.open(targets)
+    void controller.loadImpact()
+  }
+  /** 用户选中连接后沿用工作台选库；SQLite 固定 main，默认可查询未禁用表。 */
   const toggleResource = (connection: ServerOpsConnection): void => {
     if (view.resources.some((resource) => serverOpsReadResourceKey(resource) === connection.id)) {
-      controller.edit(view.resources.filter((resource) => serverOpsReadResourceKey(resource) !== connection.id)); return
+      controller.edit(view.resources.filter((resource) => serverOpsReadResourceKey(resource) !== connection.id))
+      return
     }
     if (connection.kind === 'ssh' && connection.hostId) {
-      controller.edit([...view.resources, { kind: 'ssh', hostId: connection.hostId }]); return
+      controller.edit([...view.resources, { kind: 'ssh', hostId: connection.hostId }])
+      return
     }
     const source = dataSources.find((entry) => entry.id === connection.sourceId)
     if (!source) return
-    controller.edit([...view.resources, source.engine === 'redis' ? { kind: 'redis', sourceId: source.id } : { kind: source.engine, sourceId: source.id, instance: false, databases: source.engine === 'sqlite' ? [{ database: 'main', tables: null, readRows: false }] : [] }])
+    /** 选库在打开弹窗时固定，不用其他 Pane 或配置中的旧库名猜测目标。 */
+    const database = source.engine === 'sqlite' ? 'main' : databaseTargetsRef.current.get(source.id)
+    controller.edit([
+      ...view.resources,
+      source.engine === 'redis'
+        ? { kind: 'redis', sourceId: source.id }
+        : { kind: source.engine, sourceId: source.id, instance: false, databases: database ? [createServerOpsQueryableScope(database)] : [] },
+    ])
   }
   /** 当前项目可新选连接；其它项目只展示已授权资源。 */
   const managed = allConnections.filter((connection) => connection.projectId === projectId || view.resources.some((resource) => serverOpsReadResourceKey(resource) === connection.id))
@@ -97,8 +121,10 @@ export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, conne
   const missing = view.resources.filter((resource) => !allConnections.some((connection) => connection.id === serverOpsReadResourceKey(resource)))
   /** 在途提交锁定编辑，避免提交内容与当前勾选不一致。 */
   const busy = view.loading || view.saving
-  /** 未指定实例或库的 MySQL 是无效能力范围，保存前直接解释并锁定。 */
-  const invalidMySql = view.resources.some((resource) => resource.kind === 'mysql' && !resource.instance && resource.databases.length === 0)
+  /** 数据库查询必须有明确选库目标，避免隐式开放其它库。 */
+  const missingMySqlDatabase = view.resources.some((resource) => resource.kind === 'mysql' && resource.databases.length === 0)
+  /** 加入当前库后若超出合同容量，保留原库并让用户从其他授权中明确移除。 */
+  const tooManyDatabases = view.resources.some((resource) => resource.kind === 'mysql' && resource.databases.length > 20)
   /** 已授权资源的期限由主进程快照给出，不因 UI 读操作续期。 */
   const remainingMinutes = view.access ? Math.max(0, Math.ceil((view.access.expiresAt - now) / 60_000)) : 0
   /** 编辑器已有完整连接目录，无需额外查询即可显示授权目标名称。 */
@@ -106,7 +132,7 @@ export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, conne
   return <>
     <Button ref={triggerRef} type="button" variant="outline" size="sm" className="h-8 gap-1.5 rounded-md bg-content-area px-2 text-xs text-foreground/80" aria-label="Agent 只读授权"
       title={unavailableReason ?? (!api ? '请更新客户端以使用只读授权' : '管理当前 Agent 的只读运维范围')}
-      disabled={!targetSession || view.loading} onClick={() => { setTableDrafts({}); setDatabaseDrafts({}); controller.open(); void controller.loadImpact() }}>
+      disabled={!targetSession || view.loading} onClick={openEditor}>
       {view.loading ? <LoaderCircle className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
       <span className="shrink-0">Agent 只读授权</span>
     </Button>
@@ -128,59 +154,43 @@ export function ServerOpsAgentReadAccess({ sessionId, projectId, projects, conne
             /** 稳定 ID 保证改名和移动不会改变已选能力。 */
             const selected = view.resources.find((resource) => serverOpsReadResourceKey(resource) === connection.id)
             /** 数据库连接选中后才显示权限编辑。 */
-            const mysql = selected?.kind === 'mysql' || selected?.kind === 'sqlite' ? selected : undefined
-            /** 明确新增库名；重复添加不覆盖该库已有表范围。 */
-            const addDatabase = (): void => {
-              const database = databaseDrafts[connection.id]?.trim()
-              if (!mysql || !database || mysql.databases.some((scope) => scope.database === database)) return
-              updateDatabaseResource(mysql.sourceId, { databases: [...mysql.databases, { database, tables: null, readRows: false }] })
-              setDatabaseDrafts((drafts) => ({ ...drafts, [connection.id]: '' }))
-            }
+            const databaseResource = selected?.kind === 'mysql' || selected?.kind === 'sqlite' ? selected : undefined
+            /** 目录请求使用公开配置身份，不能跨连接复用库表结果。 */
+            const source = dataSources.find((entry) => entry.id === connection.sourceId)
             return <div key={connection.id} className="min-w-0 space-y-2 rounded-md border border-border/60 p-3">
               <label className="flex min-w-0 items-start gap-2 text-xs font-medium">
                 <input type="checkbox" className="mt-0.5 accent-primary" disabled={busy} checked={Boolean(selected)} onChange={() => toggleResource(connection)} aria-label={`授权连接 ${connection.label}`} />
                 <span className="min-w-0 flex-1"><span className="block break-words">{connection.label}</span><span className="mt-0.5 block break-all text-[10px] font-normal text-muted-foreground">{connection.detail}</span></span>
                 <span className="max-w-24 break-words text-[10px] font-normal text-muted-foreground">{connection.projectId === projectId ? '当前项目' : projects.find((project) => project.id === connection.projectId)?.name ?? '其他项目'}</span>
               </label>
-              {selected?.kind === 'ssh' ? <p className="ml-5 text-[11px] text-muted-foreground">读取已连接服务器的概览和服务列表；需要先在界面连接。</p> : null}
+              {selected?.kind === 'ssh' ? <div className="ml-5 space-y-1.5 text-[11px] text-muted-foreground"><p>读取已连接服务器的概览、服务列表与有限发现结果；需要先在界面连接。</p><label className="flex items-start gap-2"><input type="checkbox" disabled={busy} checked={selected.readLogs === true} aria-label={`允许读取 ${connection.label} 日志`} onChange={(event) => controller.edit(view.resources.map((resource) => resource.kind === 'ssh' && resource.hostId === selected.hostId ? { ...resource, readLogs: event.target.checked } : resource))} /><span>单独允许读取服务器日志快照（最多 200 行；日志可能包含业务信息）</span></label></div> : null}
               {selected?.kind === 'redis' ? <p className="ml-5 text-[11px] text-muted-foreground">实例 INFO 与隐藏命令参数的慢日志指标，不读取键值。</p> : null}
-              {mysql ? <div className="ml-5 min-w-0 space-y-3 border-l border-border/60 pl-3 text-xs">
-                {mysql.kind === 'mysql' ? <><label className="flex items-start gap-2"><input type="checkbox" disabled={busy} checked={mysql.instance} onChange={(event) => updateDatabaseResource(mysql.sourceId, { instance: event.target.checked })} aria-label={`允许 ${connection.label} 实例诊断`} /><span>实例诊断：总览、所有库的会话与语句指标、参数</span></label>
-                <div className="flex gap-2"><Input className="h-8 min-w-0 text-xs" aria-label={`${connection.label} 授权库名`} maxLength={64} disabled={busy} value={databaseDrafts[connection.id] ?? ''} placeholder="输入明确的数据库名称"
-                  onChange={(event) => setDatabaseDrafts((drafts) => ({ ...drafts, [connection.id]: event.target.value }))}
-                  onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); addDatabase() } }} />
-                  <Button type="button" variant="outline" size="sm" disabled={busy || !databaseDrafts[connection.id]?.trim() || mysql.databases.length >= 20} onClick={addDatabase}>添加库</Button></div></> : <p className="text-[11px] text-muted-foreground">SQLite 仅授权该服务器文件的 main 库；更换文件路径后需要重新授权。</p>}
-                {mysql.databases.map((scope) => {
-                  /** 同名库的输入状态按连接隔离。 */
-                  const key = JSON.stringify([mysql.sourceId, scope.database])
-                  /** 编辑只替换精确库条目。 */
-                  const updateScope = (patch: Partial<typeof scope>): void => updateDatabaseResource(mysql.sourceId, { databases: mysql.databases.map((entry) => entry.database === scope.database ? { ...entry, ...patch } : entry) })
-                  return <div key={scope.database} className="min-w-0 space-y-2 rounded bg-muted/30 p-2.5">
-                    <div className="flex items-center justify-between gap-2"><span className="break-all font-medium">{scope.database}</span><Button type="button" variant="ghost" size="sm" className="h-6 shrink-0 px-1 text-[10px]" disabled={busy || mysql.kind === 'sqlite'} aria-label={`删除 ${scope.database} 授权`} onClick={() => updateDatabaseResource(mysql.sourceId, { databases: mysql.databases.filter((entry) => entry.database !== scope.database) })}>删除</Button></div>
-                    <label className="flex items-start gap-2"><input type="checkbox" disabled={busy} checked={scope.tables === null} aria-label={`${scope.database} 全部表`} onChange={(event) => {
-                      /** 切回白名单时恢复可见草稿，防止界面有表名而实际提交空集合。 */
-                      const previousNames = tableDrafts[key] ?? scope.tables?.join('\n') ?? ''
-                      setTableDrafts((drafts) => ({ ...drafts, [key]: previousNames }))
-                      updateScope({ tables: event.target.checked ? null : [...new Set(previousNames.split('\n').map((name) => name.trim()).filter(Boolean))] })
-                    }} /><span>{mysql.kind === 'sqlite' ? '该文件全部表' : '该库全部表（含库级会话与语句指标）'}</span></label>
-                    {scope.tables !== null ? <textarea className="min-h-16 w-full resize-y rounded-md border border-border/60 bg-background px-2 py-1 text-[11px]" disabled={busy} value={tableDrafts[key] ?? scope.tables.join('\n')}
-                      placeholder="每行一个表名；至少填写一张表" aria-label={`${scope.database} 表白名单`}
-                      onChange={(event) => { const value = event.target.value; setTableDrafts((drafts) => ({ ...drafts, [key]: value })); updateScope({ tables: [...new Set(value.split('\n').map((name) => name.trim()).filter(Boolean))] }) }} /> : null}
-                    <label className="flex items-start gap-2"><input type="checkbox" disabled={busy} checked={scope.readRows} aria-label={`允许读取 ${scope.database} 行数据`} onChange={(event) => updateScope(updateServerOpsAgentScopeReadRows(scope, event.target.checked))} /><span>允许读取{scope.tables === null ? '该库全部表' : '指定表'}的行数据（每次最多 50 行）</span></label>
-                    <label className="flex items-start gap-2"><input type="checkbox" disabled={busy || !scope.readRows} checked={scope.query === true} aria-label={`允许查询 ${scope.database}`} onChange={(event) => updateScope({ query: event.target.checked })} /><span>{SERVER_OPS_AGENT_QUERY_PERMISSION_LABEL}</span></label>
-                    <p className="text-[10px] leading-4 text-muted-foreground">{scope.tables === null ? '默认只读结构；SQL 查询需同时开启行读取和查询权限。' : '指定表范围同样约束 SQL 查询，不读取未授权表；敏感字段处理不保证完全匿名化。'}</p>
-                  </div>
-                })}
+              {databaseResource ? <div className="ml-5 min-w-0 text-xs">
+                {source ? <ServerOpsAgentDatabaseExclusions
+                  source={source}
+                  resource={databaseResource}
+                  currentDatabase={databaseTargetsRef.current.get(databaseResource.sourceId)}
+                  api={catalogApi}
+                  disabled={busy}
+                  onChange={(databases) => updateDatabaseScopes(databaseResource.sourceId, databases)}
+                /> : <p className="text-[11px] text-muted-foreground">连接配置不可用，请刷新连接列表。</p>}
               </div> : null}
             </div>
           })}
           {missing.map((resource) => <div key={serverOpsReadResourceKey(resource)} className="flex items-center justify-between gap-2 text-xs"><span className="break-all">资源已移除：{serverOpsReadResourceKey(resource)}</span><Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => controller.edit(view.resources.filter((entry) => serverOpsReadResourceKey(entry) !== serverOpsReadResourceKey(resource)))}>移出授权</Button></div>)}
           {connections.length === 0 ? <p className="text-xs text-muted-foreground">当前项目暂无连接，可以管理其它项目中已授权的连接。</p> : null}
         </div>
-        <p className="text-[11px] leading-5 text-muted-foreground">授权的结构、诊断、所选行数据和显式允许的 SQL 查询结果会发送给当前模型，密码不发送。保存或改范围后，新消息使用新权限；撤权不能收回已发送给模型的历史内容。常见敏感列会遮罩，但不保证完全匿名化。新增或移入项目的连接不会自动获得授权。</p>
-        {invalidMySql ? <p role="alert" className="text-xs text-destructive">MySQL 连接需选择实例诊断或至少一个数据库，才能保存授权。</p> : null}
+        <p className="text-[11px] leading-5 text-muted-foreground">保存后，所选数据库默认可查询全部未禁用表（含新增表），支持结构、数据预览和只读 SQL，不开放写入。读取结果会发送给当前模型，连接凭据不会发送；日志仍需单独授权。新消息使用保存后的权限；撤权不能收回已发送的内容。</p>
+        {missingMySqlDatabase ? <p role="alert" className="text-xs text-destructive">请先在数据库工作台顶部选库，再打开授权设置；也可取消勾选尚未选库的连接。</p> : null}
+        {tooManyDatabases ? <p role="alert" className="text-xs text-destructive">每个连接最多授权 20 个数据库，请展开“其他已授权数据库”移除不再需要的范围。</p> : null}
         {view.error ? <p role="alert" className="break-words text-xs text-destructive">{view.error}</p> : null}
-        <div className="flex flex-wrap justify-end gap-2"><Button type="button" variant="ghost" size="sm" className="mr-auto" disabled={busy || view.impactLoading || !view.access} onClick={() => { void controller.save([]) }}>撤销全部</Button><Button type="button" variant="outline" size="sm" disabled={view.saving} onClick={() => controller.close()}>取消</Button><Button type="button" size="sm" disabled={busy || view.impactLoading || invalidMySql} onClick={() => { void controller.save() }}>{view.saving ? <LoaderCircle className="size-3.5 animate-spin" /> : null}保存授权</Button></div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button type="button" variant="ghost" size="sm" className="mr-auto" disabled={busy || view.impactLoading || !view.access} onClick={() => { void controller.save([]) }}>撤销全部</Button>
+          <Button type="button" variant="outline" size="sm" disabled={view.saving} onClick={() => controller.close()}>取消</Button>
+          <Button type="button" size="sm" disabled={busy || view.impactLoading || missingMySqlDatabase || tooManyDatabases} onClick={() => { void controller.save() }}>
+            {view.saving ? <LoaderCircle className="size-3.5 animate-spin" /> : null}保存授权
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
     <AlertDialog open={view.confirming} onOpenChange={(open) => { if (!open) controller.cancelConfirmation() }}>

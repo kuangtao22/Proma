@@ -552,6 +552,11 @@ describe('服务器运维共享合同', () => {
     } as const
 
     expect(isServerOpsAuditRecord(serverRead)).toBe(true)
+    expect(isServerOpsAuditRecord({ ...serverRead, readAction: 'server-discover' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...serverRead, readAction: 'server-logs' })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...serverRead, readAction: 'server-logs', command: 'journalctl --follow', commandTruncated: false })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...serverRead, readAction: 'server-logs', sourceId: 'source-1' })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...serverRead, readAction: 'server-discover', scope: 'database' })).toBe(false)
     expect(isServerOpsAuditRecord(dataRead)).toBe(true)
     expect(isServerOpsAuditRecord({ ...serverRead, operationId: undefined })).toBe(false)
     expect(isServerOpsAuditRecord({ ...dataRead, operationId: undefined })).toBe(false)

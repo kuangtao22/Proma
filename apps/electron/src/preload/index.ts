@@ -32,6 +32,8 @@ import { createServerOpsTransferPreload } from './server-ops-transfer-preload'
 import type { ServerOpsTransferPreload } from './server-ops-transfer-preload'
 import { createServerOpsDataPreload } from './server-ops-data-preload'
 import { createServerOpsAgentReadPreload } from './server-ops-agent-read-preload'
+import { createServerOpsConnectionDraftPreload } from './server-ops-connection-draft-preload'
+import type { ServerOpsConnectionDraftPreload } from './server-ops-connection-draft-preload'
 import type { ServerOpsAgentReadPreload } from './server-ops-agent-read-preload'
 import type { ServerOpsDataPreload } from './server-ops-data-preload'
 import { createServerOpsProjectPreload } from './server-ops-project-preload'
@@ -281,7 +283,7 @@ import { QUICK_TASK_IPC_CHANNELS, TRAY_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNEL
 /**
  * 暴露给渲染进程的 API 接口定义
  */
-export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload, ServerOpsDataPreload, ServerOpsProjectPreload, ServerOpsAgentReadPreload, MediaPreloadApi, CanvasMediaPreloadApi {
+export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPreloadApi, DesignPreloadApi, ServerOpsTrustPreload, ServerOpsDockerPreload, ServerOpsFilesPreload, ServerOpsConsolePreloadApi, ServerOpsTransferPreload, ServerOpsDataPreload, ServerOpsProjectPreload, ServerOpsAgentReadPreload, ServerOpsConnectionDraftPreload, MediaPreloadApi, CanvasMediaPreloadApi {
   // ===== 运行时相关 =====
 
   /**
@@ -1501,6 +1503,11 @@ const electronAPI: ElectronAPI = {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown): void => listener(value)
     ipcRenderer.on(channel, handler)
     return () => { ipcRenderer.removeListener(channel, handler) }
+  }),
+  ...createServerOpsConnectionDraftPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, value: unknown): void => listener(value)
+    ipcRenderer.on(channel, handler)
+    return () => ipcRenderer.removeListener(channel, handler)
   }),
   ...createServerOpsProjectPreload((channel, input) => ipcRenderer.invoke(channel, input)),
   ...createServerOpsConsolePreload(ipcRenderer),

@@ -31,6 +31,7 @@ import type {
   ServerOpsAgentAccessChanged,
   ServerOpsAgentAccessTarget,
   ServerOpsConnectionState,
+  ServerOpsConnectionDraft,
   ServerOpsCredentialInput,
   ServerOpsDataEngine,
   ServerOpsDataSourceUpsertInput,
@@ -74,6 +75,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import { ServerOpsHostDialog } from './ServerOpsHostDialog'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
 import { ServerOpsConnectDialog } from './ServerOpsConnectDialog'
 import { ServerOpsRemoteTerminal } from './ServerOpsRemoteTerminal'
@@ -85,6 +87,8 @@ import { ServerOpsDockerPanel } from './ServerOpsDockerPanel'
 import type { ServerOpsDockerPanelApi } from './ServerOpsDockerPanel'
 import type { ServerOpsDataPanelApi } from './ServerOpsDataServicesPanel'
 import { ServerOpsDataConnectionView } from './ServerOpsDataConnectionView'
+import { ServerOpsProjectSelector, ServerOpsWorkspaceToolbar } from './ServerOpsWorkspaceToolbar'
+import type { ServerOpsWorkspaceToolbarContent } from './ServerOpsWorkspaceToolbar'
 import { ServerOpsProjectDrawer } from './ServerOpsProjectDrawer'
 import { ServerOpsProjectDialog } from './ServerOpsProjectDialog'
 import { ServerOpsConnectionMoveDialog } from './ServerOpsConnectionMoveDialog'
@@ -1231,8 +1235,40 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   const [selectedConnectionId, setSelectedConnectionId] = useAtom(selectedServerOpsConnectionIdAtom)
   /** 当前普通 Agent 会话决定授权身份的一半。 */
   const [currentAgentSessionId] = useAtom(currentAgentSessionIdAtom)
+  /** 当前 Pane 可领取的草稿投影，主进程是唯一权威来源。 */
+  const connectionDraftsAtom = React.useMemo(() => atom<ServerOpsConnectionDraft[]>([]), [])
+  const [connectionDrafts, setConnectionDrafts] = useAtom(connectionDraftsAtom)
+  /** 用户必须显式指定草稿归属项目，不能隐式继承会话工作区。 */
+  const [draftProjectId, setDraftProjectId] = React.useState<string | null>(null)
+  /** 已放入表单但未保存的草稿；关闭表单不会消费队列。 */
+  const [activeConnectionDraft, setActiveConnectionDraft] = React.useState<ServerOpsConnectionDraft | null>(null)
+  /** 切换 Agent 会话后必须重新选择草稿归属，原会话草稿仍留在主进程等待领取。 */
+  React.useEffect(() => {
+    setDraftProjectId(null)
+  }, [currentAgentSessionId])
   /** Renderer 已加载的会话元数据，用于提前判断会话是否支持服务器授权。 */
   const [agentSessions] = useAtom(agentSessionsAtom)
+  React.useEffect(() => {
+    const api = window.electronAPI
+    if (!currentAgentSessionId || !paneActive || !api.listServerOpsConnectionDrafts || !api.onServerOpsConnectionDraftChanged) {
+      setConnectionDrafts([])
+      return
+    }
+    let active = true
+    let requestRevision = 0
+    /** 事件仅是提示；重新读取权威快照可恢复面板尚未打开期间产生的草稿。 */
+    const refresh = (): void => {
+      const revision = ++requestRevision
+      void api.listServerOpsConnectionDrafts(currentAgentSessionId).then((drafts) => {
+        if (active && revision === requestRevision) setConnectionDrafts(drafts)
+      }).catch(() => { if (active && revision === requestRevision) setConnectionDrafts([]) })
+    }
+    const unsubscribe = api.onServerOpsConnectionDraftChanged((event) => {
+      if (event.sessionId === currentAgentSessionId) refresh()
+    })
+    refresh()
+    return () => { active = false; unsubscribe() }
+  }, [currentAgentSessionId, paneActive, setConnectionDrafts])
   /** 项目列表的公开投影。 */
   const [projects, setProjects] = useAtom(serverOpsProjectsAtom)
   const [projectsStatus, setProjectsStatus] = useAtom(serverOpsProjectsStatusAtom)
@@ -1372,6 +1408,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     set: window.electronAPI.setServerOpsAgentReadAccess,
     impact: window.electronAPI.getServerOpsAgentAccessImpact,
     onChanged: window.electronAPI.onServerOpsAgentReadAccessChanged,
+    listServerOpsDataSchemaTables: window.electronAPI.listServerOpsDataSchemaTables,
   } : undefined, [])
   /** 当前控制台页签。 */
   const [activeSection, setActiveSection] = React.useState<ServerOpsSection>('overview')
@@ -1611,6 +1648,10 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       const result = await window.electronAPI.upsertServerOpsDataSource({ ...input, projectId: creatingDataSourceProjectId })
       dataSourceController.acceptSavedSource(result.source)
       setCreatingDataSourceEngine(null)
+      if (activeConnectionDraft && activeConnectionDraft.input.kind !== 'ssh') {
+        void dismissConnectionDraft(activeConnectionDraft)
+        setActiveConnectionDraft(null)
+      }
       /** 以写入回执为归属依据；创建使用打开表单时捕获的项目身份。 */
       const landedProjectId = result.source.projectId
       const switchedProject = landedProjectId !== undefined && landedProjectId !== currentProjectId
@@ -1760,6 +1801,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   /** 打开空白主机表单。 */
   const handleCreateHost = (): void => {
     if (!currentProjectId) return
+    setActiveConnectionDraft(null)
     setCreatingHostProjectId(currentProjectId)
     setEditingHost(null)
     setDialogOpen(true)
@@ -1786,8 +1828,47 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       return
     }
     setDataSourceFormError(null)
+    setActiveConnectionDraft(null)
     setCreatingDataSourceProjectId(currentProjectId)
     setCreatingDataSourceEngine(kind === 'redis' ? 'redis' : 'mysql')
+  }
+
+  /** 成功保存或用户主动忽略后才消费草稿；窗口失联时保留剩余草稿供稍后重试。 */
+  const dismissConnectionDraft = async (draft: ServerOpsConnectionDraft): Promise<void> => {
+    try {
+      await window.electronAPI.dismissServerOpsConnectionDraft({ sessionId: draft.sessionId, id: draft.id })
+      setConnectionDrafts((current) => current.filter((entry) => entry.id !== draft.id))
+    } catch {
+      toast.error('草稿状态更新失败', { description: '草稿仍可在运维面板重新领取' })
+    }
+  }
+
+  /** 只有用户指定项目且表单空闲时才将草稿放入原连接表单。 */
+  const claimConnectionDraft = (draft: ServerOpsConnectionDraft): void => {
+    // 点击时复核身份与有效期，防止久置面板或切会话瞬间继续领取旧投影。
+    if (!paneActive || draft.sessionId !== currentAgentSessionId) return
+    if (draft.expiresAt <= Date.now()) {
+      setConnectionDrafts((current) => current.filter((entry) => entry.id !== draft.id))
+      toast.error('连接草稿已过期，请让 Agent 重新生成')
+      return
+    }
+    if (!draftProjectId || !projects.some((project) => project.id === draftProjectId) || dialogOpen || creatingDataSourceEngine !== null || saving || savingDataSource) return
+    const hostsForProject = resolveServerOpsProjectDataSourceHosts(connections, draftProjectId).hostOptions
+    const requestedHostId = draft.input.kind !== 'ssh' && draft.input.transport === 'ssh' ? draft.input.hostId : undefined
+    if (requestedHostId && !hostsForProject.some((host) => host.id === requestedHostId)) {
+      toast.error('草稿引用的服务器不属于所选项目，请选择正确项目')
+      return
+    }
+    setActiveConnectionDraft(draft)
+    if (draft.input.kind === 'ssh') {
+      setCreatingHostProjectId(draftProjectId)
+      setEditingHost(null)
+      setDialogOpen(true)
+    } else {
+      setCreatingDataSourceProjectId(draftProjectId)
+      setDataSourceFormError(null)
+      setCreatingDataSourceEngine(draft.input.kind)
+    }
   }
 
   /** 使用本次表单凭据发起真实 SSH 登录。 */
@@ -1893,6 +1974,10 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       setSelectedConnectionId(createServerOpsSshConnectionId(saved.id))
       setProjectViewActive(false)
       setDialogOpen(false)
+      if (activeConnectionDraft?.input.kind === 'ssh') {
+        void dismissConnectionDraft(activeConnectionDraft)
+        setActiveConnectionDraft(null)
+      }
       setDrawerOpen(false)
       toast.success(input.host.id ? '服务器已更新' : '服务器已添加')
     } catch (saveError) {
@@ -1930,6 +2015,11 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
 
   /** 网络数据库保持首台服务器默认跳板；SQLite 仍展示全部服务器并要求显式选择。 */
   const projectDataSourceHosts = resolveServerOpsProjectDataSourceHosts(connections, creatingDataSourceProjectId)
+  /** 模型给出的主机身份仅在所选项目已存在时使用；否则保留原表单默认值与字段校验。 */
+  const requestedDraftHostId = activeConnectionDraft?.input.kind !== 'ssh' ? activeConnectionDraft?.input.hostId : undefined
+  const draftedHostId = requestedDraftHostId && projectDataSourceHosts.hostOptions.some((host) => host.id === requestedDraftHostId)
+    ? requestedDraftHostId : undefined
+  const draftedHost = projectDataSourceHosts.hostOptions.find((host) => host.id === draftedHostId)
   /** 项目分组视图；连接不存在或身份失效时作为中间区域的稳定回退。 */
   /** 两种视图复用同一只读授权入口，切换视图仅卸载编辑器，不撤销租约。 */
   const readAccessControl = currentProject ? <ServerOpsAgentReadAccess
@@ -1940,10 +2030,35 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     connections={projectConnections}
     allConnections={connections}
     dataSources={dataSources}
+    viewScope={viewScope}
+    activeSourceId={selectedDataSource?.id}
     api={agentReadApi}
   /> : undefined
+  /** 顶部导航只组合现有状态；数据库工作台展开时由其内部调用，避免导航被遮住。 */
+  const renderWorkspaceToolbar = (content: ServerOpsWorkspaceToolbarContent = {}): React.ReactNode => (
+    <ServerOpsWorkspaceToolbar projects={projects} projectId={currentProjectId} onSelectProject={handleSelectProject} onManageProjects={() => setDrawerOpen(true)} {...content} actions={readAccessControl} />
+  )
+  /** 详情与项目页共用待领入口；只展示当前会话并且仅在真实 Pane 活动时展示。 */
+  const visibleConnectionDrafts = paneActive ? connectionDrafts.filter((draft) => draft.sessionId === currentAgentSessionId) : []
+  const pendingDraftPanel = visibleConnectionDrafts.length ? <section className="grid max-h-44 shrink-0 gap-2 overflow-y-auto border-y border-border/60 bg-content-area px-4 py-3" aria-label="Agent 连接草稿">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <div><h2 className="text-sm font-medium">Agent 连接草稿</h2><p className="text-xs text-muted-foreground">选择运维项目，核对参数并在原表单中测试、保存。</p></div>
+      <Select value={draftProjectId ?? ''} onValueChange={setDraftProjectId}>
+        <SelectTrigger className="h-8 w-44 max-w-full text-xs" aria-label="草稿归属项目"><SelectValue placeholder="选择归属项目" /></SelectTrigger>
+        <SelectContent>{projects.map((project) => <SelectItem key={project.id} value={project.id}>{project.name}</SelectItem>)}</SelectContent>
+      </Select>
+    </div>
+    {visibleConnectionDrafts.map((draft) => <div key={draft.id} className="flex min-w-0 flex-wrap items-center gap-2 border-l-2 border-primary/50 py-1 pl-3 text-xs">
+      <span className="min-w-0 flex-1 truncate">{draft.input.kind === 'ssh' ? 'SSH' : draft.input.kind.toUpperCase()} · {draft.input.kind === 'ssh' ? draft.input.name : draft.input.label}</span>
+      <Button size="sm" variant="outline" className="h-7 text-xs" disabled={!draftProjectId || dialogOpen || creatingDataSourceEngine !== null} onClick={() => claimConnectionDraft(draft)}>填写连接</Button>
+      <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => { void dismissConnectionDraft(draft) }}>忽略</Button>
+    </div>)}
+  </section> : undefined
+  /** 项目列表沿用同一选择器，返回列表后仍可直接切换项目。 */
   const projectPane = (
     <ServerOpsProjectView
+      pendingDrafts={pendingDraftPanel}
+      projectSelector={<ServerOpsProjectSelector projects={projects} projectId={currentProjectId} onSelectProject={handleSelectProject} onManageProjects={() => setDrawerOpen(true)} />}
       project={currentProject}
       status={projectsStatus}
       error={projectsError}
@@ -2014,6 +2129,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       )
       : selectedDataSource === null ? null : (
         <ServerOpsDataConnectionView
+          renderWorkspaceToolbar={renderWorkspaceToolbar}
           api={serverOpsDataApi}
           viewScope={viewScope}
           paneActive={paneActive}
@@ -2041,7 +2157,8 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     <div className="relative flex min-h-0 flex-1 overflow-hidden">
       {/* 中间区域三选一：项目分组列表、SSH 能力页签、数据连接详情。 */}
       {connectionPane ? <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="flex shrink-0 justify-end border-b border-border/40 px-3 py-1">{readAccessControl}</div>
+        {selectedConnection?.kind === 'ssh' ? renderWorkspaceToolbar() : null}
+        {pendingDraftPanel}
         {connectionPane}
       </div> : projectPane}
       <AlertDialog open={pendingLegacyImpact !== null} onOpenChange={(open) => { if (!open) setPendingLegacyImpact(null) }}>
@@ -2089,8 +2206,9 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       <ServerOpsHostDialog
         open={dialogOpen}
         host={editingHost}
+        initialDraft={activeConnectionDraft?.input.kind === 'ssh' ? activeConnectionDraft.input : null}
         saving={saving}
-        onOpenChange={setDialogOpen}
+        onOpenChange={(open) => { setDialogOpen(open); if (!open) setActiveConnectionDraft(null) }}
         onSubmit={handleSaveHost}
         onTest={(input) => window.electronAPI.testServerOpsConnection(input)}
       />
@@ -2100,14 +2218,15 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
         mode="create"
         source={null}
         initialEngine={creatingDataSourceEngine ?? 'mysql'}
-        hostId={projectDataSourceHosts.defaultHost?.id ?? ''}
-        hostLabel={projectDataSourceHosts.defaultHost?.label ?? ''}
+        initialDraft={activeConnectionDraft?.input.kind !== 'ssh' ? activeConnectionDraft?.input : null}
+        hostId={draftedHostId ?? projectDataSourceHosts.defaultHost?.id ?? ''}
+        hostLabel={draftedHost?.label ?? projectDataSourceHosts.defaultHost?.label ?? ''}
         hostOptions={projectDataSourceHosts.hostOptions}
         submitting={savingDataSource}
         error={dataSourceFormError}
         onTest={(draft) => serverOpsDataApi.probeServerOpsDataSource({ draft })}
         onSubmit={(input) => { void handleCreateDataSource(input) }}
-        onClose={() => { setCreatingDataSourceEngine(null); setDataSourceFormError(null) }}
+        onClose={() => { setCreatingDataSourceEngine(null); setDataSourceFormError(null); setActiveConnectionDraft(null) }}
       />
       {transferLeave.dialog}
       <ServerOpsConnectDialog

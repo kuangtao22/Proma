@@ -7,6 +7,22 @@
 /* 运维右栏按自身宽度收紧标题栏，不受主窗口断点影响。 */
 .server-ops-workspace-container {
   container-type: inline-size;
+  container-name: server-ops-workspace;
+}
+
+/* 项目、连接与授权属于同一身份区；按运维 Pane 宽度排列，不重复项目面包屑。 */
+.server-ops-connection-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: 'project access' 'identity controls';
+  align-items: center;
+}
+
+@container server-ops-workspace (min-width: 800px) {
+  .server-ops-connection-header {
+    grid-template-columns: 10rem minmax(0, 1fr) auto auto;
+    grid-template-areas: 'project identity access controls';
+  }
 }
 
 /* 项目入口按运维面板宽度排卡片，筛选与添加不受主窗口宽度误导。 */

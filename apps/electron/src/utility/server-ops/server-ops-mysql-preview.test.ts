@@ -28,10 +28,14 @@ function createPreviewFixture() {
 
 /** 为边界用例提供两次真实驱动响应形状，返回生产函数结果与发出的 SQL。 */
 async function readPreviewFixture(metadata: Record<string, unknown>[], rows: Record<string, unknown>[] = [], fields: string[] = []) {
-  /** 只允许元数据和预览两次读取，额外读取会被查询预算断言发现。 */
+  /** 固定策略语句另行验证，业务元数据与预览仍只需两次绑定读取。 */
   const statements: string[] = []
   const result = await readMySqlWithConnection({
-    query: async () => { throw new Error('TEST_CLIENT_INTERPOLATION_FORBIDDEN') },
+    query: async (sql) => {
+      if (sql === 'SELECT VERSION() AS version') return [[{ version: '8.0.36' }], []]
+      if (sql === 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2') return [[], []]
+      throw new Error('TEST_CLIENT_INTERPOLATION_FORBIDDEN')
+    },
     execute: async (sql) => {
       statements.push(sql)
       return statements.length === 1 ? [metadata, []] : [rows, fields.map((name) => ({ name }))]
@@ -44,6 +48,41 @@ async function readPreviewFixture(metadata: Record<string, unknown>[], rows: Rec
 }
 
 describe('MySQL 表预览读取预算', () => {
+  test('Given 单表数据预览 When 读取元数据或行 Then MySQL和MariaDB均先设置十秒执行与两秒锁等待', async () => {
+    for (const version of ['8.0.36', '10.11.8-MariaDB']) {
+      /** 记录固定策略配置；含用户标识的查询仍只走服务端绑定。 */
+      const settings: string[] = []
+      /** 复用真实预览结果夹具，仅收口连接初始化行为。 */
+      const fixture = createPreviewFixture()
+      await readMySqlWithConnection({
+        query: async (sql) => { settings.push(sql); return sql.includes('VERSION()') ? [[{ version }], []] : [[], []] },
+        execute: async (sql, values) => {
+          expect(settings).toContain(version.includes('MariaDB')
+            ? 'SET SESSION max_statement_time = 10, lock_wait_timeout = 2'
+            : 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2')
+          return fixture.connection.execute(sql, values)
+        },
+      }, { mode: 'schema-rows', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', schemaDatabase: 'app', schemaTable: 'items', rowOffset: 0, rowLimit: 10 })
+      expect(fixture.calls).toHaveLength(2)
+    }
+  })
+
+  test('Given 预览连接不支持服务端保护 When 设置失败 Then 不下发任何表数据读取', async () => {
+    /** MySQL旧版本与配置失败都应在访问表前停止。 */
+    for (const version of ['5.6.51', '8.0.36']) {
+      /** 保护安装失败后，任何业务读取调用都属于回归。 */
+      let reads = 0
+      await expect(readMySqlWithConnection({
+        query: async (sql) => {
+          if (sql.includes('VERSION()')) return [[{ version }], []]
+          throw new Error('TEST_LIMIT_SETUP_FAILED')
+        },
+        execute: async () => { reads++; return [[], []] },
+      }, { mode: 'schema-rows', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', schemaDatabase: 'app', schemaTable: 'items', rowOffset: 0, rowLimit: 10 })).rejects.toThrow()
+      expect(reads).toBe(0)
+    }
+  })
+
   for (const filtered of [false, true]) {
     test(`Given ${filtered ? '已筛选' : '未筛选'}表 When 读取一页 Then 两次绑定查询且保留预览语义`, async () => {
       /** 每次请求都独立查询实时元数据，不依赖权限或字段缓存。 */
@@ -54,9 +93,9 @@ describe('MySQL 表预览读取预算', () => {
         schemaDatabase: 'app', schemaTable: 'items', rowOffset: 0, rowLimit: 50,
         ...(filtered ? { rowFilters: { match: 'all' as const, conditions: [{ column: 'id', operator: 'eq' as const, value: '1' }] } } : {}),
       })
-      expect(fixture.calls).toHaveLength(2)
-      expect(fixture.calls.every(({ prepared }) => prepared)).toBe(true)
-      expect(fixture.calls.some(({ sql }) => sql.includes('VERSION()'))).toBe(false)
+      expect(fixture.calls).toHaveLength(4)
+      expect(fixture.calls.slice(0, 2).map(({ sql }) => sql)).toEqual(['SELECT VERSION() AS version', 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2'])
+      expect(fixture.calls.slice(2).every(({ prepared }) => prepared)).toBe(true)
       expect(fixture.calls.at(-1)?.sql).not.toContain('SELECT *')
       expect(fixture.calls.at(-1)?.sql).toContain('LEFT(`note`, 257)')
       expect(fixture.calls.at(-1)?.sql).toContain('OCTET_LENGTH(`payload`)')
@@ -66,7 +105,7 @@ describe('MySQL 表预览读取预算', () => {
         orderedByPrimaryKey: true, truncated: true,
       })
       if (filtered) {
-        expect(fixture.calls.every(({ prepared }) => prepared)).toBe(true)
+        expect(fixture.calls.slice(2).every(({ prepared }) => prepared)).toBe(true)
         expect(fixture.calls.at(-1)?.values).toEqual(['1'])
         expect('totalEstimate' in result).toBe(false)
       } else expect(result).toMatchObject({ totalEstimate: 12 })

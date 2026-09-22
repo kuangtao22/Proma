@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import { isServerOpsAuditRecord } from '@proma/shared'
+import { isServerOpsAuditRecord, parseServerOpsAgentReadGrant } from '@proma/shared'
 import type {
   AgentSessionMeta,
   ServerOpsAgentReadAccess,
@@ -13,6 +13,7 @@ import type {
 import { buildServerOpsReadTools } from '../adapters/pi-server-ops-read-tools'
 import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { captureServerOpsReadBindings } from './server-ops-agent-read-identity'
+import { prepareServerOpsDatabaseChangeContext } from './server-ops-database-change-context'
 import {
   createServerOpsAgentReadFacade,
   type ServerOpsAgentReadFacadeDependencies,
@@ -125,6 +126,44 @@ function dependencies(options: {
 }
 
 describe('Server Ops Agent 多资源只读 Facade', () => {
+  test('Given 展示投影省略合法库 When 生成变更依据 Then 精确授权仍允许目标且拒绝禁用表与跨库', async () => {
+    /** 授权受 16 KiB 文档预算约束，模拟展示裁剪只修改公开目录，不修改真实 Facade。 */
+    const scopes = Array.from({ length: 4 }, (_, index) => ({
+      database: `database_${index}`, tables: null, readRows: true,
+      excludedTables: Array.from({ length: 20 }, (_, tableIndex) => `private_${tableIndex}_${'x'.repeat(110)}`),
+    }))
+    const access: ServerOpsAgentReadAccess = {
+      sessionId: 'session-1', revision: 7, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
+      resources: [{ kind: 'mysql', sourceId: 'source-1', instance: false,
+        databases: [...scopes, { database: 'target', tables: null, excludedTables: ['secret'], readRows: true }] }],
+    }
+    expect(parseServerOpsAgentReadGrant({ sessionId: access.sessionId, resources: access.resources }).resources).toEqual(access.resources)
+    const deps = dependencies({ access })
+    const reads: string[] = []
+    deps.services.data!.describeSchemaTable = async ({ table }) => {
+      reads.push(table)
+      return { columns: [], indexes: [] }
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const actualDirectory = facade.resources()
+    expect(actualDirectory.resources[0]?.kind === 'mysql' && actualDirectory.resources[0].databases.some((scope) => scope.database === 'target')).toBe(true)
+    facade.resources = () => ({ ...actualDirectory, resources: [], truncated: true })
+    const directory = facade.resources()
+    expect(directory.truncated).toBe(true)
+    expect(directory.resources).toEqual([])
+    await expect(prepareServerOpsDatabaseChangeContext(facade, { sourceId: 'source-1', database: 'target', tables: ['users'] }))
+      .resolves.toMatchObject({ engine: 'mysql', tables: [{ name: 'users' }] })
+    expect(reads).toEqual(['users'])
+    await expect(prepareServerOpsDatabaseChangeContext(facade, { sourceId: 'source-1', database: 'target', tables: ['users', 'SECRET'] }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(prepareServerOpsDatabaseChangeContext(facade, { sourceId: 'source-1', database: 'other', tables: ['users'] }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    expect(reads).toEqual(['users'])
+    deps.services.access.getReadAccess = () => ({ ...access, revision: 8 })
+    await expect(prepareServerOpsDatabaseChangeContext(facade, { sourceId: 'source-1', database: 'target', tables: ['users'] }))
+      .rejects.toThrow('SERVER_OPS_AGENT_ACCESS_CHANGED')
+    expect(reads).toEqual(['users'])
+  })
   test('Given 停止本轮运行 When 再次调用工具 Then 保留会话租约但拒绝旧闭包', async () => {
     /** 运行取消与授权生命周期相互独立。 */
     const deps = dependencies()
@@ -390,6 +429,24 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
     expect(Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8')).toBeLessThanOrEqual(32_768)
   })
 
+  test('Given 排除名单导致目录超限 When 裁剪目录 Then 不能裁剪名单而暗示表可读', () => {
+    /** 大量结构标识逼近模型输出预算；授权事实仍应保持完整。 */
+    const excludedTables = Array.from({ length: 100 }, (_, index) => `private_${index}_${'x'.repeat(110)}`)
+    const access: ServerOpsAgentReadAccess = {
+      sessionId: 'session-1', revision: 9, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
+      resources: [{ kind: 'mysql', sourceId: 'source-1', instance: false,
+        databases: Array.from({ length: 4 }, (_, index) => ({ database: `database_${index}`,
+          tables: null, excludedTables, readRows: false })) }],
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: dependencies({ access }) })!
+    const result = facade.resources()
+    expect(result.truncated).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8')).toBeLessThanOrEqual(32_768)
+    for (const resource of result.resources) {
+      if (resource.kind === 'mysql') for (const scope of resource.databases) expect(scope.excludedTables).toEqual(excludedTables)
+    }
+  })
+
   test('Given 数据库只授权指定库表 When 列目录和读取行 Then 过滤目录并遮罩敏感列', async () => {
     const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: dependencies() })!
     await expect(facade.databaseTables({ sourceId: 'source-1', database: 'app' })).resolves.toEqual({
@@ -400,6 +457,45 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
     })
     await expect(facade.databaseRows({ sourceId: 'source-1', database: 'app', table: 'payments', offset: 0, limit: 50 })).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
     await expect(facade.databaseRows({ sourceId: 'source-1', database: 'app', table: 'users', offset: 0, limit: 51 })).rejects.toThrow('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+  })
+
+  test('Given 库表排除名单 When 查询目录结构行和联表 SQL Then 大小写变化也不能访问屏蔽表', async () => {
+    const access: ServerOpsAgentReadAccess = {
+      sessionId: 'session-1', revision: 7, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
+      resources: [{ kind: 'mysql', sourceId: 'source-1', instance: false,
+        databases: [{ database: 'app', tables: null, excludedTables: ['Payments'], readRows: true, query: true }] }],
+    }
+    const deps = dependencies({ access })
+    /** 记录真正到达数据库的 SQL，证明权限检查早于底层请求。 */
+    let queries = 0
+    deps.services.data!.querySource = async (request) => {
+      queries += 1
+      return { queryId: request.queryId, database: request.database, columns: ['id'], rows: [['1']],
+        rowCount: 1, durationMs: 1, truncated: false, warnings: [] }
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    expect((await facade.databaseTables({ sourceId: 'source-1', database: 'app' })).tables).toEqual([{ name: 'users', type: 'table' }])
+    await expect(facade.databaseDescribe({ sourceId: 'source-1', database: 'app', table: 'payments' })).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseRows({ sourceId: 'source-1', database: 'app', table: 'PAYMENTS', offset: 0, limit: 50 })).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseQuery({ sourceId: 'source-1', database: 'app', sql: 'SELECT users.id FROM users JOIN payments ON users.id = payments.id', maxRows: 10 }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    expect(queries).toBe(0)
+    await expect(facade.databaseQuery({ sourceId: 'source-1', database: 'app', sql: 'SELECT id FROM users', maxRows: 10 })).resolves.toMatchObject({ rowCount: 1 })
+    expect(queries).toBe(1)
+  })
+
+  test('Given 排除表同时存在实例权限 When 诊断 Then 整库与实例汇总都拒绝但连接测试仍可用', async () => {
+    const access: ServerOpsAgentReadAccess = {
+      sessionId: 'session-1', revision: 7, grantedAt: 10, expiresAt: Date.now() + 1_800_000,
+      resources: [{ kind: 'mysql', sourceId: 'source-1', instance: true,
+        databases: [{ database: 'app', tables: null, excludedTables: ['payments'], readRows: true }] }],
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: dependencies({ access }) })!
+    await expect(facade.dataDiagnose({ sourceId: 'source-1', scope: 'database', database: 'app', section: 'statements' }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.dataDiagnose({ sourceId: 'source-1', scope: 'instance', section: 'statements' }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.dataProbe({ sourceId: 'source-1' })).resolves.toMatchObject({ capability: 'available' })
   })
 
   test('Given 实例与数据库范围分离 When 运行诊断 Then 不允许缺省扩大且删除 SQL 正文', async () => {
@@ -553,5 +649,67 @@ describe('Server Ops Agent 多资源只读 Facade', () => {
     expect(Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8')).toBeLessThanOrEqual(32_768)
     expect(result.truncated).toBe(true)
     expect(result.services.length).toBeLessThan(1_000)
+  })
+  test('Given 已授权 SSH When 服务发现 Then 仅返回有限摘要和明确部分结果', async () => {
+    const deps = dependencies()
+    deps.services.systemd.listServices = async ({ hostId }) => ({ hostId, capability: 'available', warnings: [], services: [{
+      unitId: 'mysql.service', description: 'MySQL', activeState: 'active', loadState: 'loaded', subState: 'running', enabled: true,
+    }] })
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const result = await facade.serverDiscover({ hostId: 'host-1' })
+    expect(result).toMatchObject({ systemd: { capability: 'available', services: [{ unitId: 'mysql.service' }] }, docker: { capability: 'unavailable' }, partial: true })
+    expect(JSON.stringify(result)).not.toContain('loadState')
+  })
+
+  test('Given Docker 发布端口 When 发现服务 Then 有界展示绑定且不返回挂载或环境变量', async () => {
+    const deps = dependencies()
+    deps.services.docker = { listContainers: async ({ hostId }) => ({ hostId, capability: 'available', containers: [{
+      containerId: 'a'.repeat(64), names: ['db'], image: 'mysql:8', state: 'running', status: 'up', createdAt: 'now',
+      publishedPorts: ['127.0.0.1:3306->3306/tcp'], mountNames: ['secret-volume'],
+    }] }) }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const result = await facade.serverDiscover({ hostId: 'host-1' })
+    expect(result.docker.containers[0]).toMatchObject({ name: 'db', publishedPorts: ['127.0.0.1:3306->3306/tcp'] })
+    expect(JSON.stringify(result)).not.toContain('secret-volume')
+  })
+
+  test('Given 旧 SSH 授权 When 要求日志 Then 不调用日志服务；新授权可调用并审计', async () => {
+    const deps = dependencies()
+    let reads = 0
+    const actions: string[] = []
+    deps.services.logs = { snapshot: async ({ hostId }) => { reads++; return { hostId, lines: ['[MASKED]'], truncated: false, warnings: [] } } }
+    deps.services.audit.append = (entry) => { actions.push(entry.readAction ?? ''); return { id: 'audit-1', timestamp: 1, ...entry } }
+    const old = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const request = { hostId: 'host-1', source: { kind: 'system' } as const, since: '15m' as const, priority: 'warning' as const, tailLines: 20 }
+    await expect(old.serverLogs(request)).rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    expect(reads).toBe(0)
+    const current = deps.services.access.getReadAccess('session-1')!
+    deps.services.access.getReadAccess = () => ({ ...current, revision: 8, resources: current.resources.map((resource) => resource.kind === 'ssh' ? { ...resource, readLogs: true } : resource) })
+    const fresh = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    expect((await fresh.serverLogs(request)).lines).toEqual(['[MASKED]'])
+    expect(actions).toEqual(['server-logs', 'server-logs'])
+    await expect(old.serverLogs(request)).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_CHANGED')
+  })
+
+  test('Given 注入的日志来源 When 解析输入 Then 在远程调用前拒绝', async () => {
+    const deps = dependencies()
+    deps.services.access.getReadAccess = () => ({ ...dependencies().services.access.getReadAccess('session-1')!, resources: [{ kind: 'ssh', hostId: 'host-1', readLogs: true }] })
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    await expect(facade.serverLogs({ hostId: 'host-1', source: { kind: 'unit', unitId: "ssh.service'; echo leak" }, since: '1h', priority: 'info', tailLines: 20 })).rejects.toThrow('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+  })
+  test('Given 日志在途 When 取消、撤权或重授 Then 不返回旧日志', async () => {
+    const deps = dependencies()
+    let access = { ...deps.services.access.getReadAccess('session-1')!, resources: [{ kind: 'ssh' as const, hostId: 'host-1', readLogs: true }] }
+    deps.services.access.getReadAccess = () => access
+    const entered = Promise.withResolvers<void>()
+    const gate = Promise.withResolvers<void>()
+    deps.services.logs = { snapshot: async ({ hostId }) => { entered.resolve(); await gate.promise; return { hostId, lines: ['private'], truncated: false, warnings: [] } } }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+    const request = { hostId: 'host-1', source: { kind: 'system' } as const, since: '15m' as const, priority: 'info' as const, tailLines: 10 }
+    const result = facade.serverLogs(request)
+    await entered.promise
+    access = { ...access, revision: 8 }
+    gate.resolve()
+    await expect(result).rejects.toThrow('SERVER_OPS_AGENT_ACCESS_CHANGED')
   })
 })

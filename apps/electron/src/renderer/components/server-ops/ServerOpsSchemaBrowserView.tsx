@@ -90,7 +90,7 @@ export function ServerOpsDatabaseSelector({ projection, onSelectDatabase, onRefr
     {projection.databasesTruncated ? <div className={cn('shrink-0 py-1 text-[11px] text-muted-foreground', compact ? 'px-0' : 'px-4')}>可见数据库目录已按上限截断</div> : null}
     <ServerOpsDataReadStatus state={projection} onRetry={onRefresh} />
   </>
-  if (compact) return <div className="flex min-w-0 flex-[1_1_14rem] flex-col" data-server-ops-database-selector data-server-ops-database-selector-compact="true"><div className="flex min-w-0 items-center gap-2">{controls}</div>{status}</div>
+  if (compact) return <div className="flex min-w-0 flex-[1_1_12rem] flex-col" data-server-ops-database-selector data-server-ops-database-selector-compact="true"><div className="flex min-w-0 items-center gap-2">{controls}</div>{status}</div>
   return <><div className={SERVER_OPS_TOOLBAR_CLASS} data-server-ops-database-selector>{controls}</div>{status}</>
 }
 
@@ -157,16 +157,18 @@ export function ServerOpsSchemaBrowserView({
   return (
     <div ref={containerRef} className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" style={{ containerType: 'inline-size', containerName: 'db-browser', '--directory-width': `${directoryWidth}px` } as React.CSSProperties} data-server-ops-schema-browser={projection.database ?? 'none'}>
       <style>{'.db-table-directory,.db-directory-resize{display:none}.db-browser-body{display:flex}@container db-browser (min-width:720px){.db-table-directory,.db-directory-resize{display:block}.db-directory-trigger,.db-directory-toolbar{display:none}.db-browser-body{display:grid;grid-template-columns:var(--directory-width) 4px minmax(0,1fr)}}'}</style>
-      {showDatabaseSelector ? <ServerOpsDatabaseSelector projection={projection} onSelectDatabase={onSelectDatabase} onRefresh={onRefreshTables}>{directoryToggle}</ServerOpsDatabaseSelector>
-        : <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'db-directory-toolbar')}>{directoryToggle}<span className="min-w-0 truncate text-xs text-muted-foreground">{projection.database ?? '先选择数据库'}</span></div>}
-      <div className="db-browser-body min-h-0 min-w-0 flex-1 overflow-hidden">
+      {showDatabaseSelector ? <ServerOpsDatabaseSelector projection={projection} onSelectDatabase={onSelectDatabase} onRefresh={onRefreshTables}>{projection.database === null ? null : directoryToggle}</ServerOpsDatabaseSelector>
+        : projection.database !== null ? <div className={cn(SERVER_OPS_TOOLBAR_CLASS, 'db-directory-toolbar')}>{directoryToggle}<span className="min-w-0 truncate text-xs text-muted-foreground">{projection.tablesTruncated ? '已加载 ' : ''}{projection.tables.length} 张表</span></div> : null}
+      <div className={cn('min-h-0 min-w-0 flex-1 overflow-hidden', projection.database === null ? 'flex' : 'db-browser-body')}>
+        {projection.database !== null ? <>
         <aside className="db-table-directory min-h-0 overflow-hidden">{directory}</aside>
         <div className="db-directory-resize cursor-col-resize touch-none bg-border/30 hover:bg-primary/30 focus-visible:bg-primary/30" role="separator" tabIndex={0} aria-label="表目录宽度" aria-orientation="vertical" aria-valuemin={160} aria-valuemax={240} aria-valuenow={directoryWidth}
           onKeyDown={(event) => { if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); resize(directoryWidth + (event.key === 'ArrowLeft' ? -10 : 10)) } }}
           onPointerDown={(event) => { resizeRef.current = { x: event.clientX, width: directoryWidth }; event.currentTarget.setPointerCapture(event.pointerId) }}
           onPointerMove={(event) => { if (resizeRef.current) resize(resizeRef.current.width + event.clientX - resizeRef.current.x) }}
           onPointerUp={(event) => { resizeRef.current = null; event.currentTarget.releasePointerCapture(event.pointerId) }} onLostPointerCapture={() => { resizeRef.current = null }} />
-        {projection.selectedTable === null ? <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-muted-foreground"><div className="rounded-xl bg-muted/50 p-3"><Table2 className="size-6" /></div><p className="text-sm font-medium text-foreground">{projection.database === null ? '选择数据库开始浏览' : '从表目录选择一张表'}</p><p className="text-xs">数据、结构、索引和属性会显示在这里</p></div> : (
+        </> : null}
+        {projection.selectedTable === null ? <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-muted-foreground"><div className="rounded-xl bg-muted/50 p-3">{projection.database === null ? <Database className="size-6" /> : <Table2 className="size-6" />}</div><p className="text-sm font-medium text-foreground">{projection.database === null ? '选择数据库开始浏览' : '从表目录选择一张表'}</p><p className="text-xs">{projection.database === null ? '从上方选择数据库，再选择表查看数据与结构。' : '数据、结构、索引和属性会显示在这里'}</p></div> : (
           <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={projection.detailTab} onValueChange={(tab) => onDetailTabChange(tab as ServerOpsSchemaDetailTab)} data-server-ops-schema-table-detail={projection.selectedTable}>
             <div className={SERVER_OPS_TOOLBAR_CLASS}>
               <div className="flex min-w-[7rem] flex-1 items-center gap-2"><Table2 className="size-3.5 shrink-0 text-muted-foreground" /><span className="min-w-0 flex-1 truncate text-xs font-medium" title={`${projection.database}.${projection.selectedTable}`}>{projection.selectedTable}</span><span className="text-[10px] text-muted-foreground">只读</span></div>

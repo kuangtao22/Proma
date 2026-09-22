@@ -8,6 +8,23 @@ import { DataRootLocator } from './data-root-locator'
 /** 当前测试创建的临时目录，测试结束后统一清理。 */
 const temporaryDirs: string[] = []
 
+test('Given 运维工具可用 When 构建提示词 Then 数据库修改只交付脚本且明确代码证据要求', () => {
+  /** 纯提示词依赖不会读取真实用户配置或项目文件。 */
+  const context = {
+    sessionId: 'ops-session', permissionMode: 'bypassPermissions' as const,
+    dependencies: { resolveWorkspaceContext: () => ({ workspaceRoot: '/tmp/workspace', projectRoot: '/tmp/project', isLocalProject: true }),
+      getUserName: () => '测试用户', isGitAttributionEnabled: () => false },
+  }
+  const prompt = buildSystemPrompt({ ...context, serverOpsAvailable: true })
+  expect(prompt).toContain('ops_database_change_context')
+  expect(prompt).toContain('业务校验')
+  expect(prompt).toContain('不得执行变更脚本')
+  expect(prompt).toContain('不承诺事务回滚')
+  expect(prompt).toContain('不得把生产事务回滚当作无副作用测试')
+  expect(prompt).toContain('未读取程序时明确标记缺失')
+  expect(buildSystemPrompt(context)).not.toContain('ops_database_change_context')
+})
+
 afterEach(() => {
   for (const directory of temporaryDirs.splice(0)) {
     rmSync(directory, { recursive: true, force: true })

@@ -154,6 +154,8 @@ import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { requireOrdinaryTopLevelAgentSession } from '../agent-session-visibility'
 import type { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { SERVER_OPS_AGENT_READ_CHANNELS, parseServerOpsAgentReadGrant, parseServerOpsAgentReadSession } from '@proma/shared'
+import { SERVER_OPS_CONNECTION_DRAFT_CHANNELS, parseServerOpsConnectionDraftDismiss, parseServerOpsConnectionDraftSession } from '@proma/shared'
+import { serverOpsConnectionDraftStore } from './server-ops-connection-draft-store'
 import { captureServerOpsReadBindings, revalidateServerOpsReadBindings } from './server-ops-agent-read-identity'
 import type { ServerOpsTrustService } from './server-ops-trust-service'
 import type { ServerOpsDockerService } from './server-ops-docker-service'
@@ -391,6 +393,8 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     SERVER_OPS_IPC_CHANNELS.EXPORT_LOG,
     SERVER_OPS_AGENT_READ_CHANNELS.GET,
     SERVER_OPS_AGENT_READ_CHANNELS.SET,
+    SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST,
+    SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS,
     ...Object.values(SERVER_OPS_TRUST_CHANNELS),
     ...Object.values(SERVER_OPS_DOCKER_CHANNELS),
     ...Object.values(SERVER_OPS_FILE_CHANNELS),
@@ -575,6 +579,20 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const { window } = requireOwner(event)
     if (!options.docker) throw new Error('SERVER_OPS_DOCKER_UNAVAILABLE')
     options.docker.cancelAction(window.id, parsed)
+  })
+  installHandler(SERVER_OPS_CONNECTION_DRAFT_CHANNELS.LIST, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const sessionId = parseServerOpsConnectionDraftSession(input)
+    const session = requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(sessionId))
+    if (session.archived) throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
+    return serverOpsConnectionDraftStore.list(sessionId)
+  })
+  installHandler(SERVER_OPS_CONNECTION_DRAFT_CHANNELS.DISMISS, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const target = parseServerOpsConnectionDraftDismiss(input)
+    const session = requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(target.sessionId))
+    if (session.archived) throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
+    return serverOpsConnectionDraftStore.dismiss(target.sessionId, target.id)
   })
   installHandler(SERVER_OPS_DATA_CHANNELS.LIST_SOURCES, (event, input) => {
     assertAuthorizedSender(event, options)
@@ -1149,6 +1167,8 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
   }
   /** 逐项安装 runtime 与日志订阅，使中途失败可精确逆序回滚。 */
   installSubscription(() => options.access.onReadChanged((event) => broadcast(SERVER_OPS_AGENT_READ_CHANNELS.CHANGED, event)))
+  /** 广播只包含会话和草稿 ID，具体字段仍经有权限检查的定向读取入口获取。 */
+  installSubscription(() => serverOpsConnectionDraftStore.subscribe((event) => broadcast(SERVER_OPS_CONNECTION_DRAFT_CHANNELS.CHANGED, event)))
   installSubscription(() => options.connections.onState((state) => {
     if (state.phase === 'disconnected' || state.phase === 'blocked' || state.phase === 'error') revokeHostAccess(state.hostId)
     broadcast(SERVER_OPS_IPC_CHANNELS.CONNECTION_STATE, state)

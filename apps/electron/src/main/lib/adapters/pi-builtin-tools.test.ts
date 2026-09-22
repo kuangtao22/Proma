@@ -56,7 +56,24 @@ const sdk = {
 } as typeof import('@earendil-works/pi-coding-agent')
 
 describe('Pi Server Ops 工具合同', () => {
-  test('Given 会话恢复为运维只读模式 When 重建工具 Then 每轮仅有九项独立工具实例', async () => {
+  test('Given 草稿能力可用 When 按来源和模式构建 Then 仅普通用户标准模式注册', async () => {
+    /** 注册检查不调用草稿写入，也不引入真实配置。 */
+    const serverOpsConnectionDrafts = { prepare: () => { throw new Error('未执行') } }
+    for (const triggeredBy of [undefined, 'user', 'automation', 'delegation', 'external'] as const) {
+      const result = await buildPiBuiltinTools(sdk, {
+        sessionId: 'session-1', channelId: 'channel-1', triggeredBy, serverOpsConnectionDrafts,
+        productivityTools: { todosEnabled: false, calendarEnabled: false, obsidianEnabled: false },
+      })
+      expect(result.tools.some((tool) => tool.name === 'ops_connection_prepare')).toBe(triggeredBy === undefined || triggeredBy === 'user')
+    }
+    const readonly = await buildPiBuiltinTools(sdk, {
+      sessionId: 'session-1', channelId: 'channel-1', toolMode: 'server-ops-read', serverOpsConnectionDrafts,
+      serverOpsReadFacade: {} as ServerOpsAgentReadFacade,
+    })
+    expect(readonly.tools.some((tool) => tool.name === 'ops_connection_prepare')).toBe(false)
+  })
+
+  test('Given 会话恢复为运维只读模式 When 重建工具 Then 每轮仅有固定只读工具实例', async () => {
     const facade = {} as ServerOpsAgentReadFacade
     const context = {
       sessionId: 'session-1', channelId: 'channel-1', toolMode: 'server-ops-read' as const, serverOpsReadFacade: facade,
@@ -66,8 +83,10 @@ describe('Pi Server Ops 工具合同', () => {
     const resumed = await buildPiBuiltinTools(sdk, context)
     expect(first.tools.map((tool) => tool.name)).toEqual([
       'ops_resources', 'ops_server_overview', 'ops_server_services',
+      'ops_server_discover', 'ops_server_logs',
       'ops_data_test', 'ops_data_diagnose', 'ops_database_tables',
       'ops_database_describe', 'ops_database_rows', 'ops_database_query',
+      'ops_database_change_context',
     ])
     expect(first.collaborationAvailable).toBe(false)
     expect(first.tools[0]).not.toBe(resumed.tools[0])

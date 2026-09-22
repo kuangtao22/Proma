@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { ServerOpsDataSource, ServerOpsProject } from '@proma/shared'
-import { SERVER_OPS_AGENT_QUERY_PERMISSION_LABEL, ServerOpsAgentReadAccess, updateServerOpsAgentScopeReadRows } from './ServerOpsAgentReadAccess'
+import { ServerOpsAgentReadAccess } from './ServerOpsAgentReadAccess'
 import type { ServerOpsConnection } from './server-ops-connections'
 
 const projects: readonly ServerOpsProject[] = [
@@ -30,12 +30,5 @@ describe('ServerOpsAgentReadAccess', () => {
   test('无会话时入口不可用且不加载资源目录', () => {
     const html = renderToStaticMarkup(<ServerOpsAgentReadAccess sessionId={null} projectId="project-1" projects={projects} connections={connections} allConnections={connections} dataSources={dataSources} />)
     expect(html).toMatch(/disabled=""[^>]*aria-label="Agent 只读授权"|aria-label="Agent 只读授权"[^>]*disabled=""/)
-  })
-
-  test('授权说明明确SQL查询独立授权且仍受表范围约束', () => {
-    expect(SERVER_OPS_AGENT_QUERY_PERMISSION_LABEL).toContain('允许只读 SQL 查询')
-    expect(SERVER_OPS_AGENT_QUERY_PERMISSION_LABEL).toContain('仍限制在上述库表范围')
-    expect(updateServerOpsAgentScopeReadRows({ database: 'app', tables: ['users'], readRows: true, query: true }, false)).toMatchObject({ readRows: false, query: false })
-    expect(updateServerOpsAgentScopeReadRows({ database: 'app', tables: ['users'], readRows: false }, true)).not.toHaveProperty('query')
   })
 })

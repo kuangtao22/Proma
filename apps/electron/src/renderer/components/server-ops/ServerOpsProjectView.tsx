@@ -20,8 +20,12 @@ const SERVER_OPS_PROJECT_KINDS: readonly { kind: ServerOpsConnectionKind; label:
 
 /** 项目视图属性。 */
 export interface ServerOpsProjectViewProps {
+  /** 顶部直接切换项目的入口；抽屉继续负责项目管理。 */
+  projectSelector?: React.ReactNode
   /** 工具栏右侧附加操作，例如 Agent 只读授权。 */
   toolbarActions?: React.ReactNode
+  /** 当前会话 Agent 生成的待审核连接草稿；项目归属由用户在这里确定。 */
+  pendingDrafts?: React.ReactNode
   /** 当前项目；为空表示项目列表尚未就绪。 */
   project: ServerOpsProject | null
   /** 项目列表加载阶段；项目为空时用于区分"读取中/失败/确实没有项目"。 */
@@ -36,7 +40,7 @@ export interface ServerOpsProjectViewProps {
   onSelectConnection: (connection: ServerOpsConnection) => void
   /** 打开连接移动弹窗；不传时隐藏管理菜单。 */
   onMoveConnection?: (connection: ServerOpsConnection) => void
-  /** 打开项目列表抽屉；项目列表是抽屉里的唯一内容，也是切换项目的入口。 */
+  /** 打开项目列表抽屉，提供项目管理与列表导航。 */
   onOpenDrawer: () => void
   /** 重新读取项目列表；仅在失败态提供。 */
   onRetry?: () => void
@@ -65,9 +69,11 @@ function GroupIcon({ kind, className }: { kind: ServerOpsConnectionKind; classNa
 function ProjectViewToolbar({
   title,
   onOpenDrawer,
+  projectSelector,
 }: {
   title: string
   onOpenDrawer: () => void
+  projectSelector?: React.ReactNode
 }): React.ReactElement {
   return (
     <div className="titlebar-no-drag flex min-w-0 flex-wrap items-center justify-between gap-3 py-3" data-server-ops-project-toolbar>
@@ -75,11 +81,13 @@ function ProjectViewToolbar({
         <Blocks className="size-6 text-foreground/70" aria-hidden="true" />
         <h1 className="text-lg font-semibold text-foreground">服务器运维</h1>
       </div>
-      <Button type="button" variant="outline" size="sm" className="max-w-full gap-2 rounded-lg bg-content-area text-[13px] text-foreground/80" aria-label="打开项目列表" title={title} onClick={onOpenDrawer}>
-        <FolderOpen className="size-3.5 text-muted-foreground" aria-hidden="true" />
-        <span className="max-w-44 truncate">{title}</span>
-        <ChevronDown className="size-3.5 text-muted-foreground" aria-hidden="true" />
-      </Button>
+      {projectSelector ? <div className="w-48 min-w-0 max-w-full">{projectSelector}</div> : (
+        <Button type="button" variant="outline" size="sm" className="max-w-full gap-2 rounded-lg bg-content-area text-[13px] text-foreground/80" aria-label="打开项目列表" title={title} onClick={onOpenDrawer}>
+          <FolderOpen className="size-3.5 text-muted-foreground" aria-hidden="true" />
+          <span className="max-w-44 truncate">{title}</span>
+          <ChevronDown className="size-3.5 text-muted-foreground" aria-hidden="true" />
+        </Button>
+      )}
     </div>
   )
 }
@@ -109,6 +117,8 @@ export function ServerOpsProjectView({
   onFilterKindChange,
   onSearchQueryChange,
   toolbarActions,
+  pendingDrafts,
+  projectSelector,
 }: ServerOpsProjectViewProps): React.ReactElement {
   if (!project) {
     /*
@@ -117,7 +127,7 @@ export function ServerOpsProjectView({
      */
     return (
       <div className="flex min-h-0 flex-1 flex-col bg-content-area px-4" data-server-ops-project-view="empty">
-        <ProjectViewToolbar title="项目" onOpenDrawer={onOpenDrawer} />
+        <ProjectViewToolbar title="项目" onOpenDrawer={onOpenDrawer} projectSelector={projectSelector} />
         <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
           {status === 'loading' || status === 'idle' ? (
             <>
@@ -158,8 +168,9 @@ export function ServerOpsProjectView({
   return (
     <div className="server-ops-project-container flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-content-area scrollbar-thin" data-server-ops-project-view={project.id}>
       <div className="mx-auto w-full max-w-6xl px-4 pb-5">
-        <ProjectViewToolbar title={project.name} onOpenDrawer={onOpenDrawer} />
+        <ProjectViewToolbar title={project.name} onOpenDrawer={onOpenDrawer} projectSelector={projectSelector} />
         <AgentActionHint action="查看已授权的服务器状态、分析数据库或查询数据" className="mb-3" />
+        {pendingDrafts}
         <div className="titlebar-no-drag mb-4 flex min-w-0 flex-wrap items-center gap-2" data-server-ops-project-actions>
           <label className="relative block min-w-0 flex-1 basis-52" data-server-ops-project-search>
             <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-foreground/40" aria-hidden="true" />

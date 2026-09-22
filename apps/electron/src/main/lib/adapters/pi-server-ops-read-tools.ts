@@ -1,7 +1,9 @@
 import { Type } from 'typebox'
+import { SERVER_OPS_DATA_QUERY_TIMEOUT_MS } from '@proma/shared'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { ServerOpsAgentReadFacade } from '../server-ops/server-ops-agent-read-facade'
+import { prepareServerOpsDatabaseChangeContext } from '../server-ops/server-ops-database-change-context'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -36,6 +38,28 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
       description: `Read the bounded systemd service list from one already connected authorized server.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ hostId: Type.String() }, { additionalProperties: false }),
       async execute(_id, params, signal) { return jsonToolResult(await facade.serverServices(params as { hostId: string }, signal)) },
+    }),
+    sdk.defineTool({
+      name: 'ops_server_discover', label: '发现服务器服务',
+      description: `Discover bounded systemd services and Docker containers on one connected authorized server. Reports partial/unavailable sources explicitly; does not scan networks, read credentials or create connections. If ops_connection_prepare is available, use the returned hostId to propose a separate database connection draft; otherwise direct the user to the Server Ops panel.${UNTRUSTED_EVIDENCE}`,
+      parameters: Type.Object({ hostId: Type.String() }, { additionalProperties: false }),
+      async execute(_id, params, signal) { return jsonToolResult(await facade.serverDiscover(params as { hostId: string }, signal)) },
+    }),
+    sdk.defineTool({
+      name: 'ops_server_logs', label: '读取服务器日志快照',
+      description: `Read one bounded log snapshot only when this server explicitly grants readLogs. Never follows logs or starts a persistent stream. At most 200 lines and 32 KiB. Common secrets are masked but arbitrary business data may remain; request only the relevant source and time range. Container logs do not support journal priority filtering.${UNTRUSTED_EVIDENCE}`,
+      parameters: Type.Object({
+        hostId: Type.String(),
+        source: Type.Union([
+          Type.Object({ kind: Type.Literal('system') }, { additionalProperties: false }),
+          Type.Object({ kind: Type.Literal('unit'), unitId: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false }),
+          Type.Object({ kind: Type.Literal('container'), containerId: Type.String({ pattern: '^[a-f0-9]{64}$' }) }, { additionalProperties: false }),
+        ]),
+        since: Type.Union(['15m', '1h', '6h', '24h', 'boot'].map((value) => Type.Literal(value))),
+        priority: Type.Union(['emerg', 'alert', 'crit', 'err', 'warning', 'notice', 'info', 'debug'].map((value) => Type.Literal(value))),
+        tailLines: Type.Integer({ minimum: 1, maximum: 200 }),
+      }, { additionalProperties: false }),
+      async execute(_id, params, signal) { return jsonToolResult(await facade.serverLogs(params as Parameters<ServerOpsAgentReadFacade['serverLogs']>[0], signal)) },
     }),
     sdk.defineTool({
       name: 'ops_data_test', label: '测试数据连接',
@@ -74,7 +98,7 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
     }),
     sdk.defineTool({
       name: 'ops_database_rows', label: '读取数据库表数据',
-      description: `Read one bounded page from an explicitly authorized MySQL or SQLite table. Sensitive-looking columns are masked by default. If continuation is returned, continue at nextOffset with recommendedLimit to avoid skipping rows.${UNTRUSTED_EVIDENCE}`,
+      description: `Read one bounded page from an explicitly authorized MySQL or SQLite table. Sensitive-looking columns are masked by default. Execution is capped at ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS / 1_000} seconds. After a timeout, do not repeatedly retry the same request or bypass limits through SSH/Shell; narrow the query or inspect indexes first. If continuation is returned, continue at nextOffset with recommendedLimit to avoid skipping rows.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }), table: Type.String({ minLength: 1, maxLength: 128 }),
         offset: Type.Integer({ minimum: 0, maximum: 1_000_000 }), limit: Type.Integer({ minimum: 1, maximum: 50 }),
@@ -83,7 +107,7 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
     }),
     sdk.defineTool({
       name: 'ops_database_query', label: '执行只读 SQL 查询',
-      description: `Execute one read-only MySQL or SQLite SELECT only when the database scope explicitly grants query and row access. Every referenced base table must be authorized. Supports filtering, aggregation and joins within the named database. No comments, subqueries, CTEs, UNION, views, protected fields, writes, locking, user variables or arbitrary functions. Returns at most 50 rows with a bounded execution time and result size. SQL literals are omitted from audit.${UNTRUSTED_EVIDENCE}`,
+      description: `Execute one read-only MySQL or SQLite SELECT only when the database scope explicitly grants query and row access. Every referenced base table must be authorized. Supports filtering, aggregation and joins within the named database. No comments, subqueries, CTEs, UNION, views, protected fields, writes, locking, user variables or arbitrary functions. Single-table and join queries share a ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS / 1_000}-second execution limit; returns at most 50 rows and a bounded result size. After a timeout, do not repeatedly retry unchanged SQL or bypass limits through SSH/Shell; narrow filters, reduce joined tables or inspect indexes first. SQL literals are omitted from audit.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({
         sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }),
         sql: Type.String({ minLength: 1, maxLength: 16_384 }), maxRows: Type.Integer({ minimum: 1, maximum: 50 }),
@@ -91,6 +115,15 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
       async execute(_id, params, signal) {
         return jsonToolResult(await facade.databaseQuery(params as Parameters<ServerOpsAgentReadFacade['databaseQuery']>[0], signal))
       },
+    }),
+    sdk.defineTool({
+      name: 'ops_database_change_context', label: '准备数据库变更脚本依据',
+      description: `Read columns and indexes for up to four authorized MySQL/SQLite tables to prepare a reviewable migration or repair script. This tool never reads rows, writes data, modifies schema or executes a script. Combine the evidence with actual authorized project models, business validation and migration conventions before generating files. Report missing code, constraints and truncated metadata. Deliver preflight, bounded changes, verification and a feasible recovery strategy; generated programs default to dry-run. Do not execute database changes through SSH, Shell, MCP or client libraries. In read-only mode return code blocks; file creation requires a separately available project writing tool.${UNTRUSTED_EVIDENCE}`,
+      parameters: Type.Object({
+        sourceId: Type.String(), database: Type.String({ minLength: 1, maxLength: 64 }),
+        tables: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 4, uniqueItems: true }),
+      }, { additionalProperties: false }),
+      async execute(_id, params, signal) { return jsonToolResult(await prepareServerOpsDatabaseChangeContext(facade, params, signal)) },
     }),
   ] as ToolDefinition[]
 }

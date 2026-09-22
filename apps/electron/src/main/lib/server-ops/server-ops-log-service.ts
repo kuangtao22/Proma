@@ -2,8 +2,11 @@ import {
   parseServerOpsLogIdentity,
   parseServerOpsLogOutputAck,
   parseServerOpsLogStartInput,
+  parseServerOpsAgentLogsInput,
   type ServerOpsLogSince,
   type ServerOpsLogStartInput,
+  type ServerOpsAgentLogsInput,
+  type ServerOpsAgentLogsResult,
 } from '@proma/shared'
 import type {
   ServerOpsConnectionState,
@@ -19,10 +22,13 @@ import type {
   ServerOpsConnectionLogOutputEvent,
 } from './server-ops-connection-service'
 import { SERVER_OPS_DOCKER_COMMAND_PREFIX } from './server-ops-docker-service'
+import type { ServerOpsRuntimeExecResult } from '../../../utility/server-ops/server-ops-runtime-protocol'
 
 /** Log Service 可见的最小连接边界。 */
 export interface ServerOpsLogConnection {
   getActiveIdentity(hostId: string): ServerOpsActiveConnectionIdentity
+  /** 一次性快照仅走现有可信连接上的非 PTY exec，不创建第二条连接。 */
+  exec?: (hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal) => Promise<ServerOpsRuntimeExecResult>
   startLog(identity: ServerOpsActiveConnectionIdentity, streamId: string, command: string): Promise<void>
   stopLog(identity: ServerOpsActiveConnectionIdentity, streamId: string): void
   acknowledgeLog(identity: ServerOpsActiveConnectionIdentity, streamId: string, sequence: number): void
@@ -59,15 +65,37 @@ function quotePosix(value: string): string {
 }
 
 /** 从严格 Shared 输入构造唯一受控日志命令模板。 */
-function buildLogCommand(input: ServerOpsLogStartInput): string {
+function buildLogCommand(input: ServerOpsLogStartInput, follow = true): string {
   if (input.source.kind === 'container') {
     /** boot 对容器日志表示从 Unix epoch 开始，但初始输出仍受 tail 上限约束。 */
     const since = input.since === 'boot' ? '0' : input.since
-    return `${SERVER_OPS_DOCKER_COMMAND_PREFIX} container logs --follow --timestamps --tail ${input.tailLines} --since ${quotePosix(since)} -- ${quotePosix(input.source.containerId)}`
+    return `${SERVER_OPS_DOCKER_COMMAND_PREFIX} container logs${follow ? ' --follow' : ''} --timestamps --tail ${input.tailLines} --since ${quotePosix(since)} -- ${quotePosix(input.source.containerId)}`
   }
   /** 只有 unit 来源附加受控的 systemd unit 参数。 */
   const unitArgument = input.source.kind === 'unit' ? ` --unit=${quotePosix(input.source.unitId)}` : ''
-  return `LC_ALL=C journalctl --no-pager --output=short-iso-precise --priority=${input.priority} --lines=${input.tailLines} ${JOURNAL_SINCE_ARGUMENTS[input.since]}${unitArgument} --follow`
+  return `LC_ALL=C journalctl --no-pager --output=short-iso-precise --priority=${input.priority} --lines=${input.tailLines} ${JOURNAL_SINCE_ARGUMENTS[input.since]}${unitArgument}${follow ? ' --follow' : ''}`
+}
+
+/** 脱敏日志中常见赋值凭据、Bearer 和 URL 用户信息；未知格式仍可能含敏感业务内容。 */
+function redactLogLine(line: string): string {
+  return line
+    .replace(/\bBearer\s+\S+/giu, 'Bearer [MASKED]')
+    .replace(/(["'](?:password|passwd|pwd|secret|token|api[_-]?key|authorization)["']\s*:\s*)(?:"[^"]*"|'[^']*'|[^,}\s]+)/giu, '$1"[MASKED]"')
+    .replace(/\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\s*([=:])\s*(?:"[^"]*"|'[^']*'|\S+)/giu, '$1$2[MASKED]')
+    .replace(/\b((?:https?|mysql|mariadb|postgres(?:ql)?|redis):\/\/)[^\s/@:]+:[^\s/@]+@/giu, '$1[MASKED]@')
+}
+
+/** PEM 私钥可能跨多行，整段均不得交给模型。 */
+function redactLogLines(lines: string[]): string[] {
+  let insidePrivateKey = false
+  return lines.map((line) => {
+    if (/-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u.test(line)) insidePrivateKey = true
+    if (insidePrivateKey) {
+      if (/-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u.test(line)) insidePrivateKey = false
+      return '[MASKED PRIVATE KEY]'
+    }
+    return redactLogLine(line)
+  })
 }
 
 /** 按 main owner 管理日志流，公开边界不暴露 connectionId。 */
@@ -92,6 +120,31 @@ export class ServerOpsLogService {
       dependencies.connection.onLogOutput((event) => this.handleOutput(event)),
       dependencies.connection.onLogExit((event) => this.handleExit(event)),
     ]
+  }
+
+  /** 对当前 SSH 代次执行固定模板的一次快照，受 10 秒和最终 32KiB 文本预算约束。 */
+  async snapshot(raw: ServerOpsAgentLogsInput, signal?: AbortSignal): Promise<ServerOpsAgentLogsResult> {
+    const input = parseServerOpsAgentLogsInput(raw)
+    if (!this.dependencies.connection.exec) throw new Error('SERVER_OPS_AGENT_LOGS_UNAVAILABLE')
+    if (signal?.aborted) throw new Error('SERVER_OPS_AGENT_READ_CANCELLED')
+    const identity = this.dependencies.connection.getActiveIdentity(input.hostId)
+    const result = await this.dependencies.connection.exec(input.hostId, identity.connectionId, buildLogCommand(input, false), 10_000, signal)
+    if (signal?.aborted) throw new Error('SERVER_OPS_AGENT_READ_CANCELLED')
+    if (!this.identitiesEqual(identity, this.dependencies.connection.getActiveIdentity(input.hostId))) throw new Error('SERVER_OPS_LOG_CONNECTION_CHANGED')
+    if (result.exitCode !== 0) throw new Error('SERVER_OPS_AGENT_LOGS_FAILED')
+    /** Docker 日志常写 stderr；该通道也是日志正文，仅在零退出码时消费。 */
+    const output = input.source.kind === 'container' ? `${result.stdout}${result.stderr}` : result.stdout
+    const rawLines = output.replace(/\r?\n$/u, '').split(/\r?\n/u).filter((line) => line.length > 0)
+    /** 先遮罩整个源，再取末尾行，避免行预算截掉私钥 BEGIN 后泄漏后续内容。 */
+    const lines = redactLogLines(rawLines).slice(-input.tailLines)
+    const snapshot: ServerOpsAgentLogsResult = { hostId: input.hostId, lines, truncated: result.truncated || rawLines.length > input.tailLines,
+      warnings: input.source.kind === 'container' ? ['容器日志不支持 priority 筛选'] : [] }
+    while (Buffer.byteLength(JSON.stringify(snapshot, null, 2), 'utf8') > 32_256 && snapshot.lines.length > 0) {
+      snapshot.lines.shift()
+      snapshot.truncated = true
+    }
+    if (Buffer.byteLength(JSON.stringify(snapshot, null, 2), 'utf8') > 32_256) throw new Error('SERVER_OPS_AGENT_RESULT_TOO_LARGE')
+    return snapshot
   }
 
   /** 严格解析查询并在 runtime started 后复核连接代次。 */

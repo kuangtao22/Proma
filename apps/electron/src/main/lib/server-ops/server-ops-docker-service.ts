@@ -56,7 +56,7 @@ const SERVER_OPS_DOCKER_MAX_LINE_LENGTH = 32_768
 /** Docker Service 只依赖当前 SSH 连接的身份、exec 与审计能力。 */
 export interface ServerOpsDockerServiceDependencies {
   getActiveIdentity(hostId: string): ServerOpsActiveConnectionIdentity
-  exec(hostId: string, connectionId: string, command: string, timeoutMs: number): Promise<ServerOpsRuntimeExecResult>
+  exec(hostId: string, connectionId: string, command: string, timeoutMs: number, signal?: AbortSignal): Promise<ServerOpsRuntimeExecResult>
   audit: {
     append(input: ServerOpsAuditAppendInput): unknown
     prepareForWrites?: () => Promise<void>
@@ -181,6 +181,20 @@ export class ServerOpsDockerService {
     } catch {
       throw new Error('SERVER_OPS_DOCKER_OUTPUT_INVALID')
     }
+  }
+
+  /** Agent 发现只运行 daemon 能力探测和容器列表，不读取镜像、网络或卷。 */
+  async listContainers(input: ServerOpsDockerResourcesInput, signal?: AbortSignal): Promise<Pick<ServerOpsDockerResourcesResult, 'hostId' | 'capability' | 'containers'>> {
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
+    const parsed = parseServerOpsDockerResourcesInput(input)
+    const identity = this.readInitialIdentity(parsed.hostId)
+    const capability = await this.discoverCapability(identity, signal)
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
+    if (capability !== 'available') return { hostId: parsed.hostId, capability, containers: [] }
+    const containers = this.parseContainers(await this.execRead(identity, SERVER_OPS_DOCKER_CONTAINERS_COMMAND, signal), 500)
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
+    this.assertIdentityUnchanged(identity)
+    return { hostId: parsed.hostId, capability, containers }
   }
 
   /** 按完整 ID 读取并投影单个容器详情。 */
@@ -336,15 +350,17 @@ export class ServerOpsDockerService {
   }
 
   /** 探测 Docker CLI、daemon 和 Unix socket 权限。 */
-  private async discoverCapability(identity: ServerOpsActiveConnectionIdentity): Promise<ServerOpsDockerCapability> {
+  private async discoverCapability(identity: ServerOpsActiveConnectionIdentity, signal?: AbortSignal): Promise<ServerOpsDockerCapability> {
     let response: ServerOpsRuntimeExecResult
     try {
       response = await this.dependencies.exec(identity.hostId, identity.connectionId,
-        SERVER_OPS_DOCKER_CAPABILITY_COMMAND, SERVER_OPS_DOCKER_READ_TIMEOUT_MS)
+        SERVER_OPS_DOCKER_CAPABILITY_COMMAND, SERVER_OPS_DOCKER_READ_TIMEOUT_MS, signal)
     } catch {
+      if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
       this.assertIdentityUnchanged(identity)
       return 'daemon-unavailable'
     }
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     this.assertIdentityUnchanged(identity)
     if (response.exitCode === 127 && response.signal === undefined && !response.truncated) return 'cli-missing'
     if (response.exitCode !== 0 || response.signal !== undefined || response.truncated) {
@@ -361,14 +377,16 @@ export class ServerOpsDockerService {
   }
 
   /** 执行固定只读命令并校验资格和连接代次。 */
-  private async execRead(identity: ServerOpsActiveConnectionIdentity, command: string): Promise<string> {
+  private async execRead(identity: ServerOpsActiveConnectionIdentity, command: string, signal?: AbortSignal): Promise<string> {
     let response: ServerOpsRuntimeExecResult
     try {
-      response = await this.dependencies.exec(identity.hostId, identity.connectionId, command, SERVER_OPS_DOCKER_READ_TIMEOUT_MS)
+      response = await this.dependencies.exec(identity.hostId, identity.connectionId, command, SERVER_OPS_DOCKER_READ_TIMEOUT_MS, signal)
     } catch {
+      if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
       this.assertIdentityUnchanged(identity)
       throw new Error('SERVER_OPS_DOCKER_OUTPUT_INVALID')
     }
+    if (signal?.aborted) throw new Error('SERVER_OPS_EXEC_CANCELLED')
     this.assertIdentityUnchanged(identity)
     if (response.exitCode !== 0 || response.signal !== undefined || response.truncated || response.stderr.length > 0) {
       throw new Error('SERVER_OPS_DOCKER_OUTPUT_INVALID')

@@ -7,18 +7,26 @@ export const SERVER_OPS_AGENT_READ_CHANNELS = {
   CHANGED: 'server-ops:agent-read-access-changed',
 } as const
 
-/** 指定数据库内的表结构权限与独立行读取权限；null 明确代表该库全部表。 */
+/** 数据库读取范围；null 代表默认全部表，禁用项另行排除，旧分层权限仍可读取。 */
 export interface ServerOpsAgentDatabaseScope {
   database: string
   tables: string[] | null
+  /** 仅全部表范围可指定例外；表名大小写变化也必须保持禁止访问。 */
+  excludedTables?: string[]
   readRows: boolean
-  /** SQL 查询须另行显式授权；省略保持旧合同，不从行预览权限推导。 */
+  /** 新编辑器保存时与行预览一起开启；旧授权省略时仍不自动授予 SQL 权限。 */
   query?: boolean
+}
+
+/** 判断表是否位于授权范围；旧白名单保持精确匹配，排除名单保守忽略大小写。 */
+export function isServerOpsAgentTableAllowed(scope: ServerOpsAgentDatabaseScope, table: string): boolean {
+  return (scope.tables === null || scope.tables.includes(table))
+    && !scope.excludedTables?.some((excluded) => excluded.toLowerCase() === table.toLowerCase())
 }
 
 /** 授权绑定连接身份；项目只是选择入口，不参与权限继承。 */
 export type ServerOpsAgentReadResource =
-  | { kind: 'ssh'; hostId: string }
+  | { kind: 'ssh'; hostId: string; /** 日志正文另行授权，旧授权不隐式继承。 */ readLogs?: boolean }
   | { kind: 'mysql'; sourceId: string; instance: boolean; databases: ServerOpsAgentDatabaseScope[] }
   | { kind: 'sqlite'; sourceId: string; instance: false; databases: ServerOpsAgentDatabaseScope[] }
   | { kind: 'redis'; sourceId: string }
@@ -77,9 +85,10 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
   const resources = input.resources.map((entry): ServerOpsAgentReadResource => {
     if (typeof entry !== 'object' || entry === null) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
     if (entry.kind === 'ssh') {
-      const item = record(entry, ['kind', 'hostId'])
+      const item = record(entry, 'readLogs' in entry ? ['kind', 'hostId', 'readLogs'] : ['kind', 'hostId'])
       if (!isServerOpsId(item.hostId)) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
-      return { kind: 'ssh', hostId: item.hostId }
+      if (item.readLogs !== undefined && typeof item.readLogs !== 'boolean') throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+      return { kind: 'ssh', hostId: item.hostId, ...(typeof item.readLogs === 'boolean' ? { readLogs: item.readLogs } : {}) }
     }
     if (entry.kind === 'redis') {
       const item = record(entry, ['kind', 'sourceId'])
@@ -90,14 +99,25 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
     if ((item.kind !== 'mysql' && item.kind !== 'sqlite') || !isServerOpsId(item.sourceId) || typeof item.instance !== 'boolean'
       || !Array.isArray(item.databases) || item.databases.length > 20 || (!item.instance && item.databases.length === 0)) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
     const databases = item.databases.map((entry): ServerOpsAgentDatabaseScope => {
-      const scope = record(entry, typeof entry === 'object' && entry !== null && 'query' in entry
-        ? ['database', 'tables', 'readRows', 'query'] : ['database', 'tables', 'readRows'])
+      const optional = typeof entry === 'object' && entry !== null
+        ? ['query', 'excludedTables'].filter((key) => key in entry) : []
+      const scope = record(entry, ['database', 'tables', 'readRows', ...optional])
       const database = identifier(scope.database, 64)
       if (typeof scope.readRows !== 'boolean' || (scope.tables !== null && (!Array.isArray(scope.tables) || scope.tables.length === 0 || scope.tables.length > 100))) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       if (scope.query !== undefined && (typeof scope.query !== 'boolean' || (scope.query && !scope.readRows))) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       const tables = scope.tables === null ? null : (scope.tables as unknown[]).map((table) => identifier(table, 128))
       if (tables && new Set(tables).size !== tables.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
-      return { database, tables, readRows: scope.readRows, ...(typeof scope.query === 'boolean' ? { query: scope.query } : {}) }
+      if (scope.excludedTables !== undefined && (tables !== null || !Array.isArray(scope.excludedTables) || scope.excludedTables.length > 100)) {
+        throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+      }
+      /** 重建并校验排除表，防止混入非法标识或仅大小写不同的重复项。 */
+      const excludedTables = scope.excludedTables === undefined ? undefined
+        : (scope.excludedTables as unknown[]).map((table) => identifier(table, 128))
+      if (excludedTables && new Set(excludedTables.map((table) => table.toLowerCase())).size !== excludedTables.length) {
+        throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
+      }
+      return { database, tables, readRows: scope.readRows,
+        ...(excludedTables ? { excludedTables } : {}), ...(typeof scope.query === 'boolean' ? { query: scope.query } : {}) }
     })
     if (new Set(databases.map((scope) => scope.database)).size !== databases.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
     /** SQLite 只有 main，且文件级授权不能扩大为 MySQL 式实例范围。 */

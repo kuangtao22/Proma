@@ -13,6 +13,7 @@ import {
   parseServerOpsDataRowFilters,
   parseServerOpsDataTableList,
   parseServerOpsDataWarnings,
+  SERVER_OPS_DATA_QUERY_TIMEOUT_MS,
 } from '@proma/shared'
 import type { ServerOpsDataQueryResult } from '@proma/shared'
 import type { ServerOpsRuntimeDataReadRequest, ServerOpsRuntimeDataReadResult } from './server-ops-runtime-protocol'
@@ -172,7 +173,10 @@ function createRemotePayload(input: ServerOpsRuntimeDataReadRequest): Record<str
   const base: Record<string, unknown> = {
     mode: input.mode,
     filePath: input.filePath,
-    timeoutMs: Math.min(15_000, Math.max(250, input.timeoutMs)),
+    timeoutMs: Math.min(
+      input.mode === 'sql-query' || input.mode === 'schema-rows' ? SERVER_OPS_DATA_QUERY_TIMEOUT_MS : 15_000,
+      Math.max(250, input.timeoutMs),
+    ),
   }
   if (input.mode === 'schema-tables' || input.mode === 'diagnostics' || input.mode === 'probe') return base
   if (input.mode === 'schema-table') return { ...base, schemaTable: input.schemaTable }

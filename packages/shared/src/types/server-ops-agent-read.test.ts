@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { parseServerOpsAgentReadAccess, parseServerOpsAgentReadGrant } from './server-ops-agent-read'
+import { isServerOpsAgentTableAllowed, parseServerOpsAgentReadAccess, parseServerOpsAgentReadGrant } from './server-ops-agent-read'
 import type { ServerOpsAgentReadGrant } from './server-ops-agent-read'
 
 describe('运维只读授权合同', () => {
@@ -38,6 +38,35 @@ describe('运维只读授权合同', () => {
     expect(parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [] }).resources).toEqual([])
     expect(() => parseServerOpsAgentReadGrant({ ...grant, resources: [{ kind: 'mysql', sourceId: 'db-1', instance: false, databases: [{ database: 'app', readRows: true }] }] })).toThrow()
   })
+  test('Given 全表授权含排除表 When 解析和匹配 Then 忽略大小写拒绝排除表且保留其它表', () => {
+    const input: ServerOpsAgentReadGrant = { sessionId: 'session-1', resources: [{ kind: 'mysql', sourceId: 'db-1', instance: false,
+      databases: [{ database: 'app', tables: null, excludedTables: ['Private_Data'], readRows: true, query: true }] }] }
+    const parsed = parseServerOpsAgentReadGrant(input)
+    expect(parsed).toEqual(input)
+    const resource = parsed.resources[0]
+    if (!resource || resource.kind !== 'mysql') throw new Error('无效测试授权')
+    const scope = resource.databases[0]!
+    expect(isServerOpsAgentTableAllowed(scope, 'private_data')).toBe(false)
+    expect(isServerOpsAgentTableAllowed(scope, 'PUBLIC_DATA')).toBe(true)
+    expect(isServerOpsAgentTableAllowed({ database: 'app', tables: ['Users'], readRows: true }, 'users')).toBe(false)
+    expect(parseServerOpsAgentReadGrant({ ...input, resources: [{ ...input.resources[0],
+      databases: [{ database: 'app', tables: null, excludedTables: [], readRows: false }] }] }).resources[0]).toMatchObject({
+      databases: [{ excludedTables: [] }],
+    })
+  })
+  test('Given 旧白名单或不合法排除列表 When 解析 Then 拒绝隐式扩大范围', () => {
+    const scope = { database: 'app', tables: null, readRows: true }
+    /** 使用完整授权合同触发同一解析路径。 */
+    const input = (candidate: object) => ({ sessionId: 'session-1', resources: [{ kind: 'mysql', sourceId: 'db-1', instance: false, databases: [candidate] }] })
+    for (const invalid of [
+      { ...scope, tables: ['users'], excludedTables: ['private'] },
+      { ...scope, excludedTables: 'private' },
+      { ...scope, excludedTables: Array.from({ length: 101 }, (_, index) => `table_${index}`) },
+      { ...scope, excludedTables: ['Private', 'private'] },
+      { ...scope, excludedTables: ['bad\nname'] },
+      { ...scope, excludedTables: [], password: 'secret' },
+    ]) expect(() => parseServerOpsAgentReadGrant(input(invalid))).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+  })
   test('Given 分层数量合法但总字节过大 Then 拒绝，避免复制广播放大', () => {
     const resources = Array.from({ length: 20 }, (_, index) => ({ kind: 'mysql', sourceId: `db-${index}`, instance: false,
       databases: [{ database: 'app', tables: Array.from({ length: 30 }, (_, table) => `${table}-${'名'.repeat(120)}`), readRows: false }] }))
@@ -59,5 +88,13 @@ describe('运维只读授权合同', () => {
       { ...sqliteGrant.resources[0], databases: [] },
     ]) expect(() => parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [resource] }))
       .toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+  })
+  test('Given 旧 SSH 授权 When 解析 Then 不获得日志；显式授权只接受布尔值', () => {
+    const old = parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1' }] })
+    expect(old.resources[0]).toEqual({ kind: 'ssh', hostId: 'host-1' })
+    expect(parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [{ kind: 'ssh', hostId: 'host-1', readLogs: true }] }).resources[0]).toEqual({ kind: 'ssh', hostId: 'host-1', readLogs: true })
+    for (const resource of [{ kind: 'ssh', hostId: 'host-1', readLogs: 'true' }, { kind: 'ssh', hostId: 'host-1', readLogs: true, command: 'id' }]) {
+      expect(() => parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [resource] })).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+    }
   })
 })

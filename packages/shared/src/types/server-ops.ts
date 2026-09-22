@@ -66,6 +66,8 @@ export type ServerOpsAuditResourceType = 'host-trust' | 'docker-container' | 're
 export type ServerOpsAuditReadAction =
   | 'server-overview'
   | 'server-services'
+  | 'server-discover'
+  | 'server-logs'
   | 'data-probe'
   | 'data-diagnose'
   | 'schema-list'
@@ -615,7 +617,7 @@ function isServerOpsAuditOperation(value: unknown): value is ServerOpsAuditOpera
 
 /** 判断 Agent 只读动作是否属于公开审计枚举。 */
 function isServerOpsAuditReadAction(value: unknown): value is ServerOpsAuditReadAction {
-  return value === 'server-overview' || value === 'server-services'
+  return value === 'server-overview' || value === 'server-services' || value === 'server-discover' || value === 'server-logs'
     || value === 'data-probe' || value === 'data-diagnose'
     || value === 'schema-list' || value === 'schema-describe' || value === 'rows-read'
 }
@@ -706,7 +708,7 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
     /** 开始与结果必须共享业务生成的关联 ID，不能只依赖两条独立审计记录的时间顺序。 */
     if (value.operationId === undefined) return false
     /** 服务器读取与数据源读取使用不同资源身份，禁止跨类型复用。 */
-    const isServerRead = value.readAction === 'server-overview' || value.readAction === 'server-services'
+    const isServerRead = value.readAction === 'server-overview' || value.readAction === 'server-services' || value.readAction === 'server-discover' || value.readAction === 'server-logs'
     if (isServerRead !== (value.hostId !== undefined)) return false
     if (isServerRead && (value.database !== undefined || value.table !== undefined || value.scope !== undefined)) return false
     if (value.scope !== undefined && value.scope !== 'instance' && value.scope !== 'database') return false
@@ -735,6 +737,8 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
     return false
   }
   if (isDockerOperation && value.operationId === undefined) return false
+  /** Agent 读取审计只保存动作及资源，不允许携带日志或命令正文。 */
+  if (isAgentReadOperation && value.command !== undefined) return false
   if (value.command !== undefined && (typeof value.command !== 'string' || value.command.length > 512)) return false
   if (value.command === undefined) {
     if (value.commandTruncated !== undefined) return false

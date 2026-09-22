@@ -1,13 +1,20 @@
 import type { PermissionResult } from './agent-permission-service'
 import type { AgentToolMode } from '@proma/shared'
 
-/** 受限运行唯一能注册与分派的九个既有只读工具。 */
+/** 受限运行只注册和分派这一固定只读工具集合，新增入口须同步宿主准入。 */
 const SERVER_OPS_READ_TOOL_NAMES = [
   'ops_resources', 'ops_server_overview', 'ops_server_services',
+  'ops_server_discover', 'ops_server_logs',
   'ops_data_test', 'ops_data_diagnose', 'ops_database_tables',
   'ops_database_describe', 'ops_database_rows', 'ops_database_query',
+  'ops_database_change_context',
 ] as const
 const SERVER_OPS_READ_TOOL_SET = new Set<string>(SERVER_OPS_READ_TOOL_NAMES)
+
+/** 判断工具是否属于具有独立 Facade 授权检查的只读集合，供宿主统一准入。 */
+export function isServerOpsReadToolName(toolName: string): boolean {
+  return SERVER_OPS_READ_TOOL_SET.has(toolName)
+}
 
 /** 返回模式限定的 Pi 工具集合；普通模式继续使用现有注册策略。 */
 export function resolveAgentModeToolNames(mode: AgentToolMode): string[] | undefined {

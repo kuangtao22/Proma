@@ -17,6 +17,7 @@ import { buildLegacyProjectMigrationPrompt as buildLegacyProjectMigrationRequire
 import type { BrowserUserContextSnapshot } from './browser-controller'
 import type { VaultUserContextSnapshot } from './vault-service'
 import type { ProductivityToolsSettings } from '../../types'
+import { SERVER_OPS_DATABASE_CHANGE_WORKFLOW } from './server-ops/server-ops-database-change-context'
 
 const WORKFLOW_PROMPT = `## 工作流
 - 需要多个步骤、多个文件或并行/委派时，先用 TaskCreate 建立 3–7 个可见进度项；仅用 TaskUpdate 追加更新，完成后收束状态。
@@ -32,6 +33,8 @@ interface SystemPromptContext {
   sessionWorkbenchLayout?: SessionWorkbenchLayout
   permissionMode: PromaPermissionMode
   collaborationAvailable?: boolean
+  /** 本轮具备运维能力时注入数据库脚本交付约束，不增加任何执行权限。 */
+  serverOpsAvailable?: boolean
   currentModelId?: string
   projectInstructions?: ProjectInstructionManifest
   /** Only explicit guided consent enables Agent-initiated AGENTS.md maintenance. */
@@ -203,6 +206,9 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 - 重要命令仍须遵守权限确认和安全规则；可见终端不替代确认。Automation、外部 Bridge 和协作子 Agent 没有可见终端时，不要假装可见。
 - 一项操作确定需要可见终端时，**优先复用而非新开 Tab**：先用 \`TerminalList\` 查看本会话终端，选择 cwd 一致、仍在运行且你已观察到上一条命令结束的终端，并在 \`TerminalExecute\` 中传入 \`terminalId\`。仅在没有这种安全候选、cwd 或 shell 必须改变、或需要让用户独立观察并行会话时，才新开终端。交互式、长驻或忙碌状态不明的终端不可复用；需要确认完成状态或命令结果时使用 \`TerminalRead\`。`,
     WORKFLOW_PROMPT,
+    ctx.serverOpsAvailable
+      ? `## 服务器运维与数据库变更\n- 新增连接使用 \`ops_connection_prepare\` 生成草稿；在运维面板选择项目、填写凭据、测试并保存，草稿成功不代表已保存或已连接。不要索取聊天中的密码或私钥。\n- 运维授权只在运维面板管理；日志须单独授权，发现服务不会自动建立或授权连接。\n- 数据库的数据、字段、索引、备注等变更只交付可审查脚本或程序。先使用 \`ops_database_change_context\` 取得授权结构证据。\n${SERVER_OPS_DATABASE_CHANGE_WORKFLOW.map((step) => `- ${step}`).join('\n')}\n- 运维只读模式没有项目文件读写能力时，明确缺少程序上下文，并以代码块交付待完善草稿；不能切换工具或自动扩大权限。`
+      : undefined,
     planningPrompt,
     ctx.collaborationAvailable
       ? '## 协作\n独立并行探索或对抗审查才使用 \`collaboration\`；先建可见进度项，委派说明保持自包含，收敛结果后更新父任务。子会话不得继续委派。'

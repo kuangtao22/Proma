@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+
 import * as React from 'react'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -14,6 +15,15 @@ import {
   useServerOpsDataSourceDialogController,
   validateServerOpsDataSourceDraft,
 } from './ServerOpsDataSourceDialog'
+
+test('Given Agent 提议 Redis 与 SQLite 连接 When 预填新建表单 Then 不出现数据库密码或 MySQL 库名', () => {
+  const redis = createServerOpsDataSourceDraft(null, 'redis', { kind: 'redis', label: '缓存', address: 'cache.internal', port: 6379, transport: 'ssh', hostId: 'host-a', database: '3' })
+  expect(redis).toMatchObject({ engine: 'redis', label: '缓存', transport: 'ssh', hostId: 'host-a', database: '3', password: '' })
+  const sqlite = createServerOpsDataSourceDraft(null, 'sqlite', { kind: 'sqlite', label: '审计', transport: 'ssh', hostId: 'host-b', filePath: '/srv/app/a.db' })
+  expect(sqlite).toMatchObject({ engine: 'sqlite', hostId: 'host-b', filePath: '/srv/app/a.db', database: 'main', password: '' })
+  const mysql = createServerOpsDataSourceDraft(null, 'mysql', { kind: 'mysql', label: '业务库', address: 'db.internal', port: 3306, transport: 'direct' })
+  expect(mysql.database).toBe('')
+})
 
 test('Given MySQL 校验证书且数据库地址是 IP When 使用默认校验名 Then 提示证书 DNS 名并允许保留 IP 连接地址', () => {
   /** 连接端点可以是 IP，但 mysql2 的证书身份校验必须使用明确 DNS 名。 */

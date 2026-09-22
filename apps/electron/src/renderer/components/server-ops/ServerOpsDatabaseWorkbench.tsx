@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { createServerOpsDatabaseNavigation, serverOpsDatabaseNavigationAtom, updateServerOpsDatabaseNavigationAtom } from '@/atoms/server-ops-database-atoms'
+import { createServerOpsDatabaseNavigation, getServerOpsDatabaseReadIdentity, serverOpsDatabaseNavigationAtom, updateServerOpsDatabaseNavigationAtom } from '@/atoms/server-ops-database-atoms'
 import type { ServerOpsDatabaseNavigation, ServerOpsDatabaseSection, ServerOpsDatabasePage, ServerOpsInstancePage } from '@/atoms/server-ops-database-atoms'
 import type { ServerOpsDataConnectionJumpHost } from './ServerOpsDataConnectionView'
 import { createServerOpsDataIdleProjection, createServerOpsDataServicesController } from './ServerOpsDataServicesPanel'
@@ -30,12 +30,6 @@ const contentClass = 'm-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden d
 const pageTabsListClass = 'flex h-9 w-full shrink-0 items-end justify-start gap-1 overflow-x-auto rounded-none border-b border-border/40 bg-transparent p-0 px-3'
 /** 页签的选中态只用文字与底边表达，不再绘制嵌套底色。 */
 const pageTabClass = 'inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-none border-b-2 border-transparent px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:border-foreground/70 data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none'
-
-/** 不含凭据的配置身份；仅展示名称与无关 SSH 状态不参与。 */
-export function getServerOpsDatabaseReadIdentity(source: ServerOpsDataSource): string {
-  return JSON.stringify([source.id, source.updatedAt, source.engine, source.transport, source.hostId, source.address, source.port,
-    source.filePath, source.database, source.username, source.tlsMode, source.tlsServerName, source.hasPassword])
-}
 
 /** MySQL 独立工作台输入；连接头由外层统一渲染。 */
 export interface ServerOpsDatabaseWorkbenchProps {
@@ -170,8 +164,8 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
         </TabsContent>
       </Tabs>
     ) : <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={navigation.section} onValueChange={(section) => updateNavigation({ section: section as ServerOpsDatabaseSection })}>
-      <div className="flex min-h-12 shrink-0 flex-wrap items-start gap-x-3 gap-y-2 border-b border-border/40 px-3 py-2" data-server-ops-database-scope-toolbar>
-        {/* 范围切换与选库、刷新统一为 32px；状态提示增加高度时仍按第一行对齐。 */}
+      <div className="flex min-h-12 shrink-0 flex-wrap items-start gap-x-3 gap-y-2 border-b border-border/40 bg-muted/15 px-3 py-2" data-server-ops-database-scope-toolbar>
+        {/* 范围和选库同层：先选择实例或数据库，再确定库内操作对象。 */}
         <TabsList className={`${SERVER_OPS_SEGMENTED_CLASS} h-8 shrink-0`} aria-label="工作台范围">
           <TabsTrigger className={`${SERVER_OPS_TAB_CLASS} min-w-14 focus-visible:ring-inset focus-visible:ring-offset-0`} value="instance">实例</TabsTrigger>
           <TabsTrigger className={`${SERVER_OPS_TAB_CLASS} min-w-14 focus-visible:ring-inset focus-visible:ring-offset-0`} value="database">数据库</TabsTrigger>

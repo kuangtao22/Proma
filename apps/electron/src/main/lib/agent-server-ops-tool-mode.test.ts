@@ -13,15 +13,17 @@ describe('运维只读运行模式', () => {
     }
   })
 
-  test('Given 运维只读模式 When 注册与分派 Then 仅九个只读工具可执行', () => {
+  test('Given 运维只读模式 When 注册与分派 Then 仅固定只读工具可执行', () => {
     const names = resolveAgentModeToolNames('server-ops-read')
     expect(names).toEqual([
       'ops_resources', 'ops_server_overview', 'ops_server_services',
+      'ops_server_discover', 'ops_server_logs',
       'ops_data_test', 'ops_data_diagnose', 'ops_database_tables',
       'ops_database_describe', 'ops_database_rows', 'ops_database_query',
+      'ops_database_change_context',
     ])
     for (const name of names!) expect(denyToolOutsideAgentMode(name, 'server-ops-read')).toBeUndefined()
-    for (const name of ['Bash', 'PowerShell', 'read', 'BrowserNavigate', 'mcp__other__tool', 'server_exec', 'server_list', 'Task']) {
+    for (const name of ['Bash', 'PowerShell', 'read', 'Write', 'Edit', 'BrowserNavigate', 'mcp__other__tool', 'server_exec', 'server_list', 'Task', 'ops_connection_prepare', 'ops_database_write', 'ops_database_apply']) {
       expect(denyToolOutsideAgentMode(name, 'server-ops-read')?.behavior).toBe('deny')
     }
   })

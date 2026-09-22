@@ -56,6 +56,31 @@ function createInput(sql = 'SELECT id, name FROM users') {
 }
 
 describe('Server Ops 受控 SQL 查询执行器', () => {
+  test('Given 单表或联表查询 When 开始预检 Then 服务端执行和锁等待上限必须先于元数据读取', async () => {
+    for (const sql of ['SELECT * FROM users', 'SELECT users.id FROM users JOIN orders ON users.id = orders.id']) {
+      /** 拒绝未先安装限时保护的元数据读取，确保慢预检也受约束。 */
+      const connection = createConnection((statement) => {
+        if (statement.includes('information_schema')) {
+          expect(connection.calls.some((call) => call.sql === 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2')).toBe(true)
+          throw Object.assign(new Error('TEST_LOCK_WAIT_TIMEOUT'), { code: 'ER_LOCK_WAIT_TIMEOUT' })
+        }
+        return [[], []]
+      })
+      await expect(executeServerOpsSqlQuery(connection, createInput(sql))).rejects.toThrow('SERVER_OPS_DATA_QUERY_TIMEOUT')
+      expect(connection.calls.some((call) => call.sql.includes('FROM `users`'))).toBe(false)
+    }
+  })
+
+  test('Given 无法设置服务端上限 When 执行 Then 不读取元数据或执行用户SQL', async () => {
+    /** 驱动拒绝会话变量时不能退回仅客户端超时。 */
+    const connection = createConnection((sql) => {
+      if (sql.startsWith('SET SESSION MAX_EXECUTION_TIME')) throw Object.assign(new Error('TEST_POLICY_REJECTED'), { code: 'ER_SPECIFIC_ACCESS_DENIED_ERROR' })
+      return [[], []]
+    })
+    await expect(executeServerOpsSqlQuery(connection, createInput())).rejects.toThrow('SERVER_OPS_DATA_QUERY_PERMISSION_DENIED')
+    expect(connection.calls.some((call) => call.sql.includes('information_schema'))).toBe(false)
+  })
+
   test('Given runtime 错误跨 utility 边界 When 读取公开信息 Then 只允许查询与解析器白名单稳定码', () => {
     /** 真实解析器实例用于证明不能只依赖相同的 message 字符串。 */
     let parserError: unknown
@@ -234,6 +259,7 @@ describe('Server Ops 受控 SQL 查询执行器', () => {
 
   test('Given 引用视图 When 校验来源 Then 拒绝且不执行用户 SQL', async () => {
     const connection = createConnection((sql) => {
+      if (sql.startsWith('SET SESSION ')) return [[], []]
       if (sql.includes('information_schema.TABLES')) return [[{ name: 'users_view', type: 'VIEW' }], []]
       throw new Error(`不应执行：${sql}`)
     })
@@ -258,7 +284,7 @@ describe('Server Ops 受控 SQL 查询执行器', () => {
     const result = await executeServerOpsSqlQuery(connection, createInput())
 
     expect(connection.calls.map((call) => call.sql)).toContain('SET SESSION TRANSACTION READ ONLY')
-    expect(connection.calls.map((call) => call.sql)).toContain('SET SESSION MAX_EXECUTION_TIME = 10000')
+    expect(connection.calls.map((call) => call.sql)).toContain('SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2')
     expect(connection.calls.map((call) => call.sql)).toContain('START TRANSACTION READ ONLY')
     expect(connection.calls.at(-1)?.sql).toBe('ROLLBACK')
     expect(result).toMatchObject({ queryId: 'query-1', database: 'app', columns: ['id', 'name'], rowCount: 2, truncated: true })
@@ -290,8 +316,8 @@ describe('Server Ops 受控 SQL 查询执行器', () => {
 
     await executeServerOpsSqlQuery(connection, createInput())
 
-    expect(connection.calls.map((call) => call.sql)).toContain('SET SESSION max_statement_time = 10')
-    expect(connection.calls.map((call) => call.sql)).not.toContain('SET SESSION MAX_EXECUTION_TIME = 10000')
+    expect(connection.calls.map((call) => call.sql)).toContain('SET SESSION max_statement_time = 10, lock_wait_timeout = 2')
+    expect(connection.calls.map((call) => call.sql)).not.toContain('SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2')
   })
 
   test('Given 通配符包含敏感来源列 When 返回 Then 保留列头并遮罩真实来源值', async () => {

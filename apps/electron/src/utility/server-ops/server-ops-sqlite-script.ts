@@ -5,6 +5,8 @@
  * Python 侧再次执行路径、对象、authorizer、VM 步数、wall clock 与输出预算校验，避免 TypeScript
  * 调用链变化后扩大读取边界。
  */
+import { SERVER_OPS_DATA_QUERY_TIMEOUT_MS } from '@proma/shared'
+
 export const SERVER_OPS_SQLITE_REMOTE_SCRIPT = String.raw`
 import json, math, os, re, signal, stat, sys, threading, time, urllib.parse
 
@@ -386,7 +388,10 @@ except Exception:
 path = payload.get('filePath')
 if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
     fail('SERVER_OPS_SQLITE_PATH_INVALID')
-timeout_ms = max(250, min(15000, int(payload.get('timeoutMs', 10000))))
+# 查询模式使用共享执行预算，结构读取保留原十五秒上限。
+requested_timeout_ms = max(250, int(payload.get('timeoutMs', ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS})))
+timeout_cap_ms = ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS} if payload.get('mode') in ('sql-query', 'schema-rows') else 15000
+timeout_ms = min(timeout_cap_ms, requested_timeout_ms)
 boot_timer.cancel()
 hard_timer = threading.Timer(timeout_ms / 1000, lambda: os._exit(124))
 hard_timer.daemon = True

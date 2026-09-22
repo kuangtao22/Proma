@@ -10,12 +10,13 @@ export interface ServerOpsReadSummary {
 /** 从主进程授权快照计算目标、结构/行/SQL 能力和剩余期限。 */
 export function summarizeServerOpsReadAccess(access: ServerOpsAgentReadAccess | null, now: number, names?: ReadonlyMap<string, string>): ServerOpsReadSummary {
   if (!access || access.expiresAt <= now) return { target: '未授权', capability: '结构/行/SQL 未启用', remaining: access ? '已到期' : '无租约' }
-  /** 每个数据库连接保留名称、库与表白名单，展示足够信息供用户判断实际范围。 */
+  /** 依据已保存事实展示库表范围，兼容尚未重新保存的旧白名单。 */
   const databaseTargets = access.resources.flatMap((resource) => {
     if (resource.kind !== 'mysql' && resource.kind !== 'sqlite') return []
     const label = names?.get(`data:${resource.sourceId}`) || (resource.kind === 'mysql' ? 'MySQL' : 'SQLite')
     const scopes = resource.databases.map((scope) => `${scope.database} · ${scope.tables === null
-      ? '全部表' : scope.tables.length === 1 ? scope.tables[0] : `${scope.tables[0]} 等 ${scope.tables.length} 表`}`)
+      ? scope.excludedTables?.length ? `已禁用 ${scope.excludedTables.length} 张表` : '全部表'
+      : scope.tables.length === 1 ? scope.tables[0] : `${scope.tables[0]} 等 ${scope.tables.length} 表`}`)
     return [[label, ...(resource.kind === 'mysql' && resource.instance ? ['实例诊断'] : []), scopes.join(' / ')].filter(Boolean).join(' · ')]
   })
   const sshCount = access.resources.filter((resource) => resource.kind === 'ssh').length
@@ -37,6 +38,7 @@ export function summarizeServerOpsReadAccess(access: ServerOpsAgentReadAccess | 
     ...(scopes.length ? ['结构'] : []),
     ...(scopes.some((scope) => scope.readRows) ? ['行'] : []),
     ...(scopes.some((scope) => scope.query) ? ['SQL'] : []),
+    ...(access.resources.some((resource) => resource.kind === 'ssh' && resource.readLogs === true) ? ['日志'] : []),
   ]
   const capability = capabilities.join('/')
   return {

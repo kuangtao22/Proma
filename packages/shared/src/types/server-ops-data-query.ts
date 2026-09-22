@@ -1,6 +1,9 @@
 import { isServerOpsId } from './server-ops'
 import type { ServerOpsDataSchemaCell } from './server-ops-data-schema'
 
+/** 单表、联表与行预览共用的数据库执行上限；调用方不能自行延长。 */
+export const SERVER_OPS_DATA_QUERY_TIMEOUT_MS = 10_000
+
 /** 数据源 SQL 查询 IPC 通道。 */
 export const SERVER_OPS_DATA_QUERY_CHANNELS = {
   EXECUTE: 'server-ops:data-query',

@@ -14,6 +14,7 @@ import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TAB_CLASS, SERVER_OPS_TABLE_CLAS
 import { createServerOpsSqlQueryHistoryController, createServerOpsSqlQueryHistoryIdleProjection } from './server-ops-sql-query-history-controller'
 import { ServerOpsSqlQueryHistory } from './ServerOpsSqlQueryHistory'
 import type { ServerOpsDataSchemaCell } from '@proma/shared'
+import { SERVER_OPS_DATA_QUERY_TIMEOUT_MS } from '@proma/shared'
 import { ServerOpsSqlEditor } from './ServerOpsSqlEditor'
 import type { ServerOpsSqlEditorHandle } from './ServerOpsSqlEditor'
 import { createServerOpsSqlCompletionSource } from './server-ops-sql-completion'
@@ -205,6 +206,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
             <h3 className="font-medium">只读查询说明</h3>
             <p className="text-muted-foreground">支持当前库基础表的单条 SELECT、筛选、排序、分组聚合与受控 JOIN，不修改数据库。暂不支持子查询、UNION、视图和跨库查询。</p>
             <p className="text-muted-foreground">每次最多返回 200 行。大字段请明确选择字段，或使用 <code className="break-words font-mono text-foreground">{dialect === 'sqlite' ? 'substr(字段, 1, 256)' : 'SUBSTRING(字段, 1, 256)'}</code>。</p>
+            <p className="text-muted-foreground">单表与联表均设 {SERVER_OPS_DATA_QUERY_TIMEOUT_MS / 1_000} 秒执行上限，超时释放本次连接。请优先限定查询条件；超时后不会自动重试。</p>
             <p className="text-muted-foreground">查询结果不会自动刷新，修改 SQL 后需要重新执行。</p>
           </PopoverContent>
         </Popover>

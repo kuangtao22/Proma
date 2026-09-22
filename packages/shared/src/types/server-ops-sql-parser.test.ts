@@ -64,6 +64,7 @@ describe('MySQL 只读 SQL 解析器', () => {
     const rejected = [
       'SELECT id FROM users -- comment',
       'SELECT id FROM users /* comment */',
+      'SELECT /*+ MAX_EXECUTION_TIME(600000) */ id FROM users',
       'SELECT id FROM users; SELECT id FROM orders',
       'WITH x AS (SELECT id FROM users) SELECT id FROM x',
       'SELECT id FROM (SELECT id FROM users) x',
