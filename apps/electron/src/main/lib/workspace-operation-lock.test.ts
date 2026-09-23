@@ -14,6 +14,24 @@ interface UntypedWorkspaceOperationRegistry {
 }
 
 describe('工作区进程内独占锁', () => {
+  test('Given 项目正在异步删除 When 新写入或迁移到达 Then 同项目被拒绝且其它项目继续可写', () => {
+    /** 使用独立注册表验证删除期间的完整准入边界。 */
+    const registry = createWorkspaceOperationRegistry()
+    const release = registry.acquireWorkspaceOperation('deleting-project', 'deletion')
+    try {
+      expect(registry.getWorkspaceOperationBlockReason('deleting-project')).toBe('项目正在删除，请等待完成后重试')
+      expect(() => registry.acquireWorkspaceWriteLease('deleting-project')).toThrow('项目正在删除')
+      expect(() => registry.acquireWorkspaceOperation('deleting-project', 'relocation')).toThrow('项目正在删除')
+      const releaseOther = registry.acquireWorkspaceWriteLease('retained-project')
+      releaseOther()
+    } finally {
+      release()
+    }
+    expect(registry.getWorkspaceOperationBlockReason('deleting-project')).toBeUndefined()
+    const releaseWrite = registry.acquireWorkspaceWriteLease('deleting-project')
+    releaseWrite()
+  })
+
   test('Given 空闲工作区 When 获取迁移锁 Then 返回固定阻断原因且释放后清除', () => {
     /** 释放模块级默认注册表中的测试锁。 */
     const release = acquireWorkspaceOperation('workspace-default', 'relocation')

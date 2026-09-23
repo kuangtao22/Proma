@@ -149,6 +149,15 @@ import { mergeActiveAgentSessionSnapshot } from '@/lib/agent-active-session-snap
 import { buildTodoAgentPrompt } from '@/lib/todo-agent-prompt'
 import { createAgentCanvasChangeConsumer } from '@/lib/agent-canvas-change-navigation'
 import { createPendingRequestRecoveryCoordinator } from '@/lib/agent-pending-request-recovery'
+import {
+  applyLiveSdkMessageRunIdentity,
+  shouldAcceptLiveSdkMessageForRun,
+} from '@/lib/live-sdk-message-run'
+
+export {
+  applyLiveSdkMessageRunIdentity,
+  shouldAcceptLiveSdkMessageForRun,
+} from '@/lib/live-sdk-message-run'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -1576,6 +1585,9 @@ export function useGlobalAgentListeners(): void {
 
         if (payload.kind === 'sdk_message') {
           const msgRecord = payload.message as Record<string, unknown>
+          /** 当前 renderer 已确认的运行身份，用于拒绝旧 generation 的迟到消息。 */
+          const currentRun = store.get(agentSessionStreamingStateAtomFamily(sessionId))
+          if (!shouldAcceptLiveSdkMessageForRun(payload.message, currentRun)) return
           // 仅在 Agent 发出变更工具调用时展示对应项目组件；右侧 Tab 严格归属产生变更的 session，
           // 同一 workspace 的其他活跃会话不得被后台变更抢走焦点。
           if (!msgRecord.isReplay) {
@@ -1593,7 +1605,7 @@ export function useGlobalAgentListeners(): void {
             // thinking_tokens 是高频进度估算，只更新流式状态，不进入消息转录。
           } else if (!msgRecord.isReplay) {
             // 当前 run 的 assistant 消息沿用 run 起始时间，与首个 Delta 预览和乐观 header 保持一致。
-            const activeRunStartedAt = store.get(agentSessionStreamingStateAtomFamily(sessionId))?.startedAt
+            const activeRunStartedAt = currentRun?.startedAt
             // 为实时消息补充 _createdAt 时间戳（与持久化时的逻辑一致），
             // 避免 AssistantTurnRenderer 因缺少时间戳导致 header 时间消失
             if (typeof msgRecord._createdAt !== 'number') {
@@ -1604,9 +1616,7 @@ export function useGlobalAgentListeners(): void {
 
             // 队列自动派发会在上一轮实时消息尚未落盘刷新时开始下一轮。
             // 标记每条实时消息所属 run，渲染层即可把上一轮立即视为完成并自动收起过程块。
-            if (activeRunStartedAt != null) {
-              msgRecord._promaLiveRunStartedAt = activeRunStartedAt
-            }
+            applyLiveSdkMessageRunIdentity(payload.message, currentRun)
 
             // 为 assistant 消息注入渠道信息，确保流式期间就绑定正确模型与 Agent SDK 窗口
             if (msgRecord.type === 'assistant' && !msgRecord._channelModelId) {

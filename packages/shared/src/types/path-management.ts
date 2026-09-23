@@ -56,7 +56,7 @@ export type WorkspaceRelocationStage =
   | 'completed'
 
 /** 当前允许占用工作区独占锁的操作类型。 */
-export type WorkspaceOperationKind = 'relocation'
+export type WorkspaceOperationKind = 'relocation' | 'deletion'
 
 /** 启动项目路径迁移的共享请求。 */
 export interface StartWorkspaceRelocationInput {

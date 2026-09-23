@@ -55,8 +55,8 @@ export interface AgentQueryInput {
 export interface AgentProviderAdapter {
   /** 发起查询；queryToken 唯一标识本次请求实例，返回 SDKMessage 异步迭代流。 */
   query(input: AgentQueryInput, queryToken: string): AsyncIterable<SDKMessage>
-  /** 中止指定会话的执行 */
-  abort(sessionId: string): void
+  /** 中止指定会话的执行；异步实现可让删除链路等待底层 runtime 真正停止。 */
+  abort(sessionId: string): void | Promise<void>
   /** 按不可复用 token 强制关闭指定查询，并在底层 runtime 与 iterator 上游队列完成收尾后 resolve。 */
   forceCloseQuery(queryToken: string): Promise<void>
   /**

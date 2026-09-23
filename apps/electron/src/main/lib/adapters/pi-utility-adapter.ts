@@ -94,26 +94,35 @@ export class PiUtilityAdapter {
     } finally {
       pending.ended = true
       unsubscribe()
-      this.pendingQueries.delete(queryId)
       if (this.currentQueryTokens.get(input.sessionId) === queryId) {
         this.currentQueryTokens.delete(input.sessionId)
       }
-      if (pending.forceClosePromise) {
-        await pending.forceClosePromise
-      } else {
-        if (pending.accepted && !pending.runtimeFailed) await this.requestRuntimeAbort(pending)
-        await this.stopRuntime(pending)
+      try {
+        if (pending.forceClosePromise) {
+          await pending.forceClosePromise
+        } else {
+          if (pending.accepted && !pending.runtimeFailed) await this.requestRuntimeAbort(pending)
+          await this.stopRuntime(pending)
+        }
+      } finally {
+        this.pendingQueries.delete(queryId)
       }
     }
   }
 
-  abort(sessionId: string): void {
+  async abort(sessionId: string): Promise<void> {
     // 恢复阶段可能暂时存在同会话的旧代际运行；全部中止，避免遗留 runtime 继续占用资源。
+    /** 同一会话所有代次共享的停止等待集合。 */
+    const aborts: Promise<void>[] = []
     for (const pending of this.pendingQueries.values()) {
       if (pending.sessionId !== sessionId) continue
       this.abortCapabilitiesForQuery(pending.queryId)
-      void this.requestRuntimeAbort(pending)
+      aborts.push((async () => {
+        await this.requestRuntimeAbort(pending)
+        await this.stopRuntime(pending)
+      })())
     }
+    await Promise.all(aborts)
   }
 
   /** 先结束 utility runtime 与事件队列，使调用方随后可等待 async generator cleanup。 */
@@ -187,7 +196,7 @@ export class PiUtilityAdapter {
       return { accepted: true }
     }
 
-    if (!pending) throw new Error(`No active Agent query: ${queryId ?? 'unknown'}`)
+    if (!pending || pending.ended) throw new Error(`No active Agent query: ${queryId ?? 'unknown'}`)
 
     if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL) {
       if (!pending.input.canUseTool) throw new Error(`No canUseTool handler: ${pending.sessionId}`)
@@ -296,7 +305,7 @@ export class PiUtilityAdapter {
       const error = toRuntimeError(event.payload)
       /** crash 只属于发出事件的 utility process，不能波及同 session 的新 generation。 */
       const failed = [this.pendingQueries.get(sourceQueryToken)]
-        .filter((pending): pending is PendingQuery => pending !== undefined)
+        .filter((pending): pending is PendingQuery => pending !== undefined && !pending.ended)
       for (const pending of failed) {
         pending.runtimeFailed = true
         pending.queue.fail(error)
@@ -315,7 +324,7 @@ export class PiUtilityAdapter {
       ?? (typeof payload?.queryId === 'string' ? payload.queryId : undefined)
     if (!queryId) return
     const pending = this.pendingQueries.get(queryId)
-    if (!pending) return
+    if (!pending || pending.ended) return
 
     if (event.method === AGENT_RUNTIME_METHODS.EVENT_QUERY) {
       const message = payload?.message

@@ -119,7 +119,7 @@ describe('工作区写 IPC 守卫合同', () => {
     const contracts: Array<{ channel: string; guardCall: string; sideEffects: string[] }> = [
       { channel: 'RELINK_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, async () =>', sideEffects: ['getAgentWorkspace(id)', 'relinkAgentWorkspaceProjectRoot(', 'releaseDirectoryWatcherIfUnreferenced(', 'watchAttachedDirectory('] },
       { channel: 'RESTORE_WORKSPACE_PROJECT_ROOT', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, async () =>', sideEffects: ['restoreAgentWorkspaceProjectRoot(', 'watchAttachedDirectory('] },
-      { channel: 'DELETE_WORKSPACE', guardCall: 'workspaceOperationGuard.runWorkspaceWrite(id, () =>', sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
+      { channel: 'DELETE_WORKSPACE', guardCall: "acquireWorkspaceOperation(id, 'deletion')", sideEffects: ['getAgentWorkspace(id)', 'listAgentWorkspaces()', 'removeBindingsForDeletedWorkspace(', 'deleteAgentSession(', 'deleteAgentWorkspace('] },
       { channel: 'ATTACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },
       { channel: 'DETACH_DIRECTORY', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'updateAgentSessionMeta(', 'releaseDirectoryWatcherIfUnreferenced('] },
       { channel: 'ATTACH_FILE', guardCall: 'workspaceOperationGuard.runSessionWrite(input.sessionId, () =>', sideEffects: ['getAgentSessionMeta(', 'realpathSync(', 'updateAgentSessionMeta(', 'watchAttachedDirectory('] },

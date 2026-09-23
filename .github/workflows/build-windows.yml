@@ -41,6 +41,22 @@ jobs:
       - name: Prepare Electron package
         run: bun run --filter='@proma/electron' package:prepare:win
 
+      - name: Test utility process lifecycle
+        run: >-
+          bun test
+          apps/electron/src/main/lib/utility-process-startup.test.ts
+          apps/electron/src/main/lib/utility-process-lifecycle.test.ts
+          apps/electron/src/main/lib/agent-runtime-client-lifecycle.test.ts
+          apps/electron/src/main/lib/terminal-runtime-client-lifecycle.test.ts
+
+      - name: Smoke test native utility processes and PTY
+        run: bun run scripts/upstream-runtime-smoke.ts
+        working-directory: apps/electron
+
+      - name: Smoke test fresh and existing configuration startup
+        run: bun run scripts/first-startup-smoke.cjs
+        working-directory: apps/electron
+
       - name: Package (Windows)
         run: bun run builder --win --x64 --publish never
         working-directory: apps/electron

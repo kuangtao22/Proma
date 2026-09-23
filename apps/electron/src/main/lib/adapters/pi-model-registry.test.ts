@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { Api, Model } from '@earendil-works/pi-ai/compat'
-import { filterSupportedCodexModels } from './pi-model-registry'
+import { buildModel, filterSupportedCodexModels } from './pi-model-registry'
 
 /** 构造最小可用的 Codex 目录条目，字段值本身不影响过滤判定。 */
 function codexModel(id: string): Model<Api> {
@@ -44,5 +44,48 @@ describe('Codex 目录下线模型过滤', () => {
     ])
 
     expect(filtered.map((model) => model.id)).toEqual(['gpt-5.6-sol', 'gpt-5.6-luna'])
+  })
+})
+
+describe('GLM-5.3-FlashX 离线模型注册', () => {
+  test('Given Pi catalog 尚无 FlashX When 离线构建智谱模型 Then 沿用 GLM-5.3 推理能力与上下文参数', async () => {
+    let registeredModel: Model<Api> | undefined
+    const modelRuntime = {
+      registerProvider: (_providerName: string, provider: { models: Model<Api>[] }) => {
+        registeredModel = provider.models[0]
+      },
+      getModel: () => registeredModel,
+    }
+    const sdk = {
+      ModelRuntime: {
+        create: async (options: { allowModelNetwork: boolean }) => {
+          expect(options).toEqual({ allowModelNetwork: false })
+          return modelRuntime
+        },
+      },
+    } as unknown as Parameters<typeof buildModel>[0]
+
+    const { model } = await buildModel(sdk, {
+      sessionId: 'session-flashx',
+      apiKey: 'test-key',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+      provider: 'zhipu',
+      model: 'glm-5.3-flashx',
+    })
+
+    expect(model).toMatchObject({
+      id: 'glm-5.3-flashx',
+      api: 'openai-completions',
+      reasoning: true,
+      contextWindow: 1_000_000,
+      maxTokens: 131_072,
+      thinkingLevelMap: { low: 'low', high: 'high', max: 'max' },
+      compat: {
+        supportsDeveloperRole: false,
+        supportsReasoningEffort: true,
+        thinkingFormat: 'zai',
+        zaiToolStream: true,
+      },
+    })
   })
 })

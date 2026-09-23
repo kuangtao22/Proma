@@ -265,6 +265,121 @@ describe('Pi utility 强制关闭合同', () => {
     await expect(pendingNext).resolves.toMatchObject({ done: true })
   })
 
+  test('Given runtime 已确认中止但底层 stop 仍等待 When await abort Then 只在真实关闭完成后 resolve', async () => {
+    /** 被测 utility adapter。 */
+    const adapter = new PiUtilityAdapter()
+    /** 启动 query 以注册待停止 runtime。 */
+    const iterator = adapter.query(createQueryInput('session-await-stop'), 'query-await-stop')[Symbol.asyncIterator]()
+    /** 等待 query 的事件队列。 */
+    const pendingNext = iterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    /** 当前 query 独占的 runtime 状态。 */
+    const runtime = runtimeStates[0]!
+
+    /** 调用方可等待的会话停止 Promise。 */
+    const aborting = adapter.abort('session-await-stop')
+    expect(runtime.calls).toContain(AGENT_RUNTIME_METHODS.QUERY_ABORT)
+    expect(await Promise.race([
+      Promise.resolve(aborting).then(() => 'settled' as const),
+      Bun.sleep(20).then(() => 'pending' as const),
+    ])).toBe('pending')
+
+    expect(runtime.stopCalls).toBe(1)
+    runtime.stop.resolve()
+    await expect(aborting).resolves.toBeUndefined()
+    runtime.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-await-stop', sessionId: 'session-await-stop', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(pendingNext).resolves.toMatchObject({ done: true })
+  })
+
+  test('Given 同会话新旧 query 并存 When 并发重复 abort Then 每个 runtime 只中止并停止一次', async () => {
+    /** 被测 utility adapter。 */
+    const adapter = new PiUtilityAdapter()
+    /** 旧 query 的事件迭代器。 */
+    const oldIterator = adapter.query(createQueryInput('session-repeat-abort'), 'query-repeat-old')[Symbol.asyncIterator]()
+    /** 等待旧 query 事件。 */
+    const oldNext = oldIterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    /** 新 query 的事件迭代器。 */
+    const currentIterator = adapter.query(createQueryInput('session-repeat-abort'), 'query-repeat-current')[Symbol.asyncIterator]()
+    /** 等待新 query 事件。 */
+    const currentNext = currentIterator.next()
+    await waitUntil(() => runtimeStates.length === 2)
+    /** 旧 query 独占的 runtime。 */
+    const oldRuntime = runtimeStates[0]!
+    /** 新 query 独占的 runtime。 */
+    const currentRuntime = runtimeStates[1]!
+
+    /** 两个并发会话中止必须复用各 query 的关闭 Promise。 */
+    const firstAbort = adapter.abort('session-repeat-abort')
+    const secondAbort = adapter.abort('session-repeat-abort')
+    await waitUntil(() => oldRuntime.stopCalls === 1 && currentRuntime.stopCalls === 1)
+    expect(oldRuntime.calls.filter((method) => method === AGENT_RUNTIME_METHODS.QUERY_ABORT)).toHaveLength(1)
+    expect(currentRuntime.calls.filter((method) => method === AGENT_RUNTIME_METHODS.QUERY_ABORT)).toHaveLength(1)
+
+    oldRuntime.stop.resolve()
+    currentRuntime.stop.resolve()
+    await expect(Promise.all([firstAbort, secondAbort])).resolves.toEqual([undefined, undefined])
+    oldRuntime.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-repeat-old', sessionId: 'session-repeat-abort', payload: {},
+    } as AgentRuntimeEvent)
+    currentRuntime.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-repeat-current', sessionId: 'session-repeat-abort', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(Promise.all([oldNext, currentNext])).resolves.toEqual([
+      { done: true, value: undefined },
+      { done: true, value: undefined },
+    ])
+  })
+
+  test('Given query 自然结束但 runtime stop 仍等待 When 删除路径调用 abort Then 等待同一 stop 且不影响其它会话', async () => {
+    /** 被测 utility adapter。 */
+    const adapter = new PiUtilityAdapter()
+    /** 正在自然收尾的 query iterator。 */
+    const drainingIterator = adapter.query(createQueryInput('session-draining'), 'query-draining')[Symbol.asyncIterator]()
+    /** 自然终态触发后会等待 finally 中的 runtime stop。 */
+    const drainingNext = drainingIterator.next()
+    await waitUntil(() => runtimeStates.length === 1)
+    /** 正在收尾的 runtime。 */
+    const drainingRuntime = runtimeStates[0]!
+    /** 另一会话仍在运行的 query iterator。 */
+    const otherIterator = adapter.query(createQueryInput('session-other'), 'query-other')[Symbol.asyncIterator]()
+    /** 另一会话的待处理事件。 */
+    const otherNext = otherIterator.next()
+    await waitUntil(() => runtimeStates.length === 2)
+    /** 不应被当前会话 abort 命中的 runtime。 */
+    const otherRuntime = runtimeStates[1]!
+
+    drainingRuntime.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-draining', sessionId: 'session-draining', payload: {},
+    } as AgentRuntimeEvent)
+    await waitUntil(() => drainingRuntime.stopCalls === 1)
+
+    /** 删除链路在自然 finally 已开始后发起的停止等待。 */
+    const aborting = adapter.abort('session-draining')
+    expect(await Promise.race([
+      aborting.then(() => 'settled' as const),
+      Bun.sleep(20).then(() => 'pending' as const),
+    ])).toBe('pending')
+    expect(otherRuntime.stopCalls).toBe(0)
+
+    drainingRuntime.stop.resolve()
+    await expect(aborting).resolves.toBeUndefined()
+    await expect(drainingNext).resolves.toMatchObject({ done: true })
+
+    otherRuntime.stop.resolve()
+    otherRuntime.eventListener?.({
+      kind: 'event', method: AGENT_RUNTIME_METHODS.EVENT_QUERY_END,
+      queryId: 'query-other', sessionId: 'session-other', payload: {},
+    } as AgentRuntimeEvent)
+    await expect(otherNext).resolves.toMatchObject({ done: true })
+  })
+
   test('Given utility run 的付费工具上限为一 When runtime 连续请求两次准入 Then 主进程共享同一本轮计数器', async () => {
     /** 被测 utility adapter。 */
     const adapter = new PiUtilityAdapter()
@@ -384,15 +499,16 @@ describe('Pi utility 强制关闭合同', () => {
 
     const runtime = runtimeStates[0]!
     const forcedClose = adapter.forceCloseQuery('query-reject')
-    adapter.abort('session-reject')
+    /** 与强制关闭共享底层 stop 的普通中止 Promise。 */
+    const aborting = adapter.abort('session-reject')
     adapter.dispose()
     await waitUntil(() => runtime.stopCalls === 1)
     /** 模拟底层 runtime stop 最终拒绝。 */
     const stopError = new Error('runtime stop failed')
     runtime.stop.reject(stopError)
 
-    const results = await Promise.allSettled([forcedClose, pendingNext, iterator.return?.()])
-    expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected', 'fulfilled'])
+    const results = await Promise.allSettled([forcedClose, aborting, pendingNext, iterator.return?.()])
+    expect(results.map((result) => result.status)).toEqual(['rejected', 'rejected', 'rejected', 'fulfilled'])
     expect(runtime.stopCalls).toBe(1)
   })
 

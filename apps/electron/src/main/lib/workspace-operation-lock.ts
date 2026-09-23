@@ -21,6 +21,14 @@ interface WorkspaceOperationEntry {
 /** 迁移期间向新写任务返回的稳定用户提示。 */
 const WORKSPACE_RELOCATION_BLOCK_REASON = '项目正在迁移，请等待完成后重试'
 
+/** 删除等待 runtime 时阻止新会话和并发写入进入同一项目。 */
+const WORKSPACE_DELETION_BLOCK_REASON = '项目正在删除，请等待完成后重试'
+
+/** 根据锁持有者返回与当前用户操作一致的阻断原因。 */
+function operationBlockReason(kind: WorkspaceOperationKind): string {
+  return kind === 'deletion' ? WORKSPACE_DELETION_BLOCK_REASON : WORKSPACE_RELOCATION_BLOCK_REASON
+}
+
 /** 拒绝空白或带首尾空白的 ID，避免不同原始 ID 被静默合并。 */
 function assertWorkspaceId(workspaceId: unknown): asserts workspaceId is string {
   if (typeof workspaceId !== 'string' || workspaceId.length === 0 || workspaceId !== workspaceId.trim()) {
@@ -30,7 +38,7 @@ function assertWorkspaceId(workspaceId: unknown): asserts workspaceId is string 
 
 /** 在未类型化运行时边界再次限制允许的工作区操作类型。 */
 function assertWorkspaceOperationKind(kind: WorkspaceOperationKind): void {
-  if (kind !== 'relocation') {
+  if (kind !== 'relocation' && kind !== 'deletion') {
     throw new Error('工作区操作类型无效')
   }
 }
@@ -47,10 +55,12 @@ export function createWorkspaceOperationRegistry(): WorkspaceOperationRegistry {
       assertWorkspaceId(workspaceId)
       assertWorkspaceOperationKind(kind)
       if ((writeLeaseCounts.get(workspaceId) ?? 0) > 0) {
-        throw new Error('项目仍有 Design 写入正在进行，无法迁移')
+        throw new Error(kind === 'deletion' ? '项目仍有写入正在进行，请稍后删除' : '项目仍有 Design 写入正在进行，无法迁移')
       }
-      if (entries.has(workspaceId)) {
-        throw new Error(WORKSPACE_RELOCATION_BLOCK_REASON)
+      /** 已有操作拥有锁，新请求不得替换其身份。 */
+      const currentOperation = entries.get(workspaceId)
+      if (currentOperation) {
+        throw new Error(operationBlockReason(currentOperation.kind))
       }
 
       /** 唯一持有令牌用于阻止旧释放函数清除后来获取的新锁。 */
@@ -68,7 +78,8 @@ export function createWorkspaceOperationRegistry(): WorkspaceOperationRegistry {
     },
     getWorkspaceOperationBlockReason: (workspaceId) => {
       assertWorkspaceId(workspaceId)
-      return entries.has(workspaceId) ? WORKSPACE_RELOCATION_BLOCK_REASON : undefined
+      const operation = entries.get(workspaceId)
+      return operation ? operationBlockReason(operation.kind) : undefined
     },
     getWorkspaceOperationKind: (workspaceId) => {
       assertWorkspaceId(workspaceId)
@@ -76,7 +87,8 @@ export function createWorkspaceOperationRegistry(): WorkspaceOperationRegistry {
     },
     acquireWorkspaceWriteLease: (workspaceId) => {
       assertWorkspaceId(workspaceId)
-      if (entries.has(workspaceId)) throw new Error(WORKSPACE_RELOCATION_BLOCK_REASON)
+      const operation = entries.get(workspaceId)
+      if (operation) throw new Error(operationBlockReason(operation.kind))
       writeLeaseCounts.set(workspaceId, (writeLeaseCounts.get(workspaceId) ?? 0) + 1)
       let released = false
       return () => {

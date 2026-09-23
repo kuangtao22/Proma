@@ -58,6 +58,7 @@ import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
 import { isAgentSessionsIndex } from './owned-path-rebaser-schema'
 import { hasValidCanvasAgentOwnership, isAgentSessionUserVisible } from './agent-session-visibility'
 import { projectSDKMessageForDisplay } from './agent-message-display'
+import { getWorkspaceOperationBlockReason } from './workspace-operation-lock'
 
 /**
  * 会话索引文件格式
@@ -73,6 +74,19 @@ interface AgentSessionsIndex {
 
 /** 当前索引版本：v2 将 Claude runtime 退役为 Pi-only。 */
 const INDEX_VERSION = 2
+
+/** 本进程已进入删除边界的会话；ID 不复用，阻止异步预检和迟到输出重新写入。 */
+const deletingAgentSessionIds = new Set<string>()
+
+/** 将指定会话标记为删除中；调用方必须在等待 runtime 停止前同步调用。 */
+export function markAgentSessionDeleting(id: string): void {
+  deletingAgentSessionIds.add(id)
+}
+
+/** 返回该会话是否已经进入不可重新运行或追加消息的删除边界。 */
+export function isAgentSessionDeleting(id: string): boolean {
+  return deletingAgentSessionIds.has(id)
+}
 
 /**
  * 会话引用最大返回数。
@@ -579,6 +593,11 @@ function initializeAgentSessionDirectories(meta: AgentSessionMeta): void {
 export function createAgentSessionWithMetadata(
   input: CreateAgentSessionWithMetadataInput,
 ): AgentSessionMeta {
+  if (input.workspaceId) {
+    /** 创建入口共享项目锁，覆盖 UI、Canvas 和后台自动任务的迟到创建。 */
+    const blockReason = getWorkspaceOperationBlockReason(input.workspaceId)
+    if (blockReason) throw new Error(blockReason)
+  }
   /** 保留规范化后的 Design 项目来源。 */
   const sourceDesignProjectId = input.sourceDesignProjectId?.trim()
   /** 保留规范化后的 Design 任务来源。 */
@@ -619,6 +638,9 @@ export function createAgentSessionWithMetadata(
   }
   if (trustedSessionId !== undefined && !hasCanvasMetadata) {
     throw new Error('预分配会话 ID 仅允许完整 Canvas 内部会话使用')
+  }
+  if (trustedSessionId !== undefined && isAgentSessionDeleting(trustedSessionId)) {
+    throw new Error('已删除或正在删除的会话 ID 不能复用')
   }
 
   const index = readIndex()
@@ -716,21 +738,22 @@ export function getAgentSessionMessages(id: string): AgentMessage[] {
  * 追加一条消息到会话的 JSONL 文件
  */
 export function appendAgentMessage(id: string, message: AgentMessage): void {
+  if (isAgentSessionDeleting(id)) return
   const filePath = getAgentSessionMessagesPath(id)
 
   try {
+    /** 写入前复核同一权威索引，防止 appendFileSync 复活已删除的 JSONL。 */
+    const index = readIndex()
+    const idx = index.sessions.findIndex((s) => s.id === id)
+    if (idx === -1) return
     const line = JSON.stringify(message) + '\n'
     appendFileSync(filePath, line, 'utf-8')
 
     // 追加消息时更新 updatedAt，若已归档则自动恢复活跃
-    const index = readIndex()
-    const idx = index.sessions.findIndex((s) => s.id === id)
-    if (idx !== -1) {
-      const session = index.sessions[idx]!
-      session.updatedAt = Date.now()
-      if (session.archived) session.archived = false
-      writeIndex(index)
-    }
+    const session = index.sessions[idx]!
+    session.updatedAt = Date.now()
+    if (session.archived) session.archived = false
+    writeIndex(index)
   } catch (error) {
     console.error(`[Agent 会话] 追加消息失败 (${id}):`, error)
     throw new Error('追加 Agent 消息失败')
@@ -750,6 +773,8 @@ const TRUNCATED_PREVIEW_LENGTH = 2000
  */
 export function appendSDKMessages(id: string, messages: SDKMessage[]): void {
   if (messages.length === 0) return
+  // 序列化前按批次复核删除标记与权威索引，拒绝已不存在的会话。
+  if (isAgentSessionDeleting(id) || !getAgentSessionMeta(id)) return
 
   const filePath = getAgentSessionMessagesPath(id)
 
@@ -955,6 +980,8 @@ export function deleteAgentSession(id: string): void {
     return
   }
 
+  // 内部清理与创建失败回滚同样可能存在迟到输出，不能只依赖 renderer 删除入口。
+  markAgentSessionDeleting(id)
   const removed = index.sessions.splice(idx, 1)[0]!
   writeIndex(index)
 

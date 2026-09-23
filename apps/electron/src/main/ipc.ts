@@ -445,7 +445,7 @@ import {
   listEnabledAgentModelsForChannel,
 } from './lib/agent-model-selection'
 import { isAgentSessionUserVisible, requireUserVisibleAgentSession } from './lib/agent-session-visibility'
-import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, listQueuedAgentMessages, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { agentEventBus, prepareAgentRun, runAgent, runPreparedAgent, runAgentHeadless, stopAgent, stopAgentAndDrain, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, listQueuedAgentMessages, reserveAgentSessionStart, listActiveCanvasAgentRuns, hasActiveAgentSessions, hasActiveAgentDataWrites, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { registerAgentMessageIpcHandlers } from './lib/agent-message-ipc'
 import { registerPathManagementIpcHandlers } from './lib/path-management-ipc'
 import { registerServerOpsIpcHandlers } from './lib/server-ops/server-ops-ipc'
@@ -577,7 +577,7 @@ import {
   removeWorktreeRepo,
   cleanupStaleWorkspaceAttachedPaths,
 } from './lib/agent-workspace-manager'
-import { getWorkspaceOperationBlockReason } from './lib/workspace-operation-lock'
+import { acquireWorkspaceOperation, getWorkspaceOperationBlockReason } from './lib/workspace-operation-lock'
 import { createWorkspaceOperationGuard } from './lib/workspace-operation-guard'
 import { movePathSafely } from './lib/file-move-service'
 import { subscribeWorkspaceMemoryChanges } from './lib/workspace-memory-change-watcher'
@@ -2322,8 +2322,11 @@ export function registerIpcHandlers(): void {
     const contents = getStoredMainWindow()?.webContents
     return contents && !contents.isDestroyed() ? [contents] : []
   }
+  /** 首次启动先创建固定配置目录；后续事务仍校验其为普通目录并拒绝符号链接。 */
+  const serverOpsConfigDirectory = join(getConfigDir(), 'server-ops')
+  mkdirSync(serverOpsConfigDirectory, { recursive: true })
   /** 项目、主机与数据源共享同一配置事务，归属验证和空项目删除不会出现检查窗口。 */
-  const serverOpsConfigTransaction = createServerOpsConfigTransaction(join(getConfigDir(), 'server-ops'))
+  const serverOpsConfigTransaction = createServerOpsConfigTransaction(serverOpsConfigDirectory)
   /** 项目引用回调在 Store 完成装配后才执行，先声明两个资产 Store。 */
   let serverOpsHostStore: ServerOpsHostStore
   let serverOpsDataSourceStore: ServerOpsDataSourceStore
@@ -3513,6 +3516,7 @@ export function registerIpcHandlers(): void {
       ))
       for (const session of sessions) {
         try {
+          await stopAgentAndDrain(session.id)
           permissionService.clearSessionWhitelist(session.id)
           permissionService.clearSessionPending(session.id)
           askUserService.clearSessionPending(session.id)
@@ -5347,7 +5351,7 @@ export function registerIpcHandlers(): void {
     async (_, id: string): Promise<void> => {
       const deletingSession = requireVisibleSession(id)
       serverOpsIpcRegistration.revokeSession(id)
-      stopAgent(id)
+      await stopAgentAndDrain(id)
       const attachedFiles = deletingSession.attachedFiles
       // 清理权限服务中该会话的白名单
       permissionService.clearSessionWhitelist(id)
@@ -5588,7 +5592,9 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.DELETE_WORKSPACE,
     async (_, id: string): Promise<void> => {
-      return workspaceOperationGuard.runWorkspaceWrite(id, () => {
+      /** 整段异步删除持有独占锁，阻止等待 runtime 时新建会话逃出删除快照。 */
+      const releaseDeletion = acquireWorkspaceOperation(id, 'deletion')
+      try {
         const deletingWorkspace = getAgentWorkspace(id)
         if (!deletingWorkspace) {
           return deleteAgentWorkspace(id)
@@ -5613,6 +5619,17 @@ export function registerIpcHandlers(): void {
           .filter((automation) => automation.workspaceId === id)
           .map((automation) => automation.id)
         const deletedProjectRoot = deletingWorkspace.projectRootPath
+        // 所有会话先同步进入删除边界；任一 runtime 收尾失败时保留索引及外部绑定。
+        /** 等所有收尾 settled 后才释放项目锁，避免单个失败导致其它清理游离于锁外。 */
+        const drainResults = await Promise.allSettled(affectedSessionIds.map(async (sessionId) => {
+          serverOpsIpcRegistration.revokeSession(sessionId)
+          await stopAgentAndDrain(sessionId)
+          permissionService.clearSessionWhitelist(sessionId)
+          await browserController.close(sessionId)
+        }))
+        /** 任一失败都保留项目与会话索引，允许重试删除。 */
+        const failedDrain = drainResults.find((result) => result.status === 'rejected')
+        if (failedDrain?.status === 'rejected') throw failedDrain.reason
         const removedDingTalkBindings = dingtalkBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
         const removedWeChatBindings = wechatBridge.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
         const removedFeishuBindings = feishuBridgeManager.removeBindingsForDeletedWorkspace(id, affectedSessionIds)
@@ -5628,9 +5645,6 @@ export function registerIpcHandlers(): void {
         }
 
         for (const sessionId of affectedSessionIds) {
-          if (isAgentSessionActive(sessionId)) {
-            stopAgent(sessionId)
-          }
           closeTerminalsForSession(sessionId)
           deleteAgentSession(sessionId)
           serverOpsIpcRegistration.revokeSession(sessionId)
@@ -5650,7 +5664,9 @@ export function registerIpcHandlers(): void {
 
         releaseAttachedFileWatchers(deletedAttachedFiles)
         if (deletedProjectRoot) releaseDirectoryWatcherIfUnreferenced(deletedProjectRoot)
-      })
+      } finally {
+        releaseDeletion()
+      }
     }
   )
 

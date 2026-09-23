@@ -64,7 +64,7 @@ import {
   getWorkspaceAttachedDirectories,
   getWorkspaceAttachedFiles,
 } from './agent-workspace-manager'
-import { getAgentSessionMeta, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
+import { getAgentSessionMeta, isAgentSessionDeleting, markAgentSessionDeleting, listAgentSessions, updateAgentSessionMeta } from './agent-session-manager'
 import { buildCanvasAgentActiveRunSnapshot, isEligibleProjectAgent } from './agent-session-visibility'
 import {
   resolveHeadlessAgentRunTerminalStatus,
@@ -154,6 +154,7 @@ export function prepareAgentRun<T extends AgentSendInput | AgentQueueMessageInpu
   extensions: AgentRunExtensions = {},
   dialogOwnerWebContentsId?: number,
 ): PreparedAgentCanvasMessage<T> {
+  assertAgentSessionAcceptsInput(input.sessionId)
   /** 媒体授权先于 Canvas 与运行准备完成，后续阶段只使用会话内固化路径。 */
   const mediaPreparedInput = prepareAgentMediaInput(input)
   /** runtime 同时提供唯一引用解析器和工具 facade；缺失时仅允许无引用消息继续。 */
@@ -346,6 +347,7 @@ const startingAgentSessions = new Map<string, number | undefined>()
 const AGENT_SESSION_BUSY_ERROR_CODE = 'AGENT_SESSION_BUSY'
 
 export function reserveAgentSessionStart(sessionId: string, startedAt?: number): () => void {
+  assertAgentSessionAcceptsInput(sessionId)
   if (startingAgentSessions.has(sessionId) || orchestrator.isActive(sessionId)) {
     /** 附加稳定内部码，避免 IPC 依赖可能变化的中文错误文案。 */
     const busyError = Object.assign(
@@ -612,7 +614,11 @@ export async function runPreparedAgent(
           }
           eventBus.emit(input.sessionId, {
             kind: 'proma_event',
-            event: buildAuthoritativeAgentRunStartedEvent(input.sessionId, startedAt, getAgentSessionMeta),
+            event: {
+              ...buildAuthoritativeAgentRunStartedEvent(input.sessionId, startedAt, getAgentSessionMeta),
+              // 普通运行与 headless 使用同一代次，让实时 SDK 过滤无需依赖时间戳精度。
+              runGeneration,
+            },
           })
         })
       },
@@ -930,6 +936,16 @@ export function stopAgent(sessionId: string): void {
   )
 }
 
+/** 删除专用收尾：先阻断迟到输入与写入，再等待底层 runtime 停止；失败交给调用方。 */
+export async function stopAgentAndDrain(sessionId: string): Promise<void> {
+  markAgentSessionDeleting(sessionId)
+  clearAgentQueuedMessages(sessionId)
+  await orchestrator.stopAndDrain(
+    sessionId,
+    shouldStopBeforeAgentRun(startingAgentSessions.has(sessionId), agentQueueCoordinator.isDispatching(sessionId)),
+  )
+}
+
 setHeadlessAgentRunner(runAgentHeadless)
 setAgentStopper(stopAgent)
 
@@ -1035,6 +1051,7 @@ export async function submitOrEnqueueAgentMessage(
   input: AgentSubmitOrEnqueueInput,
   webContents: WebContents,
 ): Promise<AgentSubmitOrEnqueueResult> {
+  assertAgentSessionAcceptsInput(input.sessionId)
   /** deferred 消息入队前必须完成附件固化，不能等当前 run 结束后再信任旧路径。 */
   const mediaPreparedInput = prepareAgentMediaInput(input)
   return routeAgentSubmitOrEnqueue(mediaPreparedInput, {
@@ -1059,6 +1076,7 @@ export async function submitOrEnqueueAgentMessage(
 
 /** 兼容旧调用：仅将消息追加到主进程 deferred queue。 */
 export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
+  assertAgentSessionAcceptsInput(input.sessionId)
   const mediaPreparedInput = prepareAgentMediaInput(input)
   workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
     registerWebContents(input.sessionId, webContents)
@@ -1078,6 +1096,13 @@ export function clearAgentQueuedMessages(sessionId: string): void {
   agentQueueCoordinator.clear(sessionId)
 }
 
+/** 在附件固化、排队或运行预留前拒绝删除中的会话，避免重建私有工作目录。 */
+function assertAgentSessionAcceptsInput(sessionId: string): void {
+  if (isAgentSessionDeleting(sessionId) || !getAgentSessionMeta(sessionId)) {
+    throw new Error('Agent 会话已删除或正在删除')
+  }
+}
+
 // ===== 文件操作 =====
 
 /**
@@ -1086,6 +1111,7 @@ export function clearAgentQueuedMessages(sessionId: string): void {
  * 将 base64 编码的文件写入当前会话的私有工作目录，供 Agent 通过授权的附加目录读取。
  */
 export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedFile[] {
+  assertAgentSessionAcceptsInput(input.sessionId)
   const sessionDir = getAgentSessionWorkspacePath(input.workspaceSlug, input.sessionId)
   const attachmentsDir = join(sessionDir, 'attachments')
   const results: AgentSavedFile[] = []

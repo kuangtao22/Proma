@@ -51,7 +51,7 @@ import { isStaleActiveQueueError } from './agent-queue-routing'
 import { decryptApiKey, getChannelById, listChannels, persistCodexOAuthCredentials, persistXaiOAuthCredentials, resolveChannelRuntimeApiKey, resolveCodexOAuthCredentials, resolveXaiOAuthCredentials } from './channel-manager'
 import pkg from '../../../package.json' with { type: 'json' }
 import { getEffectiveProxyUrl } from './proxy-settings-service'
-import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
+import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, isAgentSessionDeleting, getAgentSessionMessages, removeSDKErrorMessage, updateSDKUserMessageSkillActivations, rewindPiAgentSession, resolveAgentCwd, getActiveWorktreePath, getAgentCwdMode, getSessionWorkbenchLayout } from './agent-session-manager'
 import { getAgentWorkspace, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
 import { getLocalProjectRootStatus } from './project-root-health'
 import { getMcpApiKeyEnvironment, getMcpOAuthHeaders } from './mcp-oauth-service'
@@ -758,6 +758,15 @@ export class AgentOrchestrator {
         console.error(`[Agent 编排] terminal ${kind} callback 执行失败:`, error)
       },
     })
+    // 删除准入早于迁移检查、运行槽和消息写入，也覆盖尚未进入编排层的请求。
+    if (!sessionMeta || isAgentSessionDeleting(sessionId)) {
+      terminalNotifier.onComplete([], {
+        stoppedByUser: true,
+        startedAt: streamStartedAt,
+        ...(input.runGeneration != null ? { runGeneration: input.runGeneration } : {}),
+      })
+      return
+    }
     /** 会话模式是主进程持久化事实；发送快照不允许隐式切换工具权限。 */
     const persistedToolMode = sessionMeta?.toolMode ?? AGENT_DEFAULT_TOOL_MODE
     if (!isAgentToolMode(persistedToolMode) || (input.toolMode !== undefined && !isAgentToolMode(input.toolMode))) {
@@ -879,6 +888,7 @@ export class AgentOrchestrator {
     runGeneration = this.reserveRunGeneration(sessionId)
     const runIdentity = createAgentRunIdentity(sessionId, runGeneration, () => (
       this.activeSessions.get(sessionId) === runGeneration
+      && !isAgentSessionDeleting(sessionId)
       && isLatestRunGeneration(this.latestRunGenerations, sessionId, runGeneration)
       && (getAgentSessionMeta(sessionId)?.toolMode ?? AGENT_DEFAULT_TOOL_MODE) === runToolMode
     ))
@@ -888,8 +898,17 @@ export class AgentOrchestrator {
     this.latestRunGenerations.set(sessionId, runGeneration)
     markInFlightGeneration(this.inFlightRunGenerations, sessionId, runGeneration)
 
+    /** 仅实时副本携带运行身份；持久化对象不写入 renderer 专用标记。 */
+    const emitLiveSdkMessage = (message: SDKMessage): void => {
+      if (this.activeSessions.get(sessionId) !== runGeneration || isAgentSessionDeleting(sessionId)) return
+      this.eventBus.emit(sessionId, {
+        kind: 'sdk_message',
+        message: { ...message, _promaLiveRunStartedAt: streamStartedAt, _promaLiveRunGeneration: runGeneration },
+      })
+    }
+
     await runAgentLifecycle({
-      isCurrent: () => this.activeSessions.get(sessionId) === runGeneration,
+      isCurrent: () => this.activeSessions.get(sessionId) === runGeneration && !isAgentSessionDeleting(sessionId),
       isStopped: () => hasStoppedGeneration(this.stoppedBySessions, sessionId, runGeneration),
       release: releaseRun,
       onStopped: () => {
@@ -926,6 +945,8 @@ export class AgentOrchestrator {
 
     // 环境 / 配置类错误的统一上报：持久化为 TypedError 消息，由 SDKMessageRenderer 渲染
     const reportPreflightError = (typedError: TypedError) => {
+      // 预检异步失败可能晚于删除/停止，交给生命周期只完成停止通知。
+      checkpoint()
       const errorContent = typedError.title
         ? `${typedError.title}: ${typedError.message}`
         : typedError.message
@@ -2198,7 +2219,7 @@ export class AgentOrchestrator {
                   }
                   accumulatedMessages.push(partialOutput)
                   // Reuse the Pi UUID to replace the latest partial frame with normal markdown output.
-                  this.eventBus.emit(sessionId, { kind: 'sdk_message', message: partialOutput })
+                  emitLiveSdkMessage(partialOutput)
                 }
                 this.persistSDKMessages(sessionId, accumulatedMessages, Date.now() - queryStartedAt)
                 accumulatedMessages.length = 0
@@ -2230,7 +2251,7 @@ export class AgentOrchestrator {
                 console.log(`[Agent 编排] 已保存 TypedError 消息: ${typedError.code} - ${typedError.title}`)
 
                 // 透传归一化后的错误消息到前端，避免 SDK 原始 API Error 直接暴露给用户。
-                this.eventBus.emit(sessionId, { kind: 'sdk_message', message: errorSDKMsg })
+                emitLiveSdkMessage(errorSDKMsg)
                 try { updateAgentSessionMeta(sessionId, {}) } catch { /* 忽略 */ }
                 // 此处会提前结束迭代，必须直接传递错误终态，不能等未消费的 SDK result 补齐。
                 completeRun(getAgentSessionMessages(sessionId), {
@@ -2353,7 +2374,7 @@ export class AgentOrchestrator {
             if (!shouldEmit) {
               // 跳过 SDK 内部 user 消息的前端推送
             } else {
-              this.eventBus.emit(sessionId, { kind: 'sdk_message', message: msg })
+              emitLiveSdkMessage(msg)
             }
           }
 
@@ -2392,10 +2413,7 @@ export class AgentOrchestrator {
 
           // Plan 模式：Agent 完成规划后注入"接受计划"建议
           if (initialPermissionMode === 'plan' && planModeEntered && this.activeSessions.get(sessionId) === runGeneration) {
-            this.eventBus.emit(sessionId, {
-              kind: 'sdk_message',
-              message: { type: 'prompt_suggestion', suggestion: '请执行该计划' } as unknown as SDKMessage,
-            })
+            emitLiveSdkMessage({ type: 'prompt_suggestion', suggestion: '请执行该计划' } as unknown as SDKMessage)
             console.log(`[Agent 编排] Plan 模式：已注入计划确认建议`)
           }
 
@@ -2584,6 +2602,14 @@ export class AgentOrchestrator {
    * 再调用 adapter.abort() 中止底层 SDK 进程。
    */
   stop(sessionId: string, stopBeforeRun = false): void {
+    // 普通停止保持同步 API；异步清理失败由日志消费，避免未处理 rejection。
+    void this.stopAndDrain(sessionId, stopBeforeRun).catch((error) => {
+      console.error(`[Agent 编排] 中止会话收尾失败 (${sessionId}):`, error)
+    })
+  }
+
+  /** 同步撤销运行身份并等待适配器收尾；失败直接返回给删除调用方。 */
+  async stopAndDrain(sessionId: string, stopBeforeRun = false): Promise<void> {
     const runGeneration = this.activeSessions.get(sessionId)
     const activeController = this.activeRunControllers.get(sessionId)
     if (activeController && activeController.generation === runGeneration) {
@@ -2604,8 +2630,9 @@ export class AgentOrchestrator {
     this.queuedMessageUuids.delete(sessionId)
     // stop 同步拥有被停止代际的审批状态，必须在新 generation 可运行前清理。
     permissionService.clearSessionPending(sessionId)
+    askUserService.clearSessionPending(sessionId)
     exitPlanService.clearSessionPending(sessionId)
-    this.adapter.abort(sessionId)
+    await this.adapter.abort(sessionId)
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }
 

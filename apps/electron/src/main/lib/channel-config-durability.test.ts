@@ -122,3 +122,59 @@ describe('渠道配置持久化失败保护', () => {
     expect(readFileSync(getChannelsPath(), 'utf-8')).toBe(source)
   })
 })
+
+describe('GLM-5.3-FlashX 预设候选迁移', () => {
+  test('Given 已应用旧候选更新的存量 Coding 渠道 When 重复加载配置 Then 只追加一个默认关闭的 FlashX', () => {
+    writeChannelsSource(JSON.stringify({
+      version: 5,
+      appliedPresetModelUpdates: ['deepseek-flash-v1', 'model-candidates-v3'],
+      channels: [{
+        id: 'zhipu-coding-old',
+        name: '旧 Coding 渠道',
+        provider: 'zhipu-coding',
+        baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: 'encrypted-key',
+        models: [{ id: 'glm-5.3', name: 'GLM-5.3', enabled: true }],
+        enabled: true,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    }))
+
+    const first = channelManager.listChannels()[0]!
+    const second = channelManager.listChannels()[0]!
+    const persisted = JSON.parse(readFileSync(getChannelsPath(), 'utf-8')) as {
+      appliedPresetModelUpdates?: string[]
+    }
+
+    expect(first.models.filter((model) => model.id === 'glm-5.3-flashx')).toEqual([
+      { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+    ])
+    expect(second.models.filter((model) => model.id === 'glm-5.3-flashx')).toHaveLength(1)
+    expect(persisted.appliedPresetModelUpdates?.filter((id) => id === 'model-candidates-v4')).toHaveLength(1)
+  })
+
+  test('Given 用户已用不同大小写手动启用 FlashX When 加载迁移 Then 不重复候选且保留启用状态', () => {
+    writeChannelsSource(JSON.stringify({
+      version: 5,
+      appliedPresetModelUpdates: ['model-candidates-v3'],
+      channels: [{
+        id: 'zhipu-custom-flashx',
+        name: '手动 FlashX',
+        provider: 'zhipu',
+        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+        apiKey: 'encrypted-key',
+        models: [{ id: ' GLM-5.3-FLASHX ', name: '我的 FlashX', enabled: true }],
+        enabled: true,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    }))
+
+    const [channel] = channelManager.listChannels()
+
+    expect(channel?.models).toEqual([
+      { id: ' GLM-5.3-FLASHX ', name: '我的 FlashX', enabled: true },
+    ])
+  })
+})
