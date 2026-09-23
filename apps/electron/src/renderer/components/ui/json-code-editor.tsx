@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { EditorState, StateEffect, type Extension, type Range } from '@codemirror/state'
+import { Compartment, EditorState, StateEffect, type Extension, type Range } from '@codemirror/state'
 import {
   Decoration,
   EditorView,
@@ -16,6 +16,8 @@ import { cn } from '@/lib/utils'
 export interface JsonCodeEditorProps {
   value: string
   className?: string
+  /** 根区域与内部只读 textbox 共用的无障碍名称。 */
+  ariaLabel?: string
 }
 
 export interface VisibleJsonLine {
@@ -29,13 +31,35 @@ interface VisibleRange {
   to: number
 }
 
+/** 单行 Shiki 高亮字符预算；超长行仍由 CodeMirror 完整展示。 */
+export const MAX_JSON_CODE_EDITOR_HIGHLIGHT_LINE_LENGTH = 16 * 1024
+
+/** 判断单行是否适合进入同步 token 装饰路径。 */
+export function isJsonCodeEditorLineHighlightable(text: string): boolean {
+  return text.length <= MAX_JSON_CODE_EDITOR_HIGHLIGHT_LINE_LENGTH
+}
+
 /** 内部 textbox 的无障碍属性，保持只读内容可聚焦、可选择和可键盘滚动。 */
-export const JSON_CODE_EDITOR_CONTENT_ATTRIBUTES = {
+export interface JsonCodeEditorContentAttributes extends Record<string, string> {
+  'aria-label': string
+  'aria-readonly': 'true'
+  spellcheck: 'false'
+  tabindex: '0'
+}
+
+/** 默认工作流查看器的内部 textbox 属性。 */
+export const JSON_CODE_EDITOR_CONTENT_ATTRIBUTES: JsonCodeEditorContentAttributes = {
   'aria-label': '完整工作流 JSON',
   'aria-readonly': 'true',
   spellcheck: 'false',
   tabindex: '0',
 } as const
+
+/** 根据业务上下文构造内部 textbox 属性，未传入时保持旧默认。 */
+export function createJsonCodeEditorContentAttributes(ariaLabel: string = JSON_CODE_EDITOR_CONTENT_ATTRIBUTES['aria-label']): JsonCodeEditorContentAttributes {
+  if (ariaLabel === JSON_CODE_EDITOR_CONTENT_ATTRIBUTES['aria-label']) return JSON_CODE_EDITOR_CONTENT_ATTRIBUTES
+  return { ...JSON_CODE_EDITOR_CONTENT_ATTRIBUTES, 'aria-label': ariaLabel }
+}
 
 /** 通知高亮插件重新读取当前视口，不携带或复制完整文档。 */
 const refreshJsonHighlightEffect = StateEffect.define<null>()
@@ -82,6 +106,7 @@ function createVisibleJsonDecorations(view: EditorView, theme: string): Decorati
   const ranges: Range<Decoration>[] = []
 
   for (const line of collectVisibleJsonLines(view.state, view.visibleRanges)) {
+    if (!isJsonCodeEditorLineHighlightable(line.text)) continue
     /** Shiki 尚未完成懒加载时保留纯文本，加载完成后插件会主动刷新。 */
     const highlighted = highlightToTokens({ code: line.text, language: 'json', theme })
     const tokens = highlighted?.lines[0]
@@ -181,11 +206,11 @@ const jsonCodeEditorTheme = EditorView.theme({
 })
 
 /** 组装只读、可选择复制且支持双向滚动的 CodeMirror 扩展。 */
-function createJsonCodeEditorExtensions(): Extension[] {
+function createJsonCodeEditorExtensions(contentAttributes: Compartment, ariaLabel: string): Extension[] {
   return [
     EditorState.readOnly.of(true),
     EditorView.editable.of(false),
-    EditorView.contentAttributes.of(JSON_CODE_EDITOR_CONTENT_ATTRIBUTES),
+    contentAttributes.of(EditorView.contentAttributes.of(createJsonCodeEditorContentAttributes(ariaLabel))),
     lineNumbers(),
     highlightSpecialChars(),
     drawSelection(),
@@ -195,13 +220,15 @@ function createJsonCodeEditorExtensions(): Extension[] {
 }
 
 /** 用 CodeMirror 虚拟化展示大型只读 JSON，并在卸载时释放编辑器资源。 */
-export function JsonCodeEditor({ value, className }: JsonCodeEditorProps): React.ReactElement {
+export function JsonCodeEditor({ value, className, ariaLabel = JSON_CODE_EDITOR_CONTENT_ATTRIBUTES['aria-label'] }: JsonCodeEditorProps): React.ReactElement {
   /** 承载 CodeMirror DOM 的稳定节点。 */
   const hostRef = React.useRef<HTMLDivElement>(null)
   /** 保存当前 EditorView，供 value 变化时原位更新。 */
   const editorViewRef = React.useRef<EditorView | null>(null)
   /** 保存已经写入编辑器的值，避免为比较而复制大型文档。 */
   const appliedValueRef = React.useRef(value)
+  /** 只重配内容区属性，不重建大型文档。 */
+  const contentAttributesRef = React.useRef(new Compartment())
 
   React.useEffect(() => {
     const host = hostRef.current
@@ -212,7 +239,7 @@ export function JsonCodeEditor({ value, className }: JsonCodeEditorProps): React
       parent: host,
       state: EditorState.create({
         doc: value,
-        extensions: createJsonCodeEditorExtensions(),
+        extensions: createJsonCodeEditorExtensions(contentAttributesRef.current, ariaLabel),
       }),
     })
     editorViewRef.current = editorView
@@ -231,12 +258,21 @@ export function JsonCodeEditor({ value, className }: JsonCodeEditorProps): React
     appliedValueRef.current = value
   }, [value])
 
+  React.useEffect(() => {
+    /** 当前编辑器实例。 */
+    const editorView = editorViewRef.current
+    if (!editorView) return
+    editorView.dispatch({ effects: contentAttributesRef.current.reconfigure(
+      EditorView.contentAttributes.of(createJsonCodeEditorContentAttributes(ariaLabel)),
+    ) })
+  }, [ariaLabel])
+
   return (
     <div
       ref={hostRef}
       data-json-code-editor="true"
       role="region"
-      aria-label="完整工作流 JSON"
+      aria-label={ariaLabel}
       className={cn('min-h-0 overflow-hidden rounded-md border border-border bg-background', className)}
     />
   )

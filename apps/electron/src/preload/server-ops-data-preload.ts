@@ -20,6 +20,8 @@ import {
   parseServerOpsDataSourceProbeInput,
   parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceRowsResult,
+  parseServerOpsDataSourceCellInput,
+  parseServerOpsDataSourceCellResult,
   parseServerOpsDataSourceTableInput,
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesInput,
@@ -39,6 +41,8 @@ import type {
   ServerOpsDataSourceProbeInput,
   ServerOpsDataSourceRowsInput,
   ServerOpsDataSourceRowsResult,
+  ServerOpsDataSourceCellInput,
+  ServerOpsDataSourceCellResult,
   ServerOpsDataSourceTableInput,
   ServerOpsDataSourceTableResult,
   ServerOpsDataSourceTablesInput,
@@ -82,6 +86,8 @@ export interface ServerOpsDataPreload {
   describeServerOpsDataSchemaTable(input: ServerOpsDataSourceTableInput): Promise<ServerOpsDataSourceTableResult>
   /** 表浏览：分页读取表数据（只读）。 */
   readServerOpsDataSchemaRows(input: ServerOpsDataSourceRowsInput): Promise<ServerOpsDataSourceRowsResult>
+  /** 表浏览：按需读取经过摘要验证的单格原文。 */
+  readServerOpsDataSchemaCell(input: ServerOpsDataSourceCellInput): Promise<ServerOpsDataSourceCellResult>
 }
 
 /** 组合数据服务 API，并在 IPC 两侧都使用 exact-key parser。 */
@@ -136,6 +142,9 @@ export function createServerOpsDataPreload(invoke: ServerOpsDataInvoke): ServerO
     ),
     readServerOpsDataSchemaRows: async (input) => parseServerOpsDataSourceRowsResult(
       await invoke(SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_ROWS, parseServerOpsDataSourceRowsInput(input)),
+    ),
+    readServerOpsDataSchemaCell: async (input) => parseServerOpsDataSourceCellResult(
+      await invoke(SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, parseServerOpsDataSourceCellInput(input)),
     ),
   }
 }

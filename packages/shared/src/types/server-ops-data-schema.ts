@@ -5,12 +5,13 @@ import type { ServerOpsDataEngine } from './server-ops-data'
  * 数据连接"表浏览"领域的 IPC 通道。
  *
  * 与只读诊断分开：诊断回答"这台库健康吗"，表浏览回答"库里有什么、长什么样"。
- * 三个通道都是只读，且标识符一律先经 information_schema 白名单校验后才允许拼进语句。
+ * 所有通道均只读；标识符经引擎元数据白名单校验后才允许进入语句。
  */
 export const SERVER_OPS_DATA_SCHEMA_CHANNELS = {
   LIST_TABLES: 'server-ops:list-data-schema-tables',
   DESCRIBE_TABLE: 'server-ops:describe-data-schema-table',
   READ_ROWS: 'server-ops:read-data-schema-rows',
+  READ_CELL: 'server-ops:read-data-schema-cell',
 } as const
 
 /** 单个库下表清单的展示行。 */
@@ -98,6 +99,30 @@ export interface ServerOpsDataSourceRowsInput {
   filters?: ServerOpsDataRowFilters
 }
 
+/** 单格全文的 UTF-8 字节上限；超限拒绝，不返回部分正文。 */
+export const MAX_SERVER_OPS_CELL_BYTES = 1_048_576
+
+/** 按当前预览位置读取单格，摘要验证避免换序或更新后显示不同正文。 */
+export interface ServerOpsDataSourceCellInput {
+  sourceId: string
+  database: string
+  table: string
+  /** 当前筛选结果内的绝对行位置，含页内偏移。 */
+  offset: number
+  /** 当前预览中的列序号，最多前 64 列。 */
+  columnIndex: number
+  /** 预览公开列名，用于发现读取前的列结构变化。 */
+  expectedColumn: string
+  /** 预览时的完整原文摘要，只验证一致性，不作为权限凭证。 */
+  sha256: string
+  filters?: ServerOpsDataRowFilters
+}
+
+/** 独立详情正文；保留所有字符，不与有界预览混用。 */
+export interface ServerOpsDataSourceCellResult {
+  value: string | null | { kind: 'binary'; bytes: number }
+}
+
 /** 单次预览最多允许的条件数，限制远端 SQL 复杂度。 */
 export const MAX_SERVER_OPS_ROW_FILTERS = 12
 /** 单个条件值的最大字符数。 */
@@ -123,7 +148,7 @@ export interface ServerOpsDataRowFilters {
 /** 表数据预览单元格；二进制只暴露字节数，文本截断显式携带状态。 */
 export type ServerOpsDataSchemaCell = string | null
   | { kind: 'binary'; bytes: number }
-  | { kind: 'text'; text: string; truncated: true }
+  | { kind: 'text'; text: string; truncated: true; sha256?: string }
 
 /** 表数据预览结果；单元格已由 runtime 归一化为有界公开值。 */
 export interface ServerOpsDataSourceRowsResult {
@@ -162,6 +187,41 @@ function isNonEmptySchemaText(value: unknown, maximum: number): value is string 
 /** 有界非负整数。 */
 function isBoundedInteger(value: unknown, maximum: number): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum
+}
+
+/** 摘要只接受规范小写十六进制，避免跨进程比较差异。 */
+function isCellDigest(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value)
+}
+
+/** 解析单格定位请求；入参来自 IPC，返回复制后的有界定位条件。 */
+export function parseServerOpsDataSourceCellInput(value: unknown): ServerOpsDataSourceCellInput {
+  /** 统一错误码避免向外反射请求内容。 */
+  const errorCode = 'SERVER_OPS_DATA_CELL_INPUT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table', 'offset', 'columnIndex', 'expectedColumn', 'sha256']
+    .concat(value.filters === undefined ? [] : ['filters'])))
+    || !isServerOpsId(value.sourceId) || !isNonEmptySchemaText(value.database, 64)
+    || !isNonEmptySchemaText(value.table, 128) || !isBoundedInteger(value.offset, 1_000_199)
+    || !isBoundedInteger(value.columnIndex, 63) || !isNonEmptySchemaText(value.expectedColumn, 128)
+    || !isCellDigest(value.sha256)) throw new Error(errorCode)
+  return { sourceId: value.sourceId, database: value.database, table: value.table, offset: value.offset,
+    columnIndex: value.columnIndex, expectedColumn: value.expectedColumn, sha256: value.sha256,
+    ...(value.filters === undefined ? {} : { filters: parseServerOpsDataRowFilters(value.filters) }) }
+}
+
+/** 解析完整单格结果；保留原文，按 UTF-8 字节限制内存与 IPC 传输。 */
+export function parseServerOpsDataSourceCellResult(value: unknown): ServerOpsDataSourceCellResult {
+  /** 只接受完整值，不允许 truncated 等字段冒充成功。 */
+  const errorCode = 'SERVER_OPS_DATA_CELL_RESULT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['value']))) throw new Error(errorCode)
+  /** 与预览分开校验，换行、制表符和空字符串都是有效正文。 */
+  const cell = value.value
+  if (cell === null) return { value: null }
+  if (typeof cell === 'string' && cell.length <= MAX_SERVER_OPS_CELL_BYTES
+    && new TextEncoder().encode(cell).byteLength <= MAX_SERVER_OPS_CELL_BYTES) return { value: cell }
+  if (isRecord(cell) && hasOnlyKeys(cell, new Set(['kind', 'bytes'])) && cell.kind === 'binary'
+    && isBoundedInteger(cell.bytes, Number.MAX_SAFE_INTEGER)) return { value: { kind: 'binary', bytes: cell.bytes } }
+  throw new Error(errorCode)
 }
 
 /** 判断未知值是否为允许的 schema 缓存模式。 */
@@ -375,12 +435,18 @@ export function parseServerOpsDataSourceRowsResult(value: unknown): ServerOpsDat
       if (!isRecord(cell)) throw new Error(errorCode)
       if (cell.kind === 'binary' && hasOnlyKeys(cell, new Set(['kind', 'bytes']))
         && isBoundedInteger(cell.bytes, Number.MAX_SAFE_INTEGER)) return { kind: 'binary', bytes: cell.bytes }
-      if (cell.kind === 'text' && hasOnlyKeys(cell, new Set(['kind', 'text', 'truncated']))
-        && isSchemaText(cell.text, 256) && cell.truncated === true) return { kind: 'text', text: cell.text, truncated: true }
+      if (cell.kind === 'text' && hasOnlyKeys(cell, new Set(['kind', 'text', 'truncated'].concat(cell.sha256 === undefined ? [] : ['sha256'])))
+        && isSchemaText(cell.text, 256) && cell.truncated === true && (cell.sha256 === undefined || isCellDigest(cell.sha256))) {
+        return { kind: 'text', text: cell.text, truncated: true, ...(cell.sha256 === undefined ? {} : { sha256: cell.sha256 }) }
+      }
       throw new Error(errorCode)
     })
   })
-  if (new TextEncoder().encode(JSON.stringify(rows)).byteLength > 1_048_576) throw new Error(errorCode)
+  /** 摘要属于有界定位元数据；原预览正文继续独立遵守 1 MiB，避免摘要挤掉页内行。 */
+  const previewRows = rows.map((row) => row.map((cell) => cell !== null && typeof cell === 'object' && cell.kind === 'text'
+    ? { kind: cell.kind, text: cell.text, truncated: cell.truncated } : cell))
+  if (new TextEncoder().encode(JSON.stringify(previewRows)).byteLength > 1_048_576
+    || new TextEncoder().encode(JSON.stringify(rows)).byteLength > 2_097_152) throw new Error(errorCode)
   return {
     columns,
     rows,

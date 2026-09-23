@@ -77,6 +77,7 @@ import { toast } from 'sonner'
 import { ServerOpsHostDialog } from './ServerOpsHostDialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
+import { ServerOpsLocalSqliteDropZone } from './ServerOpsLocalSqliteDropZone'
 import { ServerOpsConnectDialog } from './ServerOpsConnectDialog'
 import { ServerOpsRemoteTerminal } from './ServerOpsRemoteTerminal'
 import { ServerOpsOverviewPanel } from './ServerOpsOverviewPanel'
@@ -118,6 +119,7 @@ import { getServerOpsDataErrorMessage } from './server-ops-data-display'
 import { ServerOpsFilesWorkspace } from './ServerOpsFilesWorkspace'
 import { ServerOpsDockerConsole } from './ServerOpsDockerConsole'
 import { useServerOpsTransferLeave } from './useServerOpsTransferLeave'
+import { createServerOpsLocalSqliteProbeDraft, importServerOpsLocalSqlite, resolveServerOpsLocalSqliteFileSelection } from './server-ops-local-sqlite-controller'
 
 /** 新建数据源需要的项目服务器上下文。 */
 export interface ServerOpsProjectDataSourceHosts {
@@ -196,6 +198,7 @@ export const serverOpsDataApi: ServerOpsDataPanelApi = {
   listServerOpsDataSchemaTables: (input) => window.electronAPI.listServerOpsDataSchemaTables(input),
   describeServerOpsDataSchemaTable: (input) => window.electronAPI.describeServerOpsDataSchemaTable(input),
   readServerOpsDataSchemaRows: (input) => window.electronAPI.readServerOpsDataSchemaRows(input),
+  readServerOpsDataSchemaCell: (input) => window.electronAPI.readServerOpsDataSchemaCell(input),
   /** 延迟读取真实可选接口；热更新遇到旧 preload 时保留 undefined，让查询门禁生效。 */
   get queryServerOpsDatabase() { return window.electronAPI.queryServerOpsDatabase },
   get cancelServerOpsDatabaseQuery() { return window.electronAPI.cancelServerOpsDatabaseQuery },
@@ -1448,6 +1451,10 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
   const [savingDataSource, setSavingDataSource] = React.useState(false)
   /** 数据源表单的公开错误。 */
   const [dataSourceFormError, setDataSourceFormError] = React.useState<string | null>(null)
+  /** 当前 Pane 是否正在探测或保存一个本地 SQLite 文件。 */
+  const [localSqliteBusy, setLocalSqliteBusy] = React.useState(false)
+  /** 同一轮事件内也阻止重复松手，锁不依赖 React 下次渲染。 */
+  const localSqliteImportLock = React.useRef(false)
   /** 等待用户确认删除的服务器。 */
   const [pendingDeleteHost, setPendingDeleteHost] = React.useState<ServerOpsHost | null>(null)
   /** 删除写入是否正在进行。 */
@@ -1497,6 +1504,13 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
 
   /** 当前生效的项目；选择失效时回落到列表第一项，界面不停留在已删除项目上。 */
   const currentProjectId = resolveServerOpsCurrentProjectId(projects, selectedProjectId)
+  /** 本地文件异步回执只允许影响仍处于同一项目的原 Pane。 */
+  const localSqliteNavigationRef = React.useRef({ projectId: currentProjectId, paneActive, alive: true })
+  localSqliteNavigationRef.current = { projectId: currentProjectId, paneActive, alive: true }
+  React.useEffect(() => {
+    localSqliteNavigationRef.current.alive = true
+    return () => { localSqliteNavigationRef.current.alive = false }
+  }, [])
   /** 项目切换当帧就使用默认条件，effect 随后清理旧状态，不短暂显示旧搜索结果。 */
   const projectBrowse = projectBrowseState.projectId === currentProjectId
     ? projectBrowseState
@@ -1655,6 +1669,11 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
     setSavingDataSource(true)
     setDataSourceFormError(null)
     try {
+      if (input.engine === 'sqlite' && input.transport === 'direct' && input.filePath !== undefined) {
+        /** 本地文件必须先完成真实探测；损坏库不能只依赖保存失败来阻止落盘。 */
+        const probe = await serverOpsDataApi.probeServerOpsDataSource({ draft: createServerOpsLocalSqliteProbeDraft(input.filePath) })
+        if (probe.capability !== 'available') throw new Error(probe.warnings[0] ?? '无法打开 SQLite 文件')
+      }
       /** 主进程写盘后返回的连接记录。 */
       const result = await window.electronAPI.upsertServerOpsDataSource({ ...input, projectId: creatingDataSourceProjectId })
       dataSourceController.acceptSavedSource(result.source)
@@ -1672,9 +1691,79 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       toast.success('数据连接已添加')
     } catch (createError) {
       /** 主进程错误统一收敛成中文说明，避免把 IPC 原文（含稳定错误码）直接暴露给用户。 */
-      setDataSourceFormError(getServerOpsDataErrorMessage(createError))
+      const rawMessage = createError instanceof Error ? createError.message : ''
+      setDataSourceFormError(input.engine === 'sqlite' && input.transport === 'direct'
+        && rawMessage !== '' && !rawMessage.includes('SERVER_OPS_')
+        ? rawMessage
+        : getServerOpsDataErrorMessage(createError))
     } finally {
       setSavingDataSource(false)
+    }
+  }
+
+  /**
+   * 打开整个运维面板接收的单个本地 SQLite 文件。
+   *
+   * 路径由 Electron webUtils 提取；renderer 不读取文件内容，也不生成主进程维护的文件身份。
+   *
+   * @param files 当前运维面板拖放收到的原生文件
+   */
+  const handleOpenLocalSqlite = async (files: readonly File[]): Promise<void> => {
+    if (localSqliteImportLock.current || currentProjectId === null || !paneActive) return
+    if (files.length > 1) {
+      toast.warning('一次只能打开一个 SQLite 文件')
+      return
+    }
+    /** 文件路径解析失败时不把空路径送到主进程。 */
+    const paths = files.map((file) => {
+      try { return window.electronAPI.getPathForFile(file) } catch { return '' }
+    }).filter((path) => path !== '')
+    const selection = resolveServerOpsLocalSqliteFileSelection(paths)
+    if (selection.error) {
+      toast.warning(selection.error)
+      return
+    }
+    if (selection.filePath === null) return
+    /** 捕获发起时的项目；探测和写入期间切项目不会改变连接归属。 */
+    const projectId = currentProjectId
+    localSqliteImportLock.current = true
+    setLocalSqliteBusy(true)
+    /** 导入期间保留进度反馈，切换项目时不遮挡新的工作区。 */
+    const progressToast = toast.loading('正在打开本地数据库…')
+    try {
+      const result = await importServerOpsLocalSqlite({
+        projectId,
+        filePath: selection.filePath,
+        sources: workspaceStore.get(serverOpsDataSourcesAtom),
+        probe: async (draft) => serverOpsDataApi.probeServerOpsDataSource({ draft }),
+        upsert: async (input) => (await serverOpsDataApi.upsertServerOpsDataSource(input)).source,
+        isProjectCurrent: (requestedProjectId) => {
+          const current = localSqliteNavigationRef.current
+          return current.alive && current.paneActive && current.projectId === requestedProjectId
+        },
+      })
+      if (result.created) dataSourceController.acceptSavedSource(result.source)
+      if (!result.shouldNavigate) {
+        if (result.created) toast.success('本地 SQLite 已添加到原项目')
+        return
+      }
+      transferLeave.requestLeave(() => {
+        setContainerConsole(null)
+        setContainerLog(null)
+        setSelectedConnectionId(createServerOpsDataConnectionId(result.source.id))
+        setProjectViewActive(false)
+      })
+      toast.success(result.created ? '本地 SQLite 已打开' : '已打开现有 SQLite 连接')
+    } catch (openError) {
+      const rawMessage = openError instanceof Error ? openError.message : ''
+      const message = rawMessage !== '' && !rawMessage.includes('SERVER_OPS_')
+        ? rawMessage
+        : getServerOpsDataErrorMessage(openError)
+      toast.error('无法打开本地 SQLite', { description: message })
+    } finally {
+      toast.dismiss(progressToast)
+      localSqliteImportLock.current = false
+      if (localSqliteNavigationRef.current.alive) setLocalSqliteBusy(false)
     }
   }
   /** 当前选中主机的公开连接状态。 */
@@ -2189,7 +2278,9 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
       )
 
   return (
-    <div className="relative flex min-h-0 flex-1 overflow-hidden">
+    <ServerOpsLocalSqliteDropZone contextKey={currentProjectId} projectLabel={currentProject?.name ?? '当前项目'}
+      enabled={projectsStatus === 'ready' && currentProjectId !== null} busy={localSqliteBusy}
+      onFiles={(files) => { void handleOpenLocalSqlite(files) }}>
       {/* 中间区域三选一：项目分组列表、SSH 能力页签、数据连接详情。 */}
       {connectionPane ? <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {selectedConnection?.kind === 'ssh' ? renderWorkspaceToolbar() : null}
@@ -2351,6 +2442,6 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </ServerOpsLocalSqliteDropZone>
   )
 }

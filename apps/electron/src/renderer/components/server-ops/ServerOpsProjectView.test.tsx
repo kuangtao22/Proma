@@ -225,6 +225,14 @@ describe('项目视图', () => {
     expect(emptyHtml).toContain('还没有项目')
   })
 
+  test('Given 项目视图 When 未拖入文件 Then 只显示统一添加入口而不占用常驻导入行', () => {
+    const html = renderView()
+    expect(html).toContain('添加连接')
+    expect(html).not.toContain('打开本地 SQLite')
+    expect(html).not.toContain('data-server-ops-local-sqlite-dropzone')
+    expect(html).not.toContain('拖入 SQLite 文件')
+  })
+
   test('Given 三类连接 When 点击某一行 Then 回调收到该连接本身', () => {
     /** 收到的选择结果。 */
     const selected: ServerOpsConnection[] = []

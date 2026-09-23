@@ -7,6 +7,7 @@ import {
   limitServerOpsSqlQuery,
   parseServerOpsDataMetricList,
   parseServerOpsDataQueryResult,
+  parseServerOpsDataSourceCellResult,
   parseServerOpsDataSourceRowsResult,
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesResult,
@@ -21,7 +22,9 @@ import { getServerOpsSqlQueryPublicError } from './server-ops-query-runtime'
 import { SERVER_OPS_SQLITE_REMOTE_SCRIPT } from './server-ops-sqlite-script'
 
 /** 远端 stdout 的硬上限；略高于 schema 行结果合同，用于容纳 envelope。 */
-const MAX_REMOTE_STDOUT_BYTES = 1_200_000
+const MAX_REMOTE_STDOUT_BYTES = 2_200_000
+/** 单字段 JSON 最坏转义会放大到约六倍，仅 schema-cell 放宽传输 envelope。 */
+const MAX_REMOTE_CELL_STDOUT_BYTES = 6_300_000
 /** stderr 只用于判断进程是否异常，不向上透传，仍限制内存占用。 */
 const MAX_REMOTE_STDERR_BYTES = 16_384
 /** stdin JSON 上限，覆盖 16 KiB SQL 与请求元数据。 */
@@ -37,7 +40,9 @@ const SQLITE_PUBLIC_ERROR_MESSAGES = new Map<string, string>([
   ['SERVER_OPS_SQLITE_FILE_NOT_FOUND', 'SQLite 文件不存在'],
   ['SERVER_OPS_SQLITE_FILE_NOT_REGULAR', 'SQLite 路径不是普通文件'],
   ['SERVER_OPS_SQLITE_FILE_PERMISSION_DENIED', '当前 SSH 用户没有读取 SQLite 文件的权限'],
+  ['SERVER_OPS_SQLITE_LOCAL_FILE_PERMISSION_DENIED', '无法读取本地 SQLite 文件，请检查文件权限'],
   ['SERVER_OPS_SQLITE_FILE_UNAVAILABLE', 'SQLite 文件暂时不可用'],
+  ['SERVER_OPS_SQLITE_FILE_CHANGED', 'SQLite 文件已被替换，请重新选择'],
   ['SERVER_OPS_SQLITE_DATABASE_INVALID', '文件不是有效的 SQLite 数据库或数据库已损坏'],
   ['SERVER_OPS_SQLITE_DATABASE_LOCKED', 'SQLite 数据库正被锁定，请稍后重试'],
   ['SERVER_OPS_SQLITE_TIMEOUT', 'SQLite 读取超时'],
@@ -48,6 +53,10 @@ const SQLITE_PUBLIC_ERROR_MESSAGES = new Map<string, string>([
   ['SERVER_OPS_SQLITE_REQUEST_INVALID', 'SQLite 读取请求无效'],
   ['SERVER_OPS_SQLITE_READ_FAILED', 'SQLite 读取失败，请检查文件状态与读取权限'],
   ['SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID', '筛选条件无效或字段不可用于筛选'],
+  ['SERVER_OPS_DATA_CELL_CHANGED', '该单元格所在行或内容已变化，请刷新后重试'],
+  ['SERVER_OPS_DATA_CELL_REDACTED', '敏感字段不允许查看完整内容'],
+  ['SERVER_OPS_DATA_CELL_TOO_LARGE', '单元格完整内容超过 1 MiB 安全上限'],
+  ['SERVER_OPS_DATA_CELL_TIMEOUT', '单元格完整内容读取超时'],
 ])
 
 /** SSH exec channel 的 stderr 最小接口。 */
@@ -104,7 +113,7 @@ function quoteShellLiteral(value: string): string {
 export const SERVER_OPS_SQLITE_COMMAND = `python3 -I -S -c ${quoteShellLiteral(SERVER_OPS_SQLITE_REMOTE_SCRIPT)}`
 
 /** 从稳定码创建不携带原始异常内容的公开错误。 */
-function createPublicError(code: string): ServerOpsSqlitePublicError {
+export function createServerOpsSqlitePublicError(code: string): ServerOpsSqlitePublicError {
   /** 未知远端码统一降级，禁止伪造任意 message。 */
   const normalizedCode = SQLITE_PUBLIC_ERROR_MESSAGES.has(code) || getServerOpsSqlQueryPublicError(new Error(code)) !== undefined
     ? code
@@ -114,6 +123,9 @@ function createPublicError(code: string): ServerOpsSqlitePublicError {
   const publicMessage = SQLITE_PUBLIC_ERROR_MESSAGES.get(normalizedCode) ?? queryError?.message ?? 'SQLite 读取失败，请检查文件状态与读取权限'
   return new ServerOpsSqlitePublicError(normalizedCode, publicMessage)
 }
+
+/** 模块内部沿用短名称，避免远端读取路径产生无关改动。 */
+const createPublicError = createServerOpsSqlitePublicError
 
 /**
  * 读取 SQLite 异常的公开稳定码与固定说明。
@@ -145,13 +157,13 @@ function validateInput(input: ServerOpsRuntimeDataReadRequest): void {
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 600_000) {
     throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
   }
-  if (input.mode === 'schema-table' || input.mode === 'schema-rows') {
+  if (input.mode === 'schema-table' || input.mode === 'schema-rows' || input.mode === 'schema-cell') {
     if (!isBoundedText(input.schemaTable, 128)) throw createPublicError('SERVER_OPS_SQLITE_TABLE_REQUIRED')
   }
-  if (input.mode === 'schema-rows') {
-    if (!Number.isSafeInteger(input.rowOffset) || (input.rowOffset ?? -1) < 0 || (input.rowOffset ?? 0) > 1_000_000
-      || !Number.isSafeInteger(input.rowLimit) || (input.rowLimit ?? 0) < 1 || (input.rowLimit ?? 0) > 200
-      || (input.rowOffset ?? 0) % (input.rowLimit ?? 1) !== 0) {
+  if (input.mode === 'schema-rows' || input.mode === 'schema-cell') {
+    if (!Number.isSafeInteger(input.rowOffset) || (input.rowOffset ?? -1) < 0 || (input.rowOffset ?? 0) > (input.mode === 'schema-cell' ? 1_000_199 : 1_000_000)
+      || (input.mode === 'schema-rows' && (!Number.isSafeInteger(input.rowLimit) || (input.rowLimit ?? 0) < 1 || (input.rowLimit ?? 0) > 200
+        || (input.rowOffset ?? 0) % (input.rowLimit ?? 1) !== 0))) {
       throw createPublicError('SERVER_OPS_SQLITE_REQUEST_INVALID')
     }
     if (input.rowFilters !== undefined) {
@@ -170,13 +182,13 @@ function normalizeQueryParserError(error: unknown): never {
 }
 
 /** 构造只含安全、已校验字段的远端 stdin JSON。 */
-function createRemotePayload(input: ServerOpsRuntimeDataReadRequest): Record<string, unknown> {
+export function createServerOpsSqliteExecutionPayload(input: ServerOpsRuntimeDataReadRequest): Record<string, unknown> {
   /** 所有请求共享且由本地校验过的固定字段。 */
   const base: Record<string, unknown> = {
     mode: input.mode,
     filePath: input.filePath,
     timeoutMs: Math.min(
-      input.mode === 'sql-query' || input.mode === 'schema-rows' ? SERVER_OPS_DATA_QUERY_TIMEOUT_MS : 15_000,
+      input.mode === 'sql-query' || input.mode === 'schema-rows' || input.mode === 'schema-cell' ? SERVER_OPS_DATA_QUERY_TIMEOUT_MS : 15_000,
       Math.max(250, input.timeoutMs),
     ),
   }
@@ -187,6 +199,18 @@ function createRemotePayload(input: ServerOpsRuntimeDataReadRequest): Record<str
   if (input.mode === 'schema-rows') {
     return {
       ...base, schemaTable: input.schemaTable, rowOffset: input.rowOffset, rowLimit: input.rowLimit,
+      ...(input.baseTablesOnly ? { baseTablesOnly: true } : {}),
+      ...(input.rowFilters === undefined ? {} : { rowFilters: input.rowFilters }),
+    }
+  }
+  if (input.mode === 'schema-cell') {
+    return {
+      ...base,
+      schemaTable: input.schemaTable,
+      rowOffset: input.rowOffset,
+      cellColumnIndex: input.cellColumnIndex,
+      cellExpectedColumn: input.cellExpectedColumn,
+      cellSha256: input.cellSha256,
       ...(input.baseTablesOnly ? { baseTablesOnly: true } : {}),
       ...(input.rowFilters === undefined ? {} : { rowFilters: input.rowFilters }),
     }
@@ -260,7 +284,8 @@ async function executeRemote(
     /** 本地兜底超时略晚于远端硬墙钟，处理远端退出通知丢失或 SSH channel 卡住。 */
     const localTimeout = setTimeout(() => {
       terminateChannel(channel)
-      finish(createPublicError(payload.mode === 'sql-query' ? 'SERVER_OPS_DATA_QUERY_TIMEOUT' : 'SERVER_OPS_SQLITE_TIMEOUT'))
+      finish(createPublicError(payload.mode === 'sql-query' ? 'SERVER_OPS_DATA_QUERY_TIMEOUT'
+        : payload.mode === 'schema-cell' ? 'SERVER_OPS_DATA_CELL_TIMEOUT' : 'SERVER_OPS_SQLITE_TIMEOUT'))
     }, Number(payload.timeoutMs) + 1_000)
 
     /** 统一完成并释放取消监听。 */
@@ -283,7 +308,7 @@ async function executeRemote(
       /** Buffer.from 同时接受 SSH Buffer 与字符串测试替身。 */
       const buffer = Buffer.from(chunk)
       stdoutBytes += buffer.byteLength
-      if (stdoutBytes > MAX_REMOTE_STDOUT_BYTES) {
+      if (stdoutBytes > (payload.mode === 'schema-cell' ? MAX_REMOTE_CELL_STDOUT_BYTES : MAX_REMOTE_STDOUT_BYTES)) {
         terminateChannel(channel)
         finish(createPublicError('SERVER_OPS_SQLITE_RESULT_TOO_LARGE'))
         return
@@ -314,7 +339,8 @@ async function executeRemote(
         return
       }
       if (exitCode === 124) {
-        finish(createPublicError(payload.mode === 'sql-query' ? 'SERVER_OPS_DATA_QUERY_TIMEOUT' : 'SERVER_OPS_SQLITE_TIMEOUT'))
+        finish(createPublicError(payload.mode === 'sql-query' ? 'SERVER_OPS_DATA_QUERY_TIMEOUT'
+          : payload.mode === 'schema-cell' ? 'SERVER_OPS_DATA_CELL_TIMEOUT' : 'SERVER_OPS_SQLITE_TIMEOUT'))
         return
       }
       if (exitCode !== undefined && exitCode !== 0) {
@@ -382,7 +408,7 @@ function parseBudgetedQueryResult(value: unknown): ServerOpsDataQueryResult {
 }
 
 /** 按请求 mode 严格解析 Python 返回并恢复 runtime 协议字段。 */
-function parseRemoteResult(input: ServerOpsRuntimeDataReadRequest, value: unknown): ServerOpsRuntimeDataReadResult {
+export function parseServerOpsSqliteExecutionResult(input: ServerOpsRuntimeDataReadRequest, value: unknown): ServerOpsRuntimeDataReadResult {
   if (!isRecord(value)) throw createPublicError('SERVER_OPS_SQLITE_READ_FAILED')
   if (input.mode === 'sql-query') {
     const parsed = parseBudgetedQueryResult(value)
@@ -419,6 +445,11 @@ function parseRemoteResult(input: ServerOpsRuntimeDataReadRequest, value: unknow
     })
     return { mode: input.mode, capability: 'available', ...parsed, warnings: parseServerOpsDataWarnings(value.warnings) }
   }
+  if (input.mode === 'schema-cell') {
+    if (value.mode !== input.mode || value.capability !== 'available') throw createPublicError('SERVER_OPS_SQLITE_READ_FAILED')
+    const parsed = parseServerOpsDataSourceCellResult({ value: value.value })
+    return { mode: input.mode, capability: 'available', ...parsed, warnings: parseServerOpsDataWarnings(value.warnings) }
+  }
   /** probe 与 diagnostics 使用同一无 mode 结果合同。 */
   if (value.capability !== 'available' || typeof value.serverVersion !== 'string'
     || value.serverVersion.length < 1 || value.serverVersion.length > 128) throw createPublicError('SERVER_OPS_SQLITE_READ_FAILED')
@@ -445,10 +476,10 @@ export async function runServerOpsSqliteRead(
   signal?: AbortSignal,
 ): Promise<ServerOpsRuntimeDataReadResult> {
   validateInput(input)
-  const payload = createRemotePayload(input)
+  const payload = createServerOpsSqliteExecutionPayload(input)
   const remoteResult = await executeRemote(payload, createChannel, signal)
   try {
-    return parseRemoteResult(input, remoteResult)
+    return parseServerOpsSqliteExecutionResult(input, remoteResult)
   } catch (error) {
     if (error instanceof ServerOpsSqlitePublicError) throw error
     throw createPublicError('SERVER_OPS_SQLITE_READ_FAILED')

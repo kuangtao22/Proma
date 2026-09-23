@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils'
 import { SERVER_OPS_STATUSBAR_CLASS, SERVER_OPS_TABLE_CLASS, SERVER_OPS_TAB_CLASS, SERVER_OPS_TOOLBAR_CLASS } from './server-ops-ui'
 import type { ServerOpsSchemaBrowserProjection, ServerOpsSchemaDetailTab, ServerOpsSchemaLoadState } from './server-ops-schema-controller'
 import { ServerOpsRowFilterPanel } from './ServerOpsRowFilterPanel'
+import { ServerOpsSchemaCellDialog } from './ServerOpsSchemaCellDialog'
 
 /** 字节数展示；未知与零容量分开。 */
 export function formatServerOpsSchemaBytes(value: number | undefined): string {
@@ -46,6 +47,9 @@ export interface ServerOpsSchemaBrowserViewProps {
   onBackToList: () => void
   onDetailTabChange: (tab: ServerOpsSchemaDetailTab) => void
   onLoadRows: (offset: number) => void
+  /** 表浏览入口必须接通详情打开与关闭，避免静默退化为不可点击。 */
+  onOpenCell: (rowIndex: number, columnIndex: number) => void
+  onCloseCell: () => void
   onApplyRowFilters?: (filters: ServerOpsDataRowFilters | null) => void
   onLoadFilterFields?: () => void
   onRefresh: () => void
@@ -96,7 +100,7 @@ export function ServerOpsDatabaseSelector({ projection, onSelectDatabase, onRefr
 
 /** 持续表目录与右侧表工作区；窄面板目录通过局部 Dialog 覆盖。 */
 export function ServerOpsSchemaBrowserView({
-  projection, onSelectDatabase, onOpenTable, onDetailTabChange, onLoadRows, onRefresh,
+  projection, onSelectDatabase, onOpenTable, onDetailTabChange, onLoadRows, onOpenCell, onCloseCell, onRefresh,
   onRefreshTables = onRefresh, onApplyRowFilters, onLoadFilterFields,
   directoryWidth = 190, onDirectoryWidthChange, showDatabaseSelector = true,
 }: ServerOpsSchemaBrowserViewProps): React.ReactElement {
@@ -179,7 +183,7 @@ export function ServerOpsSchemaBrowserView({
             </div>
             <TabsContent value="data" className="m-0 flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden">
               {onApplyRowFilters && onLoadFilterFields ? <div id={filterPanelId} className="shrink-0"><ServerOpsRowFilterPanel key={JSON.stringify([projection.sourceId, projection.database, projection.selectedTable])} open={ui.filterOpen} columns={projection.structure.columns} structureStatus={projection.structure.status} structureError={projection.structure.error} appliedFilters={projection.rowFilters} busy={projection.rows.status === 'loading'} onApply={onApplyRowFilters} onRetryFields={onLoadFilterFields} /></div> : null}
-              <SchemaRowsPanel state={projection.rows} filtered={projection.rowFilters !== null} onLoadRows={onLoadRows} onRetry={onRefresh} />
+              <SchemaRowsPanel state={projection.rows} filtered={projection.rowFilters !== null} onLoadRows={onLoadRows} onOpenCell={onOpenCell} onRetry={onRefresh} />
             </TabsContent>
             <TabsContent value="structure" className="m-0 flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"><SchemaStructurePanel state={projection.structure} onRetry={onRefresh} /></TabsContent>
             <TabsContent value="indexes" className="m-0 flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"><SchemaIndexesPanel state={projection.structure} onRetry={onRefresh} /></TabsContent>
@@ -187,6 +191,7 @@ export function ServerOpsSchemaBrowserView({
           </Tabs>
         )}
       </div>
+      {projection.cellDetail !== null ? <ServerOpsSchemaCellDialog detail={projection.cellDetail} onClose={onCloseCell} /> : null}
     </div>
   )
 }
@@ -194,12 +199,19 @@ export function ServerOpsSchemaBrowserView({
 /** 统一固定表头和数据网格尺寸，让滚动留在内容区。 */
 const gridClass = cn(SERVER_OPS_TABLE_CLASS, 'whitespace-nowrap [&_th]:sticky [&_th]:top-0 [&_th]:z-10 [&_th]:border-b [&_th]:border-border/40 [&_th]:bg-content-area')
 
+/** 行网格属性；打开动作可选以兼容只读静态渲染。 */
+interface SchemaRowsGridProps extends Pick<ServerOpsSchemaBrowserProjection['rows'], 'columns' | 'rows' | 'offset'> {
+  onOpenCell?: (rowIndex: number, columnIndex: number) => void
+}
+
 /** 只依赖行快照的表格；外层加载态、筛选展开和分页按钮更新不会重做单元格格式化。 */
-export const SchemaRowsGrid = React.memo(function SchemaRowsGrid({ columns, rows, offset }: Pick<ServerOpsSchemaBrowserProjection['rows'], 'columns' | 'rows' | 'offset'>): React.ReactElement {
+export const SchemaRowsGrid = React.memo(function SchemaRowsGrid({ columns, rows, offset, onOpenCell }: SchemaRowsGridProps): React.ReactElement {
   return <table className={gridClass}><thead><tr>{columns.map((column) => <th key={column} scope="col">{column}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={`${offset + rowIndex}`}>{row.map((cell, cellIndex) => {
     /** 同一格的 title 与正文共享展示文本，不重复格式化。 */
     const text = formatServerOpsSchemaCell(cell)
-    return <td key={cellIndex} className={cn('max-w-[20rem] truncate font-mono', typeof cell === 'string' && /^-?\d+(\.\d+)?$/u.test(cell) && 'text-right tabular-nums', (cell === null || cell === '' || typeof cell === 'object') && 'text-muted-foreground italic')} title={text}>{text}</td>
+    /** 单元格内容的稳定样式。 */
+    const contentClass = cn('block max-w-[20rem] truncate font-mono', typeof cell === 'string' && /^-?\d+(\.\d+)?$/u.test(cell) && 'text-right tabular-nums', (cell === null || cell === '' || typeof cell === 'object') && 'text-muted-foreground italic')
+    return <td key={cellIndex} className="max-w-[20rem] p-0" title={text}>{onOpenCell ? <button type="button" className={cn('w-full px-3 py-2 text-left hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50', contentClass)} aria-label={`查看第 ${offset + rowIndex + 1} 行 ${columns[cellIndex] ?? `第 ${cellIndex + 1} 列`} 的完整内容`} onClick={() => onOpenCell(rowIndex, cellIndex)}>{text}</button> : <span className={contentClass}>{text}</span>}</td>
   })}</tr>)}</tbody></table>
 })
 
@@ -221,13 +233,13 @@ function SchemaPropertiesPanel({ table }: { table: ServerOpsDataSchemaTableSumma
 }
 
 /** 只读分页网格，空表也保留真实字段头。 */
-function SchemaRowsPanel({ state, filtered, onLoadRows, onRetry }: { state: ServerOpsSchemaBrowserProjection['rows']; filtered: boolean; onLoadRows: (offset: number) => void; onRetry: () => void }): React.ReactElement {
+function SchemaRowsPanel({ state, filtered, onLoadRows, onOpenCell, onRetry }: { state: ServerOpsSchemaBrowserProjection['rows']; filtered: boolean; onLoadRows: (offset: number) => void; onOpenCell?: (rowIndex: number, columnIndex: number) => void; onRetry: () => void }): React.ReactElement {
   /** 在途请求与偏移上限共同限制分页操作。 */
   const busy = state.status === 'loading'
   const hasMore = state.hasMore ?? state.rows.length >= state.limit
   return <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" data-server-ops-schema-rows>
     <ServerOpsDataReadStatus state={state} onRetry={onRetry} />
-    <div className="min-h-0 min-w-0 flex-1 overflow-auto"><SchemaRowsGrid columns={state.columns} rows={state.rows} offset={state.offset} />{state.status === 'ready' && !state.rows.length ? <div className="p-8 text-center text-xs text-muted-foreground">{filtered ? '没有符合筛选条件的记录' : '暂无记录'}</div> : null}</div>
+    <div className="min-h-0 min-w-0 flex-1 overflow-auto"><SchemaRowsGrid columns={state.columns} rows={state.rows} offset={state.offset} onOpenCell={onOpenCell} />{state.status === 'ready' && !state.rows.length ? <div className="p-8 text-center text-xs text-muted-foreground">{filtered ? '没有符合筛选条件的记录' : '暂无记录'}</div> : null}</div>
     {state.orderedByPrimaryKey === false ? <p className="shrink-0 bg-muted/30 px-4 py-1.5 text-[11px] text-muted-foreground">无主键，分页顺序可能变化</p> : null}
     {state.truncated ? <p className="shrink-0 bg-muted/30 px-4 py-1.5 text-[11px] text-muted-foreground">已按列数、文本或结果大小上限截断</p> : null}
     <div className={SERVER_OPS_STATUSBAR_CLASS}><span className="min-w-0 flex-1 tabular-nums">{filtered ? '筛选结果 · ' : ''}{state.rows.length ? `第 ${state.offset + 1}–${state.offset + state.rows.length} 行` : '0 行'}{filtered || state.totalEstimate === undefined ? '' : ` / 约 ${formatServerOpsSchemaCount(state.totalEstimate)} 行`}</span><span>{state.limit} 行/页</span><Button size="icon-sm" variant="ghost" aria-label="上一页" disabled={busy || state.offset === 0} onClick={() => onLoadRows(Math.max(0, state.offset - state.limit))}><ChevronLeft className="size-3.5" /></Button><Button size="icon-sm" variant="ghost" aria-label="下一页" disabled={busy || !hasMore || state.offset + state.limit > 1_000_000} onClick={() => onLoadRows(state.offset + state.limit)}><ChevronRight className="size-3.5" /></Button></div>

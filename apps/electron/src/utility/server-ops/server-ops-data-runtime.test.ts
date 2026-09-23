@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { PassThrough } from 'node:stream'
 import { connect as connectTcp, type AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
@@ -795,12 +796,13 @@ describe('数据服务 runtime 解析与指标构造', () => {
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('odd`table', ['id`part', 'empty', 'nullable', 'payload', 'note'], null, { 'id`part': 'int', payload: 'blob' }, ['id`part']), []]
       if (isPreviewRowsSql(sql)) {
         expect(sql).toContain('OCTET_LENGTH(`payload`) AS `payload`')
-        expect(sql).toContain('LEFT(`note`, 257) AS `note`')
+        expect(sql).toContain('LEFT(CONVERT(`note` USING utf8mb4), 257) AS `note`')
         expect(sql).toContain('`db``name`.`odd``table` ORDER BY `id``part`')
         expect(sql).toContain('LIMIT 3 OFFSET 0')
         expect(values).toEqual([])
         return [[
-          { 'id`part': 1, empty: '', nullable: null, payload: 2, note: 'x'.repeat(257) },
+          { 'id`part': 1, empty: '', nullable: null, payload: 2, note: 'x'.repeat(257),
+            __proma_cell_sha256_4: createHash('sha256').update('x'.repeat(257), 'utf8').digest('hex') },
           { 'id`part': 2, empty: '', nullable: null, payload: 0, note: 'ok' },
           { 'id`part': 3, empty: '', nullable: null, payload: 1, note: 'more' },
         ], [{ name: 'id`part' }, { name: 'empty' }, { name: 'nullable' }, { name: 'payload' }, { name: 'note' }]]
@@ -850,6 +852,85 @@ describe('数据服务 runtime 解析与指标构造', () => {
       expect.objectContaining({ sql: expect.stringContaining('information_schema.TABLES AS t'), values: ['app', 'orders'] }),
       expect.objectContaining({ sql: expect.stringContaining(' FROM `app`.`orders`'), values: ["%a!%!_!!' OR 1=1%", '20'] }),
     ])
+  })
+
+  test('Given latin1、emoji、JSON 与控制字符文本 When MySQL 预览 Then 统一按 utf8mb4 摘要且安全截断', async () => {
+    const emoji = '😀'.repeat(200)
+    const json = JSON.stringify({ message: '界'.repeat(300) })
+    const controlled = 'line1\nline2'
+    const fixture = createMySqlConnection((sql) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('events', ['latin_note', 'json_data', 'controlled'], 1,
+        { latin_note: 'varchar', json_data: 'json', controlled: 'text' }), []]
+      if (isPreviewRowsSql(sql)) {
+        expect(sql).toContain('LEFT(CONVERT(`latin_note` USING utf8mb4), 257)')
+        expect(sql).toContain('OCTET_LENGTH(CONVERT(`latin_note` USING utf8mb4)) > 256')
+        expect(sql).toContain('LEFT(CONVERT(`json_data` USING utf8mb4), 257)')
+        return [[{
+          latin_note: emoji,
+          json_data: json.slice(0, 257),
+          controlled,
+          __proma_cell_sha256_0: createHash('sha256').update(emoji, 'utf8').digest('hex'),
+          __proma_cell_sha256_1: createHash('sha256').update(json, 'utf8').digest('hex'),
+          __proma_cell_sha256_2: createHash('sha256').update(controlled, 'utf8').digest('hex'),
+        }], [{ name: 'latin_note' }, { name: 'json_data' }, { name: 'controlled' }]]
+      }
+      return [[], []]
+    })
+    const result = await readMySqlWithConnection(fixture.connection, {
+      mode: 'schema-rows', schemaDatabase: 'app', schemaTable: 'events', rowOffset: 0, rowLimit: 10,
+      engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled',
+    })
+    if (!('rows' in result)) throw new Error('TEST_SCHEMA_ROWS_MISSING')
+    expect(result.rows[0]?.[0]).toEqual({ kind: 'text', text: '😀'.repeat(128), truncated: true,
+      sha256: createHash('sha256').update(emoji, 'utf8').digest('hex') })
+    expect(result.rows[0]?.[1]).toMatchObject({ kind: 'text', truncated: true,
+      sha256: createHash('sha256').update(json, 'utf8').digest('hex') })
+    expect(result.rows[0]?.[2]).toEqual({ kind: 'text', text: 'line1 line2', truncated: true,
+      sha256: createHash('sha256').update(controlled, 'utf8').digest('hex') })
+  })
+
+  test('Given MySQL 单元格摘要 When 按绝对偏移读取 Then 仅返回匹配且不超限的同一正文', async () => {
+    const fullText = `${'前缀'.repeat(128)}-完整尾部`
+    const digest = createHash('sha256').update(fullText, 'utf8').digest('hex')
+    let changed = false
+    let tooLarge = false
+    const fixture = createMySqlConnection((sql, values) => {
+      if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
+      if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('events', ['id', 'payload', 'authorization'], 1,
+        { id: 'int', payload: 'text', authorization: 'text' }, ['id']), []]
+      if (sql.includes('AS value_bytes')) {
+        expect(sql).toContain('ORDER BY `id` LIMIT 1 OFFSET 7')
+        expect(values).toEqual(['active'])
+        if (sql.includes('THEN `id` END AS value')) return [[{ value: 1, value_bytes: 1, value_sha256: null }], []]
+        expect(sql).toContain('CONVERT(`payload` USING utf8mb4)')
+        if (tooLarge) return [[{ value: null, value_bytes: 1_048_577, value_sha256: digest }], []]
+        return [[{ value: changed ? `${fullText}已变化` : fullText, value_bytes: Buffer.byteLength(fullText),
+          value_sha256: changed ? createHash('sha256').update(`${fullText}已变化`, 'utf8').digest('hex') : digest }], []]
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`)
+    })
+    const input = {
+      mode: 'schema-cell' as const, schemaDatabase: 'app', schemaTable: 'events', rowOffset: 7,
+      cellColumnIndex: 1, cellExpectedColumn: 'payload', cellSha256: digest,
+      rowFilters: { match: 'all' as const, conditions: [{ column: 'id', operator: 'eq' as const, value: 'active' }] },
+      engine: 'mysql' as const, address: '127.0.0.1', port: 3306, tlsMode: 'disabled' as const,
+    }
+    await expect(readMySqlWithConnection(fixture.connection, input)).resolves.toMatchObject({ mode: 'schema-cell', value: fullText })
+    changed = true
+    await expect(readMySqlWithConnection(fixture.connection, input)).rejects.toThrow('SERVER_OPS_DATA_CELL_CHANGED')
+    changed = false
+    tooLarge = true
+    await expect(readMySqlWithConnection(fixture.connection, input)).rejects.toThrow('SERVER_OPS_DATA_CELL_TOO_LARGE')
+    await expect(readMySqlWithConnection(fixture.connection, {
+      ...input, cellColumnIndex: 0, cellExpectedColumn: 'id', cellSha256: digest,
+    })).rejects.toThrow('SERVER_OPS_DATA_CELL_CHANGED')
+    await expect(readMySqlWithConnection(fixture.connection, {
+      ...input, cellColumnIndex: 0, cellExpectedColumn: 'id', cellSha256: createHash('sha256').update('1', 'utf8').digest('hex'),
+    })).resolves.toMatchObject({ mode: 'schema-cell', value: '1' })
+    await expect(readMySqlWithConnection(fixture.connection, {
+      ...input, cellColumnIndex: 2, cellExpectedColumn: 'authorization', cellSha256: digest,
+    })).rejects.toThrow('SERVER_OPS_DATA_CELL_REDACTED')
   })
 
   test('Given 字段不在真实表或属于敏感列 When MySQL 筛选 Then 查询前拒绝', async () => {
@@ -954,9 +1035,11 @@ describe('数据服务 runtime 解析与指标构造', () => {
 
   test('Given 行预览命中总字节预算 When 裁剪 Then 保留全部页内行且显式标记文本截断', async () => {
     const fields = Array.from({ length: 64 }, (_, index) => ({ name: `column_${index}` }))
-    const sourceRows = Array.from({ length: 201 }, (_, rowIndex) => Object.fromEntries(
-      fields.map((field) => [field.name, `第${rowIndex}行`.repeat(100).slice(0, 257)]),
-    ))
+    const sourceRows = Array.from({ length: 201 }, (_, rowIndex) => {
+      const values = fields.map((field) => [field.name, `第${rowIndex}行`.repeat(100).slice(0, 257)] as const)
+      return Object.fromEntries(values.flatMap(([name, value], index) => [[name, value],
+        [`__proma_cell_sha256_${index}`, createHash('sha256').update(value, 'utf8').digest('hex')]]))
+    })
     const fixture = createMySqlConnection((sql) => {
       if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('wide_table', fields.map((field) => field.name)), []]
@@ -971,16 +1054,19 @@ describe('数据服务 runtime 解析与指标构造', () => {
     expect(result.rows).toHaveLength(200)
     expect(result.hasMore).toBe(true)
     expect(result.truncated).toBe(true)
-    expect(Buffer.byteLength(JSON.stringify(result.rows), 'utf8')).toBeLessThanOrEqual(1_048_576)
+    expect(Buffer.byteLength(JSON.stringify(result.rows, (key, value) => key === 'sha256' ? undefined : value), 'utf8')).toBeLessThanOrEqual(1_048_576)
+    expect(Buffer.byteLength(JSON.stringify(result.rows), 'utf8')).toBeLessThanOrEqual(2_097_152)
     expect(result.rows[199]?.every((cell) => typeof cell === 'object' && cell !== null && cell.kind === 'text')).toBe(true)
   })
 
   test('Given 反斜杠引号与多字节文本放大 JSON When 裁剪 Then 最终序列化仍不越过预算', async () => {
     const fields = Array.from({ length: 64 }, (_, index) => ({ name: `column_${index}` }))
     /** 混合字符同时覆盖 JSON 转义膨胀和 UTF-8 多字节计量。 */
-    const sourceRows = Array.from({ length: 200 }, () => Object.fromEntries(
-      fields.map((field) => [field.name, '\\\"界'.repeat(100).slice(0, 257)]),
-    ))
+    const sourceRows = Array.from({ length: 200 }, () => {
+      const values = fields.map((field) => [field.name, '\\\"界'.repeat(100).slice(0, 257)] as const)
+      return Object.fromEntries(values.flatMap(([name, value], index) => [[name, value],
+        [`__proma_cell_sha256_${index}`, createHash('sha256').update(value, 'utf8').digest('hex')]]))
+    })
     const fixture = createMySqlConnection((sql) => {
       if (sql.includes('VERSION()')) return [[{ version: '8.0.36' }], []]
       if (sql.includes('information_schema.TABLES AS t')) return [createPreviewColumns('escaped_table', fields.map((field) => field.name), 200), []]
@@ -994,7 +1080,8 @@ describe('数据服务 runtime 解析与指标构造', () => {
     if (!('rows' in result)) throw new Error('TEST_SCHEMA_ROWS_MISSING')
     expect(result.rows).toHaveLength(200)
     expect(result.truncated).toBe(true)
-    expect(Buffer.byteLength(JSON.stringify(result.rows), 'utf8')).toBeLessThanOrEqual(1_048_576)
+    expect(Buffer.byteLength(JSON.stringify(result.rows, (key, value) => key === 'sha256' ? undefined : value), 'utf8')).toBeLessThanOrEqual(1_048_576)
+    expect(Buffer.byteLength(JSON.stringify(result.rows), 'utf8')).toBeLessThanOrEqual(2_097_152)
     /** 协议层会把内部 mode/capability/warnings 剥离后交给公开 rows parser。 */
     expect(() => parseServerOpsDataSourceRowsResult({
       columns: result.columns,

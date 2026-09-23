@@ -33,8 +33,10 @@ export interface ServerOpsStoredDataSource {
   /** 网络引擎使用地址与端口；SQLite 使用服务器文件路径。 */
   address?: string
   port?: number
-  /** SSH 服务器上的 SQLite 绝对文件路径。 */
+  /** SQLite 绝对文件路径：direct 为本机，SSH 为远端服务器。 */
   filePath?: string
+  /** 主进程登记的本地 SQLite 文件身份。 */
+  localFileId?: string
   database?: string
   username?: string
   tlsMode: ServerOpsDataTlsMode
@@ -125,6 +127,7 @@ function parseStoredDataSource(value: unknown): ServerOpsStoredDataSource {
       ...(parsed.address === undefined ? {} : { address: parsed.address }),
       ...(parsed.port === undefined ? {} : { port: parsed.port }),
       ...(parsed.filePath === undefined ? {} : { filePath: parsed.filePath }),
+      ...(parsed.localFileId === undefined ? {} : { localFileId: parsed.localFileId }),
       ...(parsed.database === undefined ? {} : { database: parsed.database }),
       ...(parsed.username === undefined ? {} : { username: parsed.username }),
       tlsMode: parsed.tlsMode,
@@ -223,9 +226,10 @@ export class ServerOpsDataSourceStore {
    *
    * @param input 已通过共享合同解析的写入输入
    * @param credentialRef 可选的密码密文引用
+   * @param localFileId 主进程校验的本地 SQLite 文件身份，不能来自渲染层输入
    * @returns 新建的数据源副本
    */
-  create(input: ServerOpsDataSourceUpsertInput, credentialRef?: string): ServerOpsStoredDataSource {
+  create(input: ServerOpsDataSourceUpsertInput, credentialRef?: string, localFileId?: string): ServerOpsStoredDataSource {
     if (input.sourceId !== undefined) throw new Error('SERVER_OPS_DATA_SOURCE_ID_INVALID')
     if (credentialRef !== undefined && !isServerOpsId(credentialRef)) throw new Error('SERVER_OPS_CREDENTIAL_REF_INVALID')
     /** 新数据源的稳定 ID。 */
@@ -250,6 +254,7 @@ export class ServerOpsDataSourceStore {
         ...(input.address === undefined ? {} : { address: input.address }),
         ...(input.port === undefined ? {} : { port: input.port }),
         ...(input.filePath === undefined ? {} : { filePath: input.filePath }),
+        ...(localFileId === undefined ? {} : { localFileId }),
         ...(input.database === undefined ? {} : { database: input.database }),
         ...(input.username === undefined ? {} : { username: input.username }),
         tlsMode: input.tlsMode,
@@ -258,6 +263,7 @@ export class ServerOpsDataSourceStore {
         createdAt: now,
         updatedAt: now,
       }
+      parseStoredDataSource(created)
       this.persist([...loaded.sources, created], loaded.expectedDestination, loaded.priorBackup)
       return cloneSource(created)
     })
@@ -282,6 +288,8 @@ export class ServerOpsDataSourceStore {
       port?: number
       /** 编辑 SQLite 文件目标时参与原子配置更新。 */
       filePath?: string
+      /** 本地文件绑定变更；切换到 SSH 时清除。 */
+      localFileId?: string | null
       database?: string | null
       username?: string | null
       tlsMode?: ServerOpsDataTlsMode
@@ -319,6 +327,8 @@ export class ServerOpsDataSourceStore {
         ...(patch.tlsMode === undefined ? {} : { tlsMode: patch.tlsMode }),
         updatedAt: Math.max(now, existing.updatedAt),
       }
+      if (patch.localFileId === null) delete updated.localFileId
+      else if (patch.localFileId !== undefined) updated.localFileId = patch.localFileId
       if (patch.database === null) delete updated.database
       else if (patch.database !== undefined) updated.database = patch.database
       if (patch.username === null) delete updated.username

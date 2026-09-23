@@ -6,6 +6,7 @@ import type { ServerOpsSftpRequest } from './server-ops/server-ops-sftp-runtime'
 import { runServerOpsDataRead } from './server-ops/server-ops-data-runtime'
 import { runServerOpsSqliteRead, getServerOpsSqlitePublicError } from './server-ops/server-ops-sqlite-runtime'
 import type { ServerOpsSqliteChannelFactory } from './server-ops/server-ops-sqlite-runtime'
+import { runServerOpsLocalSqliteRead } from './server-ops/server-ops-local-sqlite-runtime'
 import type { ServerOpsDataRuntimeInput } from './server-ops/server-ops-data-runtime'
 import { getServerOpsSqlQueryPublicError } from './server-ops/server-ops-query-runtime'
 import { getServerOpsRowFilterPublicError } from './server-ops/server-ops-row-filter-sql'
@@ -639,8 +640,10 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       reject(error)
     }
   })
-  /** protocol parser 已校验端点分支；SQLite 与网络驱动共享在途身份和终态收束。 */
-  const read = input.engine === 'sqlite'
+  /** protocol parser 已校验端点分支；本地文件不要求存在 SSH 连接。 */
+  const read = input.engine === 'sqlite' && input.transport === 'direct'
+    ? runServerOpsLocalSqliteRead(input, controller.signal)
+    : input.engine === 'sqlite'
     ? runServerOpsSqliteRead(input, createSqliteChannel, controller.signal)
     : runServerOpsDataRead(input as ServerOpsDataRuntimeInput, createChannel, controller.signal)
   void read.then((result) => {

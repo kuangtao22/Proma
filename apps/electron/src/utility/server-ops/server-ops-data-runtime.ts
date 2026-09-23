@@ -1,11 +1,12 @@
 import type { Duplex } from 'node:stream'
+import { createHash } from 'node:crypto'
 import { checkServerIdentity, connect as connectTls } from 'node:tls'
 import { isIP } from 'node:net'
 import type { PeerCertificate, TLSSocket } from 'node:tls'
 import { createConnection as createMysqlConnection } from 'mysql2'
 import type { Connection as MySqlConnection } from 'mysql2'
 import { AbstractConnector, Redis } from 'ioredis'
-import { isServerOpsMySqlTlsServerName } from '@proma/shared'
+import { isServerOpsMySqlTlsServerName, isServerOpsSqlSensitiveColumn, MAX_SERVER_OPS_CELL_BYTES } from '@proma/shared'
 import type {
   ServerOpsDataCapability,
   ServerOpsDataEngine,
@@ -56,6 +57,10 @@ interface ServerOpsDataRuntimeInputBase {
   rowLimit?: number
   /** 行预览的受控字段条件；仅 schema-rows 使用。 */
   rowFilters?: ServerOpsDataRowFilters
+  /** 全文读取的目标列、绝对行偏移与预览摘要。 */
+  cellColumnIndex?: number
+  cellExpectedColumn?: string
+  cellSha256?: string
   /** MySQL 诊断分区；省略时保持旧版全量诊断。 */
   diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection
   /** MySQL 会话或慢语句的库级筛选；不参与握手默认库。 */
@@ -64,7 +69,7 @@ interface ServerOpsDataRuntimeInputBase {
 
 /** 诊断与表浏览输入；禁止夹带 SQL 查询字段。 */
 export interface ServerOpsDataRuntimeNonQueryInput extends ServerOpsDataRuntimeInputBase {
-  mode: 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows'
+  mode: 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'schema-cell'
   queryId?: never
   sql?: never
   maxRows?: never
@@ -122,6 +127,8 @@ const MAX_PARAMETER_VALUE_LENGTH = 1_024
 const MAX_PARAMETER_RESULT_BYTES = 262_144
 /** 行预览公开结果的总字节预算；不通过丢行满足预算，避免分页跳行。 */
 const MAX_SCHEMA_ROWS_RESULT_BYTES = 1_048_576
+/** 摘要元数据单独计入总预算；正文仍受上方 1 MiB 限制。 */
+const MAX_SCHEMA_ROWS_WITH_DIGESTS_BYTES = 2_097_152
 
 /** MySQL 只读诊断固定语句；不含任何用户插值。 */
 const MYSQL_VERSION_QUERY = 'SELECT VERSION() AS version'
@@ -785,7 +792,13 @@ async function readMySql(
   } catch (error) {
     if (dependencies.signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
     /** 筛选字段无效属于用户输入错误，不能被诊断连接失败分类器吞掉。 */
-    if (input.mode === 'schema-rows' && getServerOpsRowFilterPublicError(error) !== null) throw error
+    if ((input.mode === 'schema-rows' || input.mode === 'schema-cell') && getServerOpsRowFilterPublicError(error) !== null) throw error
+    if (input.mode === 'schema-cell') {
+      if (getServerOpsSqlQueryPublicError(error) !== undefined) throw error
+      const normalized = normalizeServerOpsSqlQueryError(error)
+      if (normalized.message === 'SERVER_OPS_DATA_QUERY_TIMEOUT') throw new Error('SERVER_OPS_DATA_CELL_TIMEOUT')
+      if (getServerOpsSqlQueryPublicError(normalized) !== undefined) throw normalized
+    }
     if (input.baseTablesOnly && getServerOpsSqlQueryPublicError(error)?.code === 'SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE') throw error
     if (input.mode === 'sql-query') {
       /** 建连与执行共用公开错误白名单，不向主进程泄露驱动原始详情。 */
@@ -849,8 +862,8 @@ export async function readMySqlWithConnection(
     }, signal)
   }
   /** 结构目录保持按需读取；行预览先安装与 SQL 相同的服务端保护。 */
-  if (input.mode === 'schema-tables' || input.mode === 'schema-table' || input.mode === 'schema-rows') {
-    if (input.mode === 'schema-rows') {
+  if (input.mode === 'schema-tables' || input.mode === 'schema-table' || input.mode === 'schema-rows' || input.mode === 'schema-cell') {
+    if (input.mode === 'schema-rows' || input.mode === 'schema-cell') {
       if (typeof connection.execute !== 'function') throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
       await configureServerOpsMySqlReadLimits((statement) => connection.query(statement), signal)
       /** 表预览元数据同样含用户标识符，所有行读取统一使用服务端绑定。 */
@@ -981,31 +994,56 @@ interface MySqlPreviewColumn {
   name: string
   expression: string
   binarySize: boolean
+  digestAlias?: string
+  normalizedTextExpression?: string
 }
 
 /** 可在数据库端安全截取前缀的文本类型；复杂 JSON、空间类型和数值保留驱动原有语义。 */
-const MYSQL_PREVIEW_TEXT_TYPES = new Set(['char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext', 'enum', 'set'])
+const MYSQL_PREVIEW_TEXT_TYPES = new Set(['char', 'varchar', 'tinytext', 'text', 'mediumtext', 'longtext', 'enum', 'set', 'json'])
 /** 这些类型在 mysql2 中原本返回 Buffer；预览只需要大小，不传输完整内容。 */
 const MYSQL_PREVIEW_BINARY_TYPES = new Set(['binary', 'varbinary', 'tinyblob', 'blob', 'mediumblob', 'longblob'])
 
 /** 根据实时列类型生成有界预览；入参为列元数据，返回前 64 个可见列的安全表达式。 */
 function buildMySqlPreviewColumns(rows: readonly Record<string, unknown>[]): MySqlPreviewColumn[] {
-  return rows.filter((row) => typeof row.name === 'string' && !/\bINVISIBLE\b/iu.test(String(row.extra ?? ''))).slice(0, 64).map((row) => {
+  const visibleRows = rows.filter((row) => typeof row.name === 'string' && !/\bINVISIBLE\b/iu.test(String(row.extra ?? ''))).slice(0, 64)
+  const occupiedNames = new Set(visibleRows.map((row) => row.name as string))
+  return visibleRows.map((row, index) => {
     /** 标识符保持原名，只做 MySQL 反引号转义，不把元数据内容当 SQL。 */
     const name = row.name as string
     const identifier = quoteMySqlIdentifier(name)
     const dataType = String(row.data_type ?? '').toLowerCase()
     const binarySize = MYSQL_PREVIEW_BINARY_TYPES.has(dataType)
+    const sensitive = isServerOpsSqlSensitiveColumn(name)
+    /** 所有摘要与全文统一转成 utf8mb4，保证数据库摘要与 main 对 JS 字符串计算的 UTF-8 摘要一致。 */
+    const normalizedTextExpression = MYSQL_PREVIEW_TEXT_TYPES.has(dataType)
+      ? `CONVERT(${identifier} USING utf8mb4)` : undefined
+    /** 摘要别名不能碰撞真实列名，否则 mysql2 的对象行会覆盖其中一个值。 */
+    let digestAlias = `__proma_cell_sha256_${index}`
+    while (occupiedNames.has(digestAlias)) digestAlias = `_${digestAlias}`
+    occupiedNames.add(digestAlias)
     /** 257 个数据库字符足以判断 256 UTF-16 单元是否截断；最终仍沿用客户端文本归一化。 */
-    const expression = binarySize ? `OCTET_LENGTH(${identifier})`
-      : MYSQL_PREVIEW_TEXT_TYPES.has(dataType) ? `LEFT(${identifier}, 257)` : identifier
-    return { name, expression: `${expression} AS ${identifier}`, binarySize }
+    const expression = sensitive ? "'***'"
+      : binarySize ? `OCTET_LENGTH(${identifier})`
+      : normalizedTextExpression === undefined ? identifier : `LEFT(${normalizedTextExpression}, 257)`
+    const digestExpression = !sensitive && normalizedTextExpression !== undefined
+      ? `, CASE WHEN ${identifier} IS NOT NULL AND (OCTET_LENGTH(${normalizedTextExpression}) > 256 OR ${normalizedTextExpression} REGEXP '[[:cntrl:]]')`
+        + ` THEN LOWER(SHA2(CAST(${normalizedTextExpression} AS BINARY), 256)) END AS ${quoteMySqlIdentifier(digestAlias)}`
+      : ''
+    return { name, expression: `${expression} AS ${identifier}${digestExpression}`, binarySize: binarySize && !sensitive,
+      ...(digestExpression === '' ? {} : { digestAlias }), ...(normalizedTextExpression === undefined ? {} : { normalizedTextExpression }) }
   })
 }
 
 /** 还原预览字段的公开类型；二进制仅接收大小，NULL 与零字节严格区分。 */
-function formatMySqlPreviewCell(value: unknown, column: MySqlPreviewColumn): ServerOpsDataSchemaCell {
-  if (!column.binarySize || value === null || value === undefined) return formatMySqlCell(value)
+function formatMySqlPreviewCell(value: unknown, column: MySqlPreviewColumn, digest: unknown): ServerOpsDataSchemaCell {
+  if (column.digestAlias !== undefined && typeof value === 'string') {
+    const sanitized = value.replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    if ((sanitized !== value || sanitized.length > 256)
+      && (typeof digest !== 'string' || !/^[a-f0-9]{64}$/u.test(digest))) {
+      throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+    }
+  }
+  if (!column.binarySize || value === null || value === undefined) return formatMySqlCell(value, digest)
   /** MySQL OCTET_LENGTH 返回可安全表示的非负整数，拒绝异常驱动结果。 */
   const bytes = toFiniteNumber(value)
   if (bytes === undefined || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
@@ -1093,6 +1131,7 @@ async function readMySqlSchema(
   }
 
   if (schemaDatabase === undefined) {
+    if (input.mode === 'schema-cell') throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
     return input.mode === 'schema-rows'
       ? { mode: 'schema-rows', capability: 'unsupported', columns: [], rows: [], offset: input.rowOffset ?? 0,
           limit: input.rowLimit ?? 50, truncated: false, warnings: createWarnings(['缺少目标库']) }
@@ -1102,11 +1141,14 @@ async function readMySqlSchema(
   /** 表名同样先经白名单校验，未命中直接返回可读原因。 */
   const schemaTable = input.schemaTable
   if (schemaTable === undefined) {
+    if (input.mode === 'schema-cell') throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
     return { mode: 'schema-table', capability: 'unsupported', columns: [], indexes: [], warnings: createWarnings(['缺少目标表']) }
   }
   /** 行读取复用本次元数据里的表白名单、列类型与估算，不缓存授权事实。 */
-  const existsRows = await readRows(connection, input.mode === 'schema-rows' ? MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY : MYSQL_SCHEMA_TABLE_EXISTS_QUERY, [schemaDatabase, schemaTable])
-  if (existsRows.length === 0 || input.mode === 'schema-rows' && !existsRows.every((row) => row.table_name === schemaTable)) {
+  const readsRows = input.mode === 'schema-rows' || input.mode === 'schema-cell'
+  const existsRows = await readRows(connection, readsRows ? MYSQL_SCHEMA_PREVIEW_COLUMNS_QUERY : MYSQL_SCHEMA_TABLE_EXISTS_QUERY, [schemaDatabase, schemaTable])
+  if (existsRows.length === 0 || readsRows && !existsRows.every((row) => row.table_name === schemaTable)) {
+    if (input.mode === 'schema-cell') throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
     /** 白名单未命中：按当前模式返回对应的空结果，界面据此提示"表不存在或不可见"。 */
     const warnings = createWarnings([`表 ${schemaDatabase}.${schemaTable} 不存在或当前账号不可见`])
     if (input.mode === 'schema-rows') {
@@ -1176,6 +1218,41 @@ async function readMySqlSchema(
         .map((row) => row.name).filter((name): name is string => typeof name === 'string'),
       'mysql',
     )
+  if (input.mode === 'schema-cell') {
+    const columnIndex = input.cellColumnIndex
+    const expectedColumn = input.cellExpectedColumn
+    const expectedSha256 = input.cellSha256
+    const column = columnIndex === undefined ? undefined : previewColumns[columnIndex]
+    if (!column || column.name !== expectedColumn || expectedSha256 === undefined) throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    if (isServerOpsSqlSensitiveColumn(column.name)) throw new Error('SERVER_OPS_DATA_CELL_REDACTED')
+    if (column.binarySize) throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    const rowOffset = input.rowOffset
+    if (!Number.isSafeInteger(rowOffset) || rowOffset === undefined || rowOffset < 0 || rowOffset > 1_000_199) {
+      throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    }
+    if (typeof connection.execute !== 'function') throw new Error('SERVER_OPS_DATA_SCHEMA_FILTERS_UNAVAILABLE')
+    const identifier = quoteMySqlIdentifier(column.name)
+    const valueExpression = column.normalizedTextExpression ?? identifier
+    /** 值本身在服务器端按字节上限裁决，超限时只返回长度与摘要，不把大字段传进 utility。 */
+    const cellSql = `SELECT CASE WHEN OCTET_LENGTH(${valueExpression}) <= ${MAX_SERVER_OPS_CELL_BYTES} THEN ${valueExpression} END AS value, `
+      + `OCTET_LENGTH(${valueExpression}) AS value_bytes, `
+      + `${column.normalizedTextExpression === undefined ? 'NULL' : `LOWER(SHA2(CAST(${valueExpression} AS BINARY), 256))`} AS value_sha256 `
+      + `FROM ${quoteMySqlIdentifier(schemaDatabase)}.${quoteMySqlIdentifier(schemaTable)}` + filterSql.clause + orderClause
+      + ` LIMIT 1 OFFSET ${rowOffset}`
+    const cellRows = await readRows(connection, cellSql, filterSql.values)
+    if (cellRows.length !== 1) throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    const valueBytes = toFiniteNumber(cellRows[0]?.value_bytes)
+    if (valueBytes !== undefined && valueBytes > MAX_SERVER_OPS_CELL_BYTES) throw new Error('SERVER_OPS_DATA_CELL_TOO_LARGE')
+    const value = cellRows[0]?.value
+    if (value === null || value === undefined) throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    const formatted = column.normalizedTextExpression === undefined ? formatMySqlCell(value) : value
+    if (typeof formatted !== 'string') throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    if (Buffer.byteLength(formatted, 'utf8') > MAX_SERVER_OPS_CELL_BYTES) throw new Error('SERVER_OPS_DATA_CELL_TOO_LARGE')
+    const actualSha256 = column.normalizedTextExpression === undefined
+      ? createHash('sha256').update(formatted, 'utf8').digest('hex') : cellRows[0]?.value_sha256
+    if (actualSha256 !== expectedSha256) throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    return { mode: 'schema-cell', capability: 'available', value: formatted, warnings: [] }
+  }
   /** 所有行读取通过服务端 prepared execute；分页数字先独立校验再写入固定 SQL。 */
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000
     || !Number.isSafeInteger(limit) || limit < 1 || limit > 200 || offset % limit !== 0) {
@@ -1196,13 +1273,15 @@ async function readMySqlSchema(
   )
   /** 空表也保留列头；核对字段顺序，避免异常结果与本次列类型错配。 */
   const columnNames = previewColumns.map((column) => toDisplayText(column.name, 128))
-  if (rowsQuery.fields.length !== columnNames.length || rowsQuery.fields.some((field, index) => field.name !== columnNames[index])) {
+  const returnedFieldNames = new Set(rowsQuery.fields.map((field) => field.name))
+  if (columnNames.some((name) => !returnedFieldNames.has(name))) {
     throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
   }
   const columnTruncated = existsRows.filter((row) => typeof row.name === 'string' && !/\bINVISIBLE\b/iu.test(String(row.extra ?? ''))).length > columnNames.length
   const hasMore = rowsQuery.rows.length > limit
   const normalizedRows = rowsQuery.rows.slice(0, limit)
-    .map((row) => previewColumns.map((column) => formatMySqlPreviewCell(row[column.name], column)))
+    .map((row) => previewColumns.map((column) => formatMySqlPreviewCell(row[column.name], column,
+      column.digestAlias === undefined ? undefined : row[column.digestAlias])))
   const budgetedRows = fitSchemaRowsToBudget(normalizedRows)
   const cellTruncated = normalizedRows.some((row) => row.some((cell) => typeof cell === 'object' && cell !== null && cell.kind === 'text'))
   /** 同次表元数据已携带估算，避免数据返回后再多发一次查询。 */
@@ -1287,9 +1366,9 @@ function quoteMySqlIdentifier(identifier: string): string {
 }
 
 /** 把单格数据库值归一化为可区分 NULL、空串、二进制与截断文本的公开值。 */
-function formatMySqlCell(value: unknown): ServerOpsDataSchemaCell {
+function formatMySqlCell(value: unknown, digest?: unknown): ServerOpsDataSchemaCell {
   if (value === null || value === undefined) return null
-  if (typeof value === 'string') return formatSchemaText(value)
+  if (typeof value === 'string') return formatSchemaText(value, digest)
   if (typeof value === 'number' || typeof value === 'bigint') return String(value).slice(0, 256)
   if (typeof value === 'boolean') return value ? 'true' : 'false'
   if (value instanceof Date) return value.toISOString()
@@ -1306,15 +1385,23 @@ function formatMySqlCell(value: unknown): ServerOpsDataSchemaCell {
 }
 
 /** 文本超过 256 字符时用结构化单元格保留截断事实。 */
-function formatSchemaText(value: string): ServerOpsDataSchemaCell {
+function formatSchemaText(value: string, digest?: unknown): ServerOpsDataSchemaCell {
   const sanitized = value.replace(/[\u0000-\u001f\u007f]/gu, ' ')
-  return sanitized.length <= 256 ? sanitized : { kind: 'text', text: sanitized.slice(0, 256), truncated: true }
+  const lossy = sanitized !== value || sanitized.length > 256
+  if (!lossy) return sanitized
+  const sha256 = typeof digest === 'string' && /^[a-f0-9]{64}$/u.test(digest)
+    ? digest
+    : createHash('sha256').update(value, 'utf8').digest('hex')
+  let text = sanitized.slice(0, 256)
+  if (/[\uD800-\uDBFF]$/u.test(text)) text = text.slice(0, -1)
+  return { kind: 'text', text, truncated: true, sha256 }
 }
 
 /** 在不丢行的前提下压缩单元格，保证翻页不会跳过被字节预算裁掉的行。 */
 function fitSchemaRowsToBudget(rows: ServerOpsDataSchemaCell[][]): { rows: ServerOpsDataSchemaCell[][]; truncated: boolean } {
   /** 最终 JSON 已在预算内时不做任何分配和复制。 */
-  if (schemaRowsJsonBytes(rows) <= MAX_SCHEMA_ROWS_RESULT_BYTES) return { rows, truncated: false }
+  if (schemaRowsContentJsonBytes(rows) <= MAX_SCHEMA_ROWS_RESULT_BYTES
+    && schemaRowsJsonBytes(rows) <= MAX_SCHEMA_ROWS_WITH_DIGESTS_BYTES) return { rows, truncated: false }
   /** 单元格公开文本最多 256 个 UTF-16 code unit，统一二分字符上限即可覆盖所有文本。 */
   let lower = 0
   let upper = 256
@@ -1324,19 +1411,27 @@ function fitSchemaRowsToBudget(rows: ServerOpsDataSchemaCell[][]): { rows: Serve
     /** 文本字符上限；每轮都按最终 rows JSON 重新计量转义与 UTF-8 字节。 */
     const middle = Math.floor((lower + upper) / 2)
     const candidate = fitSchemaRowsToTextLength(rows, middle)
-    if (schemaRowsJsonBytes(candidate) <= MAX_SCHEMA_ROWS_RESULT_BYTES) {
+    if (schemaRowsContentJsonBytes(candidate) <= MAX_SCHEMA_ROWS_RESULT_BYTES
+      && schemaRowsJsonBytes(candidate) <= MAX_SCHEMA_ROWS_WITH_DIGESTS_BYTES) {
       best = candidate
       lower = middle + 1
     } else {
       upper = middle - 1
     }
   }
+  if (schemaRowsContentJsonBytes(best) > MAX_SCHEMA_ROWS_RESULT_BYTES
+    || schemaRowsJsonBytes(best) > MAX_SCHEMA_ROWS_WITH_DIGESTS_BYTES) throw new Error('SERVER_OPS_DATA_RESULT_TOO_LARGE')
   return { rows: best, truncated: true }
 }
 
 /** 计算公开行集最终 JSON 的真实 UTF-8 字节数，包含引号、反斜杠与数组分隔符。 */
 function schemaRowsJsonBytes(rows: ServerOpsDataSchemaCell[][]): number {
   return Buffer.byteLength(JSON.stringify(rows), 'utf8')
+}
+
+/** 计算移除摘要后的正文预算，避免校验元数据挤占原有 1 MiB 预览正文。 */
+function schemaRowsContentJsonBytes(rows: ServerOpsDataSchemaCell[][]): number {
+  return Buffer.byteLength(JSON.stringify(rows, (key, value: unknown) => key === 'sha256' ? undefined : value), 'utf8')
 }
 
 /** 按统一字符上限裁剪文本；NULL 与二进制元数据不改变。 */
@@ -1348,7 +1443,12 @@ function fitSchemaRowsToTextLength(rows: ServerOpsDataSchemaCell[][], maximumTex
     /** 避免在高代理项后截断，防止产生无效 Unicode；共享合同按同一 UTF-16 长度计数。 */
     let limited = text.slice(0, maximumTextLength)
     if (/[\uD800-\uDBFF]$/u.test(limited)) limited = limited.slice(0, -1)
-    const replacement = { kind: 'text' as const, text: limited, truncated: true as const }
+    /** 聚合预算产生的新截断同样属于有损展示，必须携带完整原文摘要。 */
+    const sha256 = typeof cell === 'string'
+      ? createHash('sha256').update(cell, 'utf8').digest('hex')
+      : cell.sha256
+    if (sha256 === undefined) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+    const replacement = { kind: 'text' as const, text: limited, truncated: true as const, sha256 }
     /** 对很短文本，结构化截断对象可能反而更大，此时保留更小的原值。 */
     return Buffer.byteLength(JSON.stringify(replacement), 'utf8') < originalBytes ? replacement : cell
   }))
@@ -1579,6 +1679,7 @@ export async function runServerOpsDataRead(
   } catch (error) {
     if (!timedOut) throw error
     if (input.mode === 'sql-query') throw new Error('SERVER_OPS_DATA_QUERY_TIMEOUT')
+    if (input.mode === 'schema-cell') throw new Error('SERVER_OPS_DATA_CELL_TIMEOUT')
     return { capability: 'timeout', metrics: [], tables: [], warnings: ['数据库读取超时'] }
   } finally {
     clearTimeout(timer)

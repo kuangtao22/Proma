@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import * as React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ServerOpsDataRowFilters, ServerOpsDataSourceRowsInput } from '@proma/shared'
+import type { ServerOpsDataRowFilters, ServerOpsDataSourceCellInput, ServerOpsDataSourceRowsInput } from '@proma/shared'
 import {
   createServerOpsSchemaBrowserController,
   createServerOpsSchemaIdleProjection,
@@ -49,6 +49,7 @@ function createApi(overrides: Partial<ServerOpsSchemaBrowserApi> = {}): ServerOp
       truncated: false,
       totalEstimate: 120,
     }),
+    readServerOpsDataSchemaCell: async () => ({ value: '完整内容' }),
     ...overrides,
   }
 }
@@ -68,6 +69,77 @@ async function flush(): Promise<void> {
 }
 
 describe('数据连接表浏览', () => {
+  test('Given 完整单元格 When 打开详情 Then 直接展示且不发起全文请求', async () => {
+    /** 记录不应发生的全文请求。 */
+    let cellReads = 0
+    const { controller } = createHarness(createApi({
+      readServerOpsDataSchemaCell: async () => { cellReads += 1; return { value: '不应读取' } },
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql' }); await flush()
+    controller.openTable('users'); await flush()
+    controller.openCell(0, 1)
+    expect(cellReads).toBe(0)
+    expect(controller.getProjection().cellDetail).toMatchObject({ status: 'ready', column: 'name', absoluteOffset: 0, value: 'alice' })
+  })
+
+  test('Given 带摘要的截断单元格 When 打开详情 Then 使用绝对行位置与筛选快照按需读取全文', async () => {
+    /** 当前请求输入，用于核对表格坐标没有误用页内行号。 */
+    const received: ServerOpsDataSourceCellInput[] = []
+    /** 固定摘要，模拟主进程返回的可复核预览。 */
+    const sha256 = 'a'.repeat(64)
+    const { controller } = createHarness(createApi({
+      readServerOpsDataSchemaRows: async (input) => ({ columns: ['payload'], rows: [[{ kind: 'text', text: '预览', truncated: true, sha256 }]], offset: input.offset, limit: input.limit, truncated: true }),
+      readServerOpsDataSchemaCell: async (input) => { received.push(input); return { value: '{"id":90071992547409931234,"id":2}' } },
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql' }); await flush()
+    controller.openTable('users'); await flush()
+    controller.applyRowFilters({ match: 'all', conditions: [{ column: 'id', operator: 'gte', value: '42' }] }); await flush()
+    controller.loadRows(50); await flush()
+    controller.openCell(0, 0); await flush()
+    expect(received).toEqual([{ sourceId: 'source-1', database: 'app', table: 'users', offset: 50, columnIndex: 0,
+      expectedColumn: 'payload', sha256, filters: { match: 'all', conditions: [{ column: 'id', operator: 'gte', value: '42' }] } }])
+    expect(controller.getProjection().cellDetail).toMatchObject({ status: 'ready', absoluteOffset: 50, value: '{"id":90071992547409931234,"id":2}' })
+  })
+
+  test('Given 全文请求在途 When 关闭详情或换页 Then 清空详情且迟到结果不能恢复', async () => {
+    /** 两次打开分别由两个可控回执验证关闭与换页边界。 */
+    const first = createDeferred<{ value: string | null | { kind: 'binary'; bytes: number } }>()
+    const second = createDeferred<{ value: string | null | { kind: 'binary'; bytes: number } }>()
+    /** 依次返回两次全文读取。 */
+    let calls = 0
+    /** 固定摘要，确保控制器进入按需请求路径。 */
+    const sha256 = 'b'.repeat(64)
+    const { controller } = createHarness(createApi({
+      readServerOpsDataSchemaRows: async (input) => ({ columns: ['payload'], rows: [[{ kind: 'text', text: '预览', truncated: true, sha256 }]], offset: input.offset, limit: input.limit, truncated: true, hasMore: true }),
+      readServerOpsDataSchemaCell: () => (++calls === 1 ? first.promise : second.promise),
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql' }); await flush()
+    controller.openTable('users'); await flush()
+    controller.openCell(0, 0)
+    controller.closeCell()
+    first.resolve({ value: '关闭后的迟到正文' }); await flush()
+    expect(controller.getProjection().cellDetail).toBeNull()
+    controller.openCell(0, 0)
+    controller.loadRows(50)
+    second.resolve({ value: '换页后的迟到正文' }); await flush()
+    expect(controller.getProjection().cellDetail).toBeNull()
+  })
+
+  test('Given 旧版截断预览没有摘要 When 打开详情 Then 明确不可读取且不把预览冒充全文', async () => {
+    /** 旧结果没有 sha256，全文接口不能安全定位。 */
+    let cellReads = 0
+    const { controller } = createHarness(createApi({
+      readServerOpsDataSchemaRows: async (input) => ({ columns: ['payload'], rows: [[{ kind: 'text', text: '旧预览', truncated: true }]], offset: input.offset, limit: input.limit, truncated: true }),
+      readServerOpsDataSchemaCell: async () => { cellReads += 1; return { value: '不应读取' } },
+    }))
+    controller.setSource({ id: 'source-1', engine: 'mysql' }); await flush()
+    controller.openTable('users'); await flush()
+    controller.openCell(0, 0)
+    expect(cellReads).toBe(0)
+    expect(controller.getProjection().cellDetail).toMatchObject({ status: 'unavailable', preview: { text: '旧预览' } })
+    expect(controller.getProjection().cellDetail?.error).toContain('无法读取完整内容')
+  })
+
   test('Given 50×100 个单元格 When 渲染行网格 Then 每格展示文本只读取一次', () => {
     /** 用 getter 计数真实格式化路径，不用不稳定的墙钟时间作为性能断言。 */
     let reads = 0
@@ -77,6 +149,13 @@ describe('数据连接表浏览', () => {
     const html = renderToStaticMarkup(<SchemaRowsGrid columns={columns} rows={rows} offset={0} />)
     expect(reads).toBe(5_000)
     expect(html).toContain('title="预览…（已截断）"')
+  })
+
+  test('Given 数据行网格 When 提供打开动作 Then 每格使用原生按钮支持点击与键盘激活', () => {
+    /** 静态标记验证原生按钮语义，不模拟浏览器合成键盘事件。 */
+    const html = renderToStaticMarkup(<SchemaRowsGrid columns={['payload']} rows={[['正文']]} offset={50} onOpenCell={() => undefined} />)
+    expect(html).toContain('type="button"')
+    expect(html).toContain('aria-label="查看第 51 行 payload 的完整内容"')
   })
 
   test('Given 旧后台不认识筛选字段 When 应用条件 Then 显示完整重启提示并保留条件', async () => {
@@ -100,7 +179,7 @@ describe('数据连接表浏览', () => {
       rowFilters: { match: 'all', conditions: [{ column: 'id', operator: 'gt', value: '9000' }] },
       rows: { status: 'ready', error: null, columns: ['id'], rows: [], offset: 0, limit: 50, truncated: false, totalEstimate: 120 },
     }
-    const html = renderToStaticMarkup(<ServerOpsSchemaBrowserView projection={projection} onSelectDatabase={() => undefined} onOpenTable={() => undefined} onBackToList={() => undefined} onDetailTabChange={() => undefined} onLoadRows={() => undefined} onRefresh={() => undefined} onApplyRowFilters={() => undefined} onLoadFilterFields={() => undefined} />)
+    const html = renderToStaticMarkup(<ServerOpsSchemaBrowserView projection={projection} onSelectDatabase={() => undefined} onOpenTable={() => undefined} onBackToList={() => undefined} onDetailTabChange={() => undefined} onLoadRows={() => undefined} onOpenCell={() => undefined} onCloseCell={() => undefined} onRefresh={() => undefined} onApplyRowFilters={() => undefined} onLoadFilterFields={() => undefined} />)
     expect(html).toContain('aria-expanded="false"')
     expect(html).toContain('筛选结果')
     expect(html).toContain('没有符合筛选条件的记录')
@@ -360,6 +439,8 @@ describe('数据连接表浏览', () => {
         onBackToList={() => undefined}
         onDetailTabChange={() => undefined}
         onLoadRows={() => undefined}
+        onOpenCell={() => undefined}
+        onCloseCell={() => undefined}
         onRefresh={() => undefined}
       />,
     )
@@ -380,6 +461,8 @@ describe('数据连接表浏览', () => {
         onBackToList={() => undefined}
         onDetailTabChange={() => undefined}
         onLoadRows={() => undefined}
+        onOpenCell={() => undefined}
+        onCloseCell={() => undefined}
         onRefresh={() => undefined}
       />,
     )
@@ -600,6 +683,8 @@ describe('数据连接表浏览', () => {
         onBackToList={() => undefined}
         onDetailTabChange={() => undefined}
         onLoadRows={() => undefined}
+        onOpenCell={() => undefined}
+        onCloseCell={() => undefined}
         onRefresh={() => undefined}
       />,
     )

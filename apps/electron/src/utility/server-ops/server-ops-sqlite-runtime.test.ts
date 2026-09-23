@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import type { ServerOpsRuntimeDataReadRequest } from './server-ops-runtime-protocol'
 import {
   runServerOpsSqliteRead,
@@ -122,6 +123,70 @@ afterEach(() => {
 })
 
 describe('远程 SQLite 只读运行时', () => {
+  test('Given 有损预览 When 读取单格 Then 按筛选和页内位置返回含换行的完整原文', async () => {
+    /** JSON 保留超安全整数和换行，确保原文不会被预览清洗覆盖。 */
+    const value = '{\n\t"id":90071992547409931234,"body":"' + '长'.repeat(400) + '"\n}'
+    const database = new Database(databasePath)
+    database.query('INSERT INTO users(name,note) VALUES (?,?)').run('target', value)
+    database.close()
+    const channel = createLocalChannelFactory([])
+    const filters = { match: 'all' as const, conditions: [{ column: 'name', operator: 'eq' as const, value: 'target' }] }
+    const sha256 = createHash('sha256').update(value).digest('hex')
+    const rows = await runServerOpsSqliteRead(createInput({ mode: 'schema-rows', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 0, rowLimit: 50, rowFilters: filters }), channel)
+    expect(rows).toMatchObject({ rows: [['2', 'target', '***', null, { kind: 'text', truncated: true, sha256 }]] })
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 0,
+      cellColumnIndex: 4, cellExpectedColumn: 'note', cellSha256: sha256, rowFilters: filters }), channel)).resolves.toMatchObject({ mode: 'schema-cell', value })
+    /** 不带筛选时用第二行的绝对位置定位。 */
+    await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 1,
+      cellColumnIndex: 4, cellExpectedColumn: 'note', cellSha256: sha256 }), channel)).resolves.toMatchObject({ value })
+  })
+  test('Given 控制字符短文本或无主键尾部更新 When 查看详情 Then 原文保真且摘要变化拒绝', async () => {
+    /** 无主键表与相同预览前缀复现最容易误认的更新场景。 */
+    const database = new Database(databasePath)
+    database.exec('CREATE TABLE loose(body TEXT)')
+    const short = 'one\ntwo\tthree\0end'
+    database.query('INSERT INTO loose VALUES (?)').run(short)
+    const channel = createLocalChannelFactory([])
+    const sha256 = createHash('sha256').update(short).digest('hex')
+    try {
+      const rows = await runServerOpsSqliteRead(createInput({ mode: 'schema-rows', schemaDatabase: 'main', schemaTable: 'loose', rowOffset: 0, rowLimit: 50 }), channel)
+      expect(rows).toMatchObject({ rows: [[{ kind: 'text', truncated: true, sha256 }]] })
+      await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'loose', rowOffset: 0,
+        cellColumnIndex: 0, cellExpectedColumn: 'body', cellSha256: sha256 }), channel)).resolves.toMatchObject({ value: short })
+      const original = 'x'.repeat(300) + 'old'
+      database.query('UPDATE loose SET body=?').run(original)
+      const previousSha256 = createHash('sha256').update(original).digest('hex')
+      database.query('UPDATE loose SET body=?').run('x'.repeat(300) + 'new')
+      await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'loose', rowOffset: 0,
+        cellColumnIndex: 0, cellExpectedColumn: 'body', cellSha256: previousSha256 }), channel)).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CELL_CHANGED' })
+    } finally { database.close() }
+  })
+  test('Given 敏感字段、列变化或超限正文 When 读取全文 Then 返回明确错误不泄露内容', async () => {
+    /** 直接构造请求验证 runtime 不信任前端摘要或列选择。 */
+    const channel = createLocalChannelFactory([])
+    const base = createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 0,
+      cellColumnIndex: 2, cellExpectedColumn: 'authorization', cellSha256: createHash('sha256').update('Bearer-secret').digest('hex') })
+    await expect(runServerOpsSqliteRead(base, channel)).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CELL_REDACTED' })
+    await expect(runServerOpsSqliteRead({ ...base, cellColumnIndex: 4, cellExpectedColumn: 'renamed' }, channel)).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CELL_CHANGED' })
+    const database = new Database(databasePath)
+    database.query('UPDATE users SET note=?').run('x'.repeat(1_048_577))
+    database.close()
+    await expect(runServerOpsSqliteRead({ ...base, cellColumnIndex: 4, cellExpectedColumn: 'note' }, channel)).rejects.toMatchObject({ code: 'SERVER_OPS_DATA_CELL_TOO_LARGE' })
+  })
+  test('Given emoji或大量控制字符 When 预览再读全文 Then UTF16预览有界且JSON转义不挤掉原文', async () => {
+    /** 分别覆盖代理对 Unicode 的长度差异和最坏六倍 JSON 转义。 */
+    const channel = createLocalChannelFactory([])
+    for (const value of ['😀'.repeat(200), '\0'.repeat(300_000)]) {
+      const database = new Database(databasePath)
+      database.query('UPDATE users SET note=?').run(value)
+      database.close()
+      const sha256 = createHash('sha256').update(value).digest('hex')
+      const rows = await runServerOpsSqliteRead(createInput({ mode: 'schema-rows', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 0, rowLimit: 50 }), channel)
+      expect(rows).toMatchObject({ rows: [['1', '中文用户', '***', { kind: 'binary', bytes: 3 }, { kind: 'text', sha256 }]] })
+      await expect(runServerOpsSqliteRead(createInput({ mode: 'schema-cell', schemaDatabase: 'main', schemaTable: 'users', rowOffset: 0,
+        cellColumnIndex: 4, cellExpectedColumn: 'note', cellSha256: sha256 }), channel)).resolves.toMatchObject({ value })
+    }
+  })
   test('Given 超过500张表 When 搜索SQLite目录 Then 能按字面匹配尾部表', async () => {
     const database = new Database(databasePath)
     for (let index = 0; index < 505; index += 1) database.exec(`CREATE TABLE table_${String(index).padStart(3, '0')} (id INTEGER)`)

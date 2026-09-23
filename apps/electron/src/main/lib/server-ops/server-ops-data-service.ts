@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { inspectServerOpsLocalSqliteFile } from '../../../utility/server-ops/server-ops-local-sqlite-file'
 import type {
   ServerOpsDataDiagnoseInput,
   ServerOpsDataDiagnosticsResult,
@@ -16,6 +17,8 @@ import type {
   ServerOpsDataSourceProbeDraft,
   ServerOpsDataSourceRowsInput,
   ServerOpsDataSourceRowsResult,
+  ServerOpsDataSourceCellInput,
+  ServerOpsDataSourceCellResult,
   ServerOpsDataSourceTableInput,
   ServerOpsDataSourceTableResult,
   ServerOpsDataSourceTablesInput,
@@ -29,6 +32,8 @@ import {
   parseServerOpsDataDiagnoseInput,
   parseServerOpsDataQueryInput,
   parseServerOpsDataSourceRowsInput,
+  parseServerOpsDataSourceCellInput,
+  parseServerOpsDataSourceCellResult,
   parseServerOpsDataSourceTableInput,
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesInput,
@@ -130,6 +135,7 @@ export class ServerOpsDataService {
       ...(record.address === undefined ? {} : { address: record.address }),
       ...(record.port === undefined ? {} : { port: record.port }),
       ...(record.filePath === undefined ? {} : { filePath: record.filePath }),
+      ...(record.localFileId === undefined ? {} : { localFileId: record.localFileId }),
       ...(record.database === undefined ? {} : { database: record.database }),
       ...(record.username === undefined ? {} : { username: record.username }),
       tlsMode: record.tlsMode,
@@ -180,9 +186,19 @@ export class ServerOpsDataService {
    */
   upsertSource(input: ServerOpsDataSourceUpsertInput): ServerOpsDataSourceUpsertResult {
     this.assertUsable()
+    /** 本地文件在配置落盘前校验，重复编辑同一路径不能悄悄重新绑定替换文件。 */
+    const existingLocal = input.sourceId === undefined ? undefined : this.dependencies.store.getById(input.sourceId)
+    /** 仅本机 SQLite 捕获文件身份，网络与远端连接不增加文件系统访问。 */
+    const localFile = input.engine === 'sqlite' && input.transport === 'direct'
+      ? inspectServerOpsLocalSqliteFile(input.filePath ?? '')
+      : undefined
+    if (localFile !== undefined && existingLocal?.transport === 'direct'
+      && (existingLocal.filePath === input.filePath || existingLocal.filePath === localFile.filePath)
+      && existingLocal.localFileId !== localFile.localFileId) throw new Error('SERVER_OPS_SQLITE_FILE_CHANGED')
+    if (localFile !== undefined) input = { ...input, filePath: localFile.filePath }
     if (input.sourceId === undefined) {
       /** 新建时先落元数据，再绑定密码密文，避免出现悬空凭据。 */
-      const created = this.dependencies.store.create(input)
+      const created = this.dependencies.store.create(input, undefined, localFile?.localFileId)
       if (input.password !== undefined) {
         try {
           /** 新数据源的密码密文引用。 */
@@ -229,6 +245,7 @@ export class ServerOpsDataService {
         address: input.address,
         port: input.port,
         ...(input.filePath === undefined ? {} : { filePath: input.filePath }),
+        localFileId: localFile?.localFileId ?? null,
         database: input.database ?? null,
         username: input.username ?? null,
         tlsMode: input.tlsMode,
@@ -334,6 +351,9 @@ export class ServerOpsDataService {
     const readKey = draft.savedSourceId === undefined ? `draft:${this.uuid()}` : draft.savedSourceId
     /** 草稿与已保存记录共用同一份直连 TLS 硬规则。 */
     this.assertDirectTransportIsSafe(draft)
+    /** 未保存测试同样固定本地身份，仅本次请求使用，不落盘。 */
+    const localFile = draft.engine === 'sqlite' && draft.transport === 'direct'
+      ? inspectServerOpsLocalSqliteFile(draft.filePath ?? '') : undefined
     const { result, latencyMs } = await this.runReadTarget('probe', {
       transport: draft.transport,
       ...(draft.hostId === undefined ? {} : { hostId: draft.hostId }),
@@ -341,6 +361,7 @@ export class ServerOpsDataService {
       ...(draft.address === undefined ? {} : { address: draft.address }),
       ...(draft.port === undefined ? {} : { port: draft.port }),
       ...(draft.filePath === undefined ? {} : { filePath: draft.filePath }),
+      ...(localFile ?? {}),
       ...(draft.database === undefined ? {} : { database: draft.database }),
       ...(draft.username === undefined ? {} : { username: draft.username }),
       tlsMode: draft.tlsMode,
@@ -565,6 +586,30 @@ export class ServerOpsDataService {
     }
   }
 
+  /** 按需读取单格原文；入参固定预览位置与摘要，返回通过来源和正文一致性验证的完整值。 */
+  async readSchemaCell(input: ServerOpsDataSourceCellInput, signal?: AbortSignal, context?: ServerOpsReadContext): Promise<ServerOpsDataSourceCellResult> {
+    this.assertUsable()
+    this.checkReadCaller(signal, context)
+    /** 即使内部调用也解析，防止无界位置或原始 SQL 绕过 IPC。 */
+    const parsed = parseServerOpsDataSourceCellInput(input)
+    const record = this.requireSource(parsed.sourceId)
+    const password = record.credentialRef === undefined ? undefined : this.dependencies.credentials.resolveSecret(record.credentialRef)
+    const { result } = await this.runReadTarget('schema-cell', record, password, `${record.id}:schema-cell`, {
+      database: parsed.database, table: parsed.table, offset: parsed.offset, columnIndex: parsed.columnIndex,
+      expectedColumn: parsed.expectedColumn, sha256: parsed.sha256,
+      ...(parsed.filters === undefined ? {} : { filters: parsed.filters }),
+    }, undefined, undefined, undefined, signal, undefined, context)
+    if (!('mode' in result) || result.mode !== 'schema-cell' || result.capability !== 'available') {
+      throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
+    }
+    /** 主进程再次核对原文，runtime 的成功回执不能代替正文一致性证据。 */
+    const detail = parseServerOpsDataSourceCellResult({ value: result.value })
+    if (typeof detail.value !== 'string' || createHash('sha256').update(detail.value, 'utf8').digest('hex') !== parsed.sha256) {
+      throw new Error('SERVER_OPS_DATA_CELL_CHANGED')
+    }
+    return detail
+  }
+
   /**
    * 执行单条受控只读 SQL 查询，并在返回前复核连接配置与 SSH 会话身份。
    *
@@ -639,6 +684,13 @@ export class ServerOpsDataService {
     this.activeSchemaCacheReads.clear()
   }
 
+  /** 复核本地文件目标；正常内容修改不改变身份，文件替换阻止返回与缓存复用。 */
+  private assertLocalFileCurrent(target: ServerOpsDataReadTarget): void {
+    if (target.engine !== 'sqlite' || target.transport !== 'direct') return
+    if (target.localFileId === undefined) throw new Error('SERVER_OPS_SQLITE_FILE_CHANGED')
+    inspectServerOpsLocalSqliteFile(target.filePath ?? '', target.localFileId)
+  }
+
   /** 构造不含明文秘密的完整缓存身份；无法证明密文版本时禁用缓存。 */
   private createSchemaCacheContext(record: ServerOpsStoredDataSource): ServerOpsDataSchemaCacheContext | undefined {
     /** 没有凭据用 null 明确参与身份；有凭据则必须能取得当前密文版本。 */
@@ -662,6 +714,7 @@ export class ServerOpsDataService {
         ...(record.address === undefined ? {} : { address: record.address }),
         ...(record.port === undefined ? {} : { port: record.port }),
         ...(record.filePath === undefined ? {} : { filePath: record.filePath }),
+        ...(record.localFileId === undefined ? {} : { localFileId: record.localFileId }),
         database: record.database ?? null,
         username: record.username ?? null,
         tlsMode: record.tlsMode,
@@ -681,6 +734,7 @@ export class ServerOpsDataService {
   private assertSchemaCacheContextCurrent(expected: ServerOpsDataSchemaCacheContext): void {
     this.assertUsable()
     const current = this.requireSource(expected.source.id)
+    this.assertLocalFileCurrent(current)
     if (!sameDataReadIdentity(expected.source, current)) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
     const currentCredentialVersion = current.credentialRef === undefined
       ? null
@@ -841,12 +895,13 @@ export class ServerOpsDataService {
    * @returns runtime 结果与主进程侧往返耗时
    */
   private async runReadTarget(
-    mode: 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'sql-query',
+    mode: 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'schema-cell' | 'sql-query',
     target: ServerOpsDataReadTarget,
     password: string | undefined,
     readKey: string,
     /** 表浏览参数；诊断模式下必须为空，由 runtime 协议再校验一次。 */
-    schema?: { database?: string; tableSearch?: string; table?: string; offset?: number; limit?: number; filters?: ServerOpsDataRowFilters },
+    schema?: { database?: string; tableSearch?: string; table?: string; offset?: number; limit?: number; filters?: ServerOpsDataRowFilters;
+      columnIndex?: number; expectedColumn?: string; sha256?: string },
     diagnosticSection?: import('@proma/shared').ServerOpsDataDiagnosticSection,
     diagnosticDatabase?: string,
     query?: { database: string; queryId: string; sql: string; maxRows: number },
@@ -868,6 +923,7 @@ export class ServerOpsDataService {
     const source = 'id' in target ? target as ServerOpsStoredDataSource : undefined
     const validate = (): void => {
       this.assertUsable()
+      this.assertLocalFileCurrent(target)
       if (source !== undefined) {
         const current = this.requireSource(source.id)
         if (!sameDataReadIdentity(source, current)) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
@@ -896,13 +952,14 @@ export class ServerOpsDataService {
         ...(target.address === undefined ? {} : { address: target.address }),
         ...(target.port === undefined ? {} : { port: target.port }),
         ...(target.filePath === undefined ? {} : { filePath: target.filePath }),
+        ...(target.localFileId === undefined ? {} : { localFileId: target.localFileId }),
         ...((query?.database ?? target.database) === undefined ? {} : { database: query?.database ?? target.database }),
         ...(target.username === undefined ? {} : { username: target.username }),
         ...(password === undefined ? {} : { password }),
         tlsMode: target.tlsMode,
         ...(target.tlsServerName === undefined ? {} : { tlsServerName: target.tlsServerName }),
         timeoutMs: SERVER_OPS_DATA_READ_TIMEOUT_MS,
-        ...(context?.ownerSessionId && (mode === 'schema-table' || mode === 'schema-rows') ? { baseTablesOnly: true } : {}),
+        ...(context?.ownerSessionId && (mode === 'schema-table' || mode === 'schema-rows' || mode === 'schema-cell') ? { baseTablesOnly: true } : {}),
         ...(diagnosticSection === undefined ? {} : { diagnosticSection }),
         ...(diagnosticDatabase === undefined ? {} : { diagnosticDatabase }),
         ...(schema === undefined ? {} : {
@@ -912,6 +969,9 @@ export class ServerOpsDataService {
           ...(schema.offset === undefined ? {} : { rowOffset: schema.offset }),
           ...(schema.limit === undefined ? {} : { rowLimit: schema.limit }),
           ...(schema.filters === undefined ? {} : { rowFilters: schema.filters }),
+          ...(schema.columnIndex === undefined ? {} : { cellColumnIndex: schema.columnIndex }),
+          ...(schema.expectedColumn === undefined ? {} : { cellExpectedColumn: schema.expectedColumn }),
+          ...(schema.sha256 === undefined ? {} : { cellSha256: schema.sha256 }),
         }),
         ...(query === undefined ? {} : { queryId: query.queryId, sql: query.sql, maxRows: query.maxRows }),
       }, signal)
@@ -928,6 +988,7 @@ export class ServerOpsDataService {
    * `isServerOpsPlaintextDirectAddress()`，避免"界面说可以、主进程说不行"。
    */
   private assertDirectTransportIsSafe(target: ServerOpsDataReadTarget): void {
+    if (target.engine === 'sqlite') return
     /** 历史 IP 校验配置仍可列出，但在发送凭据与开通道前明确要求用户改为 DNS 名称。 */
     if (target.engine === 'mysql' && target.tlsMode === 'verify'
       && !isServerOpsMySqlTlsServerName(target.tlsServerName)) {
@@ -950,7 +1011,7 @@ interface ServerOpsDataSchemaCacheContext {
 /** 一次只读读取所需的连接目标字段；已保存记录与未保存草稿都满足它。 */
 type ServerOpsDataReadTarget = Pick<
   ServerOpsStoredDataSource,
-  'transport' | 'hostId' | 'engine' | 'address' | 'port' | 'filePath' | 'database' | 'username' | 'tlsMode' | 'tlsServerName'
+  'transport' | 'hostId' | 'engine' | 'address' | 'port' | 'filePath' | 'localFileId' | 'database' | 'username' | 'tlsMode' | 'tlsServerName'
 >
 
 /**
@@ -981,6 +1042,7 @@ function sameDataReadIdentity(left: ServerOpsStoredDataSource, right: ServerOpsS
     && left.address === right.address
     && left.port === right.port
     && left.filePath === right.filePath
+    && left.localFileId === right.localFileId
     && left.database === right.database
     && left.username === right.username
     && left.tlsMode === right.tlsMode

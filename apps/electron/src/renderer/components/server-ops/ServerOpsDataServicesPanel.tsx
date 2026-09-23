@@ -21,6 +21,8 @@ import type {
   ServerOpsDataSourceListResult,
   ServerOpsDataSourcePasswordInput,
   ServerOpsDataSourcePasswordResult,
+  ServerOpsDataSourceCellInput,
+  ServerOpsDataSourceCellResult,
   ServerOpsDataSourceProbeDraft,
   ServerOpsDataSourceProbeInput,
   ServerOpsDataSourceRowsInput,
@@ -84,6 +86,8 @@ export interface ServerOpsDataPanelApi {
   describeServerOpsDataSchemaTable(input: ServerOpsDataSourceTableInput): Promise<ServerOpsDataSourceTableResult>
   /** 表浏览：分页行预览。 */
   readServerOpsDataSchemaRows(input: ServerOpsDataSourceRowsInput): Promise<ServerOpsDataSourceRowsResult>
+  /** 表浏览：按需读取一格完整内容。 */
+  readServerOpsDataSchemaCell(input: ServerOpsDataSourceCellInput): Promise<ServerOpsDataSourceCellResult>
   /** 当前数据库的显式只读 SQL 查询；旧 preload 下缺失并由 UI 禁用。 */
   queryServerOpsDatabase?: (input: ServerOpsDataQueryInput) => Promise<ServerOpsDataQueryResult>
   /** 取消当前窗口拥有的 SQL 查询，并等待底层释放完成。 */
@@ -1099,6 +1103,7 @@ export function ServerOpsDataServicesPanel({
       listServerOpsDataSchemaTables: (input) => api.listServerOpsDataSchemaTables(input),
       describeServerOpsDataSchemaTable: (input) => api.describeServerOpsDataSchemaTable(input),
       readServerOpsDataSchemaRows: (input) => api.readServerOpsDataSchemaRows(input),
+      readServerOpsDataSchemaCell: (input) => api.readServerOpsDataSchemaCell(input),
     },
     publish: setSchemaProjection,
   }))
@@ -1113,9 +1118,10 @@ export function ServerOpsDataServicesPanel({
       : {
         id: focusSource.id,
         engine: focusSource.engine,
+        updatedAt: focusSource.updatedAt,
         ...(focusSource.database === undefined ? {} : { database: focusSource.database }),
       })
-  }, [focusSource?.id, focusSource?.engine, focusSource?.database, schemaController])
+  }, [focusSource?.id, focusSource?.engine, focusSource?.database, focusSource?.updatedAt, schemaController])
   /** 最新一次渲染的回调，供只创建一次的控制器使用，避免闭包捕获旧的刷新函数。 */
   const onSourceMutatedRef = React.useRef(onSourceMutated)
   React.useEffect(() => {
@@ -1173,6 +1179,8 @@ export function ServerOpsDataServicesPanel({
           onBackToList={() => schemaController.backToList()}
           onDetailTabChange={(tab) => schemaController.setDetailTab(tab)}
           onLoadRows={(offset) => schemaController.loadRows(offset)}
+          onOpenCell={(rowIndex, columnIndex) => schemaController.openCell(rowIndex, columnIndex)}
+          onCloseCell={() => schemaController.closeCell()}
           onRefresh={() => schemaController.refresh()}
         />
       )}

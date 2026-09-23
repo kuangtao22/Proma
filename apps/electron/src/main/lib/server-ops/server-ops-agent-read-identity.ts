@@ -50,7 +50,7 @@ export function captureServerOpsReadBindings(resources: ServerOpsAgentReadResour
       /** 同一密码引用原位替换也改变租约身份，密文摘要不向模型公开。 */
       const credentialVersion = services.data?.getReadCredentialVersion?.(source.id) ?? null
       facts = [source.id, source.engine, source.transport, source.address, source.port, source.username ?? null,
-        source.database ?? null, source.filePath ?? null, source.tlsMode, source.tlsServerName ?? null, source.hasPassword, credentialVersion, jumpHost ? hostIdentity(jumpHost, services) : null]
+        source.database ?? null, source.filePath ?? null, source.localFileId ?? null, source.tlsMode, source.tlsServerName ?? null, source.hasPassword, credentialVersion, jumpHost ? hostIdentity(jumpHost, services) : null]
     }
     return { key, fingerprint: createHash('sha256').update(JSON.stringify(facts)).digest('hex'), ...(hostId ? { hostId } : {}) }
   })

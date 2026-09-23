@@ -402,6 +402,30 @@ describe('服务器运维 IPC', () => {
     })).rejects.toThrow('SERVER_OPS_CONNECTION_MOVE_RESULT_INVALID')
   })
 
+  test('Given 单格原文 IPC When 未授权窗口或伪造请求调用 Then 不触发读取且成功回执保留全文', async () => {
+    /** 只记录受信窗口的严格请求，不运行真实数据库。 */
+    const calls: unknown[] = []
+    const value = '{\n"payload":"' + 'x'.repeat(400) + '"\n}'
+    const fixture = createAgentAccessHarness({ data: {
+      listSources: () => ({ sources: [] }), upsertSource: () => { throw new Error('NOT_USED') },
+      deleteSource: () => undefined, probeSource: async () => { throw new Error('NOT_USED') },
+      diagnoseSource: async () => { throw new Error('NOT_USED') }, revealSourcePassword: () => ({ password: null }),
+      listSchemaTables: async () => ({ databases: [], tables: [] }), describeSchemaTable: async () => ({ columns: [], indexes: [] }),
+      readSchemaRows: async () => ({ columns: [], rows: [], offset: 0, limit: 50, truncated: false }), removeHost: () => undefined,
+      readSchemaCell: async (input) => { calls.push(input); return { value } },
+    } })
+    /** 与表预览一致的来源，加上单格正文摘要。 */
+    const input = { sourceId: 'source-1', database: 'main', table: 'entries', offset: 53,
+      columnIndex: 1, expectedColumn: 'payload', sha256: 'a'.repeat(64) }
+    try {
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, createSender(99), input)).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, fixture.sender, { ...input, sql: 'SELECT 1' })).rejects.toThrow('SERVER_OPS_DATA_CELL_INPUT_INVALID')
+      expect(calls).toHaveLength(0)
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, fixture.sender, input)).resolves.toEqual({ value })
+      expect(calls).toEqual([input])
+    } finally { fixture.registration.dispose() }
+  })
+
   test('Given MySQL 按库诊断 When 调用 IPC Then 严格解析并保留 section 与 database', async () => {
     /** 记录服务层收到的诊断输入。 */
     const diagnoseCalls: unknown[] = []
@@ -1279,7 +1303,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(77)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(78)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1298,7 +1322,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(77)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(78)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

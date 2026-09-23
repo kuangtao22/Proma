@@ -2,6 +2,34 @@ import { describe, expect, test } from 'bun:test'
 import { formatServerOpsDataProbeSummary, getServerOpsDataErrorMessage } from './server-ops-data-display'
 
 describe('数据服务展示文案', () => {
+  test('Given 本地 SQLite 文件权限或身份变化 When 显示错误 Then 给出可执行恢复方式', () => {
+    expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_SQLITE_FILE_CHANGED'))).toContain('删除当前连接后重新添加')
+    expect(getServerOpsDataErrorMessage(new Error('SERVER_OPS_SQLITE_LOCAL_FILE_PERMISSION_DENIED'))).toContain('文件权限')
+  })
+  test('Given 主进程在探测前拒绝本地 SQLite 文件 When 显示错误 Then 给出对应的中文处理建议', () => {
+    /** 主进程文件检查早于 runtime probe，这些错误必须由渲染层直接解释。 */
+    const expectations: ReadonlyArray<readonly [string, string]> = [
+      ['SERVER_OPS_SQLITE_FILE_NOT_FOUND', '找不到 SQLite 文件，请确认文件路径仍然有效'],
+      ['SERVER_OPS_SQLITE_FILE_NOT_REGULAR', '所选路径不是普通文件，请重新选择 SQLite 数据库文件'],
+      ['SERVER_OPS_SQLITE_DATABASE_INVALID', '文件不是有效的 SQLite 数据库或数据库已损坏，请检查后重新选择'],
+      ['SERVER_OPS_SQLITE_PATH_INVALID', 'SQLite 文件路径无效，请重新选择文件'],
+      ['SERVER_OPS_SQLITE_FILE_UNAVAILABLE', 'SQLite 文件暂时不可用，请检查文件状态后重试'],
+    ]
+    for (const [code, message] of expectations) {
+      expect(getServerOpsDataErrorMessage(new Error(code))).toBe(message)
+      expect(getServerOpsDataErrorMessage(new Error(`Error invoking remote method 'server-ops:x': Error: ${code}`))).toBe(message)
+    }
+  })
+  test('Given 单元格全文读取受限或身份变化 When 显示错误 Then 给出安全且可操作的中文提示', () => {
+    /** 单格接口只公开稳定错误码，不展示数据库底层错误。 */
+    const expectations: ReadonlyArray<readonly [string, string]> = [
+      ['SERVER_OPS_DATA_CELL_TOO_LARGE', '单元格内容超过 1 MiB，无法在详情中打开'],
+      ['SERVER_OPS_DATA_CELL_CHANGED', '单元格数据已变化，请刷新表后重新打开'],
+      ['SERVER_OPS_DATA_CELL_REDACTED', '该敏感字段不可读取完整内容'],
+      ['SERVER_OPS_DATA_CELL_TIMEOUT', '单元格完整内容读取超时，请稍后重试'],
+    ]
+    for (const [code, message] of expectations) expect(getServerOpsDataErrorMessage(new Error(code))).toBe(message)
+  })
   test('Given 新筛选请求被旧后台合同拒绝 When 显示错误 Then 提示完整重启且不误判普通请求', () => {
     /** 现场旧主进程的 IPC 错误，不包含筛选值或数据库内容。 */
     const error = new Error("Error invoking remote method 'server-ops:read-data-schema-rows': Error: SERVER_OPS_DATA_SCHEMA_ROWS_INPUT_INVALID")

@@ -51,6 +51,7 @@ export interface ServerOpsProjectViewProps {
   searchQuery?: string
   onFilterKindChange?: (kind: ServerOpsConnectionKind | 'all') => void
   onSearchQueryChange?: (query: string) => void
+
 }
 
 /** 根据连接类别返回同一套图标，卡片可通过样式覆盖大小与颜色。 */

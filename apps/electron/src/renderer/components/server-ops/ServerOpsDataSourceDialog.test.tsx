@@ -7,10 +7,14 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { parseServerOpsDataSourceProbeInput } from '@proma/shared'
 import type { ServerOpsDataProbeResult, ServerOpsDataSource, ServerOpsDataSourceProbeDraft } from '@proma/shared'
 import {
+  applyServerOpsDataConnectionModeChange,
   applyServerOpsDataSourceEngineChange,
+  applyServerOpsLocalSqliteFileSelection,
   buildServerOpsDataSourceProbeDraft,
   buildServerOpsDataSourceUpsertInput,
   createServerOpsDataSourceDraft,
+  getServerOpsDataConnectionMode,
+  getServerOpsDataConnectionModeEngines,
   ServerOpsDataSourceFields,
   useServerOpsDataSourceDialogController,
   validateServerOpsDataSourceDraft,
@@ -156,6 +160,7 @@ function renderFields(options: {
       hostLabel="生产 API"
       hostOptions={[{ id: 'host-1', label: '生产 API' }, { id: 'host-2', label: '报表服务器' }]}
       onChange={() => undefined}
+      onConnectionModeChange={() => undefined}
       onEngineChange={() => undefined}
       onShowPasswordChange={() => undefined}
     />,
@@ -163,6 +168,80 @@ function renderFields(options: {
 }
 
 describe('数据源表单', () => {
+  test('Given 新建连接 When 渲染连接方式 Then 本地数据库常驻且各模式只提供适用引擎', () => {
+    expect(getServerOpsDataConnectionModeEngines('direct')).toEqual(['mysql', 'redis'])
+    expect(getServerOpsDataConnectionModeEngines('ssh')).toEqual(['mysql', 'redis', 'sqlite'])
+    expect(getServerOpsDataConnectionModeEngines('local-sqlite')).toEqual(['sqlite'])
+
+    const local = applyServerOpsDataConnectionModeChange(createServerOpsDataSourceDraft(null), 'local-sqlite')
+    const localHtml = renderFields({ draft: local })
+    expect(getServerOpsDataConnectionMode(local)).toBe('local-sqlite')
+    expect(localHtml).toContain('当前：本地数据库（SQLite）')
+    const engineButton = localHtml.match(/<button[^>]*id="server-ops-data-engine"[^>]*>/u)?.[0] ?? ''
+    expect(engineButton).toContain('disabled')
+    expect(localHtml).not.toContain('数据库地址')
+    expect(localHtml).not.toContain('登录凭据')
+    expect(localHtml).not.toContain('TLS 模式')
+  })
+
+  test('Given 本地 SQLite When 切回直连或切到 SSH Then 恢复网络默认值或保留 SQLite 并选择服务器', () => {
+    const local = {
+      ...applyServerOpsDataConnectionModeChange(createServerOpsDataSourceDraft(null), 'local-sqlite'),
+      label: '本地审计库',
+      filePath: '/tmp/audit.sqlite3',
+    }
+    const direct = applyServerOpsDataConnectionModeChange(local, 'direct', 'host-2')
+    expect(direct).toMatchObject({ transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: '3306', filePath: '', tlsMode: 'preferred' })
+    expect(buildServerOpsDataSourceUpsertInput({ hostId: 'host-2', source: null, draft: direct })).toEqual({
+      transport: 'direct', engine: 'mysql', label: '本地审计库', address: '127.0.0.1', port: 3306, tlsMode: 'preferred',
+    })
+
+    const ssh = applyServerOpsDataConnectionModeChange(local, 'ssh', 'host-2')
+    expect(ssh).toMatchObject({ transport: 'ssh', engine: 'sqlite', hostId: 'host-2', filePath: '', database: 'main' })
+    expect(getServerOpsDataConnectionMode(ssh)).toBe('ssh')
+  })
+
+  test('Given 本地文件选择 When 选择或取消 Then 填充路径与默认名称且取消保持草稿不变', () => {
+    const local = applyServerOpsDataConnectionModeChange(createServerOpsDataSourceDraft(null), 'local-sqlite')
+    expect(applyServerOpsLocalSqliteFileSelection(local, null)).toBe(local)
+    const selected = applyServerOpsLocalSqliteFileSelection(local, { filePath: '/tmp/orders.sqlite3', fileName: 'orders.sqlite3' })
+    expect(selected).toMatchObject({ filePath: '/tmp/orders.sqlite3', label: 'orders.sqlite3' })
+    expect(buildServerOpsDataSourceUpsertInput({ hostId: '', source: null, draft: selected })).toEqual({
+      transport: 'direct', engine: 'sqlite', label: 'orders.sqlite3', filePath: '/tmp/orders.sqlite3', database: 'main', tlsMode: 'disabled',
+    })
+    expect(applyServerOpsLocalSqliteFileSelection({ ...local, label: '自定义名称' }, { filePath: '/tmp/new.db', fileName: 'new.db' }).label).toBe('自定义名称')
+  })
+
+  test('Given 新建本地 SQLite When 选择绝对路径 Then 构造无主机、无凭据的直连输入', () => {
+    const draft = { ...createServerOpsDataSourceDraft(null, 'sqlite'), transport: 'direct' as const, label: '本地审计库', filePath: 'C:\\data\\audit.sqlite3' }
+    expect(validateServerOpsDataSourceDraft(draft)).toEqual({})
+    expect(buildServerOpsDataSourceProbeDraft({ hostId: '', source: null, draft })).toEqual({
+      transport: 'direct', engine: 'sqlite', filePath: 'C:\\data\\audit.sqlite3', database: 'main', tlsMode: 'disabled',
+    })
+    expect(buildServerOpsDataSourceUpsertInput({ hostId: '', source: null, draft })).toEqual({
+      transport: 'direct', engine: 'sqlite', label: '本地审计库', filePath: 'C:\\data\\audit.sqlite3', database: 'main', tlsMode: 'disabled',
+    })
+  })
+
+  test('Given SQLite 表单 When 切换本地文件 Then 显示文件选择入口且不要求 SSH 服务器', () => {
+    const draft = { ...createServerOpsDataSourceDraft(null, 'sqlite'), transport: 'direct' as const, label: '本地库', filePath: '/tmp/app.db' }
+    const html = renderFields({ draft, hostId: '' })
+    expect(html).toContain('本地数据库（SQLite）')
+    expect(html).toContain('选择 SQLite 文件')
+    expect(html).not.toContain('请选择 SQLite 文件所在的服务器')
+    expect(html).not.toContain('Python 3.11+')
+  })
+
+  test('Given 编辑已有 SQLite When 渲染 Then 锁定连接方式并说明切换需新建连接', () => {
+    const source = createSource({ engine: 'sqlite', transport: 'direct', hostId: undefined, address: undefined, port: undefined, username: undefined,
+      filePath: '/tmp/app.db', localFileId: '1:2:3', database: 'main', tlsMode: 'disabled', hasPassword: false })
+    const html = renderFields({ mode: 'edit', source, hostId: '' })
+    expect(html).toContain('如需切换，请新建连接')
+    /** React 服务端渲染不保证 HTML 属性顺序，只验证目标按钮本身已禁用。 */
+    const transportButton = html.match(/<button[^>]*id="server-ops-data-transport"[^>]*>/u)?.[0] ?? ''
+    expect(transportButton).toContain('disabled')
+  })
+
   test('Given 新建 SQLite When 选择服务器与绝对路径 Then 只构造 SSH 文件连接字段', () => {
     const draft = {
       ...createServerOpsDataSourceDraft(null, 'sqlite'),

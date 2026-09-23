@@ -70,6 +70,8 @@ import {
   parseServerOpsDataSourceProbeInput,
   parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceRowsResult,
+  parseServerOpsDataSourceCellInput,
+  parseServerOpsDataSourceCellResult,
   parseServerOpsDataSourceTableInput,
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesInput,
@@ -280,7 +282,7 @@ export interface ServerOpsIpcOptions {
   transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
   fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
   data?: Pick<ServerOpsDataService, 'listSources' | 'upsertSource' | 'deleteSource' | 'probeSource' | 'diagnoseSource' | 'revealSourcePassword' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows' | 'removeHost'>
-    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource' | 'getReadCredentialVersion'>>
+    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource' | 'readSchemaCell' | 'getReadCredentialVersion'>>
   /** 本地 SQL 查询历史；不经过数据库 runtime、Agent 或审计。 */
   queryHistory?: Pick<ServerOpsDataQueryHistoryStore, 'list' | 'save'>
   /** 运维项目：侧栏分组与连接归属的边界。 */
@@ -641,7 +643,7 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     return parseServerOpsDataSourcePasswordResult(options.data.revealSourcePassword(parsed))
   })
-  /** 表浏览三个通道：一律只读，且标识符由 runtime 先过 information_schema 白名单。 */
+  /** 表浏览通道一律只读，标识符由 runtime 先过引擎元数据白名单。 */
   installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.LIST_TABLES, async (event, input) => {
     assertAuthorizedSender(event, options)
     const parsed = parseServerOpsDataSourceTablesInput(input)
@@ -659,6 +661,13 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const parsed = parseServerOpsDataSourceRowsInput(input)
     if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     return parseServerOpsDataSourceRowsResult(await options.data.readSchemaRows(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    /** 单格全文使用独立严格合同，不放宽普通表预览预算。 */
+    const parsed = parseServerOpsDataSourceCellInput(input)
+    if (!options.data?.readSchemaCell) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataSourceCellResult(await options.data.readSchemaCell(parsed))
   })
   installHandler(SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, async (event, input) => {
     assertAuthorizedSender(event, options)

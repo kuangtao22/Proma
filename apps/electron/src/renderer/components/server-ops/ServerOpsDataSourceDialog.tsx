@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Eye, EyeOff, LoaderCircle, PlugZap } from 'lucide-react'
+import { Eye, EyeOff, FileUp, LoaderCircle, PlugZap } from 'lucide-react'
 import type {
   ServerOpsConnectionDraftInput,
   ServerOpsDataEngine,
@@ -10,7 +10,7 @@ import type {
   ServerOpsDataTlsMode,
   ServerOpsDataTransport,
 } from '@proma/shared'
-import { isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
+import { isServerOpsLocalSqliteFilePath, isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -62,6 +62,9 @@ export interface ServerOpsDataSourceDraft {
   tlsServerName: string
 }
 
+/** 表单层连接方式；本地 SQLite 仍映射到既有 direct + sqlite 后端合同。 */
+export type ServerOpsDataConnectionMode = ServerOpsDataTransport | 'local-sqlite'
+
 /** 表单字段错误集合。 */
 export interface ServerOpsDataSourceFormErrors {
   label?: string
@@ -89,7 +92,7 @@ export function createServerOpsDataSourceDraft(
   /** 初始引擎。 */
   const engine = source?.engine ?? initialEngine
   const base: ServerOpsDataSourceDraft = {
-    transport: engine === 'sqlite' ? 'ssh' : source?.transport ?? 'direct',
+    transport: source?.transport ?? (engine === 'sqlite' ? 'ssh' : 'direct'),
     hostId: source?.hostId ?? '',
     engine,
     label: source?.label ?? '',
@@ -126,11 +129,12 @@ export function applyServerOpsDataSourceEngineChange(
   draft: ServerOpsDataSourceDraft,
   engine: ServerOpsDataEngine,
 ): ServerOpsDataSourceDraft {
+  /** 本地文件模式的 SQLite 由连接方式控制，网络直连不能通过引擎选择隐式进入本地模式。 */
+  if (engine === 'sqlite' && draft.transport !== 'ssh') return draft
   return {
     ...draft,
     engine,
     ...(engine === 'sqlite' ? {
-      transport: 'ssh' as const,
       address: '',
       port: '',
       database: 'main',
@@ -140,6 +144,7 @@ export function applyServerOpsDataSourceEngineChange(
       tlsMode: 'disabled' as const,
       tlsServerName: '',
     } : {
+      address: draft.engine === 'sqlite' ? '127.0.0.1' : draft.address,
       port: String(DEFAULT_ENGINE_PORTS[engine]),
       filePath: '',
       database: '',
@@ -149,14 +154,98 @@ export function applyServerOpsDataSourceEngineChange(
   }
 }
 
+/** 从后端草稿推导表单的三态连接方式。 */
+export function getServerOpsDataConnectionMode(draft: ServerOpsDataSourceDraft): ServerOpsDataConnectionMode {
+  return draft.engine === 'sqlite' && draft.transport === 'direct' ? 'local-sqlite' : draft.transport
+}
+
+/** 返回指定连接方式可选择的数据库引擎，供表单渲染与规则测试共用。 */
+export function getServerOpsDataConnectionModeEngines(
+  mode: ServerOpsDataConnectionMode,
+): readonly ServerOpsDataEngine[] {
+  if (mode === 'local-sqlite') return ['sqlite']
+  if (mode === 'ssh') return ['mysql', 'redis', 'sqlite']
+  return ['mysql', 'redis']
+}
+
+/** 切换表单连接方式；只转换既有 engine/transport 字段，不扩展后端枚举。 */
+export function applyServerOpsDataConnectionModeChange(
+  draft: ServerOpsDataSourceDraft,
+  mode: ServerOpsDataConnectionMode,
+  defaultHostId = '',
+): ServerOpsDataSourceDraft {
+  if (mode === 'local-sqlite') {
+    return {
+      ...draft,
+      transport: 'direct',
+      engine: 'sqlite',
+      hostId: '',
+      address: '',
+      port: '',
+      filePath: getServerOpsDataConnectionMode(draft) === 'local-sqlite' ? draft.filePath : '',
+      database: 'main',
+      username: '',
+      password: '',
+      clearPassword: false,
+      tlsMode: 'disabled',
+      tlsServerName: '',
+    }
+  }
+  if (mode === 'ssh') {
+    return {
+      ...draft,
+      transport: 'ssh',
+      hostId: draft.hostId || defaultHostId,
+      /** 本地路径不能冒充服务器路径；SQLite 引擎本身继续保留。 */
+      ...(getServerOpsDataConnectionMode(draft) === 'local-sqlite' ? { filePath: '' } : {}),
+    }
+  }
+  if (draft.engine !== 'sqlite') return { ...draft, transport: 'direct', hostId: '' }
+  /** 从任一 SQLite 文件模式切到网络直连时恢复可立即编辑的 MySQL 默认值。 */
+  return {
+    ...draft,
+    transport: 'direct',
+    hostId: '',
+    engine: 'mysql',
+    address: '127.0.0.1',
+    port: String(DEFAULT_ENGINE_PORTS.mysql),
+    filePath: '',
+    database: '',
+    username: '',
+    password: '',
+    clearPassword: false,
+    tlsMode: 'preferred',
+    tlsServerName: '',
+  }
+}
+
+/** 应用本机文件选择结果；取消选择时完整保留当前草稿。 */
+export function applyServerOpsLocalSqliteFileSelection(
+  draft: ServerOpsDataSourceDraft,
+  selection: { filePath: string; fileName: string } | null,
+): ServerOpsDataSourceDraft {
+  if (selection === null) return draft
+  return {
+    ...draft,
+    filePath: selection.filePath,
+    ...(draft.label.trim() === '' ? { label: selection.fileName.slice(0, 64) } : {}),
+  }
+}
+
 /** 校验草稿及网络连接的跳板身份，返回字段错误；TLS 规则与主进程保持一致。 */
 export function validateServerOpsDataSourceDraft(draft: ServerOpsDataSourceDraft, hostId = draft.hostId): ServerOpsDataSourceFormErrors {
   /** 待返回的字段错误。 */
   const errors: ServerOpsDataSourceFormErrors = {}
   if (draft.label.trim().length === 0 || draft.label.length > 64) errors.label = '名称必填且不超过 64 个字符'
   if (draft.engine === 'sqlite') {
-    if (draft.hostId === '') errors.hostId = '请选择 SQLite 文件所在的服务器'
-    if (!isServerOpsSqliteFilePath(draft.filePath)) errors.filePath = '请输入服务器上的绝对路径，不能使用 URI、相对路径或内存数据库'
+    if (draft.transport === 'ssh' && draft.hostId === '') errors.hostId = '请选择 SQLite 文件所在的服务器'
+    if (draft.transport === 'direct'
+      ? !isServerOpsLocalSqliteFilePath(draft.filePath)
+      : !isServerOpsSqliteFilePath(draft.filePath)) {
+      errors.filePath = draft.transport === 'direct'
+        ? '请选择本机上的 SQLite 文件'
+        : '请输入服务器上的绝对路径，不能使用 URI、相对路径或内存数据库'
+    }
     return errors
   }
   if (draft.transport === 'ssh' && hostId === '') {
@@ -214,11 +303,15 @@ export function buildServerOpsDataSourceProbeDraft(options: {
 }): ServerOpsDataSourceProbeDraft | null {
   const { source, draft } = options
   if (draft.engine === 'sqlite') {
+    const transport = source?.transport ?? draft.transport
     const jumpHostId = source?.hostId ?? draft.hostId ?? options.hostId
-    if (jumpHostId === '' || !isServerOpsSqliteFilePath(draft.filePath)) return null
+    const validPath = transport === 'direct'
+      ? isServerOpsLocalSqliteFilePath(draft.filePath)
+      : isServerOpsSqliteFilePath(draft.filePath)
+    if (!validPath || (transport === 'ssh' && jumpHostId === '')) return null
     return {
-      transport: 'ssh',
-      hostId: jumpHostId,
+      transport,
+      ...(transport === 'ssh' ? { hostId: jumpHostId } : {}),
       engine: 'sqlite',
       filePath: draft.filePath.trim(),
       database: 'main',
@@ -272,9 +365,10 @@ export function buildServerOpsDataSourceUpsertInput(options: {
 }): ServerOpsDataSourceUpsertInput {
   const { hostId, source, draft } = options
   if (draft.engine === 'sqlite') {
+    const transport = source?.transport ?? draft.transport
     return {
-      transport: 'ssh',
-      hostId: source?.hostId ?? draft.hostId ?? hostId,
+      transport,
+      ...(transport === 'ssh' ? { hostId: source?.hostId ?? draft.hostId ?? hostId } : {}),
       ...(source ? { sourceId: source.id } : {}),
       engine: 'sqlite',
       label: draft.label,
@@ -312,6 +406,7 @@ export interface ServerOpsDataSourceFieldsProps {
   /** 密码输入是否明文显示。 */
   showPassword: boolean
   onChange: (patch: Partial<ServerOpsDataSourceDraft>) => void
+  onConnectionModeChange: (mode: ServerOpsDataConnectionMode) => void
   onEngineChange: (engine: ServerOpsDataEngine) => void
   /**
    * 切换密码明文显示。
@@ -330,6 +425,8 @@ export interface ServerOpsDataSourceFieldsProps {
   hostLabel: string
   /** 当前项目内可作为 SQLite 文件宿主的服务器。 */
   hostOptions?: readonly ServerOpsDataSourceHostOption[]
+  /** 打开本机文件选择器；仅本地 SQLite 模式显示。 */
+  onSelectLocalFile?: () => void
 }
 
 /** SQLite 服务器选择只需要稳定 ID 与可辨认名称。 */
@@ -346,6 +443,7 @@ export function ServerOpsDataSourceFields({
   hasSavedPassword,
   showPassword,
   onChange,
+  onConnectionModeChange,
   onEngineChange,
   onShowPasswordChange,
   revealingPassword = false,
@@ -353,31 +451,36 @@ export function ServerOpsDataSourceFields({
   hostId,
   hostLabel,
   hostOptions = [],
+  onSelectLocalFile,
 }: ServerOpsDataSourceFieldsProps): React.ReactElement {
   /** 固定星号只表示已有凭据，不读取真实密码，也不作为草稿提交。 */
   const hasRetainedPassword = mode === 'edit' && hasSavedPassword && !draft.clearPassword
+  /** 本地文件是表单层独立模式，提交仍使用 direct + sqlite。 */
+  const connectionMode = getServerOpsDataConnectionMode(draft)
   return (
     <div className="grid gap-4 [&_label]:text-xs" data-server-ops-data-source-form="true">
       <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
-        {draft.engine === 'sqlite' ? null : <div className="grid gap-1.5">
+        <div className="grid gap-1.5">
           <Label htmlFor="server-ops-data-transport">连接方式</Label>
-          <Select value={draft.transport} onValueChange={(value) => onChange({ transport: value as ServerOpsDataTransport })}>
+          <Select value={connectionMode} disabled={mode === 'edit'} onValueChange={(value) => onConnectionModeChange(value as ServerOpsDataConnectionMode)}>
             <SelectTrigger id="server-ops-data-transport" aria-label="连接方式"><SelectValue /></SelectTrigger>
             <SelectContent className="z-[280]">
               <SelectItem value="direct">直接连接（本机发起）</SelectItem>
-              <SelectItem value="ssh" disabled={!hostId}>{hostLabel ? `经由 SSH · ${hostLabel}` : '经由 SSH 服务器'}</SelectItem>
+              <SelectItem value="ssh" disabled={!hostId && hostOptions.length === 0}>{hostLabel ? `经由 SSH · ${hostLabel}` : '经由 SSH 服务器'}</SelectItem>
+              <SelectItem value="local-sqlite">本地数据库（SQLite）</SelectItem>
             </SelectContent>
           </Select>
+          {draft.engine === 'sqlite' ? <p className="text-[11px] text-muted-foreground">当前：{connectionMode === 'local-sqlite' ? '本地数据库（SQLite）' : 'SSH 服务器文件'}{mode === 'edit' ? '；如需切换，请新建连接' : ''}</p> : null}
           {errors.hostId ? <p className="text-[11px] text-destructive">{errors.hostId}</p> : null}
-        </div>}
+        </div>
         <div className="grid gap-1.5">
           <Label htmlFor="server-ops-data-engine">引擎</Label>
-          <Select value={draft.engine} onValueChange={(value) => onEngineChange(value as ServerOpsDataEngine)}>
+          <Select value={draft.engine} disabled={connectionMode === 'local-sqlite'} onValueChange={(value) => onEngineChange(value as ServerOpsDataEngine)}>
             <SelectTrigger id="server-ops-data-engine" aria-label="引擎"><SelectValue /></SelectTrigger>
             <SelectContent className="z-[280]">
-              <SelectItem value="mysql">MySQL</SelectItem>
-              <SelectItem value="sqlite">SQLite</SelectItem>
-              <SelectItem value="redis">Redis</SelectItem>
+              {getServerOpsDataConnectionModeEngines(connectionMode).map((engine) => (
+                <SelectItem key={engine} value={engine}>{engine === 'mysql' ? 'MySQL' : engine === 'redis' ? 'Redis' : 'SQLite'}</SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>
@@ -403,7 +506,7 @@ export function ServerOpsDataSourceFields({
       </div>
       {draft.engine === 'sqlite' ? (
         <div className="grid gap-3">
-          <div className="grid gap-1.5">
+          {draft.transport === 'ssh' ? <div className="grid gap-1.5">
             <Label htmlFor="server-ops-data-host">服务器</Label>
             <Select value={draft.hostId} disabled={mode === 'edit'} onValueChange={(hostId) => onChange({ hostId })}>
               <SelectTrigger id="server-ops-data-host" aria-label="服务器"><SelectValue placeholder="选择文件所在服务器" /></SelectTrigger>
@@ -412,11 +515,20 @@ export function ServerOpsDataSourceFields({
               </SelectContent>
             </Select>
             {errors.hostId ? <p className="text-[11px] text-destructive">{errors.hostId}</p> : null}
-          </div>
+          </div> : null}
           <div className="grid gap-1.5">
             <Label htmlFor="server-ops-data-file-path">SQLite 文件路径</Label>
-            <Input id="server-ops-data-file-path" value={draft.filePath} placeholder="/srv/data/app.sqlite3" onChange={(event) => onChange({ filePath: event.target.value })} />
-            <p className="text-[11px] text-muted-foreground">填写服务器上的绝对路径；服务器需安装 Python 3.11+ 并包含 sqlite3 标准库。</p>
+            <div className="flex min-w-0 gap-2">
+              <Input id="server-ops-data-file-path" value={draft.filePath} readOnly={draft.transport === 'direct'} title={draft.filePath}
+                placeholder={draft.transport === 'direct' ? '选择本机 SQLite 文件' : '/srv/data/app.sqlite3'}
+                onChange={(event) => onChange({ filePath: event.target.value })} />
+              {draft.transport === 'direct' ? <Button type="button" variant="outline" className="shrink-0 gap-1.5" onClick={onSelectLocalFile}>
+                <FileUp className="size-3.5" aria-hidden="true" />选择 SQLite 文件
+              </Button> : null}
+            </div>
+            <p className="text-[11px] text-muted-foreground">{draft.transport === 'direct'
+              ? '原地只读打开本机文件，不复制数据库；移动或替换文件后需重新添加连接。'
+              : '填写服务器上的绝对路径；服务器需安装 Python 3.11+ 并包含 sqlite3 标准库。'}</p>
             {errors.filePath ? <p className="text-[11px] text-destructive">{errors.filePath}</p> : null}
           </div>
         </div>
@@ -598,6 +710,7 @@ export interface ServerOpsDataSourceDialogController {
   testResult: ServerOpsDataProbeResult | null
   testError: string | null
   patchDraft: (patch: Partial<ServerOpsDataSourceDraft>) => void
+  changeConnectionMode: (mode: ServerOpsDataConnectionMode) => void
   changeEngine: (engine: ServerOpsDataEngine) => void
   setPasswordVisibility: (showPassword: boolean) => Promise<void>
   testConnection: () => Promise<void>
@@ -706,6 +819,18 @@ export function useServerOpsDataSourceDialogController(
     setTestResult(null)
     setTestError(null)
   }, [])
+
+  /** 切换表单连接方式并清理已不适用的凭据、错误和测试结果。 */
+  const changeConnectionMode = React.useCallback((connectionMode: ServerOpsDataConnectionMode): void => {
+    asyncSessionRef.current.draftRevision += 1
+    manualTlsNameRef.current = false
+    setPasswordFromStore(false)
+    setShowPassword(false)
+    setDraft((current) => applyServerOpsDataConnectionModeChange(current, connectionMode, hostId))
+    setErrors({})
+    setTestResult(null)
+    setTestError(null)
+  }, [hostId])
 
   /** 按当前会话读取已保存密码；任何身份或草稿变化都会丢弃迟到回执。 */
   const setPasswordVisibility = async (nextShowPassword: boolean): Promise<void> => {
@@ -817,6 +942,7 @@ export function useServerOpsDataSourceDialogController(
     testResult,
     testError,
     patchDraft,
+    changeConnectionMode,
     changeEngine,
     setPasswordVisibility,
     testConnection,
@@ -847,6 +973,8 @@ export function ServerOpsDataSourceDialog({
   onSubmit,
   onClose,
 }: ServerOpsDataSourceDialogProps): React.ReactElement {
+  /** 本地 SQLite 使用原生文件输入取得 File，再由 preload 安全解析绝对路径。 */
+  const localSqliteInputRef = React.useRef<HTMLInputElement>(null)
   /** 弹窗当前状态与带身份守卫的异步动作。 */
   const controller = useServerOpsDataSourceDialogController({
     open,
@@ -868,6 +996,7 @@ export function ServerOpsDataSourceDialog({
     testResult,
     testError,
     patchDraft,
+    changeConnectionMode,
     changeEngine,
     setPasswordVisibility,
     testConnection,
@@ -883,6 +1012,22 @@ export function ServerOpsDataSourceDialog({
     onSubmit(buildServerOpsDataSourceUpsertInput({ hostId, source, draft, passwordFromStore }))
   }
 
+  /** 将本机文件选择结果写入表单；不读取文件内容，也不在 renderer 生成文件身份。 */
+  const selectLocalSqliteFile = (event: React.ChangeEvent<HTMLInputElement>): void => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    try {
+      const filePath = window.electronAPI.getPathForFile(file)
+      if (filePath === '') throw new Error('empty path')
+      /** 纯转换同时覆盖名称自动填充与取消不变边界。 */
+      const next = applyServerOpsLocalSqliteFileSelection(draft, { filePath, fileName: file.name })
+      patchDraft({ filePath: next.filePath, label: next.label })
+    } catch {
+      setErrors((current) => ({ ...current, filePath: '无法读取所选文件路径，请重新选择' }))
+    }
+  }
+
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) onClose() }}>
       <DialogContent className={cn('max-h-[min(90vh,44rem)] w-[calc(100vw-2rem)] max-w-xl gap-0 overflow-hidden p-0', elevated && 'z-[260]')} overlayClassName={elevated ? 'z-[250]' : undefined}>
@@ -891,7 +1036,9 @@ export function ServerOpsDataSourceDialog({
             <DialogTitle className="pr-6 text-lg leading-6">{mode === 'create' ? '新建数据源' : '编辑数据源'}</DialogTitle>
             <DialogDescription className="text-xs leading-5">
               {draft.engine === 'sqlite'
-                ? '通过所选服务器的 SSH 连接只读访问 SQLite 文件；不会下载、复制或创建数据库。'
+                ? draft.transport === 'direct'
+                  ? '原地只读打开本机 SQLite 文件；不会复制、修改或创建数据库。'
+                  : '通过所选服务器的 SSH 连接只读访问 SQLite 文件；不会下载、复制或创建数据库。'
                 : '配置连接信息，密码通过系统安全存储加密保存在本机。'}
             </DialogDescription>
           </DialogHeader>
@@ -907,11 +1054,15 @@ export function ServerOpsDataSourceDialog({
               hostLabel={hostLabel}
               hostOptions={hostOptions}
               onChange={patchDraft}
+              onConnectionModeChange={changeConnectionMode}
               onEngineChange={changeEngine}
               onShowPasswordChange={setPasswordVisibility}
+              onSelectLocalFile={() => localSqliteInputRef.current?.click()}
               revealingPassword={revealingPassword}
               passwordFromStore={passwordFromStore}
             />
+            <input ref={localSqliteInputRef} type="file" className="sr-only" tabIndex={-1}
+              accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" aria-hidden="true" onChange={selectLocalSqliteFile} />
             {error ? <p className="text-xs text-destructive">{error}</p> : null}
             {/* 连接测试结论就地展示，用户不必先保存再回列表里找结果。 */}
             {testResult ? (

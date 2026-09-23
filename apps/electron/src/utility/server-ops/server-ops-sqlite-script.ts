@@ -8,7 +8,7 @@
 import { SERVER_OPS_DATA_QUERY_TIMEOUT_MS } from '@proma/shared'
 
 export const SERVER_OPS_SQLITE_REMOTE_SCRIPT = String.raw`
-import json, math, os, re, signal, stat, sys, threading, time, urllib.parse
+import hashlib, json, math, os, re, signal, stat, sys, threading, time, urllib.parse
 
 try:
     import sqlite3
@@ -17,7 +17,10 @@ except ImportError:
     sys.stdout.flush()
     raise SystemExit(0)
 
-MAX_OUTPUT_BYTES = 1100000
+# 预览正文仍限制 1 MiB，另留最多 200×64 个固定长度摘要的空间。
+MAX_OUTPUT_BYTES = 2200000
+# 原文 UTF-8 上限与 IPC 合同一致；JSON 转义输出单独预算。
+MAX_DETAIL_BYTES = 1048576
 MAX_CELL_LENGTH = 256
 MAX_COLUMNS = 64
 MAX_TABLES = 500
@@ -41,7 +44,8 @@ def fail(code):
 def clean_text(value, maximum):
     """清理展示文本控制字符；入参为原值和字符上限，返回有界字符串。"""
     text = re.sub(r'[\x00-\x1f\x7f]', ' ', str(value))
-    return text[:maximum]
+    # 与 TypeScript 的 UTF-16 长度一致，并在截断处保留完整 Unicode 字符。
+    return text.encode('utf-16-le')[:maximum * 2].decode('utf-16-le', errors='ignore')
 
 def sensitive(name):
     """判断列名是否敏感；入参为列名，返回是否需要遮罩。"""
@@ -54,8 +58,8 @@ def sensitive(name):
         return True
     return 'key' in parts and any(part in {'api', 'access', 'private', 'client', 'auth', 'session', 'encryption', 'signing'} for part in parts)
 
-def format_cell(value, masked=False):
-    """归一化 SQLite 单元格；入参为原值和遮罩标记，返回公开单元格。"""
+def format_cell(value, masked=False, detail_enabled=False):
+    """归一化单格；接收原值、遮罩和详情开关，返回预览及必要的原文摘要。"""
     if masked:
         return '***'
     if value is None:
@@ -64,10 +68,16 @@ def format_cell(value, masked=False):
         return {'kind': 'binary', 'bytes': len(value)}
     if isinstance(value, bool):
         return 'true' if value else 'false'
-    text = clean_text(value, 1000000)
-    if len(text) <= MAX_CELL_LENGTH:
+    # 摘要只用于表浏览的非敏感文本，SQL 查询保持原有预算和返回合同。
+    original = str(value)
+    text = clean_text(original, 1000000)
+    preview = clean_text(original, MAX_CELL_LENGTH)
+    if detail_enabled and original != preview:
+        return {'kind': 'text', 'text': preview, 'truncated': True,
+                'sha256': hashlib.sha256(original.encode('utf-8')).hexdigest()}
+    if text == preview:
         return text
-    return {'kind': 'text', 'text': text[:MAX_CELL_LENGTH], 'truncated': True}
+    return {'kind': 'text', 'text': preview, 'truncated': True}
 
 def quote_identifier(value):
     """按 SQLite 规则引用标识符；入参为已验证名称，返回安全 SQL 片段。"""
@@ -130,9 +140,13 @@ def read_columns(name):
     rows = connection.execute('PRAGMA main.table_xinfo(' + quote_identifier(name) + ')').fetchall()
     return [row for row in rows if len(row) >= 7 and int(row[6] or 0) == 0]
 
-def fit_rows_to_budget(rows, maximum_bytes):
+def fit_rows_to_budget(rows, maximum_bytes, detail_enabled=False):
     """压缩文本以保留全部页内行；入参为行集和字节预算，返回行集与截断标记。"""
-    if len(json.dumps(rows, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) <= maximum_bytes:
+    def preview_bytes(candidate):
+        """计算不含定长摘要的正文大小；入参为候选行集，返回 UTF-8 字节数。"""
+        plain = [[{key: value for key, value in cell.items() if key != 'sha256'} if isinstance(cell, dict) else cell for cell in row] for row in candidate]
+        return len(json.dumps(plain, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    if preview_bytes(rows) <= maximum_bytes:
         return rows, False
     def fit(maximum_text):
         """按统一字符上限裁剪文本；入参为字符数，返回保持行列形状的新行集。"""
@@ -141,9 +155,10 @@ def fit_rows_to_budget(rows, maximum_bytes):
             fitted_row = []
             for cell in row:
                 if isinstance(cell, str) and len(cell) > maximum_text:
-                    fitted_row.append({'kind': 'text', 'text': cell[:maximum_text], 'truncated': True})
+                    fitted_row.append({'kind': 'text', 'text': cell[:maximum_text], 'truncated': True,
+                        **({'sha256': hashlib.sha256(cell.encode('utf-8')).hexdigest()} if detail_enabled else {})})
                 elif isinstance(cell, dict) and cell.get('kind') == 'text' and len(cell.get('text', '')) > maximum_text:
-                    fitted_row.append({'kind': 'text', 'text': cell['text'][:maximum_text], 'truncated': True})
+                    fitted_row.append({**cell, 'text': cell['text'][:maximum_text]})
                 else:
                     fitted_row.append(cell)
             fitted.append(fitted_row)
@@ -153,7 +168,7 @@ def fit_rows_to_budget(rows, maximum_bytes):
     while lower <= upper:
         middle = (lower + upper) // 2
         candidate = fit(middle)
-        if len(json.dumps(candidate, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) <= maximum_bytes:
+        if preview_bytes(candidate) <= maximum_bytes:
             best = candidate
             lower = middle + 1
         else:
@@ -171,7 +186,7 @@ def read_bounded_rows(cursor, column_names, maximum_rows, maximum_bytes, preserv
             has_more = True
             result_truncated = True
             break
-        row = [format_cell(value, sensitive(column_names[index])) for index, value in enumerate(raw_row)]
+        row = [format_cell(value, sensitive(column_names[index]), preserve_rows) for index, value in enumerate(raw_row)]
         row_truncated = any(isinstance(cell, dict) and cell.get('kind') == 'text' for cell in row)
         candidate = rows + [row]
         if not preserve_rows and len(json.dumps(candidate, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > maximum_bytes:
@@ -180,7 +195,7 @@ def read_bounded_rows(cursor, column_names, maximum_rows, maximum_bytes, preserv
         rows.append(row)
         cell_truncated = cell_truncated or row_truncated
     if preserve_rows:
-        rows, budget_truncated = fit_rows_to_budget(rows, maximum_bytes)
+        rows, budget_truncated = fit_rows_to_budget(rows, maximum_bytes, True)
         result_truncated = result_truncated or budget_truncated
     return rows, has_more, cell_truncated, result_truncated
 
@@ -353,22 +368,47 @@ def execute_request(payload):
                     indexes.append({'name': clean_text(index_name, 128), 'unique': bool(index_row[2]), 'columns': names})
         return {'mode': mode, 'capability': 'available', 'columns': columns, 'indexes': indexes, 'warnings': []}
 
-    if mode == 'schema-rows':
+    if mode in ('schema-rows', 'schema-cell'):
         creation_sql = str(table_object[2] or '').upper()
         if table_object[1] != 'table' or creation_sql.startswith('CREATE VIRTUAL TABLE'):
             fail('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')
         offset = payload['rowOffset']
-        limit = payload['rowLimit']
+        limit = payload.get('rowLimit', 1)
         shown_columns = column_rows[:MAX_COLUMNS]
         # 保留完整列名给遮罩判断，公开列头仍遵守 128 字符展示上限。
         column_names = [str(row[1]) for row in shown_columns]
         columns = [clean_text(name, 128) for name in column_names]
-        primary_columns = [row for row in shown_columns if int(row[5] or 0) > 0]
+        primary_columns = [row for row in column_rows if int(row[5] or 0) > 0]
         primary_columns.sort(key=lambda row: int(row[5]))
         select_columns = ', '.join(quote_identifier(str(row[1])) for row in shown_columns)
         order_clause = '' if not primary_columns else ' ORDER BY ' + ', '.join(quote_identifier(str(row[1])) for row in primary_columns)
         where_clause, values = ('', []) if 'rowFilters' not in payload else row_filter_clause(
             payload['rowFilters'], {str(row[1]) for row in column_rows})
+        if mode == 'schema-cell':
+            # 以相同筛选、完整主键顺序和行位置定位；摘要确保无主键换序也不显示不同正文。
+            column_index = payload.get('cellColumnIndex')
+            expected_digest = payload.get('cellSha256')
+            if not isinstance(column_index, int) or column_index < 0 or column_index >= len(column_names) or columns[column_index] != payload.get('cellExpectedColumn'):
+                fail('SERVER_OPS_DATA_CELL_CHANGED')
+            if not isinstance(expected_digest, str) or re.fullmatch(r'[a-f0-9]{64}', expected_digest) is None:
+                fail('SERVER_OPS_SQLITE_REQUEST_INVALID')
+            if sensitive(column_names[column_index]):
+                fail('SERVER_OPS_DATA_CELL_REDACTED')
+            # 只投影目标列，在数据库端检查字节长度后才读取正文，NULL/类型变化同样拒绝。
+            identifier = quote_identifier(column_names[column_index])
+            size_expression = 'length(CAST(' + identifier + ' AS BLOB))'
+            projection = "typeof(" + identifier + '), ' + size_expression + ', CASE WHEN ' + size_expression + ' <= ? THEN ' + identifier + ' ELSE NULL END'
+            detail_sql = 'SELECT ' + projection + ' FROM main.' + quote_identifier(table_name) + where_clause + order_clause + ' LIMIT 1 OFFSET ?'
+            detail = connection.execute(detail_sql, (MAX_DETAIL_BYTES, *values, offset)).fetchone()
+            if detail is None:
+                fail('SERVER_OPS_DATA_CELL_CHANGED')
+            if detail[1] is not None and detail[1] > MAX_DETAIL_BYTES:
+                fail('SERVER_OPS_DATA_CELL_TOO_LARGE')
+            # 宽表总预算也可能裁剪数字展示；其原文复用预览的 str 标量规则。
+            original = str(detail[2]) if detail[0] in ('text', 'integer', 'real') else None
+            if original is None or hashlib.sha256(original.encode('utf-8')).hexdigest() != expected_digest:
+                fail('SERVER_OPS_DATA_CELL_CHANGED')
+            return {'mode': mode, 'capability': 'available', 'value': original, 'warnings': []}
         sql = 'SELECT ' + select_columns + ' FROM main.' + quote_identifier(table_name) + where_clause + order_clause + ' LIMIT ? OFFSET ?'
         cursor = connection.execute(sql, (*values, limit + 1, offset))
         rows, has_more, truncated_cells, budget_truncated = read_bounded_rows(cursor, column_names, limit, 1000000, True)
@@ -392,12 +432,16 @@ try:
 except Exception:
     fail('SERVER_OPS_SQLITE_REQUEST_INVALID')
 
+# 单格输出保留全部控制字符；最坏每字节需要六字节 JSON 转义，其他模式维持原预算。
+if payload.get('mode') == 'schema-cell':
+    MAX_OUTPUT_BYTES = MAX_DETAIL_BYTES * 6 + 4096
+
 path = payload.get('filePath')
 if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
     fail('SERVER_OPS_SQLITE_PATH_INVALID')
 # 查询模式使用共享执行预算，结构读取保留原十五秒上限。
 requested_timeout_ms = max(250, int(payload.get('timeoutMs', ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS})))
-timeout_cap_ms = ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS} if payload.get('mode') in ('sql-query', 'schema-rows') else 15000
+timeout_cap_ms = ${SERVER_OPS_DATA_QUERY_TIMEOUT_MS} if payload.get('mode') in ('sql-query', 'schema-rows', 'schema-cell') else 15000
 timeout_ms = min(timeout_cap_ms, requested_timeout_ms)
 boot_timer.cancel()
 hard_timer = threading.Timer(timeout_ms / 1000, lambda: os._exit(124))
@@ -469,7 +513,7 @@ except sqlite3.DatabaseError as error:
     text = str(error).lower()
     # 单条记录超过读取预算不代表文件损坏，使用可操作的大小错误。
     if 'too big' in text:
-        fail('SERVER_OPS_SQLITE_RESULT_TOO_LARGE')
+        fail('SERVER_OPS_DATA_CELL_TOO_LARGE' if payload.get('mode') == 'schema-cell' else 'SERVER_OPS_SQLITE_RESULT_TOO_LARGE')
     if 'interrupted' in text:
         fail('SERVER_OPS_DATA_QUERY_TIMEOUT')
     if 'not authorized' in text or 'authorization denied' in text:

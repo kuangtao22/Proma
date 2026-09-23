@@ -4,6 +4,17 @@ import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { captureServerOpsReadBindings, revalidateServerOpsReadBindings } from './server-ops-agent-read-identity'
 
 describe('运维只读授权配置身份', () => {
+  test('Given 本地 SQLite When 重新绑定到另一个文件 Then Agent 目标摘要变化', () => {
+    /** 本地文件连接不依赖 SSH，主进程产生的文件身份参与绑定。 */
+    const source: ServerOpsDataSource = { id: 'local-db', label: '本地库', engine: 'sqlite', transport: 'direct', filePath: '/tmp/app.db', localFileId: '1:42:1700000000000000000', database: 'main', tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1 }
+    const services = { hosts: { get: () => undefined }, data: { listSources: () => ({ sources: [source] }) } }
+    const resources = [{ kind: 'sqlite' as const, sourceId: source.id, instance: false as const, databases: [{ database: 'main', tables: null, readRows: true, query: true }] }]
+    const original = captureServerOpsReadBindings(resources, services)
+    source.label = '改名'
+    expect(captureServerOpsReadBindings(resources, services)).toEqual(original)
+    source.localFileId = '1:43:1700000000000000000'
+    expect(captureServerOpsReadBindings(resources, services)).not.toEqual(original)
+  })
   test('Given 已授权数据库 When 改名移动 Then 身份不变；修改端点或跳板账号 Then 身份变化', () => {
     /** 内存配置，不访问磁盘或网络。 */
     const host: ServerOpsHost = { id: 'jump-1', name: 'jump', address: '127.0.0.1', port: 22, username: 'u', authMethod: 'ssh-agent', tags: [], createdAt: 1, updatedAt: 1 }

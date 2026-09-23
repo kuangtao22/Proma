@@ -31,6 +31,10 @@ const QUERY_PUBLIC_ERROR_MESSAGES = new Map<string, string>([
   ['SERVER_OPS_DATA_QUERY_PERMISSION_DENIED', '数据库账号没有执行该查询的权限'],
   ['SERVER_OPS_DATA_QUERY_TIMEOUT', 'SQL 查询超时'],
   ['SERVER_OPS_DATA_QUERY_FAILED', 'SQL 查询失败，请检查语句与读取权限'],
+  ['SERVER_OPS_DATA_CELL_CHANGED', '该单元格所在行或内容已变化，请刷新后重试'],
+  ['SERVER_OPS_DATA_CELL_REDACTED', '敏感字段不允许查看完整内容'],
+  ['SERVER_OPS_DATA_CELL_TOO_LARGE', '单元格完整内容超过 1 MiB 安全上限'],
+  ['SERVER_OPS_DATA_CELL_TIMEOUT', '单元格完整内容读取超时'],
 ])
 
 /** 表不存在或不可用的 MySQL 驱动错误码。 */

@@ -3,7 +3,10 @@ import { EditorState } from '@codemirror/state'
 import { renderToStaticMarkup } from 'react-dom/server'
 import {
   collectVisibleJsonLines,
+  createJsonCodeEditorContentAttributes,
+  isJsonCodeEditorLineHighlightable,
   JSON_CODE_EDITOR_CONTENT_ATTRIBUTES,
+  MAX_JSON_CODE_EDITOR_HIGHLIGHT_LINE_LENGTH,
   JsonCodeEditor,
 } from './json-code-editor'
 
@@ -25,6 +28,15 @@ describe('JsonCodeEditor', () => {
     })
   })
 
+  test('Given 业务详情提供名称 When 渲染只读编辑器 Then 根区域与内容区使用同一名称且旧默认不变', () => {
+    /** 单元格详情使用的自定义无障碍名称。 */
+    const ariaLabel = '单元格原文'
+    const html = renderToStaticMarkup(<JsonCodeEditor value="text" ariaLabel={ariaLabel} />)
+    expect(html).toContain(`aria-label="${ariaLabel}"`)
+    expect(createJsonCodeEditorContentAttributes(ariaLabel)).toMatchObject({ 'aria-label': ariaLabel, 'aria-readonly': 'true' })
+    expect(createJsonCodeEditorContentAttributes()).toEqual(JSON_CODE_EDITOR_CONTENT_ATTRIBUTES)
+  })
+
   test('Given 大型 JSON When 生成高亮输入 Then 只收集可见范围覆盖的行', () => {
     const lines = Array.from({ length: 10_000 }, (_, index) => `  "node-${index}": ${index}`)
     const state = EditorState.create({ doc: `{\n${lines.join(',\n')}\n}` })
@@ -39,5 +51,13 @@ describe('JsonCodeEditor', () => {
       '  "node-4999": 4999,',
       '  "node-5000": 5000,',
     ])
+  })
+
+  test('Given 单行内容超过高亮预算 When 判断装饰范围 Then 跳过 token 化但不裁剪正文', () => {
+    /** 超长单元格原文仍完整写入 EditorState。 */
+    const source = `{"body":"${'x'.repeat(MAX_JSON_CODE_EDITOR_HIGHLIGHT_LINE_LENGTH)}"}`
+    const state = EditorState.create({ doc: source })
+    expect(isJsonCodeEditorLineHighlightable(state.doc.line(1).text)).toBe(false)
+    expect(state.doc.toString()).toBe(source)
   })
 })

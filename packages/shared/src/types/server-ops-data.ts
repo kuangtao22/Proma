@@ -90,8 +90,10 @@ export interface ServerOpsDataSource {
   /** 服务器视角地址，例如 `127.0.0.1`。 */
   address?: string
   port?: number
-  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  /** SQLite 绝对文件路径：SSH 为远端 POSIX 路径，direct 为本机路径。 */
   filePath?: string
+  /** 主进程验证的本地 SQLite 文件身份；远端与网络引擎不携带。 */
+  localFileId?: string
   /** MySQL 库名；Redis 为逻辑库序号文本。 */
   database?: string
   username?: string
@@ -128,7 +130,7 @@ export interface ServerOpsDataSourceUpsertInput {
   label: string
   address?: string
   port?: number
-  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  /** SQLite 绝对文件路径：SSH 为远端 POSIX 路径，direct 为本机路径。 */
   filePath?: string
   database?: string
   username?: string
@@ -172,7 +174,7 @@ export interface ServerOpsDataSourceProbeDraft {
   engine: ServerOpsDataEngine
   address?: string
   port?: number
-  /** SQLite 在 SSH 服务器上的 POSIX 绝对文件路径。 */
+  /** SQLite 绝对文件路径：SSH 为远端 POSIX 路径，direct 为本机路径。 */
   filePath?: string
   database?: string
   username?: string
@@ -296,6 +298,23 @@ export function isServerOpsSqliteFilePath(value: unknown): value is string {
     && !/^file:/iu.test(value)
     && value !== ':memory:'
     && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+}
+
+/** 校验本机 SQLite 绝对路径；拒绝 URI、UNC 网络路径及 Windows 设备路径。 */
+export function isServerOpsLocalSqliteFilePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 4_096
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    && ((value.startsWith('/') && !value.startsWith('//')) || /^[a-z]:[\\/]/iu.test(value))
+}
+
+/** 校验主进程生成的设备号、inode 与创建时间身份，拒绝渲染层任意扩展字段。 */
+export function isServerOpsSqliteFileId(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 128 && /^\d+:\d+:\d+$/u.test(value)
+}
+
+/** 按连接方式使用各自路径语义，Windows 本地路径不得误送远端 shell。 */
+function isSqliteEndpointPath(value: unknown, transport: unknown): value is string {
+  return transport === 'direct' ? isServerOpsLocalSqliteFilePath(value) : isServerOpsSqliteFilePath(value)
 }
 
 /** 判断 SQLite 合同中的数据库是否省略或固定为 main。 */
@@ -479,7 +498,7 @@ export function isServerOpsPlaintextDirectAddress(address: string): boolean {
 /** 严格解析数据源公开投影。 */
 export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
   const errorCode = 'SERVER_OPS_DATA_SOURCE_INVALID'
-  const keys = new Set(['id', 'projectId', 'transport', 'hostId', 'engine', 'label', 'address', 'port', 'filePath', 'database', 'username',
+  const keys = new Set(['id', 'projectId', 'transport', 'hostId', 'engine', 'label', 'address', 'port', 'filePath', 'localFileId', 'database', 'username',
     'tlsMode', 'tlsServerName', 'hasPassword', 'createdAt', 'updatedAt'])
   if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isServerOpsId(value.id)
     || (value.projectId !== undefined && !isServerOpsId(value.projectId))
@@ -488,7 +507,7 @@ export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
     || !isServerOpsDataEngine(value.engine) || !isDisplayString(value.label, 64)
     || (value.address !== undefined && !isAddressText(value.address, 255))
     || (value.port !== undefined && !isPort(value.port))
-    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
+    || (value.filePath !== undefined && !isSqliteEndpointPath(value.filePath, value.transport))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || !isServerOpsDataTlsMode(value.tlsMode)
@@ -499,11 +518,14 @@ export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
     || (value.engine === 'redis' && value.tlsMode === 'preferred')) throw new Error(errorCode)
   /** 连接方式与跳板主机的组合必须自洽。 */
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
-  /** SQLite 只绑定 SSH 远端文件；网络引擎继续严格要求地址和端口。 */
+  /** 本地文件必须携带主进程验证的稳定身份，其他来源不得混入此字段。 */
+  if (value.engine === 'sqlite' && value.transport === 'direct'
+    ? !isServerOpsSqliteFileId(value.localFileId) : Object.hasOwn(value, 'localFileId')) throw new Error(errorCode)
+  /** SQLite 绑定本机或 SSH 文件；网络引擎继续严格要求地址和端口。 */
   if (value.engine === 'sqlite') {
-    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+    if (Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
       || Object.hasOwn(value, 'username') || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
-      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)
+      || !isSqliteEndpointPath(value.filePath, value.transport) || !isSqliteMainDatabase(value.database)
       || value.hasPassword !== false) throw new Error(errorCode)
   } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   return {
@@ -516,6 +538,7 @@ export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
     ...(value.address === undefined ? {} : { address: value.address }),
     ...(value.port === undefined ? {} : { port: value.port }),
     ...(value.filePath === undefined ? {} : { filePath: value.filePath }),
+    ...(value.localFileId === undefined ? {} : { localFileId: value.localFileId as string }),
     ...(value.engine === 'sqlite' ? { database: 'main' } : value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     tlsMode: value.tlsMode,
@@ -554,7 +577,7 @@ export function parseServerOpsDataSourceUpsertInput(value: unknown): ServerOpsDa
     || !isServerOpsDataEngine(value.engine) || !isDisplayString(value.label, 64)
     || (value.address !== undefined && !isAddressText(value.address, 255))
     || (value.port !== undefined && !isPort(value.port))
-    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
+    || (value.filePath !== undefined && !isSqliteEndpointPath(value.filePath, value.transport))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || (value.password !== undefined && !isSecretText(value.password))
@@ -570,10 +593,10 @@ export function parseServerOpsDataSourceUpsertInput(value: unknown): ServerOpsDa
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
   /** SQLite 不接受任何网络、凭据或 TLS 参数。 */
   if (value.engine === 'sqlite') {
-    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+    if (Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
       || Object.hasOwn(value, 'username') || Object.hasOwn(value, 'password') || Object.hasOwn(value, 'clearPassword')
       || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
-      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
+      || !isSqliteEndpointPath(value.filePath, value.transport) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
   } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   if (value.engine === 'redis' && value.database !== undefined && !/^(?:1[0-5]|[0-9])$/u.test(value.database)) throw new Error(errorCode)
   return {
@@ -643,7 +666,7 @@ export function parseServerOpsDataSourceProbeDraft(value: unknown): ServerOpsDat
     || !isServerOpsDataEngine(value.engine)
     || (value.address !== undefined && !isAddressText(value.address, 255))
     || (value.port !== undefined && !isPort(value.port))
-    || (value.filePath !== undefined && !isServerOpsSqliteFilePath(value.filePath))
+    || (value.filePath !== undefined && !isSqliteEndpointPath(value.filePath, value.transport))
     || (value.database !== undefined && !isOptionalDataText(value.database, 64))
     || (value.username !== undefined && !isOptionalDataText(value.username, 128))
     || (value.password !== undefined && !isSecretText(value.password))
@@ -657,12 +680,12 @@ export function parseServerOpsDataSourceProbeDraft(value: unknown): ServerOpsDat
   /** 内联密码与复用已保存密码只能二选一，避免"看起来在用新密码、实际用旧密文"。 */
   if (value.password !== undefined && value.savedSourceId !== undefined) throw new Error(errorCode)
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
-  /** SQLite 探测也只接受 SSH 文件身份，禁止复用任何已保存数据库密码。 */
+  /** SQLite 探测只接受文件身份，禁止复用任何已保存数据库密码。 */
   if (value.engine === 'sqlite') {
-    if (value.transport !== 'ssh' || Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
+    if (Object.hasOwn(value, 'address') || Object.hasOwn(value, 'port')
       || Object.hasOwn(value, 'username') || Object.hasOwn(value, 'password') || Object.hasOwn(value, 'savedSourceId')
       || value.tlsMode !== 'disabled' || Object.hasOwn(value, 'tlsServerName')
-      || !isServerOpsSqliteFilePath(value.filePath) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
+      || !isSqliteEndpointPath(value.filePath, value.transport) || !isSqliteMainDatabase(value.database)) throw new Error(errorCode)
   } else if (value.address === undefined || value.port === undefined || Object.hasOwn(value, 'filePath')) throw new Error(errorCode)
   if (value.engine === 'redis' && value.database !== undefined && !/^(?:1[0-5]|[0-9])$/u.test(value.database)) throw new Error(errorCode)
   return {

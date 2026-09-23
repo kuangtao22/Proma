@@ -4,6 +4,33 @@ import type { ServerOpsDataSourceRowsInput } from '@proma/shared'
 import { createServerOpsDataPreload } from './server-ops-data-preload'
 
 describe('Server Ops 数据服务 preload 边界', () => {
+  test('Given 单格全文 When bridge 读取 Then 严格校验定位且保留正文换行', async () => {
+    /** 记录真实桥接参数，避免新通道被错误接到预览 parser。 */
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const value = '{\n"payload":"' + 'x'.repeat(400) + '"\n}'
+    const input = { sourceId: 'source-1', database: 'main', table: 'entries', offset: 53,
+      columnIndex: 1, expectedColumn: 'payload', sha256: 'a'.repeat(64) }
+    const preload = createServerOpsDataPreload(async (channel, request) => { calls.push({ channel, input: request }); return { value } })
+    await expect(preload.readServerOpsDataSchemaCell(input)).resolves.toEqual({ value })
+    expect(calls).toEqual([{ channel: SERVER_OPS_DATA_SCHEMA_CHANNELS.READ_CELL, input }])
+    await expect(preload.readServerOpsDataSchemaCell({ ...input, sql: 'SELECT 1' } as never)).rejects.toThrow()
+    expect(calls).toHaveLength(1)
+    const polluted = createServerOpsDataPreload(async () => ({ value, truncated: true }))
+    await expect(polluted.readServerOpsDataSchemaCell(input)).rejects.toThrow('SERVER_OPS_DATA_CELL_RESULT_INVALID')
+  })
+  test('Given 本地 SQLite When 通过现有 bridge 保存 Then 文件身份仅从主进程回执传回', async () => {
+    /** 记录真实 bridge 校验后的输入，身份只能存在于返回的公开配置。 */
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const draft = { transport: 'direct' as const, engine: 'sqlite' as const, label: '本地业务库', filePath: '/tmp/app.db', tlsMode: 'disabled' as const }
+    const preload = createServerOpsDataPreload(async (channel, input) => {
+      calls.push({ channel, input })
+      return { source: { ...draft, id: 'local-db', localFileId: '1:42:1700000000000000000', hasPassword: false, createdAt: 1, updatedAt: 1 } }
+    })
+    await expect(preload.upsertServerOpsDataSource(draft)).resolves.toHaveProperty('source.localFileId', '1:42:1700000000000000000')
+    expect(calls).toEqual([{ channel: SERVER_OPS_DATA_CHANNELS.UPSERT_SOURCE, input: { ...draft, database: 'main' } }])
+    await expect(preload.upsertServerOpsDataSource({ ...draft, localFileId: '1:99:1' } as never)).rejects.toThrow()
+    expect(calls).toHaveLength(1)
+  })
   test('Given 表数据筛选 When preload 读取 Then 透传有界条件且拒绝原始 SQL 夹带', async () => {
     /** 记录真实 bridge 下发的结构，验证新增字段不会被旧映射丢弃。 */
     const calls: Array<{ channel: string; input: unknown }> = []

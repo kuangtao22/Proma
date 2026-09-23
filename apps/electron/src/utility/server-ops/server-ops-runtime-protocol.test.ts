@@ -25,6 +25,14 @@ function createConnectRequest(): unknown {
 }
 
 describe('Server Ops utility runtime 请求协议', () => {
+  test('Given 本地 SQLite 文件 When 进入 utility Then 需要可信文件身份且禁止网络引擎夹带', () => {
+    /** 完整本地文件请求：沿用直连临时身份，但没有网络端点。 */
+    const input = { requestId: 'local-sqlite', hostId: 'server-ops-local-direct', connectionId: 'local-1', transport: 'direct', mode: 'probe', engine: 'sqlite', filePath: 'C:\\数据\\app.db', localFileId: '1:42:1700000000000000000', database: 'main', tlsMode: 'disabled', timeoutMs: 15_000 } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    for (const extra of [{ localFileId: undefined }, { localFileId: 'invalid' }, { transport: 'ssh', filePath: '/srv/app.db' }, { engine: 'mysql', address: '127.0.0.1', port: 3306, filePath: undefined }]) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, ...extra } })).toThrow()
+    }
+  })
   test('Given 指定库目录搜索 When 解析协议 Then 只允许 schema-tables 携带有界搜索词', () => {
     const base = { requestId: 'search-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql', address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 15_000 } as const
     const input = { ...base, mode: 'schema-tables', schemaDatabase: 'app', schemaTableSearch: "table_%'" }
@@ -59,6 +67,18 @@ describe('Server Ops utility runtime 请求协议', () => {
       expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, rowFilters: invalid } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
     }
     expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, engine: 'redis' } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+  })
+  test('Given 截断单元格详情请求 When 进入 utility Then 只接受绝对偏移、列身份与小写摘要', () => {
+    const input = { requestId: 'cell-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct', engine: 'mysql',
+      address: '127.0.0.1', port: 3306, tlsMode: 'disabled', timeoutMs: 10_000, mode: 'schema-cell', schemaDatabase: 'app',
+      schemaTable: 'events', rowOffset: 1_000_199, cellColumnIndex: 63, cellExpectedColumn: 'payload', cellSha256: 'a'.repeat(64) } as const
+    expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toEqual({ type: 'server-ops.data-read', input })
+    for (const invalid of [
+      { rowOffset: 1_000_200 }, { rowLimit: 1 }, { cellColumnIndex: 64 }, { cellExpectedColumn: '' },
+      { cellSha256: 'A'.repeat(64) }, { cellSha256: 'short' },
+    ]) {
+      expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...input, ...invalid } })).toThrow()
+    }
   })
   test('Given TLS 协商请求 When MySQL 与 Redis 进入 utility Then 只放行支持协商的引擎', () => {
     const input = { requestId: 'tls-1', hostId: 'host-1', connectionId: 'connection-1',

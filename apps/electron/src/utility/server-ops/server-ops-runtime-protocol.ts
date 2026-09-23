@@ -4,9 +4,10 @@ import type { ServerOpsSftpRequest, ServerOpsSftpResult } from './server-ops-sft
 import type { ServerOpsHostKey, ServerOpsTerminalExitEvent, ServerOpsTerminalOutputAck, ServerOpsTerminalOutputEvent } from '@proma/shared'
 import { parseServerOpsConsoleAck, parseServerOpsConsoleExitEvent, parseServerOpsConsoleIdentity,
   parseServerOpsConsoleInput, parseServerOpsConsoleOutputEvent, parseServerOpsConsoleResizeInput } from '@proma/shared'
-import { isServerOpsDataCapability, isServerOpsDataEngine, isServerOpsDataTlsMode, isServerOpsDataTlsStatus, isServerOpsMySqlTlsServerName, isServerOpsSqliteFilePath, parseServerOpsDataMetricList,
+import { isServerOpsDataCapability, isServerOpsDataEngine, isServerOpsDataTlsMode, isServerOpsDataTlsStatus, isServerOpsMySqlTlsServerName, isServerOpsSqliteFilePath, isServerOpsLocalSqliteFilePath, isServerOpsSqliteFileId, parseServerOpsDataMetricList,
   parseServerOpsDataTableList, parseServerOpsDataWarnings, parseServerOpsDataDiagnosticsResult, parseServerOpsDataSourceRowsResult,
-  parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult, parseServerOpsDataRowFilters } from '@proma/shared'
+  parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult, parseServerOpsDataRowFilters,
+  parseServerOpsDataSourceCellResult } from '@proma/shared'
 import type { ServerOpsConsoleIdentity, ServerOpsDataCapability, ServerOpsDataEngine, ServerOpsDataMetric, ServerOpsDataTable, ServerOpsDataTlsMode, ServerOpsDataTlsStatus } from '@proma/shared'
 import type { ServerOpsDataDiagnosticSection, ServerOpsDataParameter, ServerOpsDataQueryResult, ServerOpsDataSchemaCell, ServerOpsDataRowFilters } from '@proma/shared'
 import type { ServerOpsConsoleRuntimeStart } from './server-ops-console-runtime'
@@ -50,7 +51,7 @@ export interface ServerOpsRuntimeExecResult {
  * - `probe` / `diagnostics`：连接测试与只读诊断（回答"这台库健康吗"）。
  * - `schema-tables` / `schema-table` / `schema-rows`：表浏览（回答"库里有什么、长什么样"）。
  */
-export type ServerOpsRuntimeDataReadMode = 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'sql-query'
+export type ServerOpsRuntimeDataReadMode = 'probe' | 'diagnostics' | 'schema-tables' | 'schema-table' | 'schema-rows' | 'schema-cell' | 'sql-query'
 /** 主进程发往 runtime 的数据服务读取请求；密码只在进程内传递。 */
 export interface ServerOpsRuntimeDataReadRequest {
   requestId: string
@@ -65,6 +66,8 @@ export interface ServerOpsRuntimeDataReadRequest {
   port?: number
   /** SQLite 使用 SSH 服务器上的绝对文件路径。 */
   filePath?: string
+  /** 主进程绑定的本地 SQLite 文件身份；只允许 direct SQLite 携带。 */
+  localFileId?: string
   database?: string
   username?: string
   password?: string
@@ -88,6 +91,11 @@ export interface ServerOpsRuntimeDataReadRequest {
   rowLimit?: number
   /** 仅关系表分页读取可携带的有界筛选条件。 */
   rowFilters?: ServerOpsDataRowFilters
+  /** 全文读取目标列的公开序号与名称；`schema-cell` 使用。 */
+  cellColumnIndex?: number
+  cellExpectedColumn?: string
+  /** 预览时对完整原文计算的摘要，用于拒绝换序或并发修改后的不同正文。 */
+  cellSha256?: string
   /** SQL 查询公开身份与受控正文；只允许 `sql-query` 模式携带。 */
   queryId?: string
   sql?: string
@@ -99,6 +107,7 @@ export type ServerOpsRuntimeDataReadResult =
   | ServerOpsRuntimeDataSchemaTablesResult
   | ServerOpsRuntimeDataSchemaTableResult
   | ServerOpsRuntimeDataSchemaRowsResult
+  | ServerOpsRuntimeDataSchemaCellResult
   | ServerOpsDataQueryResult
 
 /** 连接测试与只读诊断结果。 */
@@ -148,6 +157,13 @@ export interface ServerOpsRuntimeDataSchemaRowsResult {
   truncated: boolean
   hasMore?: boolean
   orderedByPrimaryKey?: boolean
+  warnings: string[]
+}
+/** 表浏览：单个有损文本单元格的完整原文。 */
+export interface ServerOpsRuntimeDataSchemaCellResult {
+  mode: 'schema-cell'
+  capability: 'available'
+  value: string | null | { kind: 'binary'; bytes: number }
   warnings: string[]
 }
 /** utility process 内部启动独立日志 channel 的请求。 */
@@ -361,6 +377,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     .concat(value.address === undefined ? [] : ['address'])
     .concat(value.port === undefined ? [] : ['port'])
     .concat(value.filePath === undefined ? [] : ['filePath'])
+    .concat(value.localFileId === undefined ? [] : ['localFileId'])
     .concat(['transport'])
     .concat(value.database === undefined ? [] : ['database'])
     .concat(value.username === undefined ? [] : ['username'])
@@ -373,6 +390,9 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     .concat(value.rowOffset === undefined ? [] : ['rowOffset'])
     .concat(value.rowLimit === undefined ? [] : ['rowLimit'])
     .concat(value.rowFilters === undefined ? [] : ['rowFilters'])
+    .concat(value.cellColumnIndex === undefined ? [] : ['cellColumnIndex'])
+    .concat(value.cellExpectedColumn === undefined ? [] : ['cellExpectedColumn'])
+    .concat(value.cellSha256 === undefined ? [] : ['cellSha256'])
     .concat(value.diagnosticSection === undefined ? [] : ['diagnosticSection'])
     .concat(value.diagnosticDatabase === undefined ? [] : ['diagnosticDatabase'])
     .concat(value.queryId === undefined ? [] : ['queryId'])
@@ -382,6 +402,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     || !isRuntimeId(value.requestId) || !isRuntimeId(value.hostId) || !isRuntimeId(value.connectionId)
     || (value.mode !== 'probe' && value.mode !== 'diagnostics'
       && value.mode !== 'schema-tables' && value.mode !== 'schema-table' && value.mode !== 'schema-rows'
+      && value.mode !== 'schema-cell'
       && value.mode !== 'sql-query')
     || (value.transport !== 'ssh' && value.transport !== 'direct')
     || !isServerOpsDataEngine(value.engine)
@@ -396,8 +417,11 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     || value.timeoutMs < 1_000 || value.timeoutMs > 120_000) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
-  /** SQLite 只能读取已认证服务器上的单个主库文件，网络认证字段不得混入。 */
-  if (value.engine === 'sqlite' && (value.transport !== 'ssh' || !isServerOpsSqliteFilePath(value.filePath)
+  /** 本地文件必须绑定主进程验证的身份，其他来源不得携带本地身份。 */
+  if (value.engine === 'sqlite' && value.transport === 'direct'
+    ? !isServerOpsSqliteFileId(value.localFileId) : value.localFileId !== undefined) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  /** SQLite 只读取单个主库文件，网络认证字段不得混入。 */
+  if (value.engine === 'sqlite' && (!(value.transport === 'direct' ? isServerOpsLocalSqliteFilePath(value.filePath) : isServerOpsSqliteFilePath(value.filePath))
     || value.address !== undefined || value.port !== undefined || value.username !== undefined || value.password !== undefined
     || value.tlsMode !== 'disabled' || value.tlsServerName !== undefined
     || (value.database !== undefined && value.database !== 'main')
@@ -429,34 +453,46 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   const isSchemaTables = value.mode === 'schema-tables'
   const isSchemaTable = value.mode === 'schema-table'
   const isSchemaRows = value.mode === 'schema-rows'
+  const isSchemaCell = value.mode === 'schema-cell'
   if (value.schemaTableSearch !== undefined && (!isSchemaTables || (value.engine !== 'mysql' && value.engine !== 'sqlite')
     || value.schemaDatabase === undefined)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   if (value.baseTablesOnly !== undefined && (typeof value.baseTablesOnly !== 'boolean'
-    || (!isSchemaTable && !isSchemaRows) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+    || (!isSchemaTable && !isSchemaRows && !isSchemaCell) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   const isSqlQuery = value.mode === 'sql-query'
-  if (value.rowFilters !== undefined && (!isSchemaRows || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+  if (value.rowFilters !== undefined && ((!isSchemaRows && !isSchemaCell) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   /** 严格重建筛选条件，禁止额外字段或原始 SQL 跨进程传入。 */
   const rowFilters = value.rowFilters === undefined ? undefined : parseServerOpsDataRowFilters(value.rowFilters)
-  if (!isSchemaTables && !isSchemaTable && !isSchemaRows
+  if (!isSchemaTables && !isSchemaTable && !isSchemaRows && !isSchemaCell
     && (value.schemaDatabase !== undefined || value.schemaTable !== undefined
       || value.rowOffset !== undefined || value.rowLimit !== undefined)) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   /** 表浏览标识符：只有对应模式才解析，越界即拒绝。 */
-  const schemaDatabase = isSchemaTable || isSchemaRows || (isSchemaTables && value.schemaDatabase !== undefined)
+  const schemaDatabase = isSchemaTable || isSchemaRows || isSchemaCell || (isSchemaTables && value.schemaDatabase !== undefined)
     ? parseSchemaIdentifier(value.schemaDatabase, 64)
     : undefined
-  const schemaTable = isSchemaTable || isSchemaRows ? parseSchemaIdentifier(value.schemaTable, 128) : undefined
+  const schemaTable = isSchemaTable || isSchemaRows || isSchemaCell ? parseSchemaIdentifier(value.schemaTable, 128) : undefined
   const schemaTableSearch = value.schemaTableSearch === undefined ? undefined : parseSchemaIdentifier(value.schemaTableSearch, 128)
   if (isSchemaRows) {
     if (typeof value.rowOffset !== 'number' || !Number.isSafeInteger(value.rowOffset) || value.rowOffset < 0 || value.rowOffset > 1_000_000
       || typeof value.rowLimit !== 'number' || !Number.isSafeInteger(value.rowLimit) || value.rowLimit < 1 || value.rowLimit > 200
       || value.rowOffset % value.rowLimit !== 0) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  } else if (isSchemaCell) {
+    if (typeof value.rowOffset !== 'number' || !Number.isSafeInteger(value.rowOffset) || value.rowOffset < 0 || value.rowOffset > 1_000_199
+      || value.rowLimit !== undefined
+      || typeof value.cellColumnIndex !== 'number' || !Number.isSafeInteger(value.cellColumnIndex) || value.cellColumnIndex < 0 || value.cellColumnIndex > 63
+      || !isConnectionText(value.cellExpectedColumn, 128)
+      || typeof value.cellSha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(value.cellSha256)) {
+      throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+    }
   } else if (value.rowOffset !== undefined || value.rowLimit !== undefined) {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
+  if (!isSchemaCell && (value.cellColumnIndex !== undefined || value.cellExpectedColumn !== undefined || value.cellSha256 !== undefined)) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   if (isSqlQuery) {
@@ -482,6 +518,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     ...(value.address === undefined ? {} : { address: value.address as string }),
     ...(value.port === undefined ? {} : { port: value.port as number }),
     ...(value.filePath === undefined ? {} : { filePath: value.filePath as string }),
+    ...(value.localFileId === undefined ? {} : { localFileId: value.localFileId as string }),
     ...(value.database === undefined ? {} : { database: value.database }),
     ...(value.username === undefined ? {} : { username: value.username }),
     ...(value.password === undefined ? {} : { password: value.password }),
@@ -496,6 +533,9 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     ...(value.baseTablesOnly === undefined ? {} : { baseTablesOnly: value.baseTablesOnly }),
     ...(value.rowOffset === undefined ? {} : { rowOffset: value.rowOffset }),
     ...(value.rowLimit === undefined ? {} : { rowLimit: value.rowLimit }),
+    ...(value.cellColumnIndex === undefined ? {} : { cellColumnIndex: value.cellColumnIndex as number }),
+    ...(value.cellExpectedColumn === undefined ? {} : { cellExpectedColumn: value.cellExpectedColumn as string }),
+    ...(value.cellSha256 === undefined ? {} : { cellSha256: value.cellSha256 as string }),
     ...(value.queryId === undefined ? {} : { queryId: value.queryId }),
     ...(value.sql === undefined ? {} : { sql: value.sql }),
     ...(value.maxRows === undefined ? {} : { maxRows: value.maxRows }),
@@ -641,6 +681,17 @@ function parseDataReadResult(value: unknown): ServerOpsRuntimeDataReadResult {
   if (value.mode === 'schema-tables') return parseSchemaTablesResult(value)
   if (value.mode === 'schema-table') return parseSchemaTableResult(value)
   if (value.mode === 'schema-rows') return parseSchemaRowsResult(value)
+  if (value.mode === 'schema-cell') {
+    if (!hasExactKeys(value, ['mode', 'capability', 'value', 'warnings']) || value.capability !== 'available') {
+      throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+    }
+    return {
+      mode: value.mode,
+      capability: value.capability,
+      value: parseServerOpsDataSourceCellResult({ value: value.value }).value,
+      warnings: parseServerOpsDataWarnings(value.warnings),
+    }
+  }
   /** 版本字段可选，其余字段必须齐全。 */
   const keys = ['capability', 'metrics', 'tables', 'warnings']
     .concat(value.serverVersion === undefined ? [] : ['serverVersion'])

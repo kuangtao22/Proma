@@ -46,6 +46,7 @@ const api: ServerOpsDataPanelApi = {
   listServerOpsDataSchemaTables: async (input) => ({ databases: ['app'], tables: [], ...(input.database === undefined ? {} : { database: input.database }) }),
   describeServerOpsDataSchemaTable: async () => ({ columns: [], indexes: [] }),
   readServerOpsDataSchemaRows: async (input) => ({ columns: [], rows: [], offset: input.offset, limit: input.limit, truncated: false }),
+  readServerOpsDataSchemaCell: async () => ({ value: '完整内容' }),
 }
 
 /** 渲染数据连接详情视图。 */

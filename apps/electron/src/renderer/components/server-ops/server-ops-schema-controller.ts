@@ -1,5 +1,7 @@
 import type {
   ServerOpsDataRowFilters,
+  ServerOpsDataSchemaCell,
+  ServerOpsDataSourceCellInput, ServerOpsDataSourceCellResult,
   ServerOpsDataSourceRowsInput, ServerOpsDataSourceRowsResult,
   ServerOpsDataSourceTableInput, ServerOpsDataSourceTableResult,
   ServerOpsDataSourceTablesInput, ServerOpsDataSourceTablesResult,
@@ -13,6 +15,7 @@ export interface ServerOpsSchemaBrowserApi {
   listServerOpsDataSchemaTables(input: ServerOpsDataSourceTablesInput): Promise<ServerOpsDataSourceTablesResult>
   describeServerOpsDataSchemaTable(input: ServerOpsDataSourceTableInput): Promise<ServerOpsDataSourceTableResult>
   readServerOpsDataSchemaRows(input: ServerOpsDataSourceRowsInput): Promise<ServerOpsDataSourceRowsResult>
+  readServerOpsDataSchemaCell(input: ServerOpsDataSourceCellInput): Promise<ServerOpsDataSourceCellResult>
 }
 
 /** 表内页面按用户任务分类。 */
@@ -35,6 +38,16 @@ export interface ServerOpsSchemaSource {
   readIdentity?: string
 }
 
+/** 当前打开的单元格详情；正文仅存在于 renderer 内存。 */
+export interface ServerOpsSchemaCellDetail {
+  status: 'loading' | 'ready' | 'error' | 'unavailable'
+  error: string | null
+  column: string
+  absoluteOffset: number
+  preview: ServerOpsDataSchemaCell
+  value?: ServerOpsDataSourceCellResult['value']
+}
+
 /** 完整浏览投影只保留当前目录、当前表描述及当前页。 */
 export interface ServerOpsSchemaBrowserProjection extends ServerOpsSchemaLoadState {
   sourceId: string | null
@@ -50,6 +63,7 @@ export interface ServerOpsSchemaBrowserProjection extends ServerOpsSchemaLoadSta
   rowFilters: ServerOpsDataRowFilters | null
   structure: ServerOpsSchemaLoadState & ServerOpsDataSourceTableResult
   rows: ServerOpsSchemaLoadState & ServerOpsDataSourceRowsResult
+  cellDetail: ServerOpsSchemaCellDetail | null
 }
 
 /** 仅保留轻量导航，不包括查询结果或密码。 */
@@ -79,6 +93,8 @@ export interface ServerOpsSchemaBrowserController {
   backToList(): void
   setDetailTab(tab: ServerOpsSchemaDetailTab): void
   loadRows(offset: number): void
+  openCell(rowIndex: number, columnIndex: number): void
+  closeCell(): void
   loadFilterFields(): void
   applyRowFilters(filters: ServerOpsDataRowFilters | null): void
   refresh(): void
@@ -92,6 +108,7 @@ export function createServerOpsSchemaIdleProjection(): ServerOpsSchemaBrowserPro
     databases: [], database: null, tables: [], selectedTable: null, detailTab: 'data', rowFilters: null,
     structure: { status: 'idle', error: null, columns: [], indexes: [] },
     rows: { status: 'idle', error: null, columns: [], rows: [], offset: 0, limit: 50, truncated: false },
+    cellDetail: null,
   }
 }
 
@@ -108,6 +125,8 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
   let tableRevision = 0
   let structureRevision = 0
   let rowsRevision = 0
+  /** 单元格详情独立代次；关闭或任何行身份变化都会作废全文回执。 */
+  let cellRevision = 0
   /** 当前配置身份与首读标志。 */
   let sourceKey: string | null = null
   let initialCatalog = true
@@ -121,8 +140,14 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     projection = { ...projection, ...update }
     if (active) options.publish(projection)
   }
+  /** 清空详情并作废在途全文读取。 */
+  const invalidateCellDetail = (): void => {
+    cellRevision += 1
+    if (projection.cellDetail !== null) patch({ cellDetail: null })
+  }
   /** 清空目标正文，绝不把前一个库/表的数据留在新标题下。 */
   const resetTable = (): void => {
+    invalidateCellDetail()
     tableRevision += 1
     patch({ selectedTable: null, detailTab: 'data', rowFilters: null, structure: createServerOpsSchemaIdleProjection().structure,
       rows: { ...createServerOpsSchemaIdleProjection().rows, limit: pageSize } })
@@ -155,6 +180,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     const selected = target()
     if (!selected || !active || !readable || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000 || offset % pageSize !== 0) return
     if (projection.rows.status === 'loading' && projection.rows.offset === offset) return
+    invalidateCellDetail()
     const owner = ownerRevision
     const table = tableRevision
     const revision = ++rowsRevision
@@ -168,6 +194,50 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       if (valid()) patch({ rows: { ...result, status: 'ready', error: null, collectedAt: Date.now() } })
     }, (error: unknown) => {
       if (valid()) patch({ rows: { ...projection.rows, status: 'error', error: getServerOpsDataErrorMessage(error, input.filters ? 'filtered-rows' : undefined) } })
+    })
+  }
+
+  /** 打开当前页的一个单元格；只有带摘要的截断文本需要额外读取。 */
+  const openCell = (rowIndex: number, columnIndex: number): void => {
+    const selected = target()
+    if (!selected || !active || !readable || !Number.isSafeInteger(rowIndex) || !Number.isSafeInteger(columnIndex)
+      || projection.rows.status === 'loading' || rowIndex < 0 || columnIndex < 0
+      || rowIndex >= projection.rows.rows.length || columnIndex >= projection.rows.columns.length) return
+    /** 当前页内的单元格预览。 */
+    const preview = projection.rows.rows[rowIndex]?.[columnIndex]
+    /** 由当前列投影验证的列名。 */
+    const column = projection.rows.columns[columnIndex]
+    /** 后端合同使用整表绝对位置，不使用页内行号。 */
+    const absoluteOffset = projection.rows.offset + rowIndex
+    if (preview === undefined || column === undefined || absoluteOffset > 1_000_199) return
+    const revision = ++cellRevision
+    if (typeof preview !== 'object' || preview === null || preview.kind === 'binary') {
+      patch({ cellDetail: { status: 'ready', error: null, column, absoluteOffset, preview, value: preview } })
+      return
+    }
+    if (preview.sha256 === undefined) {
+      patch({ cellDetail: { status: 'unavailable', error: '当前预览缺少校验摘要，无法读取完整内容；请刷新表后重试', column, absoluteOffset, preview } })
+      return
+    }
+    /** 发起请求时冻结 owner、表、行页和筛选条件身份。 */
+    const owner = ownerRevision
+    /** 当前表代次。 */
+    const table = tableRevision
+    /** 当前行页代次。 */
+    const rows = rowsRevision
+    /** 当前已应用筛选条件的不可变副本。 */
+    const filters = projection.rowFilters === null ? undefined : parseServerOpsDataRowFilters(projection.rowFilters)
+    /** 单格全文请求。 */
+    const input: ServerOpsDataSourceCellInput = { ...selected, offset: absoluteOffset, columnIndex, expectedColumn: column,
+      sha256: preview.sha256, ...(filters === undefined ? {} : { filters }) }
+    /** 检查全文回执仍属于当前打开的同一格。 */
+    const valid = (): boolean => active && owner === ownerRevision && table === tableRevision && rows === rowsRevision && revision === cellRevision
+    patch({ cellDetail: { status: 'loading', error: null, column, absoluteOffset, preview } })
+    void enqueueServerOpsDataRead(options.api, `${selected.sourceId}:schema-cell`, JSON.stringify([sourceKey, input]),
+      () => options.api.readServerOpsDataSchemaCell(input), valid).then((result) => {
+      if (valid()) patch({ cellDetail: { status: 'ready', error: null, column, absoluteOffset, preview, value: result.value } })
+    }, (error: unknown) => {
+      if (valid()) patch({ cellDetail: { status: 'error', error: getServerOpsDataErrorMessage(error), column, absoluteOffset, preview } })
     })
   }
 
@@ -238,7 +308,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       if (rowsLoading) loadRows(projection.rows.offset)
       if (structureLoading) loadStructure()
     },
-    dispose(): void { active = false; ownerRevision += 1 },
+    dispose(): void { active = false; ownerRevision += 1; cellRevision += 1; projection = { ...projection, cellDetail: null } },
     setSource(source, nextReadable = true): void {
       /** 相同配置只改变可达性时保留轻导航；真实配置变更必须丢弃。 */
       const key = source ? JSON.stringify([source.id, source.engine, source.database, source.updatedAt, source.readIdentity]) : null
@@ -277,6 +347,8 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     },
     openTable,
     backToList: resetTable,
+    openCell,
+    closeCell: invalidateCellDetail,
     setDetailTab(tab): void {
       patch({ detailTab: tab })
       if (tab === 'data' && projection.rows.status === 'idle') loadRows(projection.rows.offset)
@@ -298,6 +370,7 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     },
     refreshTables(): void {
       if (projection.status === 'loading') return
+      invalidateCellDetail()
       /** 目录刷新会使后端字段失效，页面也同步清除已展示的旧描述。 */
       structureRevision += 1
       patch({ structure: createServerOpsSchemaIdleProjection().structure })
