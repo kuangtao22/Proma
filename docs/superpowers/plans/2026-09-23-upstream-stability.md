@@ -125,3 +125,12 @@ Agent 与 Terminal 现在共享进程生命周期 helper：fork 返回即监听 
 用户明确授权将独立分支推送到 `kuangtao22/Proma` 并运行 Windows 预检。源码提交 `dc1899758acd4a1d95b152a9285024865a784a53`（移植官方稳定性修复并补齐首次启动与跨平台回归）已推送到 `codex/upstream-stability-sept23`；工作流输入 ref 固定为同一完整 SHA。
 
 [首轮 Build Windows 35834013117](https://github.com/kuangtao22/Proma/actions/runs/35834013117) 的依赖安装、原生目录 helper 和完整 Electron 构建通过，但生命周期测试在解析 `@proma/shared` 时失败（其余 16 项通过），后续 smoke/打包未运行。根因是 `package:prepare:win` 最终会清空应用 node_modules 并只保留生产 external 依赖；源码检查必须在裁剪前执行。CI 已按源码单测 → 构建/PTY 重编 → 真实 smoke → 平台依赖安装/裁剪 → 打包排序，静态核对拆分的构建与依赖准备命令完全等于原 package:prepare:win。无生产源码或 package.json 变更，待新提交重验。未合并 main、打标签、发布或重启用户客户端。
+
+### Windows 真运行诊断与夹具修正
+
+- [第二轮 35835085651](https://github.com/kuangtao22/Proma/actions/runs/35835085651)，提交 `e86e808e`：生命周期单测和 Electron/PTY 构建通过，真实终端 utility 早退，但默认标准流未给出原因。
+- `0d18bace` 为隔离 smoke 增加 utility stdout/stderr 管道并独立运行首次启动。Git HTTPS 随后多次连接失败；通过同仓库 Git API 逐个核对 blob、完整 tree 和提交 SHA 后，非强制推进同一分支，提交身份未改变。中间 run `35836157636` 因远程尚未收到该 SHA，仅 checkout 失败，未提供运行时证据。
+- [诊断轮 35836913871](https://github.com/kuangtao22/Proma/actions/runs/35836913871) 明确记录 `Cannot find module 'node-pty'`，发生在临时 bundle 的模块解析阶段，尚未加载原生 binding，不能归因于 ABI 或终止逻辑。临时 runtime 依赖需映射到真实安装目录。
+- 同轮首次启动没有取得 IPC 成功标记：Windows 构建的 `dist/resources/startup-splash/index.html` 缺失，splash 关闭后触发退出。CI 现使用 Bun 的 `fs.cpSync` 严格准备资源，再运行真实 main/preload/renderer；不通过忽略错误或伪造 IPC 响应让 smoke 通过。
+
+后续重验仍须全部实际 smoke 与安装包构建通过。本轮修改仅限 CI/验收夹具；生产业务代码保持 `dc189975`。原生 smoke 使用开发依赖 Electron 43.2.0；现有 electron-builder.yml 另固定 43.3.0，属于 fork 历史配置，本批未改变，不将 CI 源码 smoke 等同于已安装 EXE 的完整启动验收。

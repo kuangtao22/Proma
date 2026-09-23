@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { copyFile, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import os, { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { TerminalOutputEvent, TerminalProfile, TerminalState } from '@proma/shared'
 
 /** 标记当前进程是由 smoke 父入口启动的 Electron 子进程。 */
@@ -397,12 +397,23 @@ async function orchestrateSmoke(): Promise<void> {
       "require('./terminal-runtime-actual.cjs')",
       '',
     ].join('\n'))
-    /** 让临时 runtime bundle 解析工作树内已安装的外部依赖。 */
-    const nodeModulesLink = join(buildDir, 'node_modules')
+    /** 临时 runtime bundle 的独立依赖目录，避免 Windows junction 内再次解析 Bun 相对链接。 */
+    const fixtureNodeModules = join(buildDir, 'node_modules')
+    await mkdir(fixtureNodeModules, { recursive: true })
+    /** 复用打包同步脚本的 external 清单；动态导入避免 Electron CJS 子入口初始化脚本路径。 */
+    const runtimeDepsModulePath: string = './sync-runtime-deps'
+    const { EXTERNAL_RUNTIME_PACKAGES } = await import(runtimeDepsModulePath) as typeof import('./sync-runtime-deps')
     /** Windows 使用无需开发者模式的 junction；macOS 保持普通目录符号链接。 */
-    const nodeModulesLinkType = process.platform === 'win32' ? 'junction' : 'dir'
-    await symlink(join(process.cwd(), 'node_modules'), nodeModulesLink, nodeModulesLinkType)
-    assert.equal((await lstat(nodeModulesLink)).isSymbolicLink(), true, '临时 node_modules 链接创建失败')
+    const packageLinkType = process.platform === 'win32' ? 'junction' : 'dir'
+    for (const packageName of EXTERNAL_RUNTIME_PACKAGES) {
+      /** 工作树中当前 external 包经 Bun 链接解析后的真实安装根。 */
+      const packageSource = await realpath(join(process.cwd(), 'node_modules', ...packageName.split('/')))
+      /** 临时 bundle 内保持标准 Node package 目录结构。 */
+      const packageTarget = join(fixtureNodeModules, ...packageName.split('/'))
+      await mkdir(dirname(packageTarget), { recursive: true })
+      await symlink(packageSource, packageTarget, packageLinkType)
+      assert.equal((await lstat(packageTarget)).isSymbolicLink(), true, `临时依赖链接创建失败：${packageName}`)
+    }
 
     /** 显式任务变量或 electron 包入口解析出的真实 Electron 可执行文件。 */
     const electronExecutable = await resolveElectronExecutable()

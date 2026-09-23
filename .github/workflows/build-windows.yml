@@ -52,13 +52,20 @@ jobs:
         run: bun run build && bun run build:mobile && bun run rebuild:node-pty
         working-directory: apps/electron
 
+      # build:resources 的 shell cp 在 Windows 可静默失败；验收前严格准备真实应用资源。
+      - name: Stage built application resources
+        id: stage_resources
+        run: |
+          bun -e "require('node:fs').cpSync('resources', 'dist/resources', { recursive: true })"
+        working-directory: apps/electron
+
       - name: Smoke test native utility processes and PTY
         run: bun run scripts/upstream-runtime-smoke.ts
         working-directory: apps/electron
 
       - name: Smoke test fresh and existing configuration startup
         # 与 runtime smoke 相互独立，构建成功时继续收集真实启动证据。
-        if: ${{ !cancelled() && steps.build_electron.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build_electron.outcome == 'success' && steps.stage_resources.outcome == 'success' }}
         run: bun run scripts/first-startup-smoke.cjs
         working-directory: apps/electron
 
