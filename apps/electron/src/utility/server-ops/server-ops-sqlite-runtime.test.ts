@@ -17,7 +17,7 @@ let fixtureDirectory = ''
 /** 当前测试使用的真实 SQLite 文件路径。 */
 let databasePath = ''
 
-/** 构造 SQLite runtime 请求；共享合同接线完成前通过 unknown 保持测试独立。 */
+/** 构造 SQLite runtime 请求；正常读取沿用生产预算，超时边界由各用例显式覆盖。 */
 function createInput(overrides: Partial<ServerOpsRuntimeDataReadRequest> = {}): ServerOpsRuntimeDataReadRequest {
   return {
     requestId: 'request-sqlite',
@@ -29,7 +29,8 @@ function createInput(overrides: Partial<ServerOpsRuntimeDataReadRequest> = {}): 
     database: 'main',
     filePath: databasePath,
     tlsMode: 'disabled',
-    timeoutMs: 2_000,
+    /** 避免全仓负载下 shell/Python 启动耗时被两秒的测试专用预算误判为读取故障。 */
+    timeoutMs: 15_000,
     ...overrides,
   }
 }

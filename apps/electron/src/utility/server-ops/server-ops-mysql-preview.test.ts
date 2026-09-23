@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { readMySqlWithConnection } from './server-ops-data-runtime'
 
 /** 同时识别旧读取和合并元数据读取，验证驱动调用次数；真实网络开销另用隔离实例测量。 */
@@ -18,7 +19,12 @@ function createPreviewFixture() {
     if (sql.includes('information_schema.COLUMNS')) return [columns, []]
     if (sql.includes('information_schema.STATISTICS')) return [[{ name: 'PRIMARY', seq: 1, column_name: 'id' }], []]
     if (sql.includes('information_schema.TABLES')) return [[{ name: 'items', rows_estimate: 12 }], []]
-    return [[{ id: 1, note: 'x'.repeat(257), payload: sql.includes('OCTET_LENGTH(') ? 8_000_000 : Buffer.alloc(8) }], columns.map(({ name }) => ({ name }))]
+    return [[{
+      id: 1,
+      note: 'x'.repeat(257),
+      payload: sql.includes('OCTET_LENGTH(') ? 8_000_000 : Buffer.alloc(8),
+      __proma_cell_sha256_1: createHash('sha256').update('x'.repeat(257), 'utf8').digest('hex'),
+    }], columns.map(({ name }) => ({ name }))]
   }
   return { calls, columns, connection: {
     query: (sql: string, values?: (string | number)[]) => read(sql, values),
@@ -139,7 +145,7 @@ describe('MySQL 表预览读取预算', () => {
       expect(fixture.calls.slice(0, 2).map(({ sql }) => sql)).toEqual(['SELECT VERSION() AS version', 'SET SESSION MAX_EXECUTION_TIME = 10000, lock_wait_timeout = 2'])
       expect(fixture.calls.slice(2).every(({ prepared }) => prepared)).toBe(true)
       expect(fixture.calls.at(-1)?.sql).not.toContain('SELECT *')
-      expect(fixture.calls.at(-1)?.sql).toContain('LEFT(`note`, 257)')
+      expect(fixture.calls.at(-1)?.sql).toContain('LEFT(CONVERT(`note` USING utf8mb4), 257)')
       expect(fixture.calls.at(-1)?.sql).toContain('OCTET_LENGTH(`payload`)')
       expect(result).toMatchObject({
         columns: ['id', 'note', 'payload'],
@@ -173,7 +179,8 @@ describe('MySQL 表预览读取预算', () => {
     const name = "odd`'column"
     const { result, statements } = await readPreviewFixture([{ table_name: 'items', name, data_type: 'text' }], [{ [name]: 'safe' }], [name])
     expect(result).toMatchObject({ columns: [name], rows: [['safe']] })
-    expect(statements[1]).toContain("LEFT(`odd``'column`, 257) AS `odd``'column`")
+    expect(statements[1]).toContain("LEFT(CONVERT(`odd``'column` USING utf8mb4), 257) AS `odd``'column`")
+    expect(statements[1]).toContain("SHA2(CAST(CONVERT(`odd``'column` USING utf8mb4) AS BINARY), 256)")
   })
 
   test('Given NULL与空二进制 When 仅传大小 Then 不把NULL误报为零字节', async () => {
@@ -208,13 +215,14 @@ describe('MySQL 表预览读取预算', () => {
     }
   })
 
-  test('Given JSON和空间字段 When 预览 Then 保留驱动对象语义而非数据库字符串切片', async () => {
+  test('Given JSON和空间字段 When 预览 Then JSON有界转为文本且空间对象保留驱动语义', async () => {
     const metadata = [{ table_name: 'items', name: 'document', data_type: 'json' }, { table_name: 'items', name: 'location', data_type: 'geometry' }]
     const document = { quote: '"', text: '界😀', list: [1, null] }
     const location = { x: 1, y: 2 }
-    const { result, statements } = await readPreviewFixture(metadata, [{ document, location }], ['document', 'location'])
+    const { result, statements } = await readPreviewFixture(metadata, [{ document: JSON.stringify(document), location }], ['document', 'location'])
     expect(result).toMatchObject({ rows: [[JSON.stringify(document), JSON.stringify(location)]] })
-    expect(statements[1]).not.toContain('LEFT(')
-    expect(statements[1]).not.toContain('OCTET_LENGTH(')
+    expect(statements[1]).toContain('LEFT(CONVERT(`document` USING utf8mb4), 257)')
+    expect(statements[1]).not.toContain('LEFT(`location`')
+    expect(statements[1]).not.toContain('OCTET_LENGTH(`location`)')
   })
 })
