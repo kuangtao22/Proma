@@ -1,5 +1,7 @@
 # 官方稳定性改进选择性移植实施与验收
 
+**最终状态：** 第一批选择性移植已提交并推送至 `codex/upstream-stability-sept23`。本地 7700 项测试、7 工作区类型检查、真实 macOS 验收通过；固定 `eb39955a` 的 Windows CI（35838643874，attempt 2）全部通过。未合并 main、发布或重启用户客户端。
+
 **目标：** 按用户确认的第一批范围，适配官方 `1f8df675`、`d30c57d7`、`1b866c45` 和 `15c59296` 的有效能力，保留 Bone 已有功能与运行边界。
 
 **架构：** 复用既有 AgentOrchestrator、Pi utility、Jotai 与原子配置持久化。删除采用先标记、再停止等待、最后清理；运行事件带现有 generation 身份；进度按当前运行聚合。模型目录仅增加 FlashX。
@@ -134,3 +136,22 @@ Agent 与 Terminal 现在共享进程生命周期 helper：fork 返回即监听 
 - 同轮首次启动没有取得 IPC 成功标记：Windows 构建的 `dist/resources/startup-splash/index.html` 缺失，splash 关闭后触发退出。CI 现使用 Bun 的 `fs.cpSync` 严格准备资源，再运行真实 main/preload/renderer；不通过忽略错误或伪造 IPC 响应让 smoke 通过。
 
 后续重验仍须全部实际 smoke 与安装包构建通过。本轮修改仅限 CI/验收夹具；生产业务代码保持 `dc189975`。原生 smoke 使用开发依赖 Electron 43.2.0；现有 electron-builder.yml 另固定 43.3.0，属于 fork 历史配置，本批未改变，不将 CI 源码 smoke 等同于已安装 EXE 的完整启动验收。
+
+## 最终 Windows 验收结果（2026-09-23）
+
+固定提交 `eb39955a4efe472baa138fac0fe67565404dd5fb` 的 [Build Windows 35838643874，attempt 2](https://github.com/kuangtao22/Proma/actions/runs/35838643874/attempts/2) 已完成，结论为 **success**。attempt 1 仅在 Bun 安装 `picomatch` 的链接阶段发生 ENOENT，未运行功能测试；未改源码/锁文件即重跑，安装及后续完整流程通过。
+
+| Windows 验证 | 结果 |
+| --- | --- |
+| stable-directory/native build 测试 | 53 pass / 14 平台条件 skip / 0 fail |
+| 4 文件 lifecycle 测试 | 20 pass / 0 fail |
+| Electron/原生 PTY 构建与资源准备 | 全部通过 |
+| 真实 Agent utility 启动取消、重启、退出 | PASS，重启 PID 9436，停止后已确认退出 |
+| 真实 PowerShell PTY 输出、取消 create 与重新创建 | PASS，PTY PID 4064/6404，utility PID 5628/6164，均逐阶段确认退出 |
+| 完整客户端首次/再次启动 | 两轮均取得真实 preload `client IPC PASS`，既有配置原文与目录身份保留 |
+| 生产依赖裁剪、Windows x64 NSIS 打包 | 通过，文件名 `Proma-0.19.53-bone.7-windows-x64.exe` |
+| GitHub artifact 上传 | `Proma-win-x64`，1 个 EXE，artifact ID 10740777862，ZIP 199255142 字节 |
+
+[CI 产物](https://github.com/kuangtao22/Proma/actions/runs/35838643874/artifacts/10740777862) 的上传 ZIP SHA-256 为 `ed44b6f9d418d99907f12f550c5049e38f1734ea056d21e75a34aa42dbda52e4`；这是 GitHub 返回的 artifact 摘要，不是本机重新下载或安装验证。完整成功日志：`/private/tmp/proma-upstream-windows-success.log`。
+
+最终生产源码仍为 `dc189975` 的版本；后续提交只修正 CI/验收夹具并补记录。版本、依赖锁、Pi 0.85.1、3 次重试及首次提示均保留。Windows smoke 明确使用 Electron 43.2.0，安装包沿用既有 builder 固定的 43.3.0；本轮证明了源码原生行为及安装包可构建，未证明已安装 EXE 在 43.3.0 上的完整交互。FlashX 在线 API、真实模型压缩和人工全流程仍未验收。
