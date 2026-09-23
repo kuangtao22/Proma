@@ -38,9 +38,6 @@ jobs:
       - name: Test stable directory helper
         run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
 
-      - name: Prepare Electron package
-        run: bun run --filter='@proma/electron' package:prepare:win
-
       - name: Test utility process lifecycle
         run: >-
           bun test
@@ -49,12 +46,22 @@ jobs:
           apps/electron/src/main/lib/agent-runtime-client-lifecycle.test.ts
           apps/electron/src/main/lib/terminal-runtime-client-lifecycle.test.ts
 
+      # 源码检查与 smoke 构建需要 workspace/dev 链接；裁剪依赖必须最后执行。
+      - name: Build Electron and native PTY
+        run: bun run build && bun run build:mobile && bun run rebuild:node-pty
+        working-directory: apps/electron
+
       - name: Smoke test native utility processes and PTY
         run: bun run scripts/upstream-runtime-smoke.ts
         working-directory: apps/electron
 
       - name: Smoke test fresh and existing configuration startup
         run: bun run scripts/first-startup-smoke.cjs
+        working-directory: apps/electron
+
+      # 与 package:prepare:win 的最后两步一致，验收后才整理实际安装包依赖。
+      - name: Prepare production runtime dependencies
+        run: bun install --frozen-lockfile --os=win32 --cpu=x64 && bun run sync:runtime-deps --target-platform=win32 --target-arch=x64
         working-directory: apps/electron
 
       - name: Package (Windows)

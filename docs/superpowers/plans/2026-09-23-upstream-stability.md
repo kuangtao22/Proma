@@ -119,3 +119,9 @@ Agent 与 Terminal 现在共享进程生命周期 helper：fork 返回即监听 
 独立复审：无 CRITICAL/HIGH/MEDIUM；核心 4 文件 20 pass / 0 fail（61 次断言）。最终 7 工作区类型检查、主进程重建、完整客户端首次/再次启动及 macOS utility/PTY 冒烟通过。macOS 最终 Agent PID 44974、PTY 44977/45010、utility 44974/44976/45009，均通过各阶段退出断言。
 
 最终本机日志：`/private/tmp/proma-upstream-final2-tests.log`、`/private/tmp/proma-upstream-final2-typecheck.log`、`/private/tmp/proma-upstream-final2-main-build.log`、`/private/tmp/proma-first-startup-final2.log`、`/private/tmp/proma-upstream-runtime-final2.log`。最新全仓 `bun test --isolate`：596 个文件，7700 pass / 6 Windows 专属 skip / 0 fail，29835 次断言，103.95 秒。版本、package.json、bun.lock 和 release.yml 未改，`git diff --check` 通过。Windows CI 结果待固定源码提交执行后补录。
+
+### 固定源码 Windows 预检
+
+用户明确授权将独立分支推送到 `kuangtao22/Proma` 并运行 Windows 预检。源码提交 `dc1899758acd4a1d95b152a9285024865a784a53`（移植官方稳定性修复并补齐首次启动与跨平台回归）已推送到 `codex/upstream-stability-sept23`；工作流输入 ref 固定为同一完整 SHA。
+
+[首轮 Build Windows 35834013117](https://github.com/kuangtao22/Proma/actions/runs/35834013117) 的依赖安装、原生目录 helper 和完整 Electron 构建通过，但生命周期测试在解析 `@proma/shared` 时失败（其余 16 项通过），后续 smoke/打包未运行。根因是 `package:prepare:win` 最终会清空应用 node_modules 并只保留生产 external 依赖；源码检查必须在裁剪前执行。CI 已按源码单测 → 构建/PTY 重编 → 真实 smoke → 平台依赖安装/裁剪 → 打包排序，静态核对拆分的构建与依赖准备命令完全等于原 package:prepare:win。无生产源码或 package.json 变更，待新提交重验。未合并 main、打标签、发布或重启用户客户端。
