@@ -129,9 +129,17 @@ export interface WorkspacePathState {
   relocation: WorkspaceRelocationProgress | null
 }
 
+/** 启动前发现的应用数据目录问题，供轻量恢复窗口直接说明路径与原因。 */
+export interface DataRootStartupIssue {
+  path: string
+  code: 'missing' | 'permission' | 'not-directory' | 'symlink' | 'unavailable'
+  message: string
+}
+
 /** 路径管理界面与主进程共享的当前状态。 */
 export interface PathManagementState {
   activeRoot: string | null
+  startupIssue?: DataRootStartupIssue
   previousRoot?: string
   availability: DataRootAvailability
   deviceType: DataRootDeviceType
@@ -178,6 +186,12 @@ export interface DataRootSelection {
   targetRoot: string
 }
 
+/** 恢复窗口选择的已有数据或空白数据区；选择本身不写入目录。 */
+export interface DataRootRecoverySelection extends DataRootSelection {
+  /** 区分找回已有数据与启用全新数据区。 */
+  kind: 'existing' | 'empty'
+}
+
 /** preview/start 必须原样回传的服务端选择授权。 */
 export type DataRootMigrationSelectionInput = DataRootSelection
 
@@ -206,8 +220,12 @@ export type DataRootStartupMode = 'normal' | 'data-root-migration' | 'data-root-
 
 /** 数据根恢复请求。 */
 export interface RecoverDataRootInput {
-  action: DataRootRecoveryAction
+  action: DataRootRecoveryAction | 'cancel-selection'
   selectedRoot?: string
+  /** 重新定位必须回传当前系统选择器签发的单次授权。 */
+  selectionId?: string
+  /** 仅明确确认启用空白数据区后为 true，不代表迁移旧数据。 */
+  initializeEmpty?: boolean
 }
 
 /** 固定定位文件中持久化的可恢复迁移记录。 */

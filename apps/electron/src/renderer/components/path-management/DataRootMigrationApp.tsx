@@ -3,8 +3,10 @@ import { AlertTriangle, FolderOpen, RefreshCw, RotateCcw, X } from 'lucide-react
 import type {
   DataRootMigrationProgress,
   DataRootRecoveryAction,
+  DataRootRecoverySelection,
   DataRootStartupMode,
   PathManagementState,
+  RecoverDataRootInput,
 } from '@proma/shared'
 import type {
   DataRootMigrationPreloadApi,
@@ -33,6 +35,8 @@ export interface DataRootMigrationViewState {
   percent: number
   /** 当前错误摘要。 */
   error?: string
+  /** 启动阶段捕获的实际故障位置与安全摘要。 */
+  issue?: NonNullable<PathManagementState['startupIssue']>
   /** 是否存在经过 locator 保存的旧根候选。 */
   canRestorePrevious: boolean
   /** 当前状态实际允许渲染和执行的 recovery 动作。 */
@@ -63,9 +67,15 @@ export function createDataRootMigrationViewState(
   if (mode === 'data-root-recovery' || state.availability !== 'available') {
     return {
       kind: 'recovery',
-      stageLabel: '数据根当前不可用',
+      stageLabel: '应用数据目录需要处理',
       percent: 0,
-      ...(state.postCommitCleanup?.error === undefined ? {} : { error: state.postCommitCleanup.error }),
+      ...(state.startupIssue === undefined ? {} : {
+        issue: state.startupIssue,
+        error: state.startupIssue.message,
+      }),
+      ...(state.startupIssue !== undefined || state.postCommitCleanup?.error === undefined
+        ? {}
+        : { error: state.postCommitCleanup.error }),
       canRestorePrevious: state.previousRoot !== undefined,
       recoveryActions: state.postCommitCleanup === undefined
         ? DATA_ROOT_RECOVERY_ACTIONS
@@ -89,6 +99,45 @@ export function createDataRootMigrationViewState(
     canRestorePrevious: state.previousRoot !== undefined,
     recoveryActions: [],
   }
+}
+
+/** 根据主进程签发的恢复选择构造请求；空目录必须先获得用户明确确认。 */
+export function createRelocateRecoveryInput(
+  selection: DataRootRecoverySelection,
+  initializeEmpty: boolean,
+): RecoverDataRootInput | null {
+  if (selection.kind === 'empty' && !initializeEmpty) return null
+  return {
+    action: 'relocate',
+    selectedRoot: selection.targetRoot,
+    selectionId: selection.selectionId,
+    ...(selection.kind === 'empty' ? { initializeEmpty: true } : {}),
+  }
+}
+
+/** 重新选择前先清掉已被主进程撤销的旧授权，再保存本次选择结果。 */
+export async function replaceRecoveryDataRootSelection(
+  pick: () => Promise<DataRootRecoverySelection | null>,
+  setSelection: (selection: DataRootRecoverySelection | null) => void,
+  setInitializeEmpty: (confirmed: boolean) => void,
+): Promise<void> {
+  setSelection(null)
+  setInitializeEmpty(false)
+  const selection = await pick()
+  setSelection(selection)
+}
+
+/** 撤销主进程签发的恢复选择；只有后台确认成功后才清理界面草稿。 */
+export async function cancelRecoveryDataRootSelection(
+  selection: DataRootRecoverySelection,
+  recover: (input: RecoverDataRootInput) => Promise<void>,
+  clearSelection: () => void,
+): Promise<void> {
+  await recover({
+    action: 'cancel-selection',
+    selectionId: selection.selectionId,
+  })
+  clearSelection()
 }
 
 /** 用户确认后才执行切回旧数据根，取消时保持 locator 不变。 */
@@ -136,6 +185,42 @@ export function DataRootMigrationProgressBar({
   )
 }
 
+/** 首次读取失败时保留可恢复操作，避免窗口永久停留在加载文案。 */
+export function DataRootInitialLoadError({
+  message,
+  isBusy,
+  onRetry,
+  onExit,
+}: {
+  /** 初次状态查询返回的安全错误摘要。 */
+  message: string
+  /** 是否正在重新查询。 */
+  isBusy: boolean
+  /** 重新读取状态。 */
+  onRetry: () => void
+  /** 退出恢复窗口。 */
+  onExit: () => void
+}): React.JSX.Element {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 py-10 text-foreground">
+      <section aria-labelledby="data-root-load-error-title" className="w-full max-w-xl">
+        <h1 id="data-root-load-error-title" className="text-xl font-semibold">应用数据目录需要处理</h1>
+        <p role="alert" className="my-6 rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {message}
+        </p>
+        <div className="flex flex-wrap gap-3">
+          <Button disabled={isBusy} onClick={onRetry}>
+            <RefreshCw aria-hidden="true" />重新检测
+          </Button>
+          <Button variant="ghost" disabled={isBusy} onClick={onExit}>
+            <X aria-hidden="true" />退出
+          </Button>
+        </div>
+      </section>
+    </main>
+  )
+}
+
 /** recovery 按钮区只接收已派生的允许动作与无状态回调。 */
 export interface DataRootRecoveryControlsProps {
   /** 当前 recovery 视图及允许动作。 */
@@ -170,7 +255,7 @@ export function DataRootRecoveryControls({
       ) : null}
       {view.recoveryActions.includes('relocate') ? (
         <Button variant="outline" disabled={isBusy} onClick={onRelocate}>
-          <FolderOpen aria-hidden="true" />重新定位
+          <FolderOpen aria-hidden="true" />选择应用数据目录
         </Button>
       ) : null}
       {view.recoveryActions.includes('restore-previous') ? (
@@ -181,6 +266,70 @@ export function DataRootRecoveryControls({
       <Button variant="ghost" disabled={isBusy} onClick={onExit}>
         <X aria-hidden="true" />退出
       </Button>
+    </div>
+  )
+}
+
+/** 恢复目录选择后的确认区属性。 */
+export interface DataRootRecoverySelectionPanelProps {
+  /** 主进程校验并签发的目录选择。 */
+  selection: DataRootRecoverySelection
+  /** 用户是否确认空目录将作为全新数据区。 */
+  initializeEmpty: boolean
+  /** 是否正在提交恢复操作。 */
+  isBusy: boolean
+  /** 更新空目录确认状态。 */
+  onInitializeEmptyChange: (checked: boolean) => void
+  /** 提交当前选择。 */
+  onConfirm: () => void
+  /** 放弃当前选择，不修改 locator。 */
+  onCancel: () => void
+}
+
+/** 明确区分已有数据目录与空目录，提交前展示对应的数据影响。 */
+export function DataRootRecoverySelectionPanel({
+  selection,
+  initializeEmpty,
+  isBusy,
+  onInitializeEmptyChange,
+  onConfirm,
+  onCancel,
+}: DataRootRecoverySelectionPanelProps): React.JSX.Element {
+  /** 空目录只有在用户勾选确认后才能提交。 */
+  const requiresEmptyConfirmation = selection.kind === 'empty'
+  return (
+    <div aria-live="polite" className="mb-6 rounded-md border border-border bg-muted/40 p-4">
+      <p className="text-sm font-medium">
+        {requiresEmptyConfirmation ? '启用全新数据区' : '使用该目录中的已有数据'}
+      </p>
+      <p className="mt-2 break-all text-sm text-muted-foreground">{selection.targetRoot}</p>
+      <p className="mt-3 text-sm text-muted-foreground">
+        {requiresEmptyConfirmation
+          ? '旧聊天和配置不会自动迁移，原数据仍会保留。'
+          : '这不是迁移；Proma 将直接使用该目录中的已有数据，原位置会保留。'}
+      </p>
+      {requiresEmptyConfirmation ? (
+        <label className="mt-4 flex items-start gap-2 text-sm text-foreground">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-4 accent-primary"
+            checked={initializeEmpty}
+            disabled={isBusy}
+            onChange={(event) => onInitializeEmptyChange(event.target.checked)}
+          />
+          <span>我确认使用空目录创建全新数据区</span>
+        </label>
+      ) : null}
+      <div className="mt-4 flex flex-wrap gap-3">
+        <Button
+          type="button"
+          disabled={isBusy || (requiresEmptyConfirmation && !initializeEmpty)}
+          onClick={onConfirm}
+        >
+          {requiresEmptyConfirmation ? '启用全新数据区' : '使用此数据目录'}
+        </Button>
+        <Button type="button" variant="ghost" disabled={isBusy} onClick={onCancel}>取消</Button>
+      </div>
     </div>
   )
 }
@@ -203,6 +352,10 @@ export function DataRootMigrationApp(): React.JSX.Element {
   const [actionError, setActionError] = useState<string | null>(null)
   /** 防止用户重复提交路径操作。 */
   const [isBusy, setIsBusy] = useState(false)
+  /** 主进程签发、等待用户确认的恢复目录。 */
+  const [recoverySelection, setRecoverySelection] = useState<DataRootRecoverySelection | null>(null)
+  /** 空目录作为全新数据区的显式确认。 */
+  const [initializeEmpty, setInitializeEmpty] = useState(false)
 
   /** 从唯一的路径 IPC 刷新公开状态。 */
   const refreshState = useCallback(async (): Promise<void> => {
@@ -249,7 +402,36 @@ export function DataRootMigrationApp(): React.JSX.Element {
     }
   }, [refreshState])
 
+  /** 打开系统选择器；取消选择只清空本地候选，不执行恢复或写入 locator。 */
+  const pickRecoveryRoot = useCallback(async (): Promise<void> => {
+    setIsBusy(true)
+    setActionError(null)
+    try {
+      await replaceRecoveryDataRootSelection(
+        recoveryApi.pickDataRoot,
+        setRecoverySelection,
+        setInitializeEmpty,
+      )
+    } catch (error) {
+      setActionError(toErrorMessage(error))
+    } finally {
+      setIsBusy(false)
+    }
+  }, [recoveryApi])
+
   if (state === null) {
+    if (actionError !== null) {
+      return (
+        <DataRootInitialLoadError
+          message={actionError}
+          isBusy={isBusy}
+          onRetry={() => void runAction(async () => undefined)}
+          onExit={() => void (mode === 'data-root-recovery'
+            ? recoveryApi.exitDataRootManagement()
+            : migrationApi.exitDataRootManagement())}
+        />
+      )
+    }
     return (
       <main className="flex min-h-screen items-center justify-center bg-background text-foreground">
         <div role="status" className="text-sm text-muted-foreground">正在读取数据根状态...</div>
@@ -274,7 +456,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
           <div className="min-w-0">
             <h1 id="data-root-title" className="text-xl font-semibold">{view.stageLabel}</h1>
             <p className="mt-2 break-all text-sm text-muted-foreground">
-              {state.activeRoot ?? '定位文件无效，请重新选择数据目录'}
+              {view.issue?.path ?? state.activeRoot ?? '定位文件无效，请重新选择应用数据目录'}
             </p>
           </div>
         </div>
@@ -289,6 +471,31 @@ export function DataRootMigrationApp(): React.JSX.Element {
           </p>
         ) : null}
 
+        {view.kind === 'recovery' && recoverySelection !== null ? (
+          <DataRootRecoverySelectionPanel
+            selection={recoverySelection}
+            initializeEmpty={initializeEmpty}
+            isBusy={isBusy}
+            onInitializeEmptyChange={setInitializeEmpty}
+            onConfirm={() => {
+              /** 二次防线：即使按钮状态异常，也不提交未确认的空目录。 */
+              const input = createRelocateRecoveryInput(recoverySelection, initializeEmpty)
+              if (input === null) return
+              void runAction(async () => {
+                await recoveryApi.recoverDataRoot(input)
+              })
+            }}
+            onCancel={() => void runAction(() => cancelRecoveryDataRootSelection(
+              recoverySelection,
+              recoveryApi.recoverDataRoot,
+              () => {
+                setRecoverySelection(null)
+                setInitializeEmpty(false)
+              },
+            ))}
+          />
+        ) : null}
+
         {view.kind === 'recovery' ? (
           <DataRootRecoveryControls
             view={view}
@@ -296,12 +503,7 @@ export function DataRootMigrationApp(): React.JSX.Element {
             onRecheck={() => void runAction(async () => {
               await recoveryApi.recoverDataRoot({ action: 'recheck' })
             })}
-            onRelocate={() => void runAction(async () => {
-              /** 系统选择器返回的已授权候选目录。 */
-              const selectedRoot = await recoveryApi.pickDataRoot()
-              if (selectedRoot === null) return
-              await recoveryApi.recoverDataRoot({ action: 'relocate', selectedRoot })
-            })}
+            onRelocate={() => void pickRecoveryRoot()}
             onRestorePrevious={() => void runAction(async () => {
               await confirmRestorePreviousDataRoot(
                 () => window.confirm('切回旧备份后，当前离线数据根将保留为可恢复位置。是否继续？'),

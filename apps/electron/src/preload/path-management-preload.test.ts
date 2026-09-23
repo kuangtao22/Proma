@@ -195,15 +195,49 @@ describe('路径管理 preload API', () => {
       'recoverDataRoot',
     ])
 
+    /** 恢复选择包含主进程签发授权与目录分类，preload 不得退化成裸路径。 */
+    const recoverySelection = {
+      selectionId: 'recovery-selection-1',
+      targetRoot: '/data/found',
+      kind: 'empty',
+    }
+    recorded.ipc.invoke = async (channel, ...args) => {
+      recorded.invokes.push({ channel, args })
+      return channel === PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT ? recoverySelection : undefined
+    }
+
     await invokeApi(api, 'getPathManagementState')
-    await invokeApi(api, 'pickDataRoot')
-    await invokeApi(api, 'recoverDataRoot', { action: 'relocate', selectedRoot: '/data/found' })
+    const pickDataRoot = api.pickDataRoot
+    if (typeof pickDataRoot !== 'function') throw new Error('恢复 API 缺少目录选择')
+    expect(await pickDataRoot()).toBe(recoverySelection)
+    await invokeApi(api, 'recoverDataRoot', {
+      action: 'relocate',
+      selectedRoot: '/data/found',
+      selectionId: 'recovery-selection-1',
+      initializeEmpty: true,
+    })
+    await invokeApi(api, 'recoverDataRoot', {
+      action: 'cancel-selection',
+      selectionId: 'recovery-selection-1',
+    })
     await invokeApi(api, 'openDataRoot', 'current')
     await invokeApi(api, 'exitDataRootManagement')
     expect(recorded.invokes).toEqual([
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, args: [] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, args: [] },
-      { channel: PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, args: [{ action: 'relocate', selectedRoot: '/data/found' }] },
+      {
+        channel: PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
+        args: [{
+          action: 'relocate',
+          selectedRoot: '/data/found',
+          selectionId: 'recovery-selection-1',
+          initializeEmpty: true,
+        }],
+      },
+      {
+        channel: PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT,
+        args: [{ action: 'cancel-selection', selectionId: 'recovery-selection-1' }],
+      },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.OPEN_DATA_ROOT, args: ['current'] },
       { channel: PATH_MANAGEMENT_IPC_CHANNELS.EXIT_APP, args: [] },
     ])

@@ -38,6 +38,13 @@ jobs:
       - name: Test stable directory helper
         run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
 
+      - name: Test data root recovery
+        run: >-
+          bun test
+          apps/electron/src/main/lib/data-root-recovery.test.ts
+          apps/electron/src/main/lib/data-root-startup-check.test.ts
+          apps/electron/src/main/lib/path-management-ipc.test.ts
+
       - name: Test utility process lifecycle
         run: >-
           bun test

@@ -9,6 +9,8 @@
 
 ## 长期约束
 
+- 2026-09-23：用户批准目录异常时提供可操作的恢复入口，已在 codex/upstream-stability-sept23 实现：普通业务前补齐缺失目录，文件/链接/权限异常进入隔离恢复窗口；候选区分已有 Proma 数据与严格空目录，空目录需明确确认。系统选择授权在取消、新选择或目录替换后失效；候选准备成功才原子切换定位，旧数据保留，重新定位不等于迁移。为什么：避免启动报错后无路可走，以及切换空目录导致用户误以为数据丢失。检查仅做固定目录与有界身份读取，无全量扫描、新依赖或常驻任务。本轮相关回归 229 项通过，7 工作区类型检查及真实 Electron 首次/再次/冲突恢复验收通过；Windows 预检另行记录。尚未合并 main 或发布，不改变用户安装版。
+
 - 2026-09-23：官方移植收尾的真实 runtime 验收确认：utilityProcess 在 fork 返回但 spawn 尚未完成时，kill 可能返回 false，发出终止请求不代表已退出。Agent/Terminal 现等待真实 exit，提前取消在 spawn 后补发 kill，超时保留所有权，禁止新代次覆盖残留进程；逐阶段验收 PID 退出，不以历史 PID 去重或新旧 PID 必须不同作为证据。为什么：避免用户取消后残留后台进程和重复终端，且保持停止失败可重试。独立复审无阻塞；最新全仓 7700 pass / 6 Windows skip / 0 fail，7 工作区类型检查、主进程重建、隔离首次/再次启动及真实 macOS utility/PTY 通过。用户明确授权推送到 kuangtao22/Proma 后，源码 dc1899758acd4a1d95b152a9285024865a784a53 已提交并推送至 codex/upstream-stability-sept23，Windows 预检须先做源码/原生验收，再裁剪开发依赖；已修正临时 node-pty 真实依赖映射和 shell cp 静默漏资源。最终固定 eb39955a 的 Windows CI 35838643874（attempt 2）全部成功：20 项生命周期、真实 utility/PTY、两次 IPC 启动、x64 打包及产物上传通过。首次 attempt 仅 Bun 安装链接 ENOENT，同源码重跑后消失。源码 smoke 使用 Electron 43.2.0，包沿用既有 43.3.0，未进行安装后人工验收；Git HTTPS 故障时可用同仓库 Git API 上传，但必须核对 blob/tree/commit SHA 且非强制推进；不合并 main、不发布、不重启用户客户端。
 
 - 2026-09-23：按用户要求发布 `v0.19.53-bone.7`，本地 SQLite 与单元格全文功能已合入并推送 `main`，标签固定源码 `c1668d0e5df7539fd6aed28ebdcfd59316d00552`。7655 项全仓回归通过、6 项平台跳过，7 工作区类型检查、独立 macOS ARM64 正式包内 SQLite 全链路及同 SHA Windows 预检 `35815156876` 通过；正式流程 `35817027939` 六个任务成功，15 项资产和三个自动更新清单核验通过，已成为 latest。为什么：固定同一源码完成预检、标签与资产核验，避免安装包和更新清单错位；macOS 预检显式使用 `CSC_IDENTITY_AUTO_DISCOVERY=false`，避免自动发现本机证书进入非预期签名流程，正式包仍沿用未签名分发。未替换安装版、重启 dev 或访问真实数据库；未执行四平台完整安装启动或重算大型包 SHA-512。下载 `https://github.com/kuangtao22/Proma/releases/tag/v0.19.53-bone.7`；详细证据见 `.omx/reports/2026-09-23-release-v0.19.53-bone.7.md`，发布后补记忆不移动标签。

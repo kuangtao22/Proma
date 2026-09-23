@@ -4,8 +4,13 @@ import type { PathManagementState } from '@proma/shared'
 import type { PathManagementPreloadApi } from '../../../preload/path-management-preload'
 import * as dataRootMigrationModule from './DataRootMigrationApp'
 import {
+  cancelRecoveryDataRootSelection,
+  createRelocateRecoveryInput,
   createDataRootMigrationViewState,
+  replaceRecoveryDataRootSelection,
+  DataRootInitialLoadError,
   DataRootMigrationProgressBar,
+  DataRootRecoverySelectionPanel,
   DataRootRecoveryControls,
   confirmRestorePreviousDataRoot,
 } from './DataRootMigrationApp'
@@ -41,6 +46,77 @@ describe('DataRootMigrationApp', () => {
     }
 
     expect(() => subscribe?.(recoveryApi, () => undefined)()).not.toThrow()
+  })
+
+  test('Given 已有恢复候选 When 重新打开选择器 Then 先清空失效授权再保存新选择', async () => {
+    /** 记录候选状态变化，确保选择器异常时也不会遗留已撤销授权。 */
+    const selections: Array<string | null> = ['old-selection']
+    /** 记录空目录确认是否同步重置。 */
+    const confirmations: boolean[] = [true]
+
+    await replaceRecoveryDataRootSelection(
+      async () => ({
+        selectionId: 'new-selection',
+        targetRoot: '/data/new',
+        kind: 'existing',
+      }),
+      (selection) => selections.push(selection?.selectionId ?? null),
+      (confirmed) => confirmations.push(confirmed),
+    )
+
+    expect(selections).toEqual(['old-selection', null, 'new-selection'])
+    expect(confirmations).toEqual([true, false])
+  })
+
+  test('Given 待确认选择 When 后台撤销成功 Then 回传 selectionId 后才清理界面草稿', async () => {
+    /** 记录恢复 IPC 与草稿清理的先后顺序。 */
+    const events: string[] = []
+    const selection = {
+      selectionId: 'selection-cancel',
+      targetRoot: '/data/cancel',
+      kind: 'empty' as const,
+    }
+
+    await cancelRecoveryDataRootSelection(
+      selection,
+      async (input) => { events.push(`recover:${input.action}:${input.selectionId}`) },
+      () => { events.push('clear') },
+    )
+
+    expect(events).toEqual(['recover:cancel-selection:selection-cancel', 'clear'])
+  })
+
+  test('Given 待确认选择 When 后台撤销失败 Then 保留草稿并向界面传播错误', async () => {
+    /** 后端拒绝时不得误报已取消。 */
+    let cleared = false
+    const failure = new Error('选择授权撤销失败')
+
+    await expect(cancelRecoveryDataRootSelection(
+      {
+        selectionId: 'selection-still-active',
+        targetRoot: '/data/pending',
+        kind: 'existing',
+      },
+      async () => { throw failure },
+      () => { cleared = true },
+    )).rejects.toBe(failure)
+    expect(cleared).toBe(false)
+  })
+
+  test('Given 首次状态读取失败 When 渲染恢复窗口 Then 显示错误并保留重试与退出', () => {
+    const html = renderToStaticMarkup(
+      <DataRootInitialLoadError
+        message="无法读取应用数据目录状态"
+        isBusy={false}
+        onRetry={() => undefined}
+        onExit={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('无法读取应用数据目录状态')
+    expect(html).toContain('重新检测')
+    expect(html).toContain('退出')
+    expect(html).not.toContain('正在读取数据根状态')
   })
 
   test('Given copying/verifying/rebasing 进度 When 生成视图 Then 显示复制/校验/重写阶段与稳定百分比', () => {
@@ -79,12 +155,102 @@ describe('DataRootMigrationApp', () => {
     }), 'data-root-recovery')
 
     expect(view.kind).toBe('recovery')
+    expect(view.stageLabel).toBe('应用数据目录需要处理')
     expect(view.recoveryActions).toEqual([
       'recheck',
       'relocate',
       'restore-previous',
     ])
     expect(view.canRestorePrevious).toBe(true)
+  })
+
+  test('Given 启动故障包含实际路径与原因 When 生成恢复视图 Then 不展示内部堆栈', () => {
+    const state = createState({
+      availability: 'unavailable',
+      startupIssue: {
+        path: 'C:\\Users\\alice\\.proma\\server-ops',
+        code: 'not-directory',
+        message: '该位置不是可安全使用的目录',
+      },
+    })
+    const view = createDataRootMigrationViewState(state, 'data-root-recovery')
+
+    expect(view.issue).toEqual(state.startupIssue)
+    expect(view.issue?.message).not.toContain('at resolveTransactionDirectory')
+  })
+
+  test('Given 选择已有数据目录 When 渲染确认区 Then 说明不会迁移并允许确认', () => {
+    const html = renderToStaticMarkup(
+      <DataRootRecoverySelectionPanel
+        selection={{
+          selectionId: 'selection-existing',
+          targetRoot: '/data/existing',
+          kind: 'existing',
+        }}
+        initializeEmpty={false}
+        isBusy={false}
+        onInitializeEmptyChange={() => undefined}
+        onConfirm={() => undefined}
+        onCancel={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('/data/existing')
+    expect(html).toContain('使用该目录中的已有数据')
+    expect(html).toContain('这不是迁移')
+    expect(html).toContain('原位置会保留')
+    expect(html).not.toContain('disabled=""')
+  })
+
+  test('Given 选择空目录 When 尚未明确确认 Then 提示旧数据不迁移且禁止启用', () => {
+    const html = renderToStaticMarkup(
+      <DataRootRecoverySelectionPanel
+        selection={{
+          selectionId: 'selection-empty',
+          targetRoot: '/data/empty',
+          kind: 'empty',
+        }}
+        initializeEmpty={false}
+        isBusy={false}
+        onInitializeEmptyChange={() => undefined}
+        onConfirm={() => undefined}
+        onCancel={() => undefined}
+      />,
+    )
+
+    expect(html).toContain('启用全新数据区')
+    expect(html).toContain('旧聊天和配置不会自动迁移')
+    expect(html).toContain('原数据仍会保留')
+    expect(html).toContain('type="checkbox"')
+    expect(html).toContain('disabled=""')
+  })
+
+  test('Given 主进程签发空目录选择 When 用户明确确认 Then 生成受授权的恢复请求', () => {
+    const selection = {
+      selectionId: 'selection-empty',
+      targetRoot: '/data/empty',
+      kind: 'empty' as const,
+    }
+
+    expect(createRelocateRecoveryInput(selection, false)).toBeNull()
+    expect(createRelocateRecoveryInput(selection, true)).toEqual({
+      action: 'relocate',
+      selectedRoot: '/data/empty',
+      selectionId: 'selection-empty',
+      initializeEmpty: true,
+    })
+  })
+
+  test('Given 主进程签发已有目录选择 When 用户确认 Then 保留授权且不初始化空目录', () => {
+    expect(createRelocateRecoveryInput({
+      selectionId: 'selection-existing',
+      targetRoot: '/data/existing',
+      kind: 'existing',
+    }, false)).toEqual({
+      action: 'relocate',
+      selectedRoot: '/data/existing',
+      selectionId: 'selection-existing',
+    })
   })
 
   test('Given 迁移已提交但 cleanup 待重试 When 生成视图 Then 不误显示为无迁移', () => {
@@ -144,7 +310,7 @@ describe('DataRootMigrationApp', () => {
 
     expect(html).toContain('重新检测')
     expect(html).toContain('退出')
-    expect(html).not.toContain('重新定位')
+    expect(html).not.toContain('选择应用数据目录')
     expect(html).not.toContain('切回旧备份')
   })
 

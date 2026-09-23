@@ -151,7 +151,7 @@ import {
   getDefaultDataRootInstanceLeaseRegistry,
   type DataRootInstanceLeaseRegistry,
 } from './lib/data-root-instance-lease'
-import { prepareNormalDataRoot } from './lib/data-root-marker'
+import { inspectDataRootStartup } from './lib/data-root-startup-check'
 import { detectStaleDevBundle } from './lib/dev-bundle-freshness'
 import type { DataRootStartupMode } from '@proma/shared'
 import { createDataRootStartupRouter } from './lib/data-root-startup-routing'
@@ -830,10 +830,10 @@ app.whenReady()
  * 单点失败不应阻止窗口和托盘的创建（用户至少要能看到界面）。
  */
 async function bootstrap(): Promise<void> {
-  /** 首次且无副作用检查固定 locator，决定是否允许普通业务初始化。 */
+  /** 首次解析固定 locator，并在 normal gate 内准备受控目录。 */
   const dataRootLocator = getDefaultDataRootLocator()
-  /** bootstrap 复用同一 locator 的首次无副作用检查结果。 */
-  const locatorResult = dataRootLocator.inspect()
+  /** normal gate 前准备受控默认根和关键目录，异常直接转入轻量恢复模式。 */
+  const locatorResult = inspectDataRootStartup(dataRootLocator, true)
   /** 数据根启动隔离模式。 */
   const dataRootMode = resolveDataRootStartupMode(locatorResult)
   if (dataRootMode !== 'normal') {
@@ -841,6 +841,7 @@ async function bootstrap(): Promise<void> {
     dataRootBusinessStartupBlocked = true
     registerPathManagementIpcHandlers({
       mode: dataRootMode,
+      initialStartupIssue: locatorResult.state.startupIssue,
       ipc: ipcMain,
       app,
       dialog,
@@ -852,10 +853,15 @@ async function bootstrap(): Promise<void> {
     return
   }
 
-  /** marker 初始化与共享 lease 都必须早于任何普通业务服务。 */
-  let activeRoot: string
+  /** 启动检查已经完成 marker 与关键目录准备，随后才能取得共享 lease。 */
+  const activeRoot = locatorResult.state.activeRoot
+  if (activeRoot === null || locatorResult.state.availability !== 'available') {
+    dataRootBusinessStartupBlocked = true
+    throw new Error('应用数据目录启动检查未返回可用根')
+  }
+
+  /** 共享 lease 必须早于任何普通业务服务。 */
   try {
-    activeRoot = prepareNormalDataRoot(dataRootLocator, locatorResult)
     dataRootInstanceLease = getDefaultDataRootInstanceLeaseRegistry()
     await dataRootInstanceLease.acquire(activeRoot)
     /** 只自动完成不可取消的 committing；其他 journal 留给设置页继续或取消。 */
