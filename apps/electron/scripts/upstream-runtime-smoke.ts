@@ -294,7 +294,7 @@ async function verifyTerminalRuntime(
 
 /** Electron 子进程入口：隔离 userData 后运行两组真 utilityProcess 验收。 */
 async function runElectronSmoke(): Promise<void> {
-  const { app } = await import('electron')
+  const { app, utilityProcess } = await import('electron')
   /** 父进程创建并通过环境变量传入的隔离根目录。 */
   const smokeRoot = process.env[ROOT_ENV]
   assert.ok(smokeRoot, '缺少 runtime smoke 临时根目录')
@@ -314,6 +314,15 @@ async function runElectronSmoke(): Promise<void> {
   app.setPath('appData', appDataPath)
   app.setPath('userData', userDataPath)
   await app.whenReady()
+  /** 仅在隔离验收中接管 utility 标准流，确保 Windows CI 保留原生加载失败原因。 */
+  const nativeFork = utilityProcess.fork.bind(utilityProcess)
+  utilityProcess.fork = (modulePath, args, options) => {
+    /** 原始 fork 返回的真实子进程，生命周期行为保持由 Electron 实现。 */
+    const child = nativeFork(modulePath, args, { ...options, stdio: 'pipe' })
+    child.stdout?.on('data', (data: Buffer) => process.stdout.write(data))
+    child.stderr?.on('data', (data: Buffer) => process.stderr.write(data))
+    return child
+  }
   /** 按生命周期阶段核验 utility 退出，防止后续 PID 复用污染旧记录。 */
   const utilityTracker: UtilityProcessTracker = {
     nextRecordIndex: 0,

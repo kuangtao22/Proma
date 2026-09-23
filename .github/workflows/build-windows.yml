@@ -48,6 +48,7 @@ jobs:
 
       # 源码检查与 smoke 构建需要 workspace/dev 链接；裁剪依赖必须最后执行。
       - name: Build Electron and native PTY
+        id: build_electron
         run: bun run build && bun run build:mobile && bun run rebuild:node-pty
         working-directory: apps/electron
 
@@ -56,6 +57,8 @@ jobs:
         working-directory: apps/electron
 
       - name: Smoke test fresh and existing configuration startup
+        # 与 runtime smoke 相互独立，构建成功时继续收集真实启动证据。
+        if: ${{ !cancelled() && steps.build_electron.outcome == 'success' }}
         run: bun run scripts/first-startup-smoke.cjs
         working-directory: apps/electron
 
