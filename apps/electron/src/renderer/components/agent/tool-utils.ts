@@ -7,6 +7,7 @@ import type { LucideIcon } from 'lucide-react'
 import {
   BookOpen,
   Bot,
+  Braces,
   CalendarClock,
   CalendarDays,
   CalendarX,
@@ -107,6 +108,12 @@ export const TOOL_ICONS: Record<string, LucideIcon> = {
   BrowserPreviewOpen: Globe,
   BrowserDomAction: MousePointer2,
   BrowserExecuteJavaScript: Code2,
+  api_list: Braces,
+  api_get_request: Braces,
+  api_prepare_request: Braces,
+  api_send_request: Braces,
+  api_inspect_run: Braces,
+  api_save_request: Braces,
 }
 
 /**
@@ -183,6 +190,12 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   BrowserPreviewOpen: '打开本地网页预览',
   BrowserDomAction: '操作网页 DOM',
   BrowserExecuteJavaScript: '执行网页 JavaScript',
+  api_list: '查看接口目录',
+  api_get_request: '读取接口请求',
+  api_prepare_request: '准备接口请求',
+  api_send_request: '发送接口请求',
+  api_inspect_run: '查看接口运行',
+  api_save_request: '保存接口请求',
 }
 
 /**

@@ -45,7 +45,7 @@ function createDreaminaProfile(overrides: Record<string, unknown> = {}): Record<
 describe('独立生图生成 Shared 合同', () => {
   test('Given 三家供应商描述 When 读取 Then 标签、专属字段与凭据形态精确', () => {
     expect(IMAGE_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => descriptor.label)).toEqual([
-      '即梦', 'ChatGPT（OpenAI Images）', 'MiniMax 图像',
+      '即梦', 'OpenAI 图片兼容', 'MiniMax 图像',
     ])
     expect(IMAGE_GENERATION_PROVIDER_DESCRIPTORS.find((descriptor) => descriptor.provider === 'dreamina')?.usesApiKey).toBeFalse()
     expect(IMAGE_GENERATION_PROVIDER_DEFAULTS.dreamina.baseUrl).toBe('')
@@ -94,7 +94,7 @@ describe('独立生图生成 Shared 合同', () => {
   test('Given 非法地址、空模型、重复模型或未知能力 When 解析 Then 拒绝', () => {
     /** 服务地址有独立的稳定错误码，便于界面区分「地址写错」与「配置非法」。 */
     for (const baseUrl of [
-      'http://api.openai.com/v1',
+      'ftp://api.openai.com/v1',
       'https://user:pass@api.openai.com/v1',
       'https://api.openai.com/v1?token=1',
       'https://api.openai.com/v1#fragment',
@@ -112,6 +112,37 @@ describe('独立生图生成 Shared 合同', () => {
       createOpenAIProfile({ provider: 'unknown' }),
     ]) {
       expect(() => parseImageGenerationProfile(invalid)).toThrow('IMAGE_GENERATION_CONFIG_INVALID')
+    }
+  })
+
+  test('Given 第三方 HTTP 图片服务 When 保存、拉取与读取公开目录 Then 地址完整往返且不改自定义路径', () => {
+    /** 使用供应商自定义路径，避免客户端擅自补写 /v1。 */
+    const baseUrl = 'http://images.example:8080/proxy/custom'
+    const profile = createOpenAIProfile({ baseUrl })
+    expect(parseImageGenerationProfile(profile)).toMatchObject({ baseUrl })
+    expect(parseReplaceImageGenerationCatalogRequest({ expectedRevision: 0, profiles: [
+      { profile, credentialUpdate: { mode: 'replace', apiKey: 'test-only' } },
+    ] }).profiles[0]?.profile).toMatchObject({ baseUrl })
+    expect(parseImageGenerationCatalogFetchInput({
+      requestId: 'f', provider: 'openai-images', baseUrl, credential: { mode: 'draft', apiKey: 'test-only' },
+    }).baseUrl).toBe(baseUrl)
+    expect(parseImageGenerationSettingsResult({
+      catalog: { schemaVersion: 1, revision: 1, profiles: [
+        { ...profile, credentialConfigured: true, endpointOrigin: 'http://images.example:8080' },
+      ] }, legacyImageProfiles: [],
+    }).catalog.profiles[0]?.endpointOrigin).toBe('http://images.example:8080')
+  })
+
+  test('Given HTTP 兼容支持 When 使用 MiniMax 或夹带 URL 凭据 Then 仍拒绝', () => {
+    expect(() => parseImageGenerationProfile(createOpenAIProfile({
+      provider: 'minimax', baseUrl: 'http://images.example/v1',
+    }))).toThrow('IMAGE_GENERATION_URL_INVALID')
+    expect(() => parseImageGenerationCatalogFetchInput({
+      requestId: 'f', provider: 'minimax', baseUrl: 'http://images.example/v1',
+      credential: { mode: 'draft', apiKey: 'test-only' },
+    })).toThrow('IMAGE_GENERATION_URL_INVALID')
+    for (const baseUrl of ['http://user:secret@images.example/v1', 'http://images.example/v1?key=secret', 'http://images.example/#secret']) {
+      expect(() => parseImageGenerationProfile(createOpenAIProfile({ baseUrl }))).toThrow('IMAGE_GENERATION_URL_INVALID')
     }
   })
 

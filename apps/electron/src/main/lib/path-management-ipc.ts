@@ -847,7 +847,7 @@ function getDefaultCoordinator(locator: DataRootLocator): DataRootMigrationCoord
 
 /** 正常模式迁移计划写入前检查全部运行时互斥条件。 */
 async function assertMigrationCanStart(options: RegisterPathManagementIpcOptions): Promise<void> {
-  if (options.hasActiveTasks?.() === true) throw new Error('仍有 Agent 或 Automation 正在运行，无法迁移数据根')
+  if (options.hasActiveTasks?.() === true) throw new Error('仍有 Agent、Automation 或接口请求正在运行，无法迁移数据根')
   if (await options.hasOtherPromaInstance?.() === true) {
     throw new Error('另一个 Proma 实例正在使用数据根，无法迁移')
   }

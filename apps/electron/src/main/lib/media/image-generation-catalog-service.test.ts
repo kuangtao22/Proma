@@ -14,6 +14,21 @@ function createFetchStub(body: unknown, status = 200): ImageGenerationCatalogFet
   })
 }
 
+/** 创建只抛出固定结构化错误的 fetch 替身。 */
+function createRejectingFetch(error: unknown): ImageGenerationCatalogFetch {
+  return async () => { throw error }
+}
+
+/** 创建使用草稿密钥的 OpenAI 图片目录输入。 */
+function createOpenAiInput(baseUrl = 'https://api.openai.com/v1'): Record<string, unknown> {
+  return {
+    requestId: 'fetch-openai',
+    provider: 'openai-images',
+    baseUrl,
+    credential: { mode: 'draft', apiKey: 'secret' },
+  }
+}
+
 /** 记录 CLI 调用的替身。 */
 function createCliStub(result: ImageGenerationCliResult): {
   runCli: (args: readonly string[], cliPath: string) => Promise<ImageGenerationCliResult>
@@ -131,5 +146,119 @@ describe('生图供应商目录拉取', () => {
       baseUrl: 'https://api.minimax.cn/v1',
       credential: { mode: 'saved', profileId: 'missing' },
     })).message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.credential)
+  })
+
+  test('Given fetch 错误的有限层 cause 带 TLS code When 拉取 Then 返回证书校验提示且不泄露原始消息', async () => {
+    const privateMessage = 'certificate for secret.internal /Users/private failed'
+    const tlsError = new Error(privateMessage, {
+      cause: new Error('outer transport', {
+        cause: { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' },
+      }),
+    })
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: createRejectingFetch(tlsError),
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.tls)
+    expect(JSON.stringify(result)).not.toContain(privateMessage)
+  })
+
+  test('Given fetch 错误仅在 message 提到 TLS code When 拉取 Then 不根据原始消息误判证书问题', async () => {
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: createRejectingFetch(new Error('UNABLE_TO_VERIFY_LEAF_SIGNATURE secret.internal')),
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.network)
+  })
+
+  test('Given fetch 因连接失败 When 拉取 Then 返回网络提示', async () => {
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: createRejectingFetch(Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' })),
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.network)
+  })
+
+  test('Given 模型目录返回 404 When 拉取 Then 保持接口不存在分类', async () => {
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: createFetchStub({ error: 'missing' }, 404),
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.notFound)
+  })
+
+  test('Given 模型目录返回 HTML When 解析 JSON Then 返回响应格式错误提示', async () => {
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: async () => new Response('<html>gateway error</html>', { status: 200 }),
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.malformed)
+  })
+
+  test('Given 响应头已返回但正文读取直到超时 When 拉取 Then 返回超时提示', async () => {
+    const fetchImpl: ImageGenerationCatalogFetch = async (_input, init) => ({
+      status: 200,
+      ok: true,
+      text: async () => await new Promise<string>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+      }),
+    }) as unknown as Response
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl,
+      timeoutMs: 5,
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.timeout)
+  })
+
+  test('Given 模型目录返回重定向 When 拉取 Then 禁止跟随并返回重定向提示', async () => {
+    const calls: Array<{ url: string; redirect: RequestRedirect | undefined }> = []
+    const fetchImpl: ImageGenerationCatalogFetch = async (input, init) => {
+      calls.push({ url: input.toString(), redirect: init?.redirect })
+      return new Response(null, { status: 302, headers: { location: 'http://other.example/v1/models' } })
+    }
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl,
+    })
+
+    const result = await service.fetch(createOpenAiInput())
+
+    expect(result.message).toBe(IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.redirect)
+    expect(calls).toEqual([{ url: 'https://api.openai.com/v1/models', redirect: 'manual' }])
+  })
+
+  test('Given HTTP 自定义路径 When 拉取 Then 原样在末尾追加 models 且不升级协议', async () => {
+    const calls: string[] = []
+    const service = new ImageGenerationCatalogService({
+      store: { resolveApiKey: () => 'unused' },
+      fetchImpl: async (input) => {
+        calls.push(input.toString())
+        return new Response(JSON.stringify({ data: [{ id: 'gpt-image-1' }] }), { status: 200 })
+      },
+    })
+
+    const result = await service.fetch(createOpenAiInput('http://gateway.example/openai/v1/'))
+
+    expect(result.state).toBe('success')
+    expect(calls).toEqual(['http://gateway.example/openai/v1/models'])
   })
 })

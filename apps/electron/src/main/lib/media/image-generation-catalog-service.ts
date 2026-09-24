@@ -24,6 +24,21 @@ import {
 const CATALOG_RESPONSE_MAX_BYTES = 1024 * 1024
 /** 单次拉取的默认超时时间。 */
 const DEFAULT_TIMEOUT_MS = 15_000
+/** 允许检查的错误 cause 最大层数，避免处理不受信任对象时无界遍历。 */
+const ERROR_CAUSE_MAX_DEPTH = 4
+/** Node/Bun fetch 可能暴露的证书校验错误码，仅按结构化 code 判定。 */
+const TLS_ERROR_CODES = new Set([
+  'CERT_HAS_EXPIRED',
+  'CERT_NOT_YET_VALID',
+  'CERT_UNTRUSTED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+])
 
 /** 判断未知值是否为可枚举的普通对象。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -142,6 +157,12 @@ export class ImageGenerationCatalogService {
         return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.notFound
       case 'IMAGE_GENERATION_CATALOG_TIMEOUT':
         return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.timeout
+      case 'IMAGE_GENERATION_CATALOG_TLS':
+        return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.tls
+      case 'IMAGE_GENERATION_CATALOG_NETWORK':
+        return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.network
+      case 'IMAGE_GENERATION_CATALOG_REDIRECT':
+        return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.redirect
       case 'IMAGE_GENERATION_CATALOG_CLI_MISSING':
         return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.cliMissing
       case 'IMAGE_GENERATION_CATALOG_CLI_NOT_LOGGED_IN':
@@ -164,23 +185,49 @@ export class ImageGenerationCatalogService {
       /** 超时与取消必须与上游错误区分，便于提示用户检查网络或地址。 */
       let response: Response
       try {
-        response = await this.fetchImpl(url, { ...init, signal: controller.signal })
-      } catch {
-        throw new Error(controller.signal.aborted
-          ? 'IMAGE_GENERATION_CATALOG_TIMEOUT'
-          : 'IMAGE_GENERATION_CATALOG_UPSTREAM_STATUS')
+        response = await this.fetchImpl(url, { ...init, redirect: 'manual', signal: controller.signal })
+      } catch (error) {
+        throw ImageGenerationCatalogService.classifyTransportFailure(error, controller.signal.aborted)
       }
+      if (response.status >= 300 && response.status < 400) throw new Error('IMAGE_GENERATION_CATALOG_REDIRECT')
       if (response.status === 401 || response.status === 403) throw new Error('IMAGE_GENERATION_CATALOG_UNAUTHORIZED')
       if (response.status === 404) throw new Error('IMAGE_GENERATION_CATALOG_NOT_FOUND')
       if (!response.ok) throw new Error('IMAGE_GENERATION_CATALOG_UPSTREAM_STATUS')
-      const text = await response.text()
+      let text: string
+      try {
+        text = await response.text()
+      } catch (error) {
+        throw ImageGenerationCatalogService.classifyTransportFailure(error, controller.signal.aborted)
+      }
       if (Buffer.byteLength(text, 'utf8') > CATALOG_RESPONSE_MAX_BYTES) {
         throw new Error('IMAGE_GENERATION_CATALOG_RESPONSE_LIMIT')
       }
-      return JSON.parse(text) as unknown
+      try {
+        return JSON.parse(text) as unknown
+      } catch {
+        throw new Error('IMAGE_GENERATION_CATALOG_INVALID_RESPONSE')
+      }
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /** 把 fetch 与正文读取异常收敛为不含上游消息的稳定错误码。 */
+  private static classifyTransportFailure(error: unknown, timedOut: boolean): Error {
+    if (timedOut) return new Error('IMAGE_GENERATION_CATALOG_TIMEOUT')
+    return new Error(ImageGenerationCatalogService.hasTlsErrorCode(error)
+      ? 'IMAGE_GENERATION_CATALOG_TLS'
+      : 'IMAGE_GENERATION_CATALOG_NETWORK')
+  }
+
+  /** 在有限层 cause 链上查找已知 TLS code，不根据可能含敏感信息的 message 猜测。 */
+  private static hasTlsErrorCode(error: unknown): boolean {
+    let current: unknown = error
+    for (let depth = 0; depth <= ERROR_CAUSE_MAX_DEPTH && isRecord(current); depth += 1) {
+      if (typeof current.code === 'string' && TLS_ERROR_CODES.has(current.code)) return true
+      current = current.cause
+    }
+    return false
   }
 
   /**

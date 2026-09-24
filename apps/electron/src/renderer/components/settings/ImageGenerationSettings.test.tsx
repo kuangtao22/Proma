@@ -169,6 +169,30 @@ describe('独立生图设置页视图', () => {
       catalog: { state: 'failed', message: '鉴权失败，请检查 API Key', models: [], draftIdentity: imageCatalogIdentity(draft) },
     })} />)
     expect(html).toContain('鉴权失败，请检查 API Key')
+    expect(html.split('鉴权失败，请检查 API Key')).toHaveLength(2)
+    expect(html).toContain('仍可手动添加供应商提供的图片模型 ID')
+    expect(html).toContain('内置模型仅供参考')
+  })
+
+  test('Given 第三方 HTTP 裸域名 When 编辑 Then 解释图片兼容、明文传输并提供显式路径补全', () => {
+    /** 草稿保持用户填写的 HTTP，渲染不能自动改协议或路径。 */
+    const draft = { ...createImageGenerationDraft('openai-images', 'image-http', 10), baseUrl: 'http://images.example', name: '第三方' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).toContain('OpenAI 图片兼容')
+    expect(html).toContain('支持官方与第三方 OpenAI Images 接口')
+    expect(html).toContain('HTTP 会明文传输 API Key、提示词和参考图')
+    expect(html).toContain('补全 /v1')
+    expect(html).toContain('value="http://images.example"')
+    expect(html).not.toContain('ChatGPT（OpenAI Images）')
+  })
+
+  test('Given HTTPS 自定义 API 路径 When 编辑 Then 不显示 HTTP 警告或裸域名补全按钮', () => {
+    /** 自定义路径必须由供应商定义，不能自动拼接 /v1。 */
+    const draft = { ...createImageGenerationDraft('openai-images', 'image-custom', 10), baseUrl: 'https://images.example/proxy/api', name: '第三方' }
+    const html = renderToStaticMarkup(<ImageGenerationCatalogView controller={createController({ draft })} />)
+    expect(html).not.toContain('HTTP 会明文传输')
+    expect(html).not.toContain('补全 /v1')
+    expect(html).toContain('value="https://images.example/proxy/api"')
   })
 
   test('Given MiniMax 草稿清空模型 When 渲染可用模型 Then 列出官方内置图像模型', () => {

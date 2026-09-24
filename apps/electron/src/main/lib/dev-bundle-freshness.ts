@@ -24,6 +24,7 @@ const DEV_BUNDLES: readonly { bundle: string; sources: readonly string[]; rebuil
   /** agent-runtime 会包进主进程的 Pi 适配器，因此只盯 `src/main/lib`（不含 ipc.ts 等不影响它的文件）。 */
   { bundle: 'dist/agent-runtime.cjs', sources: ['src/utility/agent-runtime.ts', 'src/utility/agent-runtime-request-timeout.ts', 'src/main/lib', '../../packages/shared/src'], rebuild: 'bun run build:agent-runtime' },
   { bundle: 'dist/terminal-runtime.cjs', sources: ['src/utility/terminal-runtime.ts', 'src/utility/terminal-shell-resolver.ts', '../../packages/shared/src'], rebuild: 'bun run build:terminal-runtime' },
+  { bundle: 'dist/api-workbench-runtime.cjs', sources: ['src/utility/api-workbench-runtime.ts', 'src/main/lib/api-workbench', '../../packages/shared/src'], rebuild: 'bun run build:api-workbench-runtime' },
 ] as const
 /** 单个目录最多递归的层数，避免深层依赖目录拖慢启动。 */
 const MAX_SCAN_DEPTH = 8

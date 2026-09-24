@@ -1032,7 +1032,7 @@ describe('路径管理 IPC', () => {
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
     const selection = await authorizeMigrationSelection(handlers)
-    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent、Automation 或接口请求正在运行')
     expect(created).toBe(false)
   })
 
@@ -1082,7 +1082,7 @@ describe('路径管理 IPC', () => {
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
     const selection = await authorizeMigrationSelection(handlers)
-    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent 或 Automation 正在运行')
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('仍有 Agent、Automation 或接口请求正在运行')
     expect(cancelled).toBe(true)
     expect(relaunchCalls).toEqual([])
   })

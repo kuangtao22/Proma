@@ -133,6 +133,69 @@ function requireController(controller: ImageGenerationController | null): ImageG
 }
 
 describe('独立生图设置控制器', () => {
+  test('Given 旧 Key 拉取尚未完成 When 更换 Key 并重新拉取 Then 旧失败不能覆盖新结果', async () => {
+    /** 第一笔请求保持在途，第二笔使用新 Key 成功。 */
+    const api = createApi()
+    let releaseOld!: (result: ImageGenerationCatalogFetchResult) => void
+    let fetchCount = 0
+    api.fetchCatalog = async (input) => {
+      if (++fetchCount === 1) return new Promise((resolve) => { releaseOld = resolve })
+      return { requestId: input.requestId, state: 'success', message: '已从供应商获取可用生图模型', models: [{ id: 'new-image', capabilities: ['text-to-image'] }] }
+    }
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      await act(async () => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      /** 先捕获旧请求 Promise，不等待它结束。 */
+      let pendingOld!: Promise<void>
+      act(() => { pendingOld = requireController(controller).fetchCatalog() })
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, apiKey: 'new-test-key' }))
+      expect(requireController(controller).catalog).toBeNull()
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      await act(async () => {
+        releaseOld({ requestId: 'old', state: 'failed', message: '鉴权失败，请检查 API Key', models: [] })
+        await pendingOld
+      })
+      expect(requireController(controller).catalog).toMatchObject({ state: 'success', models: [{ id: 'new-image' }] })
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given 无效服务地址 When 拉取或保存 Then 就地说明地址错误且不调用 IPC', async () => {
+    /** 两个入口共用合法草稿，只改变地址以锁定失败原因。 */
+    const api = createApi()
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      await act(async () => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, provider: 'openai-images', baseUrl: 'images.example' }))
+      await act(async () => { await requireController(controller).fetchCatalog() })
+      expect(api.fetches).toHaveLength(0)
+      expect(requireController(controller).catalog?.message).toContain('服务地址无效')
+      await act(async () => { await requireController(controller).saveDraft() })
+      expect(api.replacements).toHaveLength(0)
+      expect(requireController(controller).actionError).toContain('服务地址无效')
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
+  test('Given HTTP 第三方草稿 When 拉取模型并保存 Then 地址原样通过严格合同', async () => {
+    /** 测试使用虚构地址和内存 API，不触发真实供应商请求。 */
+    const api = createApi()
+    let controller: ImageGenerationController | null = null
+    const host = createHost()
+    try {
+      await act(async () => { host.render(<ControllerProbe api={api} onController={(next) => { controller = next }} />) })
+      await act(async () => requireController(controller).startEdit(requireController(controller).settings!.catalog.profiles[0]!))
+      act(() => requireController(controller).updateDraft({ ...requireController(controller).draft!, provider: 'openai-images', baseUrl: 'http://images.example/custom/v1' }))
+      await act(async () => { await requireController(controller).fetchCatalog(); await requireController(controller).saveDraft() })
+      expect(api.fetches[0]?.baseUrl).toBe('http://images.example/custom/v1')
+      expect(api.replacements).toHaveLength(1)
+      expect(() => parseReplaceImageGenerationCatalogRequest(api.replacements[0])).not.toThrow()
+      expect(requireController(controller).actionError).toBeNull()
+    } finally { act(() => host.unmount()); host.restore() }
+  })
+
   test('Given 权威目录 When 加载 Then 暴露可见配置且搜索生效', async () => {
     const api = createApi()
     let controller: ImageGenerationController | null = null

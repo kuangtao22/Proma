@@ -100,6 +100,28 @@ describe('独立生图配置存储', () => {
     expect(createStore().resolveApiKey('openai-main')).toBe('secret-key')
   })
 
+  test('Given 第三方 OpenAI Images 使用 HTTP When 保存并重读 Then 公开目录保留完整地址合同', () => {
+    createStore().replace(createRequest([
+      {
+        profile: openaiProfile({
+          name: '第三方 GPT 生图',
+          baseUrl: 'http://images.example.test:8030/v1',
+        }),
+        credentialUpdate: { mode: 'replace', apiKey: 'third-party-secret' },
+      },
+    ]))
+
+    /** 用新 Store 实例从磁盘重读，避免只验证本次 replace 的内存返回值。 */
+    const reopenedStore = createStore()
+    expect(reopenedStore.readPublic().profiles[0]).toMatchObject({
+      provider: 'openai-images',
+      baseUrl: 'http://images.example.test:8030/v1',
+      endpointOrigin: 'http://images.example.test:8030',
+      credentialConfigured: true,
+    })
+    expect(reopenedStore.resolveApiKey('openai-main')).toBe('third-party-secret')
+  })
+
   test('Given 即梦配置 When 保存 Then 不写入密文槽位且拒绝替换密钥', () => {
     const catalog = createStore().replace(createRequest([
       { profile: dreaminaProfile(), credentialUpdate: { mode: 'preserve' } },

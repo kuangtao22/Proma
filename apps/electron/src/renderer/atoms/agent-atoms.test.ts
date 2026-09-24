@@ -138,6 +138,14 @@ describe('Agent 右侧画布标签', () => {
   })
 })
 
+describe('Agent 右侧接口工作台标签', () => {
+  test('Given 历史状态包含接口工作台和未知值 When 清洗 Then 保留接口工作台且丢弃未知项', async () => {
+    const { sanitizeWorkspaceComponentTabs } = await import('./agent-atoms')
+
+    expect(sanitizeWorkspaceComponentTabs(['api-workbench', 'broken', 'skills'])).toEqual(['api-workbench', 'skills'])
+  })
+})
+
 describe('Agent 会话待插入引用队列', () => {
   test('Given 两个会话各有待插入引用 When 成功后确认其中一个 Then 不串线且同一引用只确认一次', () => {
     const store = createStore()

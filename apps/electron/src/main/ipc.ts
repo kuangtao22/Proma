@@ -1,3 +1,6 @@
+import { API_WORKBENCH_CHANNELS, isOrdinaryTopLevelAgentSession } from '@proma/shared'
+import { registerApiWorkbenchIpc } from './lib/api-workbench/api-ipc'
+import { getApiWorkbenchService, hasActiveApiWorkbenchRequests, setApiWorkbenchEventSink, setApiWorkbenchStreamSink, shutdownApiWorkbench } from './lib/api-workbench/api-workbench-singleton'
 /**
  * IPC 处理器模块
  *
@@ -2322,6 +2325,26 @@ export function registerIpcHandlers(): void {
     const contents = getStoredMainWindow()?.webContents
     return contents && !contents.isDestroyed() ? [contents] : []
   }
+  /** 接口工作台只信任主窗口，workspace 从当前普通会话元数据解析。 */
+  registerApiWorkbenchIpc({
+    ipc: ipcMain,
+    get service() { return getApiWorkbenchService() },
+    isAuthorizedSender: (event) => listAuthorizedDesignWebContents().some((contents) => contents.id === event.sender.id),
+    requireSession: (sessionId) => {
+      const session = requireVisibleSession(sessionId)
+      if (!isOrdinaryTopLevelAgentSession(session) || session.archived || session.explorationParentSessionId !== undefined || !session.workspaceId || !getAgentWorkspace(session.workspaceId)) throw new Error('API_ACCESS_DENIED')
+      return { id: session.id, workspaceId: session.workspaceId }
+    },
+    assertWorkspaceWritable: (workspaceId) => workspaceOperationGuard.assertWorkspaceWritable(workspaceId),
+    runWorkspaceWrite: (workspaceId, effect) => workspaceOperationGuard.runWorkspaceWrite(workspaceId, effect),
+  })
+  setApiWorkbenchEventSink((event) => {
+    for (const contents of listAuthorizedDesignWebContents()) contents.send(API_WORKBENCH_CHANNELS.CHANGED, event)
+  })
+  /** 流式事件按增量广播；未打开工作台的窗口也会收到有界批次。 */
+  setApiWorkbenchStreamSink((event) => {
+    for (const contents of listAuthorizedDesignWebContents()) contents.send(API_WORKBENCH_CHANNELS.STREAM, event)
+  })
   /** 首次启动先创建固定配置目录；后续事务仍校验普通目录并拒绝符号链接。 */
   const serverOpsConfigDirectory = join(getConfigDir(), 'server-ops')
   mkdirSync(serverOpsConfigDirectory, { recursive: true })
@@ -2613,9 +2636,14 @@ export function registerIpcHandlers(): void {
   /** 首次及在途重复退出都由同一屏障拦截，清理终态才解绑并恢复 quit。 */
   registerServerOpsBeforeQuitBarrier(
     app,
-    serverOpsLifecycle.dispose,
+    async () => {
+      /** 两个独立执行器共享既有退出屏障，任一失败仍等待另一项收尾。 */
+      const results = await Promise.allSettled([serverOpsLifecycle.dispose(), shutdownApiWorkbench()])
+      const failed = results.find((result) => result.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
+    },
     (error) => {
-      console.error('[Server Ops] 退出清理失败:', error)
+      console.error('[桌面运行时] 退出清理失败:', error)
     },
   )
   /** 图片任务直接更新 Canvas 节点后发布准确 revision，驱动折叠节点即时刷新。 */
@@ -4030,7 +4058,7 @@ export function registerIpcHandlers(): void {
     dialog,
     shell,
     getExpectedWebContents: () => getStoredMainWindow()?.webContents ?? null,
-    hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations(),
+    hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations() || hasActiveApiWorkbenchRequests(),
     hasOtherPromaInstance: () => dataRootInstanceLease.hasOtherActiveLease(),
     acquireMigrationGuard: () => dataRootInstanceLease.acquireMigrationGuard(),
     workspaceRelocator: getDefaultWorkspaceProjectRelocator(),

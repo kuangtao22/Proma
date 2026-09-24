@@ -134,7 +134,7 @@ export interface ImageGenerationSettingsResult {
 /** 每个供应商固定的显示名与专属字段合同。 */
 interface ImageGenerationProviderDescriptorDefinition {
   dreamina: { label: '即梦'; specificFields: readonly ['cliPath']; usesApiKey: false }
-  'openai-images': { label: 'ChatGPT（OpenAI Images）'; specificFields: readonly []; usesApiKey: true }
+  'openai-images': { label: 'OpenAI 图片兼容'; specificFields: readonly []; usesApiKey: true }
   minimax: { label: 'MiniMax 图像'; specificFields: readonly ['groupId']; usesApiKey: true }
 }
 
@@ -148,7 +148,7 @@ export type ImageGenerationProviderDescriptor = {
 /** 按供应商键约束的完整描述映射，新增 provider 时必须同步声明。 */
 const IMAGE_GENERATION_PROVIDER_DESCRIPTOR_BY_PROVIDER = {
   dreamina: { provider: 'dreamina', label: '即梦', specificFields: ['cliPath'], usesApiKey: false },
-  'openai-images': { provider: 'openai-images', label: 'ChatGPT（OpenAI Images）', specificFields: [], usesApiKey: true },
+  'openai-images': { provider: 'openai-images', label: 'OpenAI 图片兼容', specificFields: [], usesApiKey: true },
   minimax: { provider: 'minimax', label: 'MiniMax 图像', specificFields: ['groupId'], usesApiKey: true },
 } as const satisfies {
   [Provider in ImageGenerationProvider]: {
@@ -326,8 +326,12 @@ function parseOptionalText(value: unknown, maxLength: number): string | undefine
   return trimmed
 }
 
-/** 解析密钥型供应商的服务地址：必须是 https 且不含凭据、查询与片段。 */
-function parseBaseUrl(value: unknown): string {
+/**
+ * 解析供应商 API 基址；入参为未知地址和供应商，返回保留自定义路径的地址。
+ * OpenAI 图片兼容服务允许用户显式填写 HTTP；MiniMax 仍要求 HTTPS。
+ * 两者均禁止在 URL 内夹带凭据、查询与片段，不自动改协议或补路径。
+ */
+function parseBaseUrl(value: unknown, provider: ImageGenerationProvider): string {
   if (typeof value !== 'string' || value.length > IMAGE_PROVIDER_URL_MAX_LENGTH) {
     throw new Error('IMAGE_GENERATION_URL_INVALID')
   }
@@ -339,7 +343,7 @@ function parseBaseUrl(value: unknown): string {
   } catch {
     throw new Error('IMAGE_GENERATION_URL_INVALID')
   }
-  if (parsed.protocol !== 'https:' || parsed.username || parsed.password
+  if ((parsed.protocol !== 'https:' && !(provider === 'openai-images' && parsed.protocol === 'http:')) || parsed.username || parsed.password
     || parsed.search || parsed.hash || !parsed.hostname) {
     throw new Error('IMAGE_GENERATION_URL_INVALID')
   }
@@ -440,9 +444,13 @@ export const IMAGE_GENERATION_CATALOG_MESSAGES = {
 
 /** 拉取失败的分类固定文案；按原因给可操作提示，但不携带上游正文。 */
 export const IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES = {
+  url: '服务地址无效，请填写完整的 API 基址，不要包含账号密码、查询参数或片段',
   credential: '凭据不可用，请重新填写 API Key',
   unauthorized: '鉴权失败，请检查 API Key',
-  notFound: '服务地址不正确，未找到模型接口',
+  notFound: '未找到模型列表接口，请核对 API 基址与 /v1 路径；供应商也可能不提供模型列表',
+  tls: 'HTTPS 证书校验失败，请联系供应商修复证书或使用其提供的有效 HTTPS 地址',
+  network: '无法连接供应商，请检查服务地址、网络或代理',
+  redirect: '模型接口发生重定向，请填写供应商最终的 API 基址',
   upstream: '供应商返回错误状态，请稍后重试',
   timeout: '请求超时，请检查网络或服务地址',
   malformed: '供应商返回格式无法识别',
@@ -495,13 +503,13 @@ export function parseImageGenerationProfile(value: unknown): ImageGenerationProf
       : { ...common, provider: 'dreamina', cliPath }
   }
   if (value.provider === 'openai-images') {
-    return { ...common, provider: 'openai-images', baseUrl: parseBaseUrl(value.baseUrl) }
+    return { ...common, provider: 'openai-images', baseUrl: parseBaseUrl(value.baseUrl, value.provider) }
   }
   /** MiniMax 专属的可选 Group ID。 */
   const groupId = parseOptionalText(value.groupId, IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH)
   return groupId === undefined
-    ? { ...common, provider: 'minimax', baseUrl: parseBaseUrl(value.baseUrl) }
-    : { ...common, provider: 'minimax', baseUrl: parseBaseUrl(value.baseUrl), groupId }
+    ? { ...common, provider: 'minimax', baseUrl: parseBaseUrl(value.baseUrl, value.provider) }
+    : { ...common, provider: 'minimax', baseUrl: parseBaseUrl(value.baseUrl, value.provider), groupId }
 }
 
 /** 解析单条凭据更新；即梦不接受密钥替换。 */
@@ -571,7 +579,8 @@ function parsePublicImageProfile(value: unknown): ImageGenerationPublicProfile {
   const { credentialConfigured, endpointOrigin, ...rest } = value
   const profile = parseImageGenerationProfile(rest)
   if (endpointOrigin !== undefined && endpointOrigin !== null) {
-    if (typeof endpointOrigin !== 'string' || !endpointOrigin.startsWith('https://')) {
+    /** 展示来源必须与已验证配置一致；HTTP 兼容仅由该配置的供应商决定。 */
+    if (profile.provider === 'dreamina' || endpointOrigin !== new URL(profile.baseUrl).origin) {
       throw new Error('IMAGE_GENERATION_CONFIG_INVALID')
     }
   }
@@ -624,7 +633,7 @@ export function parseImageGenerationCatalogFetchInput(value: unknown): ImageGene
     }
     return { requestId, provider: 'dreamina', credential }
   }
-  const baseUrl = parseBaseUrl(value.baseUrl)
+  const baseUrl = parseBaseUrl(value.baseUrl, value.provider)
   const groupId = value.provider === 'minimax'
     ? parseOptionalText(value.groupId, IMAGE_PROVIDER_IDENTIFIER_MAX_LENGTH)
     : undefined

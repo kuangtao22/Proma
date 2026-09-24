@@ -21,7 +21,7 @@ import type {
   ImageGenerationPublicProfile,
   ReplaceImageGenerationCatalogRequest,
 } from '@proma/shared'
-import { DREAMINA_LOGIN_MESSAGES } from '@proma/shared'
+import { DREAMINA_LOGIN_MESSAGES, IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES, parseImageGenerationCatalogFetchInput } from '@proma/shared'
 import {
   copyImageGenerationProfile,
   createImageGenerationDraft,
@@ -179,7 +179,8 @@ function describeImageError(error: unknown): string {
     return '配置已被其他窗口修改，已重新读取权威目录，请重新应用改动。'
   }
   if (code === 'IMAGE_GENERATION_CREDENTIAL_PRESERVE_INVALID') return '新增配置必须填写 API Key。'
-  if (code === 'IMAGE_GENERATION_CONFIG_INVALID' || code === 'IMAGE_GENERATION_URL_INVALID') {
+  if (code === 'IMAGE_GENERATION_URL_INVALID') return IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.url
+  if (code === 'IMAGE_GENERATION_CONFIG_INVALID') {
     return '请完整填写有效的名称、服务地址与至少一个模型。'
   }
   return '保存失败，请稍后重试。'
@@ -243,6 +244,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const [draft, setDraft] = React.useState<ImageGenerationDraft | null>(null)
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
   const [catalog, setCatalog] = React.useState<ImageGenerationCatalogViewState | null>(null)
+  /** 拉取代次随用户编辑递增；不把明文 Key 放进结果指纹，仍能丢弃旧凭据的迟到回执。 */
+  const catalogRequestVersion = React.useRef(0)
   /** 即梦账号状态与登录流程状态；只在即梦草稿里展示。 */
   const [dreaminaStatus, setDreaminaStatus] = React.useState<ImageGenerationDreaminaStatus | null>(null)
   const [dreaminaLogin, setDreaminaLogin] = React.useState<ImageGenerationDreaminaLoginView>(EMPTY_DREAMINA_LOGIN)
@@ -331,6 +334,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       if (!mountedRef.current) return
       setSettings(saved)
       baselineRef.current = null
+      ++catalogRequestVersion.current
       setDraft(null)
       /** 保存成功后失效该草稿的拉取结果。 */
       setCatalog(null)
@@ -520,6 +524,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
   const fetchCatalog = React.useCallback(async (): Promise<void> => {
     const currentDraft = draft
     if (!currentDraft) return
+    /** 当前调用独占的回执代次，后续编辑或再次拉取都会使其失效。 */
+    const requestVersion = ++catalogRequestVersion.current
     /** 草稿可能还没添加模型，身份不能走严格 Profile 校验。 */
     const identity = imageCatalogIdentity(currentDraft)
     setCatalog({ state: 'loading', models: [], draftIdentity: identity })
@@ -529,7 +535,8 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
         : currentDraft.apiKey.trim()
           ? { mode: 'draft' as const, apiKey: currentDraft.apiKey.trim() }
           : { mode: 'saved' as const, profileId: currentDraft.id }
-      const result = await api.fetchCatalog({
+      /** 与主进程共用严格拉取合同，使无效地址在本地显示准确原因；不要求已选模型。 */
+      const input = parseImageGenerationCatalogFetchInput({
         requestId: createImageGenerationId(),
         provider: currentDraft.provider,
         ...(currentDraft.provider === 'dreamina' ? {} : { baseUrl: currentDraft.baseUrl }),
@@ -538,13 +545,16 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
           : {}),
         credential,
       })
-      if (!mountedRef.current) return
+      const result = await api.fetchCatalog(input)
+      if (!mountedRef.current || requestVersion !== catalogRequestVersion.current) return
       setCatalog({ state: result.state, message: result.message, models: result.models, draftIdentity: identity })
     } catch (error) {
-      if (!mountedRef.current) return
+      if (!mountedRef.current || requestVersion !== catalogRequestVersion.current) return
       setCatalog({
         state: 'failed',
-        message: error instanceof Error && error.message === 'IMAGE_GENERATION_CONFIG_INVALID'
+        message: error instanceof Error && error.message === 'IMAGE_GENERATION_URL_INVALID'
+          ? IMAGE_GENERATION_CATALOG_FAILURE_MESSAGES.url
+          : error instanceof Error && error.message === 'IMAGE_GENERATION_CONFIG_INVALID'
           ? '请先完整填写服务地址与凭据。'
           : '从供应商获取失败，请检查服务地址与凭据。',
         models: [],
@@ -559,6 +569,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
     setQuery,
     load,
     startCreate: () => {
+      ++catalogRequestVersion.current
       baselineRef.current = null
       setActionError(null)
       setCatalog(null)
@@ -566,6 +577,7 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       setDraft(createImageGenerationDraft('dreamina', createImageGenerationId(), Date.now()))
     },
     startEdit: (profile) => {
+      ++catalogRequestVersion.current
       baselineRef.current = { id: profile.id, fingerprint: imageProfileFingerprint(profile) }
       setActionError(null)
       setCatalog(null)
@@ -585,13 +597,20 @@ export function useImageGenerationController(api: ImageGenerationSettingsApi): I
       }
     },
     startCopy: (profile) => {
+      ++catalogRequestVersion.current
       baselineRef.current = null
       setActionError(null)
       setCatalog(null)
       setDraft(copyImageGenerationProfile(profile, createImageGenerationId(), Date.now()))
     },
-    updateDraft: setDraft,
+    updateDraft: (next) => {
+      ++catalogRequestVersion.current
+      setCatalog(null)
+      setActionError(null)
+      setDraft(next)
+    },
     closeDraft: () => {
+      ++catalogRequestVersion.current
       /** 关闭表单即丢弃设备码流程，避免后台继续轮询已放弃的授权。 */
       const pendingRequest = dreaminaRequestRef.current
       dreaminaRequestRef.current = null

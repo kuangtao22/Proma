@@ -34,6 +34,22 @@ export function providerUsesApiKey(provider: ImageGenerationProvider): boolean {
 }
 
 /**
+ * 为有效裸域名提供标准 OpenAI API 路径建议。
+ * 入参为用户填写的地址；返回待用户显式采用的地址，自定义路径或无效地址返回 null。
+ */
+export function suggestOpenAIImageBaseUrl(baseUrl: string): string | null {
+  try {
+    /** 只检查地址，不修改草稿，也不探测供应商。 */
+    const parsed = new URL(baseUrl.trim())
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password
+      || parsed.search || parsed.hash || parsed.pathname !== '/') return null
+    return `${parsed.origin}/v1`
+  } catch {
+    return null
+  }
+}
+
+/**
  * 供应商默认模型条目。
  * 入参：供应商；返回值：初始模型数组（可能为空）。
  * 官方内置清单直接带出，用户不需要手工抄写 model_version。

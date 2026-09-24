@@ -108,6 +108,26 @@ describe('独立生成配置的画布来源', () => {
     expect(resolved).toEqual(['image-openai'])
   })
 
+  test('Given 公开目录含第三方 HTTP OpenAI Images When 解析路由 Then 原样交给专用执行器', () => {
+    const catalog = createCatalog()
+    const profile = catalog.profiles[0]!
+    if (profile.provider !== 'openai-images') throw new Error('测试目录首项必须是 OpenAI Images')
+    profile.name = '第三方 GPT 生图'
+    profile.baseUrl = 'http://images.example.test:8030/v1'
+    profile.endpointOrigin = 'http://images.example.test:8030'
+    const { source, resolved } = createSource(catalog)
+
+    const snapshot = source.resolveAvailableSnapshot(
+      buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'),
+    )
+    expect(source.resolveExecutionRoute(snapshot)).toMatchObject({
+      executor: 'openai-images',
+      baseUrl: 'http://images.example.test:8030/v1',
+      apiKey: 'sk-independent',
+    })
+    expect(resolved).toEqual(['image-openai'])
+  })
+
   test('Given 快照与当前配置不一致 When 复核或解析路由 Then 拒绝运行', () => {
     const { source } = createSource()
     const snapshot = source.resolveAvailableSnapshot(buildCanvasGenerationModelId('openai-images', 'image-openai', 'gpt-image-1'))

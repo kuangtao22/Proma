@@ -630,6 +630,7 @@ function ToolUseBlock({ block, allMessages, sessionId, animate = false, index = 
             result={resultText}
             isError={isError}
             basePath={basePath}
+            sessionId={sessionId}
           />
         </div>
       )}

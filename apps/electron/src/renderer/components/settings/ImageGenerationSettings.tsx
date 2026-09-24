@@ -38,6 +38,7 @@ import {
   imageGenerationSummary,
   initialModelsForProvider,
   providerUsesApiKey,
+  suggestOpenAIImageBaseUrl,
   withDefaultCapabilities,
   type ImageGenerationDraft,
 } from './ImageGenerationSettings.logic'
@@ -227,7 +228,7 @@ function AvailableModels({ draft, controller, disabled, kind }: {
           {catalog?.state === 'loading'
             ? '正在从供应商获取…'
             : catalog?.state === 'failed'
-              ? catalog.message ?? '从供应商获取失败'
+              ? '可在下方手动添加模型'
               : candidates.length > 0
                 ? '可用的模型都已添加'
                 : catalog?.state === 'success'
@@ -238,6 +239,11 @@ function AvailableModels({ draft, controller, disabled, kind }: {
       {catalog?.state === 'failed' && (
         <p role="alert" className="border-t border-border/50 px-4 py-2 text-xs text-destructive">
           {catalog.message ?? '从供应商获取失败'}
+        </p>
+      )}
+      {draft.provider === 'openai-images' && (
+        <p className="border-t border-border/50 px-4 py-2 text-xs text-muted-foreground">
+          内置模型仅供参考，以供应商实际支持为准。未列出或拉取失败时，仍可手动添加供应商提供的图片模型 ID。
         </p>
       )}
       <div className="flex items-center gap-2 border-t border-border/50 px-4 py-2.5">
@@ -319,6 +325,8 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
   }, [dreaminaProfileId, refreshDreaminaStatus])
 
   if (draft) {
+    /** 仅为 OpenAI 兼容裸域名提供显式补全，保留用户自定义 API 路径。 */
+    const suggestedBaseUrl = draft.provider === 'openai-images' ? suggestOpenAIImageBaseUrl(draft.baseUrl) : null
     /** 当前草稿的图片与视频模型数量，供筛选控件与分区描述共用。 */
     const imageModelCount = draft.models.filter((model) => imageGenerationModelKind(model) === 'image').length
     const videoModelCount = draft.models.length - imageModelCount
@@ -329,6 +337,7 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
             <SettingsSelect
               id="image-provider"
               label="供应商类型"
+              description={draft.provider === 'openai-images' ? '支持官方与第三方 OpenAI Images 接口；仅兼容聊天接口的服务不能用于生图。' : undefined}
               value={draft.provider}
               disabled={saving}
               options={IMAGE_GENERATION_PROVIDER_DESCRIPTORS.map((descriptor) => ({
@@ -367,14 +376,29 @@ export function ImageGenerationCatalogView({ controller, navigation, headerConte
               </>
             ) : (
               <>
-                <SettingsInput
-                  id="image-base-url"
-                  label="服务地址"
-                  value={draft.baseUrl}
-                  disabled={saving}
-                  placeholder={draft.provider === 'openai-images' ? 'https://api.openai.com/v1' : 'https://api.minimax.cn/v1'}
-                  onChange={(baseUrl) => controller.updateDraft({ ...draft, baseUrl })}
-                />
+                <div>
+                  <SettingsInput
+                    id="image-base-url"
+                    label="服务地址"
+                    description={draft.provider === 'openai-images' ? '填写供应商提供的 API 基址，通常以 /v1 结尾；自定义路径按原样使用。' : '填写 HTTPS API 基址，通常以 /v1 结尾。'}
+                    value={draft.baseUrl}
+                    disabled={saving}
+                    placeholder={draft.provider === 'openai-images' ? 'https://api.openai.com/v1' : 'https://api.minimax.cn/v1'}
+                    onChange={(baseUrl) => controller.updateDraft({ ...draft, baseUrl })}
+                  />
+                  {draft.provider === 'openai-images' && /^http:\/\//i.test(draft.baseUrl.trim()) && (
+                    <p role="note" className="px-4 pb-3 text-xs text-muted-foreground">
+                      HTTP 会明文传输 API Key、提示词和参考图，请仅用于你信任的服务；优先使用 HTTPS。
+                    </p>
+                  )}
+                  {suggestedBaseUrl && (
+                    <div className="flex flex-wrap items-center gap-2 px-4 pb-3 text-xs text-muted-foreground">
+                      <span>当前只填写了域名，标准 OpenAI 接口通常需要 /v1。</span>
+                      <Button type="button" variant="outline" size="sm" className="h-7 text-xs" disabled={saving}
+                        onClick={() => controller.updateDraft({ ...draft, baseUrl: suggestedBaseUrl })}>补全 /v1</Button>
+                    </div>
+                  )}
+                </div>
                 <div className="space-y-2 px-4 py-3">
                   <div className="text-sm font-medium text-foreground">API Key</div>
                   <div className="relative">

@@ -17,6 +17,7 @@ import { WebFetchResultRenderer } from './web-fetch-result'
 import { TaskGetResultRenderer } from './task-get-result'
 import { TaskListResultRenderer } from './task-list-result'
 import { DefaultResultRenderer } from './default-result'
+import { ApiRunResultRenderer } from './ApiRunResultRenderer'
 
 export interface ToolResultRendererProps {
   toolName: string
@@ -24,9 +25,10 @@ export interface ToolResultRendererProps {
   result: string
   isError: boolean
   basePath?: string
+  sessionId?: string
 }
 
-export function ToolResultRenderer({ toolName, input, result, isError, basePath }: ToolResultRendererProps): React.ReactElement {
+export function ToolResultRenderer({ toolName, input, result, isError, basePath, sessionId }: ToolResultRendererProps): React.ReactElement {
   switch (toolName) {
     case 'Bash':
       return <BashResultRenderer result={result} isError={isError} input={input} />
@@ -48,6 +50,8 @@ export function ToolResultRenderer({ toolName, input, result, isError, basePath 
       return <TaskGetResultRenderer result={result} isError={isError} />
     case 'TaskList':
       return <TaskListResultRenderer result={result} isError={isError} />
+    case 'api_send_request':
+      return <ApiRunResultRenderer result={result} isError={isError} sessionId={sessionId} />
     default:
       return <DefaultResultRenderer result={result} isError={isError} />
   }

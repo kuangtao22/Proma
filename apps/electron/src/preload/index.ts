@@ -1,3 +1,5 @@
+import { createApiWorkbenchPreload } from './api-workbench-preload'
+import type { ApiWorkbenchApi } from '@proma/shared'
 import type { AgentToolMode } from '@proma/shared'
 /**
  * Preload 脚本
@@ -312,6 +314,8 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   onTerminalExit: (callback: (event: TerminalExitEvent) => void) => () => void
 
   // ===== Linux 服务器运维资产 =====
+  /** 接口工作台共享服务桥接，旧客户端缺失时由 UI 提示重启。 */
+  apiWorkbench: ApiWorkbenchApi
   listServerOpsHosts: () => Promise<ServerOpsHost[]>
   upsertServerOpsHost: (input: ServerOpsSaveHostInput) => Promise<ServerOpsHost>
   deleteServerOpsHost: (hostId: string) => Promise<boolean>
@@ -1506,6 +1510,12 @@ const electronAPI: ElectronAPI = {
     return () => { ipcRenderer.removeListener(channel, handler) }
   }),
   ...createServerOpsConnectionDraftPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, value: unknown): void => listener(value)
+    ipcRenderer.on(channel, handler)
+    return () => ipcRenderer.removeListener(channel, handler)
+  }),
+  apiWorkbench: createApiWorkbenchPreload((channel, input) => ipcRenderer.invoke(channel, input), (channel, listener) => {
+    /** IPC 原始事件仅在 preload 内保留，UI 只接收已校验业务值。 */
     const handler = (_event: Electron.IpcRendererEvent, value: unknown): void => listener(value)
     ipcRenderer.on(channel, handler)
     return () => ipcRenderer.removeListener(channel, handler)

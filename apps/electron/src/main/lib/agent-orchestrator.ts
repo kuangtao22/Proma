@@ -79,6 +79,9 @@ import {
 import { validateToolInput } from './agent-tool-input-validator'
 import { estimateTokenCount, WRITE_CONTENT_TOKEN_THRESHOLD } from './agent-tool-token-estimator'
 import { buildPiBuiltinTools } from './adapters/pi-builtin-tools'
+import { createApiAgentFacade } from './api-workbench/api-agent-facade'
+import { buildApiAgentTools, API_AGENT_TOOL_NAMES } from './api-workbench/api-agent-tools'
+import { getApiWorkbenchService } from './api-workbench/api-workbench-singleton'
 import { createServerOpsAgentFacade } from './server-ops/server-ops-agent-facade'
 import { createServerOpsAgentReadFacade } from './server-ops/server-ops-agent-read-facade'
 import { createServerOpsConnectionDraftAgent } from './server-ops/server-ops-connection-draft-agent'
@@ -1255,7 +1258,16 @@ export class AgentOrchestrator {
         ...(serverOpsConnectionDrafts ? { serverOpsConnectionDrafts } : {}),
       })
       checkpoint()
-      piBuiltinTools = builtinMcpResult.tools
+      /** API 能力固定在本次普通会话运行，访问服务时才初始化 Utility。 */
+      const apiFacade = createApiAgentFacade({
+        sessionId, toolMode: runToolMode, triggeredBy: input.triggeredBy,
+        getSession: getAgentSessionMeta, runSignal: runIdentity.signal, assertRunActive: runIdentity.assertActive,
+        get service() { return getApiWorkbenchService() },
+        canMutate: () => getPermissionMode() !== 'plan',
+        assertWorkspaceWritable: (id) => { if (!getAgentWorkspace(id)) throw new Error('API_AGENT_WORKSPACE_NOT_FOUND'); workspaceOperationGuard.assertWorkspaceWritable(id) },
+        runWorkspaceWrite: (id, effect) => workspaceOperationGuard.runWorkspaceWrite(id, effect),
+      })
+      piBuiltinTools = [...builtinMcpResult.tools, ...(apiFacade ? buildApiAgentTools(piSdk, apiFacade) : [])]
       const collaborationAvailable = builtinMcpResult.collaborationAvailable
 
       // 合并外部注入的自定义 MCP 服务器（如飞书群聊工具）
@@ -1493,6 +1505,28 @@ export class AgentOrchestrator {
           /** Design 上下文预检失败转为稳定 deny，禁止进入付费图片执行器。 */
           const message = error instanceof Error ? error.message : String(error)
           return { behavior: 'deny', message }
+        }
+
+        /** 接口出网与保存各自批准精确快照；只读工具仍受 facade 身份检查。 */
+        if (API_AGENT_TOOL_NAMES.some((name) => name === toolName)) {
+          if (!apiFacade) return { behavior: 'deny', message: '当前会话不具备接口工作台能力' }
+          if (toolName !== 'api_send_request' && toolName !== 'api_save_request') return { behavior: 'allow', updatedInput: input }
+          try {
+            if (toolName === 'api_send_request' && apiFacade.hasCompletedSend(input)) return { behavior: 'allow', updatedInput: input }
+            if (currentMode === 'plan' || options.signal.aborted) return { behavior: 'deny', message: '计划模式或已停止的运行不能发送或保存接口' }
+            const snapshot = await apiFacade.approval(toolName, input)
+            const permission = currentMode === 'bypassPermissions'
+              ? { behavior: 'allow' as const, updatedInput: input }
+              : await permissionService.requestSingleApproval(sessionId, toolName, { ...input, preview: snapshot.preview, ...(snapshot.save ? { save: snapshot.save } : {}) }, options, (request) => {
+                if (!denyStaleToolRun()) this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
+              })
+            const checked = revalidateSingleApprovalResult(permission, denyStaleToolRun, getPermissionMode)
+            if (checked.behavior !== 'allow' || options.signal.aborted) return checked.behavior === 'deny' ? checked : { behavior: 'deny', message: '操作已中止' }
+            await apiFacade.authorize(toolName, input, snapshot)
+            return revalidateSingleApprovalResult({ behavior: 'allow', updatedInput: input }, denyStaleToolRun, getPermissionMode)
+          } catch (error) {
+            return { behavior: 'deny', message: error instanceof Error ? error.message : '接口批准已失效，请重新准备请求' }
+          }
         }
 
         /** 付费或高影响工具按可信运行策略决定逐次确认或自动执行，plan 与中止始终优先拒绝。 */

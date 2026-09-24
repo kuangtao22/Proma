@@ -5,6 +5,7 @@ export const DEV_BUNDLE_RELATIVE_PATHS = [
   'dist/main.cjs',
   'dist/agent-runtime.cjs',
   'dist/server-ops-runtime.cjs',
+  'dist/api-workbench-runtime.cjs',
   'dist/preload.cjs',
 ] as const
 

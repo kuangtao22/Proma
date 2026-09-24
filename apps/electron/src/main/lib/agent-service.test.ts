@@ -120,7 +120,7 @@ describe('Agent service 迁移准入', () => {
     expect(source).toContain('export function hasActiveAgentDataWritesForWorkspace(workspaceId: string): boolean {')
     expect(source).toContain('return orchestrator.hasGenerationOwnedWritesForWorkspace(workspaceId)')
     expect(ipcSource).toContain('hasActiveAgentDataWrites')
-    expect(ipcSource).toContain('hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations()')
+    expect(ipcSource).toContain('hasActiveTasks: () => hasActiveAgentDataWrites() || hasRunningAutomations() || hasActiveApiWorkbenchRequests()')
   })
 
   test('Given 会话权威工作区正在迁移 When 准备 service 运行副作用 Then 抛固定原因且不执行副作用', () => {

@@ -7,7 +7,7 @@
 
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { X, ExternalLink, ChevronRight, MoreHorizontal, FolderSearch, Pencil, FolderInput, GitBranch, GitMerge, MessageSquarePlus, FileDiff, FileText, FolderOpen, Globe, MessageCircle, Brain, Split, Blocks, CalendarDays, ListTodo, Clock, ServerCog, SquareTerminal, Terminal, Workflow } from 'lucide-react'
+import { X, ExternalLink, ChevronRight, MoreHorizontal, FolderSearch, Pencil, FolderInput, GitBranch, GitMerge, MessageSquarePlus, FileDiff, FileText, FolderOpen, Globe, MessageCircle, Brain, Split, Blocks, Braces, CalendarDays, ListTodo, Clock, ServerCog, SquareTerminal, Terminal, Workflow } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -162,6 +162,8 @@ import {
 import { designAdapter } from '@/lib/design-adapter'
 import { removeCanvasSessionAtom, upsertCanvasSessionAtom } from '@/atoms/canvas-session-atoms'
 import { ServerOpsWorkspace } from '@/components/server-ops/ServerOpsWorkspace'
+import { ApiWorkbench } from '@/components/api-workbench/ApiWorkbench'
+import { apiWorkbenchOpenRunTargetAtom } from '@/atoms/api-workbench-atoms'
 import { useServerOpsTransferLeave } from '@/components/server-ops/useServerOpsTransferLeave'
 import {
   CANVAS_WORKSPACE_FAILURE_MESSAGES,
@@ -923,6 +925,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     : null
   // 项目能力与全局运维入口共用当前 session 的右侧 Tab 生命周期，业务数据保持各自归属。
   const [workspaceComponentTabs, setWorkspaceComponentTabs] = useAtom(agentSessionComponentTabsAtomFamily(sessionId))
+  const setApiWorkbenchOpenRunTarget = useSetAtom(apiWorkbenchOpenRunTargetAtom)
   const productivityTools = useAtomValue(productivityToolsAtom)
   const automationFormOpen = useAtomValue(automationFormAtom).open
   const isWorkspaceComponentEnabled = React.useCallback((component: WorkspaceComponentTab): boolean => (
@@ -1299,6 +1302,22 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     queue.desiredTabId = browserTabId
     flushBrowserTabSelection()
   }, [flushBrowserTabSelection, markDelegationSessionViewed, onTabChange, previewFiles, recordWorkspaceTabSelection, sessionId, setPreviewFileMap, sideChatConversationId, sideDelegationSessionId, sideTemporaryAgents, split, updateSplit])
+
+  React.useEffect(() => {
+    /** Agent 结果卡要求定位的接口运行。 */
+    const handleOpenApiRun = (event: Event): void => {
+      if (!(event instanceof CustomEvent)) return
+      /** 事件 detail 在 renderer 边界做最小结构校验。 */
+      const detail = event.detail as { sessionId?: unknown; runId?: unknown } | null
+      if (!detail || detail.sessionId !== sessionId || typeof detail.runId !== 'string' || !detail.runId) return
+      setApiWorkbenchOpenRunTarget({ sessionId, runId: detail.runId })
+      setWorkspaceComponentTabs((previous) => previous.includes('api-workbench') ? previous : [...previous, 'api-workbench'])
+      setIsOpen(true)
+      handleWorkspaceTabChange('api-workbench')
+    }
+    window.addEventListener('proma:open-api-run', handleOpenApiRun)
+    return () => window.removeEventListener('proma:open-api-run', handleOpenApiRun)
+  }, [handleWorkspaceTabChange, sessionId, setApiWorkbenchOpenRunTarget, setIsOpen, setWorkspaceComponentTabs])
 
   /** 登记用户明确打开的 Canvas 标签；具体画布会替换仅用于选取画布的 launcher。 */
   const rememberOpenedCanvasWorkspaceTab = React.useCallback((tab: AgentSidePanelTab, makeActive: boolean): void => {
@@ -1748,6 +1767,7 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
         memory: { label: '项目记忆', icon: <Brain className="size-3.5" /> },
         vault: { label: OBSIDIAN_NAME, icon: <ObsidianIcon className="size-3.5" /> },
         'server-ops': { label: '运维', icon: <ServerCog className="size-3.5" /> },
+        'api-workbench': { label: '接口', icon: <Braces className="size-3.5" /> },
       }
       return { id: component, ...meta[component], closable: true }
     }),
@@ -2168,6 +2188,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       <div className="min-h-0 flex-1 overflow-hidden"><VaultView embedded sessionId={sessionId} /></div>
     ) : paneTab === 'server-ops' ? (
       <ServerOpsWorkspace viewScope={`${sessionId}:${pane ?? 'single'}`} paneActive={paneActive} />
+    ) : paneTab === 'api-workbench' ? (
+      <ApiWorkbench sessionId={sessionId} workspaceScope={currentWorkspaceId ?? undefined} />
     ) : paneTab === 'changes' ? (
       sessionPath ? (
         <DiffChangesList

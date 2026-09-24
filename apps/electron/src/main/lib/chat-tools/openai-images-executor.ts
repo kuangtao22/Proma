@@ -114,6 +114,10 @@ export async function executeOpenAIImages(
   input.signal?.throwIfAborted()
   const response = await dependencies.fetch(url, request)
   input.signal?.throwIfAborted()
+  /** 有凭据 POST 不跟随重定向，避免把密钥和请求体发送到配置外地址。 */
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error('生图服务返回重定向，请填写最终 API 基址后重试')
+  }
   if (!response.ok) throw await createResponseError(response)
   const responseBody = await parseJsonResponse(response)
   const items = parseResponseItems(responseBody)
@@ -145,6 +149,7 @@ function createGenerationRequest(
       n: count,
     }),
     signal: input.signal,
+    redirect: 'manual',
   }
 }
 
@@ -173,6 +178,7 @@ function createEditRequest(
     headers: { Authorization: `Bearer ${input.route.apiKey}` },
     body: form,
     signal: input.signal,
+    redirect: 'manual',
   }
 }
 

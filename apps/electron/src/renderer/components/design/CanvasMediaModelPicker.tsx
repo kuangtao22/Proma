@@ -14,7 +14,7 @@ import { getJimengLogo, getProviderLogo } from '@/lib/model-logo'
 /** 供应商稳定标识到中文名的展示映射，与生成模型设置页保持一致。 */
 const PROVIDER_LABELS: Record<string, string> = {
   dreamina: '即梦',
-  'openai-images': 'ChatGPT（OpenAI Images）',
+  'openai-images': 'OpenAI 图片兼容',
   minimax: 'MiniMax 图像',
 }
 

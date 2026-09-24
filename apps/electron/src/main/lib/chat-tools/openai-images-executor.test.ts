@@ -35,6 +35,7 @@ interface CapturedRequest {
   url: string
   headers: Record<string, string>
   body: BodyInit | null | undefined
+  redirect: RequestRedirect | undefined
 }
 
 /** 创建只存在于主进程内存的 GPT Image 2 路由。 */
@@ -103,6 +104,7 @@ function createExecutorDependencies(
         url: String(input),
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
         body: init?.body,
+        redirect: init?.redirect,
       })
       return new Response(JSON.stringify(responseBody), {
         status: 200,
@@ -135,6 +137,7 @@ describe('OpenAI Images executor', () => {
     expect(requests[0]).toMatchObject({
       url: 'http://100.124.186.117:8030/v1/images/generations',
       headers: { authorization: 'Bearer secret-key', 'content-type': 'application/json' },
+      redirect: 'manual',
     })
     expect(JSON.parse(String(requests[0]?.body))).toEqual({
       model: 'gpt-image-2',
@@ -158,8 +161,55 @@ describe('OpenAI Images executor', () => {
 
     expect(requests[0]?.url).toEndWith('/images/edits')
     expect(requests[0]?.body).toBeInstanceOf(FormData)
+    expect(requests[0]?.redirect).toBe('manual')
     expect((requests[0]?.body as FormData).get('model')).toBe('gpt-image-2')
     expect((requests[0]?.body as FormData).get('image')).toBeInstanceOf(Blob)
+  })
+
+  test.each([
+    { endpoint: 'generations', withReference: false },
+    { endpoint: 'edits', withReference: true },
+  ])('Given $endpoint 返回 3xx When 携带凭据请求 Then 拒绝跳转且不重试或保存', async ({ withReference }) => {
+    /** 编辑场景使用真实授权参考图，确保 multipart 分支同样受保护。 */
+    const fixture = withReference ? createReferenceImageFixture() : undefined
+    /** 记录唯一一次有凭据请求及其重定向策略。 */
+    const requests: CapturedRequest[] = []
+    /** 记录是否发生了不应有的附件保存。 */
+    let saveCount = 0
+    const dependencies = createExecutorDependencies(requests, {})
+    dependencies.fetch = async (input, init) => {
+      requests.push({
+        url: String(input),
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+        body: init?.body,
+        redirect: init?.redirect,
+      })
+      return new Response(null, {
+        status: 307,
+        headers: { location: 'https://redirected.example.test/v1/images' },
+      })
+    }
+    dependencies.saveAttachment = (input) => {
+      saveCount += 1
+      return {
+        attachment: {
+          id: 'unexpected-attachment',
+          filename: input.filename,
+          mediaType: input.mediaType,
+          localPath: 'session-1/unexpected.png',
+          size: PNG_BYTES.length,
+        },
+      }
+    }
+
+    await expect(executor.executeOpenAIImages({
+      ...createExecutionInput(),
+      ...(fixture ? { referenceImagePaths: [fixture.imagePath], cwd: fixture.root } : {}),
+    }, dependencies)).rejects.toThrow('生图服务返回重定向，请填写最终 API 基址后重试')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.redirect).toBe('manual')
+    expect(saveCount).toBe(0)
   })
 
   test('Given 三张授权参考图 When 调用 Then 按序发送全部 image[] 并捕获真实字节审计', async () => {
@@ -224,6 +274,7 @@ describe('OpenAI Images executor', () => {
         url: String(input),
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
         body: init?.body,
+        redirect: init?.redirect,
       })
       return new Response(JSON.stringify({ error: { message: 'multi image rejected' } }), {
         status: 503,

@@ -109,6 +109,18 @@ export function getToolPhrase(toolName: string, input: Record<string, unknown>):
   }
 
   switch (toolName) {
+    case 'api_list':
+      return phrase('查看接口目录')
+    case 'api_get_request':
+      return phrase('读取接口请求')
+    case 'api_prepare_request':
+      return phrase('准备接口请求')
+    case 'api_send_request':
+      return phrase('发送接口请求')
+    case 'api_inspect_run':
+      return phrase('查看接口运行')
+    case 'api_save_request':
+      return phrase('保存接口请求')
     case 'Read': {
       const fp = input.file_path ?? input.filePath
       if (typeof fp === 'string') {
