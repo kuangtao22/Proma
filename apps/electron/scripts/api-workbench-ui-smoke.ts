@@ -174,7 +174,75 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('请求「Smoke 请求」') ?? false"), true, '运行时变量面板未显示来源')
     await clickText(window, '清空')
     await waitFor(window, "document.body.textContent?.includes('还没有提取到变量')", '清空后没有空状态')
+    /** 关掉运行时变量面板，后续弹层与截图不应叠在它上面。 */
+    await clickText(window, '关闭')
+    await waitFor(window, "![...document.querySelectorAll('[role=dialog]')].some((item) => item.getAttribute('data-state') === 'open')", '运行时变量面板未关闭')
     console.log('[API Workbench UI smoke] 运行时变量面板已验证')
+    /** 具名用例：新增两条用例后一键跑完，报告与复制文本都按真实运行核对。 */
+    await clickText(window, '用例')
+    await waitFor(window, "document.body.textContent?.includes('还没有用例')", '用例分区未打开')
+    await clickText(window, '新增用例')
+    await waitFor(window, "document.querySelectorAll('input[aria-label=\"用例名称\"]').length === 1", '用例未创建')
+    await fill(window, 'input[aria-label="用例名称"]', '正常用例')
+    await clickText(window, '新增用例')
+    await waitFor(window, "document.querySelectorAll('input[aria-label=\"用例名称\"]').length === 2", '第二条用例未创建')
+    /** 第二条输入框必须按索引定位，避免改到第一条。 */
+    const renamed = await window.webContents.executeJavaScript(`(() => {
+      const fields = document.querySelectorAll('input[aria-label="用例名称"]')
+      const field = fields[1]
+      if (!(field instanceof HTMLInputElement)) return false
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(field, '越权用例')
+      field.dispatchEvent(new Event('input', { bubbles: true }))
+      return true
+    })()`)
+    assert.equal(renamed, true, '第二条用例改名失败')
+    /** 选中用例后断言页必须标明编辑对象，避免把断言写到请求默认断言上。 */
+    await clickText(window, '断言')
+    await waitFor(window, "document.body.textContent?.includes('正在编辑：用例')", '断言页未标明当前用例')
+    await clickLabel(window, '保存请求 (⌘S)')
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.find((item) => item.url === 'http://127.0.0.1:8080/smoke')?.cases.length === 2", '用例未随请求保存')
+    /** 目录要能一眼看出哪些接口带测试用例。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const section = [...document.querySelectorAll('section')].find((item) => item.textContent?.includes('Smoke 集合'))
+      const header = section?.querySelector('button')
+      if (!(header instanceof HTMLButtonElement)) return false
+      if (!section?.textContent?.includes('2 用例')) header.click()
+      return true
+    })()`), true, '找不到 Smoke 集合')
+    await waitFor(window, "document.body.textContent?.includes('2 用例')", '目录未显示用例数量')
+    /** 跑全部用例：顺序两次真实发送，跑完再汇总。 */
+    const sendsBeforeCases = await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.sendCalls')
+    await clickLabel(window, '跑全部用例')
+    await waitFor(window, "document.body.textContent?.includes('用例报告') && document.body.textContent?.includes('1/2 通过')", '用例报告未出现')
+    await waitFor(window, "document.body.textContent?.includes('正在跑剩余用例') === false", '用例报告未跑完')
+    assert.equal(await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.sendCalls'), sendsBeforeCases + 2, '跑全部用例没有逐条发送')
+    assert.equal(await window.webContents.executeJavaScript("(document.body.textContent?.includes('正常用例') && document.body.textContent?.includes('越权用例')) ?? false"), true, '报告缺少用例名')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('期望 401，实际 200') ?? false"), true, '报告缺少失败原因')
+    await waitForClosedLayersToLeave(window)
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    const caseShot = await window.webContents.capturePage()
+    await writeFile('/private/tmp/api-workbench-ui-cases.png', caseShot.toPNG())
+    /** 复制报告：文本与表格同源，且不含响应正文。 */
+    await clickText(window, '复制报告')
+    await waitFor(window, "window.__apiWorkbenchSmoke.clipboard.includes('1/2 通过')", '复制报告没有写入剪贴板')
+    const reportText = await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.clipboard')
+    assert.ok(reportText.includes('| 用例 | 结果 | 状态码 | 断言 | 耗时 | 备注 |'), '复制报告缺少表头')
+    assert.ok(reportText.includes('| 正常用例 | 通过 | 200 | 1/1 |'), reportText)
+    assert.ok(reportText.includes('| 越权用例 | 失败 | 200 | 0/1 |'), reportText)
+    /** 逐条打开 runId：报告关闭并切到该次运行的响应面板。 */
+    const getsBeforeOpen = await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.getRunCalls')
+    await clickText(window, '打开运行')
+    await waitFor(window, `window.__apiWorkbenchSmoke.getRunCalls === ${getsBeforeOpen + 1} && document.body.textContent?.includes('用例 正常用例')`, '报告行未能打开对应运行')
+    /** Radix 关闭后仍会短暂保留节点，因此按 data-state 判断报告确实关掉了。 */
+    await waitFor(window, "![...document.querySelectorAll('[role=dialog]')].some((item) => item.getAttribute('data-state') === 'open')", '打开运行后报告未关闭')
+    /** 删除用例：界面立即减少一条，保存后目录也同步。 */
+    await clickText(window, '用例')
+    await clickLabel(window, '删除用例 越权用例')
+    await waitFor(window, "document.querySelectorAll('input[aria-label=\"用例名称\"]').length === 1", '删除用例后界面未更新')
+    await clickLabel(window, '保存请求 (⌘S)')
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.find((item) => item.url === 'http://127.0.0.1:8080/smoke')?.cases.length === 1", '删除的用例未同步到目录')
+    assert.equal(await window.webContents.executeJavaScript("document.querySelectorAll('input[aria-label=\"用例名称\"]')[0]?.value ?? ''"), '正常用例', '删除后残留的用例不正确')
+    console.log('[API Workbench UI smoke] 用例页签、跑全部用例与复制报告已验证')
     await waitForClosedLayersToLeave(window)
     await waitFor(window, `(() => {
       const request = document.querySelector('input[aria-label="请求 URL"]')
@@ -222,7 +290,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     const darkOutput = '/private/tmp/api-workbench-ui-narrow-dark.png'
     await writeFile(darkOutput, darkPng)
     console.log(`[API Workbench UI smoke] screenshots: ${wideOutput}, ${lightOutput}, ${darkOutput}`)
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

@@ -106,6 +106,26 @@ describe('接口工作台 UI 集成', () => {
     expect(source).toContain('api.clearRuntimeVariables')
   })
 
+  test('Given 已交付具名用例 When 检查组件源码 Then 用例分区、跑全部用例与复制报告都接线', async () => {
+    const source = await Bun.file(new URL('./ApiWorkbench.tsx', import.meta.url)).text()
+
+    expect(source).toContain("['cases', '用例']")
+    expect(source).toContain('function CaseEditor')
+    expect(source).toContain('aria-label={`设为当前用例 ${item.name}`}')
+    expect(source).toContain('label="跑全部用例"')
+    expect(source).toContain('runAllApiCases')
+    expect(source).toContain('onRunAllCases={() => void runAllCases()}')
+    expect(source).toContain('activeTab.activeCaseId')
+    expect(source).toContain('function CaseReportDialog')
+    expect(source).toContain('formatApiCaseReportMarkdown')
+    expect(source).toContain('复制报告')
+    expect(source).toContain('打开运行')
+    expect(source).toContain('resolveCaseName')
+    expect(source).toContain('withDraftAssertions')
+    /** 恢复运行头部必须标注用例，否则用户无法确认跑的是哪一组断言。 */
+    expect(source).toContain('用例 ${caseName} · ')
+  })
+
   test('Given 导入对话框 When 检查组件源码 Then 明确不执行 shell 且只在预览可用时允许确认', async () => {
     const source = await Bun.file(new URL('./ApiImportDialog.tsx', import.meta.url)).text()
 

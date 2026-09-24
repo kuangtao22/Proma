@@ -19,6 +19,32 @@ function sseEvent(index: number, data = 'x'): ApiSseEvent {
 }
 
 describe('接口工作台 Service', () => {
+  test('Given 指定用例 When 发送 Then 断言与变量覆盖来自该用例且缺用例时拒绝', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'api-service-case-'))
+    try {
+      const store = new ApiWorkbenchStore(root)
+      const seen: ApiResolvedRequest[] = []
+      const service = new ApiWorkbenchService({ store, transport: async (request) => { seen.push(request); return completed } })
+      const request = {
+        ...createApiRequestDraft(), url: 'https://example.test/{{who}}',
+        assertions: [{ id: 'default_a', kind: 'status' as const, path: '', expected: '200' }],
+        cases: [{
+          id: 'case_401', name: '越权',
+          assertions: [{ id: 'case_a', kind: 'status' as const, path: '', expected: '401' }],
+          overrides: [{ id: 'case_ov', name: 'who', value: 'case-value', enabled: true }],
+        }],
+      }
+
+      const preview = await service.prepare(context, { request, caseId: 'case_401' })
+      const run = await service.send(context, preview.preparedId)
+
+      expect(run.caseId).toBe('case_401')
+      expect(run.assertions[0]?.expected).toBe('401')
+      expect(seen[0]?.url).toContain('case-value')
+      await expect(service.prepare(context, { request, caseId: 'missing_case' })).rejects.toThrow('API_WORKBENCH_CASE_NOT_FOUND')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
   test('Given 首个请求提取秘密变量 When 后续请求引用 Then 复用取值且任何记录都不含明文', async () => {
     const root = mkdtempSync(join(tmpdir(), 'api-service-extract-'))
     try {

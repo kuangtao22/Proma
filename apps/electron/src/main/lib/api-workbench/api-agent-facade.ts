@@ -29,6 +29,8 @@ export interface ApiAgentRunSummary {
   kind: 'api-workbench-run'; runId: string; sessionId: string; method: string; url: string
   state: ApiRun['state']; status: number | null; durationMs: number | null
   assertions: { passed: number; total: number }; recording: ApiRun['recording']; error?: ApiRun['error']
+  /** 本次运行所跑的测试用例；未按用例跑时缺省。 */
+  caseId?: string
 }
 /** 模型输出按实际 UTF-8 字节限额；过大只返回标记清晰的文本预览。 */
 export function boundApiAgentResult(value: unknown): unknown {
@@ -129,7 +131,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
     async prepare(input: unknown): Promise<ApiPreparedPreview> {
       current()
       if (drafts.size >= 128) throw new Error('API_AGENT_PREPARE_LIMIT')
-      const args = apiRecord(input, ['request', 'requestId', 'environmentId', 'overrides'])
+      const args = apiRecord(input, ['request', 'requestId', 'environmentId', 'overrides', 'caseId'])
       const requestId = args.requestId === undefined ? undefined : parseApiId(args.requestId)
       const catalog = await options.service.getCatalog(context.workspaceId)
       current()
@@ -138,7 +140,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const base = saved ? apiDraftFromDefinition(saved) : createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
       const overrides = args.request === undefined ? {} : apiRecord(args.request, Object.keys(base))
       const request = parseApiRequestDraft({ ...base, ...overrides })
-      const preview = await options.service.prepare(context, { request, ...(requestId ? { requestId } : {}), ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }), ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }) })
+      const preview = await options.service.prepare(context, { request, ...(requestId ? { requestId } : {}), ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }), ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
       current()
       drafts.set(preview.preparedId, { request, preview, ...(requestId ? { requestId } : {}) })
       return preview
@@ -152,7 +154,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       await requireGrant('api_send_request', input)
       const run = await write(() => options.service.send(context, args.preparedId, signal ? AbortSignal.any([signal, options.runSignal]) : options.runSignal))
       current()
-      const summary: ApiAgentRunSummary = { kind: 'api-workbench-run', runId: run.id, sessionId: context.sessionId, method: run.request.method, url: run.request.url, state: run.state, status: run.hops.at(-1)?.status ?? null, durationMs: run.finishedAt === undefined ? null : Math.max(0, run.finishedAt - run.createdAt), assertions: { passed: run.assertions.filter((item) => item.passed).length, total: run.assertions.length }, recording: run.recording, ...(run.error ? { error: run.error } : {}) }
+      const summary: ApiAgentRunSummary = { kind: 'api-workbench-run', runId: run.id, sessionId: context.sessionId, method: run.request.method, url: run.request.url, state: run.state, status: run.hops.at(-1)?.status ?? null, durationMs: run.finishedAt === undefined ? null : Math.max(0, run.finishedAt - run.createdAt), assertions: { passed: run.assertions.filter((item) => item.passed).length, total: run.assertions.length }, recording: run.recording, ...(run.caseId ? { caseId: run.caseId } : {}), ...(run.error ? { error: run.error } : {}) }
       sent.set(args.preparedId, summary)
       return summary
     },

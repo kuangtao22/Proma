@@ -4,15 +4,22 @@ import { createApiCatalogSnapshotExport, createApiRequestDraft } from '@proma/sh
 import {
   appendBodySlice,
   clearApiValue,
+  createApiCase,
   createImportedRequestTabs,
   createApiWorkbenchController,
   createRequestTab,
+  draftAssertions,
   editApiValue,
   formatApiResponseBody,
   previewApiWorkbenchImport,
   renameCatalogFolder,
+  removeApiCase,
+  renameApiCase,
+  resolveApiCaseName,
+  runAllApiCases,
   saveCatalogWithLatestRevision,
   upsertCatalogRequest,
+  withDraftAssertions,
 } from './api-workbench-model'
 import type { ApiWorkbenchImportPreview } from './api-workbench-model'
 
@@ -83,6 +90,32 @@ describe('接口工作台编辑模型', () => {
     expect(calls[0]?.expectedRevision).toBe(9)
     expect(calls[0]?.catalog.environments).toEqual(latest.environments)
     expect(result.revision).toBe(10)
+  })
+
+  test('Given 指定测试用例 When 发送 Then prepare 带上用例身份', async () => {
+    /** 记录 prepare 参数，验证用例身份确实传到 Host。 */
+    const calls: unknown[] = []
+    const api = {
+      getCatalog: async () => createCatalog(),
+      saveCatalog: async (input: { catalog: ApiCatalog }) => input.catalog,
+      prepare: async (input: { caseId?: string }) => {
+        calls.push(input)
+        return {
+          preparedId: 'prepared_case', requestName: '用例', catalogRevision: 0, createdAt: 1, expiresAt: 2, warnings: [],
+          request: {
+            method: 'GET' as const, url: 'https://example.test', headers: [], body: '', timeoutMs: 1_000,
+            followRedirects: false, maxRedirects: 0, sensitiveHeaderNames: [], sensitiveQueryNames: [],
+          },
+        }
+      },
+      send: async () => createRun('run-case'),
+      cancel: async () => undefined,
+    } as unknown as ApiWorkbenchApi
+    const controller = createApiWorkbenchController(api, 'session-1', () => undefined)
+
+    await controller.send('tab-1', createApiRequestDraft(), undefined, undefined, 'case_401')
+
+    expect(calls[0]).toMatchObject({ sessionId: 'session-1', caseId: 'case_401' })
   })
 
   test('Given 请求 A 在途后切到请求 B When A 迟到完成 Then 结果只写回 A 标签', async () => {
@@ -266,6 +299,99 @@ describe('接口工作台编辑模型', () => {
     expect(tabs.every((tab) => tab.dirty && tab.requestId === undefined && tab.savedDraft === null)).toBe(true)
     tabs[0]!.draft.name = '改名'
     expect(tabs[1]!.draft.name).not.toBe('改名')
+  })
+
+  test('Given 选中某条用例 When 编辑断言 Then 只改该用例且不动请求默认断言', () => {
+    const draft = {
+      ...createApiRequestDraft('default'),
+      assertions: [{ id: 'default-a', kind: 'status' as const, path: '', expected: '200' }],
+      cases: [createApiCase('case-1', '缺参数'), createApiCase('case-2', '越权')],
+    }
+
+    expect(draftAssertions(draft, 'case-1')).toEqual([])
+    expect(draftAssertions(draft, undefined)).toEqual(draft.assertions)
+
+    const updated = withDraftAssertions(draft, 'case-1', [{ id: 'a', kind: 'status', path: '', expected: '400' }])
+
+    expect(updated.cases?.[0]?.assertions).toHaveLength(1)
+    expect(updated.cases?.[1]?.assertions).toEqual([])
+    expect(updated.assertions).toEqual(draft.assertions)
+    expect(updated.cases?.[0]?.name).toBe('缺参数')
+  })
+
+  test('Given 用例已被删除 When 写回断言 Then 保留草稿不变而不是写错位置', () => {
+    const draft = { ...createApiRequestDraft('default'), cases: [createApiCase('case-1')] }
+
+    expect(withDraftAssertions(draft, 'case-gone', [])).toBe(draft)
+    expect(withDraftAssertions(draft, undefined, []).assertions).toEqual([])
+  })
+
+  test('Given 用例增删改 When 变更草稿 Then 身份稳定且顺序保持', () => {
+    const draft = {
+      ...createApiRequestDraft('default'),
+      cases: [createApiCase('case-1', '正常'), createApiCase('case-2', '缺参数')],
+    }
+
+    const renamed = renameApiCase(draft, 'case-2', '缺少必填参数')
+    const removed = removeApiCase(renamed, 'case-1')
+
+    expect(renamed.cases?.map((item) => `${item.id}:${item.name}`)).toEqual(['case-1:正常', 'case-2:缺少必填参数'])
+    expect(removed.cases?.map((item) => item.id)).toEqual(['case-2'])
+    expect(draft.cases?.map((item) => item.name)).toEqual(['正常', '缺参数'])
+    expect(createApiCase('case-3')).toEqual({ id: 'case-3', name: '新用例', assertions: [] })
+  })
+
+  test('Given 运行带用例身份 When 解析用例名 Then 草稿优先、其次目录，查不到说明已删除', () => {
+    const draft = { ...createApiRequestDraft('default'), cases: [createApiCase('case-1', '草稿用例')] }
+    const definition = {
+      ...createApiRequestDraft('default'),
+      id: 'request-1',
+      revision: 1,
+      updatedAt: 1,
+      cases: [createApiCase('case-2', '目录用例')],
+    }
+    const catalog = { ...createCatalog(), requests: [definition] }
+
+    expect(resolveApiCaseName({ ...createRun('run-1'), caseId: 'case-1' }, draft, catalog)).toBe('草稿用例')
+    expect(resolveApiCaseName({ ...createRun('run-2'), caseId: 'case-2', requestId: 'request-1' }, null, catalog)).toBe('目录用例')
+    expect(resolveApiCaseName({ ...createRun('run-3'), caseId: 'case-gone', requestId: 'request-1' }, null, catalog)).toBe('已删除的用例')
+    expect(resolveApiCaseName({ ...createRun('run-4'), caseId: 'case-gone' }, draft, null)).toBe('已删除的用例')
+    expect(resolveApiCaseName(createRun('run-5'), draft, catalog)).toBeNull()
+  })
+
+  test('Given 顺序跑全部用例 When 中途取消 Then 剩余用例标记已取消且不再发起请求', async () => {
+    const cases = [createApiCase('case-1', '正常'), createApiCase('case-2', '缺参数'), createApiCase('case-3', '越权')]
+    const visited: string[] = []
+    let cancelled = false
+    const progress: number[] = []
+
+    const rows = await runAllApiCases(cases, async (caseId) => {
+      visited.push(caseId)
+      cancelled = true
+      return null
+    }, { isCancelled: () => cancelled, describeError: () => '派发失败', onProgress: (current) => progress.push(current.length) })
+
+    expect(visited).toEqual(['case-1'])
+    expect(progress).toEqual([1, 2, 3])
+    expect(rows.map((row) => row.caseName)).toEqual(['正常', '缺参数', '越权'])
+    expect(rows[0]?.error).toBe('已取消')
+    expect(rows.slice(1).map((row) => row.error)).toEqual(['已取消，未执行', '已取消，未执行'])
+    expect(rows.every((row) => row.runId === undefined)).toBe(true)
+  })
+
+  test('Given 用例派发失败 When 跑完全部用例 Then 失败行带原因且后续用例继续执行', async () => {
+    const cases = [createApiCase('case-1', '正常'), createApiCase('case-2', '缺参数')]
+    const errors: Record<string, string> = { 'case-2': 'API_WORKBENCH_CASE_NOT_FOUND' }
+
+    const rows = await runAllApiCases(cases, async (caseId) => caseId === 'case-1' ? createRun('run-1') : null, {
+      isCancelled: () => false,
+      describeError: (caseId) => errors[caseId],
+    })
+
+    expect(rows[0]?.runId).toBe('run-1')
+    expect(rows[0]?.caseId).toBe('case-1')
+    expect(rows[1]?.error).toBe('API_WORKBENCH_CASE_NOT_FOUND')
+    expect(rows[1]?.assertionsTotal).toBe(0)
   })
 })
 

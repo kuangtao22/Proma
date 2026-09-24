@@ -62,6 +62,8 @@ export interface ApiWorkbenchPrepareInput {
   requestId?: string
   environmentId?: string
   overrides?: ApiField[]
+  /** 指定测试用例：断言与变量覆盖都来自该用例。 */
+  caseId?: string
 }
 
 /** Utility/transport 的固定调用合同；原始正文产物只写入 Store 分配的目录。 */
@@ -91,6 +93,8 @@ interface PreparedRecord {
   preview: ApiPreparedPreview
   rawRequest: ApiResolvedRequest
   assertions: ReturnType<typeof parseApiRequestDraft>['assertions']
+  /** 本次运行绑定的测试用例身份；未按用例跑时缺省。 */
+  caseId?: string
   /** 发送前冻结的提取规则；执行结束前不再重新读目录。 */
   extractions: NonNullable<ReturnType<typeof parseApiRequestDraft>['extractions']>
   secretValues: string[]
@@ -225,13 +229,20 @@ export class ApiWorkbenchService {
     const request = parseApiRequestDraft(input.request)
     const requestId = input.requestId === undefined ? undefined : parseApiId(input.requestId)
     const environmentId = input.environmentId === undefined ? undefined : parseApiId(input.environmentId)
+    /** 指定用例时必须存在于草稿里，避免静默按默认断言执行。 */
+    const caseId = input.caseId === undefined ? undefined : parseApiId(input.caseId)
+    const testCase = caseId === undefined ? undefined : (request.cases ?? []).find((item) => item.id === caseId)
+    if (caseId !== undefined && !testCase) throw new Error('API_WORKBENCH_CASE_NOT_FOUND')
+    /** 用例环境只在环境仍存在时生效；显式传入的环境优先级更高。 */
+    const effectiveEnvironmentId = environmentId ?? (testCase?.environmentId && catalog.environments.some((item) => item.id === testCase.environmentId) ? testCase.environmentId : undefined)
     if (requestId && !catalog.requests.some((item) => item.id === requestId)) throw new Error('API_WORKBENCH_REQUEST_NOT_FOUND')
     const resolved = resolveApiRequest({
       catalog,
       request,
       ...(requestId ? { requestId } : {}),
-      ...(environmentId ? { environmentId } : {}),
-      ...(input.overrides ? { overrides: input.overrides } : {}),
+      ...(effectiveEnvironmentId ? { environmentId: effectiveEnvironmentId } : {}),
+      /** 用例覆盖低于显式单次覆盖、高于运行时变量与环境。 */
+      ...((testCase?.overrides?.length || input.overrides?.length) ? { overrides: [...(testCase?.overrides ?? []), ...(input.overrides ?? [])] } : {}),
       runtimeVariables: this.runtimeVariableFields(context.workspaceId),
       resolveSecret: ({ ref, owner }) => this.store.resolveSecret(context.workspaceId, ref, owner),
     })
@@ -242,7 +253,7 @@ export class ApiWorkbenchService {
       request: redactApiRequest(resolved.request, resolved.secretValues),
       requestName: request.name,
       catalogRevision: catalog.revision,
-      ...(environmentId ? { environmentId } : {}),
+      ...(effectiveEnvironmentId ? { environmentId: effectiveEnvironmentId } : {}),
       ...(resolved.environmentKind ? { environmentKind: resolved.environmentKind } : {}),
       createdAt,
       expiresAt: createdAt + PREPARED_TTL_MS,
@@ -255,7 +266,8 @@ export class ApiWorkbenchService {
       ...(requestId ? { requestId } : {}),
       preview,
       rawRequest: resolved.request,
-      assertions: request.assertions.map((assertion) => ({ ...assertion })),
+      assertions: (testCase?.assertions ?? request.assertions).map((assertion) => ({ ...assertion })),
+      ...(testCase ? { caseId: testCase.id } : {}),
       extractions: (request.extractions ?? []).map((rule) => ({ ...rule })),
       secretValues: [...resolved.secretValues],
       origin,
@@ -301,6 +313,7 @@ export class ApiWorkbenchService {
       source: context.source,
       requestName: prepared.preview.requestName,
       ...(prepared.requestId ? { requestId: prepared.requestId } : {}),
+      ...(prepared.caseId ? { caseId: prepared.caseId } : {}),
       ...(prepared.preview.environmentId ? { environmentId: prepared.preview.environmentId } : {}),
       catalogRevision: prepared.preview.catalogRevision,
       createdAt: this.now(),

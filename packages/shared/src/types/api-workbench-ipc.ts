@@ -37,8 +37,8 @@ export function parseApiCommand(value: unknown): ApiCommand {
       return { method, input: { ...target(input), expectedRevision: apiInteger(input.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision'), catalog: parseApiCatalog(input.catalog) } }
     }
     case 'prepare': {
-      const input = apiRecord(root.input, ['sessionId', 'request', 'requestId', 'environmentId', 'overrides'])
-      return { method, input: { ...target(input), request: parseApiRequestDraft(input.request), ...(input.requestId === undefined ? {} : { requestId: parseApiId(input.requestId) }), ...(input.environmentId === undefined ? {} : { environmentId: parseApiId(input.environmentId) }), ...(input.overrides === undefined ? {} : { overrides: parseApiFields(input.overrides) }) } }
+      const input = apiRecord(root.input, ['sessionId', 'request', 'requestId', 'environmentId', 'overrides', 'caseId'])
+      return { method, input: { ...target(input), request: parseApiRequestDraft(input.request), ...(input.requestId === undefined ? {} : { requestId: parseApiId(input.requestId) }), ...(input.environmentId === undefined ? {} : { environmentId: parseApiId(input.environmentId) }), ...(input.overrides === undefined ? {} : { overrides: parseApiFields(input.overrides) }), ...(input.caseId === undefined ? {} : { caseId: parseApiId(input.caseId) }) } }
     }
     case 'send': case 'cancel': {
       const input = apiRecord(root.input, ['sessionId', 'preparedId'])
@@ -108,7 +108,7 @@ function bodyInfo(value: unknown): ApiBodyInfo {
 function failure(value: unknown): ApiFailure { const record = apiRecord(value, ['code', 'phase', 'message']); return { code: str(record.code, 'code', 128), phase: str(record.phase, 'phase', 128), message: str(record.message, 'message', 4096) } }
 /** 严格验证运行公开结果，原始密钥不能混进 DTO。 */
 export function parseApiRun(value: unknown): ApiRun {
-  const record = apiRecord(value, ['id', 'workspaceId', 'sessionId', 'source', 'requestName', 'requestId', 'environmentId', 'catalogRevision', 'createdAt', 'finishedAt', 'state', 'request', 'hops', 'body', 'assertions', 'error', 'recording', 'pinned', 'sse', 'extracted'])
+  const record = apiRecord(value, ['id', 'workspaceId', 'sessionId', 'source', 'requestName', 'requestId', 'environmentId', 'catalogRevision', 'createdAt', 'finishedAt', 'state', 'request', 'hops', 'body', 'assertions', 'error', 'recording', 'pinned', 'sse', 'extracted', 'caseId'])
   return {
     id: parseApiId(record.id), workspaceId: parseApiId(record.workspaceId), sessionId: parseApiId(record.sessionId), source: one(record.source, ['manual', 'agent']), requestName: str(record.requestName, 'requestName', 128),
     ...(record.requestId === undefined ? {} : { requestId: parseApiId(record.requestId) }), ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
@@ -118,6 +118,7 @@ export function parseApiRun(value: unknown): ApiRun {
     ...(record.error === undefined ? {} : { error: failure(record.error) }), recording: one(record.recording, ['saved', 'memory-only', 'failed']), pinned: bool(record.pinned),
     ...(record.sse === undefined ? {} : { sse: sseStream(record.sse) }),
     ...(record.extracted === undefined ? {} : { extracted: list(record.extracted, extractionOutcome, API_LIMITS.maxExtractions) }),
+    ...(record.caseId === undefined ? {} : { caseId: parseApiId(record.caseId) }),
   }
 }
 /** 解析运行时变量元数据；出现 value 等取值字段一律拒绝。 */

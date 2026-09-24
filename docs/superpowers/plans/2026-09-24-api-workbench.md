@@ -260,3 +260,65 @@ Electron 链路 smoke 在 `apps/electron` 编译 `scripts/api-workbench-smoke.ts
 - 系统安全存储不可用时新秘密禁止持久化，有限内存只保存请求与头的原始详情；正文只保留脱敏预览，界面需明确标识。自定义敏感项须标记或引用秘密环境变量。
 - 文件夹基于请求路径，空文件夹不持久化；历史载入编辑器、集合鉴权继承、可拖动分隔条、JSON 类型断言与响应差异比较尚未交付。
 - 本轮不执行安装包发布、Windows/Linux 原生测试、真实第三方接口调用或用户客户端重启；变更留在隔离工作树待审阅。
+
+## 阶段 B7：接口测试用例（已交付）
+
+分支 `codex/api-cases`（工作树 `.worktrees/api-cases`，基于 main `7aca05ff`）。目标：把请求上那份扁平的断言升级成**具名用例**，让同一接口的「正常 / 缺参数 / 越权」各自独立，并能一键跑全部用例拿到结论。
+
+### 已交付（6 个提交，均带测试）
+
+| 提交 | 内容 |
+| --- | --- |
+| `5c21e764` | 契约：`cases?: ApiTestCase[]`（id/name/assertions/overrides/environmentId），≤16 条，可选字段向后兼容 |
+| `2f91540b` | 求值：`prepare({ caseId })` 用该用例的断言与覆盖；优先级 **显式覆盖 > 用例覆盖 > 运行时变量 > 环境 > 集合**；用例环境仅在仍存在时生效；用例不存在时 `API_WORKBENCH_CASE_NOT_FOUND`；运行记录带 `caseId` |
+| `30e76442` | Agent：`api_prepare_request` 接受 `caseId` 并透传；运行摘要带 `caseId`；补齐用例执行回归测试 |
+| `e79c0ad4` | 报告：`ApiCaseReportRow` + `formatApiCaseReportMarkdown`（未执行/未验证/通过/失败四态分明，单元格转义竖线与换行） |
+| `4fdda2ee` | 发送链路：控制器 `send` 接受 `caseId` 并透传 `prepare`，未指定时仍按请求默认断言 |
+| `46a4f6fe` | 界面：用例分区、按用例发送与标注、跑全部用例、用例报告与复制、目录用例数量 |
+
+验证基线：主进程工作台 91 项、共享合同与服务工作台 559 项、用例报告 4 项测试通过；`@proma/shared` 与 `@proma/electron` 类型检查通过。
+
+### 界面与批量运行（已交付）
+
+- 模型层：`ApiWorkbenchRequestTab.activeCaseId` 保留每个请求标签各自选中的用例；`draftAssertions`/`withDraftAssertions` 决定「断言」页当前编辑的是用例还是请求默认断言（用例被删后自动回落，绝不写到错误位置）；`resolveApiCaseName` 按「当前草稿 → 目录 requestId 回查 → 已删除的用例」解析用例名；`runAllApiCases` 把「顺序执行 + 取消后不再派发 + 每次进度回调」抽成可注入的纯逻辑。
+- 「用例」分区支持新增/重命名/删除/设为当前，`0/16` 上限与请求默认断言入口同排；新增用例创建后立即选中；选中用例时「断言」页顶部标明「正在编辑：用例「<名称>」的断言」。
+- 发送入口（按钮与 ⌘/Ctrl+Enter）带上当前用例身份；按用例运行时响应头部显示「用例 <名称> · 断言 x/y」，运行历史每行显示用例名，目录树在 `cases.length > 0` 时显示「N 用例」。
+- 「跑全部用例」顺序对每个用例走同一个控制器 `prepare + send`（单飞与取消语义不变），**跑完再汇总**；报告弹层列出 用例/结果/状态码/断言/耗时/备注，可「复制报告」或逐行「打开运行」（打开时先关闭报告，让位给响应面板）。
+- 报告表格与复制出的 Markdown 共用 `formatApiCaseReportCells`：`createApiCaseReportRow` 只取运行里的真实状态码、断言计数与耗时；失败、取消、中断的运行一律不算通过，备注写出「期望 X，实际 Y」或具体错误码，未执行的行保留声明的断言数量。
+- 批量运行期间「发送」入口关闭、报告弹层不允许关闭（只能「取消剩余用例」），避免插进另一个用例的执行或看不到中途结果。
+
+### 验收记录（2026-09-24）
+
+| 验证 | 结果 | 日志 |
+| --- | --- | --- |
+| 定向回归 `bun test packages/shared/src/types apps/electron/src/main/lib/api-workbench apps/electron/src/renderer/components/api-workbench apps/electron/src/preload` | 679 pass / 0 fail，75 文件 | `/tmp/proma-api-b7-targeted.log` |
+| `bun run typecheck` | 7 workspace 全部通过 | `/tmp/proma-api-b7-typecheck.log` |
+| `bun run electron:build`（隔离工作树） | 通过；仅既有 EventKit `@available` 告警 | 见下文命令 |
+| 真实 Electron 端到端（`api-workbench-smoke.ts`，真实 utility） | PASS；网络调用 10 次，含 `caseId`、用例级断言一通过一失败、`case_not_found` 拒绝、无用例运行不带 `caseId` 与报告文本 | `/tmp/proma-api-b7-smoke.log` |
+| 真实界面（`api-workbench-ui-smoke.ts` + 受控夹具） | PASS；用例新增/改名/删除、保存、跑全部用例、报告「1/2 通过」、复制报告文本、逐行打开运行、目录用例数量徽标 | `/tmp/proma-api-b7-ui-smoke.log` |
+
+截图（等弹层与抽屉动画结束后采集并目视检查）：
+- 用例报告（两条用例一通过一失败，备注显示「期望 401，实际 200」）：`/private/tmp/api-workbench-ui-cases.png`
+- 宽布局（响应头部「用例 正常用例 · 断言 1/1」、目录「1 用例」徽标）：`/private/tmp/api-workbench-ui-wide.png`
+- 亮色窄抽屉：`/private/tmp/api-workbench-ui-narrow.png`；暗色窄布局：`/private/tmp/api-workbench-ui-narrow-dark.png`
+
+复跑命令（在隔离工作树 `apps/electron` 下）：
+```bash
+bun run typecheck && bun run electron:build
+bun x esbuild scripts/api-workbench-smoke.ts --bundle --platform=node --format=cjs --outfile=dist/api-workbench-smoke.cjs --external:electron
+PROMA_ELECTRON_PATH=<Electron 二进制> <Electron 二进制> dist/api-workbench-smoke.cjs
+PROMA_ELECTRON_PATH=<Electron 二进制> bun run scripts/api-workbench-ui-smoke.ts
+```
+
+已知范围与限制：界面 smoke 使用受控 IPC 夹具（用例结论由夹具按用例序号给出），真实传输链路由 `api-workbench-smoke.ts` 覆盖，两者合并才能代表「用例定义 → 真实发送 → 报告」；未跑四平台安装包验收，也未接真实第三方接口。用例的 `overrides`/`environmentId` 仍只能经 Agent 或导入快照声明，界面本期不提供编辑入口。批量运行串行执行，不做并发；某个用例失败后仍继续跑完（fail-fast 未实现，属有意取舍）。
+
+合并进主工作区的方式：**按显式路径提交**（`git checkout codex/api-cases -- <paths>` + `git commit <paths>`），因为主区索引里可能已有用户暂存的 `MEMORY.md`/`.gitignore`，`git commit -m` 会把整个索引一起提交（B6 那次踩过）。
+
+### 环境注意事项（踩过的坑）
+
+- 新建工作树没有 `node_modules`，先 `bun install --offline --frozen-lockfile`，否则 `@proma/electron` 类型检查会报大量「找不到 @proma/shared」的假错误。
+- 解析器给新字段补默认值（如 `cases ?? []`）时，`createApiRequestDraft` 必须同步补形状，否则「解析前 vs 解析后」不一致会让既有相等断言失败（B7 第二步实际踩到）。
+- `ApiWorkbench.tsx` 里有几行超长 JSX，`apply_patch` 常对不上上下文；改用带断言的定点替换更稳。
+- 隔离工作树里 `node_modules/electron` 没有下载 dist，跑真实 Electron 需复用主仓库已下载的二进制（`PROMA_ELECTRON_PATH=/Users/xutaoyu/CodeSource/GPL/Proma-git/apps/electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron`）；启动 GUI 进程在受限沙箱下会被 SIGABRT，须在沙箱外执行。
+- `bun run electron:build` 里的 `prepare:officecli` 会联网下载并校验 33MB 二进制；离线时把主仓库 `apps/electron/resources/officecli/officecli`（大小与 SHA-256 一致）复制过来即可跳过下载。原生 helper 编译若报 `~/.cache/clang/ModuleCache ... Operation not permitted`，用 `CLANG_MODULE_CACHE_PATH=/tmp/<dir> SWIFT_MODULECACHE_PATH=/tmp/<dir>` 重跑即可。
+- 界面 smoke 在 `executeJavaScript` 里执行 JS 字符串，`a && b ?? c` 这种 `&&` 与 `??` 混写是无括号语法错误（会报 `Unexpected token '??'`），必须加括号；Radix 弹层关闭后节点仍会短暂留在 DOM，判定「已关闭」要看 `[role=dialog]` 的 `data-state` 而不是节点是否存在。

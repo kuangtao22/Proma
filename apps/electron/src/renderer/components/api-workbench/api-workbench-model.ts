@@ -1,14 +1,19 @@
 import type {
+  ApiAssertion,
   ApiBodySlice,
   ApiCatalog,
   ApiCatalogSnapshot,
+  ApiCaseReportMeta,
+  ApiCaseReportRow,
   ApiPreparedPreview,
   ApiRequestDraft,
   ApiRun,
+  ApiTestCase,
   ApiValue,
   ApiWorkbenchApi,
 } from '@proma/shared'
 import {
+  createApiCaseReportRow,
   describeApiCatalogSnapshot,
   detectApiWorkbenchImportKind,
   parseApiCatalogSnapshot,
@@ -23,12 +28,22 @@ export interface ApiWorkbenchRequestTab {
   baseRevision?: number
   draft: ApiRequestDraft
   savedDraft: ApiRequestDraft | null
+  /** 当前选中编辑的用例；未选中时「断言」页编辑请求自身的默认断言。 */
+  activeCaseId?: string
   dirty: boolean
   saving: boolean
   sending: boolean
   preparedId?: string
   run?: ApiRun
   error?: string
+}
+
+/** 一次「跑全部用例」的汇总状态：报告行与抬头一起冻结，便于复制与逐条打开。 */
+export interface ApiWorkbenchCaseBatch {
+  tabId: string
+  running: boolean
+  rows: ApiCaseReportRow[]
+  meta: ApiCaseReportMeta
 }
 
 /** 大正文已读取的连续字符范围。 */
@@ -161,6 +176,97 @@ export function clearApiValue(_current: ApiValue): ApiValue {
   return { value: '', secret: false }
 }
 
+/** 创建一条用例；默认只跑请求、不做校验，用例身份由调用方生成。 */
+export function createApiCase(id: string, name = '新用例'): ApiTestCase {
+  return { id, name, assertions: [] }
+}
+
+/** 读取当前编辑目标：选中用例时是用例的断言，未选中时是请求自身的默认断言。 */
+export function draftAssertions(draft: ApiRequestDraft, caseId?: string): ApiAssertion[] {
+  if (!caseId) return draft.assertions
+  return (draft.cases ?? []).find((item) => item.id === caseId)?.assertions ?? draft.assertions
+}
+
+/**
+ * 写回当前编辑目标的断言。
+ * @param draft 当前草稿。
+ * @param caseId 目标用例；为空表示请求自身的默认断言。
+ * @param assertions 新的断言集合。
+ * @returns 新草稿；用例已被删除时原样返回，避免把断言写到错误的位置。
+ */
+export function withDraftAssertions(draft: ApiRequestDraft, caseId: string | undefined, assertions: ApiAssertion[]): ApiRequestDraft {
+  if (!caseId) return { ...draft, assertions }
+  /** 目录中的全部用例，保持用户顺序。 */
+  const cases = draft.cases ?? []
+  if (!cases.some((item) => item.id === caseId)) return draft
+  return { ...draft, cases: cases.map((item) => item.id === caseId ? { ...item, assertions } : item) }
+}
+
+/** 重命名用例；名称允许重复，身份保持稳定。 */
+export function renameApiCase(draft: ApiRequestDraft, caseId: string, name: string): ApiRequestDraft {
+  return { ...draft, cases: (draft.cases ?? []).map((item) => item.id === caseId ? { ...item, name } : item) }
+}
+
+/** 删除用例；用例级断言一并删除，其余用例顺序不变。 */
+export function removeApiCase(draft: ApiRequestDraft, caseId: string): ApiRequestDraft {
+  return { ...draft, cases: (draft.cases ?? []).filter((item) => item.id !== caseId) }
+}
+
+/**
+ * 解析运行所属用例名，用于响应头部与历史列表。
+ * @param run 运行记录。
+ * @param draft 当前编辑草稿，未保存请求的用例只存在于这里。
+ * @param catalog 已保存目录，历史运行按 requestId 回查。
+ * @returns 用例名；运行不属于任何用例时返回 null；用例已删除时返回可读说明。
+ */
+export function resolveApiCaseName(run: ApiRun, draft: ApiRequestDraft | null, catalog: ApiCatalog | null): string | null {
+  if (!run.caseId) return null
+  /** 当前标签的草稿优先：未保存请求没有目录副本。 */
+  const fromDraft = draft?.cases?.find((item) => item.id === run.caseId)
+  if (fromDraft) return fromDraft.name
+  /** 已保存请求按运行自身携带的 requestId 回查，不用当前标签猜测。 */
+  const definition = run.requestId ? catalog?.requests.find((item) => item.id === run.requestId) : undefined
+  return definition?.cases?.find((item) => item.id === run.caseId)?.name ?? '已删除的用例'
+}
+
+/** 顺序跑全部用例所需的注入点，便于对批量语义做纯函数回归。 */
+export interface ApiCaseBatchOptions {
+  /** 每个用例开始前与结束后询问是否已取消。 */
+  isCancelled: () => boolean
+  /** 没有产生运行记录时取可读原因（例如派发失败的错误码）。 */
+  describeError: (caseId: string) => string | undefined
+  /** 每次用例结束后回调最新的全部报告行。 */
+  onProgress?: (rows: ApiCaseReportRow[]) => void
+}
+
+/**
+ * 顺序执行请求上的全部用例，失败与未执行都留在报告里，便于一次看全。
+ * @param cases 用例声明，顺序即执行顺序。
+ * @param sendCase 执行单个用例并返回运行记录；取消或失败时返回 null。
+ * @param options 取消判定、错误说明与进度回调。
+ * @returns 全部用例的报告行；取消后不再发起后续请求，剩余用例标为已取消。
+ */
+export async function runAllApiCases(
+  cases: readonly ApiTestCase[],
+  sendCase: (caseId: string) => Promise<ApiRun | null>,
+  options: ApiCaseBatchOptions,
+): Promise<ApiCaseReportRow[]> {
+  /** 已产出的报告行，顺序与用例顺序一致。 */
+  const rows: ApiCaseReportRow[] = []
+  for (const testCase of cases) {
+    if (options.isCancelled()) {
+      rows.push(createApiCaseReportRow(testCase, null, '已取消，未执行'))
+      options.onProgress?.([...rows])
+      continue
+    }
+    /** 该用例的运行记录；取消或失败时为 null。 */
+    const run = await sendCase(testCase.id)
+    rows.push(createApiCaseReportRow(testCase, run, run ? undefined : options.isCancelled() ? '已取消' : options.describeError(testCase.id)))
+    options.onProgress?.([...rows])
+  }
+  return rows
+}
+
 /** 每次写目录前重新读取最新 revision，保留其它 Pane 的并发内容。 */
 export async function saveCatalogWithLatestRevision(
   api: ApiCatalogApi,
@@ -252,7 +358,8 @@ export function createApiWorkbenchController(
   sessionId: string,
   publish: (tabId: string, patch: ApiWorkbenchExecutionPatch) => void,
 ): {
-  send: (tabId: string, request: ApiRequestDraft, requestId?: string, environmentId?: string) => Promise<ApiRun | null>
+  /** caseId 指定要跑测试用例；未指定时按请求自身的默认断言发送。 */
+  send: (tabId: string, request: ApiRequestDraft, requestId?: string, environmentId?: string, caseId?: string) => Promise<ApiRun | null>
   cancel: (tabId: string) => Promise<void>
 } {
   /** 单个标签当前 prepare/send 的完整生命周期。 */
@@ -266,7 +373,7 @@ export function createApiWorkbenchController(
   const activeByTab = new Map<string, ActiveExecution>()
   return {
     /** 先固定请求快照，再发送同一个 preparedId。 */
-    send(tabId, request, requestId, environmentId) {
+    send(tabId, request, requestId, environmentId, caseId) {
       /** 双击与连续快捷键复用同一 prepare/send，不产生第二次副作用。 */
       const existing = activeByTab.get(tabId)
       if (existing) return existing.promise
@@ -279,7 +386,7 @@ export function createApiWorkbenchController(
       const promise = (async (): Promise<ApiRun | null> => {
         try {
           /** Host 生成的固定执行快照。 */
-          const prepared = await api.prepare({ sessionId, request, ...(requestId ? { requestId } : {}), ...(environmentId ? { environmentId } : {}) })
+          const prepared = await api.prepare({ sessionId, request, ...(requestId ? { requestId } : {}), ...(environmentId ? { environmentId } : {}), ...(caseId ? { caseId } : {}) })
           if (active.cancelRequested) {
             /** prepare 尚未完成时的取消在取得合法身份后清理，且绝不进入 send。 */
             await api.cancel({ sessionId, preparedId: prepared.preparedId }).catch(() => undefined)

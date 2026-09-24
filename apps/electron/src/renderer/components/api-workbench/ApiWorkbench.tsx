@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleStop,
+  CircleDot,
   Copy,
   Download,
   Eye,
@@ -13,6 +14,7 @@ import {
   FolderPlus,
   History,
   KeyRound,
+  ListChecks,
   Menu,
   MoreHorizontal,
   Play,
@@ -49,6 +51,8 @@ import {
   createApiCatalogSnapshotExport,
   createApiRequestDraft,
   createCurlCommand,
+  formatApiCaseReportCells,
+  formatApiCaseReportMarkdown,
   mergeApiCatalogSnapshot,
 } from '@proma/shared'
 import { copyTextToClipboard } from '@/lib/clipboard'
@@ -86,17 +90,24 @@ import {
   appendBodySlice,
   clearApiValue,
   cloneApiRequestDraft,
+  createApiCase,
   createApiWorkbenchController,
   createImportedRequestTabs,
   createRequestTab,
+  draftAssertions,
   editApiValue,
   formatApiResponseBody,
   isApiRequestDirty,
+  removeApiCase,
   renameCatalogFolder,
+  renameApiCase,
+  resolveApiCaseName,
+  runAllApiCases,
   saveCatalogWithLatestRevision,
   upsertCatalogRequest,
+  withDraftAssertions,
 } from './api-workbench-model'
-import type { ApiWorkbenchBodyPage, ApiWorkbenchRequestTab } from './api-workbench-model'
+import type { ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbenchRequestTab } from './api-workbench-model'
 import { ApiImportDialog } from './ApiImportDialog'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
@@ -117,7 +128,7 @@ export function dispatchResendApiRun(run: ApiRun, currentSessionId: string | und
 /** 阶段 A 支持的请求方法。 */
 const METHODS: readonly ApiMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 /** 编辑器一级分区。 */
-type EditorSection = 'query' | 'headers' | 'body' | 'auth' | 'assertions' | 'extract' | 'settings'
+type EditorSection = 'query' | 'headers' | 'body' | 'auth' | 'cases' | 'assertions' | 'extract' | 'settings'
 /** 窄 Pane 当前显示的主区域。 */
 type CompactView = 'request' | 'response'
 /** 目录命名弹窗支持的操作。 */
@@ -397,11 +408,14 @@ function RequestTreeButton({ request, activeTabId, onOpen, environmentKind }: {
 }): React.ReactElement {
   /** 请求已打开时由 requestId 定位标签，按钮仍负责切换活动项。 */
   const active = activeTabId === `request_${request.id}`
+  /** 该接口声明的用例数量；为 0 时不显示徽标。 */
+  const caseCount = request.cases?.length ?? 0
   return (
     <button type="button" className={cn('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted/60', active && 'bg-muted text-foreground')} onClick={() => onOpen(request)}>
       <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
       {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
-      <span className="truncate">{request.name}</span>
+      <span className="min-w-0 flex-1 truncate">{request.name}</span>
+      {caseCount > 0 && <span className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground" title={`该接口有 ${caseCount} 条测试用例`}>{caseCount} 用例</span>}
     </button>
   )
 }
@@ -423,12 +437,17 @@ function RequestTabBar({ tabs, activeTabId, onSelect, onClose }: { tabs: ApiWork
 }
 
 /** 请求编辑器主体。 */
-function RequestEditor({ tab, environmentId, environments, onChange, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel }: {
+function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel }: {
   tab: ApiWorkbenchRequestTab
   environmentId: string | null
   /** 用于「目标环境」标记选择：标记只区分开发/测试/生产，不改变发送权限。 */
   environments: ApiEnvironment[]
+  /** 是否正在跑全部用例：期间不允许再触发批量或改选用例。 */
+  casesRunning: boolean
   onChange: (draft: ApiRequestDraft) => void
+  onCasesChange: (draft: ApiRequestDraft, activeCaseId: string | undefined) => void
+  onActiveCaseChange: (caseId: string | undefined) => void
+  onRunAllCases: () => void
   onSave: () => void
   onDuplicate: () => void
   onCopyCurl: () => void
@@ -438,6 +457,10 @@ function RequestEditor({ tab, environmentId, environments, onChange, onSave, onD
 }): React.ReactElement {
   /** 当前编辑分区。 */
   const [section, setSection] = React.useState<EditorSection>('query')
+  /** 当前选中的用例；用例被删除后自动回落为请求默认断言。 */
+  const activeCase = (tab.draft.cases ?? []).find((item) => item.id === tab.activeCaseId)
+  /** 「断言」页当前编辑的对象说明。 */
+  const assertionTarget = activeCase ? `用例「${activeCase.name}」的断言` : '请求默认断言（不随用例执行）'
   /** 只更新草稿某个顶层字段。 */
   const patchDraft = <Key extends keyof ApiRequestDraft>(key: Key, value: ApiRequestDraft[Key]): void => onChange({ ...tab.draft, [key]: value })
   return (
@@ -445,6 +468,7 @@ function RequestEditor({ tab, environmentId, environments, onChange, onSave, onD
       <div className="flex shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2">
         <Input value={tab.draft.name} onChange={(event) => patchDraft('name', event.target.value)} className="h-8 min-w-0 flex-1 border-transparent bg-transparent px-1 text-sm font-semibold shadow-none hover:border-border/50" aria-label="请求名称" />
         <span className="hidden text-[10px] text-muted-foreground xl:inline">{environmentId ? '使用所选环境' : '无环境'}</span>
+        <ToolButton label="跑全部用例" onClick={onRunAllCases} disabled={casesRunning || tab.sending || (tab.draft.cases ?? []).length === 0}><ListChecks className="size-3.5" /></ToolButton>
         <ToolButton label="保存请求 (⌘S)" onClick={onSave} disabled={tab.saving}><Save className="size-3.5" /></ToolButton>
         <ToolButton label="复制请求" onClick={onDuplicate}><Copy className="size-3.5" /></ToolButton>
         <ToolButton label="复制为 cURL" onClick={onCopyCurl}><Terminal className="size-3.5" /></ToolButton>
@@ -459,12 +483,12 @@ function RequestEditor({ tab, environmentId, environments, onChange, onSave, onD
         {tab.sending ? (
           <Button type="button" variant="destructive" className="h-9 gap-1.5 px-3" onClick={onCancel}><CircleStop className="size-4" />取消</Button>
         ) : (
-          <Button type="button" className="h-9 gap-1.5 px-3" onClick={onSend}><Play className="size-4" />发送</Button>
+          <Button type="button" className="h-9 gap-1.5 px-3" onClick={onSend} disabled={casesRunning} title={casesRunning ? '正在跑全部用例，请等这批结束或取消' : undefined}><Play className="size-4" />发送</Button>
         )}
       </div>
       {tab.error && <div className="mx-3 mb-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{tab.error}</div>}
       <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/50 px-3 scrollbar-none">
-        {([['query', '查询'], ['headers', 'Headers'], ['body', 'Body'], ['auth', '鉴权'], ['assertions', '断言'], ['extract', '提取'], ['settings', '设置']] as const).map(([id, label]) => (
+        {([['query', '查询'], ['headers', 'Headers'], ['body', 'Body'], ['auth', '鉴权'], ['cases', '用例'], ['assertions', '断言'], ['extract', '提取'], ['settings', '设置']] as const).map(([id, label]) => (
           <button key={id} type="button" className={cn('h-8 shrink-0 border-b-2 px-2 text-xs', section === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => setSection(id)}>{label}</button>
         ))}
       </div>
@@ -473,7 +497,8 @@ function RequestEditor({ tab, environmentId, environments, onChange, onSave, onD
         {section === 'headers' && <FieldRows rows={tab.draft.headers} allowSecrets onChange={(rows) => patchDraft('headers', rows)} namePlaceholder="Header" />}
         {section === 'body' && <BodyEditor body={tab.draft.body} onChange={(body) => patchDraft('body', body)} />}
         {section === 'auth' && <AuthEditor draft={tab.draft} onChange={onChange} />}
-        {section === 'assertions' && <AssertionEditor assertions={tab.draft.assertions} onChange={(assertions) => patchDraft('assertions', assertions)} />}
+        {section === 'cases' && <CaseEditor draft={tab.draft} activeCaseId={activeCase?.id} onCasesChange={onCasesChange} onActiveCaseChange={onActiveCaseChange} />}
+        {section === 'assertions' && <AssertionEditor assertions={draftAssertions(tab.draft, activeCase?.id)} target={assertionTarget} onChange={(assertions) => onChange(withDraftAssertions(tab.draft, activeCase?.id, assertions))} />}
         {section === 'extract' && <ExtractionEditor extractions={tab.draft.extractions ?? []} onChange={(extractions) => patchDraft('extractions', extractions)} />}
         {section === 'settings' && <RequestSettings draft={tab.draft} environments={environments} activeEnvironmentId={environmentId} onChange={onChange} />}
       </div>
@@ -567,12 +592,13 @@ function ExtractionEditor({ extractions, onChange }: { extractions: ApiExtractio
   )
 }
 
-/** 声明式断言编辑器。 */
-function AssertionEditor({ assertions, onChange }: { assertions: ApiAssertion[]; onChange: (assertions: ApiAssertion[]) => void }): React.ReactElement {
+/** 声明式断言编辑器；target 说明这组断言属于请求默认还是某条用例。 */
+function AssertionEditor({ assertions, target, onChange }: { assertions: ApiAssertion[]; target: string; onChange: (assertions: ApiAssertion[]) => void }): React.ReactElement {
   /** 更新单条断言。 */
   const updateAssertion = (id: string, patch: Partial<ApiAssertion>): void => onChange(assertions.map((item) => item.id === id ? { ...item, ...patch } : item))
   return (
     <div className="space-y-2">
+      <p className="text-[11px] text-muted-foreground">正在编辑：{target}</p>
       {assertions.map((assertion) => (
         <div key={assertion.id} className="grid grid-cols-[140px_minmax(100px,1fr)_minmax(100px,1fr)_32px] gap-2">
           <Select value={assertion.kind} onValueChange={(kind) => updateAssertion(assertion.id, { kind: kind as ApiAssertion['kind'] })}><SelectTrigger className="h-8 text-xs"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="status">状态码</SelectItem><SelectItem value="header">Header</SelectItem><SelectItem value="json-value">JSON 值</SelectItem><SelectItem value="json-exists">JSON 存在</SelectItem><SelectItem value="duration">耗时</SelectItem><SelectItem value="sse-count">事件数量</SelectItem><SelectItem value="sse-first-event">首事件耗时</SelectItem><SelectItem value="sse-ended">事件流结束</SelectItem><SelectItem value="sse-last-data">最后一段事件数据</SelectItem></SelectContent></Select>
@@ -582,6 +608,58 @@ function AssertionEditor({ assertions, onChange }: { assertions: ApiAssertion[];
         </div>
       ))}
       <Button type="button" variant="ghost" size="sm" className="h-7 gap-1.5 px-2 text-xs" onClick={() => onChange([...assertions, createAssertion()])}><Plus className="size-3.5" />添加断言</Button>
+    </div>
+  )
+}
+
+/** 用例编辑器：维护用例清单与当前编辑目标，断言仍在「断言」页编辑。 */
+function CaseEditor({ draft, activeCaseId, onCasesChange, onActiveCaseChange }: {
+  draft: ApiRequestDraft
+  activeCaseId?: string
+  onCasesChange: (draft: ApiRequestDraft, activeCaseId: string | undefined) => void
+  onActiveCaseChange: (caseId: string | undefined) => void
+}): React.ReactElement {
+  /** 当前请求声明的用例，保持用户顺序。 */
+  const cases = draft.cases ?? []
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button
+          type="button"
+          aria-pressed={!activeCaseId}
+          className={cn('rounded-md border px-2 py-1 text-xs', !activeCaseId ? 'border-primary text-foreground' : 'border-border/60 text-muted-foreground hover:bg-muted/40')}
+          onClick={() => onActiveCaseChange(undefined)}
+        >默认断言（请求自身）</button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 gap-1.5 px-2 text-xs"
+          disabled={cases.length >= API_LIMITS.maxCases}
+          onClick={() => {
+            /** 新用例默认只跑请求；创建后立即选中，方便马上补断言。 */
+            const created = createApiCase(createLocalId('case'))
+            onCasesChange({ ...draft, cases: [...cases, created] }, created.id)
+          }}
+        ><Plus className="size-3.5" />新增用例</Button>
+        <span className="text-[11px] text-muted-foreground">{cases.length}/{API_LIMITS.maxCases}</span>
+      </div>
+      {cases.map((item) => (
+        <div key={item.id} className="grid grid-cols-[auto_minmax(120px,1fr)_auto_auto] items-center gap-2">
+          <button
+            type="button"
+            aria-label={`设为当前用例 ${item.name}`}
+            aria-pressed={item.id === activeCaseId}
+            className={cn('flex size-6 items-center justify-center rounded-md border', item.id === activeCaseId ? 'border-primary bg-primary/10 text-primary' : 'border-border/60 text-muted-foreground hover:bg-muted/40')}
+            onClick={() => onActiveCaseChange(item.id)}
+          >{item.id === activeCaseId ? <Check className="size-3.5" /> : <CircleDot className="size-3.5" />}</button>
+          <Input value={item.name} aria-label="用例名称" onChange={(event) => onCasesChange(renameApiCase(draft, item.id, event.target.value), activeCaseId)} className="h-8 text-xs" />
+          <span className="shrink-0 text-[11px] text-muted-foreground">{item.assertions.length} 条断言</span>
+          <ToolButton label={`删除用例 ${item.name}`} onClick={() => onCasesChange(removeApiCase(draft, item.id), activeCaseId === item.id ? undefined : activeCaseId)}><Trash2 className="size-3.5" /></ToolButton>
+        </div>
+      ))}
+      {cases.length === 0 && <p className="rounded-md border border-dashed border-border/60 px-3 py-6 text-center text-xs text-muted-foreground">还没有用例。用「正常 / 缺参数 / 越权」这类用例固定各自的断言，就能一键跑全部并拿到结论。</p>}
+      <p className="text-[11px] text-muted-foreground">选中用例后，「断言」页编辑的是该用例的断言；未选中时编辑的是请求自身的默认断言。</p>
     </div>
   )
 }
@@ -630,7 +708,7 @@ function RequestSettings({ draft, environments, activeEnvironmentId, onChange }:
 }
 
 /** 响应与历史区域。 */
-function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, historyHasMore = false, onLoadMoreHistory }: {
+function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, resolveCaseName, historyHasMore = false, onLoadMoreHistory }: {
   api: ApiWorkbenchApi
   sessionId: string
   run: ApiRun | null
@@ -639,6 +717,8 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
   onHistoryOpenChange: (open: boolean) => void
   onOpenRun: (runId: string, reveal?: boolean) => void
   onPinRun: (run: ApiRun) => void
+  /** 运行所属用例名；未按用例运行时返回 null。 */
+  resolveCaseName: (run: ApiRun) => string | null
   historyHasMore?: boolean
   onLoadMoreHistory?: () => void
 }): React.ReactElement {
@@ -721,6 +801,7 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
             <button type="button" className="flex min-w-0 flex-1 items-center gap-3 px-2.5 py-2 text-left" onClick={() => onOpenRun(item.id)} aria-label={`打开运行 ${item.requestName}`}>
               <span className="w-14 shrink-0 font-mono text-[10px] font-semibold">{item.request.method}</span>
               <span className="min-w-0 flex-1 truncate text-xs">{item.requestName}</span>
+              {item.caseId && <span className="shrink-0 text-[10px] text-muted-foreground">用例 {resolveCaseName(item)}</span>}
               <span className="text-[10px] text-muted-foreground">{item.hops.at(-1)?.status ?? item.state}</span>
             </button>
             <button type="button" className="mr-2 rounded p-1 hover:bg-muted" onClick={() => onPinRun(item)} aria-label={item.pinned ? '取消收藏' : '收藏运行'}><ShieldCheck className={cn('size-3.5', item.pinned && 'text-primary')} /></button>
@@ -744,6 +825,8 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
   const finalHop = displayedRun.hops.at(-1)
   /** 断言统计。 */
   const assertionPassed = displayedRun.assertions.filter((item) => item.passed).length
+  /** 本次运行所属用例名；未按用例运行时为空。 */
+  const caseName = resolveCaseName(displayedRun)
   /** 当前正文格式化结果。 */
   const formattedBody = formatApiResponseBody(bodyPage?.text ?? displayedRun.body.preview, displayedRun.body.contentType)
   /** 响应详情的稳定分区。 */
@@ -760,7 +843,9 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
         <Badge variant={displayedRun.state === 'completed' ? 'secondary' : 'destructive'}>{finalHop?.status ?? displayedRun.state}</Badge>
         <span>{finalHop ? `${finalHop.timings.totalMs} ms` : '耗时不适用'}</span>
         <span>{displayedRun.body.rawBytes.toLocaleString()} B</span>
-        {displayedRun.assertions.length === 0 ? <span className="text-muted-foreground">未验证</span> : <span className={cn('font-medium', assertionPassed !== displayedRun.assertions.length ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400')}>断言 {assertionPassed}/{displayedRun.assertions.length}</span>}
+        {displayedRun.assertions.length === 0
+          ? <span className="text-muted-foreground">{caseName ? `用例 ${caseName} · 未验证` : '未验证'}</span>
+          : <span className={cn('font-medium', assertionPassed !== displayedRun.assertions.length ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400')}>{caseName ? `用例 ${caseName} · ` : ''}断言 {assertionPassed}/{displayedRun.assertions.length}</span>}
         <span className="ml-auto text-[10px] text-muted-foreground">{revealed ? '本地原始内容' : '默认脱敏'}</span>
         {!revealed && displayedRun.recording !== 'failed' && <ToolButton label="查看本地原始内容" onClick={revealOriginal}><Eye className="size-3.5" /></ToolButton>}
         <ToolButton label="运行历史" onClick={() => onHistoryOpenChange(true)}><History className="size-3.5" /></ToolButton>
@@ -792,6 +877,66 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
         ))}
       </div>
     </div>
+  )
+}
+
+/** 用例报告弹窗：表格结论与复制出的 Markdown 同源，避免两处判断漂移。 */
+function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: {
+  batch: ApiWorkbenchCaseBatch | null
+  onOpenChange: (open: boolean) => void
+  onCopy: () => void
+  onOpenRun: (runId: string) => void
+  onCancel: () => void
+}): React.ReactElement {
+  /** 当前报告行；批量运行中会持续追加。 */
+  const rows = batch?.rows ?? []
+  /** 只统计已执行且带断言的用例，与导出报告的通过率口径一致。 */
+  const executed = rows.filter((row) => row.runId !== undefined && row.assertionsTotal > 0)
+  /** 通过数取自与表格相同的结论函数。 */
+  const passed = executed.filter((row) => formatApiCaseReportCells(row).verdict === '通过').length
+  /** 表头与数据行共用同一列宽，避免窄窗口下错位。 */
+  const columns = 'grid-cols-[minmax(110px,1.2fr)_64px_64px_64px_80px_minmax(80px,1.1fr)_88px]'
+  return (
+    <Dialog open={batch !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>用例报告</DialogTitle>
+          <DialogDescription>
+            {batch === null ? '' : `${batch.meta.method} ${batch.meta.url} · ${executed.length === 0 ? '尚未执行' : `${passed}/${executed.length} 通过`}${batch.running ? ' · 正在跑剩余用例' : ''}`}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-1 text-xs">
+          <div className={cn('grid items-center gap-2 px-2 text-[10px] text-muted-foreground', columns)}>
+            <span>用例</span><span>结果</span><span>状态码</span><span>断言</span><span>耗时</span><span>备注</span><span />
+          </div>
+          {rows.map((row) => {
+            /** 与复制报告同源的单元格文本。 */
+            const cells = formatApiCaseReportCells(row)
+            /** 该行对应的运行身份；未执行时为空。 */
+            const runId = row.runId
+            return (
+              <div key={row.caseId ?? row.caseName} className={cn('grid items-center gap-2 rounded-md border border-border/50 px-2 py-1.5', columns)}>
+                <span className="truncate" title={cells.caseName}>{cells.caseName}</span>
+                <span className={cn(cells.verdict === '通过' ? 'text-emerald-600 dark:text-emerald-400' : cells.verdict === '失败' ? 'text-destructive' : 'text-muted-foreground')}>{cells.verdict}</span>
+                <span>{cells.status}</span>
+                <span>{cells.assertions}</span>
+                <span>{cells.duration}</span>
+                <span className="truncate text-muted-foreground" title={cells.remark}>{cells.remark || '—'}</span>
+                {runId
+                  ? <Button type="button" variant="ghost" size="sm" className="h-6 px-2 text-[11px]" onClick={() => onOpenRun(runId)}>打开运行</Button>
+                  : <span className="text-[10px] text-muted-foreground">无运行</span>}
+              </div>
+            )
+          })}
+          {rows.length === 0 && <p className="py-6 text-center text-muted-foreground">正在准备第一个用例…</p>}
+        </div>
+        <DialogFooter className="items-center">
+          {batch?.running && <Button type="button" variant="destructive" className="mr-auto" onClick={onCancel}>取消剩余用例</Button>}
+          <Button type="button" variant="outline" disabled={rows.length === 0} onClick={onCopy}>复制报告</Button>
+          <Button type="button" disabled={batch?.running} title={batch?.running ? '跑完之后再关闭，避免看不到中途结果' : undefined} onClick={() => onOpenChange(false)}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -929,6 +1074,12 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** 运行时变量面板开关与元数据列表。 */
   const [runtimeOpen, setRuntimeOpen] = React.useState(false)
   const [runtimeVariables, setRuntimeVariables] = React.useState<ApiRuntimeVariable[]>([])
+  /** 一次「跑全部用例」的报告状态；关闭弹窗即清空，不写入目录。 */
+  const [caseBatch, setCaseBatch] = React.useState<ApiWorkbenchCaseBatch | null>(null)
+  /** 批量用例代次；取消后置空，后续用例不再派发。 */
+  const caseBatchTokenRef = React.useRef<symbol | null>(null)
+  /** 控制器最近一次投递的错误文案，供批量运行标注失败用例。 */
+  const lastExecutionErrorRef = React.useRef(new Map<string, string | undefined>())
   /** 根容器引用。 */
   const rootRef = React.useRef<HTMLDivElement>(null)
   /** 当前请求标签。 */
@@ -944,6 +1095,8 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   }, [setView])
   /** 请求执行控制器固定原标签身份。 */
   const controller = React.useMemo(() => api ? createApiWorkbenchController(api, sessionId, (tabId, patch) => {
+    /** 批量运行在 send 返回 null 时读取这里的原因，不额外扩展控制器接口。 */
+    lastExecutionErrorRef.current.set(tabId, patch.error)
     updateTab(tabId, (tab) => ({ ...tab, ...patch }))
     if (patch.run) setView((previous) => ({ ...previous, selectedRun: previous.activeTabId === tabId ? patch.run ?? null : previous.selectedRun }))
   }) : null, [api, sessionId, setView, updateTab])
@@ -1128,13 +1281,73 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     }))
   }, [activeTab, mutateCatalog, setView, updateTab])
 
-  /** 发送当前请求。 */
+  /** 打开一次运行；历史点击、报告行与结果卡定位都不会自动重发。 */
+  const openRun = React.useCallback((runId: string, reveal = false): void => {
+    if (!api) return
+    void api.getRun({ sessionId, runId, ...(reveal ? { reveal: true } : {}) })
+      .then((run) => setView((previous) => ({ ...previous, selectedRun: run, historyOpen: false })))
+      .catch((error: unknown) => setLoadError(errorMessage(error, '读取运行记录失败')))
+  }, [api, sessionId, setView])
+
+  /** 发送当前请求；选中用例时按该用例的断言与覆盖执行。 */
   const sendActive = React.useCallback(async (): Promise<void> => {
     if (!activeTab || !controller) return
+    /** 批量用例运行期间的发送入口统一关闭，避免插进另一个用例的执行。 */
+    if (caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running) return
     setCompactView('response')
-    await controller.send(activeTab.id, cloneApiRequestDraft(activeTab.draft), activeTab.requestId, view.environmentId ?? undefined)
+    await controller.send(activeTab.id, cloneApiRequestDraft(activeTab.draft), activeTab.requestId, view.environmentId ?? undefined, activeTab.activeCaseId)
+    await refreshHistory()
+  }, [activeTab, caseBatch, controller, refreshHistory, view.environmentId])
+
+  /** 取消当前标签的发送；批量运行中同时停止后续用例。 */
+  const cancelActive = React.useCallback((): void => {
+    if (!activeTab || !controller) return
+    /** 先作废批量代次，循环不会再派发下一个用例。 */
+    caseBatchTokenRef.current = null
+    setCaseBatch((current) => current && current.tabId === activeTab.id ? { ...current, running: false } : current)
+    void controller.cancel(activeTab.id)
+  }, [activeTab, controller])
+
+  /**
+   * 顺序跑完当前请求的全部用例。
+   * 跑完再汇总：某个用例失败或取消不影响其它用例的记录，一次就能看全。
+   */
+  const runAllCases = React.useCallback(async (): Promise<void> => {
+    if (!activeTab || !controller) return
+    /** 用例声明，顺序即执行顺序。 */
+    const cases = activeTab.draft.cases ?? []
+    if (cases.length === 0) return
+    /** 发起批量时固定标签身份、请求快照与运行代次，中途切换标签不会写错位置。 */
+    const tabId = activeTab.id
+    const request = cloneApiRequestDraft(activeTab.draft)
+    const requestId = activeTab.requestId
+    const token = Symbol('case-batch')
+    caseBatchTokenRef.current = token
+    lastExecutionErrorRef.current.delete(tabId)
+    setCompactView('response')
+    setCaseBatch({ tabId, running: true, rows: [], meta: { requestName: request.name, method: request.method, url: request.url, startedAt: Date.now() } })
+    await runAllApiCases(cases, (caseId) => controller.send(tabId, request, requestId, view.environmentId ?? undefined, caseId), {
+      isCancelled: () => caseBatchTokenRef.current !== token,
+      describeError: () => lastExecutionErrorRef.current.get(tabId),
+      onProgress: (rows) => setCaseBatch((current) => current && current.tabId === tabId ? { ...current, rows } : current),
+    })
+    setCaseBatch((current) => current && current.tabId === tabId ? { ...current, running: false } : current)
     await refreshHistory()
   }, [activeTab, controller, refreshHistory, view.environmentId])
+
+  /** 复制用例报告；表格结论与复制文本同源。 */
+  const copyCaseReport = React.useCallback(async (): Promise<void> => {
+    if (!caseBatch) return
+    try {
+      await copyTextToClipboard(formatApiCaseReportMarkdown(caseBatch.rows, caseBatch.meta))
+      setNotice('已复制用例报告，可直接粘贴到评审或工单里')
+    } catch (error) {
+      setLoadError(errorMessage(error, '复制用例报告失败'))
+    }
+  }, [caseBatch])
+
+  /** 运行所属用例名；先看当前标签草稿，再按目录回查已保存请求。 */
+  const resolveCaseName = React.useCallback((run: ApiRun): string | null => resolveApiCaseName(run, activeTab?.draft ?? null, catalog), [activeTab, catalog])
 
   /** 导入的 cURL 草稿一律新开标签，确认无误后才写入目录。 */
   const importDrafts = React.useCallback((drafts: ApiRequestDraft[]): void => {
@@ -1308,8 +1521,8 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId && !window.confirm(`删除请求“${activeTab.draft.name}”？`)) return
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
-              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} onSend={() => void sendActive()} onCancel={() => void controller?.cancel(activeTab.id)} /></section>}
-              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={(runId, reveal = false) => { void api.getRun({ sessionId, runId, ...(reveal ? { reveal: true } : {}) }).then((run) => setView((previous) => ({ ...previous, selectedRun: run, historyOpen: false }))).catch((error: unknown) => setLoadError(errorMessage(error, '读取运行记录失败'))) }} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} /></section>}
+              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} /></section>}
+              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} /></section>}
             </div>
           )}
         </main>
@@ -1328,6 +1541,13 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       }} />
       <EnvironmentDialog open={environmentDialogOpen} environment={editingEnvironment} onOpenChange={setEnvironmentDialogOpen} onSave={(environment) => void mutateCatalog((latest) => ({ ...latest, environments: latest.environments.some((item) => item.id === environment.id) ? latest.environments.map((item) => item.id === environment.id ? environment : item) : [...latest.environments, environment] })).then((saved) => { if (saved) { setView((previous) => ({ ...previous, environmentId: environment.id })); setEnvironmentDialogOpen(false) } })} onDelete={(environment) => { if (!window.confirm(`删除环境“${environment.name}”？`)) return; void mutateCatalog((latest) => ({ ...latest, environments: latest.environments.filter((item) => item.id !== environment.id) })).then(() => setEnvironmentDialogOpen(false)) }} />
       <ApiImportDialog open={importOpen} onOpenChange={setImportOpen} onImportDrafts={importDrafts} onImportSnapshot={importSnapshot} />
+      <CaseReportDialog
+        batch={caseBatch}
+        onOpenChange={(open) => { if (!open && !caseBatch?.running) setCaseBatch(null) }}
+        onCopy={() => void copyCaseReport()}
+        onOpenRun={(runId) => { /** 报告是模态弹层，打开某次运行时要先让位给响应面板。 */ setCaseBatch(null); openRun(runId) }}
+        onCancel={cancelActive}
+      />
       <RuntimeVariablesDialog
         open={runtimeOpen}
         variables={runtimeVariables}

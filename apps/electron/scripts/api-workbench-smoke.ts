@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
-import { API_WORKBENCH_CHANNELS, createApiRequestDraft, apiDraftFromDefinition } from '@proma/shared'
+import { API_WORKBENCH_CHANNELS, createApiCaseReportRow, createApiRequestDraft, apiDraftFromDefinition, formatApiCaseReportMarkdown } from '@proma/shared'
 import type { AgentSessionMeta, ApiCatalog, ApiPreparedPreview, ApiRun, ApiWorkbenchApi } from '@proma/shared'
 import { ApiWorkbenchService } from '../src/main/lib/api-workbench/api-workbench-service'
 import { ApiWorkbenchStore } from '../src/main/lib/api-workbench/api-workbench-store'
@@ -193,10 +193,54 @@ async function smoke(): Promise<void> {
   const cancelled = await pending as ApiRun
   assert.equal(cancelled.state, 'cancelled')
   assert.ok(cancelled.body.preview.includes('partial'))
+  /** 具名用例：同一接口两条用例一通过一失败，另验证不带用例时仍按请求自身断言。 */
+  const caseCatalog = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
+  /** 用例断言与请求自身断言故意不同，用于证明「按谁执行」可以区分。 */
+  const caseRequest = {
+    ...draft,
+    name: '合作用例请求',
+    url: baseUrl + '/unauthorized',
+    assertions: [{ id: 'default_status', kind: 'status' as const, path: '', expected: '200' }],
+    cases: [
+      { id: 'case_expect_401', name: '未授权返回 401', assertions: [{ id: 'case_a', kind: 'status' as const, path: '', expected: '401' }] },
+      { id: 'case_expect_200', name: '越权却期望 200', assertions: [{ id: 'case_b', kind: 'status' as const, path: '', expected: '200' }] },
+    ],
+  }
+  /** 带用例的请求必须先保存进目录，运行时才能按 requestId 复核版本与所有权。 */
+  const savedCases = await call('saveCatalog', { sessionId: 'smoke-session', expectedRevision: caseCatalog.revision, catalog: { ...caseCatalog, requests: [...caseCatalog.requests, { ...caseRequest, id: 'saved-cases', revision: 1, updatedAt: Date.now() }] } }) as ApiCatalog
+  /** 保存后的真实定义，逐条用例都按它执行。 */
+  const savedCaseDefinition = apiDraftFromDefinition(savedCases.requests.find((item) => item.id === 'saved-cases')!)
+  /** 每个用例一次真实运行，结论必须来自该用例自己的断言。 */
+  const caseRuns: ApiRun[] = []
+  for (const testCase of caseRequest.cases) {
+    const preview = await call('prepare', { sessionId: 'smoke-session', requestId: 'saved-cases', request: savedCaseDefinition, caseId: testCase.id }) as ApiPreparedPreview
+    const caseRun = await call('send', { sessionId: 'smoke-session', preparedId: preview.preparedId }) as ApiRun
+    assert.equal(caseRun.caseId, testCase.id)
+    assert.equal(caseRun.hops[0]?.status, 401)
+    caseRuns.push(caseRun)
+  }
+  assert.deepEqual(caseRuns.map((item) => item.assertions.map((assertion) => assertion.passed)), [[true], [false]])
+  /** 用例不存在时必须在派发前拒绝，不能悄悄退回默认断言。 */
+  await assert.rejects(call('prepare', { sessionId: 'smoke-session', requestId: 'saved-cases', request: savedCaseDefinition, caseId: 'case_missing' }), /API_WORKBENCH_CASE_NOT_FOUND/)
+  /** 不带用例时按请求自身断言执行，运行记录不携带用例身份。 */
+  const plainPreview = await call('prepare', { sessionId: 'smoke-session', requestId: 'saved-cases', request: savedCaseDefinition }) as ApiPreparedPreview
+  const plainRun = await call('send', { sessionId: 'smoke-session', preparedId: plainPreview.preparedId }) as ApiRun
+  assert.equal(plainRun.caseId, undefined)
+  assert.deepEqual(plainRun.assertions.map((assertion) => assertion.passed), [false])
+  /** 报告文本与界面同源：通过率、失败原因与断言计数都要出现，且不含秘密明文。 */
+  const reportRows = caseRequest.cases.map((testCase, index) => createApiCaseReportRow(testCase, caseRuns[index]!))
+  const report = formatApiCaseReportMarkdown(reportRows, { requestName: caseRequest.name, method: caseRequest.method, url: caseRequest.url, startedAt: Date.now() })
+  assert.ok(report.includes('- 结果：1/2 通过'), report)
+  assert.ok(report.includes('| 未授权返回 401 | 通过 | 401 | 1/1 |'), report)
+  assert.ok(report.includes('| 越权却期望 200 | 失败 | 401 | 0/1 |'), report)
+  assert.ok(report.includes('期望 200，实际 401'), report)
+  assert.equal(report.includes('fixture-secret'), false)
+  /** 报告行与真实运行一一对应，界面据此逐条打开 runId。 */
+  assert.deepEqual(reportRows.map((row) => row.runId), caseRuns.map((run) => run.id))
   const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 7)
-  assert.equal(calls, 7)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'history'] }))
+  assert.equal(history.runs.length, 10)
+  assert.equal(calls, 10)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

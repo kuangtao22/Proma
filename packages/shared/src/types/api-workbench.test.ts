@@ -2,6 +2,36 @@ import { describe, expect, test } from 'bun:test'
 import { createApiRequestDraft, parseApiRequestDraft, parseApiCatalog, parseApiTarget } from './api-workbench'
 
 describe('接口工作台共享合同', () => {
+  test('Given 测试用例 When 解析草稿 Then 保留断言、覆盖与环境且兼容旧请求', () => {
+    const base = createApiRequestDraft()
+    const withCases = {
+      ...base,
+      cases: [{
+        id: 'case_1', name: '正常登录',
+        assertions: [{ id: 'ok', kind: 'status' as const, path: '', expected: '200' }],
+        overrides: [{ id: 'ov', name: 'user', value: 'ada', enabled: true }],
+        environmentId: 'env_test',
+      }],
+    }
+
+    const parsed = parseApiRequestDraft(withCases)
+    expect(parsed.cases?.[0]?.name).toBe('正常登录')
+    expect(parsed.cases?.[0]?.assertions?.[0]?.expected).toBe('200')
+    expect(parsed.cases?.[0]?.overrides?.[0]?.value).toBe('ada')
+    expect(parsed.cases?.[0]?.environmentId).toBe('env_test')
+    /** 升级前保存的请求没有 cases 字段，解析时补空数组而不是报错。 */
+    expect(parseApiRequestDraft({ ...base }).cases).toEqual([])
+    expect(createApiRequestDraft().cases).toEqual([])
+  })
+
+  test('Given 用例身份重复、数量越界或含未知字段 When 解析 Then 明确拒绝', () => {
+    const base = createApiRequestDraft()
+
+    expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [] }, { id: 'case_1', name: 'b', assertions: [] }] })).toThrow()
+    expect(() => parseApiRequestDraft({ ...base, cases: Array.from({ length: 17 }, (_, index) => ({ id: `case_${index}`, name: `c${index}`, assertions: [] })) })).toThrow()
+    expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], extra: 1 }] })).toThrow()
+  })
+
   test('Given 提取规则 When 解析草稿 Then 校验变量名、来源与上限', () => {
     const base = createApiRequestDraft()
     const valid = { ...base, extractions: [{ id: 'ex_1', name: 'access_token', from: 'json' as const, path: 'data.token', secret: true }] }
@@ -9,7 +39,7 @@ describe('接口工作台共享合同', () => {
     const badFrom = { ...base, extractions: [{ id: 'ex_1', name: 'token', from: 'cookie' as const, path: 'a', secret: false }] }
     const tooMany = { ...base, extractions: Array.from({ length: 17 }, (_, index) => ({ id: `ex_${index}`, name: `v${index}`, from: 'json' as const, path: 'a', secret: false })) }
 
-    expect(parseApiRequestDraft(valid).extractions[0]?.name).toBe('access_token')
+    expect(parseApiRequestDraft(valid).extractions?.[0]?.name).toBe('access_token')
     expect(() => parseApiRequestDraft(badName)).toThrow()
     expect(() => parseApiRequestDraft(badFrom)).toThrow()
     expect(() => parseApiRequestDraft(tooMany)).toThrow()
