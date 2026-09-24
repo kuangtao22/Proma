@@ -8,6 +8,7 @@ import {
   createImportedRequestTabs,
   createApiWorkbenchController,
   createRequestTab,
+  draftFromRun,
   draftAssertions,
   editApiValue,
   formatCookieExpiry,
@@ -404,6 +405,73 @@ describe('接口工作台编辑模型', () => {
     expect(formatCookieExpiry(null)).toBe('会话 cookie')
     expect(formatCookieExpiry(1_000, 2_000)).toBe('已过期')
     expect(formatCookieExpiry(2_000, 1_000)).toBe(new Date(2_000).toLocaleString())
+  })
+
+  test('Given 历史运行 When 载入编辑器 Then 还原真实请求且把遮罩位置留空待重填', () => {
+    const run = {
+      ...createRun('run-1'),
+      requestName: '下单',
+      requestId: 'request-1',
+      request: {
+        method: 'POST' as const,
+        url: 'https://example.test/orders?page=2&token=%5BREDACTED%5D',
+        headers: [
+          { name: 'Authorization', value: '[REDACTED]', source: 'generated' as const },
+          { name: 'Content-Type', value: 'application/json', source: 'generated' as const },
+          { name: 'X-Trace', value: 'trace-1', source: 'user' as const },
+        ],
+        body: '{"name":"ada","token":"[REDACTED]"}',
+        timeoutMs: 15_000,
+        followRedirects: true,
+        maxRedirects: 2,
+        sensitiveHeaderNames: ['authorization'],
+        sensitiveQueryNames: ['token'],
+      },
+    }
+    const catalog: ApiCatalog = { ...createCatalog(), requests: [{ ...createApiRequestDraft('default'), id: 'request-1', revision: 2, updatedAt: 1, collectionId: 'default', cases: [createApiCase('case_1', '用例')] }] }
+
+    let seed = 0
+    const result = draftFromRun(run, catalog, () => `f${++seed}`)
+
+    expect(result.draft.name).toBe('下单 · 历史还原')
+    expect(result.draft.collectionId).toBe('default')
+    expect(result.draft.method).toBe('POST')
+    /** 查询串拆成行，URL 只留 origin + path。 */
+    expect(result.draft.url).toBe('https://example.test/orders')
+    expect(result.draft.query.map((field) => `${field.name}:${field.enabled ? 'on' : 'off'}:${field.value}`)).toEqual(['page:on:2', 'token:off:'])
+    /** 被遮罩的 Header 留空并取消勾选，可见 Header 原样还原。 */
+    expect(result.draft.headers.map((field) => `${field.name}:${field.enabled ? 'on' : 'off'}:${field.value}`)).toEqual([
+      'Authorization:off:', 'Content-Type:on:application/json', 'X-Trace:on:trace-1',
+    ])
+    /** 正文用不可解析的占位符提示，绝不把 [REDACTED] 当真值。 */
+    expect(result.draft.body).toEqual({ kind: 'json', text: '{"name":"ada","token":"{{REDACTED_SECRET}}"}', fields: [] })
+    expect(JSON.stringify(result.draft)).not.toContain('[REDACTED]')
+    expect(result.redacted).toEqual(['Header Authorization', 'Query token', '正文'])
+    /** 用例属于原定义，不随快照复制；鉴权已体现在 Header 里。 */
+    expect(result.draft.cases).toEqual([])
+    expect(result.draft.auth).toEqual({ type: 'none', value: { value: '' } })
+    expect(result.draft.timeoutMs).toBe(15_000)
+    expect(result.draft.followRedirects).toBe(true)
+    expect(result.draft.maxRedirects).toBe(2)
+  })
+
+  test('Given URL 里含百分号编码的遮罩 When 载入 Then 用占位符替换并列入待重填', () => {
+    const run = {
+      ...createRun('run-2'),
+      request: {
+        ...createRun('run-2').request,
+        url: 'https://example.test/users/%5BREDACTED%5D',
+        headers: [],
+        body: '',
+      },
+    }
+
+    const result = draftFromRun(run, null, () => 'f1')
+
+    expect(result.draft.url).toBe('https://example.test/users/{{REDACTED_SECRET}}')
+    expect(result.redacted).toEqual(['URL'])
+    /** 目录为空时仍可载入，落到默认集合。 */
+    expect(result.draft.collectionId).toBe('default')
   })
 })
 

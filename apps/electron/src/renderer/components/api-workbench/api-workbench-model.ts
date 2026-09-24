@@ -5,8 +5,10 @@ import type {
   ApiCatalogSnapshot,
   ApiCaseReportMeta,
   ApiCaseReportRow,
+  ApiField,
   ApiPreparedPreview,
   ApiRequestDraft,
+  ApiRequestBody,
   ApiRun,
   ApiTestCase,
   ApiValue,
@@ -14,6 +16,7 @@ import type {
 } from '@proma/shared'
 import {
   createApiCaseReportRow,
+  createApiRequestDraft,
   describeApiCatalogSnapshot,
   detectApiWorkbenchImportKind,
   parseApiCatalogSnapshot,
@@ -162,6 +165,104 @@ export function createRequestTab(
 /** 比较当前草稿与最近保存快照。 */
 export function isApiRequestDirty(tab: ApiWorkbenchRequestTab): boolean {
   return tab.savedDraft === null || JSON.stringify(tab.draft) !== JSON.stringify(tab.savedDraft)
+}
+
+/** 历史载入的结果：可编辑草稿 + 必须重新填写的位置。 */
+export interface ApiRunDraftResult {
+  draft: ApiRequestDraft
+  /** 被遮罩而必须重填的位置，例如「Header Authorization」「URL」。 */
+  redacted: string[]
+}
+
+/** 脱敏遮罩：Header/Query/正文里的取值，以及 URL 里的百分号编码形态。 */
+const REDACTED_TEXT = '[REDACTED]'
+const REDACTED_URL = '%5BREDACTED%5D'
+/**
+ * URL 里被遮罩的秘密用变量占位符还原：这个名字不可能是已声明变量，
+ * 因此 prepare 会在解析阶段直接拒绝（fail closed），而不是把假值发出去。
+ */
+const REDACTED_PLACEHOLDER = '{{REDACTED_SECRET}}'
+
+/**
+ * 把一次运行的真实请求还原成未保存草稿。
+ *
+ * 运行记录里保存的是**已解析并脱敏**的请求，因此这里只做「还原可见事实 + 标出必须重填的位置」：
+ * 被遮罩的取值一律不写回草稿（Header/Query 行留空并取消勾选，URL 与正文用无法解析的占位符提示），
+ * 绝不把字面量 `[REDACTED]` 当成真值。用例、目标环境标记与自动 Cookie 属于原定义，不随快照复制。
+ * @param run 历史运行（来自运行记录，秘密已被遮罩）。
+ * @param catalog 当前目录，用于沿用原请求的集合归属。
+ * @param createId 字段身份生成器，便于测试注入。
+ * @returns 可直接打开为新标签的草稿，以及需要重新填写的位置列表。
+ */
+export function draftFromRun(run: ApiRun, catalog: ApiCatalog | null, createId: () => string): ApiRunDraftResult {
+  /** 目录里仍在的原定义；只用来沿用集合归属，不复制它的用例与秘密。 */
+  const definition = run.requestId ? catalog?.requests.find((item) => item.id === run.requestId) : undefined
+  const collectionId = definition?.collectionId ?? catalog?.collections[0]?.id ?? 'default'
+  /** 待重填位置，按出现顺序去重。 */
+  const redacted: string[] = []
+  const mark = (label: string): void => { if (!redacted.includes(label)) redacted.push(label) }
+  /** 逐条还原 Header：被遮罩的取值留空并取消勾选，避免发出空值或假值。 */
+  const headers: ApiField[] = run.request.headers.map((header) => {
+    if (header.value !== REDACTED_TEXT) return { id: createId(), name: header.name, value: header.value, enabled: true }
+    mark(`Header ${header.name}`)
+    return { id: createId(), name: header.name, value: '', enabled: false }
+  })
+  /** Query 已经体现在解析后的 URL 上，拆回列表便于编辑。 */
+  const query: ApiField[] = []
+  let url = run.request.url
+  try {
+    const parsed = new URL(run.request.url)
+    for (const [name, value] of parsed.searchParams) {
+      if (value !== REDACTED_TEXT) { query.push({ id: createId(), name, value, enabled: true }); continue }
+      mark(`Query ${name}`)
+      query.push({ id: createId(), name, value: '', enabled: false })
+    }
+    /** 查询串已经拆成行，URL 只保留 origin + path + hash。 */
+    const hash = parsed.hash
+    parsed.search = ''
+    parsed.hash = ''
+    url = `${parsed.toString()}${hash}`
+  } catch {
+    mark('URL')
+  }
+  if (url.includes(REDACTED_TEXT) || url.includes(REDACTED_URL)) {
+    mark('URL')
+    url = url.replaceAll(REDACTED_TEXT, REDACTED_PLACEHOLDER).replaceAll(REDACTED_URL, REDACTED_PLACEHOLDER)
+  }
+  /** 正文同样只还原可见内容；被遮罩的片段用占位符标出。 */
+  const contentType = run.request.headers.find((header) => header.name.toLowerCase() === 'content-type')?.value.toLowerCase() ?? ''
+  let bodyText = run.request.body
+  if (bodyText.includes(REDACTED_TEXT)) {
+    mark('正文')
+    bodyText = bodyText.replaceAll(REDACTED_TEXT, REDACTED_PLACEHOLDER)
+  }
+  const body: ApiRequestBody = bodyText === ''
+    ? { kind: 'none', text: '', fields: [] }
+    : contentType.includes('json')
+      ? { kind: 'json', text: bodyText, fields: [] }
+      : { kind: 'text', text: bodyText, fields: [] }
+  return {
+    draft: {
+      ...createApiRequestDraft(collectionId),
+      /** 名字必须能看出这是历史还原出来的草稿，避免被误当成已保存定义。 */
+      name: `${run.requestName} · 历史还原`.slice(0, 128),
+      method: run.request.method,
+      url,
+      query,
+      headers,
+      body,
+      /** 鉴权已经体现在那次请求的 Header 里，这里不再重复配置。 */
+      auth: { type: 'none', value: { value: '' } },
+      timeoutMs: run.request.timeoutMs,
+      followRedirects: run.request.followRedirects,
+      maxRedirects: run.request.maxRedirects,
+      assertions: [],
+      extractions: [],
+      cases: [],
+      useCookieJar: false,
+    },
+    redacted,
+  }
 }
 
 /** 编辑普通值或秘密值；空秘密输入保留已有 secretRef。 */

@@ -75,6 +75,8 @@ const api: ApiWorkbenchApi = {
     /** 用例第一次被准备时登记顺序，后续报告按该顺序给结论。 */
     if (input.caseId && !caseOrder.has(input.caseId)) caseOrder.set(input.caseId, caseOrder.size)
     preparedRequest = { method: input.request.method, url: input.request.url, headers: input.request.headers.map(({ name, value }) => ({ name, value })), body: input.request.body.text, timeoutMs: input.request.timeoutMs, followRedirects: input.request.followRedirects, maxRedirects: input.request.maxRedirects, sensitiveHeaderNames: [], sensitiveQueryNames: [] }
+    /** 扮演 Host 的脱敏投影：真实运行里含秘密的 Header 只会以遮罩出现，供「载入编辑器」验证待重填提示。 */
+    preparedRequest = { ...preparedRequest, headers: [...preparedRequest.headers, { name: 'X-Api-Key', value: '[REDACTED]' }], sensitiveHeaderNames: ['x-api-key'] }
     return { preparedId: 'prepared-smoke', request: preparedRequest, requestName: input.request.name, catalogRevision: state.catalog.revision, createdAt: Date.now(), expiresAt: Date.now() + 60_000, warnings: [] }
   },
   send: async () => {

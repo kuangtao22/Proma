@@ -336,7 +336,28 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     } finally {
       agentWindow.destroy()
     }
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、宽布局、亮暗主题与窄 Pane 已验证')
+    /** 历史载入编辑器：把运行里的真实请求还原成未保存草稿，并列出必须重填的遮罩位置。 */
+    await clickLabel(window, '运行历史')
+    await clickLabel(window, '打开运行 Smoke 请求')
+    await waitFor(window, "document.body.textContent?.includes('200')", '历史运行未打开')
+    await clickLabel(window, '载入编辑器')
+    await waitFor(window, "document.querySelector('input[aria-label=\"请求名称\"]')?.value.includes('历史还原') ?? false", '历史草稿未打开')
+    assert.equal(await window.webContents.executeJavaScript('document.body.textContent?.includes("必须重新填写") ?? false'), true, '缺少需要重填的提示')
+    assert.equal(await window.webContents.executeJavaScript('document.body.textContent?.includes("Header X-Api-Key") ?? false'), true, '提示没有列出被遮罩的 Header')
+    /** 被遮罩的取值留空并取消勾选：宁可少发，也不发出空值或假值。 */
+    await clickText(window, 'Headers')
+    await waitFor(window, "Boolean(document.querySelector('input[aria-label=\"启用 X-Api-Key\"]'))", 'Header 行未渲染')
+    assert.equal(await window.webContents.executeJavaScript("document.querySelector('input[aria-label=\"启用 X-Api-Key\"]')?.checked ?? true"), false, '被遮罩的 Header 没有被取消勾选')
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const box = document.querySelector('input[aria-label="启用 X-Api-Key"]')
+      const row = box?.closest('div')
+      return Boolean(row && [...row.querySelectorAll('input')].some((item) => item.value === ''))
+    })()`), true, '被遮罩的 Header 取值没有留空')
+    assert.equal(await window.webContents.executeJavaScript("document.querySelector('input[aria-label=\"请求 URL\"]')?.value ?? ''"), 'http://127.0.0.1:8080/smoke', 'URL 还原不正确')
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-load-run.png', (await window.webContents.capturePage()).toPNG())
+    console.log('[API Workbench UI smoke] 历史载入编辑器已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

@@ -196,4 +196,17 @@ describe('接口工作台 UI 集成', () => {
     /** cookie 值不在界面状态里：面板只用元数据字段。 */
     expect(source).not.toContain('cookie.value')
   })
+
+  test('Given 已交付历史载入编辑器 When 检查组件源码 Then 运行头部接线且提示需要重填', async () => {
+    const source = await Bun.file(new URL('./ApiWorkbench.tsx', import.meta.url)).text()
+
+    expect(source).toContain('label="载入编辑器"')
+    expect(source).toContain('draftFromRun(run, catalog')
+    expect(source).toContain('onLoadToEditor={loadRunToEditor}')
+    expect(source).toContain('必须重新填写')
+    expect(source).toContain('已按历史还原成未保存草稿')
+    /** 载入只开新的未保存标签，绝不覆盖已保存定义。 */
+    expect(source).toContain("createLocalId('draft')")
+    expect(source).not.toContain('mutateCatalog((latest) => upsertCatalogRequest(latest, run')
+  })
 })

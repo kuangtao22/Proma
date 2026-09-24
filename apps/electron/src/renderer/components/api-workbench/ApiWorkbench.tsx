@@ -11,6 +11,7 @@ import {
   Copy,
   Download,
   Eye,
+  FileInput,
   Folder,
   FolderPlus,
   History,
@@ -96,6 +97,7 @@ import {
   createApiWorkbenchController,
   createImportedRequestTabs,
   createRequestTab,
+  draftFromRun,
   draftAssertions,
   editApiValue,
   formatCookieExpiry,
@@ -719,7 +721,7 @@ function RequestSettings({ draft, environments, activeEnvironmentId, onChange }:
 }
 
 /** 响应与历史区域。 */
-function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, resolveCaseName, historyHasMore = false, onLoadMoreHistory }: {
+function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, resolveCaseName, onLoadToEditor, historyHasMore = false, onLoadMoreHistory }: {
   api: ApiWorkbenchApi
   sessionId: string
   run: ApiRun | null
@@ -730,6 +732,8 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
   onPinRun: (run: ApiRun) => void
   /** 运行所属用例名；未按用例运行时返回 null。 */
   resolveCaseName: (run: ApiRun) => string | null
+  /** 把这次运行的真实请求载入成一份新的未保存草稿。 */
+  onLoadToEditor: (run: ApiRun) => void
   historyHasMore?: boolean
   onLoadMoreHistory?: () => void
 }): React.ReactElement {
@@ -861,6 +865,7 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
         {!revealed && displayedRun.recording !== 'failed' && <ToolButton label="查看本地原始内容" onClick={revealOriginal}><Eye className="size-3.5" /></ToolButton>}
         <ToolButton label="运行历史" onClick={() => onHistoryOpenChange(true)}><History className="size-3.5" /></ToolButton>
         {displayedRun.requestId && <ToolButton label="用当前定义重发" onClick={() => { dispatchResendApiRun(displayedRun, sessionId) }}><Play className="size-3.5" /></ToolButton>}
+        <ToolButton label="载入编辑器" onClick={() => onLoadToEditor(displayedRun)}><FileInput className="size-3.5" /></ToolButton>
       </div>
       <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/50 px-3 scrollbar-none">
         {sections.map(([id, label]) => <button key={id} type="button" className={cn('h-8 shrink-0 border-b-2 px-2 text-xs', section === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground')} onClick={() => setSection(id)}>{label}</button>)}
@@ -1404,6 +1409,21 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** 运行所属用例名；先看当前标签草稿，再按目录回查已保存请求。 */
   const resolveCaseName = React.useCallback((run: ApiRun): string | null => resolveApiCaseName(run, activeTab?.draft ?? null, catalog), [activeTab, catalog])
 
+  /**
+   * 把一次运行的真实请求载入成新的未保存草稿。
+   * 记录里的取值是遮罩过的，因此这里只还原可见事实：被遮罩的位置留空并列入提示，绝不写回 [REDACTED]。
+   */
+  const loadRunToEditor = React.useCallback((run: ApiRun): void => {
+    /** 本地草稿标签身份；载入不覆盖任何已保存定义。 */
+    const tabId = createLocalId('draft')
+    const loaded = draftFromRun(run, catalog, () => createLocalId('field'))
+    setView((previous) => ({ ...previous, tabs: [...previous.tabs, createRequestTab(tabId, loaded.draft)], activeTabId: tabId, selectedRun: null, historyOpen: false }))
+    setCompactView('request')
+    setNotice(loaded.redacted.length > 0
+      ? `已按历史还原成未保存草稿；以下位置在运行记录里是遮罩值，必须重新填写：${loaded.redacted.join('、')}`
+      : '已按历史还原成未保存草稿；鉴权已体现在请求头里，确认后再发送或保存')
+  }, [catalog, setView])
+
   /** 导入的 cURL 草稿一律新开标签，确认无误后才写入目录。 */
   const importDrafts = React.useCallback((drafts: ApiRequestDraft[]): void => {
     if (drafts.length === 0) return
@@ -1608,7 +1628,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
               }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} /></section>}
-              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} /></section>}
+              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} /></section>}
             </div>
           )}
         </main>
