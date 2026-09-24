@@ -1,7 +1,7 @@
-import { accessSync, constants, lstatSync } from 'node:fs'
+import { accessSync, constants, lstatSync, mkdirSync, opendirSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { PATH_MANAGEMENT_IPC_CHANNELS } from '@proma/shared'
 import type {
   DataRootMigrationPreview,
@@ -9,6 +9,8 @@ import type {
   DataRootMigrationSelectionInput,
   DataRootOccupiedStorage,
   DataRootSelection,
+  DataRootRecoverySelection,
+  DataRootStartupIssue,
   DataRootStartupMode,
   OpenDataRootTarget,
   PathManagementState,
@@ -25,7 +27,8 @@ import { DataRootLocator } from './data-root-locator'
 import type { DataRootLocatorResult } from './data-root-locator'
 import { DataRootMigrationCoordinator } from './data-root-migration'
 import type { DataRootMigrationGuard } from './data-root-instance-lease'
-import { ensurePromaDataRootMarker } from './data-root-marker'
+import { ensurePromaDataRootMarker, initializeEmptyPromaDataRoot, inspectPromaDataRootIdentity } from './data-root-marker'
+import { inspectDataRootDirectories, inspectDataRootStartup } from './data-root-startup-check'
 import {
   inspectDataRootOccupied,
   inspectDataRootStorageFast,
@@ -125,6 +128,8 @@ export interface PathManagementCoordinator {
 export interface RegisterPathManagementIpcOptions {
   /** 当前启动隔离模式。 */
   mode: DataRootStartupMode
+  /** 保留启动准备阶段失败的原因，供恢复页首次展示。 */
+  initialStartupIssue?: DataRootStartupIssue
   /** 可测试的 ipcMain 最小接口。 */
   ipc: PathManagementIpcRegistrar
   /** Electron 应用生命周期接口。 */
@@ -168,6 +173,14 @@ export interface RegisterPathManagementIpcOptions {
 interface DataRootSelectionState extends DataRootSelection {
   generation: number
   status: 'selected' | 'previewing' | 'previewed' | 'starting'
+}
+
+/** 恢复选择仅对同一窗口、目录身份与当前选择代次有效。 */
+interface RecoverySelectionState extends DataRootRecoverySelection {
+  /** 系统选择时的真实目录设备与 inode，防止确认前被替换。 */
+  device: bigint
+  inode: bigint
+  owner: object
 }
 
 /** normal 窗口内单次项目目标授权的服务端状态。 */
@@ -215,6 +228,10 @@ export function registerPathManagementIpcHandlers(
   const registeredChannels: string[] = []
   /** normal 窗口当前仍有效的服务端目标授权。 */
   let currentSelection: DataRootSelectionState | null = null
+  /** recovery 与迁移授权分离，取消或新选择立即撤销旧授权。 */
+  let recoverySelection: RecoverySelectionState | null = null
+  /** 最近一次启动或重新检测的准备错误，避免只读查询抹掉真实失败原因。 */
+  let lastStartupIssue = options.initialStartupIssue
   /** pick 调用代次，较早对话框晚返回时不得恢复旧授权。 */
   let selectionGeneration = 0
   /** workspace 与 data-root 使用不同状态，禁止 token 跨 scope 复用。 */
@@ -248,9 +265,13 @@ export function registerPathManagementIpcHandlers(
     options.app.quit()
   }
   /** 使用新 locator 重读磁盘，避免 recovery 页拿到启动时缓存。 */
-  const inspectFresh = (): DataRootLocatorResult => new DataRootLocator({
-    homeDir: options.homeDir ?? homedir(),
-  }).inspect()
+  const inspectFresh = (initialize = false): DataRootLocatorResult => {
+    /** 每次从磁盘读取定位器，禁止复用启动缓存。 */
+    const fresh = inspectDataRootStartup(new DataRootLocator({ homeDir: options.homeDir ?? homedir() }), initialize)
+    if (initialize) lastStartupIssue = fresh.state.startupIssue
+    if (fresh.state.startupIssue || !lastStartupIssue) return fresh
+    return { ...fresh, status: 'unavailable', state: { ...fresh.state, startupIssue: lastStartupIssue } }
+  }
 
   if (options.mode === 'normal') {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, async () => {
@@ -572,15 +593,66 @@ export function registerPathManagementIpcHandlers(
     })
   } else {
     register(PATH_MANAGEMENT_IPC_CHANNELS.GET_STATE, () => inspectFresh().state)
-    register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async () => {
+    register(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT, async (event) => {
       if (!options.dialog) throw new Error('当前环境不支持选择数据根目录')
-      /** 用户通过系统对话框选择的目录结果。 */
+      /** 新选择和取消都撤销旧确认，较早返回的对话框不得恢复授权。 */
+      const generation = ++selectionGeneration
+      recoverySelection = null
+      /** 保存系统对话框发起者；窗口替换后不接受旧选择。 */
+      const owner = (event as PathManagementInvokeEvent).sender
       const result = await options.dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] })
-      return result.canceled ? null : result.filePaths[0] ?? null
+      if (generation !== selectionGeneration || owner !== options.getExpectedWebContents()) return null
+      if (result.canceled || !result.filePaths[0]) return null
+      /** 候选校验只读取目录元数据和有界身份文件，不写 marker 或业务目录。 */
+      const targetRoot = resolve(result.filePaths[0])
+      const kind = inspectRecoveryCandidate(targetRoot)
+      const identity = lstatSync(targetRoot, { bigint: true })
+      recoverySelection = { selectionId: createSelectionId(), targetRoot, kind, device: identity.dev, inode: identity.ino, owner }
+      return { selectionId: recoverySelection.selectionId, targetRoot, kind } satisfies DataRootRecoverySelection
     })
-    register(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, (_event, input) => {
-      recoverDataRoot(input, options.homeDir ?? homedir(), inspectFresh())
-      if (isRecoveryResolved(input, inspectFresh())) relaunchNow()
+    register(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT, (event, input) => {
+      if (!isRecoverDataRootInput(input)) throw new Error('数据根恢复请求无效')
+      if (input.action === 'cancel-selection') {
+        if (!input.selectionId) throw new Error('目录选择授权无效')
+        /** 重复取消安全返回；旧确认的迟到取消不得撤销新选择。 */
+        if (recoverySelection?.selectionId === input.selectionId
+          && recoverySelection.owner === (event as PathManagementInvokeEvent).sender) recoverySelection = null
+        return
+      }
+      /** 重检必须真正执行启动准备，不能只见根目录存在就重启到同一个错误。 */
+      if (input.action === 'recheck') {
+        if (resolveDataRootStartupMode(inspectFresh(true)) === 'normal') relaunchNow()
+        return
+      }
+      /** 未完成的迁移与 cleanup 不能被重新定位覆盖。 */
+      const current = inspectFresh()
+      if (current.state.migration !== null || current.state.postCommitCleanup !== undefined) {
+        throw new Error('迁移已提交但仍待清理或迁移尚未完成，请恢复当前目标盘后重新检测；此时不能重新定位或切回旧根')
+      }
+      if (input.action === 'relocate') {
+        /** 回传路径必须匹配最新一次系统选择及发起窗口。 */
+        const selection = recoverySelection
+        if (!selection || selection.owner !== (event as PathManagementInvokeEvent).sender
+          || selection.selectionId !== input.selectionId || selection.targetRoot !== input.selectedRoot) {
+          throw new Error('目录选择已失效，请重新选择应用数据目录')
+        }
+        /** 提交前再检查类型与目录身份，防止确认旧预览后修改新目录。 */
+        const kind = inspectRecoveryCandidate(selection.targetRoot)
+        const identity = lstatSync(selection.targetRoot, { bigint: true })
+        if (kind !== selection.kind || identity.dev !== selection.device || identity.ino !== selection.inode) {
+          recoverySelection = null
+          throw new Error('所选目录已变化，请重新选择应用数据目录')
+        }
+        if (kind === 'empty' && input.initializeEmpty !== true) throw new Error('请先确认启用全新数据区，原数据不会自动迁移')
+        recoverDataRoot(input, options.homeDir ?? homedir(), current, () => {
+          assertRecoveryDirectoryIdentity(selection.targetRoot, selection.device, selection.inode)
+        })
+        recoverySelection = null
+      } else {
+        recoverDataRoot(input, options.homeDir ?? homedir(), current)
+      }
+      lastStartupIssue = undefined
+      if (resolveDataRootStartupMode(inspectFresh(true)) === 'normal') relaunchNow()
     })
   }
 
@@ -782,9 +854,14 @@ async function assertMigrationCanStart(options: RegisterPathManagementIpcOptions
 }
 
 /** 执行无普通业务依赖的数据根恢复动作。 */
-function recoverDataRoot(input: unknown, homeDir: string, current: DataRootLocatorResult): void {
+function recoverDataRoot(
+  input: unknown,
+  homeDir: string,
+  current: DataRootLocatorResult,
+  verifySelection?: () => void,
+): void {
   if (!isRecoverDataRootInput(input)) throw new Error('数据根恢复请求无效')
-  if (input.action === 'recheck') return
+  if (input.action === 'recheck' || input.action === 'cancel-selection') return
   if (current.state.postCommitCleanup !== undefined) {
     throw new Error('迁移已提交但仍待清理，请恢复当前目标盘后重新检测；此时不能重新定位或切回旧根')
   }
@@ -793,10 +870,34 @@ function recoverDataRoot(input: unknown, homeDir: string, current: DataRootLocat
   /** 用户重新定位或切回的候选根目录。 */
   const candidateRoot = input.action === 'relocate' ? input.selectedRoot : current.state.previousRoot
   if (!candidateRoot) throw new Error(input.action === 'relocate' ? '请选择新的数据根目录' : '没有可切回的旧数据根')
-  assertAvailableDirectory(candidateRoot)
-  ensurePromaDataRootMarker(candidateRoot)
+  /** 旧备份也绑定本次恢复开始时的身份；目录选择沿用选择器授权身份。 */
+  const initialIdentity = lstatSync(candidateRoot, { bigint: true })
+  const verifyDirectory = verifySelection ?? (() => {
+    assertRecoveryDirectoryIdentity(candidateRoot, initialIdentity.dev, initialIdentity.ino)
+  })
+  verifyDirectory()
+  /** 候选根和关键子目录均通过检查才允许写入。 */
+  const kind = inspectRecoveryCandidate(candidateRoot)
+  if (kind === 'empty') {
+    if (input.action !== 'relocate' || input.initializeEmpty !== true) throw new Error('请先确认启用全新数据区')
+    initializeEmptyPromaDataRoot(candidateRoot, verifyDirectory)
+  } else {
+    ensurePromaDataRootMarker(candidateRoot, verifyDirectory)
+  }
+  /** 在更新全局 locator 前补齐关键目录并复核，失败仍保持原 activeRoot。 */
+  verifyDirectory()
+  try {
+    // 仅创建直接子目录；父目录消失时停止，不能递归重建未获授权的新路径。
+    mkdirSync(join(candidateRoot, 'server-ops'))
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+  }
+  verifyDirectory()
+  const preparedIssue = inspectDataRootDirectories(candidateRoot)
+  if (preparedIssue) throw new Error(`${preparedIssue.message}：${preparedIssue.path}`)
   /** 当前离线根保留为 previousRoot，便于用户在设备恢复后再次定位。 */
   const unavailableRoot = current.state.activeRoot
+  verifyDirectory()
   locator.write({
     version: 1,
     activeRoot: resolve(candidateRoot),
@@ -804,19 +905,15 @@ function recoverDataRoot(input: unknown, homeDir: string, current: DataRootLocat
   })
 }
 
-/** 判断恢复动作完成后是否已经可以回到 normal 模式。 */
-function isRecoveryResolved(input: unknown, latest: DataRootLocatorResult): boolean {
-  return isRecoverDataRootInput(input)
-    && resolveDataRootStartupMode(latest) === 'normal'
-}
-
 /** 运行时校验 renderer 传入的恢复请求。 */
 function isRecoverDataRootInput(input: unknown): input is RecoverDataRootInput {
   if (typeof input !== 'object' || input === null) return false
   /** renderer 输入按 unknown 字段逐项校验。 */
-  const value = input as { action?: unknown; selectedRoot?: unknown }
-  return (value.action === 'recheck' || value.action === 'relocate' || value.action === 'restore-previous')
+  const value = input as { action?: unknown; selectedRoot?: unknown; selectionId?: unknown; initializeEmpty?: unknown }
+  return (value.action === 'recheck' || value.action === 'relocate' || value.action === 'restore-previous' || value.action === 'cancel-selection')
     && (value.selectedRoot === undefined || typeof value.selectedRoot === 'string')
+    && (value.selectionId === undefined || typeof value.selectionId === 'string')
+    && (value.initializeEmpty === undefined || typeof value.initializeEmpty === 'boolean')
 }
 
 /** 验证候选数据根为具备读写进入权限的绝对目录。 */
@@ -834,5 +931,34 @@ function assertAvailableDirectory(root: string): void {
       throw error
     }
     throw new Error('所选数据根当前不可读写', { cause: error })
+  }
+}
+
+/** 检查候选的目录边界与数据身份；只接收已有 Proma 数据或严格空目录。 */
+function inspectRecoveryCandidate(root: string): DataRootRecoverySelection['kind'] {
+  assertAvailableDirectory(root)
+  /** 启动与候选必须使用同一规则，避免选中后再次遇到 server-ops 错误。 */
+  const issue = inspectDataRootDirectories(root)
+  if (issue) throw new Error(`${issue.message}：${issue.path}`)
+  if (inspectPromaDataRootIdentity(root) !== null) return 'existing'
+  /** 只读取首个目录项判断空目录，开销与目录文件总量无关。 */
+  const directory = opendirSync(root)
+  try {
+    if (directory.readSync() === null) return 'empty'
+  } finally {
+    directory.closeSync()
+  }
+  throw new Error('所选目录不是可识别的 Proma 数据根，也不是空目录；请选择已有应用数据目录或新建空文件夹')
+}
+
+/**
+ * 在每个恢复副作用边界复验授权目录，检测持续的目录替换。
+ * 保持仓库路径式写入合同；不承诺抵御同用户进程在系统调用间的恶意瞬时重绑。
+ */
+function assertRecoveryDirectoryIdentity(root: string, device: bigint, inode: bigint): void {
+  /** no-follow 判型同时拒绝符号链接、同名文件和另一目录身份。 */
+  const current = lstatSync(root, { bigint: true })
+  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== device || current.ino !== inode) {
+    throw new Error('所选目录已变化，请重新选择应用数据目录')
   }
 }

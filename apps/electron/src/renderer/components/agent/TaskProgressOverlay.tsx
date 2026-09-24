@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 import type { ToolActivity } from '@/atoms/agent-atoms'
 import { useStickToBottomContext } from 'use-stick-to-bottom'
 import { TaskProgressCard } from './TaskProgressCard'
-import { aggregateTaskItems, isTerminalTaskStatus, type TaskItem } from './task-progress'
+import { aggregateTaskItems, getTaskProgressCounts, isTerminalTaskStatus, type TaskItem } from './task-progress'
 
 const FINISH_RETENTION_MS = 4_000
 const FADE_OUT_DURATION_MS = 200
@@ -57,6 +57,11 @@ export function shouldClearRetainedCompactionForResumedStream(
   return streaming && !contextCompaction && !!retainedCompaction
 }
 
+/** 任务完成反馈只在整个 Agent run 结束后开始倒计时，避免 Agent 仍工作时提前隐藏进度。 */
+export function shouldRetainTaskProgress(streaming: boolean, hasTasks: boolean): boolean {
+  return hasTasks && !streaming
+}
+
 function CompactionProgressDetails({ progress }: { progress: ContextCompactionProgress }): React.ReactElement {
   const isRunning = progress.status === 'running'
   const isFailed = progress.status === 'failed'
@@ -96,7 +101,6 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
   )
   const liveSignature = taskSignature(liveItems)
   const hasLiveTasks = liveItems.length > 0
-  const hasLiveActiveTask = liveItems.some((item) => !isTerminalTaskStatus(item.status))
   const [retainedActivities, setRetainedActivities] = React.useState<ToolActivity[]>([])
   const [retainedSignature, setRetainedSignature] = React.useState('')
   const [retainedCompaction, setRetainedCompaction] = React.useState<ContextCompactionProgress | undefined>()
@@ -141,8 +145,8 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
 
   const displayActivities = hasLiveTasks ? activities : retainedActivities
   const displayItems = hasLiveTasks
-    ? liveItems
-    : aggregateTaskItems(retainedActivities, false)
+    ? aggregateTaskItems(activities, !streaming)
+    : aggregateTaskItems(retainedActivities, !streaming)
   const displaySignature = hasLiveTasks ? liveSignature : retainedSignature
   const displayCompaction = contextCompaction ?? retainedCompaction
   // 上游每次 liveMessages 更新都会重建 progress 对象；超时 effect 必须依赖稳定签名，不能依赖对象引用。
@@ -151,7 +155,7 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
   const compactionIsRunning = displayCompaction?.status === 'running'
   const shouldRetainFinishedProgress = displayCompaction
     ? !compactionIsRunning && displayCompaction.status !== 'failed'
-    : hasDisplayTasks && (!streaming || !hasLiveActiveTask)
+    : shouldRetainTaskProgress(streaming, hasDisplayTasks)
   const hideKey = shouldRetainFinishedProgress
     ? displayCompactionSignature
       ? `${displayCompactionSignature}:${streaming}`
@@ -187,7 +191,7 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
     }
   }, [hasDisplayTasks, displayCompactionSignature, hideKey])
 
-  const completedCount = displayItems.filter((item) => isTerminalTaskStatus(item.status)).length
+  const { completed: completedCount } = getTaskProgressCounts(displayItems)
   const currentTask = getCurrentTask(displayItems)
   const showTaskProgress = visible && (hasDisplayTasks || !!displayCompaction)
 
@@ -246,7 +250,7 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
         <PopoverContent className="w-[min(420px,calc(100vw-2rem))] rounded-md border-border/60 bg-background/95 p-2 backdrop-blur-sm" side="top" align="center">
           {displayCompaction
             ? <CompactionProgressDetails progress={displayCompaction} />
-            : <TaskProgressCard activities={displayActivities} alwaysExpanded />}
+            : <TaskProgressCard activities={displayActivities} streamEnded={!streaming} alwaysExpanded />}
         </PopoverContent>
       </Popover>
 

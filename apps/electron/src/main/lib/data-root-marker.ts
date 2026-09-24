@@ -4,6 +4,7 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  opendirSync,
   readSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -104,13 +105,32 @@ export function inspectPromaDataRootIdentity(root: string): 'marker' | 'legacy' 
  * 确保已证明所有权的数据根拥有精确 marker，并在写后重新校验。
  *
  * @param root 已确认在线且可写的数据根目录。
+ * @param verifyDirectory 可选的已授权目录身份复验，不改变普通启动调用。
  */
-export function ensurePromaDataRootMarker(root: string): void {
+export function ensurePromaDataRootMarker(root: string, verifyDirectory?: () => void): void {
+  verifyDirectory?.()
   /** 写入前的身份结果，决定直接接受、升级或拒绝。 */
   const identity = inspectPromaDataRootIdentity(root)
   if (identity === 'marker') return
   if (identity === null) throw new Error('所选目录不是可识别的 Proma 数据根')
-  writeAndVerifyPromaDataRootMarker(root)
+  writeAndVerifyPromaDataRootMarker(root, verifyDirectory)
+}
+
+/**
+ * 初始化用户明确选择并确认的空白数据区，不覆盖非空普通目录。
+ * @param root 已通过目录身份与读写权限校验的绝对路径。
+ * @param verifyDirectory 可选的选择身份复验，防止持续目录替换后继续写入。
+ */
+export function initializeEmptyPromaDataRoot(root: string, verifyDirectory?: () => void): void {
+  verifyDirectory?.()
+  /** 只读取一个目录项，避免扫描大型用户文件夹。 */
+  const directory = opendirSync(root)
+  try {
+    if (directory.readSync() !== null) throw new Error('所选目录已非空，请重新选择应用数据目录')
+  } finally {
+    directory.closeSync()
+  }
+  writeAndVerifyPromaDataRootMarker(root, verifyDirectory)
 }
 
 /**
@@ -144,10 +164,13 @@ export function prepareNormalDataRoot(
 }
 
 /** 原子写入唯一合法 marker，并通过同一 no-follow 读取链精确复验。 */
-function writeAndVerifyPromaDataRootMarker(root: string): void {
+function writeAndVerifyPromaDataRootMarker(root: string, verifyDirectory?: () => void): void {
+  /** 恢复操作传入选择时身份，在每个安全原子写边界保持该身份。 */
+  verifyDirectory?.()
   /** marker 使用共享原子写封装，避免崩溃留下截断身份文件。 */
   const markerPath = join(root, PROMA_DATA_ROOT_MARKER_FILE)
-  writeJsonFileAtomicSecure(markerPath, PROMA_DATA_ROOT_MARKER)
+  writeJsonFileAtomicSecure(markerPath, PROMA_DATA_ROOT_MARKER, { beforeRename: verifyDirectory })
+  verifyDirectory?.()
   if (inspectPromaDataRootIdentity(root) !== 'marker') {
     throw new Error('Proma 数据根标记写入后校验失败')
   }

@@ -49,6 +49,7 @@ import type { AgentEventUsage, RetryAttempt, SDKAssistantMessage, SDKMessage, SD
 import { getSDKCompactStatus } from '@proma/shared'
 import { agentLiveMessagesAtomFamily, agentSessionStreamingStateAtomFamily, type AgentStreamState } from '@/atoms/agent-atoms'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
+import { shouldAcceptLiveSdkMessageForRun, type LiveSdkMessageRunIdentity } from '@/lib/live-sdk-message-run'
 
 const EMPTY_SDK_MESSAGES: SDKMessage[] = []
 
@@ -202,6 +203,23 @@ export function getContextCompactionProgress(
     }
   }
   return undefined
+}
+
+/**
+ * 汇总当前 run 的全部实时 turn。自动压缩会拆分 turn，但不应让此前创建的任务从进度卡消失。
+ */
+export function buildCurrentRunTaskActivities(
+  liveMessages: SDKMessage[],
+  sessionModelId: string | undefined,
+  currentRun: LiveSdkMessageRunIdentity | undefined,
+): ReturnType<typeof buildTaskProgressDataForTurn>['taskActivities'] {
+  const currentRunMessages = liveMessages.filter((message) => (
+    shouldAcceptLiveSdkMessageForRun(message, currentRun)
+  ))
+  return groupIntoTurns(currentRunMessages, sessionModelId)
+    .flatMap((group) => group.type === 'assistant-turn'
+      ? buildTaskProgressDataForTurn(group).taskActivities
+      : [])
 }
 
 export interface AgentHistoryQuoteNavigationRequest {
@@ -1048,12 +1066,13 @@ export const AgentMessages = React.memo(function AgentMessages({
       .join('\u0000')
   ), [allSDKMessages])
 
-  // 仅扫描当前 live turn；不从持久化历史恢复任务，避免跨 turn 显示旧进度。
+  // 仅扫描当前 run 的实时 turn；压缩会拆开 turn，但持久化历史与旧 run 不得混入。
   const liveTaskActivities = React.useMemo(() => {
-    const liveGroups = groupIntoTurns(liveMessages ?? [], sessionModelId)
-    const currentTurn = [...liveGroups].reverse().find((group) => group.type === 'assistant-turn')
-    return currentTurn ? buildTaskProgressDataForTurn(currentTurn).taskActivities : []
-  }, [liveMessages, sessionModelId])
+    return buildCurrentRunTaskActivities(liveMessages ?? [], sessionModelId, {
+      startedAt,
+      runGeneration: streamState?.runGeneration,
+    })
+  }, [liveMessages, sessionModelId, startedAt, streamState?.runGeneration])
 
   const contextCompaction = React.useMemo(
     () => getContextCompactionProgress(liveMessages ?? [], streamState?.isCompacting, streamState?.contextCompaction),

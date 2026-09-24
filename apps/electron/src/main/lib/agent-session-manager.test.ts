@@ -1,8 +1,9 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import * as os from 'node:os'
 import { join } from 'node:path'
-import type { SDKMessage } from '@proma/shared'
+import type { AgentProviderAdapter, SDKMessage } from '@proma/shared'
+import type { SessionCallbacks } from './agent-orchestrator'
 import { DataRootLocator } from './data-root-locator'
 import { listWorktreesStrict } from './git-diff-service'
 import { WorkspaceProjectRelocator } from './workspace-project-relocator'
@@ -45,11 +46,19 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
 }))
 
 mock.module('electron', () => ({
+  default: {},
   app: {
     isPackaged: true,
     getPath: () => join(process.env.HOME ?? tempHome, 'Library', 'Application Support'),
   },
   BrowserWindow: class {},
+  WebContentsView: class {},
+  utilityProcess: {},
+  MessageChannelMain: class {},
+  ipcMain: {},
+  session: {},
+  net: {},
+  webContents: {},
   clipboard: {},
   dialog: {},
   nativeImage: { createFromPath: () => ({}) },
@@ -69,6 +78,9 @@ mock.module('node:os', () => ({
   ...os,
   homedir: () => tempHome,
 }))
+
+// 删除预检测试不执行工具；隔离工具集合的 service 反向依赖，保留真实编排和持久化链路。
+mock.module('./adapters/pi-builtin-tools', () => ({ buildPiBuiltinTools: async () => ({ tools: [], toolNames: [] }) }))
 
 function jsonl(rows: string[]): string {
   return rows.join('\n') + '\n'
@@ -143,6 +155,11 @@ function createIndexedSessions(count: number) {
   }))
 }
 
+/** 为消息写入测试创建权威索引；单有 JSONL 文件不能代表会话仍存在。 */
+function indexSessionForAppend(sessionId: string): void {
+  writeAgentSessionsIndex([{ id: sessionId, title: '消息写入测试', workspaceId: 'workspace-a', createdAt: 1, updatedAt: 1 }])
+}
+
 beforeAll(async () => {
   tempHome = mkdtempSync(join(os.tmpdir(), 'proma-agent-session-manager-'))
   process.env.HOME = tempHome
@@ -167,8 +184,141 @@ afterAll(() => {
 })
 
 describe('Agent 会话 JSONL 读取', () => {
+  test('Given 项目删除已持有锁 When 普通或内部入口创建新会话 Then 在索引和目录写入前拒绝', async () => {
+    /** 使用生产锁验证所有会话创建入口的共同存储边界。 */
+    const { acquireWorkspaceOperation } = await import('./workspace-operation-lock')
+    const release = acquireWorkspaceOperation('delete-create-project', 'deletion')
+    const before = manager.listAgentSessions()
+    try {
+      expect(() => manager.createAgentSessionWithMetadata({ title: '迟到创建', workspaceId: 'delete-create-project' })).toThrow('项目正在删除')
+      expect(manager.listAgentSessions()).toEqual(before)
+    } finally {
+      release()
+    }
+  })
+
+  test('Given Canvas 受信任 ID 已删除 When 同一事实重试创建 Then 不复用删除身份', () => {
+    /** 完整的受信任 Canvas 归属，仅使用本测试独占的 UUID。 */
+    const input = { trustedSessionId: '33333333-3333-4333-8333-333333333333', title: 'Canvas 删除身份', workspaceId: 'canvas-deletion-project', sourceCanvasProjectId: 'canvas-deletion-project', sourceCanvasId: 'canvas-deletion', sourceCanvasNodeId: 'node-deletion' }
+    const session = manager.createAgentSessionWithMetadata(input)
+    manager.deleteAgentSession(session.id)
+    expect(() => manager.createAgentSessionWithMetadata(input)).toThrow('会话 ID 不能复用')
+    expect(manager.getAgentSessionMeta(session.id)).toBeUndefined()
+  })
+
+  test('Given 会话已进入删除边界 When 迟到发送 Then 不落盘、不启动查询并完成停止通知', async () => {
+    /** 使用真实编排层验证删除准入，不仅验证存储末端。 */
+    const { AgentOrchestrator } = await import('./agent-orchestrator')
+    const { AgentEventBus } = await import('./agent-event-bus')
+    /** 记录不应发生的底层查询。 */
+    const query = mock(async function* () {})
+    /** 最小无外部副作用适配器。 */
+    const adapter: AgentProviderAdapter = { query, abort: () => {}, forceCloseQuery: async () => {}, dispose: () => {} }
+    const orchestrator = new AgentOrchestrator(adapter, new AgentEventBus())
+    const session = manager.createAgentSession('删除中的发送')
+    const onError = mock(() => {})
+    const onComplete = mock<SessionCallbacks['onComplete']>(() => {})
+    manager.markAgentSessionDeleting(session.id)
+    await orchestrator.sendMessage({ sessionId: session.id, userMessage: '迟到请求', channelId: 'missing', startedAt: 123, runGeneration: 7 }, {
+      onError, onComplete, onTitleUpdated: () => {},
+    })
+    expect(query).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    expect(onComplete).toHaveBeenCalledWith([], { stoppedByUser: true, startedAt: 123, runGeneration: 7 })
+    expect(manager.getAgentSessionMessages(session.id)).toEqual([])
+    expect(orchestrator.isInFlight(session.id)).toBe(false)
+  })
+
+  test('Given 底层异步停止尚未完成 When 等待删除收尾 Then 只有 abort 完成后才能继续且错误会传递', async () => {
+    const { AgentOrchestrator } = await import('./agent-orchestrator')
+    const { AgentEventBus } = await import('./agent-event-bus')
+    /** 人工控制停止完成时机，避免计时器掩盖提前返回。 */
+    const pending = Promise.withResolvers<void>()
+    const abort = mock(() => pending.promise)
+    const adapter: AgentProviderAdapter = { query: async function* () {}, abort, forceCloseQuery: async () => {}, dispose: () => {} }
+    const orchestrator = new AgentOrchestrator(adapter, new AgentEventBus())
+    /** 删除流程是否已经越过底层停止边界。 */
+    let drained = false
+    const stopping = orchestrator.stopAndDrain('draining-session').then(() => { drained = true })
+    await Promise.resolve()
+    expect(abort).toHaveBeenCalledWith('draining-session')
+    expect(drained).toBe(false)
+    pending.resolve()
+    await stopping
+    expect(drained).toBe(true)
+    abort.mockImplementation(() => Promise.reject(new Error('停止失败')))
+    await expect(orchestrator.stopAndDrain('failing-session')).rejects.toThrow('停止失败')
+  })
+
+  test('Given 异步项目预检未返回 When 标记删除后预检失败 Then 不报告迟到错误或启动 runtime', async () => {
+    const { AgentOrchestrator } = await import('./agent-orchestrator')
+    const { AgentEventBus } = await import('./agent-event-bus')
+    const health = await import('./project-root-health')
+    /** 控制真实编排层首个异步预检的返回时间。 */
+    const pending = Promise.withResolvers<Awaited<ReturnType<typeof health.getLocalProjectRootStatus>>>()
+    const healthCheck = spyOn(health, 'getLocalProjectRootStatus').mockImplementation(() => pending.promise)
+    const query = mock(async function* () {})
+    const adapter: AgentProviderAdapter = { query, abort: () => {}, forceCloseQuery: async () => {}, dispose: () => {} }
+    const orchestrator = new AgentOrchestrator(adapter, new AgentEventBus())
+    writeAgentWorkspacesIndex([{ id: 'delete-preflight-workspace', name: '预检', slug: 'delete-preflight', projectRootPath: tempHome, createdAt: 1, updatedAt: 1 }])
+    const session = manager.createAgentSessionWithMetadata({ title: '删除预检', workspaceId: 'delete-preflight-workspace' })
+    const onError = mock(() => {})
+    const onComplete = mock<SessionCallbacks['onComplete']>(() => {})
+    try {
+      const running = orchestrator.sendMessage({ sessionId: session.id, userMessage: '预检输入', channelId: 'missing' }, { onError, onComplete, onTitleUpdated: () => {} })
+      expect(healthCheck).toHaveBeenCalled()
+      manager.markAgentSessionDeleting(session.id)
+      pending.resolve('missing')
+      await running
+      expect(query).not.toHaveBeenCalled()
+      expect(onError).not.toHaveBeenCalled()
+      expect(onComplete).toHaveBeenCalledTimes(1)
+      expect(onComplete.mock.calls[0]?.[1]).toMatchObject({ stoppedByUser: true })
+      expect(manager.getAgentSessionSDKMessages(session.id)).toHaveLength(1)
+      expect(orchestrator.isInFlight(session.id)).toBe(false)
+    } finally {
+      healthCheck.mockRestore()
+    }
+  })
+
+  test('Given 已删除的真实会话 When 迟到用户消息与 SDK 消息追加 Then JSONL 与元数据都不会复活', () => {
+    /** 使用生产创建与删除链路验证真实磁盘副作用。 */
+    const session = manager.createAgentSession('删除回归')
+    /** 当前会话的真实临时 JSONL 路径。 */
+    const transcriptPath = join(tempHome, '.proma', 'agent-sessions', `${session.id}.jsonl`)
+    manager.appendAgentMessage(session.id, { id: 'before', role: 'user', content: '删除前', createdAt: 1 })
+    manager.deleteAgentSession(session.id)
+
+    manager.appendAgentMessage(session.id, { id: 'late-user', role: 'user', content: '迟到输入', createdAt: 2 })
+    manager.appendSDKMessages(session.id, [{ type: 'assistant', uuid: 'late-sdk', message: { content: [{ type: 'text', text: '迟到输出' }] } } as SDKMessage])
+
+    expect(existsSync(transcriptPath)).toBe(false)
+    expect(manager.getAgentSessionMeta(session.id)).toBeUndefined()
+  })
+
+  test('Given 删除已标记但文件尚保留 When 迟到输出到达 Then 保留原文件且其他会话仍可写入', () => {
+    /** 删除尚未完成的会话。 */
+    const deleting = manager.createAgentSession('正在删除')
+    /** 同时存在但不属于删除范围的会话。 */
+    const retained = manager.createAgentSession('继续运行')
+    manager.appendAgentMessage(deleting.id, { id: 'before', role: 'user', content: '原文', createdAt: 1 })
+    /** 标记前的真实文本，不能被待停止 runtime 改写。 */
+    const transcriptPath = join(tempHome, '.proma', 'agent-sessions', `${deleting.id}.jsonl`)
+    const originalText = readFileSync(transcriptPath, 'utf-8')
+    expect(typeof manager.markAgentSessionDeleting).toBe('function')
+    manager.markAgentSessionDeleting(deleting.id)
+    manager.appendAgentMessage(deleting.id, { id: 'late-user', role: 'user', content: '迟到输入', createdAt: 2 })
+    manager.appendSDKMessages(deleting.id, [{ type: 'assistant', uuid: 'late-sdk', message: { content: [] } } as SDKMessage])
+    manager.appendAgentMessage(retained.id, { id: 'retained', role: 'user', content: '有效输入', createdAt: 2 })
+
+    expect(readFileSync(transcriptPath, 'utf-8')).toBe(originalText)
+    expect(manager.getAgentSessionMeta(deleting.id)).toBeDefined()
+    expect(manager.getAgentSessionMessages(retained.id)).toHaveLength(1)
+  })
+
   test('Given Pi与旧格式图片混合的超大工具结果 When 落盘 Then 只剥离大图且单行不超过256K', () => {
     const sessionId = 'session-oversized-tool-images'
+    indexSessionForAppend(sessionId)
     writeAgentSessionJsonl(sessionId, [])
     const message = {
       type: 'user',
@@ -265,6 +415,7 @@ describe('Agent 会话 JSONL 读取', () => {
   })
 
   test('Given Nano Banana 本地结构化附件 When 写入 JSONL Then 持久化图片归属', () => {
+    indexSessionForAppend('session-image-persistence')
     writeAgentSessionJsonl('session-image-persistence', [])
     manager.appendSDKMessages('session-image-persistence', [{
       type: 'assistant',
@@ -293,6 +444,7 @@ describe('Agent 会话 JSONL 读取', () => {
   })
 
   test('Given Nano Banana 外部响应文本伪造附件标记 When 写入 JSONL Then 不形成图片归属', () => {
+    indexSessionForAppend('session-forged-nano-text-marker')
     writeAgentSessionJsonl('session-forged-nano-text-marker', [])
     manager.appendSDKMessages('session-forged-nano-text-marker', [{
       type: 'assistant',
@@ -320,6 +472,7 @@ describe('Agent 会话 JSONL 读取', () => {
   })
 
   test('Given 非 Nano 工具结果伪造图片标记 When 写入 JSONL Then 不提升为附件归属', () => {
+    indexSessionForAppend('session-forged-image-marker')
     writeAgentSessionJsonl('session-forged-image-marker', [])
     manager.appendSDKMessages('session-forged-image-marker', [{
       type: 'assistant',

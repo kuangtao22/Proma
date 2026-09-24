@@ -5,6 +5,8 @@ import {
   type MessagePortMain,
   type UtilityProcess,
 } from 'electron'
+import { startUtilityProcessWithRetry } from './utility-process-startup'
+import { createUtilityProcessLifecycle, type UtilityProcessLifecycle } from './utility-process-lifecycle'
 import {
   AGENT_RUNTIME_BOOTSTRAP_ID,
   AGENT_RUNTIME_METHODS,
@@ -65,6 +67,8 @@ export class AgentRuntimeClient {
   private readonly startupTimeoutMs: number
   private readonly requestTimeoutMs: number
   private runtimeProcess: UtilityProcess | undefined
+  /** 当前 utility process 的可等待 spawn/exit 生命周期。 */
+  private runtimeLifecycle: UtilityProcessLifecycle<UtilityProcess> | undefined
   private port: RuntimePort | undefined
   private generation = 0
   private startPromise: Promise<AgentRuntimeState> | undefined
@@ -110,23 +114,48 @@ export class AgentRuntimeClient {
     if (this.isReady) return this.currentState
     if (this.stopPromise || this.state.status === 'stopping') throw new Error('Agent runtime is shutting down')
     if (this.startPromise) return this.startPromise
+    if (this.runtimeLifecycle) throw new Error('Agent runtime cleanup incomplete')
 
     this.startPromise = this.spawnAndHandshake()
     try {
       return await this.startPromise
     } catch (error) {
+      /** stop 已接管启动流程时，启动失败不能覆盖最终 stopped 状态。 */
+      const stoppedDuringStart = this.stopPromise !== undefined
+        || this.state.status === 'stopped'
       this.port?.close()
       this.port = undefined
-      this.runtimeProcess?.kill()
-      this.runtimeProcess = undefined
       this.rejectPending(error instanceof Error ? error : new Error(String(error)))
-      this.state = {
-        status: 'crashed',
-        bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
-        pid: null,
-        active: false,
-        pendingRequests: 0,
-        lastError: serializeAgentRuntimeError(error, 'runtime.start_failed'),
+      if (!stoppedDuringStart) {
+        /** 启动失败也必须等实际进程退出，不能留下脱离实例所有权的 utility。 */
+        const lifecycle = this.getRuntimeLifecycle()
+        if (lifecycle) {
+          try {
+            await lifecycle.stop()
+          } catch (stopError) {
+            this.state = {
+              ...this.state,
+              status: 'crashed',
+              lastError: serializeAgentRuntimeError(stopError, 'runtime.stop_failed'),
+              active: false,
+            }
+            throw stopError
+          }
+          if (this.runtimeLifecycle === lifecycle) {
+            this.runtimeLifecycle = undefined
+            this.runtimeProcess = undefined
+          }
+        }
+      }
+      if (!stoppedDuringStart) {
+        this.state = {
+          status: 'crashed',
+          bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
+          pid: null,
+          active: false,
+          pendingRequests: 0,
+          lastError: serializeAgentRuntimeError(error, 'runtime.start_failed'),
+        }
       }
       throw error
     } finally {
@@ -150,6 +179,8 @@ export class AgentRuntimeClient {
     const pendingStart = this.startPromise
     this.stopPromise = (async () => {
       const currentGeneration = this.generation
+      /** stop 开始时已经登记的 utility 生命周期。 */
+      const currentLifecycle = this.runtimeLifecycle
       this.state = { ...this.state, status: 'stopping' }
       try {
         if (this.port && this.state.status === 'stopping') {
@@ -159,17 +190,31 @@ export class AgentRuntimeClient {
         if (currentGeneration === this.generation) this.generation++
         this.port?.close()
         this.port = undefined
-        this.runtimeProcess?.kill()
-        this.runtimeProcess = undefined
         this.rejectPending(new Error('Agent runtime stopped'))
-        this.state = {
-          status: 'stopped',
-          bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
-          pid: null,
-          active: false,
-          pendingRequests: 0,
-        }
+      }
+      try {
+        await currentLifecycle?.stop()
         await pendingStart?.catch(() => {})
+        /** fork 与 stop 竞态时，启动流程可能在 stop 开始后才登记 lifecycle。 */
+        const lateLifecycle = this.runtimeLifecycle
+        if (lateLifecycle && lateLifecycle !== currentLifecycle) await lateLifecycle.stop()
+      } catch (error) {
+        this.state = {
+          ...this.state,
+          status: 'crashed',
+          lastError: serializeAgentRuntimeError(error, 'runtime.stop_failed'),
+          active: false,
+        }
+        throw error
+      }
+      this.runtimeLifecycle = undefined
+      this.runtimeProcess = undefined
+      this.state = {
+        status: 'stopped',
+        bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
+        pid: null,
+        active: false,
+        pendingRequests: 0,
       }
     })()
 
@@ -181,13 +226,36 @@ export class AgentRuntimeClient {
   }
 
   private async spawnAndHandshake(): Promise<AgentRuntimeState> {
+    /** 本轮启动的不可复用代次。 */
     const generation = ++this.generation
     this.state = { ...this.state, status: 'starting', lastError: undefined }
-    const runtimeProcess = utilityProcess.fork(this.entryPath, [], {
-      serviceName: 'Proma Runtime',
-      env: { ...process.env, ...this.env, PROMA_AGENT_SESSION_ID: this.sessionId },
-    })
-    this.runtimeProcess = runtimeProcess
+    /** 判断当前启动仍由本轮代次持有。 */
+    const shouldContinueStartup = () => (
+      generation === this.generation
+      && this.stopPromise === undefined
+      && this.state.status === 'starting'
+    )
+    /** fork 同步返回时立即登记生命周期，覆盖 spawn 事件前发生的 stop。 */
+    let runtimeLifecycle: UtilityProcessLifecycle<UtilityProcess> | undefined
+    const runtimeProcess = await startUtilityProcessWithRetry(
+      () => {
+        /** 当前启动尝试创建的 utility process。 */
+        const child = utilityProcess.fork(this.entryPath, [], {
+          serviceName: 'Proma Runtime',
+          env: { ...process.env, ...this.env, PROMA_AGENT_SESSION_ID: this.sessionId },
+        })
+        runtimeLifecycle = createUtilityProcessLifecycle(child, { exitTimeoutMs: this.startupTimeoutMs })
+        this.runtimeProcess = child
+        this.runtimeLifecycle = runtimeLifecycle
+        return child
+      },
+      { shouldContinue: shouldContinueStartup },
+    )
+    if (!runtimeLifecycle) throw new Error('Agent runtime lifecycle unavailable')
+    if (!shouldContinueStartup()) {
+      await runtimeLifecycle.stop()
+      throw new Error('Agent runtime startup cancelled')
+    }
     const processEvents = runtimeProcess as unknown as {
       on(event: 'exit', listener: (code: number) => void): void
     }
@@ -230,6 +298,11 @@ export class AgentRuntimeClient {
     this.bootId = handshake.state.bootId
     this.state = { ...handshake.state, status: 'ready' }
     return this.currentState
+  }
+
+  /** 读取异步启动过程中登记的 lifecycle，避免调用前状态缩窄掩盖副作用。 */
+  private getRuntimeLifecycle(): UtilityProcessLifecycle<UtilityProcess> | undefined {
+    return this.runtimeLifecycle
   }
 
   private sendRequest<Result, Payload = unknown>(
@@ -324,15 +397,33 @@ export class AgentRuntimeClient {
   }
 
   private async handleIncomingRequest(request: AgentRuntimeRequest): Promise<void> {
-    if (request.bootId !== this.bootId) return
+    /** capability 请求到达时所属的端口。 */
+    const port = this.port
+    /** capability 请求到达时所属的进程。 */
+    const runtimeProcess = this.runtimeProcess
+    /** capability 请求到达时所属的启动代次。 */
+    const generation = this.generation
+    /** capability 请求到达时所属的 boot 身份。 */
+    const bootId = this.bootId
+    if (!port || request.bootId !== bootId) return
+    /** 异步 Host 回调完成后复核原 runtime 仍是当前拥有者。 */
+    const isCurrentRuntime = () => (
+      generation === this.generation
+      && runtimeProcess === this.runtimeProcess
+      && port === this.port
+      && bootId === this.bootId
+    )
+
     try {
       if (!this.requestHandler) throw new Error(`No main handler for runtime method: ${request.method}`)
       const payload = await this.requestHandler(request)
-      this.port?.postMessage(createAgentRuntimeResponse(request, { payload }, this.bootId))
+      if (!isCurrentRuntime()) return
+      port.postMessage(createAgentRuntimeResponse(request, { payload }, bootId))
     } catch (error) {
-      this.port?.postMessage(createAgentRuntimeResponse(request, {
+      if (!isCurrentRuntime()) return
+      port.postMessage(createAgentRuntimeResponse(request, {
         error: serializeAgentRuntimeError(error, 'runtime.main_handler_failed'),
-      }, this.bootId))
+      }, bootId))
     }
   }
 
@@ -370,6 +461,7 @@ export class AgentRuntimeClient {
     this.port?.close()
     this.port = undefined
     this.runtimeProcess = undefined
+    this.runtimeLifecycle = undefined
   }
 
   private rejectPending(error: Error): void {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { SDKMessage } from '@proma/shared'
-import { getContextCompactionProgress, hasRenderableAssistantTurnContent, isCompactionControlHistoryGroup, shouldRenderLiveAssistantTurn } from './AgentMessages'
+import { buildCurrentRunTaskActivities, getContextCompactionProgress, hasRenderableAssistantTurnContent, isCompactionControlHistoryGroup, shouldRenderLiveAssistantTurn } from './AgentMessages'
 import { shouldClearRetainedCompactionForResumedStream, shouldRestoreCompactionProgress } from './TaskProgressOverlay'
 
 function systemMessage(fields: Record<string, unknown>): SDKMessage {
@@ -136,5 +136,37 @@ describe('context compaction progress overlay state', () => {
       status: 'failed',
       detail: 'provider unavailable',
     })
+  })
+
+  test('aggregates task activities across compaction turns while excluding an older run generation', () => {
+    const taskMessage = (
+      id: string,
+      name: 'TaskCreate' | 'TaskUpdate',
+      input: Record<string, unknown>,
+      runGeneration: number,
+    ): SDKMessage => ({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: { content: [{ type: 'tool_use', id, name, input }] },
+      _promaLiveRunStartedAt: runGeneration * 100,
+      _promaLiveRunGeneration: runGeneration,
+    } as unknown as SDKMessage)
+
+    const messages: SDKMessage[] = [
+      taskMessage('old-task', 'TaskCreate', { subject: '旧任务' }, 1),
+      taskMessage('current-task', 'TaskCreate', { subject: '当前任务' }, 2),
+      systemMessage({
+        subtype: 'compact_boundary',
+        summary: '已压缩',
+        _promaLiveRunStartedAt: 200,
+        _promaLiveRunGeneration: 2,
+      }),
+      taskMessage('current-update', 'TaskUpdate', { taskId: 'current-task', status: 'in_progress' }, 2),
+    ]
+
+    expect(buildCurrentRunTaskActivities(messages, undefined, {
+      startedAt: 200,
+      runGeneration: 2,
+    }).map((activity) => activity.toolUseId)).toEqual(['current-task', 'current-update'])
   })
 })

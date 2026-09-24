@@ -103,6 +103,7 @@ import { sidebarViewModeAtom } from '@/atoms/sidebar-atoms'
 import { searchDialogOpenAtom } from '@/atoms/search-atoms'
 import { hasUpdateAtom, updateStatusAtom, type UpdateStatus } from '@/atoms/updater'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
+import { clearBrowserSessionStateAtom } from '@/atoms/browser-atoms'
 import { hasEnvironmentIssuesAtom } from '@/atoms/environment'
 import { conversationPromptIdAtom } from '@/atoms/system-prompt-atoms'
 import { useCreateSession } from '@/hooks/useCreateSession'
@@ -800,6 +801,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const setSessionPendingMentions = useSetAtom(agentSessionPendingMentionsAtom)
   const setSessionCanvasNodeReferences = useSetAtom(agentSessionCanvasNodeReferencesAtom)
   const setSessionViewStateMap = useSetAtom(sessionViewStateMapAtom)
+  const clearBrowserSessionState = useSetAtom(clearBrowserSessionStateAtom)
 
   /** 清理 per-conversation/session Map atoms 条目 */
   const cleanupMapAtoms = React.useCallback((id: string) => {
@@ -867,6 +869,8 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     setSessionPathMap(deleteKey)
     // 视图状态（预览开关 + 上次视图）：删除/归档是终态，统一清理避免孤立条目
     setSessionViewStateMap(deleteKey)
+    // 主进程删除成功后同步清理五个浏览器 Map，避免右侧面板残留已删除会话。
+    clearBrowserSessionState(id)
 
     // 重型流式数据：streamingStates（累积 content + toolActivities）与 liveMessages（SDK 消息数组）
     setStreamingStates(deleteKey)
@@ -901,7 +905,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     sessionExistsAtom.remove(id)
 
     clearPreviewCacheForSession(id)
-  }, [setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, setSessionCanvasNodeReferences, store])
+  }, [clearBrowserSessionState, setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, setSessionCanvasNodeReferences, store])
 
   const currentWorkspaceSlug = React.useMemo(() => {
     if (!currentWorkspaceId) return null
@@ -1164,9 +1168,12 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         // 先删子后删父：若子会话删除中途失败，父会话仍在，UI 一致性更好。
         if (childIds.length > 0) {
           const failedChildIds: string[] = []
+          /** 只有主进程确认删除成功的子会话才能执行本地终态清理。 */
+          const successfulChildIds: string[] = []
           for (const childId of childIds) {
             try {
               await window.electronAPI.deleteAgentSession(childId)
+              successfulChildIds.push(childId)
             } catch (error) {
               console.error(`[侧边栏] 级联删除子会话失败 (${childId}):`, error)
               failedChildIds.push(childId)
@@ -1175,8 +1182,8 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
           if (failedChildIds.length > 0) {
             toast.error(`部分子会话删除失败（${failedChildIds.length} 个），请手动清理`)
           }
-          closeArchivedAgentTabs(childIds)
-          for (const childId of childIds) {
+          closeArchivedAgentTabs(successfulChildIds)
+          for (const childId of successfulChildIds) {
             setExpandedDelegationParentIds((prev) => deleteSetEntry(prev, childId))
             setAgentMessagesCache((prev) => {
               if (!prev.has(childId)) return prev

@@ -20,7 +20,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { ToolActivity } from '@/atoms/agent-atoms'
-import { aggregateTaskItems, type TaskItem } from './task-progress'
+import { aggregateTaskItems, getTaskProgressCounts, type TaskItem } from './task-progress'
 
 // ===== 任务行 =====
 
@@ -119,8 +119,7 @@ export function TaskProgressCard({ activities, animate = false, streamEnded = fa
 
   if (items.length === 0) return null
 
-  const completedCount = items.filter((t) => t.status === 'completed').length
-  const totalCount = items.length
+  const { completed: completedCount, total: totalCount } = getTaskProgressCounts(items)
   const needsCollapse = items.length > MAX_VISIBLE
   const visibleItems = needsCollapse && !expanded && !alwaysExpanded ? items.slice(0, MAX_VISIBLE) : items
 

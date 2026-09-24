@@ -40,9 +40,40 @@ async function runClient(executable, fixtureRoot) {
   })
 }
 
+/** 启动恢复专用窗口并验证 file-conflict 场景；返回后续可检查的夹具路径。 */
+async function runRecoveryClient(executable, fixtureRoot, targetRoot) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(executable, [__filename], {
+      cwd: applicationRoot,
+      env: {
+        ...process.env,
+        [fixtureRootVariable]: fixtureRoot,
+        PROMA_RECOVERY_TARGET_ROOT: targetRoot,
+      },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    let clientVerified = false
+    let outputTail = ''
+    child.stdout.on('data', (chunk) => {
+      const text = outputTail + chunk.toString()
+      clientVerified ||= text.includes('[first startup smoke] recovery IPC PASS')
+      outputTail = text.slice(-100)
+      process.stdout.write(chunk)
+    })
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 45_000)
+    child.once('error', (error) => { clearTimeout(timeout); reject(error) })
+    child.once('close', (code, signal) => {
+      clearTimeout(timeout)
+      if (code === 0 && clientVerified) resolve()
+      else reject(new Error(`数据根恢复回归失败：code=${code}, signal=${signal}, verified=${clientVerified}`))
+    })
+  })
+}
+
 /** Bun 父入口：创建空配置，连续运行两次实际客户端，再清理临时目录。 */
 async function runSmoke() {
   /** 真实二进制路径保证 macOS helper 从 Electron.app 中解析。 */
+  /** CI 由 workflow 注入真实 Electron 路径，本机回退到 electron 包入口。 */
   const executable = fs.realpathSync(process.env.PROMA_FIRST_STARTUP_SMOKE_ELECTRON || require('electron'))
   /** 本次回归独占的临时 home；其内不预建 server-ops。 */
   const fixtureRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'proma-first-startup-')))
@@ -62,6 +93,15 @@ async function runSmoke() {
     await runClient(executable, fixtureRoot)
     assert.equal(fs.statSync(path.join(fixtureRoot, '.proma', 'server-ops')).ino, directoryIdentity)
     assert.equal(fs.readFileSync(existingConfigPath, 'utf8'), existingConfig)
+    /** 文件冲突必须进入独立恢复窗口，不能覆盖旧数据根。 */
+    const conflictingRoot = path.join(fixtureRoot, '.proma', 'server-ops')
+    fs.rmSync(conflictingRoot, { recursive: true, force: true })
+    fs.writeFileSync(conflictingRoot, 'legacy-server-ops-file')
+    const recoveryTarget = path.join(fixtureRoot, 'recovery-empty-root')
+    fs.mkdirSync(recoveryTarget)
+    await runRecoveryClient(executable, fixtureRoot, recoveryTarget)
+    assert.equal(fs.readFileSync(conflictingRoot, 'utf8'), 'legacy-server-ops-file')
+    assert.equal(fs.existsSync(path.join(recoveryTarget, 'server-ops')), true)
     console.log('[first startup smoke] PASS: Given 全新配置/既有目录 When 启动实际客户端 Then IPC 可用且既有配置保持原文')
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
@@ -83,12 +123,34 @@ function runElectronClient() {
   app.setPath('home', fixtureRoot)
   app.setPath('appData', appData)
   app.setPath('userData', path.join(appData, 'startup-smoke'))
+  const recoveryTargetRoot = process.env.PROMA_RECOVERY_TARGET_ROOT
+  let recoverySmokeComplete = false
   process.env.PROMA_DEV_INSTANCE = `first-startup-smoke-${process.pid}`
   // 验收窗口不抢用户焦点，也不占用全局快捷键。
   BrowserWindow.prototype.show = function () {}
   globalShortcut.register = () => false
   // 无凭据夹具不应访问系统钥匙串，也不允许原生错误弹窗阻塞回归。
   safeStorage.isEncryptionAvailable = () => false
+  if (recoveryTargetRoot) {
+    /** recovery 场景只允许选择脚本创建的空目录，禁止访问真实文件选择器。 */
+    /** 第二次系统选择模拟用户取消，第三次重新选择可用于新的确认。 */
+    let recoveryPickCount = 0
+    dialog.showOpenDialog = async () => {
+      recoveryPickCount += 1
+      return recoveryPickCount === 2
+        ? { canceled: true, filePaths: [] }
+        : { canceled: false, filePaths: [recoveryTargetRoot] }
+    }
+    const nativeQuit = app.quit.bind(app)
+    app.quit = () => {
+      if (!recoverySmokeComplete) return
+      nativeQuit()
+    }
+    app.relaunch = () => {
+      /** 由页面验证完成后置成功标记，避免真正再启动一个 Electron 进程。 */
+      process.env.PROMA_RECOVERY_RELAUNCH_INTERCEPTED = '1'
+    }
+  }
   dialog.showErrorBox = (title, content) => finish(new Error(`${title}: ${content}`))
   if (app.dock) app.dock.show = async () => {}
   /** 原生导航方法只对开发入口以外的 URL 保留原样。 */
@@ -134,15 +196,88 @@ function runElectronClient() {
   })
   app.on('browser-window-created', (_event, window) => {
     window.webContents.on('did-finish-load', async () => {
-      if (finished || !window.webContents.getURL().endsWith('/renderer/index.html')) return
+      if (finished || !new URL(window.webContents.getURL()).pathname.endsWith('/renderer/index.html')) return
       try {
         /** 跨真实 preload/IPC 读取两组业务列表，不使用 mock handler。 */
-        const result = await window.webContents.executeJavaScript(`Promise.all([
-          window.electronAPI.listServerOpsHosts(),
-          window.electronAPI.listAgentSessions(),
-        ])`)
-        assert.deepEqual(result, [[], []])
-        assert.equal(fs.lstatSync(path.join(fixtureRoot, '.proma', 'server-ops')).isDirectory(), true)
+        if (!recoveryTargetRoot) {
+          const result = await window.webContents.executeJavaScript(`Promise.all([
+            window.electronAPI.listServerOpsHosts(),
+            window.electronAPI.listAgentSessions(),
+          ])`)
+          assert.deepEqual(result, [[], []])
+          assert.equal(fs.lstatSync(path.join(fixtureRoot, '.proma', 'server-ops')).isDirectory(), true)
+          finish()
+          return
+        }
+        /** 等待真实 React 恢复页面渲染，不能只凭 preload IPC 可用宣称界面可用。 */
+        await window.webContents.executeJavaScript(`(async () => {
+          const deadline = Date.now() + 5000
+          while (Date.now() < deadline) {
+            if (document.body.textContent.includes('选择应用数据目录') && document.body.textContent.includes('同名文件占用')) return
+            await new Promise(resolve => setTimeout(resolve, 50))
+          }
+          throw new Error('真实恢复界面未显示目录选择和具体原因')
+        })()`)
+        /** 可选输出本次隔离窗口截图，便于本地视觉验收。 */
+        if (process.env.PROMA_RECOVERY_SCREENSHOT) {
+          fs.writeFileSync(process.env.PROMA_RECOVERY_SCREENSHOT, (await window.webContents.capturePage()).toPNG())
+        }
+        const recoveryResult = await window.webContents.executeJavaScript(`(async () => {
+          if (new URLSearchParams(location.search).get('mode') !== 'data-root-recovery') throw new Error('未进入恢复模式')
+          if (window.electronAPI !== undefined) throw new Error('恢复窗口暴露了普通业务 API')
+          const api = window.pathManagementAPI
+          const keys = Object.keys(api).sort()
+          const state = await api.getPathManagementState()
+          if (!state.startupIssue || state.startupIssue.code !== 'not-directory') {
+            throw new Error('恢复窗口未报告 file-conflict: ' + JSON.stringify(state.startupIssue))
+          }
+          if (keys.includes('listServerOpsHosts') || !keys.includes('recoverDataRoot')) {
+            throw new Error('恢复 preload 暴露了错误的 API allowlist: ' + keys.join(','))
+          }
+          await api.recoverDataRoot({ action: 'recheck' })
+          const afterRecheck = await api.getPathManagementState()
+          if (!afterRecheck.startupIssue || afterRecheck.startupIssue.code !== 'not-directory') {
+            throw new Error('recheck 错误地清除了 startupIssue')
+          }
+          const selection = await api.pickDataRoot()
+          if (!selection || selection.kind !== 'empty') throw new Error('未获得 empty recovery selection')
+          const beforeUnconfirmed = await api.getPathManagementState()
+          await api.recoverDataRoot({ action: 'relocate', selectedRoot: selection.targetRoot, selectionId: selection.selectionId }).then(
+            () => { throw new Error('未确认空目录却完成恢复') },
+            () => undefined,
+          )
+          const afterUnconfirmed = await api.getPathManagementState()
+          if (afterUnconfirmed.activeRoot !== beforeUnconfirmed.activeRoot || afterUnconfirmed.previousRoot !== beforeUnconfirmed.previousRoot) {
+            throw new Error('未确认空目录改变了 locator')
+          }
+          // 系统选择器取消必须撤销旧授权，并保持原数据根。
+          if (await api.pickDataRoot() !== null) throw new Error('系统取消未返回 null')
+          const afterCancel = await api.getPathManagementState()
+          if (afterCancel.activeRoot !== beforeUnconfirmed.activeRoot) throw new Error('取消选择改变了数据根')
+          await api.recoverDataRoot({ action: 'relocate', selectedRoot: selection.targetRoot, selectionId: selection.selectionId, initializeEmpty: true }).then(
+            () => { throw new Error('已取消的选择仍然可以提交') },
+            () => undefined,
+          )
+          const panelSelection = await api.pickDataRoot()
+          if (!panelSelection) throw new Error('取消后无法重新选择')
+          await api.recoverDataRoot({ action: 'cancel-selection', selectionId: panelSelection.selectionId })
+          await api.recoverDataRoot({ action: 'relocate', selectedRoot: panelSelection.targetRoot, selectionId: panelSelection.selectionId, initializeEmpty: true }).then(
+            () => { throw new Error('面板取消后旧授权仍可提交') },
+            () => undefined,
+          )
+          const confirmedSelection = await api.pickDataRoot()
+          if (!confirmedSelection || confirmedSelection.kind !== 'empty') throw new Error('重新选择未获得空目录授权')
+          await api.recoverDataRoot({ action: 'relocate', selectedRoot: confirmedSelection.targetRoot, selectionId: confirmedSelection.selectionId, initializeEmpty: true })
+          const afterRecovery = await api.getPathManagementState()
+          if (afterRecovery.activeRoot !== confirmedSelection.targetRoot || afterRecovery.previousRoot !== beforeUnconfirmed.activeRoot) {
+            throw new Error('恢复后 activeRoot/previousRoot 不符合预期: ' + JSON.stringify(afterRecovery))
+          }
+          return { selection: confirmedSelection, afterRecovery }
+        })()`)
+        assert.equal(recoveryResult.selection.targetRoot, recoveryTargetRoot)
+        assert.equal(process.env.PROMA_RECOVERY_RELAUNCH_INTERCEPTED, '1')
+        recoverySmokeComplete = true
+        console.log('[first startup smoke] recovery IPC PASS')
         finish()
       } catch (error) { finish(error) }
     })

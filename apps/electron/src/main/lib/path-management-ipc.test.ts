@@ -1168,6 +1168,7 @@ describe('路径管理 IPC', () => {
 
     registerPathManagementIpcHandlers({
       mode: 'data-root-recovery',
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [relocatedRoot] }) },
       homeDir,
       ipc: {
         handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -1180,9 +1181,11 @@ describe('路径管理 IPC', () => {
       getExpectedWebContents: () => expectedWebContents,
     })
 
+    /** 通过系统选择器取得当前恢复目录授权。 */
+    const selection = await handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent) as { selectionId: string }
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    handler(expectedEvent, { action: 'relocate', selectedRoot: relocatedRoot })
+    handler(expectedEvent, { action: 'relocate', selectedRoot: relocatedRoot, selectionId: selection.selectionId })
 
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: relocatedRoot,
@@ -1209,6 +1212,7 @@ describe('路径管理 IPC', () => {
     const calls: string[] = []
     registerPathManagementIpcHandlers({
       mode: 'data-root-recovery',
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [linkedRoot] }) },
       homeDir,
       ipc: {
         handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -1223,8 +1227,8 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: linkedRoot }))
-      .toThrow('所选数据根必须是实际目录，不能是符号链接或目录联接')
+    await expect(handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent))
+      .rejects.toThrow('所选数据根必须是实际目录，不能是符号链接或目录联接')
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
     expect(calls).toEqual([])
   })
@@ -1286,6 +1290,7 @@ describe('路径管理 IPC', () => {
 
     registerPathManagementIpcHandlers({
       mode: 'data-root-recovery',
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [markerOnlyRoot] }) },
       homeDir,
       ipc: {
         handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -1295,16 +1300,18 @@ describe('路径管理 IPC', () => {
       getExpectedWebContents: () => expectedWebContents,
     })
 
+    /** 通过系统选择器取得当前恢复目录授权。 */
+    const selection = await handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent) as { selectionId: string }
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: markerOnlyRoot })).not.toThrow()
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: markerOnlyRoot, selectionId: selection.selectionId })).not.toThrow()
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({
       activeRoot: markerOnlyRoot,
       previousRoot: offlineRoot,
     })
   })
 
-  test('Given 候选为空目录或普通目录 When 重新定位 Then 拒绝且 locator 不变', async () => {
+  test('Given 空目录未确认或普通目录 When 恢复 Then 拒绝且 locator 不变', async () => {
     /** 隔离 locator 与候选目录的测试 home。 */
     const homeDir = await mkdtemp(join(tmpdir(), 'proma-path-invalid-root-'))
     /** 当前离线根必须在失败后保持不变。 */
@@ -1320,8 +1327,11 @@ describe('路径管理 IPC', () => {
     /** 保存注册的 recovery handler。 */
     const handlers = new Map<string, (...args: unknown[]) => unknown>()
 
+    /** 两次选择依次验证空目录确认与普通目录拒绝。 */
+    let pickedRoot = emptyRoot
     registerPathManagementIpcHandlers({
       mode: 'data-root-recovery',
+      dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [pickedRoot] }) },
       homeDir,
       ipc: {
         handle: (channel, handler) => { handlers.set(channel, handler) },
@@ -1333,10 +1343,13 @@ describe('路径管理 IPC', () => {
 
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.RECOVER_DATA_ROOT)
     if (!handler) throw new Error('未注册数据根恢复通道')
-    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: emptyRoot }))
-      .toThrow('所选目录不是可识别的 Proma 数据根')
-    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: ordinaryRoot }))
-      .toThrow('所选目录不是可识别的 Proma 数据根')
+    /** 空目录选择不自动等于同意建立新的数据区。 */
+    const selection = await handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent) as { selectionId: string }
+    expect(() => handler(expectedEvent, { action: 'relocate', selectedRoot: emptyRoot, selectionId: selection.selectionId }))
+      .toThrow('确认')
+    pickedRoot = ordinaryRoot
+    await expect(handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent))
+      .rejects.toThrow('所选目录不是可识别的 Proma 数据根')
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
   })
 

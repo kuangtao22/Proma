@@ -154,6 +154,21 @@ const PRESET_MODEL_CANDIDATE_UPDATES: readonly {
     },
   },
   {
+    // 已应用旧候选迁移的存量渠道仍需收到 FlashX，默认关闭以保留用户选择。
+    id: 'model-candidates-v4',
+    candidates: {
+      zhipu: [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+      ],
+      'zhipu-coding': [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+      ],
+      'zhipu-coding-team': [
+        { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', enabled: false },
+      ],
+    },
+  },
+  {
     id: 'openai-codex-gpt-6-astra-v1',
     candidates: {
       // Codex 登录/拉取会启用全部精选模型；存量渠道迁移保持同一语义。
@@ -331,8 +346,10 @@ function applyPresetModelCandidateUpdates(config: ChannelsConfig): { config: Cha
       const nameCorrections = update.nameCorrections?.[channel.provider] ?? []
       if (candidates.length === 0 && nameCorrections.length === 0) return channel
 
-      const existingModelIds = new Set(channel.models.map((model) => model.id))
-      const missingCandidates = candidates.filter((model) => !existingModelIds.has(model.id))
+      // Pi 的模型 ID 匹配不区分大小写；迁移同步裁剪空白，避免重复候选覆盖用户手动配置。
+      const normalizeModelId = (modelId: string): string => modelId.trim().toLowerCase()
+      const existingModelIds = new Set(channel.models.map((model) => normalizeModelId(model.id)))
+      const missingCandidates = candidates.filter((model) => !existingModelIds.has(normalizeModelId(model.id)))
       let models = missingCandidates.length > 0
         ? [...channel.models, ...cloneModels(missingCandidates)]
         : channel.models

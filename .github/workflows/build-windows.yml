@@ -42,6 +42,35 @@ jobs:
         timeout-minutes: 5
         run: bun test apps/electron/scripts/server-ops-project-smoke.test.ts
 
+      - name: Test data root recovery
+        run: >-
+          bun test
+          apps/electron/src/main/lib/data-root-recovery.test.ts
+          apps/electron/src/main/lib/data-root-startup-check.test.ts
+          apps/electron/src/main/lib/path-management-ipc.test.ts
+
+      - name: Test utility process lifecycle
+        run: >-
+          bun test
+          apps/electron/src/main/lib/utility-process-startup.test.ts
+          apps/electron/src/main/lib/utility-process-lifecycle.test.ts
+          apps/electron/src/main/lib/agent-runtime-client-lifecycle.test.ts
+          apps/electron/src/main/lib/terminal-runtime-client-lifecycle.test.ts
+
+      # 源码检查与 smoke 构建需要 workspace/dev 链接；裁剪依赖必须最后执行。
+      - name: Build Electron and native PTY
+        id: build_electron
+        run: bun run build && bun run build:mobile && bun run rebuild:node-pty
+        working-directory: apps/electron
+
+      # build:resources 的 shell cp 在 Windows 可静默失败；验收前严格准备真实应用资源。
+      - name: Stage built application resources
+        id: stage_resources
+        run: |
+          bun -e "require('node:fs').cpSync('resources', 'dist/resources', { recursive: true })"
+        working-directory: apps/electron
+
+      # 依赖裁剪会移除 workspace 链接，真实 Electron 路径必须在裁剪前取回。
       - name: Capture Electron binary for startup smoke
         working-directory: apps/electron
         shell: pwsh
@@ -50,14 +79,23 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($electronBinary)) { throw '无法解析 Electron 可执行文件' }
           "PROMA_FIRST_STARTUP_SMOKE_ELECTRON=$electronBinary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Prepare Electron package
-        run: bun run --filter='@proma/electron' package:prepare:win
+      - name: Smoke test native utility processes and PTY
+        run: bun run scripts/upstream-runtime-smoke.ts
+        working-directory: apps/electron
 
       - name: First and second startup smoke
+        # 与 runtime smoke 相互独立，构建成功时继续收集真实启动证据；脚本同时覆盖数据根恢复场景。
         timeout-minutes: 5
+        if: ${{ !cancelled() && steps.build_electron.outcome == 'success' && steps.stage_resources.outcome == 'success' }}
         env:
           PROMA_FIRST_STARTUP_SMOKE_ELECTRON: ${{ env.PROMA_FIRST_STARTUP_SMOKE_ELECTRON }}
-        run: node apps/electron/scripts/first-startup-smoke.cjs
+        run: bun run scripts/first-startup-smoke.cjs
+        working-directory: apps/electron
+
+      # 与 package:prepare:win 的最后两步一致，验收后才整理实际安装包依赖。
+      - name: Prepare production runtime dependencies
+        run: bun install --frozen-lockfile --os=win32 --cpu=x64 && bun run sync:runtime-deps --target-platform=win32 --target-arch=x64
+        working-directory: apps/electron
 
       - name: Package (Windows)
         run: bun run builder --win --x64 --publish never

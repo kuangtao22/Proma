@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ToolActivity } from '@/atoms/agent-atoms'
-import { aggregateTaskItems, isTerminalTaskStatus } from './task-progress'
+import { aggregateTaskItems, getTaskProgressCounts, isTerminalTaskStatus } from './task-progress'
 
 function activity(toolName: string, input: Record<string, unknown>, result?: string): ToolActivity {
   return {
@@ -56,6 +56,37 @@ describe('任务进度聚合', () => {
     ])
     expect(aggregateTaskItems(activities, false, new Map([['prior-task', '历史任务']]))).toEqual([
       { id: 'prior-task', subject: '历史任务', status: 'in_progress', activeForm: undefined },
+    ])
+  })
+
+  test('given successful and unsuccessful terminal tasks when counting progress then only completed tasks increase success count', () => {
+    const items = aggregateTaskItems([
+      activity('TaskUpdate', { taskId: 'done', subject: '完成项', status: 'completed' }),
+      activity('TaskUpdate', { taskId: 'cancelled', subject: '取消项', status: 'cancelled' }),
+      activity('TaskUpdate', { taskId: 'error', subject: '失败项', status: 'error' }),
+      activity('TaskUpdate', { taskId: 'blocked', subject: '阻塞项', status: 'blocked' }),
+    ], false)
+
+    expect(getTaskProgressCounts(items)).toEqual({
+      completed: 1,
+      terminal: 3,
+      total: 4,
+      hasActive: true,
+    })
+  })
+
+  test('given an active task when the agent run ends then resets it to pending and clears stale active form', () => {
+    const items = aggregateTaskItems([
+      activity('TaskUpdate', {
+        taskId: 'active',
+        subject: '执行验收',
+        status: 'in_progress',
+        activeForm: '正在执行验收',
+      }),
+    ], true)
+
+    expect(items).toEqual([
+      { id: 'active', subject: '执行验收', status: 'pending', activeForm: undefined },
     ])
   })
 })

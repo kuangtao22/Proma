@@ -17,6 +17,26 @@ export interface TaskItem {
   activeForm?: string
 }
 
+/**
+ * 统一任务卡与浮层的统计口径。
+ * completed 只统计成功完成；terminal 用于判断任务是否仍活动，不能作为成功数展示。
+ */
+export function getTaskProgressCounts(items: TaskItem[]): {
+  completed: number
+  terminal: number
+  total: number
+  hasActive: boolean
+} {
+  const completed = items.filter((item) => item.status === 'completed').length
+  const terminal = items.filter((item) => isTerminalTaskStatus(item.status)).length
+  return {
+    completed,
+    terminal,
+    total: items.length,
+    hasActive: terminal < items.length,
+  }
+}
+
 interface TaskCreateOutput {
   task?: {
     id?: unknown
@@ -171,7 +191,9 @@ export function aggregateTaskItems(
   let items = Array.from(taskMap.values()).filter((t) => t.status !== 'deleted')
   if (streamEnded) {
     items = items.map((t) =>
-      t.status === 'in_progress' ? { ...t, status: 'pending' as const } : t
+      t.status === 'in_progress'
+        ? { ...t, status: 'pending' as const, activeForm: undefined }
+        : t
     )
   }
   return items
