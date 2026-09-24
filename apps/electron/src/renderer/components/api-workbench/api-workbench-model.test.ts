@@ -11,6 +11,7 @@ import {
   draftAssertions,
   editApiValue,
   formatApiResponseBody,
+  isAgentApiCase,
   previewApiWorkbenchImport,
   renameCatalogFolder,
   removeApiCase,
@@ -338,7 +339,11 @@ describe('接口工作台编辑模型', () => {
     expect(renamed.cases?.map((item) => `${item.id}:${item.name}`)).toEqual(['case-1:正常', 'case-2:缺少必填参数'])
     expect(removed.cases?.map((item) => item.id)).toEqual(['case-2'])
     expect(draft.cases?.map((item) => item.name)).toEqual(['正常', '缺参数'])
-    expect(createApiCase('case-3')).toEqual({ id: 'case-3', name: '新用例', assertions: [] })
+    /** 人新增的用例来源固定为人工，避免把界面操作也算成 Agent 出题。 */
+    expect(createApiCase('case-3')).toEqual({ id: 'case-3', name: '新用例', assertions: [], source: 'user' })
+    expect(isAgentApiCase(createApiCase('case-4'))).toBe(false)
+    expect(isAgentApiCase({ source: 'agent' })).toBe(true)
+    expect(isAgentApiCase({ source: undefined })).toBe(false)
   })
 
   test('Given 运行带用例身份 When 解析用例名 Then 草稿优先、其次目录，查不到说明已删除', () => {

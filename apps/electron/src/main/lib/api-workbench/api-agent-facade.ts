@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft } from '@proma/shared'
 import type { AgentSessionMeta, ApiPreparedPreview, ApiRequestDraft, ApiRun } from '@proma/shared'
 import type { ApiWorkbenchService } from './api-workbench-service'
+import { stampApiAgentCases } from './api-agent-case-ownership'
+import type { ApiAgentCaseChange } from './api-agent-case-ownership'
 import { redactApiBody } from './api-redaction'
 
 /** 只有宿主授权服务可以调用 authorize；模型工具只能消费已签发的精确快照。 */
@@ -9,7 +11,9 @@ export interface ApiAgentApproval {
   tool: string
   preparedId: string
   preview: ApiPreparedPreview
-  save?: { expectedRevision: number; requestName: string; collectionId: string; definition: ApiRequestDraft }
+  /** 发送审批的结构化摘要：这次跑的是哪一组断言。 */
+  send?: { caseId?: string; caseName?: string; assertionCount: number }
+  save?: { expectedRevision: number; requestName: string; collectionId: string; definition: ApiRequestDraft; caseDiff: ApiAgentCaseChange[] }
 }
 /** 一次普通 Agent 运行的真实身份与能力依赖。 */
 export interface ApiAgentFacadeOptions {
@@ -45,7 +49,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
     || !isOrdinaryTopLevelAgentSession(initial) || initial.archived || initial.explorationParentSessionId !== undefined || !initial.workspaceId) return undefined
   const context = { workspaceId: initial.workspaceId, sessionId: options.sessionId, source: 'agent' as const }
   /** 只保留本次 Agent 运行生成的草稿，秘密引用仍交给 Store 验证所有权。 */
-  const drafts = new Map<string, { request: ApiRequestDraft; preview: ApiPreparedPreview; requestId?: string }>()
+  const drafts = new Map<string, { request: ApiRequestDraft; preview: ApiPreparedPreview; requestId?: string; caseId?: string }>()
   /** 精确授权与已完成执行分开记录；保存批准不能变成出网批准。 */
   const grants = new Map<string, string>()
   const sent = new Map<string, ApiAgentRunSummary>()
@@ -77,13 +81,23 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const catalog = await options.service.getCatalog(context.workspaceId)
       current()
       if (catalog.revision !== args.expectedRevision) throw new Error('API_WORKBENCH_PREPARED_STALE')
+      /** 来源盖章与人写用例保护在审批之前完成：违规直接拒绝，不会弹出一个已经越界的确认框。 */
+      const ownership = stampApiAgentCases(
+        draft.requestId ? catalog.requests.find((item) => item.id === draft.requestId)?.cases : undefined,
+        draft.request.cases ?? [],
+      )
       const fields = (rows: ApiRequestDraft['headers']) => rows.map((field) => ({ ...field, value: field.secret || field.secretRef || /authorization|cookie|api[-_]?key|token|password|secret/i.test(field.name) ? '[REDACTED]' : field.value }))
-      const definition: ApiRequestDraft = { ...draft.request, headers: fields(draft.request.headers), query: fields(draft.request.query), body: { ...draft.request.body, text: redactApiBody(draft.request.body.text), fields: fields(draft.request.body.fields) }, auth: { ...draft.request.auth, value: { value: draft.request.auth.type === 'none' ? '' : '[REDACTED]' } } }
-      return { tool, preparedId: args.preparedId, preview: draft.preview, save: { expectedRevision: args.expectedRevision!, requestName: draft.request.name, collectionId: draft.request.collectionId, definition } }
+      const definition: ApiRequestDraft = { ...draft.request, cases: ownership.cases, headers: fields(draft.request.headers), query: fields(draft.request.query), body: { ...draft.request.body, text: redactApiBody(draft.request.body.text), fields: fields(draft.request.body.fields) }, auth: { ...draft.request.auth, value: { value: draft.request.auth.type === 'none' ? '' : '[REDACTED]' } } }
+      return { tool, preparedId: args.preparedId, preview: draft.preview, save: { expectedRevision: args.expectedRevision!, requestName: draft.request.name, collectionId: draft.request.collectionId, definition, caseDiff: ownership.diff } }
     }
     const preview = await options.service.getPrepared(context, args.preparedId)
     current()
-    return { tool, preparedId: args.preparedId, preview }
+    /** 用例身份由准备时固定；断言条数让审批卡能说清跑的是哪一组断言。 */
+    const preparedCase = draft.caseId ? (draft.request.cases ?? []).find((item) => item.id === draft.caseId) : undefined
+    return {
+      tool, preparedId: args.preparedId, preview,
+      send: { assertionCount: (preparedCase?.assertions ?? draft.request.assertions).length, ...(draft.caseId ? { caseId: draft.caseId } : {}), ...(preparedCase ? { caseName: preparedCase.name } : {}) },
+    }
   }
   /** 宿主在 UI 批准后再次比较完整快照；异步审批期间变更使批准失效。 */
   async function authorize(tool: string, input: unknown, snapshot: ApiAgentApproval): Promise<void> {
@@ -142,7 +156,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const request = parseApiRequestDraft({ ...base, ...overrides })
       const preview = await options.service.prepare(context, { request, ...(requestId ? { requestId } : {}), ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }), ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
       current()
-      drafts.set(preview.preparedId, { request, preview, ...(requestId ? { requestId } : {}) })
+      drafts.set(preview.preparedId, { request, preview, ...(requestId ? { requestId } : {}), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
       return preview
     },
     /** 使用精确批准派发一次请求；停止 Agent 会同步取消对应网络任务。 */
@@ -165,7 +179,9 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const catalog = await options.service.getCatalog(context.workspaceId)
       writable()
       const old = catalog.requests.find((item) => item.id === draft.requestId)
-      const definition = { ...draft.request, id: old?.id ?? randomUUID(), revision: old?.revision ?? 1, updatedAt: Date.now() }
+      /** 与审批时同一份纯逻辑再算一次：来源章与保护不会因审批期间的时间差而漂移。 */
+      const ownership = stampApiAgentCases(old?.cases, draft.request.cases ?? [])
+      const definition = { ...draft.request, cases: ownership.cases, id: old?.id ?? randomUUID(), revision: old?.revision ?? 1, updatedAt: Date.now() }
       const requests = old ? catalog.requests.map((item) => item.id === old.id ? definition : item) : [...catalog.requests, definition]
       const saved = await write(() => options.service.saveCatalog(context.workspaceId, snapshot.save!.expectedRevision, { ...catalog, requests }))
       current()

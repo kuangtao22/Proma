@@ -2,6 +2,7 @@
 
 > 前置：阶段 B7 已交付具名用例的契约、执行、报告与界面（见 `2026-09-24-api-workbench.md` 阶段 B7，main `847c850c`）。
 > 本计划只解决一件事：**Agent 能否自己出题**。它涉及「测试结论可信度」这条信任边界，实施前必须先确认设计取舍。
+> 状态：**已按默认取舍实施完毕**（提交 `1e851ef2`、`825b5f4b`、`264318c0`、`4a219bf0`，验收记录见第 8 节）。
 
 ## 1. 现状（代码事实，已逐条核对）
 
@@ -88,7 +89,31 @@
 - 用例跨项目共享 / 用例库 / Agent 自动根据失败结果改写断言。
 - 把「Agent 生成的用例」当作验收结论的自动化判定；报告只如实标注来源。
 
-## 7. 待确认的取舍（实施前请拍板）
+## 7. 取舍（已拍板，按默认实施）
 
-1. **是否采用「人写用例不可被 Agent 改/删」这条硬保护**（本计划默认采用）。若希望 Agent 能全权改写，则需要改为「审批卡逐条显示修改内容，由人决定」。
-2. 报告是否新增「来源」列（本计划默认新增）；若不想改变复制文本形状，可退化为用例名后缀「（Agent）」。
+1. **人写用例硬保护：采用**。`source` 为 `user`（含升级前缺省）的用例不允许被 Agent 改断言、改名、改覆盖或删除，违规在**审批之前**就以 `API_WORKBENCH_USER_CASE_PROTECTED` 拒绝；人的编辑走 IPC + service 另一条路径，不受影响。
+2. **报告新增「来源」列：采用**。界面表格、复制出的 Markdown 与运行历史都带来源；代价是复制文本多一列（既有逐字断言已同步更新）。
+
+## 8. 已交付与验收记录（2026-09-24）
+
+已交付行为：
+
+- `ApiTestCase.source`（`'user' | 'agent'`，解析缺省 `user`，第三种取值拒绝）；`ApiCaseReportRow.source` 与报告的「来源」列。
+- `stampApiAgentCases`：新增或改动过的用例由 Host 盖章为 `agent`，模型自称的来源被忽略；人写用例保护如上。
+- `api_prepare_request` 的 `draft.cases`（≤16 条、每条断言 ≤64、用例身份与共享解析器同一白名单；schema 显式拒绝 `source`）。
+- 审批卡结构化：发送显示 目标 / 请求名 / 环境 / 「用例 X（n 条断言）」或「请求自身默认断言 n 条」；保存逐条列出用例 新增 / 修改 / 删除（删除标红），并提示 Agent 用例需人工复核。
+- 界面：「用例」分区对 agent 用例显示 `Agent` 徽标；报告弹层与复制文本带来源列。
+
+| 验证 | 结果 | 日志 |
+| --- | --- | --- |
+| 定向回归（共享合同 / 主进程工作台 / 工作台界面 / preload / agent 组件） | 802 pass / 0 fail，98 文件 | `/tmp/proma-api-b7b-targeted.log` |
+| `bun run typecheck` | 7 workspace 全部通过 | `/tmp/proma-api-b7b-typecheck.log` |
+| `bun run electron:build`（隔离工作树，重建 preload/main/renderer） | 通过，仅既有 EventKit 告警 | `/tmp/proma-api-b7b-build.log` |
+| 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS；网络调用仍 10 次，含 Agent 建带用例的接口（来源盖章为 agent）、按人工用例执行的发送审批摘要、人写用例被改/被删在审批前拒绝、保留人工用例并追加 Agent 用例成功、报告来源列 | `/tmp/proma-api-b7b-smoke.log` |
+| 真实界面（`api-workbench-ui-smoke.ts`） | PASS；用例页签与报告（含来源列）、复制报告、逐行打开运行、目录用例数量、Agent 用例来源徽标 | `/tmp/proma-api-b7b-ui-smoke.log` |
+
+截图：`/private/tmp/api-workbench-ui-agent-case.png`（Agent 徽标）、`/private/tmp/api-workbench-ui-cases.png`（报告来源列）。
+
+过程中抓到的真实缺陷：第一次验收失败在 `API_WORKBENCH_INVALID: case`，根因是 **preload 里也内置了一份共享解析器**，改了共享合同却只重建 smoke 包时，preload 仍用旧白名单拒绝带 `source` 的目录。结论：改 `packages/shared` 的解析合同后，必须重建 preload/main/renderer（`bun run electron:build`），只重建被测脚本不够。
+
+未交付 / 有意不做：`api_run_cases` 之类的批量发送工具（需要新的审批语义）；用例跨项目共享；Agent 自动根据失败结果改写断言；把 Agent 用例的通过率当作验收结论。

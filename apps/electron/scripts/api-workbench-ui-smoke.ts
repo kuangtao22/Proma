@@ -226,9 +226,9 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await clickText(window, '复制报告')
     await waitFor(window, "window.__apiWorkbenchSmoke.clipboard.includes('1/2 通过')", '复制报告没有写入剪贴板')
     const reportText = await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.clipboard')
-    assert.ok(reportText.includes('| 用例 | 结果 | 状态码 | 断言 | 耗时 | 备注 |'), '复制报告缺少表头')
-    assert.ok(reportText.includes('| 正常用例 | 通过 | 200 | 1/1 |'), reportText)
-    assert.ok(reportText.includes('| 越权用例 | 失败 | 200 | 0/1 |'), reportText)
+    assert.ok(reportText.includes('| 用例 | 来源 | 结果 | 状态码 | 断言 | 耗时 | 备注 |'), '复制报告缺少表头')
+    assert.ok(reportText.includes('| 正常用例 | 人工 | 通过 | 200 | 1/1 |'), reportText)
+    assert.ok(reportText.includes('| 越权用例 | 人工 | 失败 | 200 | 0/1 |'), reportText)
     /** 逐条打开 runId：报告关闭并切到该次运行的响应面板。 */
     const getsBeforeOpen = await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.getRunCalls')
     await clickText(window, '打开运行')
@@ -290,7 +290,30 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     const darkOutput = '/private/tmp/api-workbench-ui-narrow-dark.png'
     await writeFile(darkOutput, darkPng)
     console.log(`[API Workbench UI smoke] screenshots: ${wideOutput}, ${lightOutput}, ${darkOutput}`)
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告、宽布局、亮暗主题与窄 Pane 已验证')
+    /** Agent 来源徽标：单独一个窗口，夹具扮演 Host 提供一条 Agent 创建的用例。 */
+    const agentWindow = new BrowserWindow({ width: 1180, height: 760, show: false, backgroundColor: '#ffffff', webPreferences: { backgroundThrottling: false } })
+    try {
+      await agentWindow.loadURL(`${process.env.PROMA_API_UI_SMOKE_URL!}?agent-case=1`)
+      await waitFor(agentWindow, "document.body.dataset.smokeReady === 'true' && document.body.textContent?.includes('Agent 集合')", 'Agent 用例页面未挂载')
+      assert.equal(await agentWindow.webContents.executeJavaScript(`(() => {
+        const button = [...document.querySelectorAll('aside button')].find((item) => item.textContent?.includes('Agent 建的接口'))
+        if (!(button instanceof HTMLButtonElement)) return false
+        button.click()
+        return true
+      })()`), true, '打开 Agent 请求失败')
+      await clickText(agentWindow, '用例')
+      await waitFor(agentWindow, `(() => {
+        const field = document.querySelector('input[aria-label="用例名称"]')
+        const row = field?.closest('div')
+        return Boolean(row && row.textContent?.includes('Agent'))
+      })()`, 'Agent 用例没有来源徽标')
+      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      await writeFile('/private/tmp/api-workbench-ui-agent-case.png', (await agentWindow.webContents.capturePage()).toPNG())
+      console.log('[API Workbench UI smoke] Agent 用例来源徽标已验证')
+    } finally {
+      agentWindow.destroy()
+    }
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

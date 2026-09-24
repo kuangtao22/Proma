@@ -6,6 +6,8 @@ export interface ApiCaseReportRow {
   /** 用例身份；请求自身的默认断言没有用例身份。 */
   caseId?: string
   caseName: string
+  /** 用例来源；缺省按人工创建展示，Agent 声明的用例必须显式标注。 */
+  source?: ApiTestCase['source']
   /** 已执行时才有运行身份；未执行表示只列出用例。 */
   runId?: string
   state?: ApiRun['state']
@@ -49,6 +51,7 @@ function duration(row: ApiCaseReportRow): string {
 /** 报告表格的六个单元格文本；界面表格与复制出的 Markdown 共用同一结论。 */
 export interface ApiCaseReportCells {
   caseName: string
+  source: string
   verdict: string
   status: string
   assertions: string
@@ -64,6 +67,8 @@ export interface ApiCaseReportCells {
 export function formatApiCaseReportCells(row: ApiCaseReportRow): ApiCaseReportCells {
   return {
     caseName: row.caseName,
+    /** 来源列让「模型自己写的断言全绿」一眼可辨。 */
+    source: row.source === 'agent' ? 'Agent' : '人工',
     verdict: verdict(row),
     status: row.status === null ? '—' : String(row.status),
     assertions: row.assertionsTotal === 0 ? '—' : `${row.assertionsPassed}/${row.assertionsTotal}`,
@@ -111,6 +116,7 @@ export function createApiCaseReportRow(testCase: ApiTestCase, run: ApiRun | null
   return {
     caseId: testCase.id,
     caseName: testCase.name,
+    source: testCase.source ?? 'user',
     ...(run ? { runId: run.id, state: run.state } : {}),
     status: run?.hops.at(-1)?.status ?? null,
     assertionsPassed: assertions.filter((item) => item.passed).length,
@@ -140,14 +146,15 @@ export function formatApiCaseReportMarkdown(rows: readonly ApiCaseReportRow[], m
     `- 开始时间：${new Date(meta.startedAt).toLocaleString()}`,
     `- 结果：${summary}`,
     '',
-    '| 用例 | 结果 | 状态码 | 断言 | 耗时 | 备注 |',
-    '| --- | --- | --- | --- | --- | --- |',
+    '| 用例 | 来源 | 结果 | 状态码 | 断言 | 耗时 | 备注 |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
   ]
   for (const row of rows) {
     /** 与界面表格一致的单元格文本，避免两处结论漂移。 */
     const cells = formatApiCaseReportCells(row)
     lines.push([
       cell(cells.caseName),
+      cells.source,
       cells.verdict,
       cells.status,
       cells.assertions,

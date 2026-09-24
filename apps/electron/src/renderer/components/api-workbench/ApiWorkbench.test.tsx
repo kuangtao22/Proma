@@ -122,6 +122,10 @@ describe('接口工作台 UI 集成', () => {
     expect(source).toContain('打开运行')
     expect(source).toContain('resolveCaseName')
     expect(source).toContain('withDraftAssertions')
+    /** 用例来源要在界面可见，报告与复制文本同样带来源列。 */
+    expect(source).toContain('isAgentApiCase')
+    expect(source).toContain('>Agent</Badge>')
+    expect(source).toContain('<span>来源</span>')
     /** 恢复运行头部必须标注用例，否则用户无法确认跑的是哪一组断言。 */
     expect(source).toContain('用例 ${caseName} · ')
   })

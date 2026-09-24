@@ -231,16 +231,67 @@ async function smoke(): Promise<void> {
   const reportRows = caseRequest.cases.map((testCase, index) => createApiCaseReportRow(testCase, caseRuns[index]!))
   const report = formatApiCaseReportMarkdown(reportRows, { requestName: caseRequest.name, method: caseRequest.method, url: caseRequest.url, startedAt: Date.now() })
   assert.ok(report.includes('- 结果：1/2 通过'), report)
-  assert.ok(report.includes('| 未授权返回 401 | 通过 | 401 | 1/1 |'), report)
-  assert.ok(report.includes('| 越权却期望 200 | 失败 | 401 | 0/1 |'), report)
+  assert.ok(report.includes('| 未授权返回 401 | 人工 | 通过 | 401 | 1/1 |'), report)
+  assert.ok(report.includes('| 越权却期望 200 | 人工 | 失败 | 401 | 0/1 |'), report)
   assert.ok(report.includes('期望 200，实际 401'), report)
   assert.equal(report.includes('fixture-secret'), false)
   /** 报告行与真实运行一一对应，界面据此逐条打开 runId。 */
   assert.deepEqual(reportRows.map((row) => row.runId), caseRuns.map((run) => run.id))
+  /** Agent 出题：只能新增自己的用例，来源由 Host 盖章，人工用例不可被改。 */
+  const authoredPrepared = await facade.prepare({ request: {
+    name: 'Agent 建的接口',
+    url: baseUrl + '/unauthorized',
+    method: 'GET',
+    cases: [{ id: 'case_agent_ok', name: 'Agent 猜的未授权', assertions: [{ id: 'agent_a', kind: 'status' as const, path: '', expected: '401' }] }],
+  } })
+  const authoredSaving = { preparedId: authoredPrepared.preparedId, expectedRevision: authoredPrepared.catalogRevision }
+  const authoredSnapshot = await facade.approval('api_save_request', authoredSaving)
+  assert.deepEqual(authoredSnapshot.save?.caseDiff, [{ caseId: 'case_agent_ok', caseName: 'Agent 猜的未授权', source: 'agent', change: 'added', assertionCount: 1 }])
+  await facade.authorize('api_save_request', authoredSaving, authoredSnapshot)
+  await facade.save(authoredSaving)
+  /** 落库的用例带 Host 盖章的来源，模型自称的来源被忽略。 */
+  const authoredSaved = (await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog).requests.find((item) => item.name === 'Agent 建的接口')
+  assert.equal(authoredSaved?.cases?.[0]?.source, 'agent')
+  /** Agent 也能按人工写好的用例执行，并在发送审批里说明跑的是哪一组断言。 */
+  const caseSendPrepared = await facade.prepare({ requestId: 'saved-cases', caseId: 'case_expect_401' })
+  const caseSendSnapshot = await facade.approval('api_send_request', { preparedId: caseSendPrepared.preparedId })
+  assert.equal(caseSendSnapshot.send?.caseId, 'case_expect_401')
+  assert.equal(caseSendSnapshot.send?.caseName, '未授权返回 401')
+  assert.equal(caseSendSnapshot.send?.assertionCount, 1)
+  /** 人工用例：改断言或删除都在审批之前被拒，目录保持原样。 */
+  const humanCatalog = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
+  const humanDefinition = humanCatalog.requests.find((item) => item.id === 'saved-cases')!
+  const humanCase = humanDefinition.cases![0]!
+  assert.equal(humanCase.source, 'user')
+  const tampered = await facade.prepare({ requestId: 'saved-cases', request: { cases: [{ ...humanCase, name: '被 Agent 改名的用例' }] } })
+  const dropped = await facade.prepare({ requestId: 'saved-cases', request: { cases: [] } })
+  await assert.rejects(facade.approval('api_save_request', { preparedId: tampered.preparedId, expectedRevision: humanCatalog.revision }), /API_WORKBENCH_USER_CASE_PROTECTED/)
+  await assert.rejects(facade.approval('api_save_request', { preparedId: dropped.preparedId, expectedRevision: humanCatalog.revision }), /API_WORKBENCH_USER_CASE_PROTECTED/)
+  assert.deepEqual((await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog).requests.find((item) => item.id === 'saved-cases')?.cases, humanDefinition.cases)
+  /** 保留人工用例、追加自己的用例则允许，报告里两个来源并列。 */
+  const appended = await facade.prepare({ requestId: 'saved-cases', request: { cases: [
+    ...humanDefinition.cases!,
+    { id: 'case_agent_extra', name: 'Agent 补的缺参数', assertions: [{ id: 'agent_b', kind: 'status' as const, path: '', expected: '400' }] },
+  ] } })
+  const appendedSaving = { preparedId: appended.preparedId, expectedRevision: humanCatalog.revision }
+  const appendedSnapshot = await facade.approval('api_save_request', appendedSaving)
+  assert.deepEqual(appendedSnapshot.save?.caseDiff, [{ caseId: 'case_agent_extra', caseName: 'Agent 补的缺参数', source: 'agent', change: 'added', assertionCount: 1 }])
+  await facade.authorize('api_save_request', appendedSaving, appendedSnapshot)
+  await facade.save(appendedSaving)
+  const mixedDefinition = (await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog).requests.find((item) => item.id === 'saved-cases')!
+  assert.deepEqual(mixedDefinition.cases?.map((item) => `${item.id}:${item.source}`), ['case_expect_401:user', 'case_expect_200:user', 'case_agent_extra:agent'])
+  /** 报告按来源并列：人工用例的真实通过结论与 Agent 用例的未执行分开表达。 */
+  const mixedReport = formatApiCaseReportMarkdown([
+    createApiCaseReportRow(mixedDefinition.cases![0]!, caseRuns[0]!),
+    createApiCaseReportRow(mixedDefinition.cases![2]!, null, '未执行'),
+  ], { requestName: mixedDefinition.name, method: mixedDefinition.method, url: mixedDefinition.url, startedAt: Date.now() })
+  assert.ok(mixedReport.includes('| 未授权返回 401 | 人工 | 通过 | 401 | 1/1 |'), mixedReport)
+  assert.ok(mixedReport.includes('| Agent 补的缺参数 | Agent | 未执行 | — | 0/1 | — | 未执行 |'), mixedReport)
+  assert.ok(mixedReport.includes('- 结果：1/1 通过'), mixedReport)
   const history = await call('listRuns', { sessionId: 'smoke-session' })
   assert.equal(history.runs.length, 10)
   assert.equal(calls, 10)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'history'] }))
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

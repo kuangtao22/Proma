@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentSessionMeta } from '@proma/shared'
+import { createApiRequestDraft } from '@proma/shared'
 import { ApiWorkbenchStore } from './api-workbench-store'
 import { ApiWorkbenchService } from './api-workbench-service'
 import { createApiAgentFacade } from './api-agent-facade'
@@ -86,4 +87,99 @@ test('Given 请求测试完成 When 另行批准保存 Then 仍可保存原草�
     expect((await f.service.getCatalog('workspace')).requests[0]?.name).toBe('已测请求')
     expect(f.sends()).toBe(1)
   } finally { f.cleanup() }
+})
+
+/** 直接经 IPC 保存路径写入一条人工创建的用例，模拟人在界面上的操作。 */
+async function saveHumanCaseRequest(f: ReturnType<typeof fixture>): Promise<string> {
+  const catalog = await f.service.getCatalog('workspace')
+  const draft = {
+    ...createApiRequestDraft(catalog.collections[0]?.id ?? 'default'),
+    name: '人工维护的登录',
+    url: 'https://example.test/login',
+    assertions: [{ id: 'default_status', kind: 'status' as const, path: '', expected: '200' }],
+    cases: [{
+      id: 'case_human',
+      name: '人工写的越权',
+      assertions: [{ id: 'case_a', kind: 'status' as const, path: '', expected: '403' }],
+    }],
+  }
+  const saved = await f.service.saveCatalog('workspace', catalog.revision, { ...catalog, requests: [{ ...draft, id: 'request_human', revision: 1, updatedAt: 1 }] })
+  return saved.requests[0]!.id
+}
+
+describe('Agent 出题边界', () => {
+  test('Given Agent 自己声明用例 When 批准并保存 Then 用例入库且来源盖章为 agent', async () => {
+    const f = fixture()
+    try {
+      const prepared = await f.facade.prepare({ request: {
+        name: 'Agent 建的接口', url: 'https://example.test/orders', method: 'POST',
+        cases: [{ id: 'case_agent_ok', name: '下单成功', assertions: [{ id: 'case_a', kind: 'status', path: '', expected: '201' }] }],
+      } })
+      const saving = { preparedId: prepared.preparedId, expectedRevision: prepared.catalogRevision }
+      const snapshot = await f.facade.approval('api_save_request', saving)
+
+      expect(snapshot.save?.caseDiff).toEqual([{ caseId: 'case_agent_ok', caseName: '下单成功', source: 'agent', change: 'added', assertionCount: 1 }])
+      expect(snapshot.save?.definition.cases?.[0]?.source).toBe('agent')
+
+      await f.facade.authorize('api_save_request', saving, snapshot)
+      await f.facade.save(saving)
+      /** 落库的用例带来源，报告与界面据此区分谁出的题。 */
+      const stored = (await f.service.getCatalog('workspace')).requests[0]
+      expect(stored?.cases?.[0]?.source).toBe('agent')
+      expect(stored?.cases?.[0]?.name).toBe('下单成功')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 人工写的用例 When Agent 改断言或删除 Then 审批前就拒绝且目录不变', async () => {
+    const f = fixture()
+    try {
+      const requestId = await saveHumanCaseRequest(f)
+      const before = (await f.service.getCatalog('workspace')).requests[0]!
+      const modified = await f.facade.prepare({ requestId, request: { cases: [{ id: 'case_human', name: '人工写的越权', assertions: [{ id: 'case_a', kind: 'status', path: '', expected: '200' }] }] } })
+      const removed = await f.facade.prepare({ requestId, request: { cases: [] } })
+
+      await expect(f.facade.approval('api_save_request', { preparedId: modified.preparedId, expectedRevision: before.revision }))
+        .rejects.toThrow('API_WORKBENCH_USER_CASE_PROTECTED')
+      await expect(f.facade.approval('api_save_request', { preparedId: removed.preparedId, expectedRevision: before.revision }))
+        .rejects.toThrow('API_WORKBENCH_USER_CASE_PROTECTED')
+      expect((await f.service.getCatalog('workspace')).requests[0]?.cases).toEqual(before.cases)
+    } finally { f.cleanup() }
+  })
+
+  test('Given 人工用例原样保留 When Agent 追加自己的用例 Then 保存成功且两个来源各自不变', async () => {
+    const f = fixture()
+    try {
+      const requestId = await saveHumanCaseRequest(f)
+      const before = (await f.service.getCatalog('workspace')).requests[0]!
+      const humanCase = before.cases![0]!
+      const prepared = await f.facade.prepare({ requestId, request: { cases: [
+        humanCase,
+        { id: 'case_agent_extra', name: 'Agent 补的缺参数', assertions: [{ id: 'case_b', kind: 'status', path: '', expected: '400' }] },
+      ] } })
+      const saving = { preparedId: prepared.preparedId, expectedRevision: before.revision }
+      const snapshot = await f.facade.approval('api_save_request', saving)
+
+      expect(snapshot.save?.caseDiff).toEqual([{ caseId: 'case_agent_extra', caseName: 'Agent 补的缺参数', source: 'agent', change: 'added', assertionCount: 1 }])
+
+      await f.facade.authorize('api_save_request', saving, snapshot)
+      await f.facade.save(saving)
+      const stored = (await f.service.getCatalog('workspace')).requests[0]!
+      expect(stored.cases?.map((item) => `${item.id}:${item.source}`)).toEqual(['case_human:user', 'case_agent_extra:agent'])
+      expect(stored.cases?.[0]?.assertions[0]?.expected).toBe('403')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 按用例准备 When 读取发送审批快照 Then 带上用例身份与断言条数', async () => {
+    const f = fixture()
+    try {
+      const requestId = await saveHumanCaseRequest(f)
+      const prepared = await f.facade.prepare({ requestId, caseId: 'case_human' })
+
+      const snapshot = await f.facade.approval('api_send_request', { preparedId: prepared.preparedId })
+
+      expect(snapshot.send).toEqual({ caseId: 'case_human', caseName: '人工写的越权', assertionCount: 1 })
+      await f.facade.authorize('api_send_request', { preparedId: prepared.preparedId }, snapshot)
+      expect((await f.facade.send({ preparedId: prepared.preparedId })).caseId).toBe('case_human')
+    } finally { f.cleanup() }
+  })
 })

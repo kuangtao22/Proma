@@ -22,6 +22,9 @@ describe('接口工作台共享合同', () => {
     /** 升级前保存的请求没有 cases 字段，解析时补空数组而不是报错。 */
     expect(parseApiRequestDraft({ ...base }).cases).toEqual([])
     expect(createApiRequestDraft().cases).toEqual([])
+    /** 来源由 Host 盖章：缺省是人工创建，显式声明 agent 时保留。 */
+    expect(parsed.cases?.[0]?.source).toBe('user')
+    expect(parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], source: 'agent' as const }] }).cases?.[0]?.source).toBe('agent')
   })
 
   test('Given 用例身份重复、数量越界或含未知字段 When 解析 Then 明确拒绝', () => {
@@ -30,6 +33,8 @@ describe('接口工作台共享合同', () => {
     expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [] }, { id: 'case_1', name: 'b', assertions: [] }] })).toThrow()
     expect(() => parseApiRequestDraft({ ...base, cases: Array.from({ length: 17 }, (_, index) => ({ id: `case_${index}`, name: `c${index}`, assertions: [] })) })).toThrow()
     expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], extra: 1 }] })).toThrow()
+    /** 来源是固定枚举，不接受模型随意声称的第三种来源。 */
+    expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], source: 'model' }] })).toThrow()
   })
 
   test('Given 提取规则 When 解析草稿 Then 校验变量名、来源与上限', () => {

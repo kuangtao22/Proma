@@ -97,6 +97,7 @@ import {
   draftAssertions,
   editApiValue,
   formatApiResponseBody,
+  isAgentApiCase,
   isApiRequestDirty,
   removeApiCase,
   renameCatalogFolder,
@@ -174,6 +175,7 @@ function errorMessage(error: unknown, fallback: string): string {
     API_WORKBENCH_SECRET_OWNER_MISMATCH: '秘密值不属于当前请求或环境，请重新输入',
     API_WORKBENCH_SECRET_BUDGET_EXCEEDED: '秘密值总量超过 1 MiB 上限，请减少后再保存',
     API_WORKBENCH_CAPACITY_LIMIT: '运行历史空间已满，请取消部分收藏后重试',
+    API_WORKBENCH_USER_CASE_PROTECTED: '人工创建的用例不能被 Agent 修改或删除，请在界面上手动调整',
   }
   /** 错误码位于冒号前，后续 Host 中文细节可以继续展示。 */
   const code = error.message.split(':', 1)[0]!
@@ -645,7 +647,7 @@ function CaseEditor({ draft, activeCaseId, onCasesChange, onActiveCaseChange }: 
         <span className="text-[11px] text-muted-foreground">{cases.length}/{API_LIMITS.maxCases}</span>
       </div>
       {cases.map((item) => (
-        <div key={item.id} className="grid grid-cols-[auto_minmax(120px,1fr)_auto_auto] items-center gap-2">
+        <div key={item.id} className="grid grid-cols-[auto_minmax(120px,1fr)_auto_auto_auto] items-center gap-2">
           <button
             type="button"
             aria-label={`设为当前用例 ${item.name}`}
@@ -654,6 +656,7 @@ function CaseEditor({ draft, activeCaseId, onCasesChange, onActiveCaseChange }: 
             onClick={() => onActiveCaseChange(item.id)}
           >{item.id === activeCaseId ? <Check className="size-3.5" /> : <CircleDot className="size-3.5" />}</button>
           <Input value={item.name} aria-label="用例名称" onChange={(event) => onCasesChange(renameApiCase(draft, item.id, event.target.value), activeCaseId)} className="h-8 text-xs" />
+          {isAgentApiCase(item) && <Badge variant="secondary" className="shrink-0 px-1 text-[9px]" title="由 Agent 声明；人工写下的用例不可被 Agent 修改或删除，报告里也会标注来源">Agent</Badge>}
           <span className="shrink-0 text-[11px] text-muted-foreground">{item.assertions.length} 条断言</span>
           <ToolButton label={`删除用例 ${item.name}`} onClick={() => onCasesChange(removeApiCase(draft, item.id), activeCaseId === item.id ? undefined : activeCaseId)}><Trash2 className="size-3.5" /></ToolButton>
         </div>
@@ -895,7 +898,7 @@ function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: 
   /** 通过数取自与表格相同的结论函数。 */
   const passed = executed.filter((row) => formatApiCaseReportCells(row).verdict === '通过').length
   /** 表头与数据行共用同一列宽，避免窄窗口下错位。 */
-  const columns = 'grid-cols-[minmax(110px,1.2fr)_64px_64px_64px_80px_minmax(80px,1.1fr)_88px]'
+  const columns = 'grid-cols-[minmax(110px,1.2fr)_56px_64px_64px_64px_80px_minmax(80px,1.1fr)_88px]'
   return (
     <Dialog open={batch !== null} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
@@ -907,7 +910,7 @@ function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: 
         </DialogHeader>
         <div className="space-y-1 text-xs">
           <div className={cn('grid items-center gap-2 px-2 text-[10px] text-muted-foreground', columns)}>
-            <span>用例</span><span>结果</span><span>状态码</span><span>断言</span><span>耗时</span><span>备注</span><span />
+            <span>用例</span><span>来源</span><span>结果</span><span>状态码</span><span>断言</span><span>耗时</span><span>备注</span><span />
           </div>
           {rows.map((row) => {
             /** 与复制报告同源的单元格文本。 */
@@ -917,6 +920,7 @@ function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: 
             return (
               <div key={row.caseId ?? row.caseName} className={cn('grid items-center gap-2 rounded-md border border-border/50 px-2 py-1.5', columns)}>
                 <span className="truncate" title={cells.caseName}>{cells.caseName}</span>
+                <span className={cn(cells.source === 'Agent' ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground')}>{cells.source}</span>
                 <span className={cn(cells.verdict === '通过' ? 'text-emerald-600 dark:text-emerald-400' : cells.verdict === '失败' ? 'text-destructive' : 'text-muted-foreground')}>{cells.verdict}</span>
                 <span>{cells.status}</span>
                 <span>{cells.assertions}</span>

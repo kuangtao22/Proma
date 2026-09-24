@@ -25,6 +25,11 @@ export interface ApiTestCase {
   overrides?: ApiField[]
   /** 该用例默认使用的环境；环境被删除后按未指定处理。 */
   environmentId?: string
+  /**
+   * 用例来源，由 Host 盖章：'user' 表示人工在界面或导入中创建，'agent' 表示 Agent 声明。
+   * 模型不能自行声明该字段；解析时缺省补 'user'（升级前保存的用例都来自人工编辑）。
+   */
+  source?: 'user' | 'agent'
 }
 /** 从响应里取值的声明式规则；只描述来源，不携带任何值。 */
 export interface ApiExtraction {
@@ -275,13 +280,15 @@ function assertion(value: unknown): ApiAssertion {
 const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases'] as const
 /** 解析单条测试用例；用例名可有界重复，身份必须唯一。 */
 function testCase(value: unknown): ApiTestCase {
-  const record = apiRecord(value, ['id', 'name', 'assertions', 'overrides', 'environmentId'], 'case')
+  const record = apiRecord(value, ['id', 'name', 'assertions', 'overrides', 'environmentId', 'source'], 'case')
   return {
     id: parseApiId(record.id),
     name: text(record.name, 'case.name', 128),
     assertions: rows(record.assertions, assertion, 64, 'case.assertions'),
     ...(record.overrides === undefined ? {} : { overrides: parseApiFields(record.overrides) }),
     ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
+    /** 来源只允许 Host 认可的两种取值；升级前保存的用例缺省为人工创建。 */
+    source: choice(record.source ?? 'user', ['user', 'agent'] as const, 'case.source'),
   }
 }
 /** 变量名必须能直接嵌入 {{name}} 模板。 */

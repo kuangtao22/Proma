@@ -49,9 +49,9 @@ describe('接口用例报告', () => {
 
     const report = formatApiCaseReportMarkdown(rows, meta)
 
-    expect(report).toContain('| 用例 | 结果 | 状态码 | 断言 | 耗时 | 备注 |')
-    expect(report).toContain('| 正常登录 | 通过 | 200 | 3/3 | 240 ms |  |')
-    expect(report).toContain('| 缺参数 | 通过 | 400 | 2/2 | 180 ms |  |')
+    expect(report).toContain('| 用例 | 来源 | 结果 | 状态码 | 断言 | 耗时 | 备注 |')
+    expect(report).toContain('| 正常登录 | 人工 | 通过 | 200 | 3/3 | 240 ms |  |')
+    expect(report).toContain('| 缺参数 | 人工 | 通过 | 400 | 2/2 | 180 ms |  |')
     expect(report).toContain('- 结果：2/2 通过')
     expect(report).toContain('- 请求：POST https://example.test/login')
   })
@@ -65,7 +65,7 @@ describe('接口用例报告', () => {
     const report = formatApiCaseReportMarkdown(rows, meta)
 
     expect(report).toContain('- 结果：1/2 通过')
-    expect(report).toContain('| 越权 | 失败 | 200 | 1/2 | 210 ms | 期望 401 实际 200 |')
+    expect(report).toContain('| 越权 | 人工 | 失败 | 200 | 1/2 | 210 ms | 期望 401 实际 200 |')
   })
 
   test('Given 未执行或无断言的用例 When 生成报告 Then 不把它们算成通过', () => {
@@ -77,8 +77,8 @@ describe('接口用例报告', () => {
     const report = formatApiCaseReportMarkdown(rows, meta)
 
     expect(report).toContain('- 结果：尚未执行')
-    expect(report).toContain('| 未跑过的用例 | 未执行 | — | 0/2 | — |  |')
-    expect(report).toContain('| 只跑请求 | 未验证 | 204 | — | 12 ms |  |')
+    expect(report).toContain('| 未跑过的用例 | 人工 | 未执行 | — | 0/2 | — |  |')
+    expect(report).toContain('| 只跑请求 | 人工 | 未验证 | 204 | — | 12 ms |  |')
   })
 
   test('Given 用例名或原因含竖线与换行 When 生成报告 Then 表格结构不被破坏', () => {
@@ -89,8 +89,22 @@ describe('接口用例报告', () => {
     const report = formatApiCaseReportMarkdown(rows, meta)
     const dataLine = report.split('\n').find((line) => line.startsWith('| 带'))
 
-    expect(dataLine).toBe('| 带\\|竖线 和换行 | 失败 | — | 0/1 | — | 第一行 第二行\\|尾 |')
+    expect(dataLine).toBe('| 带\\|竖线 和换行 | 人工 | 失败 | — | 0/1 | — | 第一行 第二行\\|尾 |')
     expect(report.split('\n').filter((line) => line.startsWith('|')).length).toBe(3)
+  })
+
+  test('Given Agent 声明的用例 When 生成报告 Then 来源列标出 Agent 以便区分谁出的题', () => {
+    const rows: ApiCaseReportRow[] = [
+      { caseId: 'case_agent', caseName: 'Agent 猜的越权', source: 'agent', runId: 'run_1', state: 'completed', status: 403, assertionsPassed: 1, assertionsTotal: 1, durationMs: 90 },
+      { caseId: 'case_human', caseName: '人工写的越权', source: 'user', runId: 'run_2', state: 'completed', status: 403, assertionsPassed: 1, assertionsTotal: 1, durationMs: 95 },
+    ]
+
+    const report = formatApiCaseReportMarkdown(rows, meta)
+
+    expect(report).toContain('| Agent 猜的越权 | Agent | 通过 | 403 | 1/1 | 90 ms |  |')
+    expect(report).toContain('| 人工写的越权 | 人工 | 通过 | 403 | 1/1 | 95 ms |  |')
+    expect(formatApiCaseReportCells(rows[0]!).source).toBe('Agent')
+    expect(formatApiCaseReportCells({ ...rows[1]!, source: undefined }).source).toBe('人工')
   })
 })
 
@@ -99,11 +113,11 @@ describe('接口用例结果映射', () => {
     const row = createApiCaseReportRow(testCase('case_ok', '正常登录', 3), run({ status: 200, passed: [true, true, true] }))
 
     expect(row).toEqual({
-      caseId: 'case_ok', caseName: '正常登录', runId: 'run_1', state: 'completed', status: 200,
+      caseId: 'case_ok', caseName: '正常登录', source: 'user', runId: 'run_1', state: 'completed', status: 200,
       assertionsPassed: 3, assertionsTotal: 3, durationMs: 240,
     })
     expect(formatApiCaseReportCells(row)).toEqual({
-      caseName: '正常登录', verdict: '通过', status: '200', assertions: '3/3', duration: '240 ms', remark: '',
+      caseName: '正常登录', source: '人工', verdict: '通过', status: '200', assertions: '3/3', duration: '240 ms', remark: '',
     })
   })
 

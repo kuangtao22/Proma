@@ -14,6 +14,7 @@ import { Shield, ShieldAlert, Check, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { allPendingPermissionRequestsAtom } from '@/atoms/agent-atoms'
 import type { DangerLevel } from '@proma/shared'
+import { describeApiWorkbenchApproval, formatApiApprovalCaseDiff } from './api-approval-view'
 
 /** 危险等级对应的图标颜色 */
 const DANGER_ICON_STYLES: Record<DangerLevel, string> = {
@@ -99,6 +100,9 @@ export function PermissionBanner({ sessionId, onStop }: PermissionBannerProps): 
 
   respondRef.current = respond
 
+  /** 接口工作台的发送/保存单独渲染：用户必须看清目标与用例改动，而不是一坨 JSON。 */
+  const apiApproval = describeApiWorkbenchApproval(request.toolName, request.toolInput)
+
   return (
     <div
       className="mx-4 mb-3 rounded-xl bg-card shadow-lg overflow-hidden animate-in slide-in-from-bottom-2 duration-200"
@@ -133,6 +137,25 @@ export function PermissionBanner({ sessionId, onStop }: PermissionBannerProps): 
 
       {/* 命令/操作内容 */}
       <div className="px-3 pb-2 space-y-1.5">
+        {apiApproval ? (
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-foreground">{apiApproval.title}</p>
+            {apiApproval.lines.map((line) => (
+              <p key={line} className="text-xs text-muted-foreground font-mono break-all">{line}</p>
+            ))}
+            {apiApproval.caseDiff.length > 0 && (
+              <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
+                <p className="text-[11px] text-muted-foreground">用例改动</p>
+                {apiApproval.caseDiff.map((entry) => (
+                  <p key={entry.caseId} className={entry.change === 'removed' ? 'text-xs text-destructive' : 'text-xs'}>
+                    {formatApiApprovalCaseDiff(entry)}
+                  </p>
+                ))}
+                <p className="text-[10px] text-muted-foreground">Agent 新增或修改的用例会在报告里标注来源；人工创建的用例不可被 Agent 修改或删除。</p>
+              </div>
+            )}
+          </div>
+        ) : null}
         {/* SDK 可读标题（优先展示，描述操作意图） */}
         {request.sdkTitle && (
           <p className="text-xs text-foreground">{request.sdkTitle}</p>
@@ -146,7 +169,7 @@ export function PermissionBanner({ sessionId, onStop }: PermissionBannerProps): 
           <pre className="text-xs font-mono bg-background/50 rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto">
             {request.command}
           </pre>
-        ) : !request.sdkTitle && Object.keys(request.toolInput).length > 0 ? (
+        ) : !apiApproval && !request.sdkTitle && Object.keys(request.toolInput).length > 0 ? (
           <pre className="text-xs font-mono bg-background/50 rounded px-2 py-1.5 overflow-x-auto whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto">
             {JSON.stringify(request.toolInput, null, 2)}
           </pre>

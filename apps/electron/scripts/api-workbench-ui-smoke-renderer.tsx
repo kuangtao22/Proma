@@ -124,6 +124,22 @@ Object.defineProperty(window, '__apiWorkbenchEmitStream', {
   configurable: true,
   value: (event: ApiRunStreamChanged) => { for (const listener of streamListeners) listener(event) },
 })
+/** Agent 用例窗口：夹具扮演 Host，提供一条由 Agent 声明、一条由人工创建的用例。 */
+if (new URLSearchParams(location.search).has('agent-case')) {
+  state.catalog = {
+    version: 1, revision: 4,
+    collections: [{ id: 'default', name: 'Agent 集合', description: '', variables: [] }],
+    environments: [],
+    requests: [{
+      ...createApiRequestDraft('default'), id: 'request_agent', revision: 2, updatedAt: 1,
+      name: 'Agent 建的接口', url: 'https://example.test/orders', method: 'POST',
+      cases: [
+        { id: 'case_agent_ok', name: 'Agent 猜的下单成功', assertions: [{ id: 'agent_a', kind: 'status', path: '', expected: '201' }], source: 'agent' },
+        { id: 'case_human_deny', name: '人工写的越权', assertions: [{ id: 'human_a', kind: 'status', path: '', expected: '403' }], source: 'user' },
+      ],
+    }],
+  }
+}
 
 /** smoke 页面只挂载生产接口工作台。 */
 function SmokeApp(): React.ReactElement {

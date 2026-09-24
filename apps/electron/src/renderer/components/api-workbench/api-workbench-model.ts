@@ -176,9 +176,17 @@ export function clearApiValue(_current: ApiValue): ApiValue {
   return { value: '', secret: false }
 }
 
-/** 创建一条用例；默认只跑请求、不做校验，用例身份由调用方生成。 */
+/** 用例来源的展示标签：界面徽标、审批卡与报告共用同一套说法。 */
+export const API_CASE_SOURCE_LABEL: Record<'user' | 'agent', string> = { user: '人工', agent: 'Agent' }
+
+/** 创建一条用例；默认只跑请求、不做校验，身份由调用方生成，来源固定为人工创建。 */
 export function createApiCase(id: string, name = '新用例'): ApiTestCase {
-  return { id, name, assertions: [] }
+  return { id, name, assertions: [], source: 'user' }
+}
+
+/** 判断用例是否由 Agent 声明；缺省视为人工创建，与解析器的默认值一致。 */
+export function isAgentApiCase(testCase: Pick<ApiTestCase, 'source'>): boolean {
+  return testCase.source === 'agent'
 }
 
 /** 读取当前编辑目标：选中用例时是用例的断言，未选中时是请求自身的默认断言。 */
