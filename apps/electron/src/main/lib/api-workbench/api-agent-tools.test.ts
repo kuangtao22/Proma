@@ -42,4 +42,12 @@ describe('接口工作台 Agent 工具合同', () => {
     expect(accepts('api_save_request', { preparedId: 'prepared_1', expectedRevision: 3 })).toBe(true)
     expect(accepts('api_save_request', { preparedId: 'prepared_1', expectedRevision: 3, definition: {} })).toBe(false)
   })
+
+  test('Given 自动 Cookie When 校验参数 Then 只接受布尔开关且取值通道不在工具里', () => {
+    expect(accepts('api_prepare_request', { request: { useCookieJar: true } })).toBe(true)
+    expect(accepts('api_prepare_request', { request: { useCookieJar: 'yes' } })).toBe(false)
+    /** 没有任何读取 cookie 取值的工具参数。 */
+    expect(accepts('api_inspect_run', { runId: 'run_1', section: 'cookies' })).toBe(false)
+    expect(accepts('api_prepare_request', { cookieJar: [] })).toBe(false)
+  })
 })

@@ -10,6 +10,7 @@ import {
   createRequestTab,
   draftAssertions,
   editApiValue,
+  formatCookieExpiry,
   formatApiResponseBody,
   isAgentApiCase,
   previewApiWorkbenchImport,
@@ -397,6 +398,12 @@ describe('接口工作台编辑模型', () => {
     expect(rows[0]?.caseId).toBe('case-1')
     expect(rows[1]?.error).toBe('API_WORKBENCH_CASE_NOT_FOUND')
     expect(rows[1]?.assertionsTotal).toBe(0)
+  })
+
+  test('Given Cookie 过期时间 When 展示 Then 区分会话 cookie、已过期与具体时间', () => {
+    expect(formatCookieExpiry(null)).toBe('会话 cookie')
+    expect(formatCookieExpiry(1_000, 2_000)).toBe('已过期')
+    expect(formatCookieExpiry(2_000, 1_000)).toBe(new Date(2_000).toLocaleString())
   })
 })
 

@@ -64,7 +64,8 @@ describe('接口工作台 UI 集成', () => {
     expect(source).not.toContain('window.prompt')
     expect(source).not.toContain('SSE')
     expect(source).not.toContain('文件上传')
-    expect(source).not.toContain('自动 Cookie')
+    /** 自动 Cookie 已交付（B8），因此这里只保留仍未交付的能力断言。 */
+    expect(source).not.toContain('Cookie Jar 同步')
     expect(source).toContain('导入接口')
     expect(source).toContain('复制为 cURL')
     expect(source).toContain('复制集合快照')
@@ -180,5 +181,19 @@ describe('接口工作台 UI 集成', () => {
       if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow)
       else Reflect.deleteProperty(globalThis, 'window')
     }
+  })
+
+  test('Given 已交付自动 Cookie When 检查组件源码 Then 开关与面板都接线且不展示取值', async () => {
+    const source = await Bun.file(new URL('./ApiWorkbench.tsx', import.meta.url)).text()
+
+    expect(source).toContain('自动 Cookie（仅本机内存）')
+    expect(source).toContain('function CookieJarDialog')
+    expect(source).toContain('api.getCookieJar')
+    expect(source).toContain('api.clearCookieJar')
+    expect(source).toContain('label="Cookie"')
+    expect(source).toContain('取值不展示也无法导出')
+    expect(source).toContain('formatCookieExpiry')
+    /** cookie 值不在界面状态里：面板只用元数据字段。 */
+    expect(source).not.toContain('cookie.value')
   })
 })

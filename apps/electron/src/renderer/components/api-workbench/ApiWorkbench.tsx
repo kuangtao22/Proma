@@ -7,6 +7,7 @@ import {
   ChevronRight,
   CircleStop,
   CircleDot,
+  Cookie,
   Copy,
   Download,
   Eye,
@@ -33,6 +34,7 @@ import type {
   ApiCatalog,
   ApiCatalogSnapshot,
   ApiCollection,
+  ApiCookieJarEntry,
   ApiEnvironment,
   ApiExtraction,
   ApiField,
@@ -96,6 +98,7 @@ import {
   createRequestTab,
   draftAssertions,
   editApiValue,
+  formatCookieExpiry,
   formatApiResponseBody,
   isAgentApiCase,
   isApiRequestDirty,
@@ -706,6 +709,11 @@ function RequestSettings({ draft, environments, activeEnvironmentId, onChange }:
       <label className="grid grid-cols-[120px_1fr] items-center gap-3"><span>超时（毫秒）</span><Input type="number" min={100} max={300000} value={draft.timeoutMs} onChange={(event) => onChange({ ...draft, timeoutMs: Number(event.target.value) })} className="h-8" /></label>
       <label className="flex items-center justify-between gap-3"><span>跟随重定向（仅同源）</span><Switch checked={draft.followRedirects} onCheckedChange={(followRedirects) => onChange({ ...draft, followRedirects })} /></label>
       <label className="grid grid-cols-[120px_1fr] items-center gap-3"><span>最多重定向</span><Input type="number" min={0} max={10} disabled={!draft.followRedirects} value={draft.maxRedirects} onChange={(event) => onChange({ ...draft, maxRedirects: Number(event.target.value) })} className="h-8" /></label>
+      <label className="flex items-center justify-between gap-3">
+        <span>自动 Cookie（仅本机内存）</span>
+        <Switch checked={draft.useCookieJar === true} onCheckedChange={(useCookieJar) => onChange({ ...draft, useCookieJar })} />
+      </label>
+      <p className="text-[11px] text-muted-foreground">开启后本次请求会读取并写入本机内存里的 Cookie：默认关闭，避免某条请求因为上次的 cookie 而悄悄成功。取值不落盘、也不进入运行记录；草稿里手写的 Cookie 头始终优先。</p>
     </div>
   )
 }
@@ -944,6 +952,46 @@ function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: 
   )
 }
 
+/** Cookie 面板：只展示元数据，取值既不显示也不导出。 */
+function CookieJarDialog({ open, cookies, onOpenChange, onRefresh, onClear }: {
+  open: boolean
+  cookies: ApiCookieJarEntry[]
+  onOpenChange: (open: boolean) => void
+  onRefresh: () => void
+  onClear: () => void
+}): React.ReactElement {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[80vh] max-w-2xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Cookie</DialogTitle>
+          <DialogDescription>只有开启「自动 Cookie」的请求才会读写这里：按项目隔离、只存在本机内存（重启即失效）、不写入运行记录。取值不展示也无法导出。</DialogDescription>
+        </DialogHeader>
+        {cookies.length === 0
+          ? <p className="text-xs text-muted-foreground">还没有 cookie。在有会话的接口上开启「自动 Cookie」并发送一次即可。</p>
+          : (
+            <div className="space-y-1 text-xs">
+              {cookies.map((cookie) => (
+                <div key={`${cookie.domain}${cookie.path}${cookie.name}`} className="flex items-center gap-2 rounded-md border border-border/50 px-2 py-1.5">
+                  <span className="font-mono">{cookie.name}</span>
+                  {cookie.httpOnly && <Badge variant="secondary">HttpOnly</Badge>}
+                  {cookie.secure && <Badge variant="secondary">Secure</Badge>}
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground" title={`${cookie.domain}${cookie.path}`}>{cookie.domain}{cookie.path}</span>
+                  <span className="shrink-0 text-muted-foreground">{formatCookieExpiry(cookie.expiresAt)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        <DialogFooter className="items-center">
+          <Button type="button" variant="destructive" className="mr-auto" disabled={cookies.length === 0} onClick={onClear}>清空</Button>
+          <Button type="button" variant="outline" onClick={onRefresh}>刷新</Button>
+          <Button type="button" onClick={() => onOpenChange(false)}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 /** 运行时变量面板：只展示元数据，取值永不出主进程。 */
 function RuntimeVariablesDialog({ open, variables, onOpenChange, onRefresh, onClear }: {
   open: boolean
@@ -1078,6 +1126,9 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** 运行时变量面板开关与元数据列表。 */
   const [runtimeOpen, setRuntimeOpen] = React.useState(false)
   const [runtimeVariables, setRuntimeVariables] = React.useState<ApiRuntimeVariable[]>([])
+  /** Cookie 面板开关与元数据列表；取值不在这条通道上。 */
+  const [cookieOpen, setCookieOpen] = React.useState(false)
+  const [cookies, setCookies] = React.useState<ApiCookieJarEntry[]>([])
   /** 一次「跑全部用例」的报告状态；关闭弹窗即清空，不写入目录。 */
   const [caseBatch, setCaseBatch] = React.useState<ApiWorkbenchCaseBatch | null>(null)
   /** 批量用例代次；取消后置空，后续用例不再派发。 */
@@ -1436,6 +1487,36 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     }
   }, [api, loadRuntimeVariables, sessionId])
 
+  /** 读取 Cookie 元数据；取值只在主进程使用，界面永远拿不到。 */
+  const loadCookies = React.useCallback(async (): Promise<void> => {
+    if (!api) return
+    try {
+      const result = await api.getCookieJar({ sessionId })
+      setCookies(result.cookies)
+    } catch (error) {
+      setLoadError(errorMessage(error, '读取 Cookie 失败'))
+    }
+  }, [api, sessionId])
+
+  /** 面板打开期间读取 Cookie，并在运行状态变化时同步刷新。 */
+  React.useEffect(() => {
+    if (!api || !cookieOpen) return
+    void loadCookies()
+    return api.onChanged((event) => { if (event.sessionId === sessionId) void loadCookies() })
+  }, [api, cookieOpen, loadCookies, sessionId])
+
+  /** 清空当前 workspace 的 Cookie Jar。 */
+  const clearCookies = React.useCallback(async (): Promise<void> => {
+    if (!api) return
+    try {
+      const result = await api.clearCookieJar({ sessionId })
+      setNotice(result.cleared > 0 ? `已清空 ${result.cleared} 条 Cookie` : '没有可清空的 Cookie')
+      await loadCookies()
+    } catch (error) {
+      setLoadError(errorMessage(error, '清空 Cookie 失败'))
+    }
+  }, [api, loadCookies, sessionId])
+
   React.useEffect(() => {
     /** 工作台快捷键只在焦点位于当前组件内时生效。 */
     const handleKeyDown = (event: KeyboardEvent): void => {
@@ -1490,6 +1571,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
           <ToolButton label="新建环境" onClick={() => { setEditingEnvironment({ id: createLocalId('environment'), name: '新环境', kind: 'local', variables: [] }); setEnvironmentDialogOpen(true) }}><Plus className="size-3.5" /></ToolButton>
           <ToolButton label="运行历史" onClick={() => setView((previous) => ({ ...previous, historyOpen: true }))}><History className="size-3.5" /></ToolButton>
           <ToolButton label="运行时变量" onClick={() => setRuntimeOpen(true)}><KeyRound className="size-3.5" /></ToolButton>
+          <ToolButton label="Cookie" onClick={() => setCookieOpen(true)}><Cookie className="size-3.5" /></ToolButton>
           <ToolButton label="导入接口" onClick={() => setImportOpen(true)}><Upload className="size-3.5" /></ToolButton>
         </div>
       </div>
@@ -1551,6 +1633,13 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
         onCopy={() => void copyCaseReport()}
         onOpenRun={(runId) => { /** 报告是模态弹层，打开某次运行时要先让位给响应面板。 */ setCaseBatch(null); openRun(runId) }}
         onCancel={cancelActive}
+      />
+      <CookieJarDialog
+        open={cookieOpen}
+        cookies={cookies}
+        onOpenChange={setCookieOpen}
+        onRefresh={() => void loadCookies()}
+        onClear={() => void clearCookies()}
       />
       <RuntimeVariablesDialog
         open={runtimeOpen}

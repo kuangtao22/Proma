@@ -6,6 +6,8 @@ import type {
   ApiRequestDraft,
   ApiValue,
 } from '@proma/shared'
+import { cookieHeaderValue } from './api-cookies'
+import type { ApiCookieJarRecord } from './api-cookies'
 
 /** 秘密解析结果同时携带版本，供 prepared 快照发送前复核。 */
 export interface ApiResolvedSecret {
@@ -28,6 +30,10 @@ export interface ResolveApiRequestInput {
   overrides?: ApiField[]
   /** 本次会话提取出的运行时变量；优先级高于环境变量、低于显式单次覆盖。 */
   runtimeVariables?: ApiField[]
+  /** 当前 workspace 的 cookie；只有请求开启自动 Cookie 时才会被调用方传入。 */
+  cookieJar?: readonly ApiCookieJarRecord[]
+  /** 判定 cookie 是否过期用的时间；默认取当前时间。 */
+  now?: number
   resolveSecret: (lookup: ApiSecretLookup) => ApiResolvedSecret | undefined
 }
 
@@ -226,6 +232,20 @@ export function resolveApiRequest(input: ResolveApiRequestInput): ResolveApiRequ
     if (/[\r\n]/.test(name + value)) throw new Error('API_WORKBENCH_HEADER_INVALID')
     headers.push({ name, value, source: 'user' })
     if (resolved.secret || containsSecretTemplate(field.value, variables) || COMMON_SENSITIVE_NAME.test(name)) sensitiveHeaderNames.push(name)
+  }
+
+  /**
+   * 自动 Cookie 默认关闭：关闭时既不读也不写，行为与升级前完全一致。
+   * 草稿里已经显式写了 Cookie 头时以人的写法为准，不再叠加 jar。
+   */
+  if (input.request.useCookieJar && (input.cookieJar?.length ?? 0) > 0 && !headers.some((header) => header.name.toLowerCase() === 'cookie')) {
+    /** 按插值后的最终 URL 选值：host、路径、协议与过期时间都参与匹配。 */
+    const cookieHeader = cookieHeaderValue(input.cookieJar ?? [], url, input.now ?? Date.now())
+    if (cookieHeader) {
+      headers.push({ name: 'Cookie', value: cookieHeader, source: 'generated' })
+      /** 注入的 cookie 视为敏感头，运行记录与预览按既有规则脱敏。 */
+      sensitiveHeaderNames.push('Cookie')
+    }
   }
 
   const auth = input.request.auth

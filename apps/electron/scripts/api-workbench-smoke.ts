@@ -24,9 +24,18 @@ let calls = 0
 const payload = '{"id":90071992547409931234,"token":"fixture-secret","ok":true}'
 /** 本测试的 HTTP server，慢接口供取消验证。 */
 let receivedAuthorization = ''
+/** 会话型接口真实收到的 Cookie 头，用于证明自动 Cookie 确实生效。 */
+let receivedCookie = ''
 const server = createServer((request, response) => {
   calls += 1
   if (request.url === '/slow') { response.writeHead(200); response.write('partial'); return }
+  if (request.url === '/session') {
+    /** 第一次下发 cookie；之后靠 cookie 才算已登录，服务端只回显收到的 Cookie。 */
+    receivedCookie = String(request.headers.cookie ?? '')
+    response.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': ['sid=smoke-cookie-1; Path=/; HttpOnly', 'theme=dark; Path=/'] })
+    response.end(JSON.stringify({ ok: true, cookie: receivedCookie }))
+    return
+  }
   if (request.url === '/login') {
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify({ token: 'fixture-token-9' }))
@@ -288,10 +297,39 @@ async function smoke(): Promise<void> {
   assert.ok(mixedReport.includes('| 未授权返回 401 | 人工 | 通过 | 401 | 1/1 |'), mixedReport)
   assert.ok(mixedReport.includes('| Agent 补的缺参数 | Agent | 未执行 | — | 0/1 | — | 未执行 |'), mixedReport)
   assert.ok(mixedReport.includes('- 结果：1/1 通过'), mixedReport)
+  /** 自动 Cookie：登录下发 cookie，开启自动 Cookie 的后续请求才带上它。 */
+  const sessionDraft = { ...draft, url: baseUrl + '/session', useCookieJar: true }
+  const sessionFirst = await call('prepare', { sessionId: 'smoke-session', request: sessionDraft }) as ApiPreparedPreview
+  await call('send', { sessionId: 'smoke-session', preparedId: sessionFirst.preparedId })
+  assert.equal(receivedCookie, '', '首次请求不该带 cookie')
+  /** 界面只能拿到元数据，取值永远不出主进程。 */
+  const jar = await call('getCookieJar', { sessionId: 'smoke-session' }) as { cookies: Array<{ name: string; domain: string; path: string; httpOnly: boolean }> }
+  assert.deepEqual(jar.cookies.map((cookie) => `${cookie.name}@${cookie.domain}${cookie.path}`).sort(), ['sid@127.0.0.1/', 'theme@127.0.0.1/'])
+  assert.equal(jar.cookies.find((cookie) => cookie.name === 'sid')?.httpOnly, true)
+  assert.equal(JSON.stringify(jar).includes('smoke-cookie-1'), false, 'Cookie 元数据不该回传取值')
+  /** 同 host 的第二次请求带上 cookie，服务端确实收到。 */
+  const sessionSecond = await call('prepare', { sessionId: 'smoke-session', request: sessionDraft }) as ApiPreparedPreview
+  const sessionRun = await call('send', { sessionId: 'smoke-session', preparedId: sessionSecond.preparedId }) as ApiRun
+  assert.equal(receivedCookie, 'sid=smoke-cookie-1; theme=dark', '服务端没有收到自动 Cookie')
+  /** 注入的 Cookie 头在记录里按敏感头遮罩。 */
+  assert.equal(sessionRun.request.headers.find((header) => header.name === 'Cookie')?.value, '[REDACTED]')
+  assert.equal(sessionRun.request.sensitiveHeaderNames.includes('cookie'), true)
+  /** 关闭自动 Cookie 的请求既不读也不写：服务端收不到 cookie。 */
+  const sessionPlain = await call('prepare', { sessionId: 'smoke-session', request: { ...draft, url: baseUrl + '/session' } }) as ApiPreparedPreview
+  await call('send', { sessionId: 'smoke-session', preparedId: sessionPlain.preparedId })
+  assert.equal(receivedCookie, '', '关闭自动 Cookie 的请求不该带 cookie')
+  /** 清空后再次开启自动 Cookie 也拿不到任何 cookie。 */
+  assert.deepEqual(await call('clearCookieJar', { sessionId: 'smoke-session' }), { cleared: 2 })
+  const sessionAfterClear = await call('prepare', { sessionId: 'smoke-session', request: sessionDraft }) as ApiPreparedPreview
+  await call('send', { sessionId: 'smoke-session', preparedId: sessionAfterClear.preparedId })
+  assert.equal(receivedCookie, '', '清空后不该再带 cookie')
+  /** 清空丢掉的是已有 cookie；这次请求又拿到了服务端新下发的那两条。 */
+  const jarAfterClear = await call('getCookieJar', { sessionId: 'smoke-session' }) as { cookies: Array<{ name: string }> }
+  assert.deepEqual(jarAfterClear.cookies.map((cookie) => cookie.name).sort(), ['sid', 'theme'])
   const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 10)
-  assert.equal(calls, 10)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'history'] }))
+  assert.equal(history.runs.length, 14)
+  assert.equal(calls, 14)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

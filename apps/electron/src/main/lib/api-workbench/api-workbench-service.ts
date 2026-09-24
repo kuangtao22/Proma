@@ -19,9 +19,12 @@ import type {
   ApiRunStreamChanged,
   ApiSseEvent,
   ApiRuntimeVariable,
+  ApiCookieJarEntry,
   ApiTransportResult,
 } from '@proma/shared'
 import { evaluateApiAssertions } from './api-assertions'
+import { isCookieExpired, parseApiSetCookie, MAX_COOKIE_JAR_ENTRIES } from './api-cookies'
+import type { ApiCookieJarRecord } from './api-cookies'
 import { evaluateApiExtractions } from './api-extractions'
 import { redactApiBody, redactApiRequest } from './api-redaction'
 import { resolveApiRequest } from './api-request-resolver'
@@ -97,6 +100,8 @@ interface PreparedRecord {
   caseId?: string
   /** 发送前冻结的提取规则；执行结束前不再重新读目录。 */
   extractions: NonNullable<ReturnType<typeof parseApiRequestDraft>['extractions']>
+  /** 本次请求是否开启自动 Cookie：决定运行终态是否写入 jar。 */
+  useCookieJar: boolean
   secretValues: string[]
   origin: string
   runId?: string
@@ -193,6 +198,8 @@ export class ApiWorkbenchService {
   private readonly onStream?: (event: ApiRunStreamChanged) => void
   /** 运行时变量按 workspace 隔离，只存在于当前主进程内存。 */
   private readonly runtimeVariables = new Map<string, Map<string, StoredRuntimeVariable>>()
+  /** Cookie Jar 同样按 workspace 隔离、只活在主进程内存；取值绝不落盘。 */
+  private readonly cookieJar = new Map<string, Map<string, ApiCookieJarRecord>>()
   private readonly prepared = new Map<string, PreparedRecord>()
   private readonly tasks = new Map<string, ScheduledTask>()
   private readonly completed = new Map<string, CompletedIdentity>()
@@ -236,6 +243,8 @@ export class ApiWorkbenchService {
     /** 用例环境只在环境仍存在时生效；显式传入的环境优先级更高。 */
     const effectiveEnvironmentId = environmentId ?? (testCase?.environmentId && catalog.environments.some((item) => item.id === testCase.environmentId) ? testCase.environmentId : undefined)
     if (requestId && !catalog.requests.some((item) => item.id === requestId)) throw new Error('API_WORKBENCH_REQUEST_NOT_FOUND')
+    /** 自动 Cookie 只在请求显式开启时读取；关闭时完全不碰 jar。 */
+    const cookies = request.useCookieJar ? [...this.activeCookies(context.workspaceId).values()] : []
     const resolved = resolveApiRequest({
       catalog,
       request,
@@ -244,6 +253,7 @@ export class ApiWorkbenchService {
       /** 用例覆盖低于显式单次覆盖、高于运行时变量与环境。 */
       ...((testCase?.overrides?.length || input.overrides?.length) ? { overrides: [...(testCase?.overrides ?? []), ...(input.overrides ?? [])] } : {}),
       runtimeVariables: this.runtimeVariableFields(context.workspaceId),
+      ...(cookies.length > 0 ? { cookieJar: cookies, now: this.now() } : {}),
       resolveSecret: ({ ref, owner }) => this.store.resolveSecret(context.workspaceId, ref, owner),
     })
     const createdAt = this.now()
@@ -269,6 +279,7 @@ export class ApiWorkbenchService {
       assertions: (testCase?.assertions ?? request.assertions).map((assertion) => ({ ...assertion })),
       ...(testCase ? { caseId: testCase.id } : {}),
       extractions: (request.extractions ?? []).map((rule) => ({ ...rule })),
+      useCookieJar: request.useCookieJar === true,
       secretValues: [...resolved.secretValues],
       origin,
     })
@@ -446,6 +457,8 @@ export class ApiWorkbenchService {
     this.completed.clear()
     /** 运行时变量只活在本次会话，关闭时一并清除。 */
     this.runtimeVariables.clear()
+    /** Cookie 同样只活在主进程内存：关闭服务即清空，重启不残留。 */
+    this.cookieJar.clear()
   }
 
   /** 从队列填充全局/来源槽位；不使用定时轮询。 */
@@ -480,6 +493,8 @@ export class ApiWorkbenchService {
         ...(task.prepared.artifacts ? { artifacts: task.prepared.artifacts } : {}),
         onEvent: (events) => this.appendStreamEvents(task, this.redactStreamEvents(events, task.prepared.secretValues)),
       })
+      /** 只有开启自动 Cookie 的请求才写 jar：关闭的请求不产生任何 cookie 副作用。 */
+      this.recordCookies(task, result)
       let recordingFailed = result.error?.code === 'API_ARTIFACT_UNAVAILABLE'
       try { this.store.saveRawDetails(task.prepared.context.workspaceId, runId, task.prepared.rawRequest, result.hops) }
       catch { recordingFailed = true }
@@ -632,6 +647,66 @@ export class ApiWorkbenchService {
       id: `runtime_${index}`, name: item.name, value: item.value, enabled: true,
       ...(item.secret ? { secret: true } : {}),
     }))
+  }
+
+  /** 读取未过期的 cookie 元数据；取值不离开主进程。 */
+  getCookieJar(workspaceId: string): ApiCookieJarEntry[] {
+    return [...this.activeCookies(parseApiId(workspaceId)).values()].map((cookie) => ({
+      name: cookie.name, domain: cookie.domain, path: cookie.path,
+      secure: cookie.secure, httpOnly: cookie.httpOnly,
+      expiresAt: cookie.expiresAt, updatedAt: cookie.updatedAt,
+    }))
+  }
+
+  /** 清空一个 workspace 的 Cookie Jar，返回被清掉的数量。 */
+  clearCookieJar(workspaceId: string): number {
+    const id = parseApiId(workspaceId)
+    const removed = this.cookieJar.get(id)?.size ?? 0
+    this.cookieJar.delete(id)
+    return removed
+  }
+
+  /** 取出未过期的 cookie，顺带清掉已过期的条目（服务端删 cookie 也走这里）。 */
+  private activeCookies(workspaceId: string): Map<string, ApiCookieJarRecord> {
+    const existing = this.cookieJar.get(workspaceId)
+    if (!existing) return new Map()
+    const now = this.now()
+    for (const [key, cookie] of existing) {
+      if (isCookieExpired(cookie, now)) existing.delete(key)
+    }
+    return existing
+  }
+
+  /**
+   * 采集本次运行所有跳转的 Set-Cookie。
+   * @param task 当前任务，提供 workspace 与「是否开启自动 Cookie」的冻结事实。
+   * @param result 传输结果，逐跳读取响应头里的原始 Set-Cookie。
+   */
+  private recordCookies(task: ScheduledTask, result: ApiTransportResult): void {
+    /** 关闭自动 Cookie 的请求完全不写 jar，保证「没开就不会悄悄产生状态」。 */
+    if (!task.prepared.useCookieJar || result.state !== 'completed') return
+    const workspaceId = task.prepared.context.workspaceId
+    const now = this.now()
+    const target = this.cookieJar.get(workspaceId) ?? new Map<string, ApiCookieJarRecord>()
+    for (const hop of result.hops) {
+      let url: URL
+      try { url = new URL(hop.url) } catch { continue }
+      for (const header of hop.responseHeaders) {
+        const parsed = parseApiSetCookie(header, url, now)
+        if (!parsed) continue
+        /** 过期即删除：Max-Age=0 或已过 Expires 的响应就是服务端在清 cookie。 */
+        if (isCookieExpired(parsed.record, now)) target.delete(parsed.key)
+        else target.set(parsed.key, parsed.record)
+      }
+    }
+    /** 条目有上限，超出时按最久未更新淘汰，避免一次恶意响应把内存顶满。 */
+    while (target.size > MAX_COOKIE_JAR_ENTRIES) {
+      const oldest = [...target.entries()].sort((left, right) => left[1].updatedAt - right[1].updatedAt)[0]
+      if (!oldest) break
+      target.delete(oldest[0])
+    }
+    if (target.size > 0) this.cookieJar.set(workspaceId, target)
+    else this.cookieJar.delete(workspaceId)
   }
 
   /**

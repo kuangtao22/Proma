@@ -37,6 +37,16 @@ describe('接口工作台共享合同', () => {
     expect(() => parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], source: 'model' }] })).toThrow()
   })
 
+  test('Given 自动 Cookie 开关 When 解析草稿 Then 缺省关闭且只接受布尔值', () => {
+    const base = createApiRequestDraft()
+
+    /** 升级前保存的请求不能因为新字段突然开始读写 cookie。 */
+    expect(parseApiRequestDraft({ ...base, useCookieJar: undefined }).useCookieJar).toBe(false)
+    expect(base.useCookieJar).toBe(false)
+    expect(parseApiRequestDraft({ ...base, useCookieJar: true }).useCookieJar).toBe(true)
+    expect(() => parseApiRequestDraft({ ...base, useCookieJar: 'yes' })).toThrow()
+  })
+
   test('Given 提取规则 When 解析草稿 Then 校验变量名、来源与上限', () => {
     const base = createApiRequestDraft()
     const valid = { ...base, extractions: [{ id: 'ex_1', name: 'access_token', from: 'json' as const, path: 'data.token', secret: true }] }

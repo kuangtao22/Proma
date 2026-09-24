@@ -39,3 +39,23 @@ test('Given 流式事件广播 When 订阅 Then 只把合法事件交给界面�
   unsubscribe()
   expect(listener).toBeUndefined()
 })
+
+test('Given Cookie Jar 查询与清空 When 调用 Then 只走会话身份并校验回执', async () => {
+  const calls: unknown[] = []
+  const api = createApiWorkbenchPreload(async (channel, command) => {
+    calls.push([channel, command])
+    const method = (command as { method: string }).method
+    if (method === 'getCookieJar') return { cookies: [{ name: 'sid', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, expiresAt: null, updatedAt: 3 }] }
+    return { cleared: 1 }
+  }, () => () => {})
+
+  expect((await api.getCookieJar({ sessionId: 'session-1' })).cookies[0]?.domain).toBe('127.0.0.1')
+  expect((await api.clearCookieJar({ sessionId: 'session-1' })).cleared).toBe(1)
+  /** 取值不在回执合同里：出现即判损坏协议并拒绝。 */
+  const leaking = createApiWorkbenchPreload(async () => ({ cookies: [{ name: 'sid', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, expiresAt: null, updatedAt: 3, value: 'leak' }] }), () => () => {})
+  await expect(leaking.getCookieJar({ sessionId: 'session-1' })).rejects.toThrow()
+  expect(calls).toEqual([
+    [API_WORKBENCH_CHANNELS.INVOKE, { method: 'getCookieJar', input: { sessionId: 'session-1' } }],
+    [API_WORKBENCH_CHANNELS.INVOKE, { method: 'clearCookieJar', input: { sessionId: 'session-1' } }],
+  ])
+})

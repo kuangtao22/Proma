@@ -6,7 +6,7 @@ export interface ApiIpcEvent { sender: { id: number } }
 /** 服务对象由生产 singleton 或测试夹具提供。 */
 export interface ApiIpcDependencies {
   ipc: { handle(channel: string, listener: (event: ApiIpcEvent, input: unknown) => Promise<unknown>): void; removeHandler(channel: string): void }
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar'>
   isAuthorizedSender(event: ApiIpcEvent): boolean
   requireSession(sessionId: string): { id: string; workspaceId: string }
   assertWorkspaceWritable?(workspaceId: string): void
@@ -42,6 +42,8 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
       case 'pinRun': result = await write(() => service.pinRun(context, command.input.runId, command.input.pinned)); break
       case 'getRuntimeVariables': result = { variables: service.getRuntimeVariables(context.workspaceId) }; break
       case 'clearRuntimeVariables': result = { cleared: service.clearRuntimeVariables(context.workspaceId) }; break
+      case 'getCookieJar': result = { cookies: service.getCookieJar(context.workspaceId) }; break
+      case 'clearCookieJar': result = { cleared: service.clearCookieJar(context.workspaceId) }; break
     }
     assertCurrent()
     return parseApiResponse(command.method, result)

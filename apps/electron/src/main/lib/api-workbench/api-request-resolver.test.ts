@@ -125,3 +125,64 @@ test('Given 多字节变量重复展开 When 准备请求 Then 在形成巨大�
   const request = { ...draft(), url: 'https://example.test', headers: [], query: [], auth: { type: 'none' as const, value: { value: '' } }, body: { kind: 'text' as const, text: '{{large}}'.repeat(10000), fields: [] } }
   expect(() => resolveApiRequest({ catalog, request, overrides: [{ id: 'large', name: 'large', value: '汉'.repeat(120000), enabled: true }], resolveSecret: () => undefined })).toThrow('REQUEST_TOO_LARGE')
 })
+
+describe('自动 Cookie 注入', () => {
+  /** 该 host 的一条会话 cookie。 */
+  const jar = [{ name: 'sid', domain: 'example.test', path: '/', secure: false, httpOnly: true, expiresAt: null, updatedAt: 1, value: 'jar-value-1' }]
+  /** 只带 URL 的最小请求：清掉默认草稿里的模板与秘密，避免与被测行为耦合。 */
+  const plain: ApiRequestDraft = {
+    ...draft(), url: 'https://example.test/users', headers: [], query: [],
+    body: { kind: 'none', text: '', fields: [] }, auth: { type: 'none', value: { value: '' } },
+  }
+
+  test('Given 未开启自动 Cookie When 解析 Then 即使传入 jar 也不注入', () => {
+    const result = resolveApiRequest({ catalog, request: plain, cookieJar: jar, resolveSecret: () => undefined })
+
+    expect(result.request.headers.some((header) => header.name.toLowerCase() === 'cookie')).toBe(false)
+    expect(result.request.sensitiveHeaderNames).not.toContain('cookie')
+  })
+
+  test('Given 开启自动 Cookie When 解析 Then 合成敏感 Cookie 头且不进入秘密取值集合', () => {
+    const result = resolveApiRequest({ catalog, request: { ...plain, useCookieJar: true }, cookieJar: jar, now: 10, resolveSecret: () => undefined })
+
+    expect(result.request.headers).toContainEqual({ name: 'Cookie', value: 'sid=jar-value-1', source: 'generated' })
+    /** 记录与预览按敏感头规则遮罩，不需要额外把取值加进秘密集合。 */
+    expect(result.request.sensitiveHeaderNames).toContain('cookie')
+    expect(result.secretValues).not.toContain('jar-value-1')
+  })
+
+  test('Given 草稿已写 Cookie 头 When 开启自动 Cookie Then 以人的写法为准且不叠加', () => {
+    const result = resolveApiRequest({
+      catalog,
+      request: { ...plain, useCookieJar: true, headers: [{ id: 'h', name: 'Cookie', value: 'manual=1', enabled: true }] },
+      cookieJar: jar,
+      now: 10,
+      resolveSecret: () => undefined,
+    })
+    const cookies = result.request.headers.filter((header) => header.name.toLowerCase() === 'cookie')
+
+    expect(cookies).toEqual([{ name: 'Cookie', value: 'manual=1', source: 'user' }])
+  })
+
+  test('Given 作用域或过期不匹配 When 开启自动 Cookie Then 不注入空头', () => {
+    const otherHost = resolveApiRequest({ catalog, request: { ...plain, useCookieJar: true }, cookieJar: [{ ...jar[0]!, domain: 'other.test' }], now: 10, resolveSecret: () => undefined })
+    const expired = resolveApiRequest({ catalog, request: { ...plain, useCookieJar: true }, cookieJar: [{ ...jar[0]!, expiresAt: 5 }], now: 10, resolveSecret: () => undefined })
+
+    expect(otherHost.request.headers.some((header) => header.name.toLowerCase() === 'cookie')).toBe(false)
+    expect(expired.request.headers.some((header) => header.name.toLowerCase() === 'cookie')).toBe(false)
+  })
+
+  test('Given 模板变量拼出的最终 URL When 选 cookie Then 按插值后的 host 判定', () => {
+    const result = resolveApiRequest({
+      catalog,
+      request: { ...plain, url: 'https://{{host}}/users', useCookieJar: true },
+      overrides: [{ id: 'o', name: 'host', value: 'example.test', enabled: true }],
+      cookieJar: jar,
+      now: 10,
+      resolveSecret: () => undefined,
+    })
+
+    expect(result.request.url).toBe('https://example.test/users')
+    expect(result.request.headers.some((header) => header.name.toLowerCase() === 'cookie')).toBe(true)
+  })
+})

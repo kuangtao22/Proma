@@ -47,6 +47,22 @@ export interface ApiExtraction {
 export interface ApiExtractionOutcome { id: string; name: string; from: ApiExtraction['from']; found: boolean; secret: boolean; message?: string }
 /** 运行时变量只回传元数据，值只在主进程内部使用。 */
 export interface ApiRuntimeVariable { name: string; secret: boolean; source: string; updatedAt: number }
+/**
+ * Cookie Jar 的公开元数据：界面只用来展示与清理，**不含取值**。
+ * 作用域按 host-only 记录：domain 就是收到 Set-Cookie 的那个 host，不做跨域共享。
+ */
+export interface ApiCookieJarEntry {
+  name: string
+  domain: string
+  path: string
+  /** 仅 https 回送。 */
+  secure: boolean
+  /** 服务端标记 HttpOnly；界面据此提示「脚本不可见」，不影响本机回送。 */
+  httpOnly: boolean
+  /** 过期时间；会话 cookie 为 null。 */
+  expiresAt: number | null
+  updatedAt: number
+}
 /** 单个 SSE 事件：序号、到达时间与原始帧同时保留，便于逐帧核对。 */
 export interface ApiSseEvent {
   index: number; receivedMs: number
@@ -103,6 +119,11 @@ export interface ApiRequestDraft {
    * 请求自身的 assertions 仍然有效，等价于「默认用例」。
    */
   cases?: ApiTestCase[]
+  /**
+   * 是否启用自动 Cookie：为真时本次请求读取并写入宿主内存里的 Cookie Jar，为假或缺省时完全不碰 cookie。
+   * 默认关闭是为了避免「某条请求因为上次的 cookie 而悄悄成功」。
+   */
+  useCookieJar?: boolean
 }
 /** 已保存请求具有独立版本，更新采用 expected revision 比较。 */
 export interface ApiRequestDefinition extends ApiRequestDraft { id: string; revision: number; updatedAt: number }
@@ -204,12 +225,16 @@ export interface ApiWorkbenchApi {
   getRuntimeVariables(input: ApiTarget): Promise<{ variables: ApiRuntimeVariable[] }>
   /** 清空当前 workspace 的运行时变量。 */
   clearRuntimeVariables(input: ApiTarget): Promise<{ cleared: number }>
+  /** Cookie Jar 只回传元数据；取值永不出主进程。 */
+  getCookieJar(input: ApiTarget): Promise<{ cookies: ApiCookieJarEntry[] }>
+  /** 清空当前 workspace 的 Cookie Jar。 */
+  clearCookieJar(input: ApiTarget): Promise<{ cleared: number }>
   onChanged(callback: (event: ApiRunChanged) => void): () => void
   onStream(callback: (event: ApiRunStreamChanged) => void): () => void
 }
 /** 创建不包含自动网络行为的新草稿。 */
 export function createApiRequestDraft(collectionId = 'default'): ApiRequestDraft {
-  return { name: '新请求', collectionId, folder: '', description: '', method: 'GET', url: '', query: [], headers: [], body: { kind: 'none', text: '', fields: [] }, auth: { type: 'none', value: { value: '' } }, timeoutMs: 30_000, followRedirects: false, maxRedirects: 5, assertions: [], extractions: [], cases: [] }
+  return { name: '新请求', collectionId, folder: '', description: '', method: 'GET', url: '', query: [], headers: [], body: { kind: 'none', text: '', fields: [] }, auth: { type: 'none', value: { value: '' } }, timeoutMs: 30_000, followRedirects: false, maxRedirects: 5, assertions: [], extractions: [], cases: [], useCookieJar: false }
 }
 /** 稳定的合同错误，附带字段名但不回显字段值。 */
 function invalid(path: string): never { throw new Error('API_WORKBENCH_INVALID: ' + path) }
@@ -277,7 +302,7 @@ function assertion(value: unknown): ApiAssertion {
   }
 }
 /** 草稿字段白名单，定义解析也复用此表。 */
-const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases'] as const
+const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases', 'useCookieJar'] as const
 /** 解析单条测试用例；用例名可有界重复，身份必须唯一。 */
 function testCase(value: unknown): ApiTestCase {
   const record = apiRecord(value, ['id', 'name', 'assertions', 'overrides', 'environmentId', 'source'], 'case')
@@ -326,6 +351,8 @@ export function parseApiRequestDraft(value: unknown): ApiRequestDraft {
     extractions: rows(record.extractions ?? [], extraction, API_LIMITS.maxExtractions, 'extractions'),
     ...(record.targetEnvironmentId === undefined ? {} : { targetEnvironmentId: parseApiId(record.targetEnvironmentId) }),
     cases: rows(record.cases ?? [], testCase, API_LIMITS.maxCases, 'cases'),
+    /** 自动 Cookie 缺省关闭：升级前保存的请求不会突然开始读写 cookie。 */
+    useCookieJar: record.useCookieJar === undefined ? false : flag(record.useCookieJar, 'useCookieJar'),
   }
 }
 /** 从定义提取编辑草稿，不把内部版本字段送入草稿解析器。 */

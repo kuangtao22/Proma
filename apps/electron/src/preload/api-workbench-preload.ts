@@ -25,6 +25,8 @@ export function createApiWorkbenchPreload(invoke: ApiWorkbenchInvoke, subscribe:
     pinRun: (input) => call('pinRun', input),
     getRuntimeVariables: (input) => call('getRuntimeVariables', input),
     clearRuntimeVariables: (input) => call('clearRuntimeVariables', input),
+    getCookieJar: (input) => call('getCookieJar', input),
+    clearCookieJar: (input) => call('clearCookieJar', input),
     onChanged: (callback) => subscribe(API_WORKBENCH_CHANNELS.CHANGED, (value) => { callback(parseApiRunChanged(value)) }),
     /** 流式事件同样先过 parser；损坏消息直接丢弃，不进入渲染层。 */
     onStream: (callback) => subscribe(API_WORKBENCH_CHANNELS.STREAM, (value) => {

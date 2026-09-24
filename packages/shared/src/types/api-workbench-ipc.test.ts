@@ -103,3 +103,25 @@ test('Given 运行时变量回执 When 解析 Then 只接受元数据并拒绝�
   expect(() => parseApiResponse('getRuntimeVariables', { variables: [{ name: '1bad', secret: true, source: 'x', updatedAt: 1 }] })).toThrow()
   expect(() => parseApiResponse('clearRuntimeVariables', { cleared: 99 })).toThrow()
 })
+
+test('Given Cookie Jar 命令 When 解析 Then 只接受会话身份且拒绝伪造 workspace', () => {
+  expect(parseApiCommand({ method: 'getCookieJar', input: { sessionId: 'session-1' } })).toEqual({ method: 'getCookieJar', input: { sessionId: 'session-1' } })
+  expect(parseApiCommand({ method: 'clearCookieJar', input: { sessionId: 'session-1' } }).method).toBe('clearCookieJar')
+  expect(() => parseApiCommand({ method: 'getCookieJar', input: { sessionId: 'session-1', workspaceId: 'other' } })).toThrow()
+})
+
+test('Given Cookie Jar 回执 When 解析 Then 只接受元数据并拒绝取值与畸形作用域', () => {
+  const entry = { name: 'session', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, expiresAt: null, updatedAt: 5 }
+  const accepted = parseApiResponse('getCookieJar', { cookies: [entry] })
+
+  expect(accepted.cookies[0]?.name).toBe('session')
+  expect(accepted.cookies[0]?.httpOnly).toBe(true)
+  expect(parseApiResponse('clearCookieJar', { cleared: 3 }).cleared).toBe(3)
+  /** 取值不在契约里：出现 value 一律判损坏协议。 */
+  expect(() => parseApiResponse('getCookieJar', { cookies: [{ ...entry, value: 'leak' }] })).toThrow()
+  expect(() => parseApiResponse('getCookieJar', { cookies: [{ ...entry, path: 'no-slash' }] })).toThrow()
+  expect(() => parseApiResponse('getCookieJar', { cookies: [{ ...entry, name: 'bad name' }] })).toThrow()
+  expect(() => parseApiResponse('getCookieJar', { cookies: [{ ...entry, domain: 'evil domain' }] })).toThrow()
+  expect(() => parseApiResponse('getCookieJar', { cookies: Array.from({ length: 129 }, () => entry) })).toThrow()
+  expect(() => parseApiResponse('clearCookieJar', { cleared: 999 })).toThrow()
+})

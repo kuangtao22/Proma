@@ -2,18 +2,18 @@ import '@fontsource-variable/inter/index.css'
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { createApiRequestDraft } from '@proma/shared'
-import type { ApiCatalog, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiWorkbenchApi } from '@proma/shared'
+import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiWorkbenchApi } from '@proma/shared'
 import { ApiWorkbench } from '../src/renderer/components/api-workbench/ApiWorkbench'
 import { TooltipProvider } from '../src/renderer/components/ui/tooltip'
 import '../src/renderer/styles/globals.css'
 
 /** smoke 运行状态只记录公开计数和目录，不包含凭据。 */
-interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string }
+interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string }
 
 /** 初始目录提供一个可点击集合。 */
 const state: ApiSmokeState = {
   catalog: { version: 1, revision: 0, collections: [{ id: 'default', name: '默认集合', description: '', variables: [] }], environments: [], requests: [] },
-  runs: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '',
+  runs: [], cookies: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '',
 }
 /** 最近一次准备后的固定请求。 */
 let preparedRequest: ApiResolvedRequest | null = null
@@ -113,6 +113,13 @@ const api: ApiWorkbenchApi = {
     runtimeVariables = []
     return { cleared }
   },
+  /** Cookie 面板只回元数据：夹具里也没有取值字段。 */
+  getCookieJar: async () => ({ cookies: state.cookies.map((item) => ({ ...item })) }),
+  clearCookieJar: async () => {
+    const cleared = state.cookies.length
+    state.cookies = []
+    return { cleared }
+  },
 }
 
 /** 让生产组件读取合成 preload，并向 Electron 验收暴露只读状态。 */
@@ -123,6 +130,17 @@ Object.defineProperty(window, '__apiWorkbenchSmoke', { configurable: true, get: 
 Object.defineProperty(window, '__apiWorkbenchEmitStream', {
   configurable: true,
   value: (event: ApiRunStreamChanged) => { for (const listener of streamListeners) listener(event) },
+})
+/** smoke 用：扮演 Host 提供两三条 cookie 元数据，用于验证面板展示与清空。 */
+Object.defineProperty(window, '__apiWorkbenchSmokeSeedCookies', {
+  configurable: true,
+  value: () => {
+    state.cookies = [
+      { name: 'sid', domain: '127.0.0.1', path: '/', secure: false, httpOnly: true, expiresAt: null, updatedAt: Date.now() },
+      { name: 'theme', domain: '127.0.0.1', path: '/app', secure: false, httpOnly: false, expiresAt: Date.now() + 60_000, updatedAt: Date.now() },
+    ]
+    return true
+  },
 })
 /** Agent 用例窗口：夹具扮演 Host，提供一条由 Agent 声明、一条由人工创建的用例。 */
 if (new URLSearchParams(location.search).has('agent-case')) {

@@ -243,6 +243,29 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.find((item) => item.url === 'http://127.0.0.1:8080/smoke')?.cases.length === 1", '删除的用例未同步到目录')
     assert.equal(await window.webContents.executeJavaScript("document.querySelectorAll('input[aria-label=\"用例名称\"]')[0]?.value ?? ''"), '正常用例', '删除后残留的用例不正确')
     console.log('[API Workbench UI smoke] 用例页签、跑全部用例与复制报告已验证')
+    /** 自动 Cookie：请求设置里有开关，面板只展示元数据并可一键清空。 */
+    await clickText(window, '设置')
+    await waitFor(window, "document.body.textContent?.includes('自动 Cookie（仅本机内存）')", '请求设置缺少自动 Cookie 开关')
+    assert.equal(await window.webContents.executeJavaScript('window.__apiWorkbenchSmokeSeedCookies()'), true, '准备 Cookie 元数据失败')
+    await clickLabel(window, 'Cookie')
+    await waitFor(window, "document.body.textContent?.includes('会话 cookie') && document.body.textContent?.includes('127.0.0.1/app')", 'Cookie 面板未显示元数据')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('HttpOnly') ?? false"), true, 'Cookie 面板缺少 HttpOnly 标记')
+    /** 等一帧再截图，确保弹层完成这次重绘。 */
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-cookie-jar.png', (await window.webContents.capturePage()).toPNG())
+    await clickText(window, '清空')
+    await waitFor(window, "document.body.textContent?.includes('还没有 cookie')", '清空 Cookie 后没有空状态')
+    assert.equal(await window.webContents.executeJavaScript('window.__apiWorkbenchSmoke.cookies.length'), 0, 'Cookie 未真正清空')
+    /** 已关闭的弹层仍会留在 DOM 里，因此只在「当前打开的那个」弹层里点关闭。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const dialog = [...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open')
+      const button = [...(dialog?.querySelectorAll('button') ?? [])].find((item) => item.textContent?.trim() === '关闭')
+      if (!(button instanceof HTMLButtonElement)) return false
+      button.click()
+      return true
+    })()`), true, '找不到 Cookie 面板的关闭按钮')
+    await waitFor(window, "![...document.querySelectorAll('[role=dialog]')].some((item) => item.getAttribute('data-state') === 'open')", 'Cookie 面板未关闭')
+    console.log('[API Workbench UI smoke] 自动 Cookie 开关与面板已验证')
     await waitForClosedLayersToLeave(window)
     await waitFor(window, `(() => {
       const request = document.querySelector('input[aria-label="请求 URL"]')
@@ -313,7 +336,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     } finally {
       agentWindow.destroy()
     }
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error
