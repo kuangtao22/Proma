@@ -1,8 +1,20 @@
 import { describe, expect, test } from 'bun:test'
 import { isServerOpsAgentTableAllowed, parseServerOpsAgentReadAccess, parseServerOpsAgentReadGrant } from './server-ops-agent-read'
-import type { ServerOpsAgentReadGrant } from './server-ops-agent-read'
+import type { ServerOpsAgentReadGrant, ServerOpsAgentReadResource } from './server-ops-agent-read'
 
 describe('运维只读授权合同', () => {
+  test('Given PostgreSQL 大小写不同 canonical 表 When 保存排除项 Then 精确保留且分别匹配', () => {
+    const resource: ServerOpsAgentReadResource = { kind: 'postgresql', sourceId: 'pg-1', instance: false, databases: [{
+      database: 'postgres', tables: null, excludedTables: ['"public"."Users"'], readRows: true,
+    }] }
+    const parsed = parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [resource] })
+    expect(parsed.resources[0]).toEqual(resource)
+    expect(isServerOpsAgentTableAllowed('postgresql', resource.databases[0]!, '"public"."Users"')).toBe(false)
+    expect(isServerOpsAgentTableAllowed('postgresql', resource.databases[0]!, '"public"."users"')).toBe(true)
+    expect(() => parseServerOpsAgentReadGrant({ sessionId: 'session-1', resources: [{
+      ...resource, databases: [{ ...resource.databases[0], excludedTables: ['public.users'] }],
+    }] })).toThrow('SERVER_OPS_READ_ACCESS_INVALID')
+  })
   test('Given 旧行权限或显式 SQL 权限 When 解析 Then 不自动升级且 SQL 必须同时允许行读取', () => {
     /** 查询开关与旧行权限独立，省略时不能获得新能力。 */
     const base = { database: 'app', tables: ['orders'], readRows: true }
@@ -46,9 +58,12 @@ describe('运维只读授权合同', () => {
     const resource = parsed.resources[0]
     if (!resource || resource.kind !== 'mysql') throw new Error('无效测试授权')
     const scope = resource.databases[0]!
-    expect(isServerOpsAgentTableAllowed(scope, 'private_data')).toBe(false)
-    expect(isServerOpsAgentTableAllowed(scope, 'PUBLIC_DATA')).toBe(true)
-    expect(isServerOpsAgentTableAllowed({ database: 'app', tables: ['Users'], readRows: true }, 'users')).toBe(false)
+    expect(isServerOpsAgentTableAllowed('mysql', scope, 'private_data')).toBe(false)
+    expect(isServerOpsAgentTableAllowed('mysql', scope, 'PUBLIC_DATA')).toBe(true)
+    expect(isServerOpsAgentTableAllowed('mysql', { database: 'app', tables: ['Users'], readRows: true }, 'users')).toBe(false)
+    expect(isServerOpsAgentTableAllowed('mysql', {
+      database: 'app', tables: null, excludedTables: ['"public"."Users"'], readRows: true,
+    }, '"public"."users"')).toBe(false)
     expect(parseServerOpsAgentReadGrant({ ...input, resources: [{ ...input.resources[0],
       databases: [{ database: 'app', tables: null, excludedTables: [], readRows: false }] }] }).resources[0]).toMatchObject({
       databases: [{ excludedTables: [] }],

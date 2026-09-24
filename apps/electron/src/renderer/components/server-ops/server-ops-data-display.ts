@@ -18,6 +18,7 @@ const SERVER_OPS_DATA_ERROR_MESSAGES: ReadonlyArray<{ match: string; text: strin
   { match: 'SERVER_OPS_DATA_SOURCE_BUSY', text: '该数据源已有读取在进行中' },
   { match: 'SERVER_OPS_DATA_BUSY', text: '同时进行的数据库读取过多，请稍后重试' },
   { match: 'SERVER_OPS_DATA_SOURCE_NOT_FOUND', text: '数据源不存在，可能已在其它窗口删除' },
+  { match: 'SERVER_OPS_DATA_SOURCE_CHANGED', text: '连接配置已更新，请重新进入连接后再试' },
   { match: 'SERVER_OPS_DATA_SOURCE_HOST_INVALID', text: '跳板服务器无效或已被删除，请重新选择连接方式' },
   { match: 'SERVER_OPS_DATA_SOURCE_ID_INVALID', text: '数据源标识无效，请关闭后重新打开这条连接' },
   { match: 'SERVER_OPS_DATA_SOURCE_TIMESTAMP_INVALID', text: '本机时间异常，无法写入数据源' },
@@ -79,6 +80,7 @@ export function isServerOpsDataSourceBusyError(error: unknown): boolean {
  * 旧 preload 不认识新增的草稿测试输入、主进程还没注册新通道、preload 还没有新方法。
  */
 const SERVER_OPS_DATA_STALE_CLIENT_HINTS = [
+  'SERVER_OPS_DATA_DEFAULT_DATABASE_UNAVAILABLE',
   'SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID',
   'No handler registered',
   'is not a function',

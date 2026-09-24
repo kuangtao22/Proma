@@ -1,4 +1,4 @@
-import { isServerOpsId } from '@proma/shared'
+import { isServerOpsId, parseServerOpsPostgresTable } from '@proma/shared'
 import type { ServerOpsDataSourceTableResult } from '@proma/shared'
 import type { ServerOpsAgentReadFacade } from './server-ops-agent-read-facade'
 
@@ -19,7 +19,7 @@ interface ServerOpsDatabaseChangeTable extends ServerOpsDataSourceTableResult {
 export interface ServerOpsDatabaseChangeContextResult {
   sourceId: string
   database: string
-  engine: 'mysql' | 'sqlite'
+  engine: 'mysql' | 'postgresql' | 'sqlite'
   executionAllowed: false
   programContext: 'not-inspected'
   schemaCoverage: 'columns-and-indexes-only'
@@ -47,7 +47,7 @@ function parseChangeContextInput(value: unknown): ServerOpsDatabaseChangeContext
   if (Object.keys(record).length !== 3 || Object.keys(record).some((key) => !['sourceId', 'database', 'tables'].includes(key))
     || !isServerOpsId(record.sourceId) || typeof record.database !== 'string' || !record.database.length || record.database.length > 64
     || /[\u0000-\u001f\u007f]/u.test(record.database) || !Array.isArray(record.tables) || record.tables.length < 1 || record.tables.length > 4
-    || record.tables.some((table) => typeof table !== 'string' || !table.length || table.length > 128 || /[\u0000-\u001f\u007f]/u.test(table))
+    || record.tables.some((table) => typeof table !== 'string' || !table.length || table.length > 260 || /[\u0000-\u001f\u007f]/u.test(table))
     || new Set(record.tables).size !== record.tables.length) throw new Error('SERVER_OPS_CHANGE_CONTEXT_INPUT_INVALID')
   return { sourceId: record.sourceId, database: record.database, tables: [...record.tables] as string[] }
 }
@@ -73,6 +73,10 @@ export async function prepareServerOpsDatabaseChangeContext(
   checkCancelled()
   /** 一次预检全部表，禁止先读部分结构才发现剩余目标越权。 */
   const initial = facade.checkDatabaseTables(input)
+  if (initial.engine === 'postgresql') {
+    try { for (const table of input.tables) parseServerOpsPostgresTable(table) }
+    catch { throw new Error('SERVER_OPS_CHANGE_CONTEXT_INPUT_INVALID') }
+  }
   /** 不要求额外行权限，并明确尚未读取业务程序。 */
   const result: ServerOpsDatabaseChangeContextResult = {
     sourceId: input.sourceId, database: input.database, engine: initial.engine,

@@ -582,10 +582,10 @@ describe('服务器运维共享合同', () => {
     } as const
 
     expect(isServerOpsAuditRecord(record)).toBe(true)
-    expect(isServerOpsAuditRecord({ ...record, database: 'x'.repeat(64), table: 'y'.repeat(128) })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...record, database: 'x'.repeat(64), table: 'y'.repeat(260) })).toBe(true)
     expect(isServerOpsAuditRecord({ ...record, database: '' })).toBe(false)
     expect(isServerOpsAuditRecord({ ...record, database: 'x'.repeat(65) })).toBe(false)
-    expect(isServerOpsAuditRecord({ ...record, table: 'y'.repeat(129) })).toBe(false)
+    expect(isServerOpsAuditRecord({ ...record, table: 'y'.repeat(261) })).toBe(false)
     expect(isServerOpsAuditRecord({ ...record, table: 'users\nsecret' })).toBe(false)
     expect(isServerOpsAuditRecord({ ...record, table: undefined })).toBe(false)
   })

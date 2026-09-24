@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { inspectServerOpsLocalSqliteFile } from '../../../utility/server-ops/server-ops-local-sqlite-file'
 import type {
   ServerOpsDataDiagnoseInput,
@@ -17,6 +18,7 @@ import type {
   ServerOpsDataSourceProbeDraft,
   ServerOpsDataSourceRowsInput,
   ServerOpsDataSourceRowsResult,
+  ServerOpsDataSourceSetDefaultDatabaseInput,
   ServerOpsDataSourceCellInput,
   ServerOpsDataSourceCellResult,
   ServerOpsDataSourceTableInput,
@@ -38,6 +40,8 @@ import {
   parseServerOpsDataSourceTableResult,
   parseServerOpsDataSourceTablesInput,
   parseServerOpsDataSourceTablesResult,
+  parseServerOpsDataSource,
+  parseServerOpsDataSourceSetDefaultDatabaseInput,
 } from '@proma/shared'
 import type { ServerOpsActiveConnectionIdentity } from './server-ops-connection-service'
 import type { ServerOpsDataSourceStore, ServerOpsStoredDataSource } from './server-ops-data-source-store'
@@ -261,6 +265,34 @@ export class ServerOpsDataService {
   }
 
   /**
+   * 基于调用方看到的完整公开快照切换 SQL 数据源默认数据库。
+   *
+   * @param input 完整公开快照与目标数据库
+   * @returns 更新后或幂等命中的权威公开数据源
+   */
+  setDefaultDatabase(input: ServerOpsDataSourceSetDefaultDatabaseInput): ServerOpsDataSourceUpsertResult {
+    this.assertUsable()
+    /** 严格解析公开快照与库名，服务内部调用也不能绕过合同。 */
+    const parsed = parseServerOpsDataSourceSetDefaultDatabaseInput(input)
+    /** 仅真实变更才在事务提交后取消旧目标的排队读取。 */
+    let changed = false
+    /** 共享配置锁包住版本复核与原子写入，防止并发编辑被旧快照覆盖。 */
+    const result = this.transaction(() => {
+      /** 锁内取得当前权威记录，不触碰已保存凭据。 */
+      const stored = this.dependencies.store.getById(parsed.source.id)
+      if (!stored) throw new Error('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
+      /** 重新走公开 parser，确保 CAS 比较的是 renderer 可见合同，而不是内部凭据字段。 */
+      const authoritative = parseServerOpsDataSource(this.toPublicSource(stored))
+      if (!isDeepStrictEqual(parsed.source, authoritative)) throw new Error('SERVER_OPS_DATA_SOURCE_CHANGED')
+      if (authoritative.database === parsed.database) return { source: authoritative }
+      changed = true
+      return { source: this.toPublicSource(this.dependencies.store.update(authoritative.id, { database: parsed.database })) }
+    })
+    if (changed) this.scheduler.cancelQueued(parsed.source.id)
+    return result
+  }
+
+  /**
    * 删除数据源并连带清理密码密文。
    *
    * @param input 主机与数据源身份
@@ -390,7 +422,7 @@ export class ServerOpsDataService {
     const parsedInput = parseServerOpsDataDiagnoseInput(input)
     /** 读取前固定数据源身份，避免读取期间被删除后回执出现不一致的引擎字段。 */
     const engine = this.requireSource(parsedInput.sourceId).engine
-    if (parsedInput.database !== undefined && engine !== 'mysql') throw new Error('SERVER_OPS_DATA_DIAGNOSE_INPUT_INVALID')
+    if (parsedInput.database !== undefined && engine !== 'mysql' && engine !== 'postgresql') throw new Error('SERVER_OPS_DATA_DIAGNOSE_INPUT_INVALID')
     /** 实际读取结果与耗时；诊断不对外暴露时延指标。 */
     const { result } = await this.runRead('diagnostics', parsedInput.sourceId, parsedInput.section, parsedInput.database, signal, context)
     if (!isDiagnosticsReadResult(result)) throw new Error('SERVER_OPS_DATA_UNEXPECTED_RESULT')
@@ -623,7 +655,9 @@ export class ServerOpsDataService {
     const parsedInput = parseServerOpsDataQueryInput(input)
     /** 查询前固定真实连接配置；label、projectId 与 updatedAt 不属于安全身份。 */
     const expectedSource = this.requireSource(parsedInput.sourceId)
-    if (expectedSource.engine !== 'mysql' && expectedSource.engine !== 'sqlite') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+    if (expectedSource.engine !== 'mysql' && expectedSource.engine !== 'postgresql' && expectedSource.engine !== 'sqlite') {
+      throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+    }
     const expectedConnection = expectedSource.transport === 'ssh'
       ? this.dependencies.connection.getActiveIdentity(expectedSource.hostId ?? '')
       : undefined
@@ -990,7 +1024,7 @@ export class ServerOpsDataService {
   private assertDirectTransportIsSafe(target: ServerOpsDataReadTarget): void {
     if (target.engine === 'sqlite') return
     /** 历史 IP 校验配置仍可列出，但在发送凭据与开通道前明确要求用户改为 DNS 名称。 */
-    if (target.engine === 'mysql' && target.tlsMode === 'verify'
+    if ((target.engine === 'mysql' || target.engine === 'postgresql') && target.tlsMode === 'verify'
       && !isServerOpsMySqlTlsServerName(target.tlsServerName)) {
       throw new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
     }

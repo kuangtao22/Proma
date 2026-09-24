@@ -24,7 +24,7 @@ export interface ServerOpsConnection {
   /** 卡片单独展示的连接说明；兼容旧调用方，因此保持可选。 */
   metadata?: string
   /** 卡片展示的真实协议或引擎名称；旧调用方缺省时由类别回退。 */
-  protocol?: 'SSH' | 'MySQL' | 'SQLite' | 'Redis'
+  protocol?: 'SSH' | 'MySQL' | 'PostgreSQL' | 'SQLite' | 'Redis'
   /** SSH 连接对应的主机 ID。 */
   hostId?: string
   /** 数据库/Redis 连接对应的数据源 ID。 */
@@ -136,7 +136,7 @@ export function buildServerOpsConnections(source: ServerOpsConnectionSource): Se
       detail: [endpoint, detailDatabaseLabel, transportLabel].filter((part): part is string => part !== undefined).join(' · '),
       endpoint,
       metadata: [databaseLabel, transportLabel].filter((part): part is string => part !== undefined).join(' · '),
-      protocol: dataSource.engine === 'sqlite' ? 'SQLite' : dataSource.engine === 'redis' ? 'Redis' : 'MySQL',
+      protocol: dataSource.engine === 'postgresql' ? 'PostgreSQL' : dataSource.engine === 'sqlite' ? 'SQLite' : dataSource.engine === 'redis' ? 'Redis' : 'MySQL',
       sourceId: dataSource.id,
       /** 只有明确关闭 TLS 的私网直连才可由配置判定为明文；优先 TLS 需看实测结果。 */
       plaintextDirect: dataSource.engine !== 'sqlite'

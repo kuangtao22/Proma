@@ -18,7 +18,7 @@ function fixture() {
       const resource = facade.resources().resources.find((entry) => entry.kind !== 'ssh' && entry.sourceId === sourceId)
       if (!resource || (resource.kind !== 'mysql' && resource.kind !== 'sqlite')) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
       const scope = resource.databases.find((entry) => entry.database === database)
-      if (!scope || tables.some((table) => !isServerOpsAgentTableAllowed(scope, table))) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+      if (!scope || tables.some((table) => !isServerOpsAgentTableAllowed(resource.kind, scope, table))) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       return { engine: resource.kind, revision }
     },
     databaseDescribe: async ({ table }) => {
@@ -122,4 +122,18 @@ describe('数据库变更脚本上下文', () => {
     expect(result.warnings.join('\n')).toContain('截断')
     expect(Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8')).toBeLessThanOrEqual(32_768)
   })
+
+  test('Given PostgreSQL 变更上下文 When 使用 canonical 表身份或别名 Then 只允许 schema 限定目标', async () => {
+    const state = fixture()
+    state.facade.checkDatabaseTables = ({ tables }) => {
+      if (tables.includes('orders')) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+      return { engine: 'postgresql', revision: 1 }
+    }
+    const table = '"sales"."orders"'
+    const result = await prepareServerOpsDatabaseChangeContext(state.facade, { sourceId: 'db-1', database: 'appdb', tables: [table] })
+    expect(result).toMatchObject({ engine: 'postgresql', tables: [{ name: table }] })
+    await expect(prepareServerOpsDatabaseChangeContext(state.facade, { sourceId: 'db-1', database: 'appdb', tables: ['orders'] }))
+      .rejects.toThrow()
+  })
+
 })

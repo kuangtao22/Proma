@@ -3,6 +3,7 @@ import type {
   ServerOpsDataQueryCancelInput,
   ServerOpsDataQueryInput,
   ServerOpsDataQueryResult,
+  ServerOpsSqlDialect,
 } from '@proma/shared'
 
 /** SQL 查询页只依赖执行与取消两个可选桥接，兼容尚未升级的 preload。 */
@@ -17,12 +18,15 @@ export interface ServerOpsSqlQueryContext {
   database: string | null
   configurationKey: string
   available: boolean
+  /** 方言与连接身份一起复核，旧调用方默认沿用 MySQL。 */
+  dialect?: ServerOpsSqlDialect
 }
 
 /** 比对当前页面与控制器的查询目标，防止 React effect 同步前查询旧数据库。 */
 export function isServerOpsSqlQueryContextCurrent(actual: ServerOpsSqlQueryContext | null, expected: ServerOpsSqlQueryContext): boolean {
   return actual !== null && actual.sourceId === expected.sourceId && actual.database === expected.database
     && actual.configurationKey === expected.configurationKey && actual.available === expected.available
+    && (actual.dialect ?? 'mysql') === (expected.dialect ?? 'mysql')
 }
 
 /** 成功结果固定执行快照，避免后续编辑让旧结果看起来属于新 SQL。 */
@@ -198,7 +202,7 @@ export function createServerOpsSqlQueryController(options: ServerOpsSqlQueryCont
       const query = options.api.query
       if (!context?.database || !query) return
       /** 每次按下执行都检查当前文本，不能依赖防抖前的旧结果；本地拒绝不记历史。 */
-      const validation = validateServerOpsSqlQuery(state.draft, context.database)
+      const validation = validateServerOpsSqlQuery(state.draft, context.database, context.dialect ?? 'mysql')
       if (!validation.plan) {
         state.status = 'error'; state.error = validation.diagnostics[0]?.message ?? 'SQL 校验未通过，请调整后重试'
         publish()

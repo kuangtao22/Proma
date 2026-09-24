@@ -1,4 +1,5 @@
 import { isServerOpsId } from './server-ops'
+import { parseServerOpsPostgresTable } from './server-ops-postgresql-identifiers'
 
 /** 数据库禁用表策略的独立通道；读取权限不再依赖临时会话租约。 */
 export const SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS = {
@@ -46,6 +47,16 @@ function identifier(value: unknown, maximum: number): string {
   return value
 }
 
+/** PostgreSQL canonical 身份大小写敏感，其它历史表名继续保守忽略大小写。 */
+function exclusionKey(table: string): string {
+  try {
+    parseServerOpsPostgresTable(table)
+    return `postgresql:${table}`
+  } catch {
+    return `legacy:${table.toLowerCase()}`
+  }
+}
+
 /** 校验并复制有界完整禁用名单。 */
 function parseExclusions(value: unknown): ServerOpsDatabaseAgentExclusion[] {
   if (!Array.isArray(value) || value.length > 1024) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_INVALID')
@@ -54,8 +65,8 @@ function parseExclusions(value: unknown): ServerOpsDatabaseAgentExclusion[] {
     if (!isServerOpsId(candidate.sourceId) || !Array.isArray(candidate.excludedTables)
       || candidate.excludedTables.length > 100) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_INVALID')
     const database = identifier(candidate.database, 64)
-    const excludedTables = candidate.excludedTables.map((table) => identifier(table, 128))
-    if (new Set(excludedTables.map((table) => table.toLowerCase())).size !== excludedTables.length) {
+    const excludedTables = candidate.excludedTables.map((table) => identifier(table, 260))
+    if (new Set(excludedTables.map(exclusionKey)).size !== excludedTables.length) {
       throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_INVALID')
     }
     return { sourceId: candidate.sourceId, database, excludedTables }

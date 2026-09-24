@@ -1,4 +1,5 @@
 import { isServerOpsId } from './server-ops'
+import { parseServerOpsPostgresTable } from './server-ops-postgresql-identifiers'
 
 /** 多资源只读授权使用独立通道，避免与单主机操作授权混淆。 */
 export const SERVER_OPS_AGENT_READ_CHANNELS = {
@@ -18,16 +19,23 @@ export interface ServerOpsAgentDatabaseScope {
   query?: boolean
 }
 
-/** 判断表是否位于授权范围；旧白名单保持精确匹配，排除名单保守忽略大小写。 */
-export function isServerOpsAgentTableAllowed(scope: ServerOpsAgentDatabaseScope, table: string): boolean {
+/** 判断表是否位于授权范围；PostgreSQL 排除项精确匹配，其它引擎保守忽略大小写。 */
+export function isServerOpsAgentTableAllowed(
+  engine: Extract<ServerOpsAgentReadResource['kind'], 'mysql' | 'postgresql' | 'sqlite'>,
+  scope: ServerOpsAgentDatabaseScope,
+  table: string,
+): boolean {
   return (scope.tables === null || scope.tables.includes(table))
-    && !scope.excludedTables?.some((excluded) => excluded.toLowerCase() === table.toLowerCase())
+    && !scope.excludedTables?.some((excluded) => engine === 'postgresql'
+      ? excluded === table
+      : excluded.toLowerCase() === table.toLowerCase())
 }
 
 /** 授权绑定连接身份；项目只是选择入口，不参与权限继承。 */
 export type ServerOpsAgentReadResource =
   | { kind: 'ssh'; hostId: string; /** 日志正文另行授权，旧授权不隐式继承。 */ readLogs?: boolean }
   | { kind: 'mysql'; sourceId: string; instance: boolean; databases: ServerOpsAgentDatabaseScope[] }
+  | { kind: 'postgresql'; sourceId: string; instance: boolean; databases: ServerOpsAgentDatabaseScope[] }
   | { kind: 'sqlite'; sourceId: string; instance: false; databases: ServerOpsAgentDatabaseScope[] }
   | { kind: 'redis'; sourceId: string }
 
@@ -96,7 +104,7 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
       return { kind: 'redis', sourceId: item.sourceId }
     }
     const item = record(entry, ['kind', 'sourceId', 'instance', 'databases'])
-    if ((item.kind !== 'mysql' && item.kind !== 'sqlite') || !isServerOpsId(item.sourceId) || typeof item.instance !== 'boolean'
+    if ((item.kind !== 'mysql' && item.kind !== 'postgresql' && item.kind !== 'sqlite') || !isServerOpsId(item.sourceId) || typeof item.instance !== 'boolean'
       || !Array.isArray(item.databases) || item.databases.length > 20 || (!item.instance && item.databases.length === 0)) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
     const databases = item.databases.map((entry): ServerOpsAgentDatabaseScope => {
       const optional = typeof entry === 'object' && entry !== null
@@ -105,15 +113,22 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
       const database = identifier(scope.database, 64)
       if (typeof scope.readRows !== 'boolean' || (scope.tables !== null && (!Array.isArray(scope.tables) || scope.tables.length === 0 || scope.tables.length > 100))) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       if (scope.query !== undefined && (typeof scope.query !== 'boolean' || (scope.query && !scope.readRows))) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
-      const tables = scope.tables === null ? null : (scope.tables as unknown[]).map((table) => identifier(table, 128))
+      const tables = scope.tables === null ? null : (scope.tables as unknown[]).map((table) => identifier(table, 260))
+      if (item.kind === 'postgresql') {
+        try { tables?.forEach((table) => parseServerOpsPostgresTable(table)) } catch { throw new Error('SERVER_OPS_READ_ACCESS_INVALID') }
+      }
       if (tables && new Set(tables).size !== tables.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       if (scope.excludedTables !== undefined && (tables !== null || !Array.isArray(scope.excludedTables) || scope.excludedTables.length > 100)) {
         throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       }
       /** 重建并校验排除表，防止混入非法标识或仅大小写不同的重复项。 */
       const excludedTables = scope.excludedTables === undefined ? undefined
-        : (scope.excludedTables as unknown[]).map((table) => identifier(table, 128))
-      if (excludedTables && new Set(excludedTables.map((table) => table.toLowerCase())).size !== excludedTables.length) {
+        : (scope.excludedTables as unknown[]).map((table) => identifier(table, 260))
+      if (item.kind === 'postgresql') {
+        try { excludedTables?.forEach((table) => parseServerOpsPostgresTable(table)) } catch { throw new Error('SERVER_OPS_READ_ACCESS_INVALID') }
+      }
+      const exclusionKeys = excludedTables?.map((table) => item.kind === 'postgresql' ? table : table.toLowerCase())
+      if (excludedTables && new Set(exclusionKeys).size !== excludedTables.length) {
         throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       }
       return { database, tables, readRows: scope.readRows,
@@ -125,7 +140,7 @@ export function parseServerOpsAgentReadGrant(value: unknown): ServerOpsAgentRead
       if (item.instance || databases.some((scope) => scope.database !== 'main')) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
       return { kind: 'sqlite', sourceId: item.sourceId, instance: false, databases }
     }
-    return { kind: 'mysql', sourceId: item.sourceId, instance: item.instance, databases }
+    return { kind: item.kind, sourceId: item.sourceId, instance: item.instance, databases }
   })
   if (new Set(resources.map(serverOpsReadResourceKey)).size !== resources.length) throw new Error('SERVER_OPS_READ_ACCESS_INVALID')
   return { sessionId: input.sessionId, resources }

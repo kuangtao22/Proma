@@ -1,10 +1,10 @@
 import { isServerOpsId } from './server-ops'
-import { isServerOpsSqliteFilePath } from './server-ops-data'
+import { isServerOpsMySqlTlsServerName, isServerOpsSqliteFilePath } from './server-ops-data'
 
 /** Agent 只能建议连接的公开参数，凭据和本地私钥路径不能进入草稿。 */
 export type ServerOpsConnectionDraftInput =
   | { kind: 'ssh'; name: string; address: string; port: number; username: string; authMethod?: 'password' | 'private-key' | 'ssh-agent' }
-  | { kind: 'mysql' | 'redis'; label: string; address: string; port: number; username?: string; transport: 'direct' | 'ssh'; hostId?: string; tlsMode?: 'disabled' | 'preferred' | 'required' | 'verify'; tlsServerName?: string; database?: string }
+  | { kind: 'mysql' | 'postgresql' | 'redis'; label: string; address: string; port: number; username?: string; transport: 'direct' | 'ssh'; hostId?: string; tlsMode?: 'disabled' | 'preferred' | 'required' | 'verify'; tlsServerName?: string; database?: string }
   | { kind: 'sqlite'; label: string; transport: 'ssh'; hostId?: string; filePath: string }
 
 /** 主进程生成的会话内领取凭据，不代表连接已保存或已授权。 */
@@ -65,15 +65,25 @@ export function parseServerOpsConnectionDraftInput(value: unknown): ServerOpsCon
     if (input.transport !== 'ssh' || !isServerOpsSqliteFilePath(filePath) || filePath.split('/').some((segment) => segment === '.' || segment === '..') || (input.hostId !== undefined && !isServerOpsId(input.hostId))) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     return { kind: 'sqlite', label: text(input.label, 64), transport: 'ssh', filePath, ...(input.hostId ? { hostId: input.hostId } : {}) }
   }
-  if (source.kind === 'mysql' || source.kind === 'redis') {
+  if (source.kind === 'mysql' || source.kind === 'postgresql' || source.kind === 'redis') {
     const input = exact(value, ['kind', 'label', 'address', 'port', 'transport'], ['username', 'hostId', 'tlsMode', 'tlsServerName', 'database'])
     if (input.transport !== 'direct' && input.transport !== 'ssh') throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     if (input.hostId !== undefined && (!isServerOpsId(input.hostId) || input.transport !== 'ssh')) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     if (typeof input.port !== 'number' || !Number.isInteger(input.port) || input.port < 1 || input.port > 65535) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     if (input.tlsMode !== undefined && (typeof input.tlsMode !== 'string' || !['disabled', 'preferred', 'required', 'verify'].includes(input.tlsMode))) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
-    if (source.kind === 'redis' && input.tlsMode === 'preferred') throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
+    if ((source.kind === 'redis' || source.kind === 'postgresql') && input.tlsMode === 'preferred') throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
+    if ((source.kind === 'mysql' || source.kind === 'postgresql') && input.tlsMode === 'verify'
+      && !isServerOpsMySqlTlsServerName(input.tlsServerName)) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     if (source.kind === 'mysql' && input.database !== undefined) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
-    if (input.database !== undefined && (typeof input.database !== 'string' || !/^\d{1,2}$/u.test(input.database) || Number(input.database) > 15)) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
+    if (source.kind === 'redis' && input.database !== undefined
+      && (typeof input.database !== 'string' || !/^\d{1,2}$/u.test(input.database) || Number(input.database) > 15)) {
+      throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
+    }
+    const database = input.database === undefined ? undefined : source.kind === 'postgresql'
+      ? text(input.database, 63)
+      : typeof input.database === 'string' ? input.database : undefined
+    if (source.kind === 'postgresql' && database !== undefined
+      && new TextEncoder().encode(database).byteLength > 63) throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')
     return {
       kind: source.kind, label: text(input.label, 64), address: address(input.address), port: input.port,
       transport: input.transport,
@@ -81,7 +91,7 @@ export function parseServerOpsConnectionDraftInput(value: unknown): ServerOpsCon
       ...(input.username !== undefined ? { username: text(input.username, 128) } : {}),
       ...(input.tlsMode ? { tlsMode: input.tlsMode as 'disabled' | 'preferred' | 'required' | 'verify' } : {}),
       ...(input.tlsServerName !== undefined ? { tlsServerName: text(input.tlsServerName, 255) } : {}),
-      ...(input.database !== undefined ? { database: input.database } : {}),
+      ...(database !== undefined ? { database } : {}),
     }
   }
   throw new Error('SERVER_OPS_CONNECTION_DRAFT_INVALID')

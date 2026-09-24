@@ -2,7 +2,7 @@ import { isServerOpsSqlSensitiveColumn, parseServerOpsDataRowFilters } from '@pr
 import type { ServerOpsDataRowFilters } from '@proma/shared'
 
 /** 根据引擎选择标识符引用规则，筛选值始终使用绑定参数。 */
-type FilterDialect = 'mysql' | 'sqlite'
+type FilterDialect = 'mysql' | 'postgresql' | 'sqlite'
 /** 严格白名单错误码，不允许用户输入穿过错误消息边界。 */
 const INVALID_FILTER_CODE = 'SERVER_OPS_DATA_SCHEMA_FILTERS_INVALID'
 /** 当前驱动没有服务端预处理能力时拒绝退回客户端 SQL 插值。 */
@@ -60,13 +60,15 @@ export function buildServerOpsRowFilterSql(
       const pattern = condition.operator === 'contains' || condition.operator === 'not-contains' ? `%${escaped}%`
         : condition.operator === 'starts-with' ? `${escaped}%` : `%${escaped}`
       values.push(pattern)
-      return `${column} ${condition.operator === 'not-contains' ? 'NOT LIKE' : 'LIKE'} ? ESCAPE '!'`
+      const placeholder = dialect === 'postgresql' ? `$${values.length}` : '?'
+      return `${column} ${condition.operator === 'not-contains' ? 'NOT LIKE' : 'LIKE'} ${placeholder} ESCAPE '!'`
     }
     values.push(value)
     const operator = {
       eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=',
     }[condition.operator]
-    return `${column} ${operator} ?`
+    const placeholder = dialect === 'postgresql' ? `$${values.length}` : '?'
+    return `${column} ${operator} ${placeholder}`
   })
   return { clause: ` WHERE (${clauses.join(parsed.match === 'all' ? ' AND ' : ' OR ')})`, values }
 }

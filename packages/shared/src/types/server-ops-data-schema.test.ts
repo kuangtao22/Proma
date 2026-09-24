@@ -39,6 +39,7 @@ describe('数据源表浏览公开合同', () => {
   })
   test('Given 关系型引擎 When 判断结构浏览能力 Then MySQL 与 SQLite 均开放', () => {
     expect(isServerOpsSchemaBrowsableEngine('mysql')).toBe(true)
+    expect(isServerOpsSchemaBrowsableEngine('postgresql')).toBe(true)
     expect(isServerOpsSchemaBrowsableEngine('sqlite')).toBe(true)
     expect(isServerOpsSchemaBrowsableEngine('redis')).toBe(false)
   })

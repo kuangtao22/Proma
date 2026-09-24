@@ -31,7 +31,7 @@ export interface ServerOpsSchemaLoadState {
 /** 不含凭据的来源身份，配置版本更新即作废旧结果。 */
 export interface ServerOpsSchemaSource {
   id: string
-  engine: 'mysql' | 'sqlite' | 'redis'
+  engine: 'mysql' | 'postgresql' | 'sqlite' | 'redis'
   database?: string
   updatedAt?: number
   /** 完整有效连接配置，避免同 ID / 同时间戳的地址变更复用旧请求。 */
@@ -50,8 +50,10 @@ export interface ServerOpsSchemaCellDetail {
 
 /** 完整浏览投影只保留当前目录、当前表描述及当前页。 */
 export interface ServerOpsSchemaBrowserProjection extends ServerOpsSchemaLoadState {
+  /** 目录读取成功但本地默认库保存失败，不阻断当前浏览。 */
+  defaultDatabaseError: string | null
   sourceId: string | null
-  engine: 'mysql' | 'sqlite' | 'redis' | null
+  engine: 'mysql' | 'postgresql' | 'sqlite' | 'redis' | null
   databases: string[]
   database: string | null
   tables: ServerOpsDataSourceTablesResult['tables']
@@ -80,6 +82,8 @@ export interface ServerOpsSchemaBrowserControllerOptions {
   pageSize?: number
   initialNavigation?: ServerOpsSchemaNavigation
   publish: (projection: ServerOpsSchemaBrowserProjection) => void
+  /** 仅显式选库且目录成功后调用；有效性检查用于跳过过期的排队保存。 */
+  onDatabaseSelected?: (database: string, isCurrent: () => boolean) => Promise<void>
 }
 
 /** 浏览操作与目录刷新分开，防止刷新当前页重置表选择。 */
@@ -104,7 +108,7 @@ export interface ServerOpsSchemaBrowserController {
 /** 创建不含请求和结果的初始状态。 */
 export function createServerOpsSchemaIdleProjection(): ServerOpsSchemaBrowserProjection {
   return {
-    sourceId: null, engine: null, status: 'idle', error: null,
+    sourceId: null, engine: null, status: 'idle', error: null, defaultDatabaseError: null,
     databases: [], database: null, tables: [], selectedTable: null, detailTab: 'data', rowFilters: null,
     structure: { status: 'idle', error: null, columns: [], indexes: [] },
     rows: { status: 'idle', error: null, columns: [], rows: [], offset: 0, limit: 50, truncated: false },
@@ -134,6 +138,8 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
   let readable = false
   /** 只在首次有效目录返回后恢复一次。 */
   let resume = options.initialNavigation
+  /** 仅用户选库产生保存意图；初始化、恢复导航和常规刷新不会反向覆盖默认库。 */
+  let databaseSelection: string | null = null
 
   /** 将不可变状态发布给仍有效的 owner。 */
   const patch = (update: Partial<ServerOpsSchemaBrowserProjection>): void => {
@@ -262,10 +268,21 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     initialCatalog = initial
     patch({ status: 'loading', error: null })
     void enqueueServerOpsDataRead(options.api, `${sourceId}:schema-tables`, JSON.stringify([sourceKey, input]),
-      () => options.api.listServerOpsDataSchemaTables(input), valid).then((result) => {
+      () => options.api.listServerOpsDataSchemaTables(input), valid).then(async (result) => {
       if (!valid()) return
+      /** 保存成功后再开放当前库，避免默认库更新取消紧接着发出的表读取。 */
+      let defaultDatabaseError: string | null = null
+      if (databaseSelection !== null && databaseSelection === result.database && options.onDatabaseSelected) {
+        try {
+          await options.onDatabaseSelected(databaseSelection, valid)
+          if (valid()) databaseSelection = null
+        } catch (error: unknown) {
+          defaultDatabaseError = `已打开数据库，但未能记住默认库：${getServerOpsDataErrorMessage(error)}。刷新后重试。`
+        }
+        if (!valid()) return
+      }
       initialCatalog = false
-      patch({ status: 'ready', error: null, collectedAt: Date.now(), databases: result.databases, database: result.database ?? null,
+      patch({ status: 'ready', error: null, defaultDatabaseError, collectedAt: Date.now(), databases: result.databases, database: result.database ?? null,
         tables: result.tables, tablesTruncated: result.tablesTruncated, databasesTruncated: result.databasesTruncated })
       if (projection.selectedTable && !result.tables.some((entry) => entry.name === projection.selectedTable)) resetTable()
       /** 先完成目录失效，再刷新当前结构，避免并发失效把新字段缓存抹掉。 */
@@ -311,12 +328,12 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
     dispose(): void { active = false; ownerRevision += 1; cellRevision += 1; projection = { ...projection, cellDetail: null } },
     setSource(source, nextReadable = true): void {
       /** 相同配置只改变可达性时保留轻导航；真实配置变更必须丢弃。 */
-      const key = source ? JSON.stringify([source.id, source.engine, source.database, source.updatedAt, source.readIdentity]) : null
+      const key = source ? source.readIdentity ?? JSON.stringify([source.id, source.engine, source.database, source.updatedAt]) : null
       const canRead = source !== null && source.engine !== 'redis' && nextReadable
       const configurationChanged = key !== sourceKey
       if (!configurationChanged && readable === canRead) return
       /** 初始化之外的配置变更不允许恢复旧配置的库表导航。 */
-      if (configurationChanged && sourceKey !== null) resume = undefined
+      if (configurationChanged && sourceKey !== null) { resume = undefined; databaseSelection = null }
       /** 多段目录恢复尚未结束时，完整 resume 优先于当前半成品投影。 */
       else if (!configurationChanged && readable && !canRead && projection.database && !resume) {
         resume = { database: projection.database, table: projection.selectedTable, detailTab: projection.detailTab,
@@ -341,8 +358,9 @@ export function createServerOpsSchemaBrowserController(options: ServerOpsSchemaB
       if (projection.engine === 'sqlite' && database !== 'main') return
       if (!database || database === projection.database) return
       resume = undefined
+      databaseSelection = database
       resetTable()
-      patch({ database, tables: [], collectedAt: undefined })
+      patch({ database, tables: [], collectedAt: undefined, defaultDatabaseError: null })
       loadTables(database)
     },
     openTable,

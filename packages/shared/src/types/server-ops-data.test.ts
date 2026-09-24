@@ -17,6 +17,7 @@ import {
   parseServerOpsDataSourcePasswordInput,
   parseServerOpsDataSourcePasswordResult,
   parseServerOpsDataSourceProbeInput,
+  parseServerOpsDataSourceSetDefaultDatabaseInput,
   parseServerOpsDataSourceUpsertInput,
   parseServerOpsDataSourceUpsertResult,
   parseServerOpsDataTable,
@@ -53,6 +54,61 @@ const table = {
 }
 
 describe('服务器运维数据服务公开合同', () => {
+  test('Given SQL 数据源完整快照 When 设置默认数据库 Then 严格校验引擎、字段与数据库名', () => {
+    const mysqlSource = {
+      ...source, engine: 'mysql' as const, port: 3306, database: 'old_db', tlsMode: 'disabled' as const,
+    }
+    const postgresqlSource = {
+      ...source, engine: 'postgresql' as const, port: 5432, database: 'postgres', tlsMode: 'required' as const,
+    }
+    expect(parseServerOpsDataSourceSetDefaultDatabaseInput({ source: mysqlSource, database: 'next_db' }))
+      .toEqual({ source: mysqlSource, database: 'next_db' })
+    expect(parseServerOpsDataSourceSetDefaultDatabaseInput({ source: postgresqlSource, database: '测'.repeat(21) }))
+      .toEqual({ source: postgresqlSource, database: '测'.repeat(21) })
+    for (const input of [
+      { source, database: '1' },
+      { source: { ...source, engine: 'sqlite', database: 'main' }, database: 'main' },
+      { source: { id: 'source-1', engine: 'mysql' }, database: 'app' },
+      { source: mysqlSource, database: 'app', extra: true },
+      { source: mysqlSource, database: '' },
+      { source: mysqlSource, database: 'app\ndb' },
+      { source: mysqlSource, database: 'x'.repeat(65) },
+      { source: postgresqlSource },
+      { source: postgresqlSource, database: '测'.repeat(22) },
+    ]) expect(() => parseServerOpsDataSourceSetDefaultDatabaseInput(input))
+      .toThrow('SERVER_OPS_DATA_SOURCE_SET_DEFAULT_DATABASE_INPUT_INVALID')
+  })
+
+  test('Given PostgreSQL 数据源 When 解析连接合同 Then 支持三种显式 TLS 并拒绝 preferred', () => {
+    const postgresql = {
+      transport: 'direct' as const, engine: 'postgresql' as const, label: '分析库', address: 'db.internal',
+      port: 5432, database: 'postgres', username: 'analyst', tlsMode: 'required' as const,
+    }
+    const postgresqlDraft = {
+      transport: postgresql.transport, engine: postgresql.engine, address: postgresql.address,
+      port: postgresql.port, database: postgresql.database, username: postgresql.username, tlsMode: postgresql.tlsMode,
+    }
+    expect(parseServerOpsDataSourceUpsertInput(postgresql)).toEqual(postgresql)
+    expect(parseServerOpsDataSourceProbeInput({ draft: postgresqlDraft })).toEqual({ draft: postgresqlDraft })
+    expect(() => parseServerOpsDataSourceUpsertInput({ ...postgresql, tlsMode: 'preferred' }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+    expect(() => parseServerOpsDataSourceProbeInput({ draft: { ...postgresqlDraft, tlsMode: 'preferred' } }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID')
+    expect(() => parseServerOpsDataSourceUpsertInput({ ...postgresql, database: '测'.repeat(22) }))
+      .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+    for (const tlsServerName of ['db.example.com', 'PG-01.internal']) {
+      expect(parseServerOpsDataSourceUpsertInput({ ...postgresql, tlsMode: 'verify', tlsServerName }).tlsServerName)
+        .toBe(tlsServerName)
+      expect(parseServerOpsDataSourceProbeInput({ draft: { ...postgresqlDraft, tlsMode: 'verify', tlsServerName } }))
+        .toMatchObject({ draft: { tlsServerName } })
+    }
+    for (const tlsServerName of ['127.0.0.1', '::1', '[::1]', 'db.example.com:5432']) {
+      expect(() => parseServerOpsDataSourceUpsertInput({ ...postgresql, tlsMode: 'verify', tlsServerName }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_INPUT_INVALID')
+      expect(() => parseServerOpsDataSourceProbeInput({ draft: { ...postgresqlDraft, tlsMode: 'verify', tlsServerName } }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_PROBE_INPUT_INVALID')
+    }
+  })
   test('Given SQLite 远端文件 When 解析公开投影 Then 固定 SSH、main 与无凭据合同', () => {
     /** 合法 SQLite 公开投影允许空格和引号，并把省略的数据库归一为 main。 */
     const sqliteSource = {

@@ -5,6 +5,10 @@ import {
 } from './server-ops-database-agent-policy'
 
 describe('数据库 Agent 禁用表合同', () => {
+  test('Given PostgreSQL canonical 身份仅大小写不同 When 解析 Then 不合并两个真实表', () => {
+    const exclusions = [{ sourceId: 'pg-1', database: 'postgres', excludedTables: ['"public"."Users"', '"public"."users"'] }]
+    expect(parseServerOpsDatabaseAgentPolicyUpdate({ expectedRevision: 1, exclusions }).exclusions).toEqual(exclusions)
+  })
   test('Given 有效禁用名单 When 解析更新 Then 复制并保留连接与库的精确身份', () => {
     const input = { expectedRevision: 2, exclusions: [{ sourceId: 'source-1', database: 'App', excludedTables: ['Orders'] }] }
     const parsed = parseServerOpsDatabaseAgentPolicyUpdate(input)

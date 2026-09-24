@@ -2,6 +2,15 @@ import { describe, expect, test } from 'bun:test'
 import { buildServerOpsRowFilterSql, getServerOpsRowFilterPublicError } from './server-ops-row-filter-sql'
 
 describe('运维行预览 SQL 筛选', () => {
+  test('Given PostgreSQL 多条件 When 构造筛选 Then 使用递增服务端绑定占位符', () => {
+    const result = buildServerOpsRowFilterSql({ match: 'all', conditions: [
+      { column: 'name', operator: 'contains', value: 'a%b' },
+      { column: 'score', operator: 'gte', value: '10' },
+    ] }, ['name', 'score'], 'postgresql')
+    expect(result.clause).toBe(' WHERE ("name" LIKE $1 ESCAPE \'!\' AND "score" >= $2)')
+    expect(result.values).toEqual(['%a!%b%', '10'])
+  })
+
   test('Given 多字段条件 When 构建 MySQL 过滤 Then 只拼元数据列并绑定所有值', () => {
     const result = buildServerOpsRowFilterSql({ match: 'all', conditions: [
       { column: 'odd`name', operator: 'contains', value: "x%'_! OR 1=1" },

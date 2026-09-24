@@ -698,7 +698,7 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
     if (value.operationId === undefined || typeof value.queryHash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.queryHash)
       || typeof value.database !== 'string' || value.database.length < 1 || value.database.length > 64 || /\p{Cc}/u.test(value.database)
       || !Array.isArray(value.tables) || value.tables.length > 16 || new Set(value.tables).size !== value.tables.length
-      || value.tables.some((table) => typeof table !== 'string' || table.length < 1 || table.length > 128 || /\p{Cc}/u.test(table))
+      || value.tables.some((table) => typeof table !== 'string' || table.length < 1 || table.length > 260 || /\p{Cc}/u.test(table))
       || value.scope !== undefined || value.table !== undefined || value.readAction !== undefined
       || (value.actor === 'user' && value.windowId === undefined)) return false
   } else if (value.queryHash !== undefined || value.tables !== undefined) return false
@@ -728,8 +728,8 @@ export function isServerOpsAuditRecord(value: unknown): value is ServerOpsAuditR
     } else if (value.readAction === 'schema-describe' || value.readAction === 'rows-read') {
       if (value.scope !== 'database' || value.database === undefined || value.table === undefined) return false
     }
-    /** 数据库与表沿用各自领域边界，MySQL 表名允许 128 字符。 */
-    for (const [name, maximum] of [[value.database, 64], [value.table, 128]] as const) {
+    /** 数据库与表沿用各自领域边界；PostgreSQL canonical schema/table 身份最多 260 字符。 */
+    for (const [name, maximum] of [[value.database, 64], [value.table, 260]] as const) {
       if (name !== undefined && (typeof name !== 'string' || name.length < 1 || name.length > maximum
         || name.trim().length === 0 || /\p{Cc}/u.test(name))) return false
     }

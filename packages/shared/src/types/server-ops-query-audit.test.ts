@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { isServerOpsAuditRecord, parseServerOpsAuditListResult } from './server-ops'
+import { formatServerOpsPostgresTable } from './server-ops-postgresql-identifiers'
 
 /** SQL 审计只保留不可逆摘要与实际表集合，不接收语句或行数据。 */
 const record = { id: 'audit-1', operationId: 'query-1', timestamp: 1, actor: 'agent', sessionId: 'session-1',
@@ -11,10 +12,11 @@ describe('SQL 查询审计合同', () => {
     expect(isServerOpsAuditRecord(record)).toBe(true)
     expect(isServerOpsAuditRecord({ ...record, actor: 'user', sessionId: undefined, windowId: 7 })).toBe(true)
     expect(isServerOpsAuditRecord({ ...record, tables: [] })).toBe(true)
+    expect(isServerOpsAuditRecord({ ...record, tables: [formatServerOpsPostgresTable('s'.repeat(63), 't'.repeat(63))] })).toBe(true)
   })
   test('Given 缺少范围或注入正文 When 审计 Then 一律拒绝', () => {
     for (const patch of [{ database: undefined }, { tables: undefined }, { tables: ['orders', 'orders'] },
-      { tables: ['x'.repeat(129)] }, { tables: Array.from({ length: 17 }, (_, index) => `t${index}`) },
+      { tables: ['x'.repeat(261)] }, { tables: Array.from({ length: 17 }, (_, index) => `t${index}`) },
       { queryHash: 'select secret' }, { operationId: undefined }, { hostId: 'host-1' },
       { sourceId: undefined }, { table: 'users' }, { scope: 'database' }, { readAction: 'rows-read' },
       { sql: 'SELECT 1' }, { rows: [['secret']] }]) expect(isServerOpsAuditRecord({ ...record, ...patch })).toBe(false)

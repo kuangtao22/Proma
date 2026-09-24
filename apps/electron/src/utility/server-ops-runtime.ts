@@ -511,12 +511,13 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
     hostId: input.hostId,
     connectionId: input.connectionId,
     controller,
-    cancelTransport: releaseActiveChannel,
+    /** PostgreSQL 由 adapter 先发 CancelRequest，再回收主查询通道。 */
+    cancelTransport: input.engine === 'postgresql' ? () => undefined : releaseActiveChannel,
     fail: (code, message) => {
       if (settled || controller.signal.aborted) return
       terminalError = { code, message }
       controller.abort()
-      releaseActiveChannel()
+      if (input.engine !== 'postgresql') releaseActiveChannel()
     },
   })
   /** 完成取消清理并向主进程确认；只有这里才允许释放外层并发计数。 */
@@ -524,7 +525,8 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
     if (settled) return
     settled = true
     clearTimeout(timer)
-    releaseActiveChannel()
+    /** PostgreSQL adapter 仍在后台发送 CancelRequest，不能在此抢先切断主会话。 */
+    if (input.engine !== 'postgresql') releaseActiveChannel()
     activeDataReads.delete(input.requestId)
     post({ type: 'server-ops.data-read-cancelled', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId })
   }
@@ -533,7 +535,8 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
     if (settled) return
     settled = true
     clearTimeout(timer)
-    releaseActiveChannel()
+    /** PostgreSQL 超时同样先由 adapter 发送 CancelRequest；普通失败仍立即回收。 */
+    if (input.engine !== 'postgresql' || !controller.signal.aborted) releaseActiveChannel()
     activeDataReads.delete(input.requestId)
     post({ type: 'server-ops.error', requestId: input.requestId, hostId: input.hostId, connectionId: input.connectionId, code, message })
   }
@@ -606,6 +609,54 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
       reject(error instanceof Error ? error : new Error('SERVER_OPS_DATA_CHANNEL_FAILED'))
     }
   })
+  /**
+   * 为 PostgreSQL CancelRequest 建立独立通道。
+   *
+   * 该通道不受已触发的读取 signal/settled 拦截，不覆盖主查询通道；SSH 分支仍严格绑定原连接身份。
+   */
+  const createPostgresqlCancelChannel = (): Promise<Duplex> => new Promise<Duplex>((resolve, reject) => {
+    if (typeof input.address !== 'string' || typeof input.port !== 'number') {
+      reject(new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID'))
+      return
+    }
+    if (input.transport === 'direct') {
+      const socket = createDirectSocket(input.address, input.port)
+      let channelSettled = false
+      const finishWithError = (error: Error): void => {
+        if (channelSettled) return
+        channelSettled = true
+        reject(error)
+      }
+      socket.setTimeout(2_000, () => { socket.destroy(new Error('SERVER_OPS_DATA_CANCEL_CHANNEL_TIMEOUT')) })
+      socket.once('error', finishWithError)
+      socket.once('close', () => { finishWithError(new Error('SERVER_OPS_DATA_CHANNEL_CLOSED')) })
+      socket.once('connect', () => {
+        channelSettled = true
+        socket.setTimeout(0)
+        resolve(socket)
+      })
+      return
+    }
+    if (!connection || connections.get(input.connectionId) !== connection || connection.hostId !== input.hostId) {
+      reject(new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE'))
+      return
+    }
+    try {
+      connection.client.forwardOut('127.0.0.1', 0, input.address, input.port, (error, channel) => {
+        if (error) { reject(error); return }
+        if (connections.get(input.connectionId) !== connection || connection.hostId !== input.hostId) {
+          try { channel.destroy() } catch { /* 失效连接返回的迟到通道只需回收。 */ }
+          reject(new Error('SERVER_OPS_CONNECTION_NOT_ACTIVE'))
+          return
+        }
+        connection.dataChannels.add(channel)
+        channel.once('close', () => { connection.dataChannels.delete(channel) })
+        resolve(channel)
+      })
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error('SERVER_OPS_DATA_CHANNEL_FAILED'))
+    }
+  })
   /** SQLite 直接在已认证的服务器执行固定脚本，不建立 TCP 转发。 */
   const createSqliteChannel: ServerOpsSqliteChannelFactory = (command) => new Promise((resolve, reject) => {
     if (!connection || controller.signal.aborted || settled) {
@@ -645,7 +696,12 @@ function dataRead(input: ServerOpsRuntimeDataReadRequest): void {
     ? runServerOpsLocalSqliteRead(input, controller.signal)
     : input.engine === 'sqlite'
     ? runServerOpsSqliteRead(input, createSqliteChannel, controller.signal)
-    : runServerOpsDataRead(input as ServerOpsDataRuntimeInput, createChannel, controller.signal)
+    : runServerOpsDataRead(
+      input as ServerOpsDataRuntimeInput,
+      createChannel,
+      controller.signal,
+      createPostgresqlCancelChannel,
+    )
   void read.then((result) => {
     if (settled) return
     if (controller.signal.aborted) {

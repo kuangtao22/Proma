@@ -17,6 +17,7 @@ import type { ServerOpsDiagnosticsProjection } from './server-ops-diagnostics-co
 import { ServerOpsDatabaseDiagnostics } from './ServerOpsDatabaseDiagnostics'
 import { ServerOpsSqlQueryPanel } from './ServerOpsSqlQueryPanel'
 import { ServerOpsDataSourceDialog } from './ServerOpsDataSourceDialog'
+import { createServerOpsDefaultDatabaseController } from './server-ops-default-database-controller'
 import { formatServerOpsDataProbeSummary } from './server-ops-data-display'
 import { SERVER_OPS_SEGMENTED_CLASS, SERVER_OPS_TAB_CLASS } from './server-ops-ui'
 
@@ -52,7 +53,13 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
   const store = useStore()
   const saveNavigation = useSetAtom(updateServerOpsDatabaseNavigationAtom)
   const viewKey = JSON.stringify([viewScope, source.id])
-  const identity = getServerOpsDatabaseReadIdentity(source)
+  /** 最新变更通知避免控制器捕获过期的项目列表刷新闭包。 */
+  const mutationRef = React.useRef(onSourceMutated)
+  mutationRef.current = onSourceMutated
+  /** 默认库保存与浏览身份分开：自己的保存回执不清空正在浏览的表。 */
+  const [defaultDatabaseController] = React.useState(() => createServerOpsDefaultDatabaseController({ source,
+    save: api.setServerOpsDataSourceDefaultDatabase, onSaved: () => mutationRef.current?.('updated') }))
+  const identity = defaultDatabaseController.getReadIdentity(source)
   /** 一次挂载固定初值；同 ID 配置变化通过后续 effect 清理。 */
   const [initial] = React.useState(() => {
     const saved = store.get(serverOpsDatabaseNavigationAtom).get(viewKey)
@@ -73,16 +80,15 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
   const [databaseDiagnostics, setDatabaseDiagnostics] = useAtom(databaseDiagnosticsAtom)
   const [managementAtom] = React.useState(() => atom(createServerOpsDataIdleProjection()))
   const [management, setManagement] = useAtom(managementAtom)
-  /** 最新变更通知避免控制器捕获过期的项目列表刷新闭包。 */
-  const mutationRef = React.useRef(onSourceMutated)
-  mutationRef.current = onSourceMutated
   /** 控制器随连接工作台创建一次，展开/切页不会重新构建。 */
-  const [schemaController] = React.useState(() => createServerOpsSchemaBrowserController({ api, publish: setSchema, initialNavigation: initial }))
+  const [schemaController] = React.useState(() => createServerOpsSchemaBrowserController({ api, publish: setSchema, initialNavigation: initial,
+    onDatabaseSelected: defaultDatabaseController.remember }))
   const [instanceDiagnosticsController] = React.useState(() => createServerOpsDiagnosticsController({ api, publish: setInstanceDiagnostics }))
   const [databaseDiagnosticsController] = React.useState(() => createServerOpsDiagnosticsController({ api, publish: setDatabaseDiagnostics }))
   const [managementController] = React.useState(() => createServerOpsDataServicesController({ api, publish: setManagement, automaticDiagnostics: false, onSourceMutated: (change) => mutationRef.current?.(change) }))
   /** 直连不依赖 SSH；跳板未连通只影响读取，不影响编辑配置。 */
   const readable = source.transport === 'direct' || (jumpHost !== null && jumpHost.id === source.hostId && jumpHost.connected)
+  React.useEffect(() => { defaultDatabaseController.setSource(source) }, [defaultDatabaseController, source])
   /** 配置同 ID 更新后，新请求不再携带旧目标导航。 */
   React.useEffect(() => {
     setNavigation((previous) => previous.configurationKey === identity ? previous : createServerOpsDatabaseNavigation(identity))
@@ -105,7 +111,7 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
     const currentSchema = schemaController.getProjection()
     /** 先暂停两区并固定配置身份，恢复库导航时绝不临时查询全部库。 */
     const configurationMatches = navigation.configurationKey === identity
-    const waitingForDatabase = currentSchema.sourceId !== source.id || currentSchema.database === null
+    const waitingForDatabase = currentSchema.sourceId !== source.id || currentSchema.database === null || currentSchema.collectedAt === undefined
     instanceDiagnosticsController.selectPage(null)
     databaseDiagnosticsController.selectPage(null)
     instanceDiagnosticsController.setSource(source.id, identity, readable)
@@ -124,7 +130,10 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
       ...previous, database: schema.database, table: schema.selectedTable, detailTab: schema.detailTab, offset,
     })
   }, [schema.status, schema.sourceId, schema.database, schema.selectedTable, schema.detailTab, schema.rows.offset, schema.rowFilters, source.id, setNavigation])
-  React.useEffect(() => { saveNavigation({ key: viewKey, navigation }) }, [saveNavigation, viewKey, navigation])
+  React.useEffect(() => {
+    /** 重进工作台用保存后的真实配置键；当前挂载继续沿用稳定浏览身份。 */
+    saveNavigation({ key: viewKey, navigation: { ...navigation, configurationKey: getServerOpsDatabaseReadIdentity(defaultDatabaseController.getSource()) } })
+  }, [saveNavigation, viewKey, navigation, source, defaultDatabaseController])
   /** 合并轻量导航字段，重复交互不产生额外状态写入。 */
   const updateNavigation = (update: Partial<ServerOpsDatabaseNavigation>): void => setNavigation((previous) => ({ ...previous, ...update }))
   /** 一次交互同时切换浏览和诊断范围，避免新库标题下短暂保留旧库正文。 */
@@ -143,12 +152,13 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
   /** 连接级操作集中到更多菜单，主内容只保留当前页操作。 */
   const actions = <DropdownMenu><DropdownMenuTrigger asChild><Button size="icon-sm" variant="ghost" aria-label="连接操作"><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="z-[260]">
     <DropdownMenuItem disabled={!readable || probe?.state === 'running'} onSelect={() => managementController.probe(source)}><PlugZap className="mr-2 size-3.5" />{probe?.state === 'running' ? '正在测试连接…' : '测试连接'}</DropdownMenuItem>
-    <DropdownMenuItem onSelect={() => managementController.openEditDialog(source)}><Pencil className="mr-2 size-3.5" />连接设置</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem className="text-destructive" onSelect={() => managementController.requestDelete(source)}><Trash2 className="mr-2 size-3.5" />删除连接</DropdownMenuItem>
+    <DropdownMenuItem onSelect={() => managementController.openEditDialog(defaultDatabaseController.getSource())}><Pencil className="mr-2 size-3.5" />连接设置</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem className="text-destructive" onSelect={() => managementController.requestDelete(source)}><Trash2 className="mr-2 size-3.5" />删除连接</DropdownMenuItem>
   </DropdownMenuContent></DropdownMenu>
   return <>
     {renderHeader(actions)}
     {probe ? <div role="status" className="mx-4 my-2 shrink-0 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">{probe.state === 'running' ? '正在测试连接…' : probe.state === 'error' ? probe.error : probe.result ? formatServerOpsDataProbeSummary(probe.result) : ''}</div> : null}
     {management.error ? <div role="alert" className="mx-4 my-2 shrink-0 rounded-lg bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-destructive">{management.error}</div> : null}
+    {schema.defaultDatabaseError ? <div role="alert" className="mx-4 my-2 shrink-0 rounded-lg bg-destructive/5 px-3 py-2 text-xs leading-relaxed text-destructive">{schema.defaultDatabaseError}</div> : null}
     {!readable ? <div className="mx-4 my-2 shrink-0 rounded-lg bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">跳板服务器尚未连接，连接后才能读取数据库。连接设置仍可编辑。</div> : null}
     {sqlite ? (
       <Tabs className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" value={navigation.databasePage === 'query' ? 'query' : 'browse'} onValueChange={(databasePage) => updateNavigation({ section: 'database', database: 'main', databasePage: databasePage as ServerOpsDatabasePage })}>
@@ -180,7 +190,7 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
             {instancePages.map(([page, label]) => <TabsTrigger key={page} className={pageTabClass} value={page}>{label}</TabsTrigger>)}
           </TabsList>
           {instancePages.map(([page]) => <TabsContent key={page} value={page} className={contentClass}>
-            <ServerOpsDatabaseDiagnostics projection={instanceDiagnostics} page={page} scope="instance" onRefresh={instanceDiagnosticsController.refresh} onSelectDatabase={browseDatabase} />
+            <ServerOpsDatabaseDiagnostics engine={source.engine} projection={instanceDiagnostics} page={page} scope="instance" onRefresh={instanceDiagnosticsController.refresh} onSelectDatabase={browseDatabase} />
           </TabsContent>)}
         </Tabs>
       </TabsContent>
@@ -193,10 +203,10 @@ export function ServerOpsDatabaseWorkbench({ api, source, jumpHost, viewScope, r
             <ServerOpsSchemaBrowserView projection={schema} showDatabaseSelector={false} onSelectDatabase={selectDatabase} onOpenTable={schemaController.openTable} onBackToList={schemaController.backToList} onDetailTabChange={schemaController.setDetailTab} onLoadRows={schemaController.loadRows} onOpenCell={schemaController.openCell} onCloseCell={schemaController.closeCell} onApplyRowFilters={schemaController.applyRowFilters} onLoadFilterFields={schemaController.loadFilterFields} onRefresh={schemaController.refresh} onRefreshTables={schemaController.refreshTables} directoryWidth={navigation.directoryWidth} onDirectoryWidthChange={(directoryWidth) => updateNavigation({ directoryWidth })} />
           </TabsContent>
           <TabsContent value="query" className={contentClass}>
-            <ServerOpsSqlQueryPanel api={api} sourceId={source.id} database={schema.database} configurationKey={identity} available={readable} dialect="mysql" />
+            <ServerOpsSqlQueryPanel api={api} sourceId={source.id} database={schema.database} configurationKey={identity} available={readable && schema.collectedAt !== undefined} dialect={source.engine === 'postgresql' ? 'postgresql' : 'mysql'} />
           </TabsContent>
           {databasePages.map(([page]) => page === 'browse' || page === 'query' ? null : <TabsContent key={page} value={page} className={contentClass}>
-            <ServerOpsDatabaseDiagnostics projection={databaseDiagnostics} page={page} scope="database" onRefresh={databaseDiagnosticsController.refresh} />
+            <ServerOpsDatabaseDiagnostics engine={source.engine} projection={databaseDiagnostics} page={page} scope="database" onRefresh={databaseDiagnosticsController.refresh} />
           </TabsContent>)}
         </Tabs>
       </TabsContent>

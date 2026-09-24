@@ -69,6 +69,84 @@ async function flush(): Promise<void> {
 }
 
 describe('数据连接表浏览', () => {
+  test('Given MySQL 或 PostgreSQL When 用户成功选库 Then 仅记住实际打开的库且刷新不重复保存', async () => {
+    for (const engine of ['mysql', 'postgresql'] as const) {
+      /** 记录真正的用户选库，初始化与刷新不得产生配置写入。 */
+      const saved: string[] = []
+      const controller = createServerOpsSchemaBrowserController({ api: createApi(), publish: () => undefined,
+        onDatabaseSelected: async (database) => { saved.push(database) } })
+      controller.activate()
+      controller.setSource({ id: 'source-1', engine, database: 'app' }); await flush()
+      expect(saved).toEqual([])
+      controller.selectDatabase('chebenben'); await flush()
+      expect(saved).toEqual(['chebenben'])
+      expect(controller.getProjection()).toMatchObject({ database: 'chebenben', status: 'ready', defaultDatabaseError: null })
+      controller.refreshTables(); await flush()
+      expect(saved).toEqual(['chebenben'])
+    }
+  })
+
+  test('Given 恢复库导航 When 初始化完成 Then 不覆盖连接默认库', async () => {
+    let saves = 0
+    const controller = createServerOpsSchemaBrowserController({ api: createApi(), publish: () => undefined,
+      initialNavigation: { database: 'chebenben', table: 'users', detailTab: 'data', offset: 50 },
+      onDatabaseSelected: async () => { saves += 1 } })
+    controller.activate()
+    controller.setSource({ id: 'source-1', engine: 'mysql', database: 'app' }); await flush()
+    expect(controller.getProjection()).toMatchObject({ database: 'chebenben', selectedTable: 'users' })
+    expect(saves).toBe(0)
+  })
+
+  test('Given 选库失败或旧目录迟到 When 最新库已选中 Then 失败及过期目标均不保存', async () => {
+    /** 延迟第一次目录回执，确认只有新库能产生保存意图。 */
+    const old = createDeferred<{ databases: string[]; database: string; tables: [] }>()
+    const saved: string[] = []
+    const controller = createServerOpsSchemaBrowserController({ api: createApi({ listServerOpsDataSchemaTables: async (input) => {
+      if (input.database === 'old') return old.promise
+      if (input.database === 'denied') throw new Error('无权访问')
+      return { databases: ['app', 'old', 'latest'], database: input.database ?? 'app', tables: [] }
+    } }), publish: () => undefined, onDatabaseSelected: async (database) => { saved.push(database) } })
+    controller.activate()
+    controller.setSource({ id: 'source-1', engine: 'postgresql' }); await flush()
+    controller.selectDatabase('denied'); await flush()
+    expect(controller.getProjection().status).toBe('error')
+    expect(saved).toEqual([])
+    controller.selectDatabase('old'); await flush()
+    controller.selectDatabase('latest')
+    old.resolve({ databases: ['old', 'latest'], database: 'old', tables: [] }); await flush()
+    expect(saved).toEqual(['latest'])
+  })
+
+  test('Given 默认库保存失败 When 刷新重试 Then 目录仍可用并恢复记忆能力', async () => {
+    let saves = 0
+    const controller = createServerOpsSchemaBrowserController({ api: createApi(), publish: () => undefined,
+      onDatabaseSelected: async () => { saves += 1; if (saves === 1) throw new Error('磁盘不可写') } })
+    controller.activate()
+    controller.setSource({ id: 'source-1', engine: 'postgresql' }); await flush()
+    controller.selectDatabase('chebenben'); await flush()
+    expect(controller.getProjection().status).toBe('ready')
+    expect(controller.getProjection().defaultDatabaseError).toContain('未能记住默认库')
+    controller.refreshTables(); await flush()
+    expect(saves).toBe(2)
+    expect(controller.getProjection().defaultDatabaseError).toBeNull()
+  })
+
+  test('Given 保存回执被识别为当前浏览身份 When 来源刷新 Then 保留表格页码且不重新请求目录', async () => {
+    let reads = 0
+    const controller = createServerOpsSchemaBrowserController({ api: createApi({ listServerOpsDataSchemaTables: async (input) => {
+      reads += 1
+      return { database: input.database ?? 'app', databases: ['app', 'chebenben'], tables: [{ name: 'users' }] }
+    } }), publish: () => undefined, onDatabaseSelected: async () => undefined })
+    controller.activate()
+    controller.setSource({ id: 'source-1', engine: 'postgresql', database: 'app', updatedAt: 1, readIdentity: 'verified-connection' }); await flush()
+    controller.selectDatabase('chebenben'); await flush()
+    controller.openTable('users'); await flush()
+    controller.loadRows(50); await flush()
+    controller.setSource({ id: 'source-1', engine: 'postgresql', database: 'chebenben', updatedAt: 2, readIdentity: 'verified-connection' }); await flush()
+    expect(reads).toBe(2)
+    expect(controller.getProjection()).toMatchObject({ database: 'chebenben', selectedTable: 'users', rows: { offset: 50 } })
+  })
+
   test('Given 完整单元格 When 打开详情 Then 直接展示且不发起全文请求', async () => {
     /** 记录不应发生的全文请求。 */
     let cellReads = 0

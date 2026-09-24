@@ -191,6 +191,7 @@ const serverOpsConsoleApi: ServerOpsConsolePreloadApi = {
 export const serverOpsDataApi: ServerOpsDataPanelApi = {
   listServerOpsDataSources: (input) => window.electronAPI.listServerOpsDataSources(input),
   upsertServerOpsDataSource: (input) => window.electronAPI.upsertServerOpsDataSource(input),
+  setServerOpsDataSourceDefaultDatabase: (input) => window.electronAPI.setServerOpsDataSourceDefaultDatabase(input),
   deleteServerOpsDataSource: (input) => window.electronAPI.deleteServerOpsDataSource(input),
   probeServerOpsDataSource: (input) => window.electronAPI.probeServerOpsDataSource(input),
   diagnoseServerOpsDataSource: (input) => window.electronAPI.diagnoseServerOpsDataSource(input),

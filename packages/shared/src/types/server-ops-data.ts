@@ -4,6 +4,7 @@ import { isServerOpsId } from './server-ops'
 export const SERVER_OPS_DATA_CHANNELS = {
   LIST_SOURCES: 'server-ops:list-data-sources',
   UPSERT_SOURCE: 'server-ops:upsert-data-source',
+  SET_DEFAULT_DATABASE: 'server-ops:set-data-source-default-database',
   DELETE_SOURCE: 'server-ops:delete-data-source',
   PROBE_SOURCE: 'server-ops:probe-data-source',
   DIAGNOSE_SOURCE: 'server-ops:diagnose-data-source',
@@ -11,7 +12,7 @@ export const SERVER_OPS_DATA_CHANNELS = {
 } as const
 
 /** 首批支持的数据服务引擎；新增引擎必须同时补齐 runtime adapter 与页面文案。 */
-export type ServerOpsDataEngine = 'mysql' | 'redis' | 'sqlite'
+export type ServerOpsDataEngine = 'mysql' | 'postgresql' | 'redis' | 'sqlite'
 
 /**
  * 数据源连接方式。
@@ -147,6 +148,12 @@ export interface ServerOpsDataSourceUpsertResult {
   source: ServerOpsDataSource
 }
 
+/** 基于调用方完整公开快照原子切换 SQL 数据源的默认数据库。 */
+export interface ServerOpsDataSourceSetDefaultDatabaseInput {
+  source: ServerOpsDataSource
+  database: string
+}
+
 /** 删除数据源。 */
 export interface ServerOpsDataSourceDeleteInput { sourceId: string }
 
@@ -220,7 +227,7 @@ export interface ServerOpsDataDiagnoseInput {
 export interface ServerOpsDataParameter {
   name: string
   value: string
-  scope: 'global'
+  scope: 'global' | 'session'
 }
 
 /** 只读诊断结果；指标与表格均已在 runtime 侧完成有界裁剪。 */
@@ -286,7 +293,7 @@ function isPort(value: unknown): value is number {
 
 /** 判断引擎枚举。 */
 export function isServerOpsDataEngine(value: unknown): value is ServerOpsDataEngine {
-  return value === 'mysql' || value === 'redis' || value === 'sqlite'
+  return value === 'mysql' || value === 'postgresql' || value === 'redis' || value === 'sqlite'
 }
 
 /** 判断 SQLite 文件身份是否为有界 POSIX 绝对路径，允许普通空格与引号。 */
@@ -320,6 +327,12 @@ function isSqliteEndpointPath(value: unknown, transport: unknown): value is stri
 /** 判断 SQLite 合同中的数据库是否省略或固定为 main。 */
 function isSqliteMainDatabase(value: unknown): boolean {
   return value === undefined || value === 'main'
+}
+
+/** PostgreSQL 数据库名遵守服务端 63 UTF-8 字节标识符上限。 */
+function isPostgresqlDatabase(value: unknown): boolean {
+  return value === undefined || (typeof value === 'string' && value.length > 0
+    && !/\p{Cc}/u.test(value) && new TextEncoder().encode(value).byteLength <= 63)
 }
 
 /** 判断 TLS 模式枚举。 */
@@ -515,7 +528,8 @@ export function parseServerOpsDataSource(value: unknown): ServerOpsDataSource {
     || typeof value.hasPassword !== 'boolean'
     || !isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt)) throw new Error(errorCode)
   if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
-    || (value.engine === 'redis' && value.tlsMode === 'preferred')) throw new Error(errorCode)
+    || ((value.engine === 'redis' || value.engine === 'postgresql') && value.tlsMode === 'preferred')) throw new Error(errorCode)
+  if (value.engine === 'postgresql' && !isPostgresqlDatabase(value.database)) throw new Error(errorCode)
   /** 连接方式与跳板主机的组合必须自洽。 */
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
   /** 本地文件必须携带主进程验证的稳定身份，其他来源不得混入此字段。 */
@@ -585,9 +599,10 @@ export function parseServerOpsDataSourceUpsertInput(value: unknown): ServerOpsDa
     || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isAddressText(value.tlsServerName, 255))) throw new Error(errorCode)
   if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
-    || (value.engine === 'redis' && value.tlsMode === 'preferred')
-    || (value.engine === 'mysql' && value.tlsMode === 'verify'
+    || ((value.engine === 'redis' || value.engine === 'postgresql') && value.tlsMode === 'preferred')
+    || ((value.engine === 'mysql' || value.engine === 'postgresql') && value.tlsMode === 'verify'
       && !isServerOpsMySqlTlsServerName(value.tlsServerName))) throw new Error(errorCode)
+  if (value.engine === 'postgresql' && !isPostgresqlDatabase(value.database)) throw new Error(errorCode)
   if (value.password !== undefined && value.clearPassword === true) throw new Error(errorCode)
   /** `ssh` 必须绑定跳板主机，`direct` 不允许携带主机。 */
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
@@ -623,6 +638,27 @@ export function parseServerOpsDataSourceUpsertResult(value: unknown): ServerOpsD
   const errorCode = 'SERVER_OPS_DATA_SOURCE_UPSERT_RESULT_INVALID'
   if (!isRecord(value) || !hasOnlyKeys(value, new Set(['source']))) throw new Error(errorCode)
   return { source: parseServerOpsDataSource(value.source) }
+}
+
+/** 严格解析 SQL 数据源默认数据库切换输入，并保留完整快照供主进程执行 CAS。 */
+export function parseServerOpsDataSourceSetDefaultDatabaseInput(
+  value: unknown,
+): ServerOpsDataSourceSetDefaultDatabaseInput {
+  const errorCode = 'SERVER_OPS_DATA_SOURCE_SET_DEFAULT_DATABASE_INPUT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['source', 'database']))) throw new Error(errorCode)
+  try {
+    /** 完整公开快照，缺字段、未知字段或字段不自洽时一律拒绝。 */
+    const source = parseServerOpsDataSource(value.source)
+    if (source.engine !== 'mysql' && source.engine !== 'postgresql') throw new Error(errorCode)
+    if (typeof value.database !== 'string') throw new Error(errorCode)
+    if (source.engine === 'mysql' && (!isOptionalDataText(value.database, 64) || /\p{Cc}/u.test(value.database))) {
+      throw new Error(errorCode)
+    }
+    if (source.engine === 'postgresql' && !isPostgresqlDatabase(value.database)) throw new Error(errorCode)
+    return { source, database: value.database as string }
+  } catch {
+    throw new Error(errorCode)
+  }
 }
 
 /** 严格解析数据源删除输入。 */
@@ -674,9 +710,10 @@ export function parseServerOpsDataSourceProbeDraft(value: unknown): ServerOpsDat
     || !isServerOpsDataTlsMode(value.tlsMode)
     || (value.tlsServerName !== undefined && !isAddressText(value.tlsServerName, 255))) throw new Error(errorCode)
   if ((value.tlsMode === 'verify' && value.tlsServerName === undefined)
-    || (value.engine === 'redis' && value.tlsMode === 'preferred')
-    || (value.engine === 'mysql' && value.tlsMode === 'verify'
+    || ((value.engine === 'redis' || value.engine === 'postgresql') && value.tlsMode === 'preferred')
+    || ((value.engine === 'mysql' || value.engine === 'postgresql') && value.tlsMode === 'verify'
       && !isServerOpsMySqlTlsServerName(value.tlsServerName))) throw new Error(errorCode)
+  if (value.engine === 'postgresql' && !isPostgresqlDatabase(value.database)) throw new Error(errorCode)
   /** 内联密码与复用已保存密码只能二选一，避免"看起来在用新密码、实际用旧密文"。 */
   if (value.password !== undefined && value.savedSourceId !== undefined) throw new Error(errorCode)
   if ((value.transport === 'ssh') !== (value.hostId !== undefined)) throw new Error(errorCode)
@@ -771,12 +808,13 @@ export function parseServerOpsDataDiagnosticsResult(value: unknown): ServerOpsDa
     || (value.parameters !== undefined && (!Array.isArray(value.parameters) || value.parameters.length > 1_000))
     || (value.parametersTruncated !== undefined && typeof value.parametersTruncated !== 'boolean')) throw new Error(errorCode)
   /** 参数逐项解析并限制公开字段，避免异常服务端值穿过 IPC。 */
-  const parameters = value.parameters === undefined ? undefined : value.parameters.map((entry) => {
+  const parameters = value.parameters === undefined ? undefined : value.parameters.map((entry): ServerOpsDataParameter => {
     if (!isRecord(entry) || !hasOnlyKeys(entry, new Set(['name', 'value', 'scope']))
-      || !isDisplayString(entry.name, 128) || !isDisplayString(entry.value, 1_024, true) || entry.scope !== 'global') {
+      || !isDisplayString(entry.name, 128) || !isDisplayString(entry.value, 1_024, true)
+      || (entry.scope !== 'global' && entry.scope !== 'session')) {
       throw new Error(errorCode)
     }
-    return { name: entry.name, value: entry.value, scope: 'global' as const }
+    return { name: entry.name, value: entry.value, scope: entry.scope }
   })
   if (parameters !== undefined && new TextEncoder().encode(JSON.stringify(parameters)).byteLength > 262_144) throw new Error(errorCode)
   if (value.capability !== 'available' && (value.metrics.length > 0 || value.tables.length > 0 || (parameters?.length ?? 0) > 0)) throw new Error(errorCode)

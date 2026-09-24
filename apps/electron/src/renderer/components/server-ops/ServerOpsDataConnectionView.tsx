@@ -47,7 +47,7 @@ export interface ServerOpsDataConnectionViewProps {
 
 /** 引擎展示名。 */
 function getEngineLabel(engine: ServerOpsDataSource['engine']): string {
-  return engine === 'redis' ? 'Redis' : engine === 'sqlite' ? 'SQLite' : 'MySQL'
+  return engine === 'postgresql' ? 'PostgreSQL' : engine === 'redis' ? 'Redis' : engine === 'sqlite' ? 'SQLite' : 'MySQL'
 }
 
 /**

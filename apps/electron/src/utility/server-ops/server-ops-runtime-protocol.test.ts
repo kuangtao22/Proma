@@ -25,6 +25,22 @@ function createConnectRequest(): unknown {
 }
 
 describe('Server Ops utility runtime 请求协议', () => {
+  test('Given PostgreSQL 请求 When 进入 utility Then 允许诊断、schema 与 SQL 并拒绝 TLS preferred', () => {
+    const base = { requestId: 'pg-1', hostId: 'host-1', connectionId: 'connection-1', transport: 'direct',
+      engine: 'postgresql', address: 'db.internal', port: 5432, database: 'postgres', username: 'analyst',
+      tlsMode: 'required', timeoutMs: 15_000 } as const
+    for (const input of [
+      { ...base, mode: 'diagnostics', diagnosticSection: 'sessions', diagnosticDatabase: 'postgres' },
+      { ...base, mode: 'schema-tables', schemaDatabase: 'postgres' },
+      { ...base, mode: 'schema-table', schemaDatabase: 'postgres', schemaTable: '"tenant"."events"' },
+      { ...base, mode: 'sql-query', queryId: 'query-1', sql: 'SELECT "id" FROM "public"."events"', maxRows: 50 },
+    ]) expect(parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input })).toMatchObject({ input })
+    expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: { ...base, mode: 'probe', tlsMode: 'preferred' } }))
+      .toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+    expect(() => parseServerOpsRuntimeRequest({ type: 'server-ops.data-read', input: {
+      ...base, mode: 'schema-table', schemaDatabase: 'postgres', schemaTable: 'public.events',
+    } })).toThrow('SERVER_OPS_RUNTIME_REQUEST_INVALID')
+  })
   test('Given 本地 SQLite 文件 When 进入 utility Then 需要可信文件身份且禁止网络引擎夹带', () => {
     /** 完整本地文件请求：沿用直连临时身份，但没有网络端点。 */
     const input = { requestId: 'local-sqlite', hostId: 'server-ops-local-direct', connectionId: 'local-1', transport: 'direct', mode: 'probe', engine: 'sqlite', filePath: 'C:\\数据\\app.db', localFileId: '1:42:1700000000000000000', database: 'main', tlsMode: 'disabled', timeoutMs: 15_000 } as const

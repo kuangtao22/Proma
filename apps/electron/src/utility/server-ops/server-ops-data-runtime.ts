@@ -31,6 +31,9 @@ import {
   normalizeServerOpsSqlQueryError,
 } from './server-ops-query-runtime'
 import { buildServerOpsRowFilterSql, getServerOpsRowFilterPublicError } from './server-ops-row-filter-sql'
+import { runServerOpsPostgresqlRead } from './server-ops-postgresql-adapter'
+
+const SERVER_OPS_POSTGRESQL_CANCEL_CHANNEL_TIMEOUT_MS = 2_000
 
 /** 数据服务在 utility process 内执行的一次数据读取输入；含秘密，禁止回传主进程之外。 */
 /** 所有数据读取模式共享的真实连接字段。 */
@@ -1611,23 +1614,27 @@ export function runServerOpsDataRead(
   input: ServerOpsDataRuntimeNonQueryInput,
   createChannel: ServerOpsDataChannelFactory,
   signal?: AbortSignal,
+  createCancelChannel?: ServerOpsDataChannelFactory,
 ): Promise<ServerOpsDataRuntimeNonQueryOutput>
 export function runServerOpsDataRead(
   input: ServerOpsDataRuntimeQueryInput,
   createChannel: ServerOpsDataChannelFactory,
   signal?: AbortSignal,
+  createCancelChannel?: ServerOpsDataChannelFactory,
 ): Promise<ServerOpsDataQueryResult>
 export function runServerOpsDataRead(
   input: ServerOpsDataRuntimeInput,
   createChannel: ServerOpsDataChannelFactory,
   signal?: AbortSignal,
+  createCancelChannel?: ServerOpsDataChannelFactory,
 ): Promise<ServerOpsDataRuntimeOutput>
 export async function runServerOpsDataRead(
   input: ServerOpsDataRuntimeInput,
   createChannel: ServerOpsDataChannelFactory,
   signal?: AbortSignal,
+  createCancelChannel: ServerOpsDataChannelFactory = createChannel,
 ): Promise<ServerOpsDataRuntimeOutput> {
-  if (input.engine !== 'mysql' && input.engine !== 'redis') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
+  if (input.engine !== 'mysql' && input.engine !== 'postgresql' && input.engine !== 'redis') throw new Error('SERVER_OPS_DATA_QUERY_ENGINE_UNSUPPORTED')
   if (signal?.aborted) throw new Error('SERVER_OPS_DATA_CANCELLED')
   if (input.engine === 'redis' && input.tlsMode === 'preferred') throw new Error('SERVER_OPS_DATA_TLS_MODE_UNSUPPORTED')
   if (input.tlsMode === 'verify' && !input.tlsServerName) throw new Error('SERVER_OPS_DATA_TLS_SERVER_NAME_REQUIRED')
@@ -1652,7 +1659,8 @@ export async function runServerOpsDataRead(
   /** 先发出取消再销毁底层通道，不依赖驱动是否触发 close/error。 */
   const onAbort = (): void => {
     rejectCancelled(new Error('SERVER_OPS_DATA_CANCELLED'))
-    activeChannel?.destroy()
+    /** PostgreSQL 主通道由 adapter 在 CancelRequest 写完或超时后回收。 */
+    if (input.engine !== 'postgresql') activeChannel?.destroy()
   }
   controller.signal.addEventListener('abort', onAbort, { once: true })
   /** 驱动共享同一撤销信号；通道工厂检查异步返回后的状态。 */
@@ -1671,10 +1679,35 @@ export async function runServerOpsDataRead(
     timeoutMs: 15_000,
     signal: controller.signal,
   }
+  /** PostgreSQL 取消包使用独立通道；它不继承已触发的读取信号，并以短超时限制资源占用。 */
+  const createPostgresqlCancelChannel = async (): Promise<Duplex> => {
+    let expired = false
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const opening = createCancelChannel().then((channel) => {
+      if (!expired) return channel
+      channel.destroy()
+      throw new Error('SERVER_OPS_DATA_CANCEL_CHANNEL_TIMEOUT')
+    })
+    const timeoutReached = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        expired = true
+        reject(new Error('SERVER_OPS_DATA_CANCEL_CHANNEL_TIMEOUT'))
+      }, SERVER_OPS_POSTGRESQL_CANCEL_CHANNEL_TIMEOUT_MS)
+    })
+    try {
+      return await Promise.race([opening, timeoutReached])
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout)
+    }
+  }
   try {
     return await Promise.race([
       cancelled,
-      input.engine === 'mysql' ? readMySql(input, dependencies) : readRedis(input, dependencies),
+      input.engine === 'mysql' ? readMySql(input, dependencies)
+        : input.engine === 'postgresql' ? runServerOpsPostgresqlRead(
+          input, dependencies.createChannel, controller.signal, createPostgresqlCancelChannel,
+        )
+          : readRedis(input, dependencies),
     ])
   } catch (error) {
     if (!timedOut) throw error
@@ -1685,6 +1718,6 @@ export async function runServerOpsDataRead(
     clearTimeout(timer)
     releaseAbortBinding()
     controller.signal.removeEventListener('abort', onAbort)
-    activeChannel?.destroy()
+    if (input.engine !== 'postgresql') activeChannel?.destroy()
   }
 }

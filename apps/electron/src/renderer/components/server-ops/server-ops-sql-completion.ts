@@ -1,8 +1,9 @@
 import type { EditorState } from '@codemirror/state'
 import { syntaxTree } from '@codemirror/language'
-import { MySQL, SQLite, keywordCompletionSource, schemaCompletionSource } from '@codemirror/lang-sql'
+import { MySQL, PostgreSQL, SQLite, keywordCompletionSource, schemaCompletionSource } from '@codemirror/lang-sql'
 import type { Completion, CompletionContext, CompletionResult, CompletionSource } from '@codemirror/autocomplete'
 import type { ServerOpsDataSchemaColumn, ServerOpsDataSchemaTableSummary } from '@proma/shared'
+import { formatServerOpsPostgresTable } from '@proma/shared'
 
 /** 当前连接/数据库的结构快照；不保存数据行或密码。 */
 export interface ServerOpsSqlCompletionSchema {
@@ -28,7 +29,7 @@ interface ServerOpsSqlCompletionOptions {
 }
 
 /** 运维查询当前支持的编辑器方言。 */
-export type ServerOpsSqlDialect = 'mysql' | 'sqlite'
+export type ServerOpsSqlDialect = 'mysql' | 'postgresql' | 'sqlite'
 
 /** 保留语法节点边界，避免把字符串/注释内部文字解释为 SQL 来源。 */
 interface SqlToken {
@@ -41,6 +42,7 @@ interface SqlToken {
 /** 保留字集合只构造一次，避免为每个字段重复拆分完整关键字表。 */
 const DIALECT_KEYWORDS: Record<ServerOpsSqlDialect, Set<string>> = {
   mysql: new Set(MySQL.spec.keywords?.toLowerCase().split(/\s+/u)),
+  postgresql: new Set(PostgreSQL.spec.keywords?.toLowerCase().split(/\s+/u)),
   sqlite: new Set(SQLite.spec.keywords?.toLowerCase().split(/\s+/u)),
 }
 /** CodeMirror SQLite 词表仍继承部分通用/厂商词；这些 MySQL 专有项不应误导用户。 */
@@ -57,12 +59,15 @@ function getColumns(schema: ServerOpsSqlCompletionSchema, table: string): Server
 }
 
 /** 移除 MySQL 标识符反引号，同时还原转义的反引号。 */
-function unquoteIdentifier(value: string): string {
+function unquoteIdentifier(value: string, dialect: ServerOpsSqlDialect = 'mysql'): string {
+  if (dialect === 'postgresql') return value.startsWith('"')
+    ? value.slice(1, value.endsWith('"') ? -1 : undefined).replace(/""/gu, '"') : value.toLowerCase()
   return value.startsWith('`') ? value.slice(1, value.endsWith('`') ? -1 : undefined).replace(/``/gu, '`') : value
 }
 
 /** 生成可安全插入 SQL 的标识符；特殊字符与保留字使用反引号。 */
 function quoteIdentifier(value: string, dialect: ServerOpsSqlDialect): string {
+  if (dialect === 'postgresql') return `"${value.replaceAll('"', '""')}"`
   return /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(value) && !DIALECT_KEYWORDS[dialect].has(value.toLowerCase())
     ? value : `\`${value.replace(/`/gu, '``')}\``
 }
@@ -88,7 +93,7 @@ function isIdentifier(token: SqlToken | undefined): token is SqlToken {
 }
 
 /** 从当前语句的语法树提取当前库表和别名；跨库、CTE、派生表不推测。 */
-export function getServerOpsSqlTableReferences(state: EditorState, pos: number, schema: ServerOpsSqlCompletionSchema): ServerOpsSqlTableReference[] {
+export function getServerOpsSqlTableReferences(state: EditorState, pos: number, schema: ServerOpsSqlCompletionSchema, dialect: ServerOpsSqlDialect = 'mysql'): ServerOpsSqlTableReference[] {
   const tokens = statementTokens(state, pos)
   if (tokens[0]?.text.toUpperCase() !== 'SELECT' || tokens.some((token) => token.name === 'Keyword' && token.text.toUpperCase() === 'UNION')) return []
   /** 用精确表名映射尊重数据库大小写规则，不自动跨库匹配。 */
@@ -103,12 +108,23 @@ export function getServerOpsSqlTableReferences(state: EditorState, pos: number, 
     if (token.name !== 'Keyword' && token.text !== ',') continue
     inSources = true
     const tableToken = tokens[index + 1]
-    if (!isIdentifier(tableToken)) continue
-    const table = unquoteIdentifier(tableToken.text)
+    if (!tableToken || (tableToken.name !== 'Identifier' && tableToken.name !== 'QuotedIdentifier'
+      && !(dialect === 'postgresql' && tableToken.name === 'CompositeIdentifier'))) continue
+    /** PostgreSQL 的两段名是 schema.table，规范表身份与后台保持一致。 */
+    let table = unquoteIdentifier(tableToken.text, dialect)
+    /** 没有显式别名时，SQL 字段限定符使用原始表名。 */
+    let defaultAlias = table
+    if (dialect === 'postgresql') {
+      /** 只解析完整的一段或两段标识符，不推测跨库、子查询或未完成的表名。 */
+      const parts = tableToken.text.match(/^("(?:[^"]|"")+"|[\p{L}_][\p{L}\p{N}_$]*)(?:\s*\.\s*("(?:[^"]|"")+"|[\p{L}_][\p{L}\p{N}_$]*))?$/u)
+      if (!parts) continue
+      defaultAlias = unquoteIdentifier(parts[2] ?? parts[1]!, dialect)
+      try { table = formatServerOpsPostgresTable(parts[2] ? unquoteIdentifier(parts[1]!, dialect) : 'public', defaultAlias) } catch { continue }
+    }
     if (!knownTables.has(table)) continue
     /** AS 不是别名自身；裸别名只接受 parser 标识符。 */
     const aliasToken = tokens[index + (tokens[index + 2]?.text.toUpperCase() === 'AS' ? 3 : 2)]
-    const alias = isIdentifier(aliasToken) ? unquoteIdentifier(aliasToken.text) : table
+    const alias = isIdentifier(aliasToken) ? unquoteIdentifier(aliasToken.text, dialect) : defaultAlias
     references.push({ table, alias })
   }
   return references
@@ -144,7 +160,7 @@ function columnCompletion(column: ServerOpsDataSchemaColumn, dialect: ServerOpsS
 export function createServerOpsSqlCompletionSource(options: ServerOpsSqlCompletionOptions): CompletionSource {
   /** 缺省沿用现有 MySQL 行为。 */
   const dialect = options.dialect ?? 'mysql'
-  const sqlDialect = dialect === 'sqlite' ? SQLite : MySQL
+  const sqlDialect = dialect === 'postgresql' ? PostgreSQL : dialect === 'sqlite' ? SQLite : MySQL
   /** 关键字源是只读共享函数，不为每次按键重新构造。 */
   const keywords = keywordCompletionSource(sqlDialect, true)
   return async (context): Promise<CompletionResult | null> => {
@@ -153,11 +169,13 @@ export function createServerOpsSqlCompletionSource(options: ServerOpsSqlCompleti
     try { await options.ensureCatalog?.() } catch { /* 目录失败时仍允许关键字联想。 */ }
     const initial = options.getSchema()
     if (context.aborted || requestedContext !== initial.contextKey) return null
-    const references = getServerOpsSqlTableReferences(context.state, context.pos, initial)
+    const references = getServerOpsSqlTableReferences(context.state, context.pos, initial, dialect)
     const tablePosition = isTableContext(context)
     /** 点号前仅匹配词法标识符，来源归属仍由语法树与已知表决定。 */
-    const qualifier = context.state.sliceDoc(0, context.pos).match(/(`(?:[^`]|``)+`|[\p{L}\p{N}_$]+)\.\s*(?:`(?:[^`]|``)*|[\p{L}\p{N}_$]*)$/u)
-    const reference = qualifier ? references.find((item) => item.alias === unquoteIdentifier(qualifier[1]!) || item.table === unquoteIdentifier(qualifier[1]!)) : undefined
+    const qualifier = context.state.sliceDoc(0, context.pos).match(dialect === 'postgresql'
+      ? /("(?:[^"]|"")+"|[\p{L}\p{N}_$]+)\.\s*(?:"(?:[^"]|"")*|[\p{L}\p{N}_$]*)$/u
+      : /(`(?:[^`]|``)+`|[\p{L}\p{N}_$]+)\.\s*(?:`(?:[^`]|``)*|[\p{L}\p{N}_$]*)$/u)
+    const reference = qualifier ? references.find((item) => item.alias === unquoteIdentifier(qualifier[1]!, dialect) || item.table === unquoteIdentifier(qualifier[1]!, dialect)) : undefined
     if (qualifier && !reference) return null
     if (!tablePosition || qualifier) {
       try { await options.ensureColumns([...new Set((reference ? [reference] : references).map((item) => item.table))]) } catch { /* 元数据失败不影响编辑或执行。 */ }
@@ -168,10 +186,10 @@ export function createServerOpsSqlCompletionSource(options: ServerOpsSqlCompleti
     const namespace: Record<string, { self: Completion; children: Completion[] }> = Object.create(null)
     for (const table of schema.tables) {
       if (table.type === 'view') continue
-      namespace[table.name] = { self: { label: table.name, type: 'type', detail: '表', apply: quoteIdentifier(table.name, dialect), ...(table.comment ? { info: table.comment } : {}) }, children: getColumns(schema, table.name).map((column) => columnCompletion(column, dialect)) }
+      namespace[table.name] = { self: { label: table.name, type: 'type', detail: '表', apply: dialect === 'postgresql' ? table.name : quoteIdentifier(table.name, dialect), ...(table.comment ? { info: table.comment } : {}) }, children: getColumns(schema, table.name).map((column) => columnCompletion(column, dialect)) }
     }
     /** 内置 SQL source 负责别名限定与反引号转义。 */
-    const native = await schemaCompletionSource({ dialect: sqlDialect, schema: namespace })(context)
+    const native = dialect === 'postgresql' ? null : await schemaCompletionSource({ dialect: sqlDialect, schema: namespace })(context)
     /** 内置 source 的词边界只识别 ASCII，中文前缀以真实光标范围补齐。 */
     const word = context.matchBefore(/[\p{L}\p{N}_$]+/u)
     const fallback: CompletionResult | null = word || context.explicit || qualifier
@@ -180,7 +198,7 @@ export function createServerOpsSqlCompletionSource(options: ServerOpsSqlCompleti
     if (qualifier) return nativeOrUnicode ? { ...nativeOrUnicode, options: native?.options ?? (reference ? getColumns(schema, reference.table).map((column) => columnCompletion(column, dialect)) : []) } : null
     const rawKeywordResult = await keywords(context)
     /** 结构候选不参与过滤；SQLite 只去掉明确属于 MySQL 的关键字与函数。 */
-    const keywordResult = rawKeywordResult && dialect === 'sqlite'
+    const keywordResult = rawKeywordResult && dialect !== 'mysql'
       ? { ...rawKeywordResult, options: rawKeywordResult.options.filter((item) => !MYSQL_ONLY_COMPLETIONS.has(item.label.toUpperCase())) }
       : rawKeywordResult
     if (tablePosition) return nativeOrUnicode ? { ...nativeOrUnicode, options: [...nativeOrUnicode.options.filter((item) => item.type === 'type'), ...(keywordResult?.options ?? [])] } : keywordResult

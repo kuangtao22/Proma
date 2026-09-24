@@ -34,16 +34,17 @@ export function validateServerOpsSqlDraft(
   const warn = (code: string, message: string, from: number, to: number): void => {
     if (diagnostics.length < 8) diagnostics.push({ code, category: 'schema', severity: 'warning', message, from, to })
   }
-  /** 表名匹配允许大小写差异；缓存无法确定服务端大小写策略，故从不阻止执行。 */
-  const tableNames = new Map(schema.tables.map((table) => [table.name.toLowerCase(), table.name]))
+  /** PostgreSQL 按 parser 已规范化的标识精确匹配；其他引擎保留既有宽松缓存提示。 */
+  const identifierKey = (value: string): string => dialect === 'postgresql' ? value : value.toLowerCase()
+  const tableNames = new Map(schema.tables.map((table) => [identifierKey(table.name), table.name]))
   /** 字段集合只读取自有属性，防止 constructor 等合法表名命中原型。 */
   const fields = new Map<string, Set<string>>()
   for (const table of parsed.plan.tables) {
-    const name = tableNames.get(table.toLowerCase()) ?? table
-    if (Object.hasOwn(schema.columns, name)) fields.set(table.toLowerCase(), new Set(schema.columns[name]!.map((column) => column.name.toLowerCase())))
+    const name = tableNames.get(identifierKey(table)) ?? table
+    if (Object.hasOwn(schema.columns, name)) fields.set(identifierKey(table), new Set(schema.columns[name]!.map((column) => identifierKey(column.name))))
   }
   for (const reference of parsed.plan.tableReferences) {
-    if (!schema.tablesTruncated && !tableNames.has(reference.table.toLowerCase())) {
+    if (!schema.tablesTruncated && !tableNames.has(identifierKey(reference.table))) {
       warn('SCHEMA_TABLE_MISSING', '缓存中未找到这张表，请刷新结构确认；执行时仍会实时检查。', reference.from, reference.to)
     }
   }
@@ -51,9 +52,9 @@ export function validateServerOpsSqlDraft(
     if (column.outputAlias || column.column === '*') continue
     /** 限定列用 parser 已验证的别名映射；裸列需所有引用表字段齐全才判断缺失。 */
     const references = column.sourceTable ? [column.sourceTable] : parsed.plan.tableReferences.map((reference) => reference.table)
-    const known = references.map((table) => fields.get(table.toLowerCase()))
+    const known = references.map((table) => fields.get(identifierKey(table)))
     if (known.length === 0 || known.some((columns) => !columns)) continue
-    const matches = known.filter((columns) => columns!.has(column.column.toLowerCase())).length
+    const matches = known.filter((columns) => columns!.has(identifierKey(column.column))).length
     if (matches === 0) warn('SCHEMA_COLUMN_MISSING', '缓存中未找到该字段，请刷新结构确认；执行时仍会实时检查。', column.from, column.to)
     else if (matches > 1) warn('SCHEMA_COLUMN_AMBIGUOUS', '缓存中多个表包含此字段，建议使用表名或别名限定。', column.from, column.to)
   }

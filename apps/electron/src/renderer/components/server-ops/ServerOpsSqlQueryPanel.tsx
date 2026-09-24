@@ -30,6 +30,8 @@ const EMPTY_DIAGNOSTICS: ServerOpsSqlEditorDiagnostic[] = []
 interface SqlValidationSnapshot {
   sql: string
   contextKey: string
+  /** 方言变化时立即隐藏旧校验结果。 */
+  dialect: ServerOpsSqlDialect
   result: ServerOpsSqlDraftValidation
 }
 
@@ -94,7 +96,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   const [projectionAtom] = React.useState(() => atom(createServerOpsSqlQueryIdleProjection()))
   const [projection, setProjection] = useAtom(projectionAtom)
   /** 渲染与事件同时核对目标，防止选库 props 先于控制器 effect 更新时误查旧库。 */
-  const currentQueryContext = { sourceId, database, configurationKey, available }
+  const currentQueryContext = { sourceId, database, configurationKey, available, dialect }
   const queryContextMatches = isServerOpsSqlQueryContextCurrent(projection.context, currentQueryContext)
   /** 输入法组合与诊断只属于当前 Pane；不进入持久草稿或查询历史。 */
   const [validationAtom] = React.useState(() => atom<SqlValidationSnapshot | null>(null))
@@ -102,7 +104,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   const [composingAtom] = React.useState(() => atom(false))
   const [composing, setComposing] = useAtom(composingAtom)
   /** 文本或连接一变就隐藏旧结果，等待本次本地校验，不沿用旧的绿色通过状态。 */
-  const visibleValidation = !composing && validation?.sql === projection.draft && validation.contextKey === completionContextKey ? validation.result : null
+  const visibleValidation = !composing && validation?.sql === projection.draft && validation.contextKey === completionContextKey && validation.dialect === dialect ? validation.result : null
   const diagnostics = visibleValidation?.diagnostics ?? EMPTY_DIAGNOSTICS
   /** 输出页签和历史读取独立于查询结果，切换页签不取消在途查询。 */
   const [outputTabAtom] = React.useState(() => atom<'result' | 'history'>('result'))
@@ -144,14 +146,14 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
     return () => controller.dispose()
   }, [controller])
   React.useEffect(() => {
-    controller.setContext({ sourceId, database, configurationKey, available })
-  }, [controller, sourceId, database, configurationKey, available])
+    controller.setContext({ sourceId, database, configurationKey, available, dialect })
+  }, [controller, sourceId, database, configurationKey, available, dialect])
 
   React.useEffect(() => {
     if (composing || !database || !projection.draft.trim()) return
     /** 停顿 350ms 后只读取现有结构，快速输入和卸载会清理待执行校验。 */
     const timer = setTimeout(() => {
-      setValidation({ sql: projection.draft, contextKey: completionContextKey, result: validateServerOpsSqlDraft(projection.draft, database, visibleCompletion, dialect) })
+      setValidation({ sql: projection.draft, contextKey: completionContextKey, dialect, result: validateServerOpsSqlDraft(projection.draft, database, visibleCompletion, dialect) })
     }, 350)
     return () => clearTimeout(timer)
   }, [projection.draft, database, completionContextKey, visibleCompletion, composing, dialect, setValidation])
@@ -160,7 +162,7 @@ export function ServerOpsSqlQueryPanel({ api, sourceId, database, configurationK
   const validateDraft = (locate: boolean): ServerOpsSqlDraftValidation => {
     const sql = controller.snapshot().draft
     const result = validateServerOpsSqlDraft(sql, database, visibleCompletion, dialect)
-    setValidation({ sql, contextKey: completionContextKey, result })
+    setValidation({ sql, contextKey: completionContextKey, dialect, result })
     if (locate && result.diagnostics[0]) editorRef.current?.reveal(result.diagnostics[0])
     return result
   }

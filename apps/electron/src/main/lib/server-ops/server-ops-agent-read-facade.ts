@@ -15,6 +15,7 @@ import {
   analyzeServerOpsSqlQuery,
   parseServerOpsDataQueryInput,
   parseServerOpsDataQueryResult,
+  parseServerOpsPostgresTable,
 } from '@proma/shared'
 import type {
   AgentSessionMeta,
@@ -64,6 +65,13 @@ const SERVER_OPS_AGENT_READ_ROW_LIMIT = 50
 const RAW_STATEMENT_COLUMN = /(sql|query|statement|digest|command|args?|argument|text)/iu
 /** 系统库可能包含凭据、运行语句或性能侧信道，不属于默认业务库读取范围。 */
 const MYSQL_SYSTEM_DATABASES = new Set(['mysql', 'sys', 'performance_schema', 'information_schema'])
+/** PostgreSQL 系统 schema 不属于默认业务表读取范围。 */
+const POSTGRESQL_SYSTEM_SCHEMAS = new Set(['information_schema'])
+
+/** 默认只读开放的数据库引擎。 */
+type ServerOpsDatabaseEngine = 'mysql' | 'postgresql' | 'sqlite'
+/** 默认只读数据库资源。 */
+type ServerOpsDatabaseResource = Extract<ServerOpsAgentReadResource, { kind: ServerOpsDatabaseEngine }>
 
 /** Facade 服务边界不包含密码读取、任意命令或连接建立能力。 */
 export interface ServerOpsAgentReadFacadeServices {
@@ -114,7 +122,7 @@ export interface CreateServerOpsAgentReadFacadeInput {
 export type ServerOpsAgentReadResourceSummary =
   | { kind: 'ssh'; hostId: string; projectId?: string; name: string; readLogs?: boolean }
   | {
-      kind: 'mysql' | 'sqlite'
+      kind: ServerOpsDatabaseEngine
       sourceId: string
       projectId?: string
       name: string
@@ -138,7 +146,7 @@ export interface ServerOpsAgentRowsResult extends ServerOpsDataSourceRowsResult 
 export interface ServerOpsAgentReadFacade {
   resources(): { resources: ServerOpsAgentReadResourceSummary[]; revision: number; expiresAt?: number; status?: string; nextStep?: string; truncated?: boolean }
   /** 内部组合工具精确校验全部目标；不向模型暴露授权快照。 */
-  checkDatabaseTables(input: { sourceId: string; database: string; tables: string[]; revision?: number }): { engine: 'mysql' | 'sqlite'; revision: number }
+  checkDatabaseTables(input: { sourceId: string; database: string; tables: string[]; revision?: number }): { engine: ServerOpsDatabaseEngine; revision: number }
   serverOverview(input: { hostId: string }, signal?: AbortSignal): Promise<ServerOpsOverviewResult>
   serverServices(input: { hostId: string }, signal?: AbortSignal): Promise<ServerOpsAgentServiceListResult>
   serverDiscover(input: { hostId: string }, signal?: AbortSignal): Promise<ServerOpsAgentDiscoveryResult>
@@ -302,7 +310,9 @@ function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSu
   while (resultBytes(output) > SERVER_OPS_AGENT_READ_RESULT_BYTES) {
     /** 只裁剪白名单；排除名单必须完整保留，否则目录会暗示更宽的权限。 */
     const scopes = output.resources
-      .filter((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' | 'sqlite' }> => resource.kind === 'mysql' || resource.kind === 'sqlite')
+      .filter((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: ServerOpsDatabaseEngine }> => (
+        resource.kind === 'mysql' || resource.kind === 'postgresql' || resource.kind === 'sqlite'
+      ))
       .flatMap((resource) => resource.databases.filter((scope) => scope.tables !== null)
         .map((scope) => ({ resource, scope, size: scope.tables?.length ?? 0 })))
       .filter((entry) => entry.size > 0)
@@ -311,10 +321,10 @@ function boundResourceDirectory(value: { resources: ServerOpsAgentReadResourceSu
       scopes[0].scope.tables.pop()
       continue
     }
-    const mysql = output.resources.find((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: 'mysql' | 'sqlite' }> =>
-      (resource.kind === 'mysql' || resource.kind === 'sqlite') && resource.databases.length > 0)
-    if (mysql) {
-      mysql.databases.pop()
+    const database = output.resources.find((resource): resource is Extract<ServerOpsAgentReadResourceSummary, { kind: ServerOpsDatabaseEngine }> =>
+      (resource.kind === 'mysql' || resource.kind === 'postgresql' || resource.kind === 'sqlite') && resource.databases.length > 0)
+    if (database) {
+      database.databases.pop()
       continue
     }
     if (output.resources.length > 0) {
@@ -372,8 +382,10 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
   try {
     databasePolicy = dependencies.services.databasePolicy?.get()
     if (databasePolicy) {
-      const sources = dependencies.services.data?.listSources().sources.filter((source) => source.engine === 'mysql' || source.engine === 'sqlite') ?? []
-      const bindings = captureBindings(sources.map((source) => ({ kind: source.engine as 'mysql' | 'sqlite', sourceId: source.id, instance: false, databases: [] })))
+      const sources = dependencies.services.data?.listSources().sources.filter((source) => (
+        source.engine === 'mysql' || source.engine === 'postgresql' || source.engine === 'sqlite'
+      )) ?? []
+      const bindings = captureBindings(sources.map((source) => ({ kind: source.engine as ServerOpsDatabaseEngine, sourceId: source.id, instance: false, databases: [] })))
       databaseBindings = new Map(bindings.map((binding) => [binding.key, binding]))
     }
   } catch { databasePolicy = undefined }
@@ -389,8 +401,8 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
   }
 
   /** 数据库资源独立于会话租约；逐次复核持久策略与本轮冻结的连接身份。 */
-  const requireDatabaseResource = (kind: 'mysql' | 'sqlite', sourceId: string, expectedRevision?: number): AuthorizedRead & {
-    resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
+  const requireDatabaseResource = (kind: ServerOpsDatabaseEngine, sourceId: string, expectedRevision?: number): AuthorizedRead & {
+    resource: ServerOpsDatabaseResource
   } => {
     checkRun()
     if (context && getServerOpsServiceContext() !== context) throw new Error('SERVER_OPS_AGENT_CONTEXT_CHANGED')
@@ -403,7 +415,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     if (current.revision !== databasePolicy.revision || expectedRevision !== undefined && expectedRevision !== current.revision) {
       throw new Error('SERVER_OPS_AGENT_ACCESS_CHANGED')
     }
-    const resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }> = { kind, sourceId, instance: false, databases: [] }
+    const resource: ServerOpsDatabaseResource = { kind, sourceId, instance: false, databases: [] }
     const key = serverOpsReadResourceKey(resource)
     const original = databaseBindings.get(key)
     if (!original) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
@@ -421,7 +433,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     id: string,
     expectedRevision?: number,
   ): AuthorizedRead => {
-    if (kind === 'mysql' || kind === 'sqlite') return requireDatabaseResource(kind, id, expectedRevision)
+    if (kind === 'mysql' || kind === 'postgresql' || kind === 'sqlite') return requireDatabaseResource(kind, id, expectedRevision)
     checkRun()
     if (context && getServerOpsServiceContext() !== context) throw new Error('SERVER_OPS_AGENT_CONTEXT_CHANGED')
     if (!isInteractiveSource(input.triggeredBy)
@@ -469,11 +481,11 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       entry.addEventListener('abort', abort, { once: true })
       if (entry.aborted) abort()
     }
-    const unsubscribe = (kind === 'mysql' || kind === 'sqlite' ? undefined : dependencies.services.access.onReadChanged?.((event) => {
+    const unsubscribe = (kind === 'mysql' || kind === 'postgresql' || kind === 'sqlite' ? undefined : dependencies.services.access.onReadChanged?.((event) => {
       if ((event.previous?.sessionId ?? event.current?.sessionId) !== input.sessionId) return
       try { requireAuthorized(kind, id, revision) } catch { abort() }
     }))
-    const unsubscribePolicy = (kind === 'mysql' || kind === 'sqlite') ? dependencies.services.databasePolicy?.onChanged?.(() => {
+    const unsubscribePolicy = (kind === 'mysql' || kind === 'postgresql' || kind === 'sqlite') ? dependencies.services.databasePolicy?.onChanged?.(() => {
       try { requireAuthorized(kind, id, revision) } catch { abort() }
     }) : undefined
     return {
@@ -558,7 +570,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
   }
 
   /** 读取已保存数据源；不存在与引擎不匹配都使用稳定权限错误。 */
-  const requireDataSource = (sourceId: string, engine: 'mysql' | 'sqlite' | 'redis') => {
+  const requireDataSource = (sourceId: string, engine: ServerOpsDatabaseEngine | 'redis') => {
     const data = dependencies.services.data
     if (!data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     const found = data.listSources().sources.find((entry) => entry.id === sourceId && entry.engine === engine)
@@ -566,30 +578,55 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
     return { data, source: found }
   }
 
-  /** 已保存的 MySQL/SQLite 由冻结资源身份选择引擎，Redis 仍走临时会话授权。 */
+  /** 已保存的关系数据库由冻结资源身份选择引擎，Redis 仍走临时会话授权。 */
   const requireDatabaseAuthorized = (sourceId: string): AuthorizedRead & {
-    resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
+    resource: ServerOpsDatabaseResource
   } => {
     const source = dependencies.services.data?.listSources().sources.find((entry) => entry.id === sourceId)
-    if (!source || source.engine !== 'mysql' && source.engine !== 'sqlite') throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    if (!source || source.engine !== 'mysql' && source.engine !== 'postgresql' && source.engine !== 'sqlite') {
+      throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
+    }
     return requireDatabaseResource(source.engine, sourceId)
   }
 
-  /** 禁用表唯一缩权规则；SQLite 只开放 main，MySQL 系统库始终关闭。 */
+  /** 解析数据库表身份；PostgreSQL 仅接受 canonical schema/table 且拒绝系统 schema。 */
+  const requireTableIdentity = (resource: ServerOpsDatabaseResource, value: unknown): string => {
+    if (resource.kind !== 'postgresql') return readIdentifier(value, 128)
+    if (typeof value !== 'string') throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    try {
+      const table = parseServerOpsPostgresTable(value)
+      if (POSTGRESQL_SYSTEM_SCHEMAS.has(table.schema.toLowerCase()) || table.schema.toLowerCase().startsWith('pg_')) {
+        throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+      }
+      return value
+    } catch {
+      throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    }
+  }
+
+  /** 禁用表唯一缩权规则；SQLite 只开放 main，MySQL 系统库与 PostgreSQL 系统 schema 始终关闭。 */
   const requireDatabaseScope = (
-    resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>,
+    resource: ServerOpsDatabaseResource,
     database: string,
     table?: string,
     readRows = false,
   ): ServerOpsAgentDatabaseScope => {
-    if (resource.kind === 'sqlite' ? database !== 'main' : MYSQL_SYSTEM_DATABASES.has(database.toLowerCase())) {
+    if (resource.kind === 'sqlite' ? database !== 'main' : resource.kind === 'mysql' && MYSQL_SYSTEM_DATABASES.has(database.toLowerCase())) {
       throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
     }
     const excludedTables = databasePolicy?.exclusions
-      .filter((entry) => entry.sourceId === resource.sourceId && entry.database.toLowerCase() === database.toLowerCase())
+      .filter((entry) => entry.sourceId === resource.sourceId && (resource.kind === 'postgresql'
+        ? entry.database === database
+        : entry.database.toLowerCase() === database.toLowerCase()))
       .flatMap((entry) => entry.excludedTables) ?? []
+    if (resource.kind === 'postgresql') {
+      for (const excluded of excludedTables) requireTableIdentity(resource, excluded)
+    }
     const scope: ServerOpsAgentDatabaseScope = { database, tables: null, excludedTables, readRows: true, query: true }
-    if (table !== undefined && !isServerOpsAgentTableAllowed(scope, table)) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    if (table !== undefined) {
+      const identity = requireTableIdentity(resource, table)
+      if (!isServerOpsAgentTableAllowed(resource.kind, scope, identity)) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    }
     return scope
   }
 
@@ -601,8 +638,8 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       if (!Array.isArray(raw.tables) || raw.tables.length < 1 || raw.tables.length > 4) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       const initial = requireDatabaseAuthorized(sourceId)
       if (raw.revision !== undefined && raw.revision !== initial.revision) throw new Error('SERVER_OPS_AGENT_ACCESS_CHANGED')
-      const resource = initial.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
-      for (const table of raw.tables) requireDatabaseScope(resource, database, readIdentifier(table, 128))
+      const resource = initial.resource as ServerOpsDatabaseResource
+      for (const table of raw.tables) requireDatabaseScope(resource, database, requireTableIdentity(resource, table))
       requireDataSource(sourceId, resource.kind)
       return { engine: resource.kind, revision: initial.revision }
     },
@@ -613,7 +650,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const request = parseServerOpsDataQueryInput({ ...record, queryId: randomUUID() })
       if (request.maxRows > SERVER_OPS_AGENT_READ_ROW_LIMIT) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       const initial = requireDatabaseAuthorized(request.sourceId)
-      const resource = initial.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
+      const resource = initial.resource as ServerOpsDatabaseResource
       const scope = requireDatabaseScope(resource, request.database, undefined, true)
       if (scope.query !== true) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       const plan = analyzeServerOpsSqlQuery(request.sql, request.database, resource.kind)
@@ -664,7 +701,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       if (databasePolicy) {
         const sources = dependencies.services.data?.listSources().sources ?? []
         for (const saved of sources) {
-          if (saved.engine !== 'mysql' && saved.engine !== 'sqlite') continue
+          if (saved.engine !== 'mysql' && saved.engine !== 'postgresql' && saved.engine !== 'sqlite') continue
           if (!databaseBindings.has(`data:${saved.id}`)) continue
           requireDatabaseResource(saved.engine, saved.id)
           /** 仅展示配置的默认库；其他可见库由用户按需调用表目录发现，不远程扫描。 */
@@ -732,10 +769,10 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       /** 数据库按持久规则，Redis 仍按当前会话授权。 */
       const saved = dependencies.services.data?.listSources().sources.find((entry) => entry.id === sourceId)
       const current = dependencies.services.access.getReadAccess(input.sessionId)
-      const resource = saved?.engine === 'mysql' || saved?.engine === 'sqlite'
+      const resource = saved?.engine === 'mysql' || saved?.engine === 'postgresql' || saved?.engine === 'sqlite'
         ? requireDatabaseAuthorized(sourceId).resource
         : current?.sessionId === input.sessionId
-        ? current.resources.find((entry): entry is Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' | 'redis' }> =>
+        ? current.resources.find((entry): entry is Extract<ServerOpsAgentReadResource, { kind: ServerOpsDatabaseEngine | 'redis' }> =>
           entry.kind !== 'ssh' && entry.sourceId === sourceId)
         : undefined
       if (!resource) throw new Error('SERVER_OPS_AGENT_ACCESS_REQUIRED')
@@ -765,7 +802,7 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       }
       const saved = dependencies.services.data?.listSources().sources.find((entry) => entry.id === sourceId)
       const access = dependencies.services.access.getReadAccess(input.sessionId)
-      const resource = saved?.engine === 'mysql' || saved?.engine === 'sqlite'
+      const resource = saved?.engine === 'mysql' || saved?.engine === 'postgresql' || saved?.engine === 'sqlite'
         ? requireDatabaseAuthorized(sourceId).resource
         : access?.sessionId === input.sessionId
         ? access.resources.find((entry) => entry.kind !== 'ssh' && entry.sourceId === sourceId)
@@ -776,6 +813,13 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
         if (scope !== 'instance' || database !== undefined || section !== undefined) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       } else if (resource.kind === 'sqlite') {
         if (scope !== 'database' || database !== 'main' || (section !== undefined && section !== 'overview')) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+        const databaseScope = requireDatabaseScope(resource, database)
+        if (databaseScope.excludedTables?.length) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+      } else if (resource.kind === 'postgresql') {
+        /** Agent 只开放能把已授权数据库原样下发到底层的会话诊断，避免回落到默认库或实例范围。 */
+        if (scope !== 'database' || !database || section !== 'sessions') {
+          throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+        }
         const databaseScope = requireDatabaseScope(resource, database)
         if (databaseScope.excludedTables?.length) throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       } else if (scope === 'instance') {
@@ -790,7 +834,11 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
         signal,
         kind: resource.kind, id: sourceId, readAction: 'data-diagnose', scope,
         ...(database ? { database } : {}),
-        read: (readSignal, readContext) => data.diagnoseSource({ sourceId, ...(section ? { section } : {}), ...(database && resource.kind !== 'sqlite' ? { database } : {}) }, readSignal, readContext),
+        read: (readSignal, readContext) => data.diagnoseSource({
+          sourceId,
+          ...(section ? { section } : {}),
+          ...(database && resource.kind !== 'sqlite' ? { database } : {}),
+        }, readSignal, readContext),
         project: (value) => {
           const parsed = validateResult(parseServerOpsDataDiagnosticsResult, value)
           if (parsed.sourceId !== sourceId || parsed.engine !== resource.kind) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
@@ -804,10 +852,10 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const sourceId = readId(record.sourceId)
       const database = record.database === undefined ? undefined : readIdentifier(record.database, 64)
       const authorized = requireDatabaseAuthorized(sourceId)
-      const resource = authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
+      const resource = authorized.resource as ServerOpsDatabaseResource
       if (resource.kind === 'sqlite' && database !== undefined && database !== 'main') throw new Error('SERVER_OPS_AGENT_SCOPE_REQUIRED')
       if (database) requireDatabaseScope(resource, database)
-      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as ServerOpsDatabaseEngine)
       return executeRead({
         signal,
         kind: authorized.resource.kind, id: sourceId, readAction: 'schema-list', scope: 'database', ...(database ? { database } : {}),
@@ -818,10 +866,25 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
           /** 未指定库时服务可能选用连接默认库；结果表仍必须应用该库的禁用项。 */
           const returnedScope = parsed.database ? requireDatabaseScope(resource, readIdentifier(parsed.database, 64)) : undefined
           if (parsed.tables.length && !returnedScope) throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID')
+          const visibleTables = returnedScope ? parsed.tables.flatMap((entry) => {
+            if (entry.type === 'view') return []
+            let identity = entry.name
+            if (resource.kind === 'postgresql') {
+              let parsedIdentity: { schema: string; table: string }
+              try { parsedIdentity = parseServerOpsPostgresTable(entry.name) }
+              catch { throw new Error('SERVER_OPS_AGENT_READ_RESULT_INVALID') }
+              if (POSTGRESQL_SYSTEM_SCHEMAS.has(parsedIdentity.schema.toLowerCase())
+                || parsedIdentity.schema.toLowerCase().startsWith('pg_')) return []
+              identity = entry.name
+            }
+            return isServerOpsAgentTableAllowed(resource.kind, returnedScope, identity) ? [{ ...entry, name: identity }] : []
+          }) : []
           return boundArrays({
             ...parsed,
-            databases: parsed.databases.filter((entry) => resource.kind === 'sqlite' ? entry === 'main' : !MYSQL_SYSTEM_DATABASES.has(entry.toLowerCase())),
-            tables: returnedScope ? parsed.tables.filter((entry) => entry.type !== 'view' && isServerOpsAgentTableAllowed(returnedScope, entry.name)) : [],
+            databases: parsed.databases.filter((entry) => resource.kind === 'sqlite'
+              ? entry === 'main'
+              : resource.kind !== 'mysql' || !MYSQL_SYSTEM_DATABASES.has(entry.toLowerCase())),
+            tables: visibleTables,
           }, ['tables', 'databases'])
         },
       })
@@ -831,10 +894,11 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const record = exactRecord(raw, ['sourceId', 'database', 'table'])
       const sourceId = readId(record.sourceId)
       const database = readIdentifier(record.database, 64)
-      const table = readIdentifier(record.table, 128)
       const authorized = requireDatabaseAuthorized(sourceId)
-      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>, database, table)
-      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
+      const resource = authorized.resource as ServerOpsDatabaseResource
+      const table = requireTableIdentity(resource, record.table)
+      requireDatabaseScope(resource, database, table)
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as ServerOpsDatabaseEngine)
       return executeRead({
         signal,
         kind: authorized.resource.kind, id: sourceId, readAction: 'schema-describe', scope: 'database', database, table,
@@ -849,15 +913,16 @@ export function createServerOpsAgentReadFacade(input: CreateServerOpsAgentReadFa
       const record = exactRecord(raw, ['sourceId', 'database', 'table', 'offset', 'limit'])
       const sourceId = readId(record.sourceId)
       const database = readIdentifier(record.database, 64)
-      const table = readIdentifier(record.table, 128)
+      const authorized = requireDatabaseAuthorized(sourceId)
+      const resource = authorized.resource as ServerOpsDatabaseResource
+      const table = requireTableIdentity(resource, record.table)
       if (typeof record.offset !== 'number' || !Number.isSafeInteger(record.offset) || record.offset < 0 || record.offset > 1_000_000
         || typeof record.limit !== 'number' || !Number.isSafeInteger(record.limit) || record.limit < 1 || record.limit > SERVER_OPS_AGENT_READ_ROW_LIMIT
         || record.offset % record.limit !== 0) throw new Error('SERVER_OPS_AGENT_READ_INPUT_INVALID')
       const offset = record.offset
       const limit = record.limit
-      const authorized = requireDatabaseAuthorized(sourceId)
-      requireDatabaseScope(authorized.resource as Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>, database, table, true)
-      const { data } = requireDataSource(sourceId, authorized.resource.kind as 'mysql' | 'sqlite')
+      requireDatabaseScope(resource, database, table, true)
+      const { data } = requireDataSource(sourceId, authorized.resource.kind as ServerOpsDatabaseEngine)
       return executeRead({
         signal,
         kind: authorized.resource.kind, id: sourceId, readAction: 'rows-read', scope: 'database', database, table,

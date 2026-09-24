@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ServerOpsDataRowFilters, ServerOpsDataSourceUpsertInput } from '@proma/shared'
 import { ServerOpsDataService } from './server-ops-data-service'
+import { ServerOpsDataSourceStore } from './server-ops-data-source-store'
 import type { ServerOpsStoredDataSource } from './server-ops-data-source-store'
 import { ServerOpsDataSchemaCache } from './server-ops-data-schema-cache'
 import type { ServerOpsDataSchemaCacheScope, ServerOpsDataSchemaCacheValue } from './server-ops-data-schema-cache'
@@ -15,6 +16,8 @@ class FakeSourceStore {
   private readonly sources: ServerOpsStoredDataSource[] = []
   /** 自增 ID 计数器。 */
   private sequence = 0
+  /** 记录元数据更新次数，验证默认库幂等路径不写入。 */
+  updateCalls = 0
 
   list(): ServerOpsStoredDataSource[] {
     return this.sources.map((source) => ({ ...source }))
@@ -60,6 +63,7 @@ class FakeSourceStore {
       tlsMode?: ServerOpsStoredDataSource['tlsMode']; tlsServerName?: string | null; credentialRef?: string | null
     },
   ): ServerOpsStoredDataSource {
+    this.updateCalls += 1
     /** 待更新记录的位置。 */
     const index = this.sources.findIndex((source) => source.id === sourceId)
     if (index < 0) throw new Error('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
@@ -84,6 +88,7 @@ class FakeSourceStore {
     else if (patch.tlsServerName !== undefined) updated.tlsServerName = patch.tlsServerName
     if (patch.credentialRef === null) delete updated.credentialRef
     else if (patch.credentialRef !== undefined) updated.credentialRef = patch.credentialRef
+    updated.updatedAt += 1
     this.sources[index] = updated
     return { ...updated }
   }
@@ -323,6 +328,136 @@ function createInput(overrides: Partial<ServerOpsDataSourceUpsertInput> = {}): S
 }
 
 describe('服务器运维数据服务编排', () => {
+  test('Given MySQL 或 PostgreSQL 公开快照 When 修改默认数据库 Then 仅更新数据库并拒绝旧快照', () => {
+    for (const config of [
+      { engine: 'mysql' as const, port: 3306, database: 'mysql', next: 'app', tlsMode: 'required' as const },
+      { engine: 'postgresql' as const, port: 5432, database: 'postgres', next: 'analytics', tlsMode: 'required' as const },
+    ]) {
+      const { service, store, credentials } = createService()
+      const source = service.upsertSource(createInput({
+        transport: 'direct', hostId: undefined, engine: config.engine, label: config.engine,
+        address: 'db.internal', port: config.port, database: config.database, password: 'secret', tlsMode: config.tlsMode,
+      })).source
+      const credentialRef = store.getById(source.id)?.credentialRef
+      const result = service.setDefaultDatabase({ source, database: config.next })
+      expect(result.source).toMatchObject({ database: config.next, label: source.label, hasPassword: true })
+      expect(store.getById(source.id)).toMatchObject({ database: config.next, credentialRef })
+      expect(credentials.resolveSecret(credentialRef ?? '')).toBe('secret')
+      expect(() => service.setDefaultDatabase({ source, database: 'warehouse' }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_CHANGED')
+      expect(store.getById(source.id)?.database).toBe(config.next)
+      expect(() => service.setDefaultDatabase({ source: { ...result.source, id: 'source-missing' }, database: 'warehouse' }))
+        .toThrow('SERVER_OPS_DATA_SOURCE_NOT_FOUND')
+    }
+  })
+
+  test('Given 当前默认数据库 When 重复设置 Then 保持时间且不写入或取消排队读取', async () => {
+    const { service, store, runtime } = createService()
+    const source = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' })).source
+    const running = service.listSchemaTables({ sourceId: source.id, database: 'app' })
+    const queued = service.listSchemaTables({ sourceId: source.id, database: 'app' })
+    const writesBefore = store.updateCalls
+    expect(service.setDefaultDatabase({ source, database: 'app' }).source).toEqual(source)
+    expect(store.updateCalls).toBe(writesBefore)
+    expect(store.getById(source.id)?.updatedAt).toBe(source.updatedAt)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+    await running
+    expect(runtime.requests).toHaveLength(2)
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'app', databases: ['app'], tables: [], warnings: [] })
+    await expect(queued).resolves.toMatchObject({ database: 'app' })
+  })
+
+  test('Given 默认数据库真实变化 When 提交成功 Then 精确取消该来源的旧排队读取', () => {
+    const { service } = createService()
+    const source = service.upsertSource(createInput({ database: 'app' })).source
+    /** 调度器的移除与拒绝语义已有独立测试；这里只锁定服务提交后的调用边界。 */
+    const scheduler = Reflect.get(service, 'scheduler') as { cancelQueued(sourceId: string): void }
+    const originalCancelQueued = scheduler.cancelQueued.bind(scheduler)
+    const cancelledSourceIds: string[] = []
+    scheduler.cancelQueued = (sourceId): void => {
+      cancelledSourceIds.push(sourceId)
+      originalCancelQueued(sourceId)
+    }
+    service.setDefaultDatabase({ source, database: 'next_app' })
+    expect(cancelledSourceIds).toEqual([source.id])
+  })
+
+  test('Given 真实数据源 Store When 设置默认数据库并重建 Then 新实例读取到已持久化值', () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'proma-default-database-'))
+    const transaction = <T>(callback: () => T): T => callback()
+    try {
+      const store = new ServerOpsDataSourceStore(configDir, {
+        uuid: () => 'source-persisted', now: () => 1_000, transaction,
+      })
+      const credentials = new FakeCredentialStore()
+      const runtime = createRuntimeHarness()
+      const service = new ServerOpsDataService({
+        store, credentials, runtime,
+        connection: { getActiveIdentity: () => { throw new Error('NOT_USED') } },
+        transaction,
+      })
+      const source = service.upsertSource(createInput({ transport: 'direct', hostId: undefined, database: 'app' })).source
+      service.setDefaultDatabase({ source, database: 'warehouse' })
+      const reopened = new ServerOpsDataSourceStore(configDir, { transaction })
+      expect(reopened.getById(source.id)).toMatchObject({ database: 'warehouse', label: source.label })
+    } finally {
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test('Given PostgreSQL 数据源 When 探测、读取目录和执行 SQL Then 保留数据库与 canonical 表身份并分派到 runtime', async () => {
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({
+      transport: 'direct', hostId: undefined, engine: 'postgresql', label: 'PostgreSQL',
+      address: 'db.example.com', port: 5432, database: 'appdb', tlsMode: 'required',
+    })).source
+
+    const probe = service.probeSource({ sourceId: created.id })
+    expect(runtime.requests[0]).toMatchObject({ mode: 'probe', engine: 'postgresql', database: 'appdb', port: 5432 })
+    runtime.settle({ ...availableResult, serverVersion: '17.2' })
+    await expect(probe).resolves.toMatchObject({ engine: 'postgresql', serverVersion: '17.2' })
+
+    const tables = service.listSchemaTables({ sourceId: created.id, database: 'appdb' })
+    runtime.settle({ mode: 'schema-tables', capability: 'available', database: 'appdb', databases: ['appdb'],
+      tables: [{ name: '"public"."orders"', type: 'table' }], warnings: [] })
+    await expect(tables).resolves.toMatchObject({ database: 'appdb', tables: [{ name: '"public"."orders"' }] })
+
+    const query = service.querySource({ sourceId: created.id, database: 'appdb', queryId: 'query-pg',
+      sql: 'SELECT id FROM public.orders', maxRows: 20 })
+    expect(runtime.requests[2]).toMatchObject({ mode: 'sql-query', engine: 'postgresql', database: 'appdb' })
+    runtime.settle({ queryId: 'query-pg', database: 'appdb', columns: ['id'], rows: [['1']], rowCount: 1,
+      durationMs: 2, truncated: false, warnings: [] })
+    await expect(query).resolves.toMatchObject({ queryId: 'query-pg', rowCount: 1 })
+  })
+
+  test('Given PostgreSQL 诊断 When 使用可用或不支持的分区 Then runtime 返回真实能力而非参数错误', async () => {
+    const { service, runtime } = createService()
+    const created = service.upsertSource(createInput({
+      transport: 'direct', hostId: undefined, engine: 'postgresql', label: 'PostgreSQL',
+      address: 'db.example.com', port: 5432, database: 'appdb', tlsMode: 'required',
+    })).source
+    for (const section of ['overview', 'sessions', 'parameters'] as const) {
+      const pending = service.diagnoseSource({ sourceId: created.id, section, ...(section === 'sessions' ? { database: 'appdb' } : {}) })
+      expect(runtime.requests.at(-1)).toMatchObject({ mode: 'diagnostics', engine: 'postgresql', diagnosticSection: section })
+      expect(runtime.requests.at(-1)?.diagnosticDatabase).toBe(section === 'sessions' ? 'appdb' : undefined)
+      runtime.settle(availableResult)
+      await pending
+    }
+    const statements = service.diagnoseSource({ sourceId: created.id, section: 'statements', database: 'appdb' })
+    expect(runtime.requests.at(-1)).toMatchObject({
+      mode: 'diagnostics', engine: 'postgresql', diagnosticSection: 'statements', diagnosticDatabase: 'appdb',
+    })
+    runtime.settle({
+      capability: 'unsupported', metrics: [], tables: [],
+      warnings: ['PostgreSQL 语句统计需要 pg_stat_statements，当前未自动启用'],
+    })
+    await expect(statements).resolves.toMatchObject({
+      sourceId: created.id, engine: 'postgresql', capability: 'unsupported',
+      warnings: ['PostgreSQL 语句统计需要 pg_stat_statements，当前未自动启用'],
+    })
+    expect(runtime.requests).toHaveLength(4)
+  })
+
   test('Given SQLite 连接 When 探测和查询 Then 保留文件路径与取消信号并拒绝路径变更后的结果', async () => {
     /** 本用例只替换远程执行，连接身份使用真实服务逻辑。 */
     const { service, runtime } = createService()

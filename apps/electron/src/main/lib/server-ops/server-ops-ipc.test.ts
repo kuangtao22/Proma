@@ -8,7 +8,7 @@ import type { ServerOpsIpcOptions } from './server-ops-ipc'
 import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { ServerOpsFileService } from './server-ops-file-service'
 import { ServerOpsSftpRuntimeError } from '../../../utility/server-ops/server-ops-sftp-runtime'
-import { SERVER_OPS_AGENT_READ_CHANNELS, SERVER_OPS_DATA_QUERY_CHANNELS, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS, isServerOpsAuditRecord } from '@proma/shared'
+import { SERVER_OPS_AGENT_READ_CHANNELS, SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS, SERVER_OPS_DATA_QUERY_CHANNELS, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS, isServerOpsAuditRecord } from '@proma/shared'
 import { SERVER_OPS_CONNECTION_DRAFT_CHANNELS } from '@proma/shared'
 import { serverOpsConnectionDraftStore } from './server-ops-connection-draft-store'
 
@@ -158,6 +158,41 @@ function createAgentAccessHarness(options: {
 }
 
 describe('服务器运维 IPC', () => {
+  test('Given 授权窗口与完整数据源快照 When 设置默认数据库 Then 严格分派并重验读取绑定', async () => {
+    const calls: unknown[] = []
+    const source = {
+      id: 'source-1', transport: 'direct' as const, engine: 'mysql' as const, label: '业务库',
+      address: 'db.internal', port: 3306, database: 'old_db', username: 'reader', tlsMode: 'required' as const,
+      hasPassword: true, createdAt: 1, updatedAt: 2,
+    }
+    const fixture = createAgentAccessHarness({ data: {
+      listSources: () => ({ sources: [{ ...source, database: 'next_db', updatedAt: 3 }] }),
+      setDefaultDatabase: (input) => { calls.push(input); return { source: { ...source, database: input.database, updatedAt: 3 } } },
+      upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
+      probeSource: async () => { throw new Error('NOT_USED') }, diagnoseSource: async () => { throw new Error('NOT_USED') },
+      revealSourcePassword: () => ({ password: null }), listSchemaTables: async () => ({ databases: [], tables: [] }),
+      describeSchemaTable: async () => ({ columns: [], indexes: [] }),
+      readSchemaRows: async () => ({ columns: [], rows: [], offset: 0, limit: 50, truncated: false }), removeHost: () => undefined,
+    } })
+    fixture.access.grantRead({
+      sessionId: 'session-1',
+      resources: [{
+        kind: 'mysql', sourceId: source.id, instance: false,
+        databases: [{ database: 'old_db', tables: null, readRows: true }],
+      }],
+    }, [{ key: `data:${source.id}`, fingerprint: 'stale-binding' }])
+    try {
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE, createSender(99), { source, database: 'next_db' }))
+        .rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE, fixture.sender, { source, database: 'next_db', extra: true }))
+        .rejects.toThrow('SERVER_OPS_DATA_SOURCE_SET_DEFAULT_DATABASE_INPUT_INVALID')
+      await expect(invoke(fixture.handlers, SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE, fixture.sender, { source, database: 'next_db' }))
+        .resolves.toMatchObject({ source: { database: 'next_db' } })
+      expect(calls).toEqual([{ source, database: 'next_db' }])
+      expect(fixture.access.getReadAccess('session-1')).toBeUndefined()
+    } finally { fixture.registration.dispose() }
+  })
+
   test('Given 数据库持久规则 When 无会话主窗口读取保存 Then 可管理且陌生窗口被拒绝', async () => {
     /** 本地策略替身不读取任何真实配置或数据库。 */
     const policy = { revision: 0, exclusions: [] }
@@ -173,6 +208,33 @@ describe('服务器运维 IPC', () => {
       await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', createSender(99), { expectedRevision: 0, exclusions: [] })).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
       await expect(invoke(fixture.handlers, 'server-ops:set-database-agent-policy', fixture.sender, { expectedRevision: 0, exclusions: [], password: 'bad' })).rejects.toThrow()
     } finally { fixture.registration.dispose() }
+  })
+  test('Given PostgreSQL 禁用表策略 When 保存 canonical、别名或系统 schema Then 仅接受业务表精确身份', async () => {
+    const policy = { revision: 0, exclusions: [] }
+    const data = {
+      listSources: () => ({ sources: [{ id: 'pg-1', engine: 'postgresql' as const, label: 'PostgreSQL', transport: 'direct' as const,
+        address: '127.0.0.1', port: 5432, database: 'appdb', tlsMode: 'disabled' as const, hasPassword: false, createdAt: 1, updatedAt: 1 }] }),
+      upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
+      probeSource: async () => { throw new Error('NOT_USED') }, diagnoseSource: async () => { throw new Error('NOT_USED') },
+      revealSourcePassword: () => ({ password: null }), listSchemaTables: async () => ({ databases: [], tables: [] }),
+      describeSchemaTable: async () => ({ columns: [], indexes: [] }),
+      readSchemaRows: async () => ({ columns: [], rows: [], offset: 0, limit: 50, truncated: false }), removeHost: () => undefined,
+    }
+    const fixture = createAgentAccessHarness({ data, databasePolicy: {
+      get: () => policy,
+      set: (input) => ({ revision: input.expectedRevision + 1, exclusions: input.exclusions }),
+      onChanged: () => () => {},
+    } })
+    const channel = SERVER_OPS_DATABASE_AGENT_POLICY_CHANNELS.SET
+    await expect(invoke(fixture.handlers, channel, fixture.sender, { expectedRevision: 0, exclusions: [{
+      sourceId: 'pg-1', database: 'appdb', excludedTables: ['"public"."Users"', '"public"."users"'],
+    }] })).resolves.toMatchObject({ exclusions: [{ excludedTables: ['"public"."Users"', '"public"."users"'] }] })
+    for (const table of ['orders', '"pg_catalog"."pg_class"', '"information_schema"."tables"']) {
+      await expect(invoke(fixture.handlers, channel, fixture.sender, { expectedRevision: 0, exclusions: [{
+        sourceId: 'pg-1', database: 'appdb', excludedTables: [table],
+      }] })).rejects.toThrow('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+    }
+    fixture.registration.dispose()
   })
   test('Given 旧客户端提交数据库会话授权 When 保存 Then 明确要求使用持久禁用名单而非假装生效', async () => {
     const fixture = createAgentAccessHarness()
@@ -209,11 +271,11 @@ describe('服务器运维 IPC', () => {
   test('Given 查询历史 IPC When sender、输入或数据源不可信 Then 拒绝；合法 MySQL 只访问本地 Store', async () => {
     /** 记录本地历史调用，证明 handler 不经过远端查询服务。 */
     const calls: unknown[] = []
-    const createFixture = (engine: 'mysql' | 'redis' | 'sqlite' = 'mysql') => createAgentAccessHarness({
+    const createFixture = (engine: 'mysql' | 'postgresql' | 'redis' | 'sqlite' = 'mysql') => createAgentAccessHarness({
       data: {
         listSources: () => ({ sources: [{
           id: 'source-1', engine, label: '主库',
-          ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: engine === 'mysql' ? 3306 : 6379, database: 'app' }),
+          ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: engine === 'mysql' ? 3306 : engine === 'postgresql' ? 5432 : 6379, database: 'app' }),
           tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1,
         }] }),
         upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
@@ -243,6 +305,9 @@ describe('服务器运维 IPC', () => {
     const redis = createFixture('redis')
     await expect(invoke(redis.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, redis.sender, scope))
       .rejects.toThrow('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+    const postgresql = createFixture('postgresql')
+    await expect(invoke(postgresql.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, postgresql.sender, scope))
+      .resolves.toEqual({ entries: [] })
     /** SQLite 历史也只读本地 Store，且不得写到附加库名下。 */
     const sqlite = createFixture('sqlite')
     await expect(invoke(sqlite.handlers, SERVER_OPS_DATA_QUERY_HISTORY_CHANNELS.LIST, sqlite.sender, { ...scope, database: 'main' })).resolves.toEqual({ entries: [] })
@@ -250,9 +315,10 @@ describe('服务器运维 IPC', () => {
     sqlite.registration.dispose()
     fixture.registration.dispose()
     redis.registration.dispose()
+    postgresql.registration.dispose()
   })
 
-  test.each(['mysql', 'sqlite'] as const)('Given %s SQL IPC When 授权窗口执行或关闭 Then 验证结果、记录审计并取消真实 signal', async (engine) => {
+  test.each(['mysql', 'postgresql', 'sqlite'] as const)('Given %s SQL IPC When 授权窗口执行或关闭 Then 验证结果、记录审计并取消真实 signal', async (engine) => {
     /** 不含网络实现的服务桩，只观察 IPC 到服务的真实取消与审计顺序。 */
     let signal: AbortSignal | undefined
     let finish!: () => void
@@ -260,7 +326,7 @@ describe('服务器运维 IPC', () => {
     const fixture = createAgentAccessHarness({
       auditAppend: (input) => { const record = { ...input, id: 'audit-1', timestamp: Date.now() }; expect(isServerOpsAuditRecord(record)).toBe(true); records.push(record); return record },
       data: {
-        listSources: () => ({ sources: [{ id: 'db-1', engine, label: '查询数据库', ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: 3306, database: 'app' }), tlsMode: 'disabled' as const, hasPassword: false, createdAt: 1, updatedAt: 1 }] }), upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
+        listSources: () => ({ sources: [{ id: 'db-1', engine, label: '查询数据库', ...(engine === 'sqlite' ? { transport: 'ssh' as const, hostId: 'host-1', filePath: '/srv/app.db', database: 'main' } : { transport: 'direct' as const, address: '127.0.0.1', port: engine === 'postgresql' ? 5432 : 3306, database: 'app' }), tlsMode: 'disabled' as const, hasPassword: false, createdAt: 1, updatedAt: 1 }] }), upsertSource: () => { throw new Error('NOT_USED') }, deleteSource: () => undefined,
         probeSource: async () => { throw new Error('NOT_USED') }, diagnoseSource: async () => { throw new Error('NOT_USED') },
         revealSourcePassword: () => ({ password: null }), listSchemaTables: async () => ({ databases: [], tables: [] }),
         describeSchemaTable: async () => ({ columns: [], indexes: [] }), readSchemaRows: async () => ({ columns: [], rows: [], offset: 0, limit: 50, truncated: false }), removeHost: () => undefined,
@@ -271,7 +337,7 @@ describe('服务器运维 IPC', () => {
         },
       },
     })
-    const input = { sourceId: 'db-1', queryId: 'query-1', database: engine === 'sqlite' ? 'main' : 'app', sql: engine === 'sqlite' ? 'SELECT "id" FROM "users"' : 'SELECT id FROM users', maxRows: 50 }
+    const input = { sourceId: 'db-1', queryId: 'query-1', database: engine === 'sqlite' ? 'main' : 'app', sql: engine === 'mysql' ? 'SELECT id FROM users' : 'SELECT "id" FROM "users"', maxRows: 50 }
     await expect(invoke(fixture.handlers, SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, createSender(99), input)).rejects.toThrow('SERVER_OPS_ACCESS_DENIED')
     const running = invoke(fixture.handlers, SERVER_OPS_DATA_QUERY_CHANNELS.EXECUTE, fixture.sender, input)
     /** 两个微任务分别经过 IPC 分派与开始审计准备。 */
@@ -1303,7 +1369,7 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(78)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(79)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1322,7 +1388,7 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(78)
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(79)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

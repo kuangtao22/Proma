@@ -39,6 +39,20 @@ describe('Agent 连接草稿会话边界', () => {
     expect(state.store.list('session-1')).toHaveLength(1)
   })
 
+  test('Given PostgreSQL 连接建议 When 通过真实 Pi 工具准备 Then 保留 database 且拒绝 preferred TLS', async () => {
+    const state = fixture()
+    const sdk = { defineTool: (definition: ToolDefinition) => definition } as typeof import('@earendil-works/pi-coding-agent')
+    const agent = createServerOpsConnectionDraftAgent(state.options)!
+    const tool = buildServerOpsConnectionTools(sdk, agent)[0]!
+    const execute = tool.execute as unknown as (id: string, input: unknown) => Promise<{ details: { kind: string } }>
+    await expect(execute('call-pg', { kind: 'postgresql', label: '订单库', address: 'db.example.com', port: 5432,
+      transport: 'direct', username: 'reader', database: 'appdb', tlsMode: 'required' })).resolves.toMatchObject({ details: { kind: 'postgresql' } })
+    expect(state.store.list('session-1')[0]?.input).toMatchObject({ kind: 'postgresql', database: 'appdb', tlsMode: 'required' })
+    await expect(execute('call-pg-unsafe', { kind: 'postgresql', label: '订单库', address: 'db.example.com', port: 5432,
+      transport: 'direct', database: 'appdb', tlsMode: 'preferred' })).rejects.toThrow('SERVER_OPS_CONNECTION_DRAFT_INVALID')
+  })
+
+
   test('Given 只读模式与后台来源 When 构建草稿能力 Then 不创建闭包', () => {
     /** 只读、自动化、委派、外部入口均不能创建配置草稿。 */
     const state = fixture()

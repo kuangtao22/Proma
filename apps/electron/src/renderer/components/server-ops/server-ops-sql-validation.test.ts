@@ -70,4 +70,19 @@ describe('SQL 草稿本地校验', () => {
     expect(validateServerOpsSqlDraft("SELECT strftime('%Y', created_at) FROM users", 'main', undefined, 'sqlite')).toMatchObject({ status: 'valid' })
     expect(validateServerOpsSqlDraft('SELECT * FROM users', 'app', schema)).toMatchObject({ status: 'valid' })
   })
+
+  test('Given PostgreSQL 大小写不同的表与字段 When 核对结构缓存 Then 精确匹配并保留真实缺失提醒', () => {
+    /** PostgreSQL 带引号标识符可以只差大小写，不能混用另一张表的缓存。 */
+    const postgresSchema: ServerOpsSqlCompletionProjection = {
+      ...schema,
+      tables: [{ name: '"public"."Users"' }, { name: '"public"."users"' }],
+      columns: {
+        '"public"."Users"': [{ name: 'UserName', type: 'text', nullable: false, primaryKey: false }],
+        '"public"."users"': [{ name: 'id', type: 'integer', nullable: false, primaryKey: true }],
+      },
+    }
+    expect(validateServerOpsSqlDraft('SELECT "UserName" FROM "Users"', 'app', postgresSchema, 'postgresql').diagnostics).toEqual([])
+    expect(validateServerOpsSqlDraft('SELECT username FROM "Users"', 'app', postgresSchema, 'postgresql').diagnostics).toMatchObject([{ code: 'SCHEMA_COLUMN_MISSING' }])
+    expect(validateServerOpsSqlDraft('SELECT id FROM "USERS"', 'app', postgresSchema, 'postgresql').diagnostics).toMatchObject([{ code: 'SCHEMA_TABLE_MISSING' }])
+  })
 })

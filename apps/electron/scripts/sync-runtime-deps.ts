@@ -71,6 +71,8 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
   'ssh2',
   // 数据服务在 Server Ops utility process 内通过 SSH forwardOut 通道直连数据库，不经过本机监听端口。
   'mysql2',
+  // PostgreSQL 单连接驱动随 utility runtime 一并分发。
+  'pg',
   'ioredis',
 ]
 

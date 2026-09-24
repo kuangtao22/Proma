@@ -41,7 +41,7 @@ function useAgentCatalog({ source, api }: CatalogProps, database?: string) {
 
 /** 单个连接的数据库禁用表编辑；当前库直接操作，其他已保存范围仍可管理。 */
 interface DatabaseExclusionsProps extends CatalogProps {
-  resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'sqlite' }>
+  resource: Extract<ServerOpsAgentReadResource, { kind: 'mysql' | 'postgresql' | 'sqlite' }>
   currentDatabase?: string
   onChange: (databases: ServerOpsAgentDatabaseScope[]) => void
 }
@@ -138,8 +138,9 @@ export function ServerOpsAgentTableExclusions(props: CatalogProps & { scope?: Se
   }, [search, projection.tableSearch, controller])
   /** 名称保持完整，仅本地搜索使用大小写折叠。 */
   const excluded = props.scope?.excludedTables ?? []
-  /** 与后台一致地识别大小写等价的禁用表。 */
-  const excludedKeys = new Set(excluded.map((name) => name.toLowerCase()))
+  /** PostgreSQL 的引用名称区分大小写，与后台策略匹配规则一致。 */
+  const tableKey = (name: string): string => props.source.engine === 'postgresql' ? name : name.toLowerCase()
+  const excludedKeys = new Set(excluded.map(tableKey))
   /** 搜索词与远端查询统一去掉首尾空白，避免粘贴表名后隐藏已命中的结果。 */
   const searchKey = search.trim().toLowerCase()
   const tables = projection.result?.tables.filter((table) => table.name.toLowerCase().includes(searchKey)) ?? []
@@ -170,7 +171,7 @@ export function ServerOpsAgentTableExclusions(props: CatalogProps & { scope?: Se
                 disabled={props.disabled}
                 className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label={`取消禁用 ${database}.${name}`}
-                onClick={() => { if (props.scope) props.onChange(toggleServerOpsExcludedTable(props.scope, name)) }}
+                onClick={() => { if (props.scope) props.onChange(toggleServerOpsExcludedTable(props.scope, name, props.source.engine)) }}
               >
                 <X className="size-3" />
               </button>
@@ -206,7 +207,7 @@ export function ServerOpsAgentTableExclusions(props: CatalogProps & { scope?: Se
             <div className="max-h-40 space-y-0.5 overflow-y-auto" role="group" aria-label={`${database} 禁用表多选`}>
               {tables.map((table) => {
                 /** 勾选代表禁用；未勾选表默认可查询。 */
-                const checked = excludedKeys.has(table.name.toLowerCase())
+                const checked = excludedKeys.has(tableKey(table.name))
                 return (
                   <label key={table.name} className="flex cursor-pointer items-start gap-2 rounded px-1.5 py-1.5 text-xs hover:bg-muted/60">
                     <input
@@ -215,7 +216,7 @@ export function ServerOpsAgentTableExclusions(props: CatalogProps & { scope?: Se
                       checked={checked}
                       disabled={props.disabled || (!checked && excluded.length >= 100)}
                       aria-label={`禁止查询 ${database}.${table.name}`}
-                      onChange={() => { if (props.scope) props.onChange(toggleServerOpsExcludedTable(props.scope, table.name)) }}
+                      onChange={() => { if (props.scope) props.onChange(toggleServerOpsExcludedTable(props.scope, table.name, props.source.engine)) }}
                     />
                     <span className="min-w-0 break-all">{table.name}{table.type === 'view' ? <span className="ml-1.5 text-[10px] text-muted-foreground">视图</span> : null}</span>
                   </label>

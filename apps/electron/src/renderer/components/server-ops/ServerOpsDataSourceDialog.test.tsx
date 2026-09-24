@@ -169,8 +169,8 @@ function renderFields(options: {
 
 describe('数据源表单', () => {
   test('Given 新建连接 When 渲染连接方式 Then 本地数据库常驻且各模式只提供适用引擎', () => {
-    expect(getServerOpsDataConnectionModeEngines('direct')).toEqual(['mysql', 'redis'])
-    expect(getServerOpsDataConnectionModeEngines('ssh')).toEqual(['mysql', 'redis', 'sqlite'])
+    expect(getServerOpsDataConnectionModeEngines('direct')).toEqual(['mysql', 'postgresql', 'redis'])
+    expect(getServerOpsDataConnectionModeEngines('ssh')).toEqual(['mysql', 'postgresql', 'redis', 'sqlite'])
     expect(getServerOpsDataConnectionModeEngines('local-sqlite')).toEqual(['sqlite'])
 
     const local = applyServerOpsDataConnectionModeChange(createServerOpsDataSourceDraft(null), 'local-sqlite')
@@ -299,8 +299,18 @@ describe('数据源表单', () => {
     expect(html).toContain('数据库地址')
     expect(html).not.toContain('库名')
     expect(html).not.toContain('id="server-ops-data-database"')
+    expect(html).toContain('高级选项')
     expect(html).toContain('id="server-ops-data-username"')
     expect(html).not.toContain('清除已保存密码')
+    /** PostgreSQL 常规连接同样不要求选库，特殊账号可展开高级选项。 */
+    const postgresqlHtml = renderFields({ draft: createServerOpsDataSourceDraft(null, 'postgresql') })
+    expect(postgresqlHtml).toContain('value="5432"')
+    expect(postgresqlHtml).not.toContain('id="server-ops-data-database"')
+    expect(postgresqlHtml).toContain('高级选项')
+    /** 编辑已指定业务库的连接时保留并展示该设置，避免无意覆盖。 */
+    const customPostgresqlHtml = renderFields({ mode: 'edit', draft: { ...createServerOpsDataSourceDraft(null, 'postgresql'), database: 'business' } })
+    expect(customPostgresqlHtml).toContain('id="server-ops-data-database"')
+    expect(customPostgresqlHtml).toContain('value="business"')
   })
 
   test('Given MySQL 与 Redis When 切换引擎 Then 更新端口且不沿用另一种引擎的数据库', () => {
@@ -510,13 +520,14 @@ describe('数据源表单', () => {
     expect(validateServerOpsDataSourceDraft({ ...base, label: '库', address: '127.0.0.1' })).toEqual({})
   })
 
-  test('Given 编辑带旧库名的 MySQL 且留空密码 When 构造输入 Then 移除默认库并保留密码', () => {
-    /** 旧连接可以继续编辑，但已移除的库名不再作为隐藏配置提交。 */
+  test('Given MySQL 已记住上次打开的库且留空密码 When 编辑连接 Then 高级选项回填默认库并保留密码', () => {
+    /** 默认库由工作台选库维护，也可在连接高级选项中调整。 */
     const source = createSource()
-    /** 编辑草稿应清除旧库名。 */
+    /** 编辑时回填真实默认库，普通字段修改不能无意清空。 */
     const draft = createServerOpsDataSourceDraft(source)
-    expect(draft.database).toBe('')
-    expect(renderFields({ mode: 'edit', source })).not.toContain('id="server-ops-data-database"')
+    expect(draft.database).toBe('app')
+    expect(renderFields({ mode: 'edit', source })).toContain('id="server-ops-data-database"')
+    expect(renderFields({ mode: 'edit', source })).toContain('默认数据库（可选）')
     const input = buildServerOpsDataSourceUpsertInput({
       hostId: 'host-1',
       source,
@@ -530,18 +541,37 @@ describe('数据源表单', () => {
       label: '业务主库',
       address: '127.0.0.1',
       port: 3306,
+      database: 'app',
       username: 'monitor',
       tlsMode: 'disabled',
     })
     expect('password' in input).toBe(false)
     expect('clearPassword' in input).toBe(false)
-    /** 在途表单残留的旧库名也不得参与校验、连接测试或保存。 */
-    const staleDraft = { ...draft, database: 'x'.repeat(65) }
-    expect(validateServerOpsDataSourceDraft(staleDraft, 'host-1')).toEqual({})
-    expect(buildServerOpsDataSourceProbeDraft({ hostId: 'host-1', source, draft: staleDraft }))
-      .not.toHaveProperty('database')
-    expect(buildServerOpsDataSourceUpsertInput({ hostId: 'host-1', source, draft: staleDraft }))
-      .not.toHaveProperty('database')
+  })
+
+  test('Given MySQL 高级选项 When 填写或清空默认库 Then 新建与编辑的测试和保存使用同一值', () => {
+    /** 分别覆盖新建连接和编辑已有默认库的连接。 */
+    for (const source of [null, createSource()]) {
+      /** 库名会归一化首尾空白，显式清空不会回退到旧库。 */
+      for (const database of [' business ', '', '   ']) {
+        /** 模拟用户在高级选项中修改后的草稿。 */
+        const draft = { ...createServerOpsDataSourceDraft(source), label: '业务库', database }
+        expect(validateServerOpsDataSourceDraft(draft, 'host-1')).toEqual({})
+        expect(buildServerOpsDataSourceProbeDraft({ hostId: 'host-1', source, draft })?.database)
+          .toBe(database.trim() || undefined)
+        expect(buildServerOpsDataSourceUpsertInput({ hostId: 'host-1', source, draft }).database)
+          .toBe(database.trim() || undefined)
+      }
+    }
+  })
+
+  test('Given MySQL 默认库 When 超长或包含控制字符 Then 在表单提示且合法边界仍可保存', () => {
+    /** 默认库沿用共享合同的 64 字符边界，并拒绝不可见控制字符。 */
+    const draft = { ...createServerOpsDataSourceDraft(null), label: '业务库' }
+    for (const database of ['x'.repeat(65), 'business\u0000', 'business\n', 'business\u0085']) {
+      expect(validateServerOpsDataSourceDraft({ ...draft, database }).database).toBeDefined()
+    }
+    expect(validateServerOpsDataSourceDraft({ ...draft, database: '库'.repeat(64) })).toEqual({})
   })
 
   test('Given 开启清除密码 When 构造输入 Then 提交 clearPassword 且不提交 password', () => {
@@ -593,7 +623,7 @@ describe('数据源表单', () => {
       draft: createServerOpsDataSourceDraft(createSource()),
     })).toEqual({
       transport: 'ssh', hostId: 'host-1', engine: 'mysql', address: '127.0.0.1', port: 3306,
-      username: 'monitor', savedSourceId: 'source-1', tlsMode: 'disabled',
+      database: 'app', username: 'monitor', savedSourceId: 'source-1', tlsMode: 'disabled',
     })
 
     /** 勾选清除密码后不得再复用旧密文。 */

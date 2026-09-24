@@ -4,6 +4,24 @@ import { ServerOpsAgentAccessStore } from './server-ops-agent-access-store'
 import { captureServerOpsReadBindings, revalidateServerOpsReadBindings } from './server-ops-agent-read-identity'
 
 describe('运维只读授权配置身份', () => {
+  test('Given PostgreSQL 已授权 When 数据库、端点或 TLS 改变 Then 配置摘要变化且不泄露连接资料', () => {
+    const source: ServerOpsDataSource = { id: 'pg-1', label: 'PostgreSQL', engine: 'postgresql', transport: 'direct',
+      address: 'db.example.com', port: 5432, database: 'appdb', username: 'reader', tlsMode: 'required',
+      hasPassword: true, createdAt: 1, updatedAt: 1 }
+    const services = { hosts: { get: () => undefined }, data: {
+      listSources: () => ({ sources: [source] }), getReadCredentialVersion: () => 'credential-version',
+    } }
+    const resources = [{ kind: 'postgresql' as const, sourceId: source.id, instance: false,
+      databases: [{ database: 'appdb', tables: null, readRows: true, query: true }] }]
+    const first = captureServerOpsReadBindings(resources, services)
+    source.label = '改名'; source.updatedAt = 2
+    expect(captureServerOpsReadBindings(resources, services)).toEqual(first)
+    source.database = 'audit'
+    expect(captureServerOpsReadBindings(resources, services)).not.toEqual(first)
+    expect(JSON.stringify(first)).not.toContain('db.example.com')
+    expect(JSON.stringify(first)).not.toContain('credential-version')
+  })
+
   test('Given 本地 SQLite When 重新绑定到另一个文件 Then Agent 目标摘要变化', () => {
     /** 本地文件连接不依赖 SSH，主进程产生的文件身份参与绑定。 */
     const source: ServerOpsDataSource = { id: 'local-db', label: '本地库', engine: 'sqlite', transport: 'direct', filePath: '/tmp/app.db', localFileId: '1:42:1700000000000000000', database: 'main', tlsMode: 'disabled', hasPassword: false, createdAt: 1, updatedAt: 1 }

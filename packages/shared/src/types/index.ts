@@ -42,6 +42,7 @@ export * from './server-ops-data-schema'
 export * from './server-ops-data-query'
 export * from './server-ops-data-query-history'
 export * from './server-ops-sql-parser'
+export * from './server-ops-postgresql-identifiers'
 export * from './server-ops-project'
 export * from './server-ops-connection-move'
 

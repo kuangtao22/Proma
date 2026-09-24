@@ -26,7 +26,7 @@ import {
   runServerOpsDataRead,
 } from './server-ops-data-runtime'
 
-for (const engine of ['mysql', 'redis'] as const) {
+for (const engine of ['mysql', 'postgresql', 'redis'] as const) {
   test(`Given ${engine} 通道回调尚未返回 When 撤销读取 Then 不等待回调且释放随后返回的通道`, async () => {
     /** 模拟尚未返回的 SSH 转发调用，验证撤销不依赖网络回调。 */
     const controller = new AbortController()

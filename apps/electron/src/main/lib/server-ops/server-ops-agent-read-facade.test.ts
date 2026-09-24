@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import { isServerOpsAuditRecord, parseServerOpsAgentReadGrant } from '@proma/shared'
+import { formatServerOpsPostgresTable, isServerOpsAuditRecord, parseServerOpsAgentReadGrant } from '@proma/shared'
 import type {
   AgentSessionMeta,
   ServerOpsAgentReadAccess,
@@ -128,6 +128,80 @@ function dependencies(options: {
 }
 
 describe('Server Ops Agent 多资源只读 Facade', () => {
+  test('Given PostgreSQL 默认只读与跨 schema 禁用表 When 浏览、读结构和查询 Then canonical 身份精确隔离', async () => {
+    const deps = dependencies()
+    const publicOrders = formatServerOpsPostgresTable('public', 'orders')
+    const salesOrders = formatServerOpsPostgresTable('sales', 'orders')
+    const quotedUsers = formatServerOpsPostgresTable('public', 'Users')
+    const lowerUsers = formatServerOpsPostgresTable('public', 'users')
+    deps.services.access.getReadAccess = () => undefined
+    deps.services.databasePolicy = { get: () => ({ revision: 4, exclusions: [{
+      sourceId: 'source-1', database: 'appdb', excludedTables: [salesOrders, quotedUsers],
+    }] }) }
+    deps.services.data!.listSources = () => ({ sources: [source({
+      engine: 'postgresql', label: '订单 PostgreSQL', port: 5432, database: 'appdb', tlsMode: 'required',
+    })] })
+    deps.services.data!.listSchemaTables = async () => ({ database: 'appdb', databases: ['appdb'], tables: [
+      { name: publicOrders, type: 'table' }, { name: salesOrders, type: 'table' },
+      { name: quotedUsers, type: 'table' }, { name: lowerUsers, type: 'table' },
+      { name: formatServerOpsPostgresTable('pg_catalog', 'pg_class'), type: 'table' },
+    ] })
+    deps.services.data!.probeSource = async (input) => {
+      if (!('sourceId' in input)) throw new Error('unexpected draft')
+      return { sourceId: input.sourceId, engine: 'postgresql', capability: 'available', warnings: [] }
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+
+    expect(facade.resources().resources).toContainEqual(expect.objectContaining({ kind: 'postgresql', sourceId: 'source-1' }))
+    await expect(facade.databaseTables({ sourceId: 'source-1', database: 'appdb' })).resolves.toMatchObject({
+      tables: [{ name: publicOrders }, { name: lowerUsers }],
+    })
+    await expect(facade.databaseDescribe({ sourceId: 'source-1', database: 'appdb', table: 'orders' }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseDescribe({ sourceId: 'source-1', database: 'appdb', table: salesOrders }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseDescribe({ sourceId: 'source-1', database: 'appdb', table: quotedUsers }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+    await expect(facade.databaseDescribe({ sourceId: 'source-1', database: 'appdb', table: lowerUsers }))
+      .resolves.toMatchObject({ columns: expect.any(Array) })
+    await expect(facade.databaseQuery({ sourceId: 'source-1', database: 'appdb', sql: 'SELECT id FROM sales.orders', maxRows: 10 }))
+      .rejects.toThrow('SERVER_OPS_AGENT_SCOPE_REQUIRED')
+  })
+
+  test('Given PostgreSQL 默认库 B 有禁用表且目标库 A 无禁用项 When Agent 请求诊断 Then 仅会话诊断携带 A 到达数据服务', async () => {
+    const deps = dependencies()
+    deps.services.access.getReadAccess = () => undefined
+    deps.services.databasePolicy = { get: () => ({ revision: 5, exclusions: [{
+      sourceId: 'source-1', database: 'database_b', excludedTables: [formatServerOpsPostgresTable('public', 'secret')],
+    }] }) }
+    deps.services.data!.listSources = () => ({ sources: [source({
+      engine: 'postgresql', label: '多租户 PostgreSQL', port: 5432, database: 'database_b', tlsMode: 'required',
+    })] })
+    /** 只记录真正到达数据服务的诊断请求，证明拒绝发生在远程读取前。 */
+    const received: Array<{ sourceId: string; database?: string; section?: string }> = []
+    deps.services.data!.diagnoseSource = async (input) => {
+      received.push(input)
+      return {
+        sourceId: input.sourceId, engine: 'postgresql', capability: 'available', collectedAt: 100,
+        metrics: [], parameters: [], tables: [], warnings: [],
+      }
+    }
+    const facade = createServerOpsAgentReadFacade({ sessionId: 'session-1', dependencies: deps })!
+
+    await expect(facade.dataDiagnose({
+      sourceId: 'source-1', scope: 'database', database: 'database_a', section: 'overview',
+    })).rejects.toThrow('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+    await expect(facade.dataDiagnose({
+      sourceId: 'source-1', scope: 'database', database: 'database_a', section: 'parameters',
+    })).rejects.toThrow('SERVER_OPS_AGENT_READ_INPUT_INVALID')
+    expect(received).toEqual([])
+
+    await expect(facade.dataDiagnose({
+      sourceId: 'source-1', scope: 'database', database: 'database_a', section: 'sessions',
+    })).resolves.toMatchObject({ engine: 'postgresql', capability: 'available' })
+    expect(received).toEqual([{ sourceId: 'source-1', database: 'database_a', section: 'sessions' }])
+  })
+
   test('Given 已保存数据库无会话租约且禁用名单为空 When 发现并读取 Then 所有普通表默认只读可用', async () => {
     const deps = dependencies()
     deps.services.access.getReadAccess = () => undefined

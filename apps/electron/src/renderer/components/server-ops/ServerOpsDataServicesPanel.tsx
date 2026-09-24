@@ -32,6 +32,7 @@ import type {
   ServerOpsDataSourceTablesInput,
   ServerOpsDataSourceTablesResult,
   ServerOpsDataSourceUpsertInput,
+  ServerOpsDataSourceSetDefaultDatabaseInput,
   ServerOpsDataSourceUpsertResult,
   ServerOpsDataQueryCancelInput,
   ServerOpsDataQueryInput,
@@ -75,6 +76,8 @@ import type { ServerOpsSchemaBrowserProjection } from './ServerOpsSchemaBrowser'
 export interface ServerOpsDataPanelApi {
   listServerOpsDataSources(input: ServerOpsDataSourceListInput): Promise<ServerOpsDataSourceListResult>
   upsertServerOpsDataSource(input: ServerOpsDataSourceUpsertInput): Promise<ServerOpsDataSourceUpsertResult>
+  /** 成功选库后只保存默认库；兼容尚未提供此能力的旧 bridge。 */
+  setServerOpsDataSourceDefaultDatabase?: (input: ServerOpsDataSourceSetDefaultDatabaseInput) => Promise<ServerOpsDataSourceUpsertResult>
   deleteServerOpsDataSource(input: ServerOpsDataSourceDeleteInput): Promise<void>
   probeServerOpsDataSource(input: ServerOpsDataSourceProbeInput): Promise<ServerOpsDataProbeResult>
   diagnoseServerOpsDataSource(input: ServerOpsDataDiagnoseInput): Promise<ServerOpsDataDiagnosticsResult>
@@ -533,7 +536,7 @@ function ServerOpsDataEngineIcon({ engine }: { engine: ServerOpsDataSource['engi
 
 /** 引擎展示名。 */
 function getEngineLabel(engine: ServerOpsDataSource['engine']): string {
-  return engine === 'mysql' ? 'MySQL' : engine === 'sqlite' ? 'SQLite' : 'Redis'
+  return engine === 'postgresql' ? 'PostgreSQL' : engine === 'mysql' ? 'MySQL' : engine === 'sqlite' ? 'SQLite' : 'Redis'
 }
 
 /** 指标卡网格。 */

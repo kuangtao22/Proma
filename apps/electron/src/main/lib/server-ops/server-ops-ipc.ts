@@ -62,6 +62,7 @@ import {
   parseServerOpsProjectResult,
   parseServerOpsDataSourceListInput,
   parseServerOpsDataSourceListResult,
+  parseServerOpsDataSourceSetDefaultDatabaseInput,
   parseServerOpsDataSourceUpsertInput,
   parseServerOpsDataSourceUpsertResult,
   parseServerOpsDataSourceDeleteInput,
@@ -79,6 +80,7 @@ import {
   parseServerOpsDataProbeResult,
   parseServerOpsDataDiagnoseInput,
   parseServerOpsDataDiagnosticsResult,
+  parseServerOpsPostgresTable,
   SERVER_OPS_TRUST_CHANNELS,
   SERVER_OPS_DATA_SCHEMA_CHANNELS,
   parseServerOpsTrustInput,
@@ -282,7 +284,7 @@ export interface ServerOpsIpcOptions {
   transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
   fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
   data?: Pick<ServerOpsDataService, 'listSources' | 'upsertSource' | 'deleteSource' | 'probeSource' | 'diagnoseSource' | 'revealSourcePassword' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows' | 'removeHost'>
-    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'querySource' | 'readSchemaCell' | 'getReadCredentialVersion'>>
+    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'setDefaultDatabase' | 'querySource' | 'readSchemaCell' | 'getReadCredentialVersion'>>
   /** 本地 SQL 查询历史；不经过数据库 runtime、Agent 或审计。 */
   queryHistory?: Pick<ServerOpsDataQueryHistoryStore, 'list' | 'save'>
   /** 运维项目：侧栏分组与连接归属的边界。 */
@@ -322,7 +324,8 @@ function assertQueryHistorySource(sourceId: string, database: string, options: S
   if (!data) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
   const result = parseServerOpsDataSourceListResult(data.listSources({}))
   const source = result.sources.find((candidate) => candidate.id === sourceId)
-  if (!source || (source.engine !== 'mysql' && source.engine !== 'sqlite') || (source.engine === 'sqlite' && database !== 'main')) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
+  if (!source || (source.engine !== 'mysql' && source.engine !== 'postgresql' && source.engine !== 'sqlite')
+    || (source.engine === 'sqlite' && database !== 'main')) throw new Error('SERVER_OPS_DATA_QUERY_HISTORY_SOURCE_UNAVAILABLE')
 }
 
 /** 判断主机 ID 是否满足跨进程稳定标识约束。 */
@@ -615,6 +618,14 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const result = parseServerOpsDataSourceUpsertResult(options.data.upsertSource(parsed))
     /** 密码替换可能保持同一凭据引用，也必须重新授权；仅改名则保留。 */
     if (parsed.sourceId && (parsed.password !== undefined || parsed.clearPassword)) options.access.revokeSource(parsed.sourceId)
+    revalidateServerOpsReadBindings(options.access, options)
+    return result
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE, (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataSourceSetDefaultDatabaseInput(input)
+    if (!options.data?.setDefaultDatabase) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    const result = parseServerOpsDataSourceUpsertResult(options.data.setDefaultDatabase(parsed))
     revalidateServerOpsReadBindings(options.access, options)
     return result
   })
@@ -1033,8 +1044,21 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
       const source = sources.find((entry) => entry.id === exclusion.sourceId)
       if (!source && previous.exclusions.some((entry) => entry.sourceId === exclusion.sourceId
         && entry.database === exclusion.database && JSON.stringify(entry.excludedTables) === JSON.stringify(exclusion.excludedTables))) continue
-      if (!source || (source.engine !== 'mysql' && source.engine !== 'sqlite') || (source.engine === 'sqlite' && exclusion.database !== 'main')) {
+      if (!source || (source.engine !== 'mysql' && source.engine !== 'postgresql' && source.engine !== 'sqlite')
+        || (source.engine === 'sqlite' && exclusion.database !== 'main')) {
         throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+      }
+      if (source.engine === 'postgresql') {
+        try {
+          for (const table of exclusion.excludedTables) {
+            const identity = parseServerOpsPostgresTable(table)
+            if (identity.schema.toLowerCase() === 'information_schema' || identity.schema.toLowerCase().startsWith('pg_')) {
+              throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+            }
+          }
+        } catch {
+          throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_SOURCE_INVALID')
+        }
       }
     }
     return options.databasePolicy.set(update)
@@ -1044,7 +1068,9 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const submitted = unpackAccess(input, 'grant')
     const grant = parseServerOpsAgentReadGrant(submitted.value)
     /** 旧界面不能把已失效的数据库租约当作禁用规则保存成功。 */
-    if (grant.resources.some((resource) => resource.kind === 'mysql' || resource.kind === 'sqlite')) throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_REQUIRED')
+    if (grant.resources.some((resource) => resource.kind === 'mysql' || resource.kind === 'postgresql' || resource.kind === 'sqlite')) {
+      throw new Error('SERVER_OPS_DATABASE_AGENT_POLICY_REQUIRED')
+    }
     requireOrdinaryTopLevelAgentSession(options.requireUserVisibleSession(grant.sessionId))
     if (options.requireUserVisibleSession(grant.sessionId).archived && grant.resources.length) throw new Error('SERVER_OPS_AGENT_SESSION_NOT_ALLOWED')
     /** 先验证整组事实再一次替换，任一资源失效不能清除现有有效授权。 */

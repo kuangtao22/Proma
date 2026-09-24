@@ -201,7 +201,7 @@ export function parseServerOpsDataSourceCellInput(value: unknown): ServerOpsData
   if (!isRecord(value) || !hasOnlyKeys(value, new Set(['sourceId', 'database', 'table', 'offset', 'columnIndex', 'expectedColumn', 'sha256']
     .concat(value.filters === undefined ? [] : ['filters'])))
     || !isServerOpsId(value.sourceId) || !isNonEmptySchemaText(value.database, 64)
-    || !isNonEmptySchemaText(value.table, 128) || !isBoundedInteger(value.offset, 1_000_199)
+    || !isNonEmptySchemaText(value.table, 260) || !isBoundedInteger(value.offset, 1_000_199)
     || !isBoundedInteger(value.columnIndex, 63) || !isNonEmptySchemaText(value.expectedColumn, 128)
     || !isCellDigest(value.sha256)) throw new Error(errorCode)
   return { sourceId: value.sourceId, database: value.database, table: value.table, offset: value.offset,
@@ -282,7 +282,7 @@ export function parseServerOpsDataSourceTableInput(value: unknown): ServerOpsDat
     .concat(value.cacheMode === undefined ? [] : ['cacheMode'])))
     || !isServerOpsId(value.sourceId)
     || !isNonEmptySchemaText(value.database, 64)
-    || !isNonEmptySchemaText(value.table, 128)
+    || !isNonEmptySchemaText(value.table, 260)
     || (value.cacheMode !== undefined && !isSchemaCacheMode(value.cacheMode))) throw new Error(errorCode)
   return {
     sourceId: value.sourceId,
@@ -299,7 +299,7 @@ export function parseServerOpsDataSourceRowsInput(value: unknown): ServerOpsData
     .concat(value.filters === undefined ? [] : ['filters'])))
     || !isServerOpsId(value.sourceId)
     || !isNonEmptySchemaText(value.database, 64)
-    || !isNonEmptySchemaText(value.table, 128)
+    || !isNonEmptySchemaText(value.table, 260)
     || !isBoundedInteger(value.offset, 1_000_000)
     || typeof value.limit !== 'number' || !Number.isSafeInteger(value.limit) || value.limit < 1 || value.limit > 200) {
     throw new Error(errorCode)
@@ -332,7 +332,7 @@ export function parseServerOpsDataSourceTablesResult(value: unknown): ServerOpsD
   const tables = value.tables.map((entry) => {
     if (!isRecord(entry)) throw new Error(errorCode)
     const tableKeys = new Set(['name', 'type', 'engine', 'rows', 'sizeBytes', 'updatedAt', 'comment'])
-    if (!Object.keys(entry).every((key) => tableKeys.has(key)) || !isNonEmptySchemaText(entry.name, 128)) throw new Error(errorCode)
+    if (!Object.keys(entry).every((key) => tableKeys.has(key)) || !isNonEmptySchemaText(entry.name, 260)) throw new Error(errorCode)
     if (entry.engine !== undefined && !isSchemaText(entry.engine, 32)) throw new Error(errorCode)
     if (entry.type !== undefined && entry.type !== 'table' && entry.type !== 'view') throw new Error(errorCode)
     if (entry.rows !== undefined && !isBoundedInteger(entry.rows, Number.MAX_SAFE_INTEGER)) throw new Error(errorCode)
@@ -461,5 +461,5 @@ export function parseServerOpsDataSourceRowsResult(value: unknown): ServerOpsDat
 
 /** 表浏览只支持关系型引擎；Redis 等键值引擎走各自的后续能力。 */
 export function isServerOpsSchemaBrowsableEngine(engine: ServerOpsDataEngine): boolean {
-  return engine === 'mysql' || engine === 'sqlite'
+  return engine === 'mysql' || engine === 'postgresql' || engine === 'sqlite'
 }

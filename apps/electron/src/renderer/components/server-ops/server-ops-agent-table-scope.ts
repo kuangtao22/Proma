@@ -10,7 +10,7 @@ import type { ServerOpsDatabaseNavigation } from '@/atoms/server-ops-database-at
  */
 export function resolveServerOpsAgentDatabase(source: ServerOpsDataSource, navigation?: ServerOpsDatabaseNavigation): string | null {
   if (source.engine === 'sqlite') return 'main'
-  if (source.engine !== 'mysql' || navigation?.configurationKey !== getServerOpsDatabaseReadIdentity(source)) return null
+  if ((source.engine !== 'mysql' && source.engine !== 'postgresql') || navigation?.configurationKey !== getServerOpsDatabaseReadIdentity(source)) return null
   return navigation.database
 }
 
@@ -32,7 +32,7 @@ export function createServerOpsQueryableScope(database: string, excludedTables: 
  */
 export function prepareServerOpsReadEditorResources(resources: readonly ServerOpsAgentReadResource[], databaseTargets: ReadonlyMap<string, string> = new Map()): ServerOpsAgentReadResource[] {
   return structuredClone(resources).map((resource) => {
-    if (resource.kind !== 'mysql' && resource.kind !== 'sqlite') return resource
+    if (resource.kind !== 'mysql' && resource.kind !== 'postgresql' && resource.kind !== 'sqlite') return resource
     /** 保留全部既有禁用项，当前库置顶，其他库仍可查看与移除。 */
     const databases = resource.databases.map((scope) => createServerOpsQueryableScope(scope.database, scope.excludedTables))
     const currentDatabase = databaseTargets.get(resource.sourceId)
@@ -46,16 +46,18 @@ export function prepareServerOpsReadEditorResources(resources: readonly ServerOp
 }
 
 /**
- * 切换禁止表选择，保留其它权限；最多 100 项，大小写等价名称只保留一次。
+ * 切换禁止表选择，保留其它权限；最多 100 项；PostgreSQL 按完整大小写精确匹配。
  * @param scope 当前默认可查询的编辑草稿。
  * @param table 用户在实际目录中点击的完整表名。
+ * @param engine 数据库引擎，决定标识符的大小写语义。
  * @returns 新草稿；不符合编辑器合同或新增超限时保持原范围。
  */
-export function toggleServerOpsExcludedTable(scope: ServerOpsAgentDatabaseScope, table: string): ServerOpsAgentDatabaseScope {
+export function toggleServerOpsExcludedTable(scope: ServerOpsAgentDatabaseScope, table: string, engine: ServerOpsDataSource['engine'] = 'mysql'): ServerOpsAgentDatabaseScope {
   if (scope.tables !== null) return scope
-  /** 用与后台一致的保守大小写规则取消已有项。 */
+  /** PostgreSQL canonical 名保留大小写，其他引擎延续已有保守匹配规则。 */
+  const key = (name: string): string => engine === 'postgresql' ? name : name.toLowerCase()
   const previous = scope.excludedTables ?? []
-  const matched = previous.some((name) => name.toLowerCase() === table.toLowerCase())
+  const matched = previous.some((name) => key(name) === key(table))
   if (!matched && previous.length >= 100) return scope
-  return { ...scope, excludedTables: matched ? previous.filter((name) => name.toLowerCase() !== table.toLowerCase()) : [...previous, table] }
+  return { ...scope, excludedTables: matched ? previous.filter((name) => key(name) !== key(table)) : [...previous, table] }
 }

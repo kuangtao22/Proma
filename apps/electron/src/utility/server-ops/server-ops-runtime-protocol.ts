@@ -7,7 +7,7 @@ import { parseServerOpsConsoleAck, parseServerOpsConsoleExitEvent, parseServerOp
 import { isServerOpsDataCapability, isServerOpsDataEngine, isServerOpsDataTlsMode, isServerOpsDataTlsStatus, isServerOpsMySqlTlsServerName, isServerOpsSqliteFilePath, isServerOpsLocalSqliteFilePath, isServerOpsSqliteFileId, parseServerOpsDataMetricList,
   parseServerOpsDataTableList, parseServerOpsDataWarnings, parseServerOpsDataDiagnosticsResult, parseServerOpsDataSourceRowsResult,
   parseServerOpsDataSourceTableResult, parseServerOpsDataSourceTablesResult, parseServerOpsDataQueryResult, parseServerOpsDataRowFilters,
-  parseServerOpsDataSourceCellResult } from '@proma/shared'
+  parseServerOpsDataSourceCellResult, parseServerOpsPostgresTable } from '@proma/shared'
 import type { ServerOpsConsoleIdentity, ServerOpsDataCapability, ServerOpsDataEngine, ServerOpsDataMetric, ServerOpsDataTable, ServerOpsDataTlsMode, ServerOpsDataTlsStatus } from '@proma/shared'
 import type { ServerOpsDataDiagnosticSection, ServerOpsDataParameter, ServerOpsDataQueryResult, ServerOpsDataSchemaCell, ServerOpsDataRowFilters } from '@proma/shared'
 import type { ServerOpsConsoleRuntimeStart } from './server-ops-console-runtime'
@@ -434,13 +434,16 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     || (value.engine === 'mysql' && !isServerOpsMySqlTlsServerName(value.tlsServerName)))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
-  if (value.engine === 'redis' && value.tlsMode === 'preferred') throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  if ((value.engine === 'redis' || value.engine === 'postgresql') && value.tlsMode === 'preferred') {
+    throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
+  }
   if (value.diagnosticSection !== undefined && (value.mode !== 'diagnostics'
     || (value.diagnosticSection !== 'overview' && value.diagnosticSection !== 'sessions'
       && value.diagnosticSection !== 'statements' && value.diagnosticSection !== 'parameters'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
-  if (value.diagnosticDatabase !== undefined && (value.mode !== 'diagnostics' || value.engine !== 'mysql'
+  if (value.diagnosticDatabase !== undefined && (value.mode !== 'diagnostics'
+    || (value.engine !== 'mysql' && value.engine !== 'postgresql')
     || (value.diagnosticSection !== 'sessions' && value.diagnosticSection !== 'statements')
     || typeof value.diagnosticDatabase !== 'string' || value.diagnosticDatabase.length > 64
     || value.diagnosticDatabase.trim().length === 0 || /\p{Cc}/u.test(value.diagnosticDatabase))) {
@@ -454,14 +457,17 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   const isSchemaTable = value.mode === 'schema-table'
   const isSchemaRows = value.mode === 'schema-rows'
   const isSchemaCell = value.mode === 'schema-cell'
-  if (value.schemaTableSearch !== undefined && (!isSchemaTables || (value.engine !== 'mysql' && value.engine !== 'sqlite')
+  if (value.schemaTableSearch !== undefined && (!isSchemaTables
+    || (value.engine !== 'mysql' && value.engine !== 'postgresql' && value.engine !== 'sqlite')
     || value.schemaDatabase === undefined)) throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   if (value.baseTablesOnly !== undefined && (typeof value.baseTablesOnly !== 'boolean'
-    || (!isSchemaTable && !isSchemaRows && !isSchemaCell) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+    || (!isSchemaTable && !isSchemaRows && !isSchemaCell)
+    || (value.engine !== 'mysql' && value.engine !== 'postgresql' && value.engine !== 'sqlite'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   const isSqlQuery = value.mode === 'sql-query'
-  if (value.rowFilters !== undefined && ((!isSchemaRows && !isSchemaCell) || (value.engine !== 'mysql' && value.engine !== 'sqlite'))) {
+  if (value.rowFilters !== undefined && ((!isSchemaRows && !isSchemaCell)
+    || (value.engine !== 'mysql' && value.engine !== 'postgresql' && value.engine !== 'sqlite'))) {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   /** 严格重建筛选条件，禁止额外字段或原始 SQL 跨进程传入。 */
@@ -475,7 +481,10 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
   const schemaDatabase = isSchemaTable || isSchemaRows || isSchemaCell || (isSchemaTables && value.schemaDatabase !== undefined)
     ? parseSchemaIdentifier(value.schemaDatabase, 64)
     : undefined
-  const schemaTable = isSchemaTable || isSchemaRows || isSchemaCell ? parseSchemaIdentifier(value.schemaTable, 128) : undefined
+  const schemaTable = isSchemaTable || isSchemaRows || isSchemaCell ? parseSchemaIdentifier(value.schemaTable, 260) : undefined
+  if (value.engine === 'postgresql' && schemaTable !== undefined) {
+    try { parseServerOpsPostgresTable(schemaTable) } catch { throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID') }
+  }
   const schemaTableSearch = value.schemaTableSearch === undefined ? undefined : parseSchemaIdentifier(value.schemaTableSearch, 128)
   if (isSchemaRows) {
     if (typeof value.rowOffset !== 'number' || !Number.isSafeInteger(value.rowOffset) || value.rowOffset < 0 || value.rowOffset > 1_000_000
@@ -496,7 +505,7 @@ function parseDataReadRequest(value: unknown): ServerOpsRuntimeDataReadRequest {
     throw new Error('SERVER_OPS_RUNTIME_PROTOCOL_INVALID')
   }
   if (isSqlQuery) {
-    if ((value.engine !== 'mysql' && value.engine !== 'sqlite') || typeof value.database !== 'string'
+    if ((value.engine !== 'mysql' && value.engine !== 'postgresql' && value.engine !== 'sqlite') || typeof value.database !== 'string'
       || !isRuntimeId(value.queryId) || typeof value.sql !== 'string' || value.sql.trim().length === 0
       || value.sql.includes('\0') || getUtf8ByteLength(value.sql) > 16_384
       || typeof value.maxRows !== 'number' || !Number.isSafeInteger(value.maxRows) || value.maxRows < 1 || value.maxRows > 200

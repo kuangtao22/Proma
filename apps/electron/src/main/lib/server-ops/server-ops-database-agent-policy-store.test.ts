@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ServerOpsDatabaseAgentPolicyStore } from './server-ops-database-agent-policy-store'
+import { formatServerOpsPostgresTable } from '@proma/shared'
 
 const temporaryDirectories: string[] = []
 
@@ -23,6 +24,15 @@ afterEach(() => {
 })
 
 describe('服务器运维数据库 Agent 禁用表 Store', () => {
+  test('Given PostgreSQL 同 schema 大小写不同的表 When 保存策略 Then 分别保留禁用身份', () => {
+    const store = createStore(createConfigDir())
+    const upper = formatServerOpsPostgresTable('public', 'Users')
+    const lower = formatServerOpsPostgresTable('public', 'users')
+    expect(store.set({ expectedRevision: 0, exclusions: [{ sourceId: 'pg-1', database: 'appdb', excludedTables: [upper, lower] }] }))
+      .toMatchObject({ exclusions: [{ excludedTables: [upper, lower] }] })
+    expect(store.get().exclusions[0]?.excludedTables).toEqual([upper, lower])
+  })
+
   test('Given 订阅者修改回执 When 保存 Then 后续订阅者与保存调用方仍得到权威副本', () => {
     /** 回调只能修改自己的投影，不能影响其它窗口或调用者。 */
     const store = createStore(createConfigDir())

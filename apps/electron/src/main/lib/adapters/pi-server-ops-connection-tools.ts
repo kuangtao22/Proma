@@ -9,7 +9,7 @@ export function buildServerOpsConnectionTools(
 ): ToolDefinition[] {
   return [sdk.defineTool({
     name: 'ops_connection_prepare', label: '准备运维连接草稿',
-    description: 'Prepare a new SSH, MySQL, Redis or remote SQLite connection draft for this user session. The Server Ops panel lets the user choose the project, enter credentials, test and save. Never request passwords, private keys or passphrases in chat. This only creates an expiring in-memory draft; it does not save a connection, connect, test, read credentials, change database data or grant Agent access. Use hostId only from known server evidence; otherwise let the user choose the SSH server in the panel. MySQL chooses its database after connecting, so do not provide database. A successful result is pending user review, not a completed connection.',
+    description: 'Prepare a new SSH, MySQL, PostgreSQL, Redis or remote SQLite connection draft for this user session. The Server Ops panel lets the user choose the project, enter credentials, test and save. Never request passwords, private keys or passphrases in chat. This only creates an expiring in-memory draft; it does not save a connection, connect, test, read credentials, change database data or grant Agent access. Use hostId only from known server evidence; otherwise let the user choose the SSH server in the panel. MySQL chooses its database after connecting, so do not provide database. PostgreSQL may provide its connection database and only supports disabled, required or verify TLS. A successful result is pending user review, not a completed connection.',
     parameters: Type.Union([
       Type.Object({
         kind: Type.Literal('ssh'), name: Type.String({ minLength: 1, maxLength: 64 }),
@@ -23,6 +23,15 @@ export function buildServerOpsConnectionTools(
         transport: Type.Union([Type.Literal('direct'), Type.Literal('ssh')]), hostId: Type.Optional(Type.String()),
         username: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
         tlsMode: Type.Optional(Type.Union([Type.Literal('disabled'), Type.Literal('preferred'), Type.Literal('required'), Type.Literal('verify')])),
+        tlsServerName: Type.Optional(Type.String({ minLength: 1, maxLength: 255 })),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal('postgresql'), label: Type.String({ minLength: 1, maxLength: 64 }),
+        address: Type.String({ minLength: 1, maxLength: 255 }), port: Type.Integer({ minimum: 1, maximum: 65535 }),
+        transport: Type.Union([Type.Literal('direct'), Type.Literal('ssh')]), hostId: Type.Optional(Type.String()),
+        username: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        database: Type.Optional(Type.String({ minLength: 1, maxLength: 63 })),
+        tlsMode: Type.Optional(Type.Union([Type.Literal('disabled'), Type.Literal('required'), Type.Literal('verify')])),
         tlsServerName: Type.Optional(Type.String({ minLength: 1, maxLength: 255 })),
       }, { additionalProperties: false }),
       Type.Object({

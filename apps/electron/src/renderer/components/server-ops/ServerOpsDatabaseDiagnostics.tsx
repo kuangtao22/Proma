@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { atom, useAtom } from 'jotai'
+import type { ServerOpsDataEngine } from '@proma/shared'
 import { RefreshCw, Search } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,6 +13,8 @@ import type { ServerOpsDiagnosticPage, ServerOpsDiagnosticsProjection } from './
 
 /** 数据库诊断正文属性；导航与日志入口由外层工作台持有。 */
 export interface ServerOpsDatabaseDiagnosticsProps {
+  /** 当前引擎决定诊断来源说明，避免 PostgreSQL 沿用 MySQL 专属承诺。 */
+  engine?: ServerOpsDataEngine
   projection: ServerOpsDiagnosticsProjection
   page: Exclude<ServerOpsDiagnosticPage, 'logs'>
   scope: 'instance' | 'database'
@@ -26,6 +29,7 @@ export interface ServerOpsDatabaseDiagnosticsProps {
  * @returns 不包含页面导航的诊断正文
  */
 export function ServerOpsDatabaseDiagnostics({
+  engine = 'mysql',
   projection,
   page,
   scope,
@@ -44,7 +48,13 @@ export function ServerOpsDatabaseDiagnostics({
   /** 参数搜索使用当前合法快照，避免等待选库时保留旧内容。 */
   const parameters = result?.parameters?.filter((entry) => entry.name.toLocaleLowerCase().includes(search.toLocaleLowerCase())) ?? []
   /** 页面说明描述数据来源及边界，不把累计摘要称作原始慢日志。 */
-  const description = page === 'statements'
+  const description = engine === 'postgresql' && page === 'statements'
+    ? '当前暂不支持 PostgreSQL 语句统计'
+    : engine === 'postgresql' && page === 'overview'
+      ? '实例快照 · 当前账号可见数据库与连接指标'
+      : engine === 'postgresql' && page === 'parameters'
+        ? '当前连接有效参数 · 固定只读项目'
+        : page === 'statements'
     ? scope === 'database'
       ? '按默认库归属筛选 · 累计 SQL 模板摘要 · 最多 20 条 · 非原始慢日志'
       : '全部数据库（含未归属） · 按默认库归属汇总 · 累计 SQL 模板摘要 · 最多 20 条 · 非原始慢日志'
@@ -116,7 +126,7 @@ export function ServerOpsDatabaseDiagnostics({
         <div className="min-h-0 flex-1 overflow-auto" data-server-ops-parameters>
           <table className={SERVER_OPS_TABLE_CLASS}>
             <thead className="sticky top-0 bg-content-area"><tr><th>参数名称</th><th>当前值</th><th>作用域</th></tr></thead>
-            <tbody>{parameters.map((entry) => <tr key={entry.name}><td className="whitespace-nowrap font-mono">{entry.name}</td><td className="max-w-[24rem] break-all font-mono">{entry.value === '' ? <span className="italic text-muted-foreground">空字符串</span> : entry.value}</td><td className="whitespace-nowrap text-muted-foreground">全局</td></tr>)}</tbody>
+            <tbody>{parameters.map((entry) => <tr key={entry.name}><td className="whitespace-nowrap font-mono">{entry.name}</td><td className="max-w-[24rem] break-all font-mono">{entry.value === '' ? <span className="italic text-muted-foreground">空字符串</span> : entry.value}</td><td className="whitespace-nowrap text-muted-foreground">{entry.scope === 'session' ? '当前连接' : '全局'}</td></tr>)}</tbody>
           </table>
           {state.status === 'ready' && !parameters.length ? <p className="p-6 text-center text-xs text-muted-foreground">{search ? '没有匹配的参数名称' : '没有可见参数'}</p> : null}
         </div>

@@ -4,6 +4,31 @@ import type { ServerOpsDataSourceRowsInput } from '@proma/shared'
 import { createServerOpsDataPreload } from './server-ops-data-preload'
 
 describe('Server Ops 数据服务 preload 边界', () => {
+  test('Given SQL 数据源快照 When 设置默认数据库 Then 使用独立通道并严格校验输入回执', async () => {
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const source = {
+      id: 'source-1', transport: 'direct' as const, engine: 'postgresql' as const, label: '分析库',
+      address: 'db.internal', port: 5432, database: 'postgres', username: 'analyst', tlsMode: 'required' as const,
+      hasPassword: true, createdAt: 1, updatedAt: 2,
+    }
+    const preload = createServerOpsDataPreload(async (channel, input) => {
+      calls.push({ channel, input })
+      return { source: { ...source, database: 'analytics', updatedAt: 3 } }
+    })
+    await expect(preload.setServerOpsDataSourceDefaultDatabase({ source, database: 'analytics' }))
+      .resolves.toHaveProperty('source.database', 'analytics')
+    expect(calls).toEqual([{
+      channel: SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE,
+      input: { source, database: 'analytics' },
+    }])
+    await expect(preload.setServerOpsDataSourceDefaultDatabase({ source, database: '', extra: true } as never))
+      .rejects.toThrow('SERVER_OPS_DATA_SOURCE_SET_DEFAULT_DATABASE_INPUT_INVALID')
+    expect(calls).toHaveLength(1)
+    const polluted = createServerOpsDataPreload(async () => ({ source: { ...source, database: 'analytics' }, extra: true }))
+    await expect(polluted.setServerOpsDataSourceDefaultDatabase({ source, database: 'analytics' }))
+      .rejects.toThrow('SERVER_OPS_DATA_SOURCE_UPSERT_RESULT_INVALID')
+  })
+
   test('Given 单格全文 When bridge 读取 Then 严格校验定位且保留正文换行', async () => {
     /** 记录真实桥接参数，避免新通道被错误接到预览 parser。 */
     const calls: Array<{ channel: string; input: unknown }> = []

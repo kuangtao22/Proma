@@ -1,3 +1,5 @@
+import { formatServerOpsPostgresTable } from './server-ops-postgresql-identifiers'
+
 /** 查询引用的源列或合法输出别名；`table` 保留 SQL 中的表名或别名限定符。 */
 export interface ServerOpsSqlColumnReference {
   table?: string
@@ -42,7 +44,7 @@ export interface ServerOpsSqlDiagnostic {
 }
 
 /** SQL 解析方言；省略时保持既有 MySQL 行为。 */
-export type ServerOpsSqlDialect = 'mysql' | 'sqlite'
+export type ServerOpsSqlDialect = 'mysql' | 'postgresql' | 'sqlite'
 
 type TokenKind = 'word' | 'quoted-identifier' | 'number' | 'string' | 'operator' | 'punctuation' | 'eof'
 
@@ -167,6 +169,7 @@ interface LimitClause {
 
 /** 内部 AST 只通过 WeakMap 关联公开 plan，不扩展跨模块合同字段。 */
 interface SelectStatement {
+  dialect: ServerOpsSqlDialect
   select: SelectItem[]
   from: TableReference
   joins: JoinClause[]
@@ -201,6 +204,12 @@ const SQLITE_SAFE_FUNCTIONS = new Set([
   'TRIM', 'LTRIM', 'RTRIM', 'REPLACE',
 ])
 
+/** PostgreSQL 只读查询开放的保守内置函数白名单。 */
+const POSTGRESQL_SAFE_FUNCTIONS = new Set([
+  'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ROUND', 'ABS', 'COALESCE', 'NULLIF',
+  'LOWER', 'UPPER', 'LENGTH', 'CHAR_LENGTH', 'SUBSTRING', 'NOW',
+])
+
 /** INTERVAL 只接受固定时间单位，不允许表达式或动态单位。 */
 const INTERVAL_UNITS = new Set([
   'MICROSECOND', 'SECOND', 'MINUTE', 'HOUR', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR',
@@ -227,6 +236,8 @@ const UNSUPPORTED_KEYWORDS = new Set([
 
 /** 永不允许读取的 MySQL 系统 schema。 */
 const SYSTEM_SCHEMAS = new Set(['information_schema', 'mysql', 'performance_schema', 'sys'])
+/** PostgreSQL 永不允许读取的系统 schema；`pg_` 前缀由服务端保留。 */
+const POSTGRESQL_SYSTEM_SCHEMAS = new Set(['information_schema'])
 
 /** 公开 plan 与已验证 AST 的进程内关联。 */
 const statementByPlan = new WeakMap<ServerOpsSqlQueryPlan, SelectStatement>()
@@ -338,7 +349,10 @@ function tokenize(sql: string, dialect: ServerOpsSqlDialect): Token[] {
     }
     if (character === '"' && dialect === 'mysql') fail('SERVER_OPS_SQL_STRING_MODE_UNSAFE', index, index + 1)
 
-    if (character === '`' || (dialect === 'sqlite' && (character === '"' || character === '['))) {
+    if (character === '`' && dialect === 'postgresql') fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', index, index + 1)
+    if (character === '[' && dialect === 'postgresql') fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', index, index + 1)
+    if (character === '`' || ((dialect === 'sqlite' || dialect === 'postgresql') && character === '"')
+      || (dialect === 'sqlite' && character === '[')) {
       const start = index
       /** 当前方言标识符的闭合字符。 */
       const closing = character === '[' ? ']' : character
@@ -362,7 +376,10 @@ function tokenize(sql: string, dialect: ServerOpsSqlDialect): Token[] {
         index += 1
       }
       if (!closed) fail('SERVER_OPS_SQL_UNCLOSED_IDENTIFIER', start, sql.length)
-      if (value.length === 0 || value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      if (value.length === 0 || value.length > 128
+        || (dialect === 'postgresql' && new TextEncoder().encode(value).byteLength > 63)) {
+        fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      }
       push({ kind: 'quoted-identifier', value, from: start, to: index })
       continue
     }
@@ -411,7 +428,9 @@ function tokenize(sql: string, dialect: ServerOpsSqlDialect): Token[] {
       index += 1
       while (isWordPart(sql[index] ?? '')) index += 1
       const value = sql.slice(start, index)
-      if (value.length > 128) fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      if (value.length > 128 || (dialect === 'postgresql' && new TextEncoder().encode(value).byteLength > 63)) {
+        fail('SERVER_OPS_SQL_INVALID_IDENTIFIER', start, index)
+      }
       push({ kind: 'word', value, from: start, to: index })
       continue
     }
@@ -496,7 +515,7 @@ class SqlParser {
 
     const where = this.consumeWord('WHERE') ? this.parseExpression() : undefined
     for (const item of select) {
-      if (item.alias !== undefined) this.projectionAliases.add(item.alias.toLowerCase())
+      if (item.alias !== undefined) this.projectionAliases.add(this.identifierKey(item.alias))
     }
     this.acceptsProjectionAlias = true
     const groupBy: SqlExpression[] = []
@@ -523,6 +542,7 @@ class SqlParser {
     this.validateColumnQualifiers()
     return {
       statement: {
+        dialect: this.dialect,
         select,
         from,
         joins,
@@ -588,9 +608,17 @@ class SqlParser {
       database = first
       tableToken = this.peek()
       table = this.parseIdentifier()
-      if (database !== this.database) fail('SERVER_OPS_SQL_CROSS_DATABASE', firstToken.from, tableToken.to)
+      if (this.dialect !== 'postgresql' && database !== this.database) {
+        fail('SERVER_OPS_SQL_CROSS_DATABASE', firstToken.from, tableToken.to)
+      }
+    } else if (this.dialect === 'postgresql') {
+      database = 'public'
     }
     if (this.dialect === 'mysql' && SYSTEM_SCHEMAS.has((database ?? this.database).toLowerCase())) {
+      fail('SERVER_OPS_SQL_SYSTEM_SCHEMA', firstToken.from, tableToken.to)
+    }
+    if (this.dialect === 'postgresql' && database !== undefined
+      && (POSTGRESQL_SYSTEM_SCHEMAS.has(database) || database.startsWith('pg_'))) {
       fail('SERVER_OPS_SQL_SYSTEM_SCHEMA', firstToken.from, tableToken.to)
     }
     let alias: string | undefined
@@ -617,7 +645,7 @@ class SqlParser {
     const qualifier = table.alias ?? table.table
     this.registerQualifier(
       qualifier,
-      table.table,
+      this.getSourceTable(table),
       table.aliasFrom ?? table.from,
       table.aliasTo ?? table.to,
     )
@@ -630,7 +658,7 @@ class SqlParser {
     from: number,
     to: number,
   ): void {
-    const key = qualifier.toLowerCase()
+    const key = this.identifierKey(qualifier)
     if (this.tableQualifiers.has(key)) fail('SERVER_OPS_SQL_DUPLICATE_TABLE_ALIAS', from, to)
     this.tableQualifiers.add(key)
     this.sourceTableByQualifier.set(key, sourceTable)
@@ -713,7 +741,7 @@ class SqlParser {
     if (this.consumeWord('TRUE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'TRUE' })
     if (this.consumeWord('FALSE')) return this.node({ kind: 'literal', literalKind: 'boolean', value: 'FALSE' })
     if (this.consumeWord('INTERVAL')) {
-      if (this.dialect === 'sqlite') this.failAtCurrent('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED', -1)
+      if (this.dialect !== 'mysql') this.failAtCurrent('SERVER_OPS_SQL_INTERVAL_UNSUPPORTED', -1)
       return this.parseInterval()
     }
     if (token.kind !== 'word' && token.kind !== 'quoted-identifier') this.failAtCurrent('SERVER_OPS_SQL_EXPECTED_EXPRESSION')
@@ -745,7 +773,9 @@ class SqlParser {
   private parseFunction(name: string, depth: number): SqlExpression {
     const normalizedName = name.toUpperCase()
     /** 当前方言使用独立白名单，防止同名或专属函数跨方言放行。 */
-    const safeFunctions = this.dialect === 'sqlite' ? SQLITE_SAFE_FUNCTIONS : MYSQL_SAFE_FUNCTIONS
+    const safeFunctions = this.dialect === 'sqlite'
+      ? SQLITE_SAFE_FUNCTIONS
+      : this.dialect === 'postgresql' ? POSTGRESQL_SAFE_FUNCTIONS : MYSQL_SAFE_FUNCTIONS
     if (!safeFunctions.has(normalizedName)) this.failAtCurrent('SERVER_OPS_SQL_FUNCTION_UNSUPPORTED', -1)
     this.expectPunctuation('(')
     const argumentsList: SqlExpression[] = []
@@ -779,6 +809,18 @@ class SqlParser {
       if (name === 'STRFTIME' && (count < 1 || count > 16)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
       if (['TRIM', 'LTRIM', 'RTRIM'].includes(name) && (count < 1 || count > 2)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
       if (name === 'REPLACE' && count !== 3) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      return
+    }
+    if (this.dialect === 'postgresql') {
+      if (name === 'NOW' && count !== 0) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['LOWER', 'UPPER', 'LENGTH', 'CHAR_LENGTH', 'ABS'].includes(name) && count !== 1) {
+        fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      }
+      if (name === 'NULLIF' && count !== 2) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'ROUND' && (count < 1 || count > 2)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'SUBSTRING' && (count < 2 || count > 3)) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(name) && count !== 1) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
+      if (name === 'COALESCE' && count < 1) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
       return
     }
     if ((name === 'NOW' || name === 'CURRENT_DATE') && count !== 0) fail('SERVER_OPS_SQL_FUNCTION_ARGUMENTS')
@@ -871,8 +913,8 @@ class SqlParser {
   private recordColumn(table: string | undefined, column: string, token: Token): void {
     if (column !== '*' && isServerOpsSqlSensitiveColumn(column)) fail('SERVER_OPS_SQL_SENSITIVE_COLUMN', token.from, token.to)
     /** 同名源列和输出别名分别记录，避免后出现的别名吞掉 WHERE/JOIN 校验。 */
-    const outputAlias = this.acceptsProjectionAlias && table === undefined && this.projectionAliases.has(column.toLowerCase())
-    const key = `${table?.toLowerCase() ?? ''}\u0000${column.toLowerCase()}\u0000${outputAlias}`
+    const outputAlias = this.acceptsProjectionAlias && table === undefined && this.projectionAliases.has(this.identifierKey(column))
+    const key = `${table === undefined ? '' : this.identifierKey(table)}\u0000${this.identifierKey(column)}\u0000${outputAlias}`
     if (this.columnReferenceKeys.has(key)) return
     this.columnReferenceKeys.add(key)
     this.columnReferences.push({
@@ -887,7 +929,7 @@ class SqlParser {
   /** 全部表解析完成后验证限定列只引用已声明表或别名。 */
   private validateColumnQualifiers(): void {
     for (const column of this.columnReferences) {
-      if (column.table !== undefined && !this.tableQualifiers.has(column.table.toLowerCase())) {
+      if (column.table !== undefined && !this.tableQualifiers.has(this.identifierKey(column.table))) {
         fail('SERVER_OPS_SQL_UNKNOWN_TABLE_ALIAS', column.from, column.to)
       }
     }
@@ -897,7 +939,7 @@ class SqlParser {
   private resolveColumnSources(): ServerOpsSqlColumnReference[] {
     return this.columnReferences.map((column) => {
       if (column.outputAlias === true || column.table === undefined) return column
-      const sourceTable = this.sourceTableByQualifier.get(column.table.toLowerCase())
+      const sourceTable = this.sourceTableByQualifier.get(this.identifierKey(column.table))
       return sourceTable === undefined ? column : { ...column, sourceTable }
     })
   }
@@ -929,7 +971,19 @@ class SqlParser {
     const token = this.peek()
     if (token.kind !== 'word' && token.kind !== 'quoted-identifier') this.failAtCurrent('SERVER_OPS_SQL_INVALID_IDENTIFIER')
     this.index += 1
-    return token.value
+    return this.dialect === 'postgresql' && token.kind === 'word' ? token.value.toLowerCase() : token.value
+  }
+
+  /** PostgreSQL 已在解析时折叠裸标识符，比较时必须保留双引号名称的大小写。 */
+  private identifierKey(identifier: string): string {
+    return this.dialect === 'postgresql' ? identifier : identifier.toLowerCase()
+  }
+
+  /** 将 PostgreSQL 表来源转成跨策略层共享的 canonical 身份。 */
+  private getSourceTable(table: TableReference): string {
+    return this.dialect === 'postgresql'
+      ? formatServerOpsPostgresTable(table.database ?? 'public', table.table)
+      : table.table
   }
 
   /** 查看相对当前位置 token。 */
@@ -1013,8 +1067,9 @@ export function analyzeServerOpsSqlQuery(
     || typeof database !== 'string'
     || database.length === 0
     || database.length > 64
+    || (dialect === 'postgresql' && new TextEncoder().encode(database).byteLength > 63)
     || /[\u0000-\u001f\u007f]/u.test(database)
-    || (dialect !== 'mysql' && dialect !== 'sqlite')) {
+    || (dialect !== 'mysql' && dialect !== 'postgresql' && dialect !== 'sqlite')) {
     fail('SERVER_OPS_SQL_INVALID')
   }
   const parser = new SqlParser(tokenize(sql, dialect), database, dialect)
@@ -1066,23 +1121,30 @@ export function limitServerOpsSqlQuery(plan: ServerOpsSqlQueryPlan, maxRows: num
 
 /** 按首次出现顺序收集真实基础表，别名不进入授权集合。 */
 function collectTables(statement: SelectStatement): string[] {
-  const tables = [statement.from.table, ...statement.joins.map((join) => join.table.table)]
+  const identity = (table: TableReference): string => statement.dialect === 'postgresql'
+    ? formatServerOpsPostgresTable(table.database ?? 'public', table.table)
+    : table.table
+  const tables = [identity(statement.from), ...statement.joins.map((join) => identity(join.table))]
   return tables.filter((table, index) => tables.indexOf(table) === index)
 }
 
 /** 按 SQL 中出现顺序收集基础表、别名与源位置。 */
 function collectTableReferences(statement: SelectStatement): ServerOpsSqlTableReference[] {
   return [statement.from, ...statement.joins.map((join) => join.table)].map((table) => ({
-    table: table.table,
+    table: statement.dialect === 'postgresql'
+      ? formatServerOpsPostgresTable(table.database ?? 'public', table.table)
+      : table.table,
     ...(table.alias === undefined ? {} : { alias: table.alias }),
     from: table.from,
     to: table.to,
   }))
 }
 
-/** 两种方言都支持反引号，统一输出并将内部反引号双写。 */
-function renderIdentifier(identifier: string): string {
-  return `\`${identifier.replaceAll('`', '``')}\``
+/** 按已验证方言引用标识符。 */
+function renderIdentifier(identifier: string, dialect: ServerOpsSqlDialect): string {
+  return dialect === 'postgresql'
+    ? `"${identifier.replaceAll('"', '""')}"`
+    : `\`${identifier.replaceAll('`', '``')}\``
 }
 
 /** 字符串统一单引号输出，内部单引号双写。 */
@@ -1093,15 +1155,15 @@ function renderString(value: string): string {
 /** 渲染完整 SELECT；所有片段均来自已验证 AST。 */
 function renderStatement(statement: SelectStatement, redactLiterals = false): string {
   const parts = [
-    `SELECT ${statement.select.map((item) => renderSelectItem(item, redactLiterals)).join(', ')}`,
-    `FROM ${renderTable(statement.from)}`,
+    `SELECT ${statement.select.map((item) => renderSelectItem(item, statement.dialect, redactLiterals)).join(', ')}`,
+    `FROM ${renderTable(statement.from, statement.dialect)}`,
   ]
-  for (const join of statement.joins) parts.push(`${join.type} ${renderTable(join.table)} ON ${renderExpression(join.on, 0, redactLiterals)}`)
-  if (statement.where !== undefined) parts.push(`WHERE ${renderExpression(statement.where, 0, redactLiterals)}`)
-  if (statement.groupBy.length > 0) parts.push(`GROUP BY ${statement.groupBy.map((expression) => renderExpression(expression, 0, redactLiterals)).join(', ')}`)
-  if (statement.having !== undefined) parts.push(`HAVING ${renderExpression(statement.having, 0, redactLiterals)}`)
+  for (const join of statement.joins) parts.push(`${join.type} ${renderTable(join.table, statement.dialect)} ON ${renderExpression(join.on, statement.dialect, 0, redactLiterals)}`)
+  if (statement.where !== undefined) parts.push(`WHERE ${renderExpression(statement.where, statement.dialect, 0, redactLiterals)}`)
+  if (statement.groupBy.length > 0) parts.push(`GROUP BY ${statement.groupBy.map((expression) => renderExpression(expression, statement.dialect, 0, redactLiterals)).join(', ')}`)
+  if (statement.having !== undefined) parts.push(`HAVING ${renderExpression(statement.having, statement.dialect, 0, redactLiterals)}`)
   if (statement.orderBy.length > 0) {
-    parts.push(`ORDER BY ${statement.orderBy.map((item) => `${renderExpression(item.expression, 0, redactLiterals)}${item.direction === undefined ? '' : ` ${item.direction}`}`).join(', ')}`)
+    parts.push(`ORDER BY ${statement.orderBy.map((item) => `${renderExpression(item.expression, statement.dialect, 0, redactLiterals)}${item.direction === undefined ? '' : ` ${item.direction}`}`).join(', ')}`)
   }
   if (statement.limit !== undefined) {
     const count = redactLiterals ? '?' : String(statement.limit.count)
@@ -1112,17 +1174,17 @@ function renderStatement(statement: SelectStatement, redactLiterals = false): st
 }
 
 /** 渲染投影及别名。 */
-function renderSelectItem(item: SelectItem, redactLiterals: boolean): string {
-  const expression = renderExpression(item.expression, 0, redactLiterals)
-  return item.alias === undefined ? expression : `${expression} AS ${renderIdentifier(item.alias)}`
+function renderSelectItem(item: SelectItem, dialect: ServerOpsSqlDialect, redactLiterals: boolean): string {
+  const expression = renderExpression(item.expression, dialect, 0, redactLiterals)
+  return item.alias === undefined ? expression : `${expression} AS ${renderIdentifier(item.alias, dialect)}`
 }
 
 /** 渲染基础表及别名。 */
-function renderTable(table: TableReference): string {
+function renderTable(table: TableReference, dialect: ServerOpsSqlDialect): string {
   const qualified = table.database === undefined
-    ? renderIdentifier(table.table)
-    : `${renderIdentifier(table.database)}.${renderIdentifier(table.table)}`
-  return table.alias === undefined ? qualified : `${qualified} AS ${renderIdentifier(table.alias)}`
+    ? renderIdentifier(table.table, dialect)
+    : `${renderIdentifier(table.database, dialect)}.${renderIdentifier(table.table, dialect)}`
+  return table.alias === undefined ? qualified : `${qualified} AS ${renderIdentifier(table.alias, dialect)}`
 }
 
 /** 表达式运算符优先级，用于仅在必要时补括号。 */
@@ -1140,20 +1202,20 @@ function expressionPrecedence(expression: SqlExpression): number {
 }
 
 /** 递归渲染表达式，保证重建 SQL 仍遵守原 AST 优先级。 */
-function renderExpression(expression: SqlExpression, parentPrecedence = 0, redactLiterals = false): string {
+function renderExpression(expression: SqlExpression, dialect: ServerOpsSqlDialect, parentPrecedence = 0, redactLiterals = false): string {
   const precedence = expressionPrecedence(expression)
   let rendered: string
   switch (expression.kind) {
     case 'column':
       rendered = expression.table === undefined
-        ? renderIdentifier(expression.column)
-        : `${renderIdentifier(expression.table)}.${expression.column === '*' ? '*' : renderIdentifier(expression.column)}`
+        ? renderIdentifier(expression.column, dialect)
+        : `${renderIdentifier(expression.table, dialect)}.${expression.column === '*' ? '*' : renderIdentifier(expression.column, dialect)}`
       break
     case 'literal':
       rendered = redactLiterals ? '?' : expression.literalKind === 'string' ? renderString(expression.value) : expression.value
       break
     case 'function':
-      rendered = `${expression.name}(${expression.arguments.map((argument) => renderExpression(argument, 0, redactLiterals)).join(', ')})`
+      rendered = `${expression.name}(${expression.arguments.map((argument) => renderExpression(argument, dialect, 0, redactLiterals)).join(', ')})`
       break
     case 'wildcard':
       rendered = '*'
@@ -1163,26 +1225,26 @@ function renderExpression(expression: SqlExpression, parentPrecedence = 0, redac
       break
     case 'unary':
       rendered = expression.operator === 'NOT'
-        ? `NOT ${renderExpression(expression.operand, precedence, redactLiterals)}`
-        : `${expression.operator}${renderExpression(expression.operand, precedence, redactLiterals)}`
+        ? `NOT ${renderExpression(expression.operand, dialect, precedence, redactLiterals)}`
+        : `${expression.operator}${renderExpression(expression.operand, dialect, precedence, redactLiterals)}`
       break
     case 'binary':
-      rendered = `${renderExpression(expression.left, precedence, redactLiterals)} ${expression.operator} ${renderExpression(expression.right, precedence + 1, redactLiterals)}`
+      rendered = `${renderExpression(expression.left, dialect, precedence, redactLiterals)} ${expression.operator} ${renderExpression(expression.right, dialect, precedence + 1, redactLiterals)}`
       break
     case 'between':
-      rendered = `${renderExpression(expression.operand, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} BETWEEN ${renderExpression(expression.lower, precedence + 1, redactLiterals)} AND ${renderExpression(expression.upper, precedence + 1, redactLiterals)}`
+      rendered = `${renderExpression(expression.operand, dialect, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} BETWEEN ${renderExpression(expression.lower, dialect, precedence + 1, redactLiterals)} AND ${renderExpression(expression.upper, dialect, precedence + 1, redactLiterals)}`
       break
     case 'in':
-      rendered = `${renderExpression(expression.operand, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} IN (${expression.values.map((value) => renderExpression(value, 0, redactLiterals)).join(', ')})`
+      rendered = `${renderExpression(expression.operand, dialect, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} IN (${expression.values.map((value) => renderExpression(value, dialect, 0, redactLiterals)).join(', ')})`
       break
     case 'is-null':
-      rendered = `${renderExpression(expression.operand, precedence, redactLiterals)} IS${expression.negated ? ' NOT' : ''} NULL`
+      rendered = `${renderExpression(expression.operand, dialect, precedence, redactLiterals)} IS${expression.negated ? ' NOT' : ''} NULL`
       break
     case 'like':
-      rendered = `${renderExpression(expression.left, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} LIKE ${renderExpression(expression.right, precedence + 1, redactLiterals)}`
+      rendered = `${renderExpression(expression.left, dialect, precedence, redactLiterals)}${expression.negated ? ' NOT' : ''} LIKE ${renderExpression(expression.right, dialect, precedence + 1, redactLiterals)}`
       break
     case 'group':
-      rendered = `(${renderExpression(expression.expression, 0, redactLiterals)})`
+      rendered = `(${renderExpression(expression.expression, dialect, 0, redactLiterals)})`
       break
   }
   return precedence < parentPrecedence ? `(${rendered})` : rendered

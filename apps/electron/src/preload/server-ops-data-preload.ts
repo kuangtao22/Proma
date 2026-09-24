@@ -18,6 +18,7 @@ import {
   parseServerOpsDataSourcePasswordInput,
   parseServerOpsDataSourcePasswordResult,
   parseServerOpsDataSourceProbeInput,
+  parseServerOpsDataSourceSetDefaultDatabaseInput,
   parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceRowsResult,
   parseServerOpsDataSourceCellInput,
@@ -39,6 +40,7 @@ import type {
   ServerOpsDataSourcePasswordInput,
   ServerOpsDataSourcePasswordResult,
   ServerOpsDataSourceProbeInput,
+  ServerOpsDataSourceSetDefaultDatabaseInput,
   ServerOpsDataSourceRowsInput,
   ServerOpsDataSourceRowsResult,
   ServerOpsDataSourceCellInput,
@@ -71,6 +73,8 @@ export interface ServerOpsDataPreload {
   saveServerOpsDatabaseQueryHistory(input: ServerOpsDataQueryHistoryRecordInput): Promise<ServerOpsDataQueryHistoryResult>
   listServerOpsDataSources(input: ServerOpsDataSourceListInput): Promise<ServerOpsDataSourceListResult>
   upsertServerOpsDataSource(input: ServerOpsDataSourceUpsertInput): Promise<ServerOpsDataSourceUpsertResult>
+  /** 使用完整公开快照执行 CAS，只改变 SQL 数据源的默认数据库。 */
+  setServerOpsDataSourceDefaultDatabase(input: ServerOpsDataSourceSetDefaultDatabaseInput): Promise<ServerOpsDataSourceUpsertResult>
   deleteServerOpsDataSource(input: ServerOpsDataSourceDeleteInput): Promise<void>
   probeServerOpsDataSource(input: ServerOpsDataSourceProbeInput): Promise<ServerOpsDataProbeResult>
   diagnoseServerOpsDataSource(input: ServerOpsDataDiagnoseInput): Promise<ServerOpsDataDiagnosticsResult>
@@ -119,6 +123,12 @@ export function createServerOpsDataPreload(invoke: ServerOpsDataInvoke): ServerO
     ),
     upsertServerOpsDataSource: async (input) => parseServerOpsDataSourceUpsertResult(
       await invoke(SERVER_OPS_DATA_CHANNELS.UPSERT_SOURCE, parseServerOpsDataSourceUpsertInput(input)),
+    ),
+    setServerOpsDataSourceDefaultDatabase: async (input) => parseServerOpsDataSourceUpsertResult(
+      await invoke(
+        SERVER_OPS_DATA_CHANNELS.SET_DEFAULT_DATABASE,
+        parseServerOpsDataSourceSetDefaultDatabaseInput(input),
+      ),
     ),
     deleteServerOpsDataSource: async (input) => {
       /** 删除只接受空回执，携带结果说明协议被破坏。 */

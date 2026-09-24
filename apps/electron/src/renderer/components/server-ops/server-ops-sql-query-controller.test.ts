@@ -16,6 +16,25 @@ function result(queryId: string, database = 'app'): ServerOpsDataQueryResult {
 }
 
 describe('SQL 查询控制器', () => {
+  test('Given PostgreSQL 双引号 SQL When 执行 Then 使用当前方言调用 API且拒绝旧方言上下文', async () => {
+    /** 捕获真正到达后端的请求，避免仅验证编辑器高亮。 */
+    const calls: ServerOpsDataQueryInput[] = []
+    /** 方言是查询上下文的一部分，切换后旧事件不能执行。 */
+    const postgresContext = { sourceId: 'pg', database: 'app', configurationKey: 'v1', available: true, dialect: 'postgresql' as const }
+    const controller = createServerOpsSqlQueryController({
+      api: { query: async (input) => { calls.push(input); return result(input.queryId, input.database) }, cancel: async () => undefined },
+      publish: () => undefined,
+    })
+    controller.activate(); controller.setContext(postgresContext); controller.setDraft('SELECT "UserName" FROM "Users"')
+    await controller.execute(postgresContext)
+    expect(calls).toHaveLength(1)
+    expect(controller.snapshot().status).toBe('success')
+    controller.setContext({ ...postgresContext, dialect: 'mysql' })
+    expect(controller.snapshot().execution).toBeNull()
+    await controller.execute(postgresContext)
+    expect(calls).toHaveLength(1)
+    controller.dispose()
+  })
   test('Given 选库器已切换但控制器 effect 尚未同步 When 按新上下文执行 Then 不会查询旧库', async () => {
     /** 模拟 React 新 props 已渲染、passive effect 尚未调用 setContext 的窗口。 */
     const current = { sourceId: 'source-1', database: 'app', configurationKey: 'v1', available: true }

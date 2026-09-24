@@ -204,6 +204,45 @@ describe('SQLite 只读 SQL 方言', () => {
   })
 })
 
+describe('PostgreSQL 只读 SQL 方言', () => {
+  test('Given schema 同名表、双引号与未引号名称 When 分析 Then 使用 canonical 表身份并按 PG 语义重建', () => {
+    const plan = analyzeServerOpsSqlQuery(
+      'SELECT U."DisplayName", AU.id FROM "Tenant".users AS U JOIN audit.users AS AU ON AU.id = U.id WHERE U.state = \'active\' ORDER BY U.id LIMIT 20',
+      'appdb',
+      'postgresql',
+    )
+
+    expect(plan.tables).toEqual(['"Tenant"."users"', '"audit"."users"'])
+    expect(plan.tableReferences.map((reference) => reference.table)).toEqual(['"Tenant"."users"', '"audit"."users"'])
+    expect(plan.columns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ table: 'u', column: 'DisplayName', sourceTable: '"Tenant"."users"' }),
+      expect.objectContaining({ table: 'au', column: 'id', sourceTable: '"audit"."users"' }),
+    ]))
+    expect(plan.sql).toBe('SELECT "u"."DisplayName", "au"."id" FROM "Tenant"."users" AS "u" JOIN "audit"."users" AS "au" ON "au"."id" = "u"."id" WHERE "u"."state" = \'active\' ORDER BY "u"."id" LIMIT 20')
+  })
+
+  test('Given 未限定表 When 分析 Then 固定 public 且 fingerprint 与限行保留 PostgreSQL 方言', () => {
+    const plan = analyzeServerOpsSqlQuery("SELECT id FROM Users WHERE state = 'Active'", 'appdb', 'postgresql')
+    expect(plan.tables).toEqual(['"public"."users"'])
+    expect(plan.sql).toBe('SELECT "id" FROM "public"."users" WHERE "state" = \'Active\'')
+    expect(plan.fingerprint).toBe('SELECT "id" FROM "public"."users" WHERE "state" = ?')
+    expect(limitServerOpsSqlQuery(plan, 50)).toBe('SELECT "id" FROM "public"."users" WHERE "state" = \'Active\' LIMIT 51')
+  })
+
+  test('Given PostgreSQL 危险或跨方言 SQL When 分析 Then 保守拒绝', () => {
+    for (const sql of [
+      'SELECT `id` FROM users',
+      'SELECT [id] FROM users',
+      'SELECT IFNULL(name, \'\') FROM users',
+      'SELECT pg_sleep(1) FROM users',
+      'SELECT id FROM pg_catalog.pg_user',
+      'WITH x AS (SELECT id FROM users) SELECT id FROM x',
+      'SELECT id FROM (SELECT id FROM users) nested',
+      'UPDATE users SET name = \'changed\'',
+    ]) expect(() => analyzeServerOpsSqlQuery(sql, 'appdb', 'postgresql')).toThrow(/^SERVER_OPS_SQL_[A-Z_]+$/)
+  })
+})
+
 describe('MySQL 只读 SQL 诊断', () => {
   test('Given SELECT 缺少 FROM When 校验 Then 返回具体语法原因与 WHERE 位置', () => {
     const sql = 'SELECT * WHERE cbb_admin_account'

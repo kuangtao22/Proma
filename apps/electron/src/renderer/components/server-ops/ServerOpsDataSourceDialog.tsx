@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Eye, EyeOff, FileUp, LoaderCircle, PlugZap } from 'lucide-react'
+import { ChevronRight, Eye, EyeOff, FileUp, LoaderCircle, PlugZap } from 'lucide-react'
 import type {
   ServerOpsConnectionDraftInput,
   ServerOpsDataEngine,
@@ -12,6 +12,7 @@ import type {
 } from '@proma/shared'
 import { isServerOpsLocalSqliteFilePath, isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   Dialog,
   DialogContent,
@@ -36,7 +37,7 @@ import {
 } from './server-ops-data-display'
 
 /** 引擎到默认端口的映射，切换引擎时带入避免用户手填常见值。 */
-const DEFAULT_ENGINE_PORTS: Partial<Record<ServerOpsDataEngine, number>> = { mysql: 3306, redis: 6379 }
+const DEFAULT_ENGINE_PORTS: Partial<Record<ServerOpsDataEngine, number>> = { mysql: 3306, postgresql: 5432, redis: 6379 }
 
 /** Renderer 在提交阶段同步失效旧会话；SSR 静态测试使用普通 Effect 避免无意义警告。 */
 const useServerOpsDialogLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
@@ -53,7 +54,7 @@ export interface ServerOpsDataSourceDraft {
   port: string
   /** SQLite 在远端服务器上的绝对文件路径。 */
   filePath: string
-  /** 仅用于 Redis 逻辑库和 SQLite 固定 main；MySQL 连接后再选库。 */
+  /** MySQL 默认数据库、PostgreSQL 首次连接数据库、Redis 逻辑库和 SQLite 固定 main。 */
   database: string
   username: string
   password: string
@@ -87,7 +88,7 @@ export interface ServerOpsDataSourceFormErrors {
 export function createServerOpsDataSourceDraft(
   source: ServerOpsDataSource | null,
   initialEngine: ServerOpsDataEngine = 'mysql',
-  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null,
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'postgresql' | 'redis' | 'sqlite' }> | null,
 ): ServerOpsDataSourceDraft {
   /** 初始引擎。 */
   const engine = source?.engine ?? initialEngine
@@ -99,11 +100,11 @@ export function createServerOpsDataSourceDraft(
     address: source?.address ?? (engine === 'sqlite' ? '' : '127.0.0.1'),
     port: source?.port === undefined ? String(DEFAULT_ENGINE_PORTS[engine] ?? '') : String(source.port),
     filePath: source?.filePath ?? '',
-    database: engine === 'sqlite' ? 'main' : engine === 'redis' ? source?.database ?? '' : '',
+    database: engine === 'sqlite' ? 'main' : source?.database ?? (engine === 'postgresql' ? 'postgres' : ''),
     username: source?.username ?? '',
     password: '',
     clearPassword: false,
-    tlsMode: source?.tlsMode ?? (engine === 'mysql' ? 'preferred' : 'disabled'),
+    tlsMode: source?.tlsMode ?? (engine === 'mysql' ? 'preferred' : engine === 'postgresql' ? 'required' : 'disabled'),
     tlsServerName: source?.tlsServerName ?? (source?.tlsMode === 'verify' ? source.address ?? '' : ''),
   }
   if (source || !initialDraft) return base
@@ -117,8 +118,8 @@ export function createServerOpsDataSourceDraft(
       address: initialDraft.address,
       port: String(initialDraft.port),
       username: initialDraft.username ?? '',
-      database: initialDraft.kind === 'redis' ? initialDraft.database ?? '' : '',
-      tlsMode: initialDraft.tlsMode ?? (initialDraft.kind === 'mysql' ? 'preferred' : 'disabled'),
+      database: initialDraft.kind === 'postgresql' ? initialDraft.database ?? 'postgres' : initialDraft.kind === 'redis' ? initialDraft.database ?? '' : '',
+      tlsMode: initialDraft.tlsMode ?? (initialDraft.kind === 'mysql' ? 'preferred' : initialDraft.kind === 'postgresql' ? 'required' : 'disabled'),
       tlsServerName: initialDraft.tlsServerName ?? '',
     }),
   }
@@ -147,8 +148,9 @@ export function applyServerOpsDataSourceEngineChange(
       address: draft.engine === 'sqlite' ? '127.0.0.1' : draft.address,
       port: String(DEFAULT_ENGINE_PORTS[engine]),
       filePath: '',
-      database: '',
-      ...(engine === 'redis' && draft.tlsMode === 'preferred' ? { tlsMode: 'required' as const } : {}),
+      database: engine === 'postgresql' ? 'postgres' : '',
+      ...((engine === 'redis' || engine === 'postgresql') && draft.tlsMode === 'preferred' ? { tlsMode: 'required' as const } : {}),
+      ...(engine === 'postgresql' && draft.engine === 'sqlite' ? { tlsMode: 'required' as const } : {}),
       ...(engine === 'mysql' && draft.engine === 'sqlite' ? { tlsMode: 'preferred' as const } : {}),
     }),
   }
@@ -164,8 +166,8 @@ export function getServerOpsDataConnectionModeEngines(
   mode: ServerOpsDataConnectionMode,
 ): readonly ServerOpsDataEngine[] {
   if (mode === 'local-sqlite') return ['sqlite']
-  if (mode === 'ssh') return ['mysql', 'redis', 'sqlite']
-  return ['mysql', 'redis']
+  if (mode === 'ssh') return ['mysql', 'postgresql', 'redis', 'sqlite']
+  return ['mysql', 'postgresql', 'redis']
 }
 
 /** 切换表单连接方式；只转换既有 engine/transport 字段，不扩展后端枚举。 */
@@ -266,14 +268,21 @@ export function validateServerOpsDataSourceDraft(draft: ServerOpsDataSourceDraft
       errors.database = 'Redis 逻辑库必须是 0 到 15 之间的数字'
     }
   }
-  if (draft.engine === 'redis' && draft.tlsMode === 'preferred') {
-    errors.tlsMode = 'Redis 不支持优先 TLS 协商，请选择必须 TLS 或校验证书'
+  if ((draft.engine === 'redis' || draft.engine === 'postgresql') && draft.tlsMode === 'preferred') {
+    errors.tlsMode = `${draft.engine === 'postgresql' ? 'PostgreSQL' : 'Redis'} 不支持优先 TLS 协商，请选择必须 TLS 或校验证书`
+  }
+  if (draft.engine === 'postgresql' && (new TextEncoder().encode(draft.database.trim()).length > 63
+    || /[\u0000-\u001f\u007f]/u.test(draft.database))) {
+    errors.database = '首次连接数据库最多 63 个 UTF-8 字节，不能包含控制字符；可在高级选项中修改'
+  }
+  if (draft.engine === 'mysql' && (draft.database.trim().length > 64 || /\p{Cc}/u.test(draft.database))) {
+    errors.database = '默认数据库最多 64 个字符，不能包含控制字符；可在高级选项中修改'
   }
   if (draft.tlsMode === 'verify'
     && ((draft.tlsServerName.trim() || draft.address.trim()).length > 255 || /\s/u.test(draft.tlsServerName.trim() || draft.address.trim()))) {
     errors.tlsServerName = '证书主机名不能超过 255 个字符或包含空白'
   }
-  if (draft.engine === 'mysql' && draft.tlsMode === 'verify' && errors.tlsServerName === undefined
+  if ((draft.engine === 'mysql' || draft.engine === 'postgresql') && draft.tlsMode === 'verify' && errors.tlsServerName === undefined
     && !isServerOpsMySqlTlsServerName(draft.tlsServerName.trim() || draft.address.trim())) {
     errors.tlsServerName = '请填写证书中的 DNS 主机名；数据库地址仍可使用 IP'
   }
@@ -336,7 +345,7 @@ export function buildServerOpsDataSourceProbeDraft(options: {
     engine: draft.engine,
     address: draft.address.trim(),
     port,
-    ...(draft.engine === 'redis' && draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
+    ...(draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
     ...(draft.username.trim() === '' ? {} : { username: draft.username.trim() }),
     ...(usesInlinePassword ? { password: draft.password } : {}),
     ...(reusesSavedPassword ? { savedSourceId: source!.id } : {}),
@@ -387,7 +396,8 @@ export function buildServerOpsDataSourceUpsertInput(options: {
     label: draft.label,
     address: draft.address,
     port: Number(draft.port),
-    ...(draft.engine === 'redis' && draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
+    /** 默认库已回填到草稿；高级选项中的修改或清空与连接测试保持一致。 */
+    ...(draft.database.trim() !== '' ? { database: draft.database.trim() } : {}),
     ...(draft.username.trim() === '' ? {} : { username: draft.username.trim() }),
     ...(submitsPassword ? { password: draft.password } : {}),
     ...(draft.clearPassword ? { clearPassword: true } : {}),
@@ -479,7 +489,7 @@ export function ServerOpsDataSourceFields({
             <SelectTrigger id="server-ops-data-engine" aria-label="引擎"><SelectValue /></SelectTrigger>
             <SelectContent className="z-[280]">
               {getServerOpsDataConnectionModeEngines(connectionMode).map((engine) => (
-                <SelectItem key={engine} value={engine}>{engine === 'mysql' ? 'MySQL' : engine === 'redis' ? 'Redis' : 'SQLite'}</SelectItem>
+                <SelectItem key={engine} value={engine}>{engine === 'mysql' ? 'MySQL' : engine === 'postgresql' ? 'PostgreSQL' : engine === 'redis' ? 'Redis' : 'SQLite'}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -571,7 +581,7 @@ export function ServerOpsDataSourceFields({
             placeholder={draft.address ? `默认：${draft.address}` : 'db.internal'}
             onChange={(event) => onChange({ tlsServerName: event.target.value })}
           />
-          <p className="text-[11px] leading-5 text-muted-foreground">校验名默认跟随数据库地址，可按证书手动修改；不要填写 SSH 跳板地址。{draft.engine === 'mysql' ? 'MySQL 此处需填写证书中的 DNS 主机名。' : ''}</p>
+          <p className="text-[11px] leading-5 text-muted-foreground">校验名默认跟随数据库地址，可按证书手动修改；不要填写 SSH 跳板地址。{draft.engine === 'mysql' || draft.engine === 'postgresql' ? '此处需填写证书中的 DNS 主机名。' : ''}</p>
           {errors.tlsServerName ? <p className="text-[11px] text-destructive">{errors.tlsServerName}</p> : null}
         </div>
       ) : null}
@@ -594,7 +604,7 @@ export function ServerOpsDataSourceFields({
         <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
           <div className="grid min-w-0 gap-1.5">
             <Label htmlFor="server-ops-data-username">用户名</Label>
-            <Input id="server-ops-data-username" value={draft.username} placeholder="可选" onChange={(event) => onChange({ username: event.target.value })} />
+            <Input id="server-ops-data-username" value={draft.username} placeholder={draft.engine === 'postgresql' ? '默认 postgres' : '可选'} onChange={(event) => onChange({ username: event.target.value })} />
           </div>
           <div className="grid min-w-0 gap-1.5">
             <Label htmlFor="server-ops-data-password">密码</Label>
@@ -647,6 +657,32 @@ export function ServerOpsDataSourceFields({
           </div>
         </div>
       </div>
+      {draft.engine === 'mysql' || draft.engine === 'postgresql' ? (
+        <div className="grid gap-1.5">
+          {/* 新建时收起；已有自定义库展开显示，切换引擎时重置展开状态。 */}
+          <Collapsible key={draft.engine} defaultOpen={draft.database.trim() !== '' && (draft.engine === 'mysql' || draft.database.trim() !== 'postgres')}>
+            <CollapsibleTrigger className="group flex items-center gap-1 rounded-sm py-1 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40">
+              <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" aria-hidden="true" />
+              高级选项
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-2">
+              <div className="grid gap-1.5">
+                <Label htmlFor="server-ops-data-database">{draft.engine === 'mysql' ? '默认数据库（可选）' : '首次连接数据库（可选）'}</Label>
+                <Input
+                  id="server-ops-data-database"
+                  value={draft.database}
+                  placeholder={draft.engine === 'mysql' ? '连接后再选择' : 'postgres'}
+                  onChange={(event) => onChange({ database: event.target.value })}
+                />
+                <p className="text-[11px] text-muted-foreground">{draft.engine === 'mysql'
+                  ? '留空时连接后再选择数据库；之后切换数据库会更新此默认值。'
+                  : '留空使用 postgres；仅账号无法访问默认库时修改。连接后可切换数据库。'}</p>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+          {errors.database ? <p className="text-[11px] text-destructive">{errors.database}</p> : null}
+        </div>
+      ) : null}
       </>}
     </div>
   )
@@ -662,7 +698,7 @@ export interface ServerOpsDataSourceDialogProps {
   /** 新建时的初始引擎；由"添加数据库 / 添加 Redis"入口指定。 */
   initialEngine?: ServerOpsDataEngine
   /** Agent 草稿只包含公开字段，用户仍在原弹窗提供凭据并测试。 */
-  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'postgresql' | 'redis' | 'sqlite' }> | null
   hostId: string
   hostLabel: string
   /** 新建 SQLite 时列出当前项目全部服务器；编辑态只展示原宿主。 */
@@ -693,7 +729,7 @@ export interface ServerOpsDataSourceDialogControllerOptions {
   mode: 'create' | 'edit'
   source: ServerOpsDataSource | null
   initialEngine?: ServerOpsDataEngine
-  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'redis' | 'sqlite' }> | null
+  initialDraft?: Extract<ServerOpsConnectionDraftInput, { kind: 'mysql' | 'postgresql' | 'redis' | 'sqlite' }> | null
   hostId: string
   onTest?: (draft: ServerOpsDataSourceProbeDraft) => Promise<ServerOpsDataProbeResult>
   onRevealPassword?: (sourceId: string) => Promise<string | null>

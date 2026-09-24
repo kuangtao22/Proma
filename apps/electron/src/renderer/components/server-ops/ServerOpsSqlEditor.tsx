@@ -4,7 +4,7 @@ import { Decoration, EditorView, drawSelection, highlightActiveLine, keymap, lin
 import { bracketMatching, HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
-import { MySQL, SQLite, sql } from '@codemirror/lang-sql'
+import { MySQL, PostgreSQL, SQLite, sql } from '@codemirror/lang-sql'
 import { acceptCompletion, autocompletion, closeCompletion, closeBrackets, closeBracketsKeymap, startCompletion } from '@codemirror/autocomplete'
 import type { CompletionSource } from '@codemirror/autocomplete'
 import type { ServerOpsSqlEditorDiagnostic } from './server-ops-sql-validation'
@@ -123,7 +123,7 @@ export const ServerOpsSqlEditor = React.forwardRef<ServerOpsSqlEditorHandle, Ser
     const view = new EditorView({ parent, state: EditorState.create({
       doc: propsRef.current.value,
       extensions: [
-        sql({ dialect: propsRef.current.dialect === 'sqlite' ? SQLite : MySQL, upperCaseKeywords: true }),
+        sql({ dialect: propsRef.current.dialect === 'postgresql' ? PostgreSQL : propsRef.current.dialect === 'sqlite' ? SQLite : MySQL, upperCaseKeywords: true }),
         syntaxHighlighting(sqlHighlight),
         lineNumbers(), drawSelection(), highlightActiveLine(), bracketMatching(), closeBrackets(), history(),
         shortcuts, keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap]),
