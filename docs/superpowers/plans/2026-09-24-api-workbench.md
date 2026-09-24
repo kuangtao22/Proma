@@ -322,3 +322,5 @@ PROMA_ELECTRON_PATH=<Electron 二进制> bun run scripts/api-workbench-ui-smoke.
 - 隔离工作树里 `node_modules/electron` 没有下载 dist，跑真实 Electron 需复用主仓库已下载的二进制（`PROMA_ELECTRON_PATH=/Users/xutaoyu/CodeSource/GPL/Proma-git/apps/electron/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron`）；启动 GUI 进程在受限沙箱下会被 SIGABRT，须在沙箱外执行。
 - `bun run electron:build` 里的 `prepare:officecli` 会联网下载并校验 33MB 二进制；离线时把主仓库 `apps/electron/resources/officecli/officecli`（大小与 SHA-256 一致）复制过来即可跳过下载。原生 helper 编译若报 `~/.cache/clang/ModuleCache ... Operation not permitted`，用 `CLANG_MODULE_CACHE_PATH=/tmp/<dir> SWIFT_MODULECACHE_PATH=/tmp/<dir>` 重跑即可。
 - 界面 smoke 在 `executeJavaScript` 里执行 JS 字符串，`a && b ?? c` 这种 `&&` 与 `??` 混写是无括号语法错误（会报 `Unexpected token '??'`），必须加括号；Radix 弹层关闭后节点仍会短暂留在 DOM，判定「已关闭」要看 `[role=dialog]` 的 `data-state` 而不是节点是否存在。
+
+后续增量：**让 Agent 自己出题**（用例来源盖章、人写用例保护、审批卡用例差异）。现状核实、设计取舍与实施顺序见 `2026-09-24-api-workbench-agent-cases.md`；本轮 Agent 仍只能按已有 `caseId` 执行，不能创建或修改用例。
