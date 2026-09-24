@@ -254,8 +254,26 @@ jobs:
       - name: 测试稳定目录 helper
         run: bun test apps/electron/src/main/lib/stable-directory-native-host.test.ts apps/electron/scripts/build-stable-directory-native.test.ts
 
+      - name: 在真实 Electron 中验证运维项目创建
+        timeout-minutes: 5
+        run: bun test apps/electron/scripts/server-ops-project-smoke.test.ts
+
+      - name: 捕获 Electron 二进制路径
+        working-directory: apps/electron
+        shell: pwsh
+        run: |
+          $electronBinary = bun -e "console.log(require('electron'))"
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($electronBinary)) { throw '无法解析 Electron 可执行文件' }
+          "PROMA_FIRST_STARTUP_SMOKE_ELECTRON=$electronBinary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: 准备 Electron 打包资源
         run: bun run --filter='@proma/electron' package:prepare:win
+
+      - name: 首次与再次启动真实客户端回归
+        timeout-minutes: 5
+        env:
+          PROMA_FIRST_STARTUP_SMOKE_ELECTRON: ${{ env.PROMA_FIRST_STARTUP_SMOKE_ELECTRON }}
+        run: node apps/electron/scripts/first-startup-smoke.cjs
 
       - name: 打包 (Windows)
         env:

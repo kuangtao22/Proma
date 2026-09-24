@@ -2322,8 +2322,11 @@ export function registerIpcHandlers(): void {
     const contents = getStoredMainWindow()?.webContents
     return contents && !contents.isDestroyed() ? [contents] : []
   }
+  /** 首次启动先创建固定配置目录；后续事务仍校验普通目录并拒绝符号链接。 */
+  const serverOpsConfigDirectory = join(getConfigDir(), 'server-ops')
+  mkdirSync(serverOpsConfigDirectory, { recursive: true })
   /** 项目、主机与数据源共享同一配置事务，归属验证和空项目删除不会出现检查窗口。 */
-  const serverOpsConfigTransaction = createServerOpsConfigTransaction(join(getConfigDir(), 'server-ops'))
+  const serverOpsConfigTransaction = createServerOpsConfigTransaction(serverOpsConfigDirectory)
   /** 项目引用回调在 Store 完成装配后才执行，先声明两个资产 Store。 */
   let serverOpsHostStore: ServerOpsHostStore
   let serverOpsDataSourceStore: ServerOpsDataSourceStore

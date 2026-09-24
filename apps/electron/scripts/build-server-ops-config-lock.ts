@@ -2,7 +2,8 @@
 /** 构建跨平台 Server Ops 配置锁 N-API addon。 */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,45 +23,28 @@ const nodeGypRoot = process.platform === 'darwin'
 const nodeRoot = resolve(nodeGypRoot, nodeVersion)
 const nodeHeaders = resolve(nodeRoot, 'include/node')
 
-/** 为 Windows 批处理参数保留空格并拒绝引号逃逸。 */
-function quoteWindowsArgument(value: string): string {
-  return `"${value.replaceAll('"', '""')}"`
-}
-
-/** 在 Visual Studio 未进入 PATH 时定位开发者环境脚本。 */
-function findVisualStudioDeveloperCommand(): string {
-  const programFilesX86 = process.env['ProgramFiles(x86)']
-  if (!programFilesX86) throw new Error('ProgramFiles(x86) is unavailable')
-  const vswhere = resolve(programFilesX86, 'Microsoft Visual Studio/Installer/vswhere.exe')
-  if (!existsSync(vswhere)) throw new Error(`vswhere.exe not found: ${vswhere}`)
-  const installationPath = execFileSync(vswhere, [
-    '-latest', '-products', '*',
-    '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
-    '-property', 'installationPath',
-  ], { encoding: 'utf8' }).trim()
-  const developerCommand = resolve(installationPath, 'Common7/Tools/VsDevCmd.bat')
-  if (!installationPath || !existsSync(developerCommand)) {
-    throw new Error('Visual Studio C++ developer command not found')
-  }
-  return developerCommand
-}
-
-/** 通过隔离批处理初始化 Visual Studio 环境并执行 cl。 */
-function compileWithVisualStudio(compilerArguments: string[]): void {
-  const commandDirectory = mkdtempSync(join(tmpdir(), 'proma-server-ops-lock-build-'))
-  const commandFile = join(commandDirectory, 'build.cmd')
-  const architecture = process.arch === 'arm64' ? 'arm64' : 'x64'
-  const command = [
-    '@echo off',
-    `call ${quoteWindowsArgument(findVisualStudioDeveloperCommand())} -no_logo -arch=${architecture} -host_arch=${architecture}`,
-    'if errorlevel 1 exit /b %errorlevel%',
-    `cl ${compilerArguments.map(quoteWindowsArgument).join(' ')}`,
-  ].join('\r\n')
+/**
+ * 通过现有 node-gyp 构建 Windows addon，并将结果复制到固定资源路径。
+ *
+ * 无入参或返回值；复用当前 Node 头文件与 Node-API 8，由 node-gyp 注入
+ * win_delay_load_hook、delayimp 和延迟导入，使 Node API 解析到 Electron/Proma 宿主。
+ */
+function buildWindowsAddon(): void {
+  /** 编译中间文件仅落在临时目录，避免多个构建相互覆盖。 */
+  const buildDirectory = mkdtempSync(join(tmpdir(), 'proma-server-ops-lock-build-'))
+  /** 从仓库现有依赖解析构建工具，不下载或新增依赖。 */
+  const require = createRequire(import.meta.url)
   try {
-    writeFileSync(commandFile, `${command}\r\n`, 'utf8')
-    execFileSync('cmd.exe', ['/d', '/c', commandFile], { stdio: 'inherit' })
+    copyFileSync(source, join(buildDirectory, 'server-ops-config-lock-addon.cc'))
+    copyFileSync(resolve(dirname(source), 'binding.gyp'), join(buildDirectory, 'binding.gyp'))
+    execFileSync('node', [
+      require.resolve('node-gyp/bin/node-gyp.js'), 'rebuild',
+      // 下载缓存按架构保存 node.lib；--nodedir 则假定为 Node 源码的 Release/node.lib。
+      `--directory=${buildDirectory}`, `--devdir=${nodeGypRoot}`, `--target=${nodeVersion}`, `--arch=${process.arch}`,
+    ], { stdio: 'inherit' })
+    copyFileSync(join(buildDirectory, 'build/Release/server-ops-config-lock.node'), output)
   } finally {
-    rmSync(commandDirectory, { recursive: true, force: true })
+    rmSync(buildDirectory, { recursive: true, force: true })
   }
 }
 
@@ -87,16 +71,7 @@ if (process.platform === 'darwin') {
 } else if (process.platform === 'win32') {
   const nodeLibrary = resolve(nodeRoot, process.arch === 'arm64' ? 'arm64' : 'x64', 'node.lib')
   if (!existsSync(nodeLibrary)) throw new Error(`Node import library not found: ${nodeLibrary}`)
-  const compilerArguments = [
-    '/nologo', '/O2', '/std:c++17', '/EHsc', '/W4', '/LD', `/I${nodeHeaders}`,
-    source, nodeLibrary, `/Fe:${output}`,
-  ]
-  try {
-    execFileSync('cl', compilerArguments, { stdio: 'inherit' })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    compileWithVisualStudio(compilerArguments)
-  }
+  buildWindowsAddon()
 } else {
   throw new Error(`Unsupported config lock platform: ${process.platform}`)
 }

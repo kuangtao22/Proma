@@ -819,16 +819,17 @@ describe('stable directory native host', () => {
       '}',
     ].join('\n'), 'utf8')
     try {
+      // 冷编译沿用原生 helper 的 120 秒预算；分类程序执行仍单独限制为 5 秒。
       if (process.platform === 'darwin') {
-        execFileSync('xcrun', ['clang++', '-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output])
+        execFileSync('xcrun', ['clang++', '-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output], { timeout: 120_000 })
       } else {
-        execFileSync(process.env.CXX || 'g++', ['-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output])
+        execFileSync(process.env.CXX || 'g++', ['-std=c++17', '-Wall', '-Wextra', contractSource, '-o', output], { timeout: 120_000 })
       }
-      execFileSync(output)
+      execFileSync(output, [], { timeout: 5_000 })
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
-  })
+  }, 150_000)
 
   test('Given fdopendir 接管 duplicated fd When 检查失败路径 Then 成功前仍由 UniqueFd 持有', () => {
     const source = readFileSync(resolve(appDir, 'native/stable-directory/stable-directory-helper.cc'), 'utf8')

@@ -221,17 +221,6 @@ describe('server-ops config native lock', () => {
     expect(source).not.toContain('unlinkat(')
     expect(source).not.toContain('DeleteFile')
   })
-
-  test('Given Windows CI 未初始化 cl PATH When 检查构建脚本 Then 可通过 Visual Studio 开发者环境回退编译', () => {
-    const source = readFileSync(
-      resolve(import.meta.dir, '../../../../scripts/build-server-ops-config-lock.ts'),
-      'utf8',
-    )
-
-    expect(source).toContain('vswhere.exe')
-    expect(source).toContain('VsDevCmd.bat')
-    expect(source).toContain("execFileSync('cmd.exe'")
-  })
 })
 
 describe('Server Ops config transaction', () => {
