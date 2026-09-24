@@ -27,6 +27,15 @@ describe('接口工作台共享合同', () => {
     expect(parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [], source: 'agent' as const }] }).cases?.[0]?.source).toBe('agent')
   })
 
+  test('Given JSON 类型断言 When 解析草稿与用例 Then 类型名保留而未知断言仍被拒绝', () => {
+    const base = createApiRequestDraft()
+    const assertion = { id: 'type_1', kind: 'json-type' as const, path: 'data.id', expected: 'number' }
+
+    expect(parseApiRequestDraft({ ...base, assertions: [assertion] }).assertions[0]?.kind).toBe('json-type')
+    expect(parseApiRequestDraft({ ...base, cases: [{ id: 'case_1', name: 'a', assertions: [assertion] }] }).cases?.[0]?.assertions[0]?.kind).toBe('json-type')
+    expect(() => parseApiRequestDraft({ ...base, assertions: [{ ...assertion, kind: 'json-schema' }] })).toThrow()
+  })
+
   test('Given 用例身份重复、数量越界或含未知字段 When 解析 Then 明确拒绝', () => {
     const base = createApiRequestDraft()
 

@@ -128,4 +128,48 @@ describe('接口断言与脱敏', () => {
     expect(evaluated[0]?.passed).toBe(false)
     expect(evaluated[1]?.passed).toBe(true)
   })
+
+  test('Given JSON 类型断言 When 六种类型 Then 各自判对且大整数仍是 number', () => {
+    const types: ApiTransportResult = {
+      ...result,
+      body: { ...result.body, preview: '{"s":"a","n":900719925474099312345,"b":true,"o":{},"arr":[1],"nil":null,"f":1.5}' },
+    }
+    const evaluated = evaluateApiAssertions([
+      { id: 's', kind: 'json-type', path: 's', expected: 'string' },
+      { id: 'n', kind: 'json-type', path: 'n', expected: 'number' },
+      { id: 'b', kind: 'json-type', path: 'b', expected: 'boolean' },
+      { id: 'o', kind: 'json-type', path: 'o', expected: 'object' },
+      { id: 'arr', kind: 'json-type', path: 'arr', expected: 'array' },
+      { id: 'nil', kind: 'json-type', path: 'nil', expected: 'null' },
+      /** 大小写与空格要容错，浮点同样是 number。 */
+      { id: 'f', kind: 'json-type', path: 'f', expected: ' Number ' },
+    ], types)
+
+    expect(evaluated.map((entry) => `${entry.id}:${entry.passed}:${entry.actual}`)).toEqual([
+      's:true:string', 'n:true:number', 'b:true:boolean', 'o:true:object', 'arr:true:array', 'nil:true:null', 'f:true:number',
+    ])
+  })
+
+  test('Given 类型不符、路径不存在或期望类型非法 When 评估 Then 逐条失败且原因可读', () => {
+    const mismatch = evaluateApiAssertions([{ id: 'm', kind: 'json-type', path: 'token', expected: 'number' }], result)
+    const missing = evaluateApiAssertions([{ id: 'x', kind: 'json-type', path: 'data.id', expected: 'string' }], result)
+    const invalid = evaluateApiAssertions([{ id: 'i', kind: 'json-type', path: 'token', expected: '整数' }], result)
+
+    /** 实际值只暴露类型名，不回显正文取值。 */
+    expect(mismatch[0]).toMatchObject({ passed: false, actual: 'string', expected: 'number' })
+    expect(mismatch[0]?.message).toBe('断言失败')
+    expect(missing[0]).toMatchObject({ passed: false, actual: '' })
+    expect(missing[0]?.message).toContain('找不到该路径')
+    expect(invalid[0]?.passed).toBe(false)
+    expect(invalid[0]?.message).toContain('期望类型无效')
+  })
+
+  test('Given 正文被截断 When 判定 JSON 类型 Then 判无法验证而不是通过', () => {
+    const truncated: ApiTransportResult = { ...result, body: { ...result.body, previewTruncated: true } }
+
+    const [entry] = evaluateApiAssertions([{ id: 't', kind: 'json-type', path: 'token', expected: 'string' }], truncated)
+
+    expect(entry?.passed).toBe(false)
+    expect(entry?.message).toContain('无法验证断言')
+  })
 })

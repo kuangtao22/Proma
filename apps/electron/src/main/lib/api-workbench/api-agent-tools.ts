@@ -28,7 +28,7 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
     timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 300000 })), followRedirects: Type.Optional(Type.Boolean()), maxRedirects: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
     /** 自动 Cookie 只影响宿主内存，默认关闭；取值永远不会回到模型。 */
     useCookieJar: Type.Optional(Type.Boolean()),
-    assertions: Type.Optional(Type.Array(Type.Object({ id, kind: Type.Union(['status', 'header', 'json-value', 'json-exists', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'].map((item) => Type.Literal(item))), path: Type.String(), expected: Type.String() }, { additionalProperties: false }))),
+    assertions: Type.Optional(Type.Array(Type.Object({ id, kind: Type.Union(['status', 'header', 'json-value', 'json-exists', 'json-type', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'].map((item) => Type.Literal(item))), path: Type.String(), expected: Type.String() }, { additionalProperties: false }))),
     /**
      * 具名测试用例：整体替换语义，本次传来的数组就是保存后的完整用例集合。
      * 来源由 Host 盖章，模型不能声明 source；人工创建的用例不可被修改或删除。
@@ -36,7 +36,7 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
     cases: Type.Optional(Type.Array(Type.Object({
       id: caseId,
       name: Type.String({ minLength: 1, maxLength: 128 }),
-      assertions: Type.Array(Type.Object({ id, kind: Type.Union(['status', 'header', 'json-value', 'json-exists', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'].map((item) => Type.Literal(item))), path: Type.String(), expected: Type.String() }, { additionalProperties: false }), { maxItems: 64 }),
+      assertions: Type.Array(Type.Object({ id, kind: Type.Union(['status', 'header', 'json-value', 'json-exists', 'json-type', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'].map((item) => Type.Literal(item))), path: Type.String(), expected: Type.String() }, { additionalProperties: false }), { maxItems: 64 }),
       overrides: Type.Optional(Type.Array(field)),
       environmentId: Type.Optional(id),
     }, { additionalProperties: false }), { maxItems: 16 })),

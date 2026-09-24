@@ -53,3 +53,23 @@ export function apiJsonValueToText(value: unknown): string {
   if (typeof value === 'string') return value
   return JSON.stringify(value)
 }
+
+/** JSON 取值在断言里可比较的类型名。 */
+export type ApiJsonValueType = 'string' | 'number' | 'boolean' | 'object' | 'array' | 'null'
+
+/**
+ * 判定命中值的 JSON 类型。
+ *
+ * 必须走这里而不是直接用 `typeof`：读取器为了不改写大整数，会把 JSON 数字保留成带前缀标记的字符串，
+ * 直接判类型会把 `900719925474099312345` 误判成 string。
+ * @param value `readApiJsonPath` 返回的命中值。
+ * @returns 六种类型名之一。
+ */
+export function apiJsonValueType(value: unknown): ApiJsonValueType {
+  if (value === null) return 'null'
+  if (typeof value === 'string') return value.startsWith(NUMBER_PREFIX) ? 'number' : 'string'
+  if (typeof value === 'number') return 'number'
+  if (typeof value === 'boolean') return 'boolean'
+  if (Array.isArray(value)) return 'array'
+  return 'object'
+}

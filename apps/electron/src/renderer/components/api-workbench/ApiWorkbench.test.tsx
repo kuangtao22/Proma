@@ -209,4 +209,11 @@ describe('接口工作台 UI 集成', () => {
     expect(source).toContain("createLocalId('draft')")
     expect(source).not.toContain('mutateCatalog((latest) => upsertCatalogRequest(latest, run')
   })
+
+  test('Given 已交付 JSON 类型断言 When 检查组件源码 Then 下拉与期望占位都提示类型名', async () => {
+    const source = await Bun.file(new URL('./ApiWorkbench.tsx', import.meta.url)).text()
+
+    expect(source).toContain('<SelectItem value="json-type">JSON 类型</SelectItem>')
+    expect(source).toContain("assertion.kind === 'json-type' ? 'string/number/boolean/object/array/null'")
+  })
 })

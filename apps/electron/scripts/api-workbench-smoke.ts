@@ -298,6 +298,20 @@ async function smoke(): Promise<void> {
   assert.ok(mixedReport.includes('| Agent 补的缺参数 | Agent | 未执行 | — | 0/1 | — | 未执行 |'), mixedReport)
   assert.ok(mixedReport.includes('- 结果：1/1 通过'), mixedReport)
   /** 自动 Cookie：登录下发 cookie，开启自动 Cookie 的后续请求才带上它。 */
+  /** JSON 类型断言：类型对了才算通过，比较结果只暴露类型名。 */
+  const typedPrepared = await call('prepare', { sessionId: 'smoke-session', request: {
+    ...draft,
+    url: baseUrl + '/typed',
+    assertions: [
+      { id: 'json_number', kind: 'json-type' as const, path: 'id', expected: 'number' },
+      { id: 'json_string', kind: 'json-type' as const, path: 'id', expected: 'string' },
+    ],
+  } }) as ApiPreparedPreview
+  const typedRun = await call('send', { sessionId: 'smoke-session', preparedId: typedPrepared.preparedId }) as ApiRun
+  assert.equal(typedRun.state, 'completed')
+  assert.deepEqual(typedRun.assertions.map((item) => `${item.passed}:${item.expected}:${item.actual}`), ['true:number:number', 'false:string:number'])
+  /** 原响应里的 id 是 20 位大整数：断言结果只写类型名，不回显取值。 */
+  assert.equal(JSON.stringify(typedRun.assertions).includes('90071992547409931234'), false)
   const sessionDraft = { ...draft, url: baseUrl + '/session', useCookieJar: true }
   const sessionFirst = await call('prepare', { sessionId: 'smoke-session', request: sessionDraft }) as ApiPreparedPreview
   await call('send', { sessionId: 'smoke-session', preparedId: sessionFirst.preparedId })
@@ -327,9 +341,9 @@ async function smoke(): Promise<void> {
   const jarAfterClear = await call('getCookieJar', { sessionId: 'smoke-session' }) as { cookies: Array<{ name: string }> }
   assert.deepEqual(jarAfterClear.cookies.map((cookie) => cookie.name).sort(), ['sid', 'theme'])
   const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 14)
-  assert.equal(calls, 14)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'history'] }))
+  assert.equal(history.runs.length, 15)
+  assert.equal(calls, 15)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

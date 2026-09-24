@@ -1,5 +1,9 @@
 import type { ApiAssertion, ApiAssertionResult, ApiSseEvent, ApiTransportResult } from '@proma/shared'
-import { apiJsonValueToText, readApiJsonPath } from './api-json-path'
+import { apiJsonValueToText, apiJsonValueType, readApiJsonPath } from './api-json-path'
+import type { ApiJsonValueType } from './api-json-path'
+
+/** `json-type` 允许的期望类型名。 */
+const JSON_TYPES: readonly ApiJsonValueType[] = ['string', 'number', 'boolean', 'object', 'array', 'null']
 
 /** 事件流断言需要的上下文：明细不在传输结果里，必须由服务层传入。 */
 export interface ApiAssertionStreamContext {
@@ -40,6 +44,22 @@ export function evaluateApiAssertions(
     } else if (assertion.kind === 'duration') {
       actual = hop ? String(hop.timings.totalMs) : ''
       passed = hop ? durationPass(hop.timings.totalMs, assertion.expected) : false
+    } else if (assertion.kind === 'json-type') {
+      if (!result.body.complete || result.body.previewTruncated) {
+        /** 只看到一部分正文时不能对类型下结论：判「无法验证」，不判通过。 */
+        message = '正文不完整或超出预览范围，无法验证断言'
+      } else {
+        /** 期望类型只接受六种 JSON 类型名，其他写法直接判失败并说明。 */
+        const expected = assertion.expected.trim().toLowerCase()
+        if (!JSON_TYPES.includes(expected as ApiJsonValueType)) {
+          message = '期望类型无效，只能是 string/number/boolean/object/array/null'
+        } else {
+          const found = readApiJsonPath(result.body.preview, assertion.path)
+          actual = found.exists ? apiJsonValueType(found.value) : ''
+          passed = found.exists && actual === expected
+          if (!found.exists) message = '在正文 JSON 里找不到该路径'
+        }
+      }
     } else if (assertion.kind === 'sse-count' || assertion.kind === 'sse-first-event') {
       const numeric = assertion.kind === 'sse-count' ? result.sse?.totalEvents : result.sse?.firstEventMs
       if (!result.sse) message = notStream

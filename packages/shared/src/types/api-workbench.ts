@@ -94,7 +94,7 @@ export interface ApiRequestBody { kind: 'none' | 'json' | 'text' | 'urlencoded';
  */
 export interface ApiAssertion {
   id: string
-  kind: 'status' | 'header' | 'json-value' | 'json-exists' | 'duration' | 'sse-count' | 'sse-first-event' | 'sse-ended' | 'sse-last-data'
+  kind: 'status' | 'header' | 'json-value' | 'json-exists' | 'json-type' | 'duration' | 'sse-count' | 'sse-first-event' | 'sse-ended' | 'sse-last-data'
   path: string
   expected: string
 }
@@ -297,7 +297,7 @@ function assertion(value: unknown): ApiAssertion {
   const record = apiRecord(value, ['id', 'kind', 'path', 'expected'], 'assertion')
   return {
     id: parseApiId(record.id),
-    kind: choice(record.kind, ['status', 'header', 'json-value', 'json-exists', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'], 'assertion.kind'),
+    kind: choice(record.kind, ['status', 'header', 'json-value', 'json-exists', 'json-type', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'], 'assertion.kind'),
     path: text(record.path, 'assertion.path', 512), expected: text(record.expected, 'assertion.expected', 4096),
   }
 }
