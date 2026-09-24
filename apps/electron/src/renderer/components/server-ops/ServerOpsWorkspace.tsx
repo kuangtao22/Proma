@@ -196,6 +196,9 @@ export const serverOpsDataApi: ServerOpsDataPanelApi = {
   probeServerOpsDataSource: (input) => window.electronAPI.probeServerOpsDataSource(input),
   diagnoseServerOpsDataSource: (input) => window.electronAPI.diagnoseServerOpsDataSource(input),
   revealServerOpsDataSourcePassword: (input) => window.electronAPI.revealServerOpsDataSourcePassword(input),
+  /** 延迟读取可选接口：热更新遇到旧 preload 时保留 undefined，让「从本机查找凭据」入口自动隐藏。 */
+  get discoverServerOpsDataCredentials() { return window.electronAPI.discoverServerOpsDataCredentials },
+  get applyServerOpsDiscoveredCredential() { return window.electronAPI.applyServerOpsDiscoveredCredential },
   listServerOpsDataSchemaTables: (input) => window.electronAPI.listServerOpsDataSchemaTables(input),
   describeServerOpsDataSchemaTable: (input) => window.electronAPI.describeServerOpsDataSchemaTable(input),
   readServerOpsDataSchemaRows: (input) => window.electronAPI.readServerOpsDataSchemaRows(input),
@@ -2353,6 +2356,10 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
         submitting={savingDataSource}
         error={dataSourceFormError}
         onTest={(draft) => serverOpsDataApi.probeServerOpsDataSource({ draft })}
+        onDiscoverCredentials={serverOpsDataApi.discoverServerOpsDataCredentials === undefined
+          ? undefined : (input) => serverOpsDataApi.discoverServerOpsDataCredentials!(input)}
+        onApplyDiscoveredCredential={serverOpsDataApi.applyServerOpsDiscoveredCredential === undefined
+          ? undefined : (input) => serverOpsDataApi.applyServerOpsDiscoveredCredential!(input)}
         onSubmit={(input) => { void handleCreateDataSource(input) }}
         onClose={() => { setCreatingDataSourceEngine(null); setDataSourceFormError(null); setActiveConnectionDraft(null) }}
       />

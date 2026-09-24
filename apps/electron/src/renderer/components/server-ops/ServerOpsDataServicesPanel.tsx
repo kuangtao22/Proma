@@ -12,6 +12,8 @@ import {
 } from 'lucide-react'
 import type {
   ServerOpsDataCapability,
+  ServerOpsDataCredentialDiscoveryInput,
+  ServerOpsDataCredentialDiscoveryResult,
   ServerOpsDataDiagnoseInput,
   ServerOpsDataDiagnosticsResult,
   ServerOpsDataProbeResult,
@@ -21,6 +23,8 @@ import type {
   ServerOpsDataSourceListResult,
   ServerOpsDataSourcePasswordInput,
   ServerOpsDataSourcePasswordResult,
+  ServerOpsDiscoveredCredentialApplyInput,
+  ServerOpsDiscoveredCredentialApplyResult,
   ServerOpsDataSourceCellInput,
   ServerOpsDataSourceCellResult,
   ServerOpsDataSourceProbeDraft,
@@ -83,6 +87,10 @@ export interface ServerOpsDataPanelApi {
   diagnoseServerOpsDataSource(input: ServerOpsDataDiagnoseInput): Promise<ServerOpsDataDiagnosticsResult>
   /** 读取已保存密码明文；只在用户点"显示密码"时调用。 */
   revealServerOpsDataSourcePassword(input: ServerOpsDataSourcePasswordInput): Promise<ServerOpsDataSourcePasswordResult>
+  /** 在本机发现可用的数据源凭据；只对回环地址开放，结果不含口令值。 */
+  discoverServerOpsDataCredentials?(input: ServerOpsDataCredentialDiscoveryInput): Promise<ServerOpsDataCredentialDiscoveryResult>
+  /** 取回用户点选的候选凭据；只填草稿，不落盘。 */
+  applyServerOpsDiscoveredCredential?(input: ServerOpsDiscoveredCredentialApplyInput): Promise<ServerOpsDiscoveredCredentialApplyResult>
   /** 表浏览：库与表清单。 */
   listServerOpsDataSchemaTables(input: ServerOpsDataSourceTablesInput): Promise<ServerOpsDataSourceTablesResult>
   /** 表浏览：单表结构。 */
@@ -785,6 +793,10 @@ export interface ServerOpsDataServicesPanelViewProps {
   onTestDraft: (draft: ServerOpsDataSourceProbeDraft) => Promise<ServerOpsDataProbeResult>
   /** 读取已保存的密码明文；只在用户点"显示密码"时调用。 */
   onRevealSourcePassword: (sourceId: string) => Promise<string | null>
+  /** 在本机发现凭据；旧客户端缺少对应方法时不渲染入口。 */
+  onDiscoverCredentials?: (input: ServerOpsDataCredentialDiscoveryInput) => Promise<ServerOpsDataCredentialDiscoveryResult>
+  /** 取回并填入点选的候选凭据。 */
+  onApplyDiscoveredCredential?: (input: ServerOpsDiscoveredCredentialApplyInput) => Promise<ServerOpsDiscoveredCredentialApplyResult>
   /** 只读诊断当前分区（统计 / 数据表）。 */
   diagnosticsTab: ServerOpsDataDiagnosticsTab
   onDiagnosticsTabChange: (tab: ServerOpsDataDiagnosticsTab) => void
@@ -814,6 +826,8 @@ export function ServerOpsDataServicesPanelView({
   onProbe,
   onTestDraft,
   onRevealSourcePassword,
+  onDiscoverCredentials,
+  onApplyDiscoveredCredential,
   diagnosticsTab,
   onDiagnosticsTabChange,
   focusSourceActions,
@@ -1031,6 +1045,8 @@ export function ServerOpsDataServicesPanelView({
         error={projection.dialogError}
         onTest={onTestDraft}
         onRevealPassword={onRevealSourcePassword}
+        onDiscoverCredentials={onDiscoverCredentials}
+        onApplyDiscoveredCredential={onApplyDiscoveredCredential}
         onSubmit={onSubmit}
         onClose={onCloseDialog}
       />
@@ -1161,6 +1177,14 @@ export function ServerOpsDataServicesPanel({
       onProbe={(source) => controller.probe(source)}
       onTestDraft={(draft) => api.probeServerOpsDataSource({ draft })}
       onRevealSourcePassword={async (sourceId) => (await api.revealServerOpsDataSourcePassword({ sourceId })).password}
+      /*
+        延迟读取可选接口：热更新遇到旧 preload 时保持 undefined，
+        界面据此隐藏「从本机查找凭据」入口，而不是点了再报错。
+      */
+      onDiscoverCredentials={api.discoverServerOpsDataCredentials === undefined
+        ? undefined : (input) => api.discoverServerOpsDataCredentials!(input)}
+      onApplyDiscoveredCredential={api.applyServerOpsDiscoveredCredential === undefined
+        ? undefined : (input) => api.applyServerOpsDiscoveredCredential!(input)}
       diagnosticsTab={diagnosticsTab}
       onDiagnosticsTabChange={setDiagnosticsTab}
       /*

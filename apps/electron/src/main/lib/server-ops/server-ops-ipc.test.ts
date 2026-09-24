@@ -1369,7 +1369,8 @@ describe('服务器运维 IPC', () => {
       'unsubscribe-connection-output',
       'unsubscribe-connection-state',
     ])
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(79)
+    /** 数量随 SERVER_OPS_* 通道常量增长：新增通道必须同步这里。 */
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(81)
   })
 
   test('dispose 中首个 unsubscribe 失败仍解绑 closed listener、释放 owner 和全部 handler', async () => {
@@ -1388,7 +1389,8 @@ describe('服务器运维 IPC', () => {
     expect(cleanup).toContain('unsubscribe-log-exit')
     expect(cleanup).toContain('remove-closed')
     expect(cleanup).toContain('dispose-owner:window:7')
-    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(79)
+    /** 与上一处保持同一口径：新增 IPC 通道后两处都要更新。 */
+    expect(cleanup.filter((entry) => entry.startsWith('remove-handler:'))).toHaveLength(81)
     expect(handlers.size).toBe(0)
     expect(() => registration.dispose()).not.toThrow()
     expect(cleanup).toEqual(afterFirstDispose)

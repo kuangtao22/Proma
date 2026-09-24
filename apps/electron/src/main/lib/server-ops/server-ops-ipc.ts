@@ -68,6 +68,10 @@ import {
   parseServerOpsDataSourceDeleteInput,
   parseServerOpsDataSourcePasswordInput,
   parseServerOpsDataSourcePasswordResult,
+  parseServerOpsDataCredentialDiscoveryInput,
+  parseServerOpsDataCredentialDiscoveryResult,
+  parseServerOpsDiscoveredCredentialApplyInput,
+  parseServerOpsDiscoveredCredentialApplyResult,
   parseServerOpsDataSourceProbeInput,
   parseServerOpsDataSourceRowsInput,
   parseServerOpsDataSourceRowsResult,
@@ -284,7 +288,8 @@ export interface ServerOpsIpcOptions {
   transfers?: Pick<ServerOpsFileTransferService, 'start' | 'list' | 'cancel' | 'closeOwner'>
   fileLeases?: Pick<ServerOpsLocalFileLeaseRegistry, 'selectUpload' | 'selectDownload' | 'release' | 'closeOwner'>
   data?: Pick<ServerOpsDataService, 'listSources' | 'upsertSource' | 'deleteSource' | 'probeSource' | 'diagnoseSource' | 'revealSourcePassword' | 'listSchemaTables' | 'describeSchemaTable' | 'readSchemaRows' | 'removeHost'>
-    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'setDefaultDatabase' | 'querySource' | 'readSchemaCell' | 'getReadCredentialVersion'>>
+    & Partial<Pick<ServerOpsDataService, 'moveSource' | 'setDefaultDatabase' | 'querySource' | 'readSchemaCell' | 'getReadCredentialVersion'
+      | 'discoverCredentials' | 'applyDiscoveredCredential'>>
   /** 本地 SQL 查询历史；不经过数据库 runtime、Agent 或审计。 */
   queryHistory?: Pick<ServerOpsDataQueryHistoryStore, 'list' | 'save'>
   /** 运维项目：侧栏分组与连接归属的边界。 */
@@ -653,6 +658,23 @@ export function registerServerOpsIpcHandlers(options: ServerOpsIpcOptions): Serv
     const parsed = parseServerOpsDataSourcePasswordInput(input)
     if (!options.data) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
     return parseServerOpsDataSourcePasswordResult(options.data.revealSourcePassword(parsed))
+  })
+  /**
+   * 本机凭据发现：只读本机容器运行时，不落盘、不写审计，也不需要先有数据源记录。
+   *
+   * 旧客户端没有这两个方法时返回稳定错误码，界面据此隐藏入口而不是显示一个点了必然报错的按钮。
+   */
+  installHandler(SERVER_OPS_DATA_CHANNELS.DISCOVER_SOURCE_CREDENTIALS, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDataCredentialDiscoveryInput(input)
+    if (!options.data?.discoverCredentials) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDataCredentialDiscoveryResult(await options.data.discoverCredentials(parsed))
+  })
+  installHandler(SERVER_OPS_DATA_CHANNELS.APPLY_DISCOVERED_CREDENTIAL, async (event, input) => {
+    assertAuthorizedSender(event, options)
+    const parsed = parseServerOpsDiscoveredCredentialApplyInput(input)
+    if (!options.data?.applyDiscoveredCredential) throw new Error('SERVER_OPS_DATA_UNAVAILABLE')
+    return parseServerOpsDiscoveredCredentialApplyResult(await options.data.applyDiscoveredCredential(parsed))
   })
   /** 表浏览通道一律只读，标识符由 runtime 先过引擎元数据白名单。 */
   installHandler(SERVER_OPS_DATA_SCHEMA_CHANNELS.LIST_TABLES, async (event, input) => {

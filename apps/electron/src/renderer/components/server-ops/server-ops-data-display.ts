@@ -31,6 +31,9 @@ const SERVER_OPS_DATA_ERROR_MESSAGES: ReadonlyArray<{ match: string; text: strin
   { match: 'SERVER_OPS_SECURE_STORAGE_UNAVAILABLE', text: '当前系统无法安全保存密码' },
   { match: 'SERVER_OPS_SAFE_STORAGE_NOT_INJECTED', text: '当前客户端未接入系统密钥库，请重启客户端后再试' },
   { match: 'SERVER_OPS_DATA_CREDENTIAL_CORRUPTED', text: '保存的密码无法解密，请重新输入' },
+  /* 本机凭据发现：候选失效与地址不支持都要给出下一步，而不是落进兜底文案。 */
+  { match: 'SERVER_OPS_DATA_CREDENTIAL_CANDIDATE_NOT_FOUND', text: '候选凭据已失效，请重新查找' },
+  { match: 'SERVER_OPS_DATA_CREDENTIAL_ADDRESS_UNSUPPORTED', text: '只有本机回环地址可以从容器读取凭据' },
   { match: 'SERVER_OPS_DATA_TIMEOUT', text: '读取超时' },
   { match: 'SERVER_OPS_SQLITE_FILE_NOT_FOUND', text: '找不到 SQLite 文件，请确认文件路径仍然有效' },
   { match: 'SERVER_OPS_SQLITE_FILE_NOT_REGULAR', text: '所选路径不是普通文件，请重新选择 SQLite 数据库文件' },

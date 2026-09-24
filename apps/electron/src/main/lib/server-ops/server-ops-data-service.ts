@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { inspectServerOpsLocalSqliteFile } from '../../../utility/server-ops/server-ops-local-sqlite-file'
 import type {
+  ServerOpsDataCredentialDiscoveryInput,
+  ServerOpsDataCredentialDiscoveryResult,
   ServerOpsDataDiagnoseInput,
   ServerOpsDataDiagnosticsResult,
   ServerOpsDataProbeResult,
@@ -27,7 +29,15 @@ import type {
   ServerOpsDataSourceTablesResult,
   ServerOpsDataSourceUpsertInput,
   ServerOpsDataSourceUpsertResult,
+  ServerOpsDiscoveredCredentialApplyInput,
+  ServerOpsDiscoveredCredentialApplyResult,
 } from '@proma/shared'
+import {
+  applyServerOpsDiscoveredCredential,
+  createContainerCliInspection,
+  discoverServerOpsLocalCredentials,
+} from './server-ops-local-credential-discovery'
+import type { ServerOpsContainerInspection } from './server-ops-local-credential-discovery'
 import {
   isServerOpsMySqlTlsServerName,
   isServerOpsPlaintextDirectAddress,
@@ -99,6 +109,8 @@ export interface ServerOpsDataServiceDependencies {
   transaction?: ServerOpsConfigTransaction
   /** 可选的 schema 派生缓存；未注入时所有读取保持实时。 */
   schemaCache?: Pick<ServerOpsDataSchemaCache, 'lookup' | 'setIfRevision' | 'invalidate'>
+  /** 本机凭据发现使用的容器探测；未注入时走 podman/docker CLI。 */
+  containerInspection?: ServerOpsContainerInspection
 }
 
 /** 数据服务编排结果：数据源增删改查与只读读取。 */
@@ -117,6 +129,8 @@ export class ServerOpsDataService {
   private readonly activeSchemaCacheReads = new Map<string, Promise<ServerOpsDataSchemaCacheValue>>()
   /** 缓存异常后本实例 fail closed；服务重建前不再恢复缓存读写。 */
   private schemaCacheDisabled = false
+  /** 本机凭据发现使用的容器探测实现。 */
+  private readonly containerInspection: ServerOpsContainerInspection
   /** dispose 后进入终态，拒绝新的读取。 */
   private disposed = false
 
@@ -125,6 +139,7 @@ export class ServerOpsDataService {
     this.now = dependencies.now ?? Date.now
     this.uuid = dependencies.uuid ?? (() => `direct-${Math.random().toString(36).slice(2, 12)}`)
     this.transaction = dependencies.transaction ?? ((callback) => callback())
+    this.containerInspection = dependencies.containerInspection ?? createContainerCliInspection()
   }
 
   /** 把内部记录投影为不含秘密的公开数据源。 */
@@ -323,6 +338,35 @@ export class ServerOpsDataService {
     if (record.credentialRef === undefined) return { password: null }
     /** 解密失败会抛 SERVER_OPS_DATA_CREDENTIAL_CORRUPTED，由界面映射成中文原因。 */
     return { password: this.dependencies.credentials.resolveSecret(record.credentialRef) ?? null }
+  }
+
+  /**
+   * 在本机发现可用的数据源凭据（L1）。
+   *
+   * 只对回环地址开放：私有网段的目标在另一台机器上，按端口匹配会把别的库的口令串过来。
+   * 结果**不含口令值**，用户点选某一项后再调用 applyDiscoveredCredential 取回；
+   * 这里不创建账号、不改权限、不落盘任何东西。
+   *
+   * @param input 用户已填的地址、端口与引擎
+   * @returns 候选列表；本机没有可用容器运行时时为空数组
+   */
+  async discoverCredentials(input: ServerOpsDataCredentialDiscoveryInput): Promise<ServerOpsDataCredentialDiscoveryResult> {
+    this.assertUsable()
+    return discoverServerOpsLocalCredentials(input, this.containerInspection)
+  }
+
+  /**
+   * 取回用户点选的候选凭据。
+   *
+   * 与"显示已保存密码"同样的边界：明文只存在于这一条 IPC 回执，
+   * 不写日志、不写审计、不进 Agent 上下文、不落盘第二份。
+   *
+   * @param input 发现输入加候选标识
+   * @returns 该候选的账号与口令；候选已失效时抛 SERVER_OPS_DATA_CREDENTIAL_CANDIDATE_NOT_FOUND
+   */
+  async applyDiscoveredCredential(input: ServerOpsDiscoveredCredentialApplyInput): Promise<ServerOpsDiscoveredCredentialApplyResult> {
+    this.assertUsable()
+    return applyServerOpsDiscoveredCredential(input, this.containerInspection)
   }
 
   /** 从权威配置捕获凭据引用与密文版本；不解密且不进入公开 DTO。 */

@@ -17,6 +17,10 @@ import {
   parseServerOpsDataSourceListResult,
   parseServerOpsDataSourcePasswordInput,
   parseServerOpsDataSourcePasswordResult,
+  parseServerOpsDataCredentialDiscoveryInput,
+  parseServerOpsDataCredentialDiscoveryResult,
+  parseServerOpsDiscoveredCredentialApplyInput,
+  parseServerOpsDiscoveredCredentialApplyResult,
   parseServerOpsDataSourceProbeInput,
   parseServerOpsDataSourceSetDefaultDatabaseInput,
   parseServerOpsDataSourceRowsInput,
@@ -31,6 +35,8 @@ import {
   parseServerOpsDataSourceUpsertResult,
 } from '@proma/shared'
 import type {
+  ServerOpsDataCredentialDiscoveryInput,
+  ServerOpsDataCredentialDiscoveryResult,
   ServerOpsDataDiagnoseInput,
   ServerOpsDataDiagnosticsResult,
   ServerOpsDataProbeResult,
@@ -51,6 +57,8 @@ import type {
   ServerOpsDataSourceTablesResult,
   ServerOpsDataSourceUpsertInput,
   ServerOpsDataSourceUpsertResult,
+  ServerOpsDiscoveredCredentialApplyInput,
+  ServerOpsDiscoveredCredentialApplyResult,
   ServerOpsDataQueryInput,
   ServerOpsDataQueryCancelInput,
   ServerOpsDataQueryResult,
@@ -84,6 +92,10 @@ export interface ServerOpsDataPreload {
    * 只在用户显式要求时调用；明文仅用于这一次展示，调用方不得缓存或写入日志。
    */
   revealServerOpsDataSourcePassword(input: ServerOpsDataSourcePasswordInput): Promise<ServerOpsDataSourcePasswordResult>
+  /** 在本机发现可用的数据源凭据；只对回环地址开放，结果不含口令值。 */
+  discoverServerOpsDataCredentials(input: ServerOpsDataCredentialDiscoveryInput): Promise<ServerOpsDataCredentialDiscoveryResult>
+  /** 取回用户点选的候选凭据；明文只在这一条回执里存在。 */
+  applyServerOpsDiscoveredCredential(input: ServerOpsDiscoveredCredentialApplyInput): Promise<ServerOpsDiscoveredCredentialApplyResult>
   /** 表浏览：库与表清单（只读）。 */
   listServerOpsDataSchemaTables(input: ServerOpsDataSourceTablesInput): Promise<ServerOpsDataSourceTablesResult>
   /** 表浏览：单表结构（列 + 索引，只读）。 */
@@ -143,6 +155,12 @@ export function createServerOpsDataPreload(invoke: ServerOpsDataInvoke): ServerO
     ),
     revealServerOpsDataSourcePassword: async (input) => parseServerOpsDataSourcePasswordResult(
       await invoke(SERVER_OPS_DATA_CHANNELS.REVEAL_SOURCE_PASSWORD, parseServerOpsDataSourcePasswordInput(input)),
+    ),
+    discoverServerOpsDataCredentials: async (input) => parseServerOpsDataCredentialDiscoveryResult(
+      await invoke(SERVER_OPS_DATA_CHANNELS.DISCOVER_SOURCE_CREDENTIALS, parseServerOpsDataCredentialDiscoveryInput(input)),
+    ),
+    applyServerOpsDiscoveredCredential: async (input) => parseServerOpsDiscoveredCredentialApplyResult(
+      await invoke(SERVER_OPS_DATA_CHANNELS.APPLY_DISCOVERED_CREDENTIAL, parseServerOpsDiscoveredCredentialApplyInput(input)),
     ),
     listServerOpsDataSchemaTables: async (input) => parseServerOpsDataSourceTablesResult(
       await invoke(SERVER_OPS_DATA_SCHEMA_CHANNELS.LIST_TABLES, parseServerOpsDataSourceTablesInput(input)),

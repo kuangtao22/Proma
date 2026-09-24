@@ -1,7 +1,9 @@
 import * as React from 'react'
-import { ChevronRight, Eye, EyeOff, FileUp, LoaderCircle, PlugZap } from 'lucide-react'
+import { ChevronRight, Eye, EyeOff, FileUp, KeyRound, LoaderCircle, PlugZap } from 'lucide-react'
 import type {
   ServerOpsConnectionDraftInput,
+  ServerOpsDataCredentialDiscoveryInput,
+  ServerOpsDataCredentialDiscoveryResult,
   ServerOpsDataEngine,
   ServerOpsDataProbeResult,
   ServerOpsDataSource,
@@ -9,8 +11,11 @@ import type {
   ServerOpsDataSourceUpsertInput,
   ServerOpsDataTlsMode,
   ServerOpsDataTransport,
+  ServerOpsDiscoveredCredentialApplyInput,
+  ServerOpsDiscoveredCredentialApplyResult,
+  ServerOpsDiscoveredCredentialCandidate,
 } from '@proma/shared'
-import { isServerOpsLocalSqliteFilePath, isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
+import { isServerOpsLocalSqliteFilePath, isServerOpsLoopbackAddress, isServerOpsMySqlTlsServerName, isServerOpsPlaintextDirectAddress, isServerOpsSqliteFilePath } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
@@ -437,6 +442,19 @@ export interface ServerOpsDataSourceFieldsProps {
   hostOptions?: readonly ServerOpsDataSourceHostOption[]
   /** 打开本机文件选择器；仅本地 SQLite 模式显示。 */
   onSelectLocalFile?: () => void
+  /** 本机凭据发现的状态与动作；旧客户端不支持时为 undefined，入口不渲染。 */
+  credentialDiscovery?: ServerOpsDataSourceCredentialDiscovery
+}
+
+/** 本机凭据发现在字段层的状态与动作。 */
+export interface ServerOpsDataSourceCredentialDiscovery {
+  /** 已发现的候选；null 表示本次打开还没有查找过。 */
+  candidates: ServerOpsDiscoveredCredentialCandidate[] | null
+  discovering: boolean
+  applyingCandidateId: string | null
+  error: string | null
+  onDiscover: () => void
+  onApplyCandidate: (candidateId: string) => void
 }
 
 /** SQLite 服务器选择只需要稳定 ID 与可辨认名称。 */
@@ -462,6 +480,7 @@ export function ServerOpsDataSourceFields({
   hostLabel,
   hostOptions = [],
   onSelectLocalFile,
+  credentialDiscovery,
 }: ServerOpsDataSourceFieldsProps): React.ReactElement {
   /** 固定星号只表示已有凭据，不读取真实密码，也不作为草稿提交。 */
   const hasRetainedPassword = mode === 'edit' && hasSavedPassword && !draft.clearPassword
@@ -600,6 +619,60 @@ export function ServerOpsDataSourceFields({
       ) : null}
       <div className="grid gap-3 border-t border-border/40 pt-4">
         <div className="text-xs font-medium text-muted-foreground">登录凭据</div>
+        {/* 本机凭据发现只对回环地址开放；旧客户端没有对应方法时不渲染入口。 */}
+        {draft.transport === 'direct' && isServerOpsLoopbackAddress(draft.address.trim()) && credentialDiscovery ? (
+          <div className="grid gap-2 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5" data-server-ops-data-credential-discovery>
+            <div className="flex items-center justify-between gap-2">
+              <p className="min-w-0 text-[11px] leading-5 text-muted-foreground">
+                本机容器里的账号与口令可以直接读取，不必再去终端里找密码。
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                disabled={credentialDiscovery.discovering}
+                onClick={credentialDiscovery.onDiscover}
+              >
+                {credentialDiscovery.discovering ? <LoaderCircle className="size-3.5 animate-spin" /> : <KeyRound className="size-3.5" />}
+                从本机查找凭据
+              </Button>
+            </div>
+            {credentialDiscovery.error === null ? null : (
+              <p className="text-[11px] leading-5 text-destructive" data-server-ops-data-credential-discovery-error>{credentialDiscovery.error}</p>
+            )}
+            {credentialDiscovery.candidates === null ? null : credentialDiscovery.candidates.length === 0 ? (
+              <p className="text-[11px] leading-5 text-muted-foreground" data-server-ops-data-credential-discovery-empty>
+                没有在这台机器上发现发布了 {draft.address.trim()}:{draft.port} 的容器，请手工填写账号与密码。
+              </p>
+            ) : (
+              <ul className="grid gap-1.5">
+                {credentialDiscovery.candidates.map((candidate) => (
+                  <li key={candidate.id} className="flex items-center justify-between gap-2 rounded-md bg-background/70 px-2 py-1.5">
+                    <div className="min-w-0">
+                      <p className="truncate text-xs text-foreground" title={candidate.label}>{candidate.label}</p>
+                      <p className="text-[11px] leading-4 text-muted-foreground">
+                        {candidate.username === undefined ? '仅口令' : `账号 ${candidate.username}`}
+                        {candidate.privilege === 'superuser' ? ' · 超级用户，长期使用建议改为只读账号' : ''}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={credentialDiscovery.applyingCandidateId !== null}
+                      onClick={() => { credentialDiscovery.onApplyCandidate(candidate.id) }}
+                    >
+                      {credentialDiscovery.applyingCandidateId === candidate.id ? <LoaderCircle className="size-3.5 animate-spin" /> : null}
+                      使用
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ) : null}
         {/* 用户名与密码顶端对齐，说明和清除入口只占密码列；窄窗口自动换行。 */}
         <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
           <div className="grid min-w-0 gap-1.5">
@@ -718,6 +791,14 @@ export interface ServerOpsDataSourceDialogProps {
    * 没有保存密码或旧客户端不支持时返回 null。
    */
   onRevealPassword?: (sourceId: string) => Promise<string | null>
+  /**
+   * 在本机发现可用的数据源凭据；只对回环地址开放。
+   *
+   * 旧客户端没有这个方法时入口不渲染——否则用户会看到一个点了必然报错的按钮。
+   */
+  onDiscoverCredentials?: (input: ServerOpsDataCredentialDiscoveryInput) => Promise<ServerOpsDataCredentialDiscoveryResult>
+  /** 取回用户点选的候选凭据；只填进当前草稿，不保存、不自动测试。 */
+  onApplyDiscoveredCredential?: (input: ServerOpsDiscoveredCredentialApplyInput) => Promise<ServerOpsDiscoveredCredentialApplyResult>
   /** 提交已通过前端校验的写入输入；主进程会再做一次严格校验。 */
   onSubmit: (input: ServerOpsDataSourceUpsertInput) => void
   onClose: () => void
@@ -733,6 +814,8 @@ export interface ServerOpsDataSourceDialogControllerOptions {
   hostId: string
   onTest?: (draft: ServerOpsDataSourceProbeDraft) => Promise<ServerOpsDataProbeResult>
   onRevealPassword?: (sourceId: string) => Promise<string | null>
+  onDiscoverCredentials?: (input: ServerOpsDataCredentialDiscoveryInput) => Promise<ServerOpsDataCredentialDiscoveryResult>
+  onApplyDiscoveredCredential?: (input: ServerOpsDiscoveredCredentialApplyInput) => Promise<ServerOpsDiscoveredCredentialApplyResult>
 }
 
 /** 弹窗状态 Hook 暴露给视图的状态与动作。 */
@@ -742,6 +825,14 @@ export interface ServerOpsDataSourceDialogController {
   showPassword: boolean
   passwordFromStore: boolean
   revealingPassword: boolean
+  /** 已发现的本机凭据候选；null 表示本次打开还没有查过。 */
+  credentialCandidates: ServerOpsDiscoveredCredentialCandidate[] | null
+  /** 是否正在查找本机凭据。 */
+  discoveringCredentials: boolean
+  /** 正在取回口令的候选标识。 */
+  applyingCredentialId: string | null
+  /** 查找失败或候选失效的可读原因。 */
+  discoveryError: string | null
   testing: boolean
   testResult: ServerOpsDataProbeResult | null
   testError: string | null
@@ -749,6 +840,10 @@ export interface ServerOpsDataSourceDialogController {
   changeConnectionMode: (mode: ServerOpsDataConnectionMode) => void
   changeEngine: (engine: ServerOpsDataEngine) => void
   setPasswordVisibility: (showPassword: boolean) => Promise<void>
+  /** 按当前草稿的地址与端口查找本机凭据。 */
+  discoverCredentials: () => Promise<void>
+  /** 取回并填入某个候选的账号与口令。 */
+  applyCredential: (candidateId: string) => Promise<void>
   testConnection: () => Promise<void>
   setErrors: React.Dispatch<React.SetStateAction<ServerOpsDataSourceFormErrors>>
 }
@@ -759,6 +854,7 @@ interface ServerOpsDataSourceDialogAsyncSession {
   draftRevision: number
   revealRequestRevision: number
   testRequestRevision: number
+  discoveryRequestRevision: number
 }
 
 /** 创建一个尚未接收用户操作的弹窗异步会话。 */
@@ -768,6 +864,7 @@ function createServerOpsDataSourceDialogAsyncSession(alive: boolean): ServerOpsD
     draftRevision: 0,
     revealRequestRevision: 0,
     testRequestRevision: 0,
+    discoveryRequestRevision: 0,
   }
 }
 
@@ -780,7 +877,7 @@ function createServerOpsDataSourceDialogAsyncSession(alive: boolean): ServerOpsD
 export function useServerOpsDataSourceDialogController(
   options: ServerOpsDataSourceDialogControllerOptions,
 ): ServerOpsDataSourceDialogController {
-  const { open, mode, source, initialEngine = 'mysql', initialDraft, hostId, onTest, onRevealPassword } = options
+  const { open, mode, source, initialEngine = 'mysql', initialDraft, hostId, onTest, onRevealPassword, onDiscoverCredentials, onApplyDiscoveredCredential } = options
   /** 当前草稿。 */
   const [draft, setDraft] = React.useState<ServerOpsDataSourceDraft>(() => createServerOpsDataSourceDraft(source, initialEngine, initialDraft))
   /** 字段级错误。 */
@@ -791,6 +888,14 @@ export function useServerOpsDataSourceDialogController(
   const [passwordFromStore, setPasswordFromStore] = React.useState(false)
   /** 是否正在读取已保存密码。 */
   const [revealingPassword, setRevealingPassword] = React.useState(false)
+  /** 已发现的本机凭据候选；null 表示本次打开还没有查找过。 */
+  const [credentialCandidates, setCredentialCandidates] = React.useState<ServerOpsDiscoveredCredentialCandidate[] | null>(null)
+  /** 是否正在查找本机凭据。 */
+  const [discoveringCredentials, setDiscoveringCredentials] = React.useState(false)
+  /** 正在取回口令的候选标识。 */
+  const [applyingCredentialId, setApplyingCredentialId] = React.useState<string | null>(null)
+  /** 查找失败或候选失效的可读原因。 */
+  const [discoveryError, setDiscoveryError] = React.useState<string | null>(null)
   /** 是否正在执行连接测试。 */
   const [testing, setTesting] = React.useState(false)
   /** 最近一次连接测试结论。 */
@@ -816,6 +921,10 @@ export function useServerOpsDataSourceDialogController(
       setShowPassword(false)
       setPasswordFromStore(false)
       setRevealingPassword(false)
+      setCredentialCandidates(null)
+      setDiscoveringCredentials(false)
+      setApplyingCredentialId(null)
+      setDiscoveryError(null)
       setTesting(false)
       setTestResult(null)
       setTestError(null)
@@ -844,6 +953,11 @@ export function useServerOpsDataSourceDialogController(
     setErrors({})
     setTestResult(null)
     setTestError(null)
+    /** 目标地址或端口变了以后，旧候选不再对应当前目标，必须重新查找。 */
+    if ('address' in patch || 'port' in patch) {
+      setCredentialCandidates(null)
+      setDiscoveryError(null)
+    }
   }, [])
 
   /** 切换引擎并推进草稿代次。 */
@@ -854,6 +968,9 @@ export function useServerOpsDataSourceDialogController(
     setErrors({})
     setTestResult(null)
     setTestError(null)
+    /** 换引擎后候选语义随之改变，直接作废。 */
+    setCredentialCandidates(null)
+    setDiscoveryError(null)
   }, [])
 
   /** 切换表单连接方式并清理已不适用的凭据、错误和测试结果。 */
@@ -866,6 +983,9 @@ export function useServerOpsDataSourceDialogController(
     setErrors({})
     setTestResult(null)
     setTestError(null)
+    /** 换连接方式后本机容器不再适用，直接作废。 */
+    setCredentialCandidates(null)
+    setDiscoveryError(null)
   }, [hostId])
 
   /** 按当前会话读取已保存密码；任何身份或草稿变化都会丢弃迟到回执。 */
@@ -968,12 +1088,98 @@ export function useServerOpsDataSourceDialogController(
     }
   }
 
+  /**
+   * 按当前草稿查找本机凭据。
+   *
+   * 只把地址、端口与引擎交给主进程，由主进程判定是否属于可发现范围；
+   * 结果为空是正常情况（这台机器上没有对应容器），因此与失败分开显示。
+   */
+  const discoverCredentials = async (): Promise<void> => {
+    if (!onDiscoverCredentials) return
+    /** 端口在表单里是字符串；不合法时不发起查找，避免把无效目标交给主进程。 */
+    const port = Number(draft.port)
+    if (draft.address.trim() === '' || !Number.isInteger(port) || port < 1 || port > 65_535) {
+      setCredentialCandidates(null)
+      setDiscoveryError('请先填写数据库地址与端口')
+      return
+    }
+    /** 本次查找绑定的弹窗会话。 */
+    const session = asyncSessionRef.current
+    /** 本次查找的请求代次。 */
+    const requestRevision = ++session.discoveryRequestRevision
+    /** 判断回执是否仍属于当前弹窗和最新一次查找。 */
+    const isCurrentRequest = (): boolean => session.alive
+      && asyncSessionRef.current === session
+      && session.discoveryRequestRevision === requestRevision
+    setDiscoveringCredentials(true)
+    setDiscoveryError(null)
+    try {
+      const result = await onDiscoverCredentials({ address: draft.address.trim(), port, engine: draft.engine })
+      if (!isCurrentRequest()) return
+      setCredentialCandidates(result.candidates)
+    } catch (discoveryFailure) {
+      if (!isCurrentRequest()) return
+      setCredentialCandidates(null)
+      setDiscoveryError(getServerOpsDataErrorMessage(discoveryFailure))
+    } finally {
+      if (isCurrentRequest()) setDiscoveringCredentials(false)
+    }
+  }
+
+  /**
+   * 取回某个候选的账号与口令并填入草稿。
+   *
+   * 只填草稿，不保存、不自动测试：用户仍要看到这一次连接是他自己点的。
+   * 填入后清掉"沿用已保存密文"与"清除密码"两个旧状态，避免保存时又被旧密文覆盖。
+   *
+   * @param candidateId 用户在候选列表里点选的候选
+   */
+  const applyCredential = async (candidateId: string): Promise<void> => {
+    if (!onApplyDiscoveredCredential) return
+    const port = Number(draft.port)
+    if (draft.address.trim() === '' || !Number.isInteger(port) || port < 1 || port > 65_535) return
+    /** 本次取回绑定的弹窗会话。 */
+    const session = asyncSessionRef.current
+    /** 本次取回的请求代次。 */
+    const requestRevision = ++session.discoveryRequestRevision
+    /** 发起时的草稿代次；用户中途改过字段就丢弃这次回执。 */
+    const draftRevision = session.draftRevision
+    /** 判断回执是否仍属于当前弹窗与本次请求。 */
+    const isCurrentRequest = (): boolean => session.alive
+      && asyncSessionRef.current === session
+      && session.discoveryRequestRevision === requestRevision
+    setApplyingCredentialId(candidateId)
+    setDiscoveryError(null)
+    try {
+      const applied = await onApplyDiscoveredCredential({ address: draft.address.trim(), port, engine: draft.engine, candidateId })
+      if (!isCurrentRequest() || session.draftRevision !== draftRevision) return
+      /** 填入新凭据本身推进草稿代次，使在途的连接测试结果失效。 */
+      session.draftRevision += 1
+      setDraft((current) => ({
+        ...current,
+        ...(applied.username === undefined ? {} : { username: applied.username }),
+        password: applied.password ?? '',
+        clearPassword: false,
+      }))
+      setPasswordFromStore(false)
+    } catch (applyFailure) {
+      if (!isCurrentRequest() || session.draftRevision !== draftRevision) return
+      setDiscoveryError(getServerOpsDataErrorMessage(applyFailure))
+    } finally {
+      if (isCurrentRequest()) setApplyingCredentialId(null)
+    }
+  }
+
   return {
     draft,
     errors,
     showPassword,
     passwordFromStore,
     revealingPassword,
+    credentialCandidates,
+    discoveringCredentials,
+    applyingCredentialId,
+    discoveryError,
     testing,
     testResult,
     testError,
@@ -981,6 +1187,8 @@ export function useServerOpsDataSourceDialogController(
     changeConnectionMode,
     changeEngine,
     setPasswordVisibility,
+    discoverCredentials,
+    applyCredential,
     testConnection,
     setErrors,
   }
@@ -1006,6 +1214,8 @@ export function ServerOpsDataSourceDialog({
   error,
   onTest,
   onRevealPassword,
+  onDiscoverCredentials,
+  onApplyDiscoveredCredential,
   onSubmit,
   onClose,
 }: ServerOpsDataSourceDialogProps): React.ReactElement {
@@ -1021,6 +1231,8 @@ export function ServerOpsDataSourceDialog({
     hostId,
     onTest,
     onRevealPassword,
+    onDiscoverCredentials,
+    onApplyDiscoveredCredential,
   })
   const {
     draft,
@@ -1028,6 +1240,10 @@ export function ServerOpsDataSourceDialog({
     showPassword,
     passwordFromStore,
     revealingPassword,
+    credentialCandidates,
+    discoveringCredentials,
+    applyingCredentialId,
+    discoveryError,
     testing,
     testResult,
     testError,
@@ -1035,6 +1251,8 @@ export function ServerOpsDataSourceDialog({
     changeConnectionMode,
     changeEngine,
     setPasswordVisibility,
+    discoverCredentials,
+    applyCredential,
     testConnection,
     setErrors,
   } = controller
@@ -1096,6 +1314,14 @@ export function ServerOpsDataSourceDialog({
               onSelectLocalFile={() => localSqliteInputRef.current?.click()}
               revealingPassword={revealingPassword}
               passwordFromStore={passwordFromStore}
+              credentialDiscovery={onDiscoverCredentials === undefined ? undefined : {
+                candidates: credentialCandidates,
+                discovering: discoveringCredentials,
+                applyingCandidateId: applyingCredentialId,
+                error: discoveryError,
+                onDiscover: () => { void discoverCredentials() },
+                onApplyCandidate: (candidateId) => { void applyCredential(candidateId) },
+              }}
             />
             <input ref={localSqliteInputRef} type="file" className="sr-only" tabIndex={-1}
               accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" aria-hidden="true" onChange={selectLocalSqliteFile} />

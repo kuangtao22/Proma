@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  isServerOpsLoopbackAddress,
   isServerOpsSqliteFilePath,
   isServerOpsPlaintextDirectAddress,
   isServerOpsDataTlsMode,
@@ -20,6 +21,10 @@ import {
   parseServerOpsDataSourceSetDefaultDatabaseInput,
   parseServerOpsDataSourceUpsertInput,
   parseServerOpsDataSourceUpsertResult,
+  parseServerOpsDataCredentialDiscoveryInput,
+  parseServerOpsDataCredentialDiscoveryResult,
+  parseServerOpsDiscoveredCredentialApplyInput,
+  parseServerOpsDiscoveredCredentialApplyResult,
   parseServerOpsDataTable,
   parseServerOpsDataTableList,
 } from './server-ops-data'
@@ -410,6 +415,59 @@ describe('服务器运维数据服务公开合同', () => {
       .toThrow('SERVER_OPS_DATA_SOURCE_PASSWORD_RESULT_INVALID')
     expect(() => parseServerOpsDataSourcePasswordResult({ password: null, sourceId: 'source-1' }))
       .toThrow('SERVER_OPS_DATA_SOURCE_PASSWORD_RESULT_INVALID')
+  })
+
+  test('Given 本机凭据发现 When 解析输入与结果 Then 候选不含口令且重复标识被拒', () => {
+    /** 回环是唯一准入范围；私有网段放行属于"允许明文直连"的判据，不能混用。 */
+    expect(isServerOpsLoopbackAddress('localhost')).toBe(true)
+    expect(isServerOpsLoopbackAddress('127.0.0.1')).toBe(true)
+    expect(isServerOpsLoopbackAddress('172.16.10.198')).toBe(false)
+
+    expect(parseServerOpsDataCredentialDiscoveryInput({ address: '127.0.0.1', port: 13307, engine: 'mysql' }))
+      .toEqual({ address: '127.0.0.1', port: 13307, engine: 'mysql' })
+    expect(() => parseServerOpsDataCredentialDiscoveryInput({ address: '127.0.0.1', port: 0, engine: 'mysql' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_INPUT_INVALID')
+    expect(() => parseServerOpsDataCredentialDiscoveryInput({ address: '127.0.0.1', port: 13307, engine: 'mysql', extra: 1 }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_INPUT_INVALID')
+
+    /** 候选只描述来源与账号：出现口令字段说明主进程越过了边界。 */
+    expect(parseServerOpsDataCredentialDiscoveryResult({
+      candidates: [{ id: 'chebenben-local-mysql|root', label: '容器 chebenben-local-mysql 的 MYSQL_ROOT_PASSWORD', username: 'root', hasPassword: true, origin: 'container-env', privilege: 'superuser' }],
+    }).candidates).toHaveLength(1)
+    expect(parseServerOpsDataCredentialDiscoveryResult({ candidates: [] })).toEqual({ candidates: [] })
+    expect(() => parseServerOpsDataCredentialDiscoveryResult({
+      candidates: [{ id: 'chebenben-local-mysql|root', label: 'x', hasPassword: true, origin: 'container-env', privilege: 'superuser', password: 'secret' }],
+    })).toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID')
+    expect(() => parseServerOpsDataCredentialDiscoveryResult({ candidates: [{ id: '容器 名字', label: 'x', hasPassword: true, origin: 'container-env', privilege: 'superuser' }] }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID')
+    expect(() => parseServerOpsDataCredentialDiscoveryResult({
+      candidates: [
+        { id: 'container|root', label: 'x', hasPassword: true, origin: 'container-env', privilege: 'superuser' },
+        { id: 'container|root', label: 'y', hasPassword: true, origin: 'container-env', privilege: 'superuser' },
+      ],
+    })).toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID')
+    expect(() => parseServerOpsDataCredentialDiscoveryResult({ candidates: new Array(9).fill({ id: 'c|root', label: 'x', hasPassword: true, origin: 'container-env', privilege: 'user' }) }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID')
+  })
+
+  test('Given 候选凭据取回 When 解析输入与结果 Then 口令有界且 Redis 候选可无账号', () => {
+    expect(parseServerOpsDiscoveredCredentialApplyInput({ address: 'localhost', port: 13307, engine: 'mysql', candidateId: 'c|root' }))
+      .toEqual({ address: 'localhost', port: 13307, engine: 'mysql', candidateId: 'c|root' })
+    expect(() => parseServerOpsDiscoveredCredentialApplyInput({ address: 'localhost', port: 13307, engine: 'mysql' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_INPUT_INVALID')
+    expect(() => parseServerOpsDiscoveredCredentialApplyInput({ address: 'localhost', port: 13307, engine: 'mysql', candidateId: 'no-separator' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_INPUT_INVALID')
+
+    expect(parseServerOpsDiscoveredCredentialApplyResult({ username: 'root', password: 'p@ss' }))
+      .toEqual({ username: 'root', password: 'p@ss' })
+    /** Redis 只有口令没有账号，username 必须可省略。 */
+    expect(parseServerOpsDiscoveredCredentialApplyResult({ password: 'p@ss' })).toEqual({ password: 'p@ss' })
+    expect(() => parseServerOpsDiscoveredCredentialApplyResult({ password: '' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_RESULT_INVALID')
+    expect(() => parseServerOpsDiscoveredCredentialApplyResult({ password: 'a\u0000b' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_RESULT_INVALID')
+    expect(() => parseServerOpsDiscoveredCredentialApplyResult({ password: 'p@ss', origin: 'container-env' }))
+      .toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_RESULT_INVALID')
   })
 
   test('Given 连接测试结果 When 能力与版本不自洽 Then 拒绝', () => {

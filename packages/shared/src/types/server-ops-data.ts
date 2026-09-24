@@ -9,6 +9,8 @@ export const SERVER_OPS_DATA_CHANNELS = {
   PROBE_SOURCE: 'server-ops:probe-data-source',
   DIAGNOSE_SOURCE: 'server-ops:diagnose-data-source',
   REVEAL_SOURCE_PASSWORD: 'server-ops:reveal-data-source-password',
+  DISCOVER_SOURCE_CREDENTIALS: 'server-ops:discover-data-source-credentials',
+  APPLY_DISCOVERED_CREDENTIAL: 'server-ops:apply-discovered-credential',
 } as const
 
 /** 首批支持的数据服务引擎；新增引擎必须同时补齐 runtime adapter 与页面文案。 */
@@ -167,6 +169,55 @@ export interface ServerOpsDataSourcePasswordInput { sourceId: string }
  * 该数据源没有保存密码时 `password` 为 `null`。
  */
 export interface ServerOpsDataSourcePasswordResult { password: string | null }
+
+/**
+ * 本机凭据发现的单个候选。
+ *
+ * 候选只描述"哪里有一组可用凭据"，**不含口令值**：口令必须由用户在候选列表里点选后，
+ * 再通过单独一次调用取回，避免一次把多组明文同时送进渲染层。
+ */
+export interface ServerOpsDiscoveredCredentialCandidate {
+  /** 一次性标识；由容器名与账号键拼成，弹窗关闭即失效。 */
+  id: string
+  /** 面向用户的来源说明，例如「容器 chebenben-local-mysql 的 MYSQL_ROOT_PASSWORD」。 */
+  label: string
+  /** 该候选可用的登录账号；Redis 只有口令没有账号时为 undefined。 */
+  username?: string
+  /** 是否解析到了口令；false 表示只能填入账号。 */
+  hasPassword: boolean
+  /** 候选来源类型；首版只支持容器环境变量。 */
+  origin: 'container-env'
+  /** 账号权限等级，用于提示用户不要长期用超级用户接入。 */
+  privilege: 'superuser' | 'user' | 'unknown'
+}
+
+/** 发现本机凭据的输入：只需用户已经填好的目标地址与引擎。 */
+export interface ServerOpsDataCredentialDiscoveryInput {
+  address: string
+  port: number
+  engine: ServerOpsDataEngine
+}
+
+/** 发现结果；为空数组表示这台机器上没有可用的候选（不是错误）。 */
+export interface ServerOpsDataCredentialDiscoveryResult {
+  candidates: ServerOpsDiscoveredCredentialCandidate[]
+}
+
+/** 取回某个候选的口令：沿用同一份输入，外加候选标识。 */
+export interface ServerOpsDiscoveredCredentialApplyInput extends ServerOpsDataCredentialDiscoveryInput {
+  candidateId: string
+}
+
+/**
+ * 候选凭据的取回结果。
+ *
+ * 明文只在这一次调用中返回给渲染层用于填入草稿，主进程不记录、不落盘、不写审计；
+ * 候选只提供账号时为 `null`。
+ */
+export interface ServerOpsDiscoveredCredentialApplyResult {
+  username?: string
+  password: string | null
+}
 
 /**
  * 未保存的数据连接草稿。
@@ -451,8 +502,16 @@ export function parseServerOpsDataWarnings(value: unknown): string[] {
   return parseWarnings(value, 'SERVER_OPS_DATA_WARNINGS_INVALID')
 }
 
-/** 判断地址是否为回环写法；回环永远允许明文直连。 */
-function isLoopbackAddress(address: string): boolean {
+/**
+ * 判断地址是否为回环写法（`localhost` / `::1` / `127.x`）。
+ *
+ * 回环永远允许明文直连，同时也是"本机凭据发现"的唯一准入范围：
+ * 只有回环目标才可能由本机的容器运行时提供凭据，私有网段是另一台机器，按端口匹配会串库。
+ *
+ * @param address 用户填写的数据库地址
+ * @returns 是否为回环地址
+ */
+export function isServerOpsLoopbackAddress(address: string): boolean {
   return address === 'localhost' || address === '::1' || address.startsWith('127.')
 }
 
@@ -503,7 +562,7 @@ function isPrivateIpv6Address(address: string): boolean {
 export function isServerOpsPlaintextDirectAddress(address: string): boolean {
   /** 去掉用户可能带上的空白。 */
   const trimmed = address.trim()
-  if (isLoopbackAddress(trimmed)) return true
+  if (isServerOpsLoopbackAddress(trimmed)) return true
   if (isPrivateIpv4Address(trimmed)) return true
   return trimmed.includes(':') && isPrivateIpv6Address(trimmed)
 }
@@ -682,6 +741,70 @@ export function parseServerOpsDataSourcePasswordResult(value: unknown): ServerOp
   if (value.password === null) return { password: null }
   if (!isSecretText(value.password)) throw new Error(errorCode)
   return { password: value.password }
+}
+
+/** 判断凭据候选标识：由容器名与账号键拼成，有界且不含空白与冒号。 */
+function isDiscoveryCandidateId(value: unknown): value is string {
+  return isAddressText(value, 160) && value.includes('|')
+}
+
+/** 严格解析单个凭据候选；候选来自主进程，仍按对外合同逐字段校验。 */
+function parseServerOpsDiscoveredCredentialCandidate(value: unknown): ServerOpsDiscoveredCredentialCandidate {
+  const errorCode = 'SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID'
+  const keys = new Set(['id', 'label', 'username', 'hasPassword', 'origin', 'privilege'])
+  if (!isRecord(value) || !hasOnlyKeys(value, keys) || !isDiscoveryCandidateId(value.id)) throw new Error(errorCode)
+  if (!isDisplayString(value.label, 160) || typeof value.hasPassword !== 'boolean') throw new Error(errorCode)
+  if (value.username !== undefined && !isOptionalDataText(value.username, 128)) throw new Error(errorCode)
+  if (value.origin !== 'container-env') throw new Error(errorCode)
+  if (value.privilege !== 'superuser' && value.privilege !== 'user' && value.privilege !== 'unknown') throw new Error(errorCode)
+  return {
+    id: value.id,
+    label: value.label,
+    hasPassword: value.hasPassword,
+    origin: value.origin,
+    privilege: value.privilege,
+    ...(value.username === undefined ? {} : { username: value.username }),
+  }
+}
+
+/** 严格解析"发现本机凭据"输入；地址与端口必须是用户已填的直连目标。 */
+export function parseServerOpsDataCredentialDiscoveryInput(value: unknown): ServerOpsDataCredentialDiscoveryInput {
+  const errorCode = 'SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_INPUT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['address', 'port', 'engine']))) throw new Error(errorCode)
+  if (!isAddressText(value.address, 255) || !isPort(value.port) || !isServerOpsDataEngine(value.engine)) throw new Error(errorCode)
+  return { address: value.address, port: value.port, engine: value.engine }
+}
+
+/** 严格解析发现结果；候选数量设上限，避免异常结果放大界面。 */
+export function parseServerOpsDataCredentialDiscoveryResult(value: unknown): ServerOpsDataCredentialDiscoveryResult {
+  const errorCode = 'SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['candidates']))) throw new Error(errorCode)
+  if (!Array.isArray(value.candidates) || value.candidates.length > 8) throw new Error(errorCode)
+  const candidates = value.candidates.map((entry) => parseServerOpsDiscoveredCredentialCandidate(entry))
+  /** 同一候选标识不得重复，否则"点选后取回哪一个"将不确定。 */
+  if (new Set(candidates.map((candidate) => candidate.id)).size !== candidates.length) throw new Error(errorCode)
+  return { candidates }
+}
+
+/** 严格解析候选凭据取回输入。 */
+export function parseServerOpsDiscoveredCredentialApplyInput(value: unknown): ServerOpsDiscoveredCredentialApplyInput {
+  const errorCode = 'SERVER_OPS_DATA_CREDENTIAL_APPLY_INPUT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['address', 'port', 'engine', 'candidateId']))) throw new Error(errorCode)
+  if (!isAddressText(value.address, 255) || !isPort(value.port) || !isServerOpsDataEngine(value.engine)) throw new Error(errorCode)
+  if (!isDiscoveryCandidateId(value.candidateId)) throw new Error(errorCode)
+  return { address: value.address, port: value.port, engine: value.engine, candidateId: value.candidateId }
+}
+
+/** 严格解析候选凭据取回结果；明文同样限定长度，避免异常大字符串进入界面。 */
+export function parseServerOpsDiscoveredCredentialApplyResult(value: unknown): ServerOpsDiscoveredCredentialApplyResult {
+  const errorCode = 'SERVER_OPS_DATA_CREDENTIAL_APPLY_RESULT_INVALID'
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(['username', 'password']))) throw new Error(errorCode)
+  if (value.username !== undefined && !isOptionalDataText(value.username, 128)) throw new Error(errorCode)
+  if (value.password !== null && !isSecretText(value.password)) throw new Error(errorCode)
+  return {
+    password: value.password,
+    ...(value.username === undefined ? {} : { username: value.username }),
+  }
 }
 
 /**

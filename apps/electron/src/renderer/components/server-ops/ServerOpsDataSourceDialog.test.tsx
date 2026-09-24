@@ -19,6 +19,8 @@ import {
   useServerOpsDataSourceDialogController,
   validateServerOpsDataSourceDraft,
 } from './ServerOpsDataSourceDialog'
+import type { ServerOpsDataSourceCredentialDiscovery } from './ServerOpsDataSourceDialog'
+import type { ServerOpsDataCredentialDiscoveryInput, ServerOpsDiscoveredCredentialCandidate } from '@proma/shared'
 
 test('Given Agent 提议 Redis 与 SQLite 连接 When 预填新建表单 Then 不出现数据库密码或 MySQL 库名', () => {
   const redis = createServerOpsDataSourceDraft(null, 'redis', { kind: 'redis', label: '缓存', address: 'cache.internal', port: 6379, transport: 'ssh', hostId: 'host-a', database: '3' })
@@ -147,6 +149,8 @@ function renderFields(options: {
   showPassword?: boolean
   /** 空字符串复现当前项目没有跳板服务器的状态。 */
   hostId?: string
+  /** 本机凭据发现能力；省略表示旧客户端不支持。 */
+  credentialDiscovery?: ServerOpsDataSourceCredentialDiscovery
 } = {}): string {
   const draft = options.draft ?? createServerOpsDataSourceDraft(options.source ?? null)
   return renderToStaticMarkup(
@@ -163,11 +167,83 @@ function renderFields(options: {
       onConnectionModeChange={() => undefined}
       onEngineChange={() => undefined}
       onShowPasswordChange={() => undefined}
+      credentialDiscovery={options.credentialDiscovery}
     />,
   )
 }
 
+/** 现场案例的候选：容器环境里的 root 账号。 */
+const discoveredRootCandidate: ServerOpsDiscoveredCredentialCandidate = {
+  id: 'chebenben-local-mysql|root',
+  label: '容器 chebenben-local-mysql 的 MYSQL_ROOT_PASSWORD',
+  username: 'root',
+  hasPassword: true,
+  origin: 'container-env',
+  privilege: 'superuser',
+}
+
+/**
+ * 构造字段层需要的发现状态。
+ *
+ * @param overrides 需要覆盖的状态字段
+ * @returns 可直接传给字段组件的发现能力
+ */
+function createCredentialDiscovery(
+  overrides: Partial<ServerOpsDataSourceCredentialDiscovery> = {},
+): ServerOpsDataSourceCredentialDiscovery {
+  return {
+    candidates: null,
+    discovering: false,
+    applyingCandidateId: null,
+    error: null,
+    onDiscover: () => undefined,
+    onApplyCandidate: () => undefined,
+    ...overrides,
+  }
+}
+
+/** 回环直连目标的草稿，用于验证入口可见性。 */
+function createLoopbackDraft(): ReturnType<typeof createServerOpsDataSourceDraft> {
+  return { ...createServerOpsDataSourceDraft(null), transport: 'direct' as const, address: '127.0.0.1', port: '13307' }
+}
+
 describe('数据源表单', () => {
+  test('Given 回环直连目标 When 渲染凭据区 Then 出现「从本机查找凭据」入口', () => {
+    const html = renderFields({ draft: createLoopbackDraft(), credentialDiscovery: createCredentialDiscovery() })
+    expect(html).toContain('从本机查找凭据')
+    expect(html).toContain('data-server-ops-data-credential-discovery="true"')
+  })
+
+  test('Given 非回环地址、跳板连接或旧客户端 When 渲染凭据区 Then 不出现入口', () => {
+    /** 私有网段是另一台机器，不能靠本机端口去猜它的凭据。 */
+    const privateDraft = { ...createServerOpsDataSourceDraft(null), transport: 'direct' as const, address: '172.16.10.198', port: '3306' }
+    expect(renderFields({ draft: privateDraft, credentialDiscovery: createCredentialDiscovery() })).not.toContain('从本机查找凭据')
+    /** 跳板连接的目标在跳板视角，本机容器与它无关。 */
+    const sshDraft = { ...createLoopbackDraft(), transport: 'ssh' as const }
+    expect(renderFields({ draft: sshDraft, credentialDiscovery: createCredentialDiscovery() })).not.toContain('从本机查找凭据')
+    /** 旧客户端没有发现能力时，界面不能显示一个点了必然报错的按钮。 */
+    expect(renderFields({ draft: createLoopbackDraft() })).not.toContain('从本机查找凭据')
+  })
+
+  test('Given 已发现候选或结果为空 When 渲染凭据区 Then 分别展示可点选项与人工回退文案', () => {
+    const draft = createLoopbackDraft()
+    const withCandidates = renderFields({
+      draft,
+      credentialDiscovery: createCredentialDiscovery({ candidates: [discoveredRootCandidate] }),
+    })
+    expect(withCandidates).toContain('容器 chebenben-local-mysql 的 MYSQL_ROOT_PASSWORD')
+    expect(withCandidates).toContain('超级用户，长期使用建议改为只读账号')
+    expect(withCandidates).toContain('使用')
+
+    const empty = renderFields({ draft, credentialDiscovery: createCredentialDiscovery({ candidates: [] }) })
+    expect(empty).toContain('没有在这台机器上发现发布了 127.0.0.1:13307 的容器')
+    expect(empty).toContain('请手工填写账号与密码')
+
+    const failed = renderFields({ draft, credentialDiscovery: createCredentialDiscovery({ error: '操作失败，请稍后重试' }) })
+    expect(failed).toContain('data-server-ops-data-credential-discovery-error="true"')
+    expect(failed).toContain('操作失败，请稍后重试')
+  })
+
   test('Given 新建连接 When 渲染连接方式 Then 本地数据库常驻且各模式只提供适用引擎', () => {
     expect(getServerOpsDataConnectionModeEngines('direct')).toEqual(['mysql', 'postgresql', 'redis'])
     expect(getServerOpsDataConnectionModeEngines('ssh')).toEqual(['mysql', 'postgresql', 'redis', 'sqlite'])
@@ -946,6 +1022,134 @@ describe('数据源表单', () => {
       expect(requireController(controller).testResult).toBeNull()
       expect(requireController(controller).testError).toBeNull()
       expect(requireController(controller).testing).toBe(false)
+    } finally {
+      act(() => host.unmount())
+      host.restore()
+    }
+  })
+
+  test('Given 回环目标 When 查找并选用候选凭据 Then 账号与口令填入草稿且不标记为已保存', async () => {
+    let controller: DialogController | null = null
+    const host = createControllerHost()
+    /** 主进程收到的查找输入，用于断言只传地址、端口与引擎。 */
+    const discoveryRequests: ServerOpsDataCredentialDiscoveryInput[] = []
+    try {
+      await act(async () => {
+        host.render(<DialogControllerProbe
+          open
+          mode="create"
+          source={null}
+          hostId="host-1"
+          onDiscoverCredentials={async (input) => {
+            discoveryRequests.push(input)
+            return { candidates: [discoveredRootCandidate] }
+          }}
+          onApplyDiscoveredCredential={async () => ({ username: 'proma_ro', password: 'discovered-secret' })}
+          onController={(next) => { controller = next }}
+        />)
+      })
+      act(() => requireController(controller).patchDraft({ address: '127.0.0.1', port: '13307' }))
+      await act(async () => { await requireController(controller).discoverCredentials() })
+      expect(discoveryRequests).toEqual([{ address: '127.0.0.1', port: 13307, engine: 'mysql' }])
+      expect(requireController(controller).credentialCandidates).toEqual([discoveredRootCandidate])
+      expect(requireController(controller).discoveringCredentials).toBe(false)
+
+      await act(async () => { await requireController(controller).applyCredential('chebenben-local-mysql|root') })
+      expect(requireController(controller).draft.username).toBe('proma_ro')
+      expect(requireController(controller).draft.password).toBe('discovered-secret')
+      expect(requireController(controller).draft.clearPassword).toBe(false)
+      /** 填进去的是本机发现的口令，不是已保存密文，保存时必须按新密码提交。 */
+      expect(requireController(controller).passwordFromStore).toBe(false)
+      expect(requireController(controller).applyingCredentialId).toBeNull()
+    } finally {
+      act(() => host.unmount())
+      host.restore()
+    }
+  })
+
+  test('Given 地址或端口不完整 When 查找凭据 Then 不调用主进程并提示先填目标', async () => {
+    let controller: DialogController | null = null
+    const host = createControllerHost()
+    /** 主进程收到的查找输入；这里必须保持为空。 */
+    const discoveryRequests: ServerOpsDataCredentialDiscoveryInput[] = []
+    try {
+      await act(async () => {
+        host.render(<DialogControllerProbe
+          open
+          mode="create"
+          source={null}
+          hostId="host-1"
+          onDiscoverCredentials={async (input) => {
+            discoveryRequests.push(input)
+            return { candidates: [] }
+          }}
+          onController={(next) => { controller = next }}
+        />)
+      })
+      /** 清空地址与端口复现"目标还没填完"的状态。 */
+      act(() => requireController(controller).patchDraft({ address: '', port: '' }))
+      await act(async () => { await requireController(controller).discoverCredentials() })
+      expect(discoveryRequests).toHaveLength(0)
+      expect(requireController(controller).discoveryError).toBe('请先填写数据库地址与端口')
+      expect(requireController(controller).credentialCandidates).toBeNull()
+    } finally {
+      act(() => host.unmount())
+      host.restore()
+    }
+  })
+
+  test('Given 已发现候选 When 改动目标地址或换引擎 Then 候选立即作废避免填错库', async () => {
+    let controller: DialogController | null = null
+    const host = createControllerHost()
+    try {
+      await act(async () => {
+        host.render(<DialogControllerProbe
+          open
+          mode="create"
+          source={null}
+          hostId="host-1"
+          onDiscoverCredentials={async () => ({ candidates: [discoveredRootCandidate] })}
+          onController={(next) => { controller = next }}
+        />)
+      })
+      act(() => requireController(controller).patchDraft({ address: '127.0.0.1', port: '13307' }))
+      await act(async () => { await requireController(controller).discoverCredentials() })
+      expect(requireController(controller).credentialCandidates).toHaveLength(1)
+
+      act(() => requireController(controller).patchDraft({ address: '127.0.0.2' }))
+      expect(requireController(controller).credentialCandidates).toBeNull()
+
+      await act(async () => { await requireController(controller).discoverCredentials() })
+      expect(requireController(controller).credentialCandidates).toHaveLength(1)
+      act(() => requireController(controller).changeEngine('postgresql'))
+      expect(requireController(controller).credentialCandidates).toBeNull()
+    } finally {
+      act(() => host.unmount())
+      host.restore()
+    }
+  })
+
+  test('Given 候选已失效 When 取回口令 Then 提示重新查找而不是报一句无信息量的失败', async () => {
+    let controller: DialogController | null = null
+    const host = createControllerHost()
+    try {
+      await act(async () => {
+        host.render(<DialogControllerProbe
+          open
+          mode="create"
+          source={null}
+          hostId="host-1"
+          onDiscoverCredentials={async () => ({ candidates: [discoveredRootCandidate] })}
+          onApplyDiscoveredCredential={async () => { throw new Error('SERVER_OPS_DATA_CREDENTIAL_CANDIDATE_NOT_FOUND') }}
+          onController={(next) => { controller = next }}
+        />)
+      })
+      act(() => requireController(controller).patchDraft({ address: '127.0.0.1', port: '13307' }))
+      await act(async () => { await requireController(controller).discoverCredentials() })
+      await act(async () => { await requireController(controller).applyCredential('chebenben-local-mysql|root') })
+      expect(requireController(controller).discoveryError).toBe('候选凭据已失效，请重新查找')
+      expect(requireController(controller).draft.password).toBe('')
+      expect(requireController(controller).applyingCredentialId).toBeNull()
     } finally {
       act(() => host.unmount())
       host.restore()

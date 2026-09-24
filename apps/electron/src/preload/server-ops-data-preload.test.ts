@@ -4,6 +4,44 @@ import type { ServerOpsDataSourceRowsInput } from '@proma/shared'
 import { createServerOpsDataPreload } from './server-ops-data-preload'
 
 describe('Server Ops 数据服务 preload 边界', () => {
+  test('Given 本机凭据发现 When 通过 bridge 查找与取回 Then 走独立通道且两侧 fail closed', async () => {
+    /** 记录真实桥接通道与输入，避免发现能力被接到其它数据源通道上。 */
+    const calls: Array<{ channel: string; input: unknown }> = []
+    const input = { address: '127.0.0.1', port: 13307, engine: 'mysql' as const }
+    const candidate = {
+      id: 'chebenben-local-mysql|root',
+      label: '容器 chebenben-local-mysql 的 MYSQL_ROOT_PASSWORD',
+      username: 'root',
+      hasPassword: true,
+      origin: 'container-env' as const,
+      privilege: 'superuser' as const,
+    }
+    const preload = createServerOpsDataPreload(async (channel, request) => {
+      calls.push({ channel, input: request })
+      return channel === SERVER_OPS_DATA_CHANNELS.DISCOVER_SOURCE_CREDENTIALS
+        ? { candidates: [candidate] }
+        : { username: 'root', password: 'p@ss' }
+    })
+    await expect(preload.discoverServerOpsDataCredentials(input)).resolves.toEqual({ candidates: [candidate] })
+    await expect(preload.applyServerOpsDiscoveredCredential({ ...input, candidateId: candidate.id }))
+      .resolves.toEqual({ username: 'root', password: 'p@ss' })
+    expect(calls).toEqual([
+      { channel: SERVER_OPS_DATA_CHANNELS.DISCOVER_SOURCE_CREDENTIALS, input },
+      { channel: SERVER_OPS_DATA_CHANNELS.APPLY_DISCOVERED_CREDENTIAL, input: { ...input, candidateId: candidate.id } },
+    ])
+    /** 输入侧：多字段、非法端口与非法候选标识都必须在发出请求之前被拒。 */
+    await expect(preload.discoverServerOpsDataCredentials({ ...input, extra: true } as never)).rejects.toThrow()
+    await expect(preload.discoverServerOpsDataCredentials({ ...input, port: 0 } as never)).rejects.toThrow()
+    await expect(preload.applyServerOpsDiscoveredCredential({ ...input, candidateId: 'no-separator' } as never)).rejects.toThrow()
+    expect(calls).toHaveLength(2)
+    /** 回执侧：候选夹带口令、或口令为空都说明协议被破坏。 */
+    const pollutedCandidates = createServerOpsDataPreload(async () => ({ candidates: [{ ...candidate, password: 'secret' }] }))
+    await expect(pollutedCandidates.discoverServerOpsDataCredentials(input)).rejects.toThrow('SERVER_OPS_DATA_CREDENTIAL_DISCOVERY_RESULT_INVALID')
+    const pollutedPassword = createServerOpsDataPreload(async () => ({ username: 'root', password: '' }))
+    await expect(pollutedPassword.applyServerOpsDiscoveredCredential({ ...input, candidateId: candidate.id }))
+      .rejects.toThrow('SERVER_OPS_DATA_CREDENTIAL_APPLY_RESULT_INVALID')
+  })
+
   test('Given SQL 数据源快照 When 设置默认数据库 Then 使用独立通道并严格校验输入回执', async () => {
     const calls: Array<{ channel: string; input: unknown }> = []
     const source = {
