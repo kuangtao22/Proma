@@ -341,7 +341,7 @@ function CatalogPanel({
               </div>
               {isExpanded && (
                 <div className="ml-4 border-l border-border/50 pl-1.5">
-                  {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} />)}
+                  {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                   {folders.map((folder) => (
                     <div key={folder} className="group/folder">
                       <div className="flex items-center gap-1 px-1 py-1 text-[11px] text-muted-foreground">
@@ -352,7 +352,7 @@ function CatalogPanel({
                         <ToolButton label="删除文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onDeleteFolder(collection.id, folder)}><Trash2 className="size-3" /></ToolButton>
                       </div>
                       <div className="ml-3">
-                        {visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder).map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} />)}
+                        {visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder).map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                       </div>
                     </div>
                   ))}
@@ -389,12 +389,18 @@ function CatalogNameDialog({ action, onOpenChange, onSubmit }: { action: Catalog
 }
 
 /** 目录中的请求入口。 */
-function RequestTreeButton({ request, activeTabId, onOpen }: { request: ApiRequestDefinition; activeTabId: string | null; onOpen: (request: ApiRequestDefinition) => void }): React.ReactElement {
+function RequestTreeButton({ request, activeTabId, onOpen, environmentKind }: {
+  request: ApiRequestDefinition
+  activeTabId: string | null
+  onOpen: (request: ApiRequestDefinition) => void
+  environmentKind?: ApiEnvironment['kind']
+}): React.ReactElement {
   /** 请求已打开时由 requestId 定位标签，按钮仍负责切换活动项。 */
   const active = activeTabId === `request_${request.id}`
   return (
     <button type="button" className={cn('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted/60', active && 'bg-muted text-foreground')} onClick={() => onOpen(request)}>
       <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
+      {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
       <span className="truncate">{request.name}</span>
     </button>
   )
@@ -417,9 +423,11 @@ function RequestTabBar({ tabs, activeTabId, onSelect, onClose }: { tabs: ApiWork
 }
 
 /** 请求编辑器主体。 */
-function RequestEditor({ tab, environmentId, onChange, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel }: {
+function RequestEditor({ tab, environmentId, environments, onChange, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel }: {
   tab: ApiWorkbenchRequestTab
   environmentId: string | null
+  /** 用于「目标环境」标记选择：标记只区分开发/测试/生产，不改变发送权限。 */
+  environments: ApiEnvironment[]
   onChange: (draft: ApiRequestDraft) => void
   onSave: () => void
   onDuplicate: () => void
@@ -467,7 +475,7 @@ function RequestEditor({ tab, environmentId, onChange, onSave, onDuplicate, onCo
         {section === 'auth' && <AuthEditor draft={tab.draft} onChange={onChange} />}
         {section === 'assertions' && <AssertionEditor assertions={tab.draft.assertions} onChange={(assertions) => patchDraft('assertions', assertions)} />}
         {section === 'extract' && <ExtractionEditor extractions={tab.draft.extractions ?? []} onChange={(extractions) => patchDraft('extractions', extractions)} />}
-        {section === 'settings' && <RequestSettings draft={tab.draft} onChange={onChange} />}
+        {section === 'settings' && <RequestSettings draft={tab.draft} environments={environments} activeEnvironmentId={environmentId} onChange={onChange} />}
       </div>
     </div>
   )
@@ -520,6 +528,24 @@ function AuthEditor({ draft, onChange }: { draft: ApiRequestDraft; onChange: (dr
   )
 }
 
+/** 环境用途的展示标签；local 对用户就是「开发」。 */
+const ENVIRONMENT_KIND_LABEL: Record<ApiEnvironment['kind'], string> = { local: '开发', test: '测试', production: '生产' }
+
+/** 环境用途徽标：生产用红色，测试用琥珀色，开发用中性色。 */
+function EnvironmentKindBadge({ kind }: { kind: ApiEnvironment['kind'] }): React.ReactElement {
+  return (
+    <span
+      className={cn('shrink-0 rounded px-1 text-[9px] font-medium',
+        kind === 'production' ? 'bg-destructive/10 text-destructive'
+          : kind === 'test' ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
+            : 'bg-muted text-muted-foreground')}
+      title={`该接口标记的目标环境：${ENVIRONMENT_KIND_LABEL[kind]}`}
+    >
+      {ENVIRONMENT_KIND_LABEL[kind]}
+    </span>
+  )
+}
+
 /** 声明式提取编辑器：提取值只进入宿主会话内存，可用 {{变量名}} 复用。 */
 function ExtractionEditor({ extractions, onChange }: { extractions: ApiExtraction[]; onChange: (extractions: ApiExtraction[]) => void }): React.ReactElement {
   /** 更新单条规则。 */
@@ -560,10 +586,42 @@ function AssertionEditor({ assertions, onChange }: { assertions: ApiAssertion[];
   )
 }
 
-/** 超时与重定向设置。 */
-function RequestSettings({ draft, onChange }: { draft: ApiRequestDraft; onChange: (draft: ApiRequestDraft) => void }): React.ReactElement {
+/** 取消标记时删掉字段，避免留下 undefined 键影响脏值比较。 */
+function withoutTargetEnvironment(draft: ApiRequestDraft): ApiRequestDraft {
+  const next = { ...draft }
+  delete next.targetEnvironmentId
+  return next
+}
+
+/** 超时、重定向与目标环境标记。 */
+function RequestSettings({ draft, environments, activeEnvironmentId, onChange }: {
+  draft: ApiRequestDraft
+  environments: ApiEnvironment[]
+  activeEnvironmentId: string | null
+  onChange: (draft: ApiRequestDraft) => void
+}): React.ReactElement {
+  /** 标记的目标环境与当前发送环境，用于展示不一致提示。 */
+  const boundKind = environments.find((item) => item.id === draft.targetEnvironmentId)?.kind
+  const activeKind = environments.find((item) => item.id === activeEnvironmentId)?.kind
   return (
     <div className="max-w-md space-y-4 text-xs">
+      <label className="grid grid-cols-[120px_1fr] items-center gap-3">
+        <span>目标环境</span>
+        <div className="flex items-center gap-2">
+          <Select value={draft.targetEnvironmentId ?? 'none'} onValueChange={(value) => onChange(value === 'none' ? withoutTargetEnvironment(draft) : { ...draft, targetEnvironmentId: value })}>
+            <SelectTrigger className="h-8 text-xs" aria-label="目标环境"><SelectValue placeholder="未标记" /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">未标记</SelectItem>
+              {environments.map((item) => <SelectItem key={item.id} value={item.id}>{item.name}（{ENVIRONMENT_KIND_LABEL[item.kind]}）</SelectItem>)}
+            </SelectContent>
+          </Select>
+          {boundKind && <EnvironmentKindBadge kind={boundKind} />}
+        </div>
+      </label>
+      <p className="text-[11px] text-muted-foreground">标记用于区分开发/测试/生产，并在打开接口时作为默认环境；它不改变发送权限，真正发送仍以工具栏当前环境为准。</p>
+      {boundKind && activeKind && boundKind !== activeKind && (
+        <p className="text-[11px] text-destructive">当前发送环境是「{ENVIRONMENT_KIND_LABEL[activeKind]}」，而该接口标记的是「{ENVIRONMENT_KIND_LABEL[boundKind]}」，发送前请确认目标。</p>
+      )}
       <label className="grid grid-cols-[120px_1fr] items-center gap-3"><span>超时（毫秒）</span><Input type="number" min={100} max={300000} value={draft.timeoutMs} onChange={(event) => onChange({ ...draft, timeoutMs: Number(event.target.value) })} className="h-8" /></label>
       <label className="flex items-center justify-between gap-3"><span>跟随重定向（仅同源）</span><Switch checked={draft.followRedirects} onCheckedChange={(followRedirects) => onChange({ ...draft, followRedirects })} /></label>
       <label className="grid grid-cols-[120px_1fr] items-center gap-3"><span>最多重定向</span><Input type="number" min={0} max={10} disabled={!draft.followRedirects} value={draft.maxRedirects} onChange={(event) => onChange({ ...draft, maxRedirects: Number(event.target.value) })} className="h-8" /></label>
@@ -834,7 +892,7 @@ function EnvironmentDialog({ open, environment, onOpenChange, onSave, onDelete }
 }
 
 /** 接口工作台阶段 A 主视图。 */
-function ApiWorkbenchSession({ sessionId, uiScope }: { sessionId: string; uiScope: string }): React.ReactElement {
+function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId: string; uiScope: string; workspaceLabel?: string }): React.ReactElement {
   /** 当前 preload 能力。 */
   const api = React.useMemo(() => getApiWorkbenchApi(), [])
   /** 目录快照。 */
@@ -981,10 +1039,14 @@ function ApiWorkbenchSession({ sessionId, uiScope }: { sessionId: string; uiScop
   const openRequest = React.useCallback((request: ApiRequestDefinition): void => {
     /** 保存请求对应的稳定编辑标签。 */
     const tabId = `request_${request.id}`
+    /** 该接口标记的目标环境只有在仍存在时才作为默认选择，避免悬空引用。 */
+    const bound = request.targetEnvironmentId && catalog?.environments.some((item) => item.id === request.targetEnvironmentId)
+      ? request.targetEnvironmentId
+      : undefined
     setView((previous) => previous.tabs.some((tab) => tab.id === tabId)
-      ? { ...previous, activeTabId: tabId }
-      : { ...previous, tabs: [...previous.tabs, createRequestTab(tabId, apiDraftFromDefinition(request), request.id, request.revision)], activeTabId: tabId, selectedRun: null })
-  }, [setView])
+      ? { ...previous, activeTabId: tabId, ...(bound ? { environmentId: bound } : {}) }
+      : { ...previous, tabs: [...previous.tabs, createRequestTab(tabId, apiDraftFromDefinition(request), request.id, request.revision)], activeTabId: tabId, selectedRun: null, ...(bound ? { environmentId: bound } : {}) })
+  }, [catalog, setView])
 
   /** 待重发的请求：等对应标签真正挂载后再发送，避免 React 批处理竞态。 */
   const [pendingResend, setPendingResend] = React.useState<string | null>(null)
@@ -1198,6 +1260,10 @@ function ApiWorkbenchSession({ sessionId, uiScope }: { sessionId: string; uiScop
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border/50 px-2.5">
         {compact && <ToolButton label="打开目录" onClick={() => setCatalogDrawerOpen(true)}><Menu className="size-4" /></ToolButton>}
         <span className="text-xs font-semibold">接口工作台</span>
+        {/** 项目制：接口资产按项目隔离，这里必须让用户看见自己在哪个项目。 */}
+        <span className="max-w-[180px] truncate text-[11px] text-muted-foreground" title={workspaceLabel ? `接口资产归项目「${workspaceLabel}」，与其它项目互不可见` : '接口资产按项目隔离'}>
+          {workspaceLabel ? `· ${workspaceLabel}` : '· 当前项目'}
+        </span>
         <div className="ml-auto flex items-center gap-1.5">
           <Select value={view.environmentId ?? 'none'} onValueChange={(environmentId) => setView((previous) => ({ ...previous, environmentId: environmentId === 'none' ? null : environmentId }))}>
             <SelectTrigger className="h-7 w-36 text-[11px]"><SelectValue placeholder="无环境" /></SelectTrigger>
@@ -1242,7 +1308,7 @@ function ApiWorkbenchSession({ sessionId, uiScope }: { sessionId: string; uiScop
                 if (activeTab.requestId && !window.confirm(`删除请求“${activeTab.draft.name}”？`)) return
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
-              }} onCopyCurl={() => void copyActiveCurl()} onSend={() => void sendActive()} onCancel={() => void controller?.cancel(activeTab.id)} /></section>}
+              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} onSend={() => void sendActive()} onCancel={() => void controller?.cancel(activeTab.id)} /></section>}
               {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={(runId, reveal = false) => { void api.getRun({ sessionId, runId, ...(reveal ? { reveal: true } : {}) }).then((run) => setView((previous) => ({ ...previous, selectedRun: run, historyOpen: false }))).catch((error: unknown) => setLoadError(errorMessage(error, '读取运行记录失败'))) }} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} /></section>}
             </div>
           )}
@@ -1274,8 +1340,8 @@ function ApiWorkbenchSession({ sessionId, uiScope }: { sessionId: string; uiScop
 }
 
 /** 工作区或会话切换时同步重建本地状态，避免旧目录残留一帧可操作。 */
-export function ApiWorkbench({ sessionId, workspaceScope }: { sessionId: string; workspaceScope?: string }): React.ReactElement {
+export function ApiWorkbench({ sessionId, workspaceScope, workspaceLabel }: { sessionId: string; workspaceScope?: string; workspaceLabel?: string }): React.ReactElement {
   /** UI 隔离键不进入 IPC，workspace 身份仍由 Host 自报和校验。 */
   const uiScope = createApiWorkbenchUiScope(sessionId, workspaceScope)
-  return <ApiWorkbenchSession key={uiScope} sessionId={sessionId} uiScope={uiScope} />
+  return <ApiWorkbenchSession key={uiScope} sessionId={sessionId} uiScope={uiScope} workspaceLabel={workspaceLabel} />
 }

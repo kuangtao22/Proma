@@ -75,6 +75,11 @@ export interface ApiRequestDraft {
    * 可选是为了兼容升级前保存的请求：解析时缺省补成空数组。
    */
   extractions?: ApiExtraction[]
+  /**
+   * 该接口绑定的目标环境；只是标记与默认选择，不授予任何执行权限。
+   * 可选是为了兼容升级前保存的请求；环境被删除后这里会留下悬空引用，界面按「环境已删除」显示。
+   */
+  targetEnvironmentId?: string
 }
 /** 已保存请求具有独立版本，更新采用 expected revision 比较。 */
 export interface ApiRequestDefinition extends ApiRequestDraft { id: string; revision: number; updatedAt: number }
@@ -247,7 +252,7 @@ function assertion(value: unknown): ApiAssertion {
   }
 }
 /** 草稿字段白名单，定义解析也复用此表。 */
-const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions'] as const
+const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId'] as const
 /** 变量名必须能直接嵌入 {{name}} 模板。 */
 const VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_.-]{0,127}$/
 /** 解析单条提取规则；来源是固定枚举，变量名必须可用于模板。 */
@@ -281,6 +286,7 @@ export function parseApiRequestDraft(value: unknown): ApiRequestDraft {
     auth: auth(record.auth), timeoutMs: apiInteger(record.timeoutMs, 100, 300000, 'timeoutMs'), followRedirects: flag(record.followRedirects, 'followRedirects'),
     maxRedirects: apiInteger(record.maxRedirects, 0, 10, 'maxRedirects'), assertions: rows(record.assertions, assertion, 64, 'assertions'),
     extractions: rows(record.extractions ?? [], extraction, API_LIMITS.maxExtractions, 'extractions'),
+    ...(record.targetEnvironmentId === undefined ? {} : { targetEnvironmentId: parseApiId(record.targetEnvironmentId) }),
   }
 }
 /** 从定义提取编辑草稿，不把内部版本字段送入草稿解析器。 */

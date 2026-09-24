@@ -135,7 +135,8 @@ describe('接口工作台 UI 集成', () => {
     expect(source).toContain("'proma:open-api-run'")
     expect(source).toContain('setApiWorkbenchOpenRunTarget')
     expect(source).toContain("handleWorkspaceTabChange('api-workbench')")
-    expect(source).toContain('<ApiWorkbench sessionId={sessionId} workspaceScope={currentWorkspaceId ?? undefined}')
+    expect(source).toContain('<ApiWorkbench')
+    expect(source).toContain('workspaceLabel={workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name}')
   })
 
   test('Given 用户打开加号菜单 When 检查入口 Then 接口工作台与其它工作区能力同级', async () => {

@@ -2189,7 +2189,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ) : paneTab === 'server-ops' ? (
       <ServerOpsWorkspace viewScope={`${sessionId}:${pane ?? 'single'}`} paneActive={paneActive} />
     ) : paneTab === 'api-workbench' ? (
-      <ApiWorkbench sessionId={sessionId} workspaceScope={currentWorkspaceId ?? undefined} />
+      <ApiWorkbench
+        sessionId={sessionId}
+        workspaceScope={currentWorkspaceId ?? undefined}
+        workspaceLabel={workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name}
+      />
     ) : paneTab === 'changes' ? (
       sessionPath ? (
         <DiffChangesList
