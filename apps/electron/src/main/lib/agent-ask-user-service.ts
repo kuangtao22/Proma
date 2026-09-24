@@ -30,6 +30,8 @@ type PermissionResult = {
 interface PendingAskUser {
   resolve: (result: PermissionResult) => void
   request: AskUserRequest
+  /** 清理本请求注册的 abort 监听器，避免回答后继续持有闭包。 */
+  cleanupAbortListener: () => void
 }
 
 /**
@@ -63,17 +65,39 @@ export class AgentAskUserService {
     }
 
     return new Promise<PermissionResult>((resolve) => {
-      this.pendingRequests.set(request.requestId, { resolve, request })
+      if (signal.aborted) {
+        resolve({ behavior: 'deny', message: '操作已中止' })
+        return
+      }
 
-      signal.addEventListener('abort', () => {
-        if (this.pendingRequests.has(request.requestId)) {
-          this.pendingRequests.delete(request.requestId)
-          resolve({ behavior: 'deny', message: '操作已中止' })
-        }
-      }, { once: true })
+      // 先声明处理器，再把它交给 pending，保证所有结束路径都能解除监听。
+      const abortHandler = () => {
+        const pending = this.pendingRequests.get(request.requestId)
+        if (!pending) return
+        this.pendingRequests.delete(request.requestId)
+        pending.cleanupAbortListener()
+        resolve({ behavior: 'deny', message: '操作已中止' })
+      }
+      this.pendingRequests.set(request.requestId, {
+        resolve,
+        request,
+        cleanupAbortListener: () => signal.removeEventListener('abort', abortHandler),
+      })
+      signal.addEventListener('abort', abortHandler, { once: true })
+      // signal 可能在首次检查后、监听器注册前转为 aborted，补一次同步复核避免遗留 pending。
+      if (signal.aborted) {
+        abortHandler()
+        return
+      }
 
       // 先登记再通知，避免事件监听方同步提交答案时找不到 pending request。
-      sendToRenderer(request)
+      try {
+        sendToRenderer(request)
+      } catch {
+        this.pendingRequests.delete(request.requestId)
+        signal.removeEventListener('abort', abortHandler)
+        resolve({ behavior: 'deny', message: '无法显示问题' })
+      }
     })
   }
 
@@ -99,6 +123,7 @@ export class AgentAskUserService {
       updatedInput,
     })
     this.pendingRequests.delete(requestId)
+    pending.cleanupAbortListener()
     return sessionId
   }
 
@@ -108,6 +133,7 @@ export class AgentAskUserService {
     if (!pending) return null
     const sessionId = pending.request.sessionId
     this.pendingRequests.delete(requestId)
+    pending.cleanupAbortListener()
     pending.resolve({ behavior: 'deny' as const, message })
     return sessionId
   }
@@ -136,6 +162,7 @@ export class AgentAskUserService {
       if (pending.request.sessionId === sessionId) {
         pending.resolve({ behavior: 'deny', message: '会话已结束' })
         this.pendingRequests.delete(requestId)
+        pending.cleanupAbortListener()
       }
     }
   }

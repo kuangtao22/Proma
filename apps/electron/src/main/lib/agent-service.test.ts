@@ -186,7 +186,7 @@ describe('Agent service 迁移准入', () => {
     }
   })
 
-  test('Given headless 与 queued 入口 When 检查源码 Then headless 延后注册且 queued 在注册和入队前守卫', () => {
+  test('Given headless 与 queued 入口 When 检查源码 Then 新 run 注册 owner、已有 run 只重绑且 queued 受写守卫保护', () => {
     /** 读取真实 agent-service 源码审计其它 Agent 入口。 */
     const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
     /** 截取 headless 新运行入口。 */
@@ -200,8 +200,14 @@ describe('Agent service 迁移准入', () => {
 
     expect(headlessBody.indexOf('registerWebContents(')).toBeGreaterThan(headlessBody.indexOf('onRunStarted:'))
     expect(queueBody.indexOf('workspaceOperationGuard.runSessionWrite(')).toBeGreaterThan(-1)
-    expect(queueBody.indexOf('registerWebContents(')).toBeGreaterThan(queueBody.indexOf('workspaceOperationGuard.runSessionWrite('))
+    expect(queueBody.indexOf('rebindWebContents(')).toBeGreaterThan(queueBody.indexOf('workspaceOperationGuard.runSessionWrite('))
     expect(queueBody.indexOf('agentQueueCoordinator.enqueue(')).toBeGreaterThan(queueBody.indexOf('workspaceOperationGuard.runSessionWrite('))
+
+    const submitStart = source.indexOf('export async function submitOrEnqueueAgentMessage(')
+    const submitEnd = source.indexOf('\n/**', submitStart + 1)
+    const submitBody = source.slice(submitStart, submitEnd)
+    expect(submitBody.match(/rebindWebContents\(/g)?.length).toBe(2)
+    expect(submitBody).toContain('await queuePreparedAgentMessage(prepared)')
   })
 
   test('Given service 正常完成或 catch When 检查终态路径 Then renderer 与 headless 都隔离外部通知后推进内部收尾', () => {

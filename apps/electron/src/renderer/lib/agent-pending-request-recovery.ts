@@ -115,6 +115,41 @@ function removeSessionRequests<TRequest>(
   return next
 }
 
+/** 每个 Jotai store 的当前恢复器；弱引用仅协调生命周期，不保留会话历史。 */
+const activeRecoveryCoordinators = new WeakMap<Store, PendingRequestRecoveryCoordinator>()
+
+/** 清理 store 中 requestIds 对应的问题草稿，不影响聊天输入草稿。 */
+function removeAskUserDrafts(store: Store, requestIds: ReadonlySet<string>): void {
+  if (requestIds.size === 0) return
+  store.set(askUserDraftsAtom, (previous) => {
+    if (![...requestIds].some((requestId) => previous.has(requestId))) return previous
+    /** 保持原草稿索引不可变，仅删除已结束问题。 */
+    const next = new Map(previous)
+    requestIds.forEach((requestId) => next.delete(requestId))
+    return next
+  })
+}
+
+/** 删除 store 中 sessionId 的三类请求及问题草稿，不更改运行身份。 */
+function clearSessionPendingRequests(store: Store, sessionId: string): void {
+  /** 删除请求之前收集它们的问题草稿身份。 */
+  const askUserRequestIds = new Set(
+    (store.get(allPendingAskUserRequestsAtom).get(sessionId) ?? []).map((request) => request.requestId),
+  )
+  store.set(allPendingPermissionRequestsAtom, (current) => removeSessionRequests(current, sessionId))
+  store.set(allPendingAskUserRequestsAtom, (current) => removeSessionRequests(current, sessionId))
+  store.set(allPendingExitPlanRequestsAtom, (current) => removeSessionRequests(current, sessionId))
+  removeAskUserDrafts(store, askUserRequestIds)
+}
+
+/** 将 sessionId 的权威终态交给 store 当前恢复器，阻止迟到快照复活旧请求。 */
+export function completePendingRequestSession(store: Store, sessionId: string): void {
+  /** 正常应用挂载时复用全局监听器的同一个恢复器。 */
+  const coordinator = activeRecoveryCoordinators.get(store)
+  if (coordinator) coordinator.completeSession(sessionId)
+  else clearSessionPendingRequests(store, sessionId)
+}
+
 /** 创建 Renderer reload 后的一次性待处理请求恢复器。 */
 export function createPendingRequestRecoveryCoordinator(
   store: Store,
@@ -136,17 +171,6 @@ export function createPendingRequestRecoveryCoordinator(
     resolvedAskUserIds.clear()
     resolvedExitPlanIds.clear()
     terminalSessionIds.clear()
-  }
-
-  /** 清理 AskUser 请求对应的未提交草稿。 */
-  const removeAskUserDrafts = (requestIds: ReadonlySet<string>): void => {
-    if (requestIds.size === 0) return
-    store.set(askUserDraftsAtom, (previous) => {
-      if (![...requestIds].some((requestId) => previous.has(requestId))) return previous
-      const next = new Map(previous)
-      requestIds.forEach((requestId) => next.delete(requestId))
-      return next
-    })
   }
 
   /** 读取并合并一次主进程权威快照。 */
@@ -191,7 +215,7 @@ export function createPendingRequestRecoveryCoordinator(
     } else if (event.type === 'ask_user_resolved') {
       if (bootstrapPending) resolvedAskUserIds.add(event.requestId)
       store.set(allPendingAskUserRequestsAtom, (current) => removeRequest(current, event.requestId))
-      removeAskUserDrafts(new Set([event.requestId]))
+      removeAskUserDrafts(store, new Set([event.requestId]))
     } else if (event.type === 'exit_plan_mode_request') {
       if (resolvedExitPlanIds.has(event.request.requestId)) return
       store.set(allPendingExitPlanRequestsAtom, (current) => upsertRequest(current, sessionId, event.request))
@@ -205,22 +229,20 @@ export function createPendingRequestRecoveryCoordinator(
   const completeSession = (sessionId: string): void => {
     if (disposed) return
     if (bootstrapPending) terminalSessionIds.add(sessionId)
-    const askUserRequestIds = new Set(
-      (store.get(allPendingAskUserRequestsAtom).get(sessionId) ?? []).map((request) => request.requestId),
-    )
-    store.set(allPendingPermissionRequestsAtom, (current) => removeSessionRequests(current, sessionId))
-    store.set(allPendingAskUserRequestsAtom, (current) => removeSessionRequests(current, sessionId))
-    store.set(allPendingExitPlanRequestsAtom, (current) => removeSessionRequests(current, sessionId))
-    removeAskUserDrafts(askUserRequestIds)
+    clearSessionPendingRequests(store, sessionId)
   }
 
-  return {
+  /** 登记本次挂载实例，供停止回执复用同一批短期终态标记。 */
+  const coordinator: PendingRequestRecoveryCoordinator = {
     start,
     handle,
     completeSession,
     dispose: () => {
       disposed = true
+      if (activeRecoveryCoordinators.get(store) === coordinator) activeRecoveryCoordinators.delete(store)
       finishBootstrap()
     },
   }
+  activeRecoveryCoordinators.set(store, coordinator)
+  return coordinator
 }

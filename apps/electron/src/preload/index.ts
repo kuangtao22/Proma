@@ -83,6 +83,7 @@ import type {
   SessionMessageSearchResponse,
   AgentSessionMeta,
   AgentActiveSessionSnapshot,
+  AgentStopResult,
   SetAgentSessionActiveWorktreeInput,
   SDKMessage,
   AgentSendInput,
@@ -751,7 +752,7 @@ export interface ElectronAPI extends LanBridgePreloadApi, NormalPathManagementPr
   sendAgentMessage: (input: AgentSendInput) => Promise<void>
 
   /** 中止 Agent 执行 */
-  stopAgent: (sessionId: string) => Promise<void>
+  stopAgent: (sessionId: string) => Promise<AgentStopResult>
 
   // ===== Agent 队列消息 =====
 

@@ -33,6 +33,7 @@ import type {
   PromaPermissionMode,
   AgentExternalRunSource,
   AgentActiveSessionSnapshot,
+  AgentStopResult,
   AgentQueuedMessageSnapshot,
   AgentMessage,
   CanvasAgentActiveRunSnapshot,
@@ -915,9 +916,11 @@ export async function generateAgentTitle(input: AgentGenerateTitleInput): Promis
 }
 
 /**
- * 中止指定会话的 Agent 执行
+ * 中止指定会话的 Agent 执行。
+ * @param sessionId 要停止的会话标识。
+ * @returns 是否仍有启动、执行或收尾中的运行，供界面安全释放运行状态。
  */
-export function stopAgent(sessionId: string): void {
+export function stopAgent(sessionId: string): AgentStopResult {
   // SEND_MESSAGE reserves this slot before the async bridge setup reaches the
   // orchestrator. Remember a stop in that window so the later run is never
   // allowed to create an uncancellable adapter query.
@@ -928,6 +931,13 @@ export function stopAgent(sessionId: string): void {
       agentQueueCoordinator.isDispatching(sessionId),
     ),
   )
+  // activeSessions 在停止请求发出时就会移除；必须核对完整生命周期，不能把已请求停止当成已退出。
+  return {
+    status: orchestrator.isInFlight(sessionId) || shouldStopBeforeAgentRun(
+      startingAgentSessions.has(sessionId),
+      agentQueueCoordinator.isDispatching(sessionId),
+    ) ? 'stopping' : 'stopped',
+  }
 }
 
 setHeadlessAgentRunner(runAgentHeadless)
@@ -1042,12 +1052,12 @@ export async function submitOrEnqueueAgentMessage(
     /** 立即注入仍属于当前可见 Renderer 交互，保存窗口必须绑定本次 IPC sender。 */
     prepareNow: (candidate) => prepareAgentRun(createAgentQueueNowInput(candidate), {}, webContents.id),
     injectPrepared: async (prepared) => {
-      registerWebContents(input.sessionId, webContents)
+      rebindWebContents(input.sessionId, webContents)
       await queuePreparedAgentMessage(prepared)
     },
     enqueue: (candidate) => {
       workspaceOperationGuard.runSessionWrite(candidate.sessionId, () => {
-        registerWebContents(candidate.sessionId, webContents)
+        rebindWebContents(candidate.sessionId, webContents)
         agentQueueCoordinator.enqueue(candidate)
       })
     },
@@ -1061,7 +1071,7 @@ export async function submitOrEnqueueAgentMessage(
 export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
   const mediaPreparedInput = prepareAgentMediaInput(input)
   workspaceOperationGuard.runSessionWrite(input.sessionId, () => {
-    registerWebContents(input.sessionId, webContents)
+    rebindWebContents(input.sessionId, webContents)
     agentQueueCoordinator.enqueue(mediaPreparedInput)
   })
 }

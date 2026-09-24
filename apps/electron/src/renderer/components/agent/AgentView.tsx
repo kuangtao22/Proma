@@ -48,7 +48,7 @@ import { preventHoverPopoverFocusRestore } from '@/components/ai-elements/input-
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { Tooltip, TooltipBoundaryProvider, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
 import { Slider } from '@/components/ui/slider'
@@ -63,6 +63,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
+import { stopAgentWithRecovery } from '@/lib/agent-stop-recovery'
 import { designAdapter } from '@/lib/design-adapter'
 import { readVisibleAgentCanvasId, synchronizeVisibleAgentCanvas } from '@/lib/agent-canvas-active-context'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
@@ -491,6 +492,12 @@ interface AgentViewProps {
 }
 
 export function AgentView({ sessionId, embedded = false }: AgentViewProps): React.ReactElement {
+  /** 当前 Agent Pane 的 DOM 边界，供 Portal Tooltip 避让右侧原生浏览器视图。 */
+  const [tooltipBoundary, setTooltipBoundary] = React.useState<HTMLElement | null>(null)
+  /** 用 callback ref 让 Tooltip 首次打开时也能取得已挂载的 Pane 边界。 */
+  const tooltipBoundaryRef = React.useCallback((element: HTMLDivElement | null) => {
+    setTooltipBoundary(element)
+  }, [])
   const store = useStore()
   const stopShortcutTarget = React.useMemo(() => ({ kind: 'agent' as const, sessionId }), [sessionId])
   const markStopShortcutTarget = React.useCallback(() => {
@@ -2476,11 +2483,12 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       })
     }
 
-    // 保持 running 到 STREAM_COMPLETE 到达。提前把它切成 false 会让输入框误以为
-    // 已经可以开启新 run，而底层 query 尚未退出，形成重复保存的竞态。
-    window.electronAPI.stopAgent(sessionId).catch((error) => {
-      console.error(error)
+    // 仅在 STREAM_COMPLETE 或后台明确确认已停止后释放 running，
+    // 避免底层 query 尚未退出时提前开启新一轮，造成重复保存。
+    void stopAgentWithRecovery(store, sessionId, window.electronAPI.stopAgent).catch((error) => {
+      console.error('[AgentView] 停止 Agent 失败:', error)
       setIsStopping(false)
+      toast.error('停止请求失败，请重试', { description: getErrorMessage(error) })
     })
   }, [isStopping, sessionId, store])
 
@@ -3179,7 +3187,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
 
   return (
     <>
+    <TooltipBoundaryProvider boundary={tooltipBoundary}>
       <div
+        ref={tooltipBoundaryRef}
         className="flex h-full min-h-0 flex-1 min-w-0 flex-col overflow-hidden"
         onFocusCapture={markStopShortcutTarget}
         onPointerDownCapture={markStopShortcutTarget}
@@ -3237,14 +3247,14 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         />
 
         {/* 权限请求横幅 */}
-        <PermissionBanner sessionId={sessionId} />
+        <PermissionBanner sessionId={sessionId} onStop={handleStop} />
 
         {/* AskUserQuestion 交互式问答横幅 */}
-        <AskUserBanner sessionId={sessionId} />
+        <AskUserBanner sessionId={sessionId} onStop={handleStop} />
 
 
         {/* ExitPlanMode 计划审批横幅 */}
-        <ExitPlanModeBanner sessionId={sessionId} />
+        <ExitPlanModeBanner sessionId={sessionId} onStop={handleStop} />
 
         {/* 输入区域 — 交互横幅显示时隐藏，由横幅替代 */}
         {!hasBannerOverlay && (
@@ -3393,6 +3403,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         )}
         </div>
       </div>
+    </TooltipBoundaryProvider>
 
     <Dialog open={todoDialogOpen} onOpenChange={setTodoDialogOpen}>
       <DialogContent className="max-w-lg">

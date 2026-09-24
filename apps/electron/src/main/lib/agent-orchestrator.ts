@@ -2605,6 +2605,7 @@ export class AgentOrchestrator {
     // stop 同步拥有被停止代际的审批状态，必须在新 generation 可运行前清理。
     permissionService.clearSessionPending(sessionId)
     exitPlanService.clearSessionPending(sessionId)
+    askUserService.clearSessionPending(sessionId)
     this.adapter.abort(sessionId)
     console.log(`[Agent 编排] 已中止会话: ${sessionId}`)
   }

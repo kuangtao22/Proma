@@ -134,9 +134,7 @@ import {
 } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
 import {
-  isSameOrNewerRun,
   isTerminalEventForCurrentRun,
-  type AgentRunMarker,
 } from '@/lib/agent-active-session-snapshot'
 import { designAdapter } from '@/lib/design-adapter'
 import {
@@ -145,7 +143,7 @@ import {
 } from '@/lib/canvas-agent-event-routing'
 import type { CanvasAgentOwner } from '@/lib/canvas-agent-event-routing'
 import { getChangedWorkspaceComponentFromSdkMessage, shouldRevealChangedWorkspaceComponentImmediately } from '@/lib/agent-component-activation'
-import { mergeActiveAgentSessionSnapshot } from '@/lib/agent-active-session-snapshot'
+import { agentTerminalRunMarkersAtom, mergeActiveAgentSessionSnapshot, recordAgentTerminalRun } from '@/lib/agent-active-session-snapshot'
 import { buildTodoAgentPrompt } from '@/lib/todo-agent-prompt'
 import { createAgentCanvasChangeConsumer } from '@/lib/agent-canvas-change-navigation'
 import { createPendingRequestRecoveryCoordinator } from '@/lib/agent-pending-request-recovery'
@@ -1228,10 +1226,8 @@ export function useGlobalAgentListeners(): void {
     }
 
     const isWindows = detectIsWindows()
-    // 初始化快照与 STREAM_COMPLETE 可跨 IPC channel 乱序抵达。完成处理回收
-    // startedAt 后仍需保留一个短生命周期的终态标记，避免迟到快照复活旧 run。
-    // 新协议用 runGeneration；只有老协议才回退到 startedAt。
-    const latestTerminalRun = new Map<string, AgentRunMarker>()
+    // 初始化快照与 STREAM_COMPLETE 可跨 IPC channel 乱序抵达，终态身份由
+    // agentTerminalRunMarkersAtom 统一保存；下方时间戳索引保留旧事件路径的兼容处理。
     const latestTerminalRunStartedAt = new Map<string, number>()
 
     const bumpPreviewContentRefresh = (sessionId: string, file: PreviewFile): void => {
@@ -1413,7 +1409,7 @@ export function useGlobalAgentListeners(): void {
             return mergeActiveAgentSessionSnapshot(
               existing,
               snapshot,
-              latestTerminalRun.get(snapshot.sessionId),
+              store.get(agentTerminalRunMarkersAtom).get(snapshot.sessionId),
             )
           })
         }
@@ -2064,11 +2060,7 @@ export function useGlobalAgentListeners(): void {
         // 等后台任务完成时 Agent 会自动唤醒续轮。
         const backgroundTasksPending = data.backgroundTasksPending === true
         if (!backgroundTasksPending && (data.runGeneration != null || data.startedAt != null)) {
-          const terminalRun = { startedAt: data.startedAt, runGeneration: data.runGeneration }
-          const previousTerminalRun = latestTerminalRun.get(data.sessionId)
-          if (!previousTerminalRun || !isSameOrNewerRun(previousTerminalRun, terminalRun)) {
-            latestTerminalRun.set(data.sessionId, terminalRun)
-          }
+          recordAgentTerminalRun(store, data.sessionId, data)
         }
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
 

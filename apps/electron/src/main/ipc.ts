@@ -3114,7 +3114,8 @@ export function registerIpcHandlers(): void {
       sourceDesignJobId: input.sourceDesignJobId,
     }),
     runHeadless: runAgentHeadless,
-    stopAgent,
+    // 画布调度器只发出停止指令，回执由 Renderer 停止交互消费。
+    stopAgent: (sessionId) => { stopAgent(sessionId) },
     traceStore: designTraceStore,
     sessionLifecycle: designExecutionSessionLifecycle,
     resolveOwnedOutputPath: resolveOwnedDesignJobOutputPath,
@@ -6206,10 +6207,10 @@ export function registerIpcHandlers(): void {
   // 中止 Agent 执行
   ipcMain.handle(
     AGENT_IPC_CHANNELS.STOP_AGENT,
-    async (_, sessionId: string): Promise<void> => {
+    async (_, sessionId: string): Promise<import('@proma/shared').AgentStopResult> => {
       requireVisibleSession(sessionId)
       feishuBridgeManager.stopSessionMirrorRun(sessionId)
-      stopAgent(sessionId)
+      return stopAgent(sessionId)
     }
   )
 

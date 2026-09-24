@@ -112,6 +112,26 @@ async function waitForInitialViews(layouts: readonly LayoutRecord[]): Promise<vo
   assert.fail('两个 BrowserSlot 未同时挂载真实 WebContentsView')
 }
 
+/** 验证长 Tooltip 在宽/窄 Pane 与深浅主题下都保持在聊天边界内。 */
+async function verifyTooltipBoundary(window: BrowserWindow): Promise<void> {
+  const result = await window.webContents.executeJavaScript(`(() => {
+    const boundary = document.querySelector('[data-testid="tooltip-boundary"]')
+    const content = document.querySelector('[data-testid="edge-tooltip-content"]')
+    if (!(boundary instanceof HTMLElement) || !(content instanceof HTMLElement)) return null
+    const boundaryRect = boundary.getBoundingClientRect()
+    const contentRect = content.getBoundingClientRect()
+    return {
+      boundaryLeft: boundaryRect.left,
+      boundaryRight: boundaryRect.right,
+      contentLeft: contentRect.left,
+      contentRight: contentRect.right,
+    }
+  })()`)
+  assert.ok(result, '找不到 Tooltip 或聊天 Pane 边界')
+  assert.ok(result.contentLeft >= result.boundaryLeft - 1, `Tooltip 越过聊天 Pane 左边界：${JSON.stringify(result)}`)
+  assert.ok(result.contentRight <= result.boundaryRight + 1, `Tooltip 越过聊天 Pane 边界：${JSON.stringify(result)}`)
+}
+
 /** 等待指定 tab 的最新布局达到目标可见性与会话保留语义。 */
 async function waitForLayout(
   layouts: readonly LayoutRecord[],
@@ -306,6 +326,9 @@ async function runElectronSmoke(): Promise<void> {
       sandbox: false,
     },
   })
+  window.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) console.error(`[浏览器模态 smoke] renderer console ${sourceId}:${line}: ${message}`)
+  })
 
   /** 为 BrowserSlot 的每个 tab 懒创建真实原生 WebContentsView。 */
   const ensureView = (tabId: string): NativeViewRecord => {
@@ -351,6 +374,13 @@ async function runElectronSmoke(): Promise<void> {
       '隔离 preload 未暴露 setAgentBrowserLayout',
     )
     await waitForInitialViews(layouts)
+    await verifyTooltipBoundary(window)
+    await window.webContents.executeJavaScript("window.__browserModalSmoke.setTheme('dark')")
+    window.setContentSize(720, 760)
+    await settle(window)
+    await verifyTooltipBoundary(window)
+    window.setContentSize(1200, 780)
+    await settle(window)
     await verifyModalFocusChain(window, views, layouts)
     await verifyNonModalOverlays(window, layouts)
     await verifyRollbackDialog(window, views, layouts, 'light')

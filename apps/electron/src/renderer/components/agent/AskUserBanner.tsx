@@ -6,7 +6,7 @@
  */
 
 import * as React from 'react'
-import { useAtom, useSetAtom } from 'jotai'
+import { useAtom } from 'jotai'
 import { Send, X } from 'lucide-react'
 import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -22,7 +22,6 @@ import {
 } from '@/lib/voice-input-focus'
 import {
   allPendingAskUserRequestsAtom,
-  agentStreamingStatesAtom,
   askUserDraftsAtom,
   type AskUserQuestionDraft,
   type AskUserRequestDraft,
@@ -41,12 +40,13 @@ function safeUrlTransform(url: string): string {
 /** AskUserBanner 属性接口 */
 interface AskUserBannerProps {
   sessionId: string
+  /** 交由 AgentView 统一执行权威停止与状态恢复。 */
+  onStop: () => void
 }
 
-export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactElement | null {
+export function AskUserBanner({ sessionId, onStop }: AskUserBannerProps): React.ReactElement | null {
   const [allRequests, setAllRequests] = useAtom(allPendingAskUserRequestsAtom)
   const [drafts, setDrafts] = useAtom(askUserDraftsAtom)
-  const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   const requests = allRequests.get(sessionId) ?? []
   const [submitting, setSubmitting] = React.useState(false)
 
@@ -140,30 +140,6 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [request?.requestId])
-
-  /** 关闭问题 & 终止 Agent */
-  const handleDismiss = (): void => {
-    // 立即标记 streaming 停止，避免 UI 残留
-    setStreamingStates((prev) => {
-      const current = prev.get(sessionId)
-      if (!current || !current.running) return prev
-      const map = new Map(prev)
-      map.set(sessionId, {
-        ...current,
-        running: false,
-      })
-      return map
-    })
-    // 清除当前 session 所有待处理的 AskUser 请求
-    setAllRequests((prev) => {
-      const map = new Map(prev)
-      map.delete(sessionId)
-      return map
-    })
-    clearDrafts(requests.map((r) => r.requestId))
-    // 终止 Agent
-    window.electronAPI.stopAgent(sessionId).catch(console.error)
-  }
 
   if (!request) return null
 
@@ -290,7 +266,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
             <button
               type="button"
               className="size-5 flex items-center justify-center rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
-              onClick={handleDismiss}
+              onClick={onStop}
               title="关闭并终止 Agent"
             >
               <X className="size-3.5" />

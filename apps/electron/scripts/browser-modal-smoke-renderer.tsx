@@ -25,6 +25,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from '../src/renderer/components/ui/popover'
 import { Sheet, SheetClose, SheetContent, SheetDescription, SheetTitle } from '../src/renderer/components/ui/sheet'
 import { Toaster } from '../src/renderer/components/ui/sonner'
+import { Tooltip, TooltipBoundaryProvider, TooltipContent, TooltipProvider, TooltipTrigger } from '../src/renderer/components/ui/tooltip'
 
 type SmokeTheme = 'light' | 'dark'
 
@@ -53,6 +54,9 @@ declare global {
 
 /** 渲染两个真实 BrowserSlot 与生产 Radix 浮层，覆盖原生视图遮挡边界。 */
 function BrowserModalFixture(): React.ReactElement {
+  /** 真实 smoke Pane 的碰撞边界，覆盖窄宽和深浅主题回归。 */
+  const [tooltipBoundary, setTooltipBoundary] = React.useState<HTMLElement | null>(null)
+  const tooltipBoundaryRef = React.useCallback((element: HTMLElement | null) => setTooltipBoundary(element), [])
   /** 当前主题用于同时驱动 DOM class 与 Toaster。 */
   const [theme, setTheme] = React.useState<SmokeTheme>('light')
   /** 回退确认弹窗的受控状态。 */
@@ -109,7 +113,9 @@ function BrowserModalFixture(): React.ReactElement {
   }, [])
 
   return (
-    <main className="overflow-hidden bg-background text-foreground" style={{ height: '100vh' }}>
+    <TooltipProvider delayDuration={0}>
+      <TooltipBoundaryProvider boundary={tooltipBoundary}>
+        <main data-testid="smoke-pane" className="overflow-hidden bg-background text-foreground" style={{ height: '100vh' }}>
       <header className="flex h-14 items-center justify-between border-b px-5">
         <div>
           <p className="text-sm font-semibold">原生浏览器模态避让回归</p>
@@ -122,13 +128,21 @@ function BrowserModalFixture(): React.ReactElement {
       </header>
 
       <section style={{ display: 'grid', gridTemplateColumns: '36% 64%', height: 'calc(100vh - 3.5rem)' }}>
-        <div className="space-y-3 border-r p-5">
+        <div ref={tooltipBoundaryRef} data-testid="tooltip-boundary" className="space-y-3 border-r p-5">
           <h1 className="text-xl font-semibold">确认回退</h1>
           <p className="text-sm text-muted-foreground">弹窗横跨网页左边界，按钮区域落在原生网页之上。</p>
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => setAlertOpen(true)}>打开确认回退</Button>
             <Button variant="outline" onClick={() => setOuterOpen(true)}>打开嵌套弹窗</Button>
             <Button variant="outline" onClick={() => setSheetOpen(true)}>打开 Sheet</Button>
+          </div>
+          <div className="flex justify-end" data-testid="tooltip-boundary-trigger">
+            <Tooltip open>
+              <TooltipTrigger asChild><Button data-testid="edge-tooltip-trigger" size="icon" variant="ghost">?</Button></TooltipTrigger>
+              <TooltipContent data-testid="edge-tooltip-content" side="top">
+                <p>停止 Agent（Command 加速键）；停止未确认时可再次发送中断请求，提示必须完整留在当前聊天 Pane 内。</p>
+              </TooltipContent>
+            </Tooltip>
           </div>
         </div>
         <div className="min-w-0 bg-muted/30 p-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
@@ -186,7 +200,9 @@ function BrowserModalFixture(): React.ReactElement {
         </DialogContent>
       </Dialog>
       <Toaster />
-    </main>
+        </main>
+      </TooltipBoundaryProvider>
+    </TooltipProvider>
   )
 }
 

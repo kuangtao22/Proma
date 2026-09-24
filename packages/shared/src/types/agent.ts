@@ -1578,6 +1578,12 @@ export interface AgentStreamEvent {
   event?: AgentEvent
 }
 
+/** 停止请求的权威回执；stopped 仅表示当前已无启动、执行或收尾中的运行。 */
+export interface AgentStopResult {
+  /** stopping 时继续等待正常终态，不允许 Renderer 提前释放运行锁。 */
+  status: 'stopping' | 'stopped'
+}
+
 export interface AgentActiveSessionSnapshot {
   sessionId: string
   /** 对应当前运行实例的启动时间，用于拒绝陈旧的 renderer 恢复快照。 */

@@ -10,7 +10,7 @@
  */
 
 import * as React from 'react'
-import { useAtom, useSetAtom } from 'jotai'
+import { useAtom } from 'jotai'
 import {
   Check,
   X,
@@ -19,7 +19,7 @@ import {
   FileText,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { allPendingExitPlanRequestsAtom, agentStreamingStatesAtom } from '@/atoms/agent-atoms'
+import { allPendingExitPlanRequestsAtom } from '@/atoms/agent-atoms'
 import type { ExitPlanModeAction, ExitPlanAllowedPrompt } from '@proma/shared'
 
 /** 选项定义 */
@@ -57,11 +57,12 @@ const PLAN_OPTIONS: PlanOption[] = [
 
 interface ExitPlanModeBannerProps {
   sessionId: string
+  /** 交由 AgentView 统一执行权威停止与状态恢复。 */
+  onStop: () => void
 }
 
-export function ExitPlanModeBanner({ sessionId }: ExitPlanModeBannerProps): React.ReactElement | null {
+export function ExitPlanModeBanner({ sessionId, onStop }: ExitPlanModeBannerProps): React.ReactElement | null {
   const [allRequests, setAllRequests] = useAtom(allPendingExitPlanRequestsAtom)
-  const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   const requests = allRequests.get(sessionId) ?? []
   const [focusedIdx, setFocusedIdx] = React.useState(0)
   const [showFeedback, setShowFeedback] = React.useState(false)
@@ -110,26 +111,6 @@ export function ExitPlanModeBanner({ sessionId }: ExitPlanModeBannerProps): Reac
   }
 
   handleActionRef.current = handleAction
-
-  /** 关闭计划审批 & 终止 Agent */
-  const handleDismiss = (): void => {
-    setStreamingStates((prev) => {
-      const current = prev.get(sessionId)
-      if (!current || !current.running) return prev
-      const map = new Map(prev)
-      map.set(sessionId, {
-        ...current,
-        running: false,
-      })
-      return map
-    })
-    setAllRequests((prev) => {
-      const map = new Map(prev)
-      map.delete(sessionId)
-      return map
-    })
-    window.electronAPI.stopAgent(sessionId).catch(console.error)
-  }
 
   // 键盘导航：只在 requestId 变化时重建 handler，内部通过 ref 读取最新值
   React.useEffect(() => {
@@ -201,7 +182,7 @@ export function ExitPlanModeBanner({ sessionId }: ExitPlanModeBannerProps): Reac
           <button
             type="button"
             className="size-5 flex items-center justify-center rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
-            onClick={handleDismiss}
+            onClick={onStop}
             title="关闭并终止 Agent"
           >
             <X className="size-3.5" />

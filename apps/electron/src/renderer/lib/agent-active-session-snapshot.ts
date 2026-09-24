@@ -1,3 +1,5 @@
+import { atom } from 'jotai'
+import type { Store } from 'jotai/vanilla/store'
 import type { AgentActiveSessionSnapshot } from '@proma/shared'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
 import { createQueuedAgentStreamState } from './agent-message-queue'
@@ -6,6 +8,23 @@ import { createQueuedAgentStreamState } from './agent-message-queue'
 export interface AgentRunMarker {
   startedAt?: number
   runGeneration?: number
+}
+
+/** 每个 Renderer store 只保留各会话最新终态身份，避免消息展示清理后被旧快照复活。 */
+export const agentTerminalRunMarkersAtom = atom<Map<string, AgentRunMarker>>(new Map())
+
+/** 将 sessionId 的 run 终态身份写入 store；旧代际不能覆盖较新的终态。 */
+export function recordAgentTerminalRun(store: Store, sessionId: string, run: AgentRunMarker): void {
+  if (run.startedAt == null && run.runGeneration == null) return
+  store.set(agentTerminalRunMarkersAtom, (previous) => {
+    /** 当前已知的最新终态，和普通完成事件共用同一代际判定。 */
+    const existing = previous.get(sessionId)
+    if (existing && isSameOrNewerRun(existing, run)) return previous
+    /** 仅保存身份字段，不保留整份运行状态或消息。 */
+    const next = new Map(previous)
+    next.set(sessionId, { startedAt: run.startedAt, runGeneration: run.runGeneration })
+    return next
+  })
 }
 
 /**
