@@ -133,7 +133,7 @@ import { ApiImportDialog } from './ApiImportDialog'
 import { ApiScenarioPanel } from './ApiScenarioPanel'
 import { ApiRequestMoveDialog } from './ApiRequestMoveDialog'
 import { ApiSplitHandle } from './ApiSplitHandle'
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
@@ -313,46 +313,105 @@ function FieldRows({
 }
 
 /**
- * 集合与分组共用的「…」操作入口。
- *
- * 用途：把一行的所有动作收进下拉菜单，行宽不再被按钮分摊（现场反馈「名字被挤成默..」）；
- * 触发器常驻显示（悬停前是弱化的 45% 前景色），保证动作入口可发现而不是靠猜悬停。
- *
- * @param label 触发器无障碍名称（同时供界面回归测试定位）
- * @param items 菜单项；destructive 项会自动前置分隔线并使用危险色
+ * 目录行（集合一级行 / 分组行）的一个动作。
+ * 同一份定义同时驱动「…」菜单与整行右键菜单，避免两处清单漏改。
  */
-function CatalogRowActions({ label, items }: {
+interface CatalogRowAction {
+  key: string
   label: string
-  items: Array<{ key: string; label: string; icon: React.ReactNode; onSelect: () => void; destructive?: boolean }>
+  icon: React.ReactNode
+  onSelect: () => void
+  /** 危险动作：自动前置分隔线并使用危险色。 */
+  destructive?: boolean
+}
+
+/**
+ * 渲染动作清单。
+ *
+ * @param items 动作定义
+ * @param kind 渲染成下拉菜单项还是右键菜单项（Radix 是两套组件，行为一致）
+ */
+function CatalogMenuEntries({ items, kind }: { items: CatalogRowAction[]; kind: 'dropdown' | 'context' }): React.ReactElement {
+  const Item = (kind === 'dropdown' ? DropdownMenuItem : ContextMenuItem) as React.ElementType
+  const Separator = (kind === 'dropdown' ? DropdownMenuSeparator : ContextMenuSeparator) as React.ElementType
+  return (
+    <>
+      {items.map((item, index) => (
+        <React.Fragment key={item.key}>
+          {item.destructive && index > 0 && <Separator />}
+          <Item className={item.destructive ? 'text-destructive focus:text-destructive' : undefined} onSelect={item.onSelect}>
+            {item.icon}
+            {item.label}
+          </Item>
+        </React.Fragment>
+      ))}
+    </>
+  )
+}
+
+/**
+ * 目录行的动作区：对外只暴露「＋」和「…」两个入口。
+ *
+ * 「＋」是该行最高频动作（集合=新建请求、分组=在分组中新建请求），常驻显示；
+ * 其余动作收进「…」菜单，行宽不再被并排按钮分摊（现场反馈「名字被挤成默..」）。
+ *
+ * @param addLabel 「＋」的无障碍名称（同时供界面回归定位）
+ * @param onAdd 「＋」的动作
+ * @param menuLabel 「…」的无障碍名称
+ * @param menuItems 「…」菜单里的动作
+ */
+function CatalogRowActions({ addLabel, onAdd, menuLabel, menuItems }: {
+  addLabel: string
+  onAdd: () => void
+  menuLabel: string
+  menuItems: CatalogRowAction[]
 }): React.ReactElement {
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          aria-label={label}
-          className="mr-1 size-6 shrink-0 rounded-[8px] text-foreground/45 transition-colors hover:bg-foreground/[0.06] hover:text-foreground data-[state=open]:bg-foreground/[0.06] data-[state=open]:text-foreground"
-        >
-          <MoreHorizontal className="size-3.5" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-44">
-        {items.map((item, index) => (
-          <React.Fragment key={item.key}>
-            {item.destructive && index > 0 && <DropdownMenuSeparator />}
-            <DropdownMenuItem
-              className={item.destructive ? 'text-destructive focus:text-destructive' : undefined}
-              onSelect={item.onSelect}
-            >
-              {item.icon}
-              {item.label}
-            </DropdownMenuItem>
-          </React.Fragment>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        aria-label={addLabel}
+        className="size-6 shrink-0 rounded-[8px] text-foreground/45 transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+        onClick={onAdd}
+      >
+        <Plus className="size-3.5" />
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={menuLabel}
+            className="mr-1 size-6 shrink-0 rounded-[8px] text-foreground/45 transition-colors hover:bg-foreground/[0.06] hover:text-foreground data-[state=open]:bg-foreground/[0.06] data-[state=open]:text-foreground"
+          >
+            <MoreHorizontal className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-44">
+          <CatalogMenuEntries items={menuItems} kind="dropdown" />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </>
+  )
+}
+
+/**
+ * 让整行支持右键唤出同一份动作清单。
+ *
+ * @param items 右键菜单项（通常比「…」多一个「＋」对应的动作，右键时给完整清单）
+ * @param children 行元素本身，作为右键触发区（Radix 用 asChild，不额外增加 DOM 层级）
+ */
+function CatalogRowContextMenu({ items, children }: { items: CatalogRowAction[]; children: React.ReactElement }): React.ReactElement {
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent className="min-w-44">
+        <CatalogMenuEntries items={items} kind="context" />
+      </ContextMenuContent>
+    </ContextMenu>
   )
 }
 
@@ -440,6 +499,14 @@ function CatalogPanel({
                * 分不清自己在哪个集合里（现场反馈「一级类不见了」就是这个观感）。
                */}
               {/* 一级行沿用应用自带列表风格：无边框方块、rounded-[10px]、foreground 透明层 hover。 */}
+              <CatalogRowContextMenu items={[
+                { key: 'create-request', label: '新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id) },
+                { key: 'create-folder', label: '新建文件夹', icon: <FolderPlus />, onSelect: () => onCreateFolder(collection) },
+                { key: 'extract-variable', label: '主机提取为变量', icon: <Link2 />, onSelect: () => onExtractBaseUrl(collection) },
+                { key: 'extract-environment', label: '主机提取到环境', icon: <Server />, onSelect: () => onExtractBaseUrlToEnvironment(collection) },
+                { key: 'rename-collection', label: '重命名集合', icon: <Pencil />, onSelect: () => onRenameCollection(collection) },
+                { key: 'delete-collection', label: '删除集合', icon: <Trash2 />, destructive: true, onSelect: () => onDeleteCollection(collection) },
+              ]}>
               <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
                 <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] font-medium" onClick={() => setExpanded((previous) => {
                   /** 复制集合，避免原地修改 React 状态。 */
@@ -452,11 +519,12 @@ function CatalogPanel({
                   {/* 名称损坏（历史数据或导入）时也要看得见这一级，而不是渲染成空白行。 */}
                   <span className="truncate">{collection.name.trim() || '（未命名集合）'}</span>
                 </button>
-                {/** 所有集合动作收进「…」菜单：行内只留一个触发器，名称拿到整行宽度。 */}
+                {/** 行内只放「＋」和「…」：新建请求直接点，其余动作进菜单，右键整行同样能唤出完整清单。 */}
                 <CatalogRowActions
-                  label={`集合操作 ${collection.name.trim() || '（未命名集合）'}`}
-                  items={[
-                    { key: 'create-request', label: '新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id) },
+                  addLabel={`新建请求 ${collection.name.trim() || '（未命名集合）'}`}
+                  onAdd={() => onCreateRequest(collection.id)}
+                  menuLabel={`集合操作 ${collection.name.trim() || '（未命名集合）'}`}
+                  menuItems={[
                     { key: 'create-folder', label: '新建文件夹', icon: <FolderPlus />, onSelect: () => onCreateFolder(collection) },
                     { key: 'extract-variable', label: '主机提取为变量', icon: <Link2 />, onSelect: () => onExtractBaseUrl(collection) },
                     { key: 'extract-environment', label: '主机提取到环境', icon: <Server />, onSelect: () => onExtractBaseUrlToEnvironment(collection) },
@@ -465,6 +533,7 @@ function CatalogPanel({
                   ]}
                 />
               </div>
+              </CatalogRowContextMenu>
               {isExpanded && (
                 <div className="ml-4 border-l border-border/50 pl-1.5">
                   {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
@@ -478,6 +547,11 @@ function CatalogPanel({
                     return (
                       <div key={folder} className="group">
                         {/** 分组标题行：整行可点收起/展开；「…」菜单挂在这一行内部，不会跑到请求列表上。 */}
+                        <CatalogRowContextMenu items={[
+                          { key: 'create-request-in-folder', label: '在分组中新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id, folder) },
+                          { key: 'rename-folder', label: '重命名文件夹', icon: <Pencil />, onSelect: () => onRenameFolder(collection.id, folder) },
+                          { key: 'delete-folder', label: '删除文件夹', icon: <Trash2 />, destructive: true, onSelect: () => onDeleteFolder(collection.id, folder) },
+                        ]}>
                         <div data-api-folder-header={`${collection.id}:${folder}`} className="flex items-center rounded-[10px] text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
                           <button
                             type="button"
@@ -496,16 +570,18 @@ function CatalogPanel({
                             <span className="min-w-0 flex-1 truncate">{folder}</span>
                             <span className="shrink-0 text-[10px] text-foreground/35">{folderRequests.length}</span>
                           </button>
-                          {/** 分组动作同样收进「…」菜单。 */}
+                          {/** 分组同样只放「＋」和「…」，右键整行唤出完整清单。 */}
                           <CatalogRowActions
-                            label={`分组操作 ${folder}`}
-                            items={[
-                              { key: 'create-request-in-folder', label: '在文件夹中新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id, folder) },
+                            addLabel={`在分组中新建请求 ${folder}`}
+                            onAdd={() => onCreateRequest(collection.id, folder)}
+                            menuLabel={`分组操作 ${folder}`}
+                            menuItems={[
                               { key: 'rename-folder', label: '重命名文件夹', icon: <Pencil />, onSelect: () => onRenameFolder(collection.id, folder) },
                               { key: 'delete-folder', label: '删除文件夹', icon: <Trash2 />, destructive: true, onSelect: () => onDeleteFolder(collection.id, folder) },
                             ]}
                           />
                         </div>
+                        </CatalogRowContextMenu>
                         {!isFolderCollapsed && (
                           <div className="ml-3">
                             {folderRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
