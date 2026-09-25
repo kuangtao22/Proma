@@ -32,12 +32,22 @@ export interface ApiApprovalFileLine {
 
 /** 审批卡要展示的接口视图；caseDiff 为空表示这次没有用例改动。 */
 export interface ApiWorkbenchApprovalView {
-  kind: 'api-send' | 'api-save'
+  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save'
   title: string
   lines: string[]
   /** 本次要读取并上传的文件；为空表示没有附件（普通请求或保存审批）。 */
   files: ApiApprovalFileLine[]
+  /** 流程审批的步骤清单：一次批准针对的就是这几行。 */
+  steps: ApiApprovalScenarioStep[]
+  /** Host 给出的提醒（production 环境、continue 策略等）。 */
+  warnings: string[]
   caseDiff: ApiApprovalCaseDiff[]
+}
+
+/** 流程里的一步：序号 + 「名称 · 方法 URL」等展示文本。 */
+export interface ApiApprovalScenarioStep {
+  index: number
+  text: string
 }
 
 /** 变更类型的中文说明，顺序固定为新增/修改/删除。 */
@@ -88,6 +98,30 @@ function fileLines(value: unknown): ApiApprovalFileLine[] {
   })
 }
 
+/** 解析 Host 生成的流程步骤清单；坏项丢弃，序号必须从 0 连续，避免展示成另一种顺序。 */
+function scenarioSteps(value: unknown): ApiApprovalScenarioStep[] {
+  if (!Array.isArray(value)) return []
+  const steps = value.flatMap((item) => {
+    const entry = record(item)
+    const index = entry?.index
+    const name = entry ? string(entry.name) : undefined
+    const method = entry ? string(entry.method) : undefined
+    const url = entry ? string(entry.url) : undefined
+    if (!entry || typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 || !name || !method || !url) return []
+    const environment = string(entry.environmentKind)
+    const caseId = string(entry.caseId)
+    return [{ index, text: `${index + 1}. ${name} · ${method} ${url}${caseId ? `（用例 ${caseId}）` : ''}${environment === 'production' ? ' ⚠ 生产环境' : ''}` }]
+  }).sort((a, b) => a.index - b.index)
+  if (steps.some((step, position) => step.index !== position)) return []
+  return steps
+}
+
+/** 解析 Host 给出的提醒文本。 */
+function warnings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => (typeof item === 'string' && item !== '' ? [item] : []))
+}
+
 /**
  * 把接口工作台的两个变更工具投影成审批卡视图。
  * @param toolName 工具名；非接口变更工具返回 null，调用方回落到原有 JSON 展示。
@@ -95,6 +129,58 @@ function fileLines(value: unknown): ApiApprovalFileLine[] {
  * @returns 结构化视图；快照缺少必要字段时返回 null。
  */
 export function describeApiWorkbenchApproval(toolName: string, toolInput: Record<string, unknown>): ApiWorkbenchApprovalView | null {
+  /** 一次批准跑完整条流程：卡片逐行列出将要发出的每一步。 */
+  if (toolName === 'api_run_scenario') {
+    const scenario = record(toolInput.scenario)
+    if (!scenario) return null
+    const name = string(scenario.scenarioName) ?? '未命名流程'
+    const environmentId = string(scenario.environmentId)
+    const onFailure = scenario.onFailure === 'continue' ? 'continue（失败后继续执行后续步骤）' : 'stop（失败后跳过后续步骤）'
+    const steps = scenarioSteps(scenario.steps)
+    return {
+      kind: 'api-scenario-run',
+      title: '运行接口流程（一次批准整条流程）',
+      lines: [`流程：${name}`, `环境：${environmentId ?? '未选择'}`, `失败策略：${onFailure}`, `步骤：${steps.length} 步，严格按顺序执行`],
+      files: [],
+      steps,
+      warnings: warnings(scenario.warnings),
+      caseDiff: [],
+    }
+  }
+  /** 保存流程只落定义，不解析 URL：这里列出步骤与它们引用的接口身份。 */
+  if (toolName === 'api_save_scenario') {
+    const save = record(toolInput.scenarioSave)
+    const scenario = save ? record(save.scenario) : undefined
+    if (!save || !scenario) return null
+    const name = string(scenario.name) ?? '未命名流程'
+    const collectionId = string(scenario.collectionId)
+    const folder = string(scenario.folder)
+    const environmentId = string(scenario.environmentId)
+    const declared = Array.isArray(scenario.steps) ? scenario.steps : []
+    const steps = declared.flatMap((item, index) => {
+      const entry = record(item)
+      const stepName = entry ? string(entry.name) : undefined
+      const requestId = entry ? string(entry.requestId) : undefined
+      if (!stepName || !requestId) return []
+      const caseId = string(entry?.caseId)
+      return [{ index, text: `${index + 1}. ${stepName} → ${requestId}${caseId ? `（用例 ${caseId}）` : ''}` }]
+    })
+    return {
+      kind: 'api-scenario-save',
+      title: '保存接口流程',
+      lines: [
+        `流程：${name}`,
+        `保存到集合：${collectionId ?? '未知集合'}`,
+        `模块（文件夹）：${folder && folder !== '' ? folder : '（未分组）'}`,
+        `环境：${environmentId ?? '未选择'}`,
+        `步骤：${steps.length} 步`,
+      ],
+      files: [],
+      steps,
+      warnings: [],
+      caseDiff: [],
+    }
+  }
   if (toolName !== 'api_send_request' && toolName !== 'api_save_request') return null
   const preview = record(toolInput.preview)
   if (!preview) return null
@@ -115,7 +201,7 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
     const assertionCount = send && typeof send.assertionCount === 'number' ? send.assertionCount : 0
     lines.push(`环境：${environmentId ?? '未选择'}`)
     lines.push(caseName || caseId ? `用例：${caseName ?? caseId}（${assertionCount} 条断言）` : `断言：请求自身默认断言 ${assertionCount} 条`)
-    return { kind: 'api-send', title: '发送接口请求', lines, files, caseDiff: [] }
+    return { kind: 'api-send', title: '发送接口请求', lines, files, steps: [], warnings: warnings(preview.warnings), caseDiff: [] }
   }
 
   const save = record(toolInput.save)
@@ -123,7 +209,7 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
   lines.push(`保存到集合：${collectionId ?? '未知集合'}`)
   const diff = caseDiff(save?.caseDiff)
   if (diff.length === 0) lines.push('用例：本次没有改动')
-  return { kind: 'api-save', title: '保存接口定义', lines, files: [], caseDiff: diff }
+  return { kind: 'api-save', title: '保存接口定义', lines, files: [], steps: [], warnings: [], caseDiff: diff }
 }
 
 /** 用例差异的展示文本，删除项单独标红由调用方处理。 */

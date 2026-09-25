@@ -69,4 +69,33 @@ describe('接口工作台 Agent 工具合同', () => {
      */
     expect(accepts('api_prepare_request', { request: { url: 'https://example.test', body: { kind: 'urlencoded', text: '', fields: [], files: [declared] } } })).toBe(true)
   })
+
+  test('Given Agent 声明流程 When 校验参数 Then 只接受步骤引用而不是内联定义', () => {
+    const valid = {
+      scenario: {
+        name: '登录后看详情', collectionId: 'default', folder: '用户模块',
+        steps: [
+          { id: 'step_login', name: '登录', requestId: 'request_login' },
+          { id: 'step_profile', name: '用户详情', requestId: 'request_profile', caseId: 'case_ok', onFailure: 'continue' },
+        ],
+        onFailure: 'stop',
+      },
+      expectedRevision: 3,
+    }
+
+    expect(accepts('api_save_scenario', valid)).toBe(true)
+    expect(accepts('api_save_scenario', { ...valid, scenarioId: 'scenario_1' })).toBe(true)
+    expect(accepts('api_prepare_scenario', { scenarioId: 'scenario_1' })).toBe(true)
+    expect(accepts('api_prepare_scenario', { scenarioId: 'scenario_1', environmentId: 'env_test' })).toBe(true)
+    expect(accepts('api_run_scenario', { preparedId: 'prepared_1' })).toBe(true)
+    /** 步骤只能引用已保存请求：内联 url / 正文一律拒绝，避免出现第二份定义。 */
+    expect(accepts('api_save_scenario', { ...valid, scenario: { ...valid.scenario, steps: [{ id: 'step_login', name: '登录', requestId: 'request_login', url: 'https://example.test' }] } })).toBe(false)
+    /** 空流程没有意义，步骤数上限与共享合同一致。 */
+    expect(accepts('api_save_scenario', { ...valid, scenario: { ...valid.scenario, steps: [] } })).toBe(false)
+    expect(accepts('api_save_scenario', { ...valid, scenario: { ...valid.scenario, steps: Array.from({ length: 21 }, (_value, index) => ({ id: `step_${index}`, name: `步骤 ${index}`, requestId: 'request_login' })) } })).toBe(false)
+    /** revision 必须由调用方给出数字，未知字段与「直接按场景身份跑」都不接受。 */
+    expect(accepts('api_save_scenario', { ...valid, expectedRevision: '3' })).toBe(false)
+    expect(accepts('api_save_scenario', { ...valid, definition: {} })).toBe(false)
+    expect(accepts('api_run_scenario', { scenarioId: 'scenario_1' })).toBe(false)
+  })
 })

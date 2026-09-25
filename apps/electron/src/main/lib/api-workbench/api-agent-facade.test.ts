@@ -10,6 +10,17 @@ import { ApiWorkbenchStore } from './api-workbench-store'
 import { ApiWorkbenchService } from './api-workbench-service'
 import { createApiAgentFacade } from './api-agent-facade'
 
+/**
+ * 单测环境没有系统安全存储：注入可用替身。
+ * 目录里出现按名字判定的敏感头（例如 Authorization）时，Store 要求秘密必须能加密落盘。
+ */
+const safeStorage = {
+  isEncryptionAvailable: () => true,
+  getSelectedStorageBackend: (): 'basic_text' => 'basic_text',
+  encryptString: (value: string) => Buffer.from(`enc:${value}`),
+  decryptString: (buffer: Buffer) => buffer.toString().replace(/^enc:/, ''),
+}
+
 /** 建立不访问真实网络、不读用户配置的 Agent 场景；可注入窄上限的文件仓库以验证回滚。 */
 function fixture(files?: ApiFileStore) {
   /** macOS 的 `/var` 指向 `/private/var`，先固定 realpath 让审批路径断言稳定。 */
@@ -19,10 +30,19 @@ function fixture(files?: ApiFileStore) {
   /** 记录真实派发出去的请求，用于逐字节核对附件。 */
   const sent: ApiResolvedRequest[] = []
   const abort = new AbortController()
-  const service = new ApiWorkbenchService({ store: new ApiWorkbenchStore(root), transport: async (request) => {
+  const service = new ApiWorkbenchService({ store: new ApiWorkbenchStore(root, { safeStorage }), transport: async (request) => {
     sends += 1
     sent.push(request)
-    return { state: 'completed', hops: [], body: { rawBytes: 2, decodedBytes: 2, contentType: 'text/plain', encoding: '', preview: 'ok', previewTruncated: false, complete: true, decoded: true } }
+    /** 合成一次 200 响应：状态断言与流程步骤结论都需要真实逐跳事实。 */
+    return {
+      state: 'completed',
+      hops: [{
+        url: request.url, method: request.method, requestHeaders: request.headers, requestHeadersSource: 'configured', status: 200, statusText: 'OK', httpVersion: '1.1',
+        responseHeaders: [], trailers: [], timings: { dnsMs: null, connectMs: null, tlsMs: null, sendMs: null, ttfbMs: null, downloadMs: null, totalMs: 1 },
+        connection: { reused: false },
+      }],
+      body: { rawBytes: 2, decodedBytes: 2, contentType: 'text/plain', encoding: '', preview: '{"token":"fixture-token-1"}', previewTruncated: false, complete: true, decoded: true },
+    }
   }, ...(files ? { files } : {}) })
   const options = { sessionId: 'session', toolMode: 'standard', getSession: () => session, service, runSignal: abort.signal, assertRunActive: () => { if (abort.signal.aborted) throw new Error('stopped') } }
   const facade = createApiAgentFacade(options)!
@@ -46,7 +66,7 @@ describe('Agent 接口工作台授权边界', () => {
       const args = { preparedId: prepared.preparedId }
       await expect(f.facade.send(args)).rejects.toThrow('APPROVAL_REQUIRED')
       const snapshot = await f.facade.approval('api_send_request', args)
-      expect(snapshot.preview.request.url).toBe('https://example.test/')
+      expect(snapshot.preview?.request.url).toBe('https://example.test/')
       await f.facade.authorize('api_send_request', args, snapshot)
       const first = await f.facade.send(args)
       const second = await f.facade.send(args)
@@ -315,6 +335,136 @@ describe('Agent 指定文件与确认授权', () => {
 
       await expect(f.facade.send(args)).rejects.toThrow('API_WORKBENCH_FILE_CHANGED')
       expect(f.sends()).toBe(0)
+    } finally { f.cleanup() }
+  })
+})
+
+/** 往目录里写入「登录 → 用户详情」两条请求与一条引用它们的流程。 */
+async function saveScenarioFixture(f: ReturnType<typeof fixture>): Promise<{ revision: number; scenarioId: string }> {
+  const catalog = await f.service.getCatalog('workspace')
+  const base = createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
+  const saved = await f.service.saveCatalog('workspace', catalog.revision, {
+    ...catalog,
+    requests: [
+      {
+        ...base, id: 'request_login', revision: 1, updatedAt: 1, name: '登录', method: 'POST', url: 'https://example.test/login',
+        extractions: [{ id: 'ex_token', name: 'token', from: 'json', path: 'token', secret: false }],
+        assertions: [{ id: 'a_login', kind: 'status', path: '', expected: '200' }],
+      },
+      {
+        ...base, id: 'request_profile', revision: 1, updatedAt: 1, name: '用户详情', method: 'GET', url: 'https://example.test/profile',
+        headers: [{ id: 'h_auth', name: 'Authorization', value: 'Bearer {{token}}', enabled: true }],
+        assertions: [{ id: 'a_profile', kind: 'status', path: '', expected: '200' }],
+      },
+    ],
+    scenarios: [{
+      id: 'scenario_login', name: '登录后看详情', description: '', collectionId: base.collectionId, folder: '用户模块',
+      steps: [
+        { id: 'step_login', name: '登录', requestId: 'request_login' },
+        { id: 'step_profile', name: '用户详情', requestId: 'request_profile' },
+      ],
+      onFailure: 'stop', revision: 1, updatedAt: 1,
+    }],
+  })
+  return { revision: saved.revision, scenarioId: 'scenario_login' }
+}
+
+describe('Agent 流程（场景）授权边界', () => {
+  test('Given 已准备流程 When 未批准直接运行 Then 不出网；批准后一次跑完并复用结论', async () => {
+    const f = fixture()
+    try {
+      const { scenarioId } = await saveScenarioFixture(f)
+      const preview = await f.facade.prepareScenario({ scenarioId })
+
+      expect(preview.steps.map((step) => `${step.index}:${step.method}:${step.url}`)).toEqual([
+        '0:POST:https://example.test/login',
+        '1:GET:https://example.test/profile',
+      ])
+      const args = { preparedId: preview.preparedId }
+      await expect(f.facade.runScenario(args)).rejects.toThrow('APPROVAL_REQUIRED')
+      expect(f.sends()).toBe(0)
+
+      /** 审批快照就是那份步骤清单：批准一次授权整条流程。 */
+      const snapshot = await f.facade.approval('api_run_scenario', args)
+      expect(snapshot.scenario?.steps.map((step) => step.url)).toEqual(['https://example.test/login', 'https://example.test/profile'])
+      expect(snapshot.preview).toBeUndefined()
+      await f.facade.authorize('api_run_scenario', args, snapshot)
+
+      const run = await f.facade.runScenario(args)
+      const again = await f.facade.runScenario(args)
+
+      expect(run.state).toBe('completed')
+      expect(run.steps.every((step) => step.state === 'passed')).toBe(true)
+      expect(again.id).toBe(run.id)
+      expect(f.sends()).toBe(2)
+    } finally { f.cleanup() }
+  })
+
+  test('Given 批准后目录被改动 When 运行流程 Then 整条流程拒绝且不出网', async () => {
+    const f = fixture()
+    try {
+      const { scenarioId } = await saveScenarioFixture(f)
+      const preview = await f.facade.prepareScenario({ scenarioId })
+      const args = { preparedId: preview.preparedId }
+      const snapshot = await f.facade.approval('api_run_scenario', args)
+      const catalog = await f.service.getCatalog('workspace')
+      await f.service.saveCatalog('workspace', catalog.revision, catalog)
+
+      await expect(f.facade.authorize('api_run_scenario', args, snapshot)).rejects.toThrow('STALE')
+      await expect(f.facade.runScenario(args)).rejects.toThrow('APPROVAL_REQUIRED')
+      expect(f.sends()).toBe(0)
+    } finally { f.cleanup() }
+  })
+
+  test('Given Agent 提交流程定义 When 批准并保存 Then 身份由 Host 盖章且步骤可回读', async () => {
+    const f = fixture()
+    try {
+      const { revision } = await saveScenarioFixture(f)
+      const pending = {
+        scenario: {
+          name: 'Agent 建的流程', description: 'Agent 声明的顺序', collectionId: 'default', folder: '订单模块',
+          steps: [
+            { id: 'step_login', name: '登录', requestId: 'request_login' },
+            { id: 'step_profile', name: '用户详情', requestId: 'request_profile', caseId: undefined, onFailure: 'continue' as const },
+          ],
+          environmentId: undefined,
+          onFailure: 'stop' as const,
+        },
+        expectedRevision: revision,
+      }
+      /** 未批准不能写目录。 */
+      await expect(f.facade.saveScenario(pending)).rejects.toThrow('APPROVAL_REQUIRED')
+
+      const snapshot = await f.facade.approval('api_save_scenario', pending)
+      expect(snapshot.scenarioSave?.scenario.name).toBe('Agent 建的流程')
+      expect(snapshot.scenarioSave?.scenario.revision).toBe(1)
+      await f.facade.authorize('api_save_scenario', pending, snapshot)
+      const saved = await f.facade.saveScenario(pending)
+
+      const catalog = await f.service.getCatalog('workspace')
+      const stored = catalog.scenarios?.find((item) => item.id === saved.scenarioId)
+      expect(stored?.name).toBe('Agent 建的流程')
+      expect(stored?.steps.map((step) => step.id)).toEqual(['step_login', 'step_profile'])
+      expect(stored?.steps[1]?.onFailure).toBe('continue')
+      expect(stored?.folder).toBe('订单模块')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 流程引用了不存在的接口 When 请求保存审批 Then 审批之前就拒绝', async () => {
+    const f = fixture()
+    try {
+      const { revision } = await saveScenarioFixture(f)
+      const pending = {
+        scenario: {
+          name: '越界流程', collectionId: 'default', folder: '',
+          steps: [{ id: 'step_missing', name: '不存在的接口', requestId: 'request_missing' }],
+          onFailure: 'stop' as const,
+        },
+        expectedRevision: revision,
+      }
+
+      await expect(f.facade.approval('api_save_scenario', pending))
+        .rejects.toThrow('API_WORKBENCH_SCENARIO_REQUEST_NOT_FOUND: 第 1 步引用的接口不存在')
     } finally { f.cleanup() }
   })
 })

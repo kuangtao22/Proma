@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft } from '@proma/shared'
-import type { AgentSessionMeta, ApiPreparedPreview, ApiRequestDraft, ApiRun } from '@proma/shared'
+import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft, parseApiScenario } from '@proma/shared'
+import type { AgentSessionMeta, ApiCatalog, ApiPreparedPreview, ApiRequestDraft, ApiRun, ApiScenario, ApiScenarioPreparedPreview, ApiScenarioRun } from '@proma/shared'
 import type { ApiWorkbenchService } from './api-workbench-service'
 import { stampApiAgentCases } from './api-agent-case-ownership'
 import type { ApiAgentCaseChange } from './api-agent-case-ownership'
@@ -10,8 +10,14 @@ import { redactApiBody } from './api-redaction'
 /** 只有宿主授权服务可以调用 authorize；模型工具只能消费已签发的精确快照。 */
 export interface ApiAgentApproval {
   tool: string
+  /** 授权身份：运行/发送是 preparedId，保存场景是「场景 + 目录版本」的稳定标识。 */
   preparedId: string
-  preview: ApiPreparedPreview
+  /** 单次请求的准备预览；场景类工具没有它。 */
+  preview?: ApiPreparedPreview
+  /** 场景运行快照：逐行步骤清单，一次批准授权整条流程。 */
+  scenario?: ApiScenarioPreparedPreview
+  /** 场景保存快照：规范化后的定义与目录版本。 */
+  scenarioSave?: { expectedRevision: number; scenario: ApiScenario; scenarioId?: string }
   /**
    * 本次要读取并上传的附件：字段名、`realpath` 与大小。
    *
@@ -28,7 +34,7 @@ export interface ApiAgentFacadeOptions {
   toolMode: string
   triggeredBy?: 'user' | 'automation' | 'delegation' | 'external'
   getSession(sessionId: string): AgentSessionMeta | undefined
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'getPrepared' | 'send' | 'getRun' | 'readBody' | 'registerAgentFiles' | 'releaseFiles'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'getPrepared' | 'send' | 'getRun' | 'readBody' | 'registerAgentFiles' | 'releaseFiles' | 'prepareScenario' | 'getScenarioPrepared' | 'runScenario'>
   runSignal: AbortSignal
   assertRunActive(): void
   assertWorkspaceWritable?(workspaceId: string): void
@@ -60,6 +66,10 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
    * `files` 是本次待上传附件的审批行（字段名 + realpath + 大小），是路径允许存在的两处之一。
    */
   const drafts = new Map<string, { request: ApiRequestDraft; preview: ApiPreparedPreview; files?: Array<{ field: string; path: string; sizeBytes: number }>; requestId?: string; caseId?: string }>()
+  /** 本次 Agent 运行生成的场景准备记录：批准与执行都只认这份步骤清单。 */
+  const scenarioDrafts = new Map<string, ApiScenarioPreparedPreview>()
+  /** 已跑过的场景身份：重复调用返回同一次结论，绝不第二次出网。 */
+  const scenarioRuns = new Map<string, ApiScenarioRun>()
   /** 精确授权与已完成执行分开记录；保存批准不能变成出网批准。 */
   const grants = new Map<string, string>()
   const sent = new Map<string, ApiAgentRunSummary>()
@@ -75,13 +85,75 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
   /** 持有当前项目写租约直到真实网络与记录完成，迁移不能穿过异步间隙。 */
   function write<T>(effect: () => T): T { writable(); return options.runWorkspaceWrite ? options.runWorkspaceWrite(context.workspaceId, effect) : effect() }
   /** 解析发送或保存参数，模型无法传入 reveal、workspace 或私有执行路径。 */
+  /**
+   * 解析各变更工具的调用身份。
+   *
+   * 保存类工具没有 preparedId，就用「场景身份 + 目录版本」当授权身份：同一份输入只能对应同一次批准，
+   * 而快照内容本身还会在 requireGrant 里被逐字比较，所以换定义就会失效。
+   */
   function mutation(tool: string, input: unknown): { preparedId: string; expectedRevision?: number } {
-    const args = apiRecord(input, tool === 'api_save_request' ? ['preparedId', 'expectedRevision'] : ['preparedId'])
-    return { preparedId: parseApiId(args.preparedId), ...(tool === 'api_save_request' ? { expectedRevision: apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision') } : {}) }
+    if (tool === 'api_send_request' || tool === 'api_run_scenario') {
+      const args = apiRecord(input, ['preparedId'])
+      return { preparedId: parseApiId(args.preparedId) }
+    }
+    if (tool === 'api_save_request') {
+      const args = apiRecord(input, ['preparedId', 'expectedRevision'])
+      return { preparedId: parseApiId(args.preparedId), expectedRevision: apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision') }
+    }
+    if (tool === 'api_save_scenario') {
+      const args = apiRecord(input, ['scenarioId', 'scenario', 'expectedRevision'])
+      const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+      const scenarioId = args.scenarioId === undefined ? 'new' : parseApiId(args.scenarioId)
+      return { preparedId: `${scenarioId}_${expectedRevision}`, expectedRevision }
+    }
+    throw new Error('API_AGENT_UNKNOWN_MUTATION')
+  }
+  /** 场景定义的关系校验：越界引用在弹审批卡之前就拒绝，不展示一份已经越界的确认框。 */
+  function validateScenario(catalog: ApiCatalog, scenario: ApiScenario): void {
+    if (scenario.steps.length === 0) throw new Error('API_WORKBENCH_SCENARIO_EMPTY: 流程至少需要一个步骤')
+    if (!catalog.collections.some((item) => item.id === scenario.collectionId)) throw new Error('API_WORKBENCH_COLLECTION_NOT_FOUND')
+    if (scenario.environmentId && !catalog.environments.some((item) => item.id === scenario.environmentId)) throw new Error('API_WORKBENCH_SCENARIO_ENVIRONMENT_NOT_FOUND: 流程默认环境不存在')
+    for (const [index, step] of scenario.steps.entries()) {
+      const request = catalog.requests.find((item) => item.id === step.requestId)
+      if (!request) throw new Error(`API_WORKBENCH_SCENARIO_REQUEST_NOT_FOUND: 第 ${index + 1} 步引用的接口不存在`)
+      if (step.caseId && !(request.cases ?? []).some((item) => item.id === step.caseId)) throw new Error(`API_WORKBENCH_SCENARIO_CASE_NOT_FOUND: 第 ${index + 1} 步引用的用例不存在`)
+      if (step.environmentId && !catalog.environments.some((item) => item.id === step.environmentId)) throw new Error(`API_WORKBENCH_SCENARIO_ENVIRONMENT_NOT_FOUND: 第 ${index + 1} 步的环境不存在`)
+    }
   }
   /** 生成审批快照前从权威 service 复查有效期与所有版本，预览全部已脱敏。 */
   async function approval(tool: string, input: unknown): Promise<ApiAgentApproval> {
     current()
+    /** 场景运行：快照就是那份步骤清单，批准一次授权整条流程。 */
+    if (tool === 'api_run_scenario') {
+      const args = mutation(tool, input)
+      if (!scenarioDrafts.has(args.preparedId)) throw new Error('API_AGENT_SCENARIO_NOT_PREPARED')
+      const scenario = await options.service.getScenarioPrepared(context, args.preparedId)
+      current()
+      return { tool, preparedId: args.preparedId, scenario }
+    }
+    /** 场景保存：快照带规范化后的定义与目录版本，越界引用在此之前已被拒绝。 */
+    if (tool === 'api_save_scenario') {
+      const args = apiRecord(input, ['scenarioId', 'scenario', 'expectedRevision'])
+      const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      current()
+      if (catalog.revision !== expectedRevision) throw new Error('API_WORKBENCH_PREPARED_STALE')
+      const scenarioId = args.scenarioId === undefined ? undefined : parseApiId(args.scenarioId)
+      const existing = scenarioId ? (catalog.scenarios ?? []).find((item) => item.id === scenarioId) : undefined
+      if (scenarioId && !existing) throw new Error('API_WORKBENCH_SCENARIO_NOT_FOUND')
+      /** 只接受定义字段；id / revision / updatedAt 一律由 Host 盖章。 */
+      const draft = apiRecord(args.scenario, ['name', 'description', 'collectionId', 'folder', 'steps', 'environmentId', 'onFailure'], 'scenario')
+      const scenario = parseApiScenario({
+        ...draft,
+        description: draft.description ?? '',
+        folder: draft.folder ?? '',
+        id: existing?.id ?? 'scenario_agent_new',
+        revision: existing?.revision ?? 1,
+        updatedAt: existing?.updatedAt ?? 0,
+      })
+      validateScenario(catalog, scenario)
+      return { tool, preparedId: `${scenarioId ?? 'new'}_${expectedRevision}`, scenarioSave: { expectedRevision, scenario: { ...scenario, id: existing?.id ?? scenario.id }, ...(scenarioId ? { scenarioId } : {}) } }
+    }
     if (tool !== 'api_send_request' && tool !== 'api_save_request') throw new Error('API_AGENT_UNKNOWN_MUTATION')
     const args = mutation(tool, input)
     const draft = drafts.get(args.preparedId)
@@ -140,7 +212,15 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const limit = args.limit === undefined ? 20 : apiInteger(args.limit, 1, 30, 'limit')
       const catalog = await options.service.getCatalog(context.workspaceId)
       current()
-      return { revision: catalog.revision, collections: catalog.collections.map(({ id, name }) => ({ id, name })), environments: catalog.environments.map(({ id, name, kind }) => ({ id, name, kind })), requests: catalog.requests.slice(cursor, cursor + limit).map(({ id, name, method, folder, collectionId, revision }) => ({ id, name, method, folder, collectionId, revision })), nextCursor: cursor + limit < catalog.requests.length ? cursor + limit : null }
+      return {
+        revision: catalog.revision,
+        collections: catalog.collections.map(({ id, name }) => ({ id, name })),
+        environments: catalog.environments.map(({ id, name, kind }) => ({ id, name, kind })),
+        requests: catalog.requests.slice(cursor, cursor + limit).map(({ id, name, method, folder, collectionId, revision }) => ({ id, name, method, folder, collectionId, revision })),
+        /** 场景摘要：只列身份与步骤数，步骤细节用 api_prepare_scenario 拿。 */
+        scenarios: (catalog.scenarios ?? []).map(({ id, name, collectionId, folder, steps, revision }) => ({ id, name, collectionId, folder, stepCount: steps.length, revision })),
+        nextCursor: cursor + limit < catalog.requests.length ? cursor + limit : null,
+      }
     },
     /** 返回已保存且脱敏的定义；大定义由统一模型预算投影。 */
     async get(input: unknown) {
@@ -190,6 +270,50 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
         ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }),
       })
       return preview
+    },
+    /** 仅准备一条流程：返回逐步清单与 preparedId，绝不出网。 */
+    async prepareScenario(input: unknown): Promise<ApiScenarioPreparedPreview> {
+      current()
+      if (scenarioDrafts.size >= 64) throw new Error('API_AGENT_PREPARE_LIMIT')
+      const args = apiRecord(input, ['scenarioId', 'environmentId', 'overrides'])
+      const preview = await options.service.prepareScenario(context, {
+        scenarioId: parseApiId(args.scenarioId),
+        ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }),
+        ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }),
+      })
+      current()
+      scenarioDrafts.set(preview.preparedId, preview)
+      return preview
+    },
+    /** 已完成运行属于查询：重复调用返回同一次结论，不再出网。 */
+    hasCompletedScenarioRun(input: unknown): boolean { current(); return scenarioRuns.has(mutation('api_run_scenario', input).preparedId) },
+    /** 用一次精确批准跑完整条流程；停止 Agent 会同步取消当前在途步骤。 */
+    async runScenario(input: unknown, signal?: AbortSignal): Promise<ApiScenarioRun> {
+      current()
+      const args = mutation('api_run_scenario', input)
+      const prior = scenarioRuns.get(args.preparedId)
+      if (prior) return prior
+      await requireGrant('api_run_scenario', input)
+      const run = await write(() => options.service.runScenario(context, args.preparedId, signal ? AbortSignal.any([signal, options.runSignal]) : options.runSignal))
+      current()
+      scenarioRuns.set(args.preparedId, run)
+      return run
+    },
+    /** 保存场景定义：独立批准的配置变更，expectedRevision 防止覆盖他人的编辑。 */
+    async saveScenario(input: unknown) {
+      const snapshot = await requireGrant('api_save_scenario', input)
+      const pending = snapshot.scenarioSave!
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      writable()
+      const existing = pending.scenarioId ? (catalog.scenarios ?? []).find((item) => item.id === pending.scenarioId) : undefined
+      const definition: ApiScenario = { ...pending.scenario, id: existing?.id ?? randomUUID(), revision: existing?.revision ?? 1, updatedAt: Date.now() }
+      const scenarios = existing
+        ? (catalog.scenarios ?? []).map((item) => item.id === existing.id ? definition : item)
+        : [...(catalog.scenarios ?? []), definition]
+      const saved = await write(() => options.service.saveCatalog(context.workspaceId, pending.expectedRevision, { ...catalog, scenarios }))
+      current()
+      grants.delete('api_save_scenario:' + snapshot.preparedId)
+      return { scenarioId: definition.id, catalogRevision: saved.revision, saved: true }
     },
     /** 使用精确批准派发一次请求；停止 Agent 会同步取消对应网络任务。 */
     async send(input: unknown, signal?: AbortSignal): Promise<ApiAgentRunSummary> {

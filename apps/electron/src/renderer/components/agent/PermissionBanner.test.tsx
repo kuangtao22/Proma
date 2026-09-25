@@ -19,6 +19,19 @@ function apiSendApproval(toolInput: Record<string, unknown>): PermissionRequest 
   }
 }
 
+/** 造一条已入队的流程运行审批：Host 侧把步骤清单放在 scenario 里。 */
+function apiScenarioApproval(toolInput: Record<string, unknown>): PermissionRequest {
+  return {
+    requestId: 'permission-api-scenario',
+    sessionId: 'session-1',
+    toolName: 'api_run_scenario',
+    toolInput,
+    description: '运行接口流程',
+    dangerLevel: 'dangerous',
+    allowAlways: false,
+  }
+}
+
 describe('权限横幅', () => {
   test('Given 没有待处理请求 When 渲染 Then 不占用聊天空间', () => {
     const html = renderToStaticMarkup(
@@ -79,5 +92,35 @@ describe('权限横幅', () => {
 
     expect(html).toContain('GET https://example.test/users')
     expect(html).not.toContain('本次将读取并上传的文件')
+  })
+
+  test('Given 流程运行审批 When 渲染 Then 逐行显示步骤、策略与生产环境提醒', () => {
+    const store = createStore()
+    store.set(allPendingPermissionRequestsAtom, new Map([['session-1', [apiScenarioApproval({
+      preparedId: 'prepared_scenario',
+      scenario: {
+        preparedId: 'prepared_scenario', scenarioId: 'scenario_login', scenarioName: '登录后看详情', catalogRevision: 5,
+        onFailure: 'stop', createdAt: 1, expiresAt: 2,
+        warnings: ['流程中有 1 个步骤指向 production 环境，运行前必须逐次复核'],
+        steps: [
+          { index: 0, stepId: 'step_login', name: '登录', requestId: 'request_login', method: 'POST', url: 'https://example.test/login' },
+          { index: 1, stepId: 'step_profile', name: '用户详情', requestId: 'request_profile', method: 'GET', url: 'https://example.test/profile', environmentKind: 'production' },
+        ],
+      },
+    })]]]))
+
+    const html = renderToStaticMarkup(
+      <Provider store={store}>
+        <PermissionBanner sessionId="session-1" onStop={() => undefined} />
+      </Provider>,
+    )
+
+    expect(html).toContain('运行接口流程（一次批准整条流程）')
+    expect(html).toContain('失败策略：stop（失败后跳过后续步骤）')
+    expect(html).toContain('本次将按顺序执行的步骤')
+    expect(html).toContain('1. 登录 · POST https://example.test/login')
+    expect(html).toContain('2. 用户详情 · GET https://example.test/profile ⚠ 生产环境')
+    expect(html).toContain('批准一次即授权这条流程的全部步骤')
+    expect(html).toContain('流程中有 1 个步骤指向 production 环境，运行前必须逐次复核')
   })
 })

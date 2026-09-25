@@ -152,6 +152,22 @@ export function PermissionBanner({ sessionId, onStop }: PermissionBannerProps): 
                 <p className="text-[10px] text-muted-foreground">路径已按真实路径（realpath）展示，符号链接不能伪装成别的文件名；目录与设备等特殊文件不会出现在这里。</p>
               </div>
             )}
+            {apiApproval.steps.length > 0 && (
+              <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
+                <p className="text-[11px] text-muted-foreground">本次将按顺序执行的步骤</p>
+                {apiApproval.steps.map((step) => (
+                  <p key={`${step.index}:${step.text}`} className="text-xs font-mono break-all">{step.text}</p>
+                ))}
+                <p className="text-[10px] text-muted-foreground">批准一次即授权这条流程的全部步骤；执行时每一步仍会与这份清单核对，不一致就整条流程拒绝。</p>
+              </div>
+            )}
+            {apiApproval.warnings.length > 0 && (
+              <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
+                {apiApproval.warnings.map((warning) => (
+                  <p key={warning} className="text-[11px] text-amber-600">{warning}</p>
+                ))}
+              </div>
+            )}
             {apiApproval.caseDiff.length > 0 && (
               <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
                 <p className="text-[11px] text-muted-foreground">用例改动</p>
