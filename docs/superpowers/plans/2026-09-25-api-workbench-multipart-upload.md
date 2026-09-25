@@ -1,0 +1,40 @@
+# 接口工作台 B12：multipart 文件上传（实施计划）
+
+> 用户已明确授权模型：**Agent 侧由用户指定文件、Agent 发起确认授权弹窗、确认后才可上传；用户也可以在接口界面自己选文件上传**。
+> 本计划把这个模型落成两层实现（B12a 机制 → B12b Agent 授权面），并收紧三处安全语义。
+
+## 1. 三条收紧后的硬约束
+
+1. **路径不入库**：请求定义里只存文件引用（`file_xxx` + 文件名/大小/类型），真实绝对路径只活在主进程内存，服务重启即失效；失效时 prepare 直接拒绝（`API_WORKBENCH_FILE_REF_NOT_FOUND`）并提示重新选择。理由：否则一条保存好的请求会在几天后悄悄重读当初授权的文件（等价于把「读本机文件」变成一个长期能力）。
+2. **路径只从一个入口进来**：界面走主进程原生文件对话框（渲染层与 Agent 都不接触路径字符串）；Agent 走审批卡——卡片显示 `fs.realpath` 解析后的**真实路径** + 大小，只接受常规文件（目录/FIFO/设备/符号链接目标不存在一律拒绝），且**只在批准后读取一次**。符号链接必须按 realpath 展示，防止把 `.ssh/id_rsa` 藏成 `/tmp/x`。
+3. **附件字节不留存**：运行记录与预览只保留「字段名 + 文件名 + 大小 + sha256 + 未留存正文」摘要，不把文件内容写进 `record.json`/`raw.bin.enc`。理由：避免每次上传往数据根塞 20 MiB，也避免把你自己的文档复制进应用目录。
+
+## 2. 分层设计
+
+- **共享合同**：`ApiRequestBody.body.kind` 新增 `multipart`；新增 `ApiFilePart { id, name, fileName, sizeBytes, contentType?, ref }`（**不含路径**）与 `ApiAttachmentSummary`（记录/预览用：字段、文件名、大小、sha256）。
+- **主进程文件仓库**：每 workspace 一份内存映射 `ref → { realpath, fileName, sizeBytes, contentType, sha256 }`；注册入口只有两个（原生对话框回调、Agent 审批通过后的登记），条数与单文件大小都有上限（单文件 20 MiB，总请求体仍受 `API_LIMITS.bodyBytes` 约束）。
+- **解析器**：multipart 草稿解析出文本字段与文件引用；引用已失效即 fail closed；合成 multipart 正文时把文件字节读进来（主进程内），产出**待发送的 base64 正文**与**可留存的摘要正文**两份投影。
+- **传输协议**：`ApiResolvedRequest` 增加可选 `bodyBase64`（仅多部分/二进制正文使用，有界），Utility 优先按 base64 解码成 Buffer 再发送（`Content-Length` 来自真实字节数）；记录侧把 `bodyBase64` 剥掉、`body` 换成摘要正文。
+- **界面**：Body 分区新增 `multipart/form-data` 类型；文本字段复用现有行编辑器，文件行提供「选择文件 / 更换 / 移除」并显示文件名与大小；引用失效时显示「需要重新选择文件」。
+- **Agent（B12b）**：`api_prepare_request` 的文件字段允许声明**路径**，但该路径只进入审批快照；保存审批卡逐行显示 realpath、大小与目标字段，批准后才登记引用；未批准前 prepare 出的 preparedId 不能发送。
+
+## 3. 两步实施（每步独立可验收）
+
+**B12a：上传机制（用户自己在界面选文件）**
+1. 合同（`multipart` + `ApiFilePart` + 摘要类型）与解析器 BDD。
+2. 主进程文件仓库 + 原生对话框 IPC（`pickApiFiles`）+ 失效语义回归。
+3. 解析器合成 multipart 正文（base64 待发 + 摘要投影）+ `bodyBase64` 协议支持 + Utility 解码（Electron 自带 Node 的传输测试）。
+4. 界面 Body 分区的文件行 + 界面 smoke（夹具扮演主进程返回引用）。
+5. 真实 Electron 端到端：临时目录造一个二进制文件（含非 UTF-8 字节），注册后发送，服务端按 multipart 解析校验字节完全一致；断言运行记录里查不到文件内容、只有摘要。
+
+**B12b：Agent 指定文件 + 确认授权**
+6. 工具 schema：文件字段接受路径；facade 生成待批准的文件清单。
+7. 审批卡显示 realpath/大小/字段；批准后登记引用；拒绝后 preparedId 作废。
+8. 真实 Electron 端到端：Agent 声明路径 → 未批准时发送被拒 → 批准后真实上传成功；符号链接按 realpath 展示；目录/设备文件被拒。
+9. 计划文档补验收证据，按显式路径合入 main。
+
+## 4. 明确不做
+
+- 不做大文件流式上传（当前上限 20 MiB，一次性读入主进程内存）；不做断点续传、不做多文件并行读取优化。
+- 不把文件路径写进请求定义或运行记录；不提供「历史里重新上传同一文件」的自动重读。
+- 不引入新的 multipart 依赖：边界、`Content-Disposition`、文件名转义自己按 RFC 7578 生成并单测（含中文/引号/换行文件名的转义与拒绝）。
