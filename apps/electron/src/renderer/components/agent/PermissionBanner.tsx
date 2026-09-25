@@ -143,6 +143,15 @@ export function PermissionBanner({ sessionId, onStop }: PermissionBannerProps): 
             {apiApproval.lines.map((line) => (
               <p key={line} className="text-xs text-muted-foreground font-mono break-all">{line}</p>
             ))}
+            {apiApproval.files.length > 0 && (
+              <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
+                <p className="text-[11px] text-muted-foreground">本次将读取并上传的文件（批准后才读取字节）</p>
+                {apiApproval.files.map((file) => (
+                  <p key={`${file.field}:${file.path}`} className="text-xs font-mono break-all">{file.text}</p>
+                ))}
+                <p className="text-[10px] text-muted-foreground">路径已按真实路径（realpath）展示，符号链接不能伪装成别的文件名；目录与设备等特殊文件不会出现在这里。</p>
+              </div>
+            )}
             {apiApproval.caseDiff.length > 0 && (
               <div className="rounded bg-background/50 px-2 py-1.5 space-y-1">
                 <p className="text-[11px] text-muted-foreground">用例改动</p>

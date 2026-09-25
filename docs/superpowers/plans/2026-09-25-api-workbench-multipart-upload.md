@@ -47,3 +47,29 @@
 - 不做大文件流式上传（当前上限 20 MiB，一次性读入主进程内存）；不做断点续传、不做多文件并行读取优化。
 - 不把文件路径写进请求定义或运行记录；不提供「历史里重新上传同一文件」的自动重读。
 - 不引入新的 multipart 依赖：边界、`Content-Disposition`、文件名转义自己按 RFC 7578 生成并单测（含中文/引号/换行文件名的转义与拒绝）。
+
+## 5. B12b 验收证据（2026-09-25）
+
+已交付行为（对应用户指定文件 + 确认授权）：
+
+- **工具 schema**：`request.body.kind` 放开 `multipart`，`request.body.files[]` 只接受 `{ id, name, path, contentType? }`；`ref`/`fileName`/`sizeBytes` 等 Host 才有权知道的事实一律拒绝，数量沿用 16 上限。
+- **路径只活在两处**：facade 在 prepare 阶段把声明路径交给 `ApiFileStore.register`（`realpath` + `stat`，**不读字节**），把 `path` 换成 `ApiFilePart` 引用；真实路径只留在待批准快照与文件仓库。模型可见的准备回执、请求定义、运行记录里都只有引用、文件名与大小。
+- **时序**：`api_prepare_request`（stat）→ `approval('api_send_request')` 快照带 `files[{field, path(realpath), sizeBytes}]` → 审批卡逐行展示 → 批准后 `send` 才读取字节（读取前复核 inode/时间戳，换文件即 `API_WORKBENCH_FILE_CHANGED`）→ 记录只留 `attachments` 摘要。
+- **字节读取时点**：B12a 原本在 prepare 阶段读字节合成 `bodyBase64` + `attachments`，本轮改成**真正派发时**（`send`）读取——否则 Agent 声明的文件会在用户批准之前被读。已知大小之和仍会在 prepare 阶段先判 `API_WORKBENCH_MULTIPART_TOO_LARGE`，避免为发不出去的请求弹确认。
+- **审批卡**：复用 `api-approval-view` 与 `PermissionBanner`，新增「本次将读取并上传的文件（批准后才读取字节）」区块，逐行 `字段 X：<realpath>（n 字节）`，并写明符号链接已按 realpath 展开、目录与特殊文件不会出现。
+- **失败可行动**：目录/设备/FIFO → `API_WORKBENCH_FILE_INVALID_TYPE`；悬空链接/不存在 → `_MISSING`；超 16 个 → `_FILE_LIMIT`；声明了文件但正文不是 multipart → `API_WORKBENCH_INVALID: body.files.multipartOnly`；批量登记中任一条非法整批回滚，准备失败也会回滚已登记的引用（否则失败的准备会白占文件槽位）。
+
+| 验证 | 结果 | 日志 |
+| --- | --- | --- |
+| 定向回归（工作台主进程 / agent 组件 / preload / 共享合同与 IPC） | 417 pass / 0 fail，61 文件 | `/tmp/proma-api-b12b-targeted.log` |
+| 全量回归（`bun test --isolate`） | 8169 pass / 6 skip / 5 fail；5 条失败都在未改动文件里（`release-workflow.test.ts` 2 条、`agent-service-route-rebind.test.ts` 3 条 `assertAgentSessionAcceptsInput is not defined`），与本增量无关 | `/tmp/proma-b12b-full-escalated.log` |
+| `bun run typecheck` | 7 workspace 全部通过 | `/tmp/proma-api-b12b-typecheck.log` |
+| `bun run electron:build` | 通过，仅既有 EventKit 告警 | `/tmp/proma-api-b12b-build.log` |
+| 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS，网络调用 17 次：Agent 声明符号链接路径 → 准备回执不含真实路径、摘要用真实文件名 → **未批准发送被拒且 0 次网络调用** → 审批快照给出 `{field:'file', path: realpath, sizeBytes}` → 批准后服务端逐字节收到附件、文件名来自 realpath → 运行记录只有 sha256 摘要、无路径无字节 → 批准后换文件被 `FILE_CHANGED` 拒绝（网络调用数不变）→ 目录与 `/dev/null` 在准备阶段被拒 | `/tmp/proma-api-b12b-smoke.log` |
+| 真实界面（`api-workbench-ui-smoke.ts`） | PASS（无回归）：multipart 选择文件、文件行、保存后定义只含引用元数据仍全部通过 | `/tmp/proma-api-b12b-ui-smoke.log` |
+
+已知边界（有意保留）：
+
+- 模型自己的工具调用参数（含路径）由 SDK 写进会话记录，这一点不由本应用控制；本应用保证的是**自己的**请求定义、运行记录、预览与模型回执里不再出现路径。
+- 保存下来的请求只保留引用，重启后引用失效，必须重新声明路径或重新选择文件（这正是「路径不入库」的代价）。
+- 审批快照里的附件行只随权限事件发到本机渲染进程用于展示（Agent 岛、桌面通知与 LAN 订阅只读工具名/状态，拿不到附件行），不落盘、不复用。

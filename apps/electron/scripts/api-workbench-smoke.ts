@@ -1,6 +1,6 @@
 /** 独立 Electron 验收：真实 preload/IPC → Service → Utility → 回环 HTTP，数据只写临时目录。 */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,8 +14,11 @@ import { ApiRuntimeClient } from '../src/main/lib/api-workbench/api-runtime-clie
 import { registerApiWorkbenchIpc } from '../src/main/lib/api-workbench/api-ipc'
 import { createApiAgentFacade } from '../src/main/lib/api-workbench/api-agent-facade'
 
-/** 临时根和该验收拥有的 Electron 内部目录，不触碰用户工作区。 */
-const directory = mkdtempSync(join(tmpdir(), 'proma-api-smoke-'))
+/**
+ * 临时根和该验收拥有的 Electron 内部目录，不触碰用户工作区。
+ * 根目录先按 realpath 固定：macOS 的 `/var` 指向 `/private/var`，附件审批展示的是 realpath。
+ */
+const directory = realpathSync(mkdtempSync(join(tmpdir(), 'proma-api-smoke-')))
 mkdirSync(join(directory, 'electron'))
 app.setPath('userData', join(directory, 'electron'))
 /** 只对本机合成请求计数，以证明重试/打开历史不会重复出网。 */
@@ -383,10 +386,73 @@ async function smoke(): Promise<void> {
   assert.deepEqual(uploadRun.request.attachments?.map((item) => item.field), ['file'])
   assert.equal(uploadRun.request.attachments?.[0]?.sha256.length, 64)
   assert.equal(JSON.stringify(uploadRun).includes(uploadBytes.toString('base64').slice(0, 12)), false, '运行记录不该带二进制正文')
-  const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 16)
+  /** B12b：Agent 指定本机文件必须走确认授权，字节只在批准之后读取。 */
+  const agentBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0xfe, 0x0d, 0x0a, 0x80])
+  const agentFilePath = join(directory, 'agent-secret.bin')
+  writeFileSync(agentFilePath, agentBytes)
+  /** 链接名故意与真实文件名不同：审批卡必须展示 realpath，不能被这个伪装名骗过。 */
+  const agentLinkPath = join(directory, 'looks-innocent.txt')
+  symlinkSync(agentFilePath, agentLinkPath)
+  /** Agent 只能声明路径，Host 用 realpath + stat 登记引用，摘要里出现的是真实文件名。 */
+  const agentUpload = await facade.prepare({ request: {
+    name: 'Agent 上传附件',
+    url: baseUrl + '/upload',
+    method: 'POST',
+    body: { kind: 'multipart', text: '', fields: [{ id: 'field_agent', name: 'note', value: 'agent 中文', enabled: true }], files: [{ id: 'part_agent', name: 'file', path: agentLinkPath }] },
+  } })
+  assert.equal(JSON.stringify(agentUpload).includes(directory), false, '模型可见的准备回执不该带真实路径')
+  assert.ok(agentUpload.request.body.includes('filename="agent-secret.bin"'), agentUpload.request.body)
+  assert.equal(agentUpload.request.body.includes('looks-innocent'), false, '摘要里不该出现链接名')
+  assert.ok(agentUpload.request.body.includes('<文件内容未留存'), agentUpload.request.body)
+  /** 未批准的发送必须被拒，并且一次网络调用都不发生。 */
+  const agentUploadArgs = { preparedId: agentUpload.preparedId }
+  await assert.rejects(facade.send(agentUploadArgs), /APPROVAL_REQUIRED/)
   assert.equal(calls, 16)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'history'] }))
+  /** 审批快照逐行给出目标字段、realpath 与大小。 */
+  const agentSnapshot = await facade.approval('api_send_request', agentUploadArgs)
+  assert.deepEqual(agentSnapshot.files, [{ field: 'file', path: agentFilePath, sizeBytes: agentBytes.length }])
+  await facade.authorize('api_send_request', agentUploadArgs, agentSnapshot)
+  const agentUploadRun = await facade.send(agentUploadArgs)
+  assert.equal(agentUploadRun.status, 200)
+  assert.equal(calls, 17)
+  /** 服务端收到的附件与批准的文件逐字节一致，文件名同样来自 realpath。 */
+  assert.ok(receivedUpload.includes(agentBytes), '服务端没有收到 Agent 指定的附件字节')
+  const agentUploadText = receivedUpload.toString('utf8')
+  assert.ok(agentUploadText.includes('name="file"; filename="agent-secret.bin"'), agentUploadText)
+  assert.ok(agentUploadText.includes('agent 中文'), agentUploadText)
+  /** 运行记录里只有摘要：没有路径、没有字节。 */
+  const agentStored = await call('getRun', { sessionId: 'smoke-session', runId: agentUploadRun.runId }) as ApiRun
+  assert.deepEqual(agentStored.request.attachments?.map((item) => item.field), ['file'])
+  assert.equal(agentStored.request.attachments?.[0]?.sha256.length, 64)
+  assert.equal(JSON.stringify(agentStored).includes(directory), false, '运行记录不该带真实路径')
+  assert.equal(JSON.stringify(agentStored).includes(agentBytes.toString('base64').slice(0, 12)), false, '运行记录不该带二进制正文')
+  /** 批准之后换掉文件：必须拒绝派发，而不是发出另一个版本。 */
+  const swapped = await facade.prepare({ request: {
+    name: 'Agent 上传附件',
+    url: baseUrl + '/upload',
+    method: 'POST',
+    body: { kind: 'multipart', text: '', fields: [{ id: 'field_agent', name: 'note', value: 'agent 中文', enabled: true }], files: [{ id: 'part_agent', name: 'file', path: agentFilePath }] },
+  } })
+  const swappedArgs = { preparedId: swapped.preparedId }
+  const swappedSnapshot = await facade.approval('api_send_request', swappedArgs)
+  writeFileSync(agentFilePath, Buffer.from('完全换过的内容'))
+  await facade.authorize('api_send_request', swappedArgs, swappedSnapshot)
+  await assert.rejects(facade.send(swappedArgs), /API_WORKBENCH_FILE_CHANGED/)
+  assert.equal(calls, 17)
+  /** 目录与设备文件在准备阶段就被拒绝，不会签发 preparedId。 */
+  const withPath = (path: string) => facade.prepare({ request: {
+    name: 'Agent 上传附件',
+    url: baseUrl + '/upload',
+    method: 'POST',
+    body: { kind: 'multipart', text: '', fields: [{ id: 'field_agent', name: 'note', value: 'x', enabled: true }], files: [{ id: 'part_agent', name: 'file', path }] },
+  } })
+  await assert.rejects(withPath(directory), /API_WORKBENCH_FILE_INVALID_TYPE/)
+  if (process.platform !== 'win32') await assert.rejects(withPath('/dev/null'), /API_WORKBENCH_FILE_INVALID_TYPE/)
+  assert.equal(calls, 17)
+  const history = await call('listRuns', { sessionId: 'smoke-session' })
+  assert.equal(history.runs.length, 17)
+  assert.equal(calls, 17)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval + realpath', 'agent file changed rejection', 'agent file type rejection', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

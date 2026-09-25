@@ -1,26 +1,32 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { AgentSessionMeta } from '@proma/shared'
+import type { ApiResolvedRequest } from '@proma/shared'
 import { createApiRequestDraft } from '@proma/shared'
+import { ApiFileStore } from './api-file-store'
 import { ApiWorkbenchStore } from './api-workbench-store'
 import { ApiWorkbenchService } from './api-workbench-service'
 import { createApiAgentFacade } from './api-agent-facade'
 
-/** 建立不访问真实网络、不读用户配置的 Agent 场景。 */
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'api-agent-'))
+/** 建立不访问真实网络、不读用户配置的 Agent 场景；可注入窄上限的文件仓库以验证回滚。 */
+function fixture(files?: ApiFileStore) {
+  /** macOS 的 `/var` 指向 `/private/var`，先固定 realpath 让审批路径断言稳定。 */
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'api-agent-')))
   let session = { id: 'session', workspaceId: 'workspace' } as AgentSessionMeta
   let sends = 0
+  /** 记录真实派发出去的请求，用于逐字节核对附件。 */
+  const sent: ApiResolvedRequest[] = []
   const abort = new AbortController()
-  const service = new ApiWorkbenchService({ store: new ApiWorkbenchStore(root), transport: async () => {
+  const service = new ApiWorkbenchService({ store: new ApiWorkbenchStore(root), transport: async (request) => {
     sends += 1
+    sent.push(request)
     return { state: 'completed', hops: [], body: { rawBytes: 2, decodedBytes: 2, contentType: 'text/plain', encoding: '', preview: 'ok', previewTruncated: false, complete: true, decoded: true } }
-  } })
+  }, ...(files ? { files } : {}) })
   const options = { sessionId: 'session', toolMode: 'standard', getSession: () => session, service, runSignal: abort.signal, assertRunActive: () => { if (abort.signal.aborted) throw new Error('stopped') } }
   const facade = createApiAgentFacade(options)!
-  return { facade, options, service, abort, sends: () => sends, change: (next: Partial<AgentSessionMeta>) => { session = { ...session, ...next } }, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  return { facade, options, service, abort, root, sent, sends: () => sends, change: (next: Partial<AgentSessionMeta>) => { session = { ...session, ...next } }, cleanup: () => rmSync(root, { recursive: true, force: true }) }
 }
 
 describe('Agent 接口工作台授权边界', () => {
@@ -180,6 +186,135 @@ describe('Agent 出题边界', () => {
       expect(snapshot.send).toEqual({ caseId: 'case_human', caseName: '人工写的越权', assertionCount: 1 })
       await f.facade.authorize('api_send_request', { preparedId: prepared.preparedId }, snapshot)
       expect((await f.facade.send({ preparedId: prepared.preparedId })).caseId).toBe('case_human')
+    } finally { f.cleanup() }
+  })
+})
+
+/** 在临时工作区里造一个待上传文件，返回路径与字节。 */
+function uploadFixture(f: ReturnType<typeof fixture>, name: string, bytes: Buffer): string {
+  const path = join(f.root, name)
+  writeFileSync(path, bytes)
+  return path
+}
+
+/** 组装一条由 Agent 声明文件的 multipart 草稿。 */
+function uploadRequest(url: string, files: unknown, fields: unknown[] = [{ id: 'field_note', name: 'note', value: 'agent 中文', enabled: true }]): Record<string, unknown> {
+  return { name: 'Agent 上传附件', url, method: 'POST', body: { kind: 'multipart', text: '', fields, files } }
+}
+
+describe('Agent 指定文件与确认授权', () => {
+  test('Given Agent 声明路径 When 未批准发送 Then 拒绝且不出网；批准后按真实字节上传', async () => {
+    const f = fixture()
+    try {
+      const bytes = Buffer.from([0x2d, 0x2d, 0x00, 0xff, 0xfe, 0x80, 0x0a, 0x0d])
+      const path = uploadFixture(f, 'report.bin', bytes)
+      const prepared = await f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path }]) })
+
+      /** 模型可见的准备回执里只有引用与文件名，没有真实路径。 */
+      expect(JSON.stringify(prepared)).not.toContain(f.root)
+      expect(prepared.request.body).toContain('filename="report.bin"')
+      expect(prepared.request.body).toContain('<文件内容未留存')
+
+      const args = { preparedId: prepared.preparedId }
+      await expect(f.facade.send(args)).rejects.toThrow('APPROVAL_REQUIRED')
+      expect(f.sends()).toBe(0)
+
+      /** 审批快照逐行给出「目标字段 + realpath + 大小」。 */
+      const snapshot = await f.facade.approval('api_send_request', args)
+      expect(snapshot.files).toEqual([{ field: 'file', path, sizeBytes: bytes.length }])
+
+      await f.facade.authorize('api_send_request', args, snapshot)
+      const run = await f.facade.send(args)
+
+      expect(run.state).toBe('completed')
+      expect(f.sends()).toBe(1)
+      /** 附件字节在批准后才被读入：派发正文里能逐字节找到原文件内容。 */
+      const outgoing = Buffer.from(f.sent[0]!.bodyBase64 ?? '', 'base64')
+      expect(outgoing.includes(bytes)).toBe(true)
+      expect(outgoing.toString('utf8')).toContain('agent 中文')
+      /** 运行记录只留摘要：没有路径、没有字节，sha256 与大小都能核对。 */
+      const stored = await f.service.getRun({ workspaceId: 'workspace', sessionId: 'session', source: 'agent' }, run.runId, false)
+      expect(stored.request.attachments).toEqual([{ field: 'file', fileName: 'report.bin', sizeBytes: bytes.length, sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }])
+      expect(JSON.stringify(stored)).not.toContain(f.root)
+      /** 模型回执同样不含路径：只有文件名与结构摘要。 */
+      expect(JSON.stringify(run)).not.toContain(f.root)
+    } finally { f.cleanup() }
+  })
+
+  test('Given 符号链接 When 准备 Then 审批行按 realpath 展开、文件名取自真实文件', async () => {
+    const f = fixture()
+    try {
+      const target = uploadFixture(f, 'id_rsa', Buffer.from('secret-key'))
+      const link = join(f.root, 'looks-innocent.txt')
+      symlinkSync(target, link)
+
+      const prepared = await f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path: link }]) })
+      const snapshot = await f.facade.approval('api_send_request', { preparedId: prepared.preparedId })
+
+      expect(snapshot.files).toEqual([{ field: 'file', path: target, sizeBytes: 'secret-key'.length }])
+      /** 文件名同样不能被链接名伪装：摘要正文里出现的是真实文件名。 */
+      expect(prepared.request.body).toContain(`filename="${basename(target)}"`)
+      expect(prepared.request.body).not.toContain('looks-innocent')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 目录、设备或悬空链接 When 准备 Then 拒绝并且不签发 preparedId', async () => {
+    const f = fixture()
+    try {
+      const dangling = join(f.root, 'dangling.txt')
+      symlinkSync(join(f.root, 'missing-target'), dangling)
+
+      await expect(f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path: f.root }]) }))
+        .rejects.toThrow('API_WORKBENCH_FILE_INVALID_TYPE')
+      await expect(f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path: dangling }]) }))
+        .rejects.toThrow('API_WORKBENCH_FILE_MISSING')
+      /** 设备文件同样不是常规文件；Windows 上没有 /dev/null，跳过该断言。 */
+      if (process.platform !== 'win32') {
+        await expect(f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path: '/dev/null' }]) }))
+          .rejects.toThrow('API_WORKBENCH_FILE_INVALID_TYPE')
+      }
+    } finally { f.cleanup() }
+  })
+
+  test('Given 声明了文件但正文不是 multipart When 准备 Then 拒绝而不是静默丢弃', async () => {
+    const f = fixture()
+    try {
+      const path = uploadFixture(f, 'note.txt', Buffer.from('note'))
+
+      await expect(f.facade.prepare({ request: { url: 'https://example.test', method: 'POST', body: { kind: 'urlencoded', text: '', fields: [], files: [{ id: 'part_1', name: 'file', path }] } } }))
+        .rejects.toThrow('API_WORKBENCH_INVALID: body.files.multipartOnly')
+      expect(f.sends()).toBe(0)
+    } finally { f.cleanup() }
+  })
+
+  test('Given 准备在登记之后失败 When 再准备 Then 文件槽位已被回滚', async () => {
+    const f = fixture(new ApiFileStore({ maxFiles: 1 }))
+    try {
+      const path = uploadFixture(f, 'note.txt', Buffer.from('note'))
+      const files = [{ id: 'part_1', name: 'file', path }]
+
+      /** URL 非法会在服务层准备阶段抛错，此时引用已经登记，必须被回滚。 */
+      await expect(f.facade.prepare({ request: uploadRequest('ftp://example.test/upload', files) })).rejects.toThrow('API_WORKBENCH_INVALID: request.url')
+      /** 槽位只有 1 个：没回滚的话这次准备会以文件数量上限失败。 */
+      const prepared = await f.facade.prepare({ request: uploadRequest('https://example.test/upload', files) })
+      expect(prepared.request.body).toContain('filename="note.txt"')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 批准前文件被换掉 When 发送 Then 拒绝且不出网', async () => {
+    const f = fixture()
+    try {
+      const path = uploadFixture(f, 'doc.bin', Buffer.from('v1'))
+      const prepared = await f.facade.prepare({ request: uploadRequest('https://example.test/upload', [{ id: 'part_1', name: 'file', path }]) })
+      const args = { preparedId: prepared.preparedId }
+      const snapshot = await f.facade.approval('api_send_request', args)
+      await f.facade.authorize('api_send_request', args, snapshot)
+
+      /** 批准之后、派发之前换文件：inode/时间戳复核必须拒绝，避免「批准的是 A、发出的是 B」。 */
+      writeFileSync(path, Buffer.from('v2-longer'))
+
+      await expect(f.facade.send(args)).rejects.toThrow('API_WORKBENCH_FILE_CHANGED')
+      expect(f.sends()).toBe(0)
     } finally { f.cleanup() }
   })
 })

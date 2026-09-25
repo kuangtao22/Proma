@@ -1,13 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ApiFileStore } from './api-file-store'
 
 /** 在临时目录里准备文件，测试结束统一清理。 */
 function fixture(): { root: string; path: (name: string) => string; write: (name: string, content: Buffer | string) => string; cleanup: () => void } {
-  const root = mkdtempSync(join(tmpdir(), 'api-file-store-'))
+  /** 先按 realpath 固定临时根：macOS 的 `/var` 是指向 `/private/var` 的符号链接，否则路径断言会漂移。 */
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'api-file-store-')))
   return {
     root,
     path: (name) => join(root, name),
@@ -139,6 +140,40 @@ describe('待上传文件引用仓库', () => {
       expect(store.clear('workspace')).toBe(1)
       expect(store.clear('workspace')).toBe(0)
       expect(() => store.read('workspace', meta.ref)).toThrow('API_WORKBENCH_FILE_REF_NOT_FOUND')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 已登记引用 When 取审批用的真实路径 Then 只回路径与大小', () => {
+    const f = fixture()
+    try {
+      const target = f.write('secret.txt', 'hello')
+      const link = f.path('looks-innocent.txt')
+      symlinkSync(target, link)
+      const store = new ApiFileStore()
+
+      const meta = store.register('workspace', link)
+
+      /** 符号链接按 realpath 展开：审批卡展示的必须是真实路径，不能是链接名。 */
+      expect(store.locate('workspace', meta.ref)).toEqual({ path: target, sizeBytes: 5 })
+      expect(store.locate('other', meta.ref)).toBeUndefined()
+      expect(store.locate('workspace', 'file_missing')).toBeUndefined()
+    } finally { f.cleanup() }
+  })
+
+  test('Given 登记后准备失败 When 释放引用 Then 槽位立刻可用', () => {
+    const f = fixture()
+    try {
+      const first = f.write('a.txt', 'a')
+      const second = f.write('b.txt', 'b')
+      const store = new ApiFileStore({ maxFiles: 2 })
+      const one = store.register('workspace', first).ref
+      const two = store.register('workspace', second)
+
+      expect(store.release('workspace', [two.ref, 'file_missing'])).toBe(1)
+      expect(() => store.read('workspace', two.ref)).toThrow('API_WORKBENCH_FILE_REF_NOT_FOUND')
+      /** 释放后空出的槽位可以重新登记；未释放的那条不受影响。 */
+      expect(store.register('workspace', second).fileName).toBe('b.txt')
+      expect(store.read('workspace', one).bytes.toString()).toBe('a')
     } finally { f.cleanup() }
   })
 })

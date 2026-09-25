@@ -14,11 +14,29 @@ export interface ApiApprovalCaseDiff {
   assertionCount: number
 }
 
+/**
+ * 一条待上传附件行。
+ *
+ * `path` 是 Host 用 `realpath` 解析后的真实路径（符号链接无法伪装成别的文件名），
+ * 大小取自登记时的 stat；字节要到用户批准之后才会被读取。
+ */
+export interface ApiApprovalFileLine {
+  /** 目标表单字段名。 */
+  field: string
+  /** realpath；只在本机界面上展示。 */
+  path: string
+  sizeBytes: number
+  /** 成品展示文本，避免调用方再拼一遍格式。 */
+  text: string
+}
+
 /** 审批卡要展示的接口视图；caseDiff 为空表示这次没有用例改动。 */
 export interface ApiWorkbenchApprovalView {
   kind: 'api-send' | 'api-save'
   title: string
   lines: string[]
+  /** 本次要读取并上传的文件；为空表示没有附件（普通请求或保存审批）。 */
+  files: ApiApprovalFileLine[]
   caseDiff: ApiApprovalCaseDiff[]
 }
 
@@ -56,6 +74,20 @@ function caseDiff(value: unknown): ApiApprovalCaseDiff[] {
   })
 }
 
+/** 解析 Host 生成的附件行；结构不符的项直接丢弃，避免展示半截事实。 */
+function fileLines(value: unknown): ApiApprovalFileLine[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    const entry = record(item)
+    const field = entry ? string(entry.field) : undefined
+    const path = entry ? string(entry.path) : undefined
+    const sizeBytes = entry?.sizeBytes
+    if (!entry || !field || !path) return []
+    if (typeof sizeBytes !== 'number' || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0) return []
+    return [{ field, path, sizeBytes, text: `字段 ${field}：${path}（${sizeBytes} 字节）` }]
+  })
+}
+
 /**
  * 把接口工作台的两个变更工具投影成审批卡视图。
  * @param toolName 工具名；非接口变更工具返回 null，调用方回落到原有 JSON 展示。
@@ -71,6 +103,8 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
   const url = request ? string(request.url) ?? '（未解析）' : '（未解析）'
   const requestName = string(preview.requestName)
   const environmentId = string(preview.environmentId)
+  /** 附件行只在发送审批上有意义：保存写的是引用，重启后本来就要重新选文件。 */
+  const files = fileLines(toolInput.files)
   const lines = [`${method} ${url}`]
   if (requestName) lines.push(`请求名称：${requestName}`)
 
@@ -81,7 +115,7 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
     const assertionCount = send && typeof send.assertionCount === 'number' ? send.assertionCount : 0
     lines.push(`环境：${environmentId ?? '未选择'}`)
     lines.push(caseName || caseId ? `用例：${caseName ?? caseId}（${assertionCount} 条断言）` : `断言：请求自身默认断言 ${assertionCount} 条`)
-    return { kind: 'api-send', title: '发送接口请求', lines, caseDiff: [] }
+    return { kind: 'api-send', title: '发送接口请求', lines, files, caseDiff: [] }
   }
 
   const save = record(toolInput.save)
@@ -89,7 +123,7 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
   lines.push(`保存到集合：${collectionId ?? '未知集合'}`)
   const diff = caseDiff(save?.caseDiff)
   if (diff.length === 0) lines.push('用例：本次没有改动')
-  return { kind: 'api-save', title: '保存接口定义', lines, caseDiff: diff }
+  return { kind: 'api-save', title: '保存接口定义', lines, files: [], caseDiff: diff }
 }
 
 /** 用例差异的展示文本，删除项单独标红由调用方处理。 */

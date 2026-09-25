@@ -4,6 +4,7 @@ import type { AgentSessionMeta, ApiPreparedPreview, ApiRequestDraft, ApiRun } fr
 import type { ApiWorkbenchService } from './api-workbench-service'
 import { stampApiAgentCases } from './api-agent-case-ownership'
 import type { ApiAgentCaseChange } from './api-agent-case-ownership'
+import { parseApiAgentDeclaredFiles } from './api-agent-files'
 import { redactApiBody } from './api-redaction'
 
 /** 只有宿主授权服务可以调用 authorize；模型工具只能消费已签发的精确快照。 */
@@ -11,6 +12,12 @@ export interface ApiAgentApproval {
   tool: string
   preparedId: string
   preview: ApiPreparedPreview
+  /**
+   * 本次要读取并上传的附件：字段名、`realpath` 与大小。
+   *
+   * 只用于审批卡展示（审批快照是路径允许存在的两处之一），不进请求定义、运行记录与模型上下文。
+   */
+  files?: Array<{ field: string; path: string; sizeBytes: number }>
   /** 发送审批的结构化摘要：这次跑的是哪一组断言。 */
   send?: { caseId?: string; caseName?: string; assertionCount: number }
   save?: { expectedRevision: number; requestName: string; collectionId: string; definition: ApiRequestDraft; caseDiff: ApiAgentCaseChange[] }
@@ -21,7 +28,7 @@ export interface ApiAgentFacadeOptions {
   toolMode: string
   triggeredBy?: 'user' | 'automation' | 'delegation' | 'external'
   getSession(sessionId: string): AgentSessionMeta | undefined
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'getPrepared' | 'send' | 'getRun' | 'readBody'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'getPrepared' | 'send' | 'getRun' | 'readBody' | 'registerAgentFiles' | 'releaseFiles'>
   runSignal: AbortSignal
   assertRunActive(): void
   assertWorkspaceWritable?(workspaceId: string): void
@@ -48,8 +55,11 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
   if (options.toolMode !== 'standard' || (options.triggeredBy && options.triggeredBy !== 'user')
     || !isOrdinaryTopLevelAgentSession(initial) || initial.archived || initial.explorationParentSessionId !== undefined || !initial.workspaceId) return undefined
   const context = { workspaceId: initial.workspaceId, sessionId: options.sessionId, source: 'agent' as const }
-  /** 只保留本次 Agent 运行生成的草稿，秘密引用仍交给 Store 验证所有权。 */
-  const drafts = new Map<string, { request: ApiRequestDraft; preview: ApiPreparedPreview; requestId?: string; caseId?: string }>()
+  /**
+   * 只保留本次 Agent 运行生成的草稿，秘密引用仍交给 Store 验证所有权。
+   * `files` 是本次待上传附件的审批行（字段名 + realpath + 大小），是路径允许存在的两处之一。
+   */
+  const drafts = new Map<string, { request: ApiRequestDraft; preview: ApiPreparedPreview; files?: Array<{ field: string; path: string; sizeBytes: number }>; requestId?: string; caseId?: string }>()
   /** 精确授权与已完成执行分开记录；保存批准不能变成出网批准。 */
   const grants = new Map<string, string>()
   const sent = new Map<string, ApiAgentRunSummary>()
@@ -96,6 +106,8 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
     const preparedCase = draft.caseId ? (draft.request.cases ?? []).find((item) => item.id === draft.caseId) : undefined
     return {
       tool, preparedId: args.preparedId, preview,
+      /** 附件行逐条带上真实路径与大小：审批卡据此让用户看清到底要读哪个文件。 */
+      ...(draft.files?.length ? { files: draft.files.map((file) => ({ ...file })) } : {}),
       send: { assertionCount: (preparedCase?.assertions ?? draft.request.assertions).length, ...(draft.caseId ? { caseId: draft.caseId } : {}), ...(preparedCase ? { caseName: preparedCase.name } : {}) },
     }
   }
@@ -153,10 +165,30 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       if (requestId && !saved) throw new Error('API_WORKBENCH_REQUEST_NOT_FOUND')
       const base = saved ? apiDraftFromDefinition(saved) : createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
       const overrides = args.request === undefined ? {} : apiRecord(args.request, Object.keys(base))
-      const request = parseApiRequestDraft({ ...base, ...overrides })
-      const preview = await options.service.prepare(context, { request, ...(requestId ? { requestId } : {}), ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }), ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
-      current()
-      drafts.set(preview.preparedId, { request, preview, ...(requestId ? { requestId } : {}), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
+      /**
+       * Agent 声明的文件路径只在这里出现一次：先登记成引用（realpath + stat，不读字节），
+       * 再把请求定义里的 `path` 换成引用；路径只留在审批快照与文件仓库两处。
+       */
+      const declared = parseApiAgentDeclaredFiles(overrides.body)
+      if (declared.length > 0 && (overrides.body as { kind?: unknown }).kind !== 'multipart') throw new Error('API_WORKBENCH_INVALID: body.files.multipartOnly')
+      const registration = declared.length > 0 ? options.service.registerAgentFiles(context.workspaceId, declared) : undefined
+      let request: ApiRequestDraft
+      let preview: ApiPreparedPreview
+      try {
+        request = parseApiRequestDraft({ ...base, ...overrides, ...(registration ? { body: { ...(overrides.body as Record<string, unknown>), files: registration.parts } } : {}) })
+        preview = await options.service.prepare(context, { request, ...(requestId ? { requestId } : {}), ...(args.environmentId === undefined ? {} : { environmentId: parseApiId(args.environmentId) }), ...(args.overrides === undefined ? {} : { overrides: parseApiFields(args.overrides) }), ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }) })
+        current()
+      } catch (error) {
+        /** 准备失败要回滚刚登记的引用，避免失败的准备长期占满文件槽位。 */
+        if (registration) options.service.releaseFiles(context.workspaceId, registration.parts.map((part) => part.ref))
+        throw error
+      }
+      drafts.set(preview.preparedId, {
+        request, preview,
+        ...(registration?.approvals.length ? { files: registration.approvals } : {}),
+        ...(requestId ? { requestId } : {}),
+        ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }),
+      })
       return preview
     },
     /** 使用精确批准派发一次请求；停止 Agent 会同步取消对应网络任务。 */

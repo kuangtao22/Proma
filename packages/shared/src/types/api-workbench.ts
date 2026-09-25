@@ -183,7 +183,10 @@ export interface ApiResolvedRequest {
    * **绝不进入预览、运行记录或模型上下文**；记录里只保留 body 的摘要与 attachments。
    */
   bodyBase64?: string
-  /** 附件摘要；运行记录与预览展示它而不是文件内容。 */
+  /**
+   * 附件摘要；**只在真正派发时才产生**（准备阶段只做 realpath + stat，不读字节），
+   * 运行记录用它说明发了什么，而不是把文件内容复制进应用数据根。
+   */
   attachments?: ApiAttachmentSummary[]
 }
 /** 发送前公开的固定快照，request 已脱敏。 */

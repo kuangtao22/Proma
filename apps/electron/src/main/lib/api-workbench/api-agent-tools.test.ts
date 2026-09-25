@@ -50,4 +50,23 @@ describe('接口工作台 Agent 工具合同', () => {
     expect(accepts('api_inspect_run', { runId: 'run_1', section: 'cookies' })).toBe(false)
     expect(accepts('api_prepare_request', { cookieJar: [] })).toBe(false)
   })
+
+  test('Given Agent 声明本机文件 When 校验参数 Then 只接受路径声明而不是引用或字节', () => {
+    const multipart = (files: unknown): unknown => ({ request: { url: 'https://example.test', method: 'POST', body: { kind: 'multipart', text: '', fields: [], files } } })
+    const declared = { id: 'part_1', name: 'file', path: '/tmp/report.pdf' }
+
+    expect(accepts('api_prepare_request', multipart([{ ...declared, contentType: 'application/pdf' }]))).toBe(true)
+    /** 路径必填：只给字段名会让 Host 无法判断要读哪个文件。 */
+    expect(accepts('api_prepare_request', multipart([{ id: 'part_1', name: 'file' }]))).toBe(false)
+    /** 模型不能自带引用、大小或文件名，这些由 Host 在 realpath + stat 之后签发。 */
+    expect(accepts('api_prepare_request', multipart([{ ...declared, ref: 'file_1' }]))).toBe(false)
+    expect(accepts('api_prepare_request', multipart([{ ...declared, fileName: 'report.pdf', sizeBytes: 3 }]))).toBe(false)
+    /** 单次请求的文件条数与共享上限一致（16）。 */
+    expect(accepts('api_prepare_request', multipart(Array.from({ length: 17 }, (_value, index) => ({ ...declared, id: `part_${index}` }))))).toBe(false)
+    /**
+     * schema 不表达「文件必须配 multipart」这种条件约束（会变成难读的联合类型），
+     * 该搭配由 Host 在 prepare 阶段以 API_WORKBENCH_INVALID: body.files.multipartOnly 拒绝。
+     */
+    expect(accepts('api_prepare_request', { request: { url: 'https://example.test', body: { kind: 'urlencoded', text: '', fields: [], files: [declared] } } })).toBe(true)
+  })
 })

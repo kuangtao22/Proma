@@ -12,6 +12,7 @@ import type {
   ApiCatalog,
   ApiExtractionOutcome,
   ApiField,
+  ApiFilePart,
   ApiPreparedPreview,
   ApiResolvedRequest,
   ApiRun,
@@ -20,15 +21,19 @@ import type {
   ApiSseEvent,
   ApiRuntimeVariable,
   ApiCookieJarEntry,
+  ApiAttachmentSummary,
   ApiTransportResult,
 } from '@proma/shared'
 import { evaluateApiAssertions } from './api-assertions'
 import { isCookieExpired, parseApiSetCookie, MAX_COOKIE_JAR_ENTRIES } from './api-cookies'
 import type { ApiCookieJarRecord } from './api-cookies'
 import { evaluateApiExtractions } from './api-extractions'
+import { parseApiAgentDeclaredFiles } from './api-agent-files'
+import type { ApiAgentDeclaredFile } from './api-agent-files'
 import { ApiFileStore } from './api-file-store'
 import type { ApiPickedFileMeta } from './api-file-store'
 import { composeMultipartBody } from './api-multipart'
+import type { ApiMultipartPlanPart } from './api-multipart'
 import { redactApiBody, redactApiRequest } from './api-redaction'
 import { resolveApiRequest } from './api-request-resolver'
 import type { ApiWorkbenchStore } from './api-workbench-store'
@@ -87,6 +92,14 @@ export interface ApiWorkbenchPrepareInput {
   caseId?: string
 }
 
+/** Agent 附件登记结果：请求定义用的引用 + 只给审批卡看的真实路径与大小。 */
+export interface ApiAgentFileRegistration {
+  /** 可直接放进请求定义的引用元数据（不含路径）。 */
+  parts: ApiFilePart[]
+  /** 审批快照里的文件行；`path` 是 realpath，符号链接无法伪装。 */
+  approvals: Array<{ field: string; path: string; sizeBytes: number }>
+}
+
 /** Utility/transport 的固定调用合同；原始正文产物只写入 Store 分配的目录。 */
 export type ApiWorkbenchTransport = (
   request: ApiResolvedRequest,
@@ -115,6 +128,11 @@ interface PreparedRecord {
   context: ApiWorkbenchContext
   preview: ApiPreparedPreview
   rawRequest: ApiResolvedRequest
+  /**
+   * multipart 的待发计划：文本字段已解析，文件部分只有引用与元数据。
+   * 真字节在 send 阶段才按这份计划读取（准备阶段只做了 realpath + stat）。
+   */
+  multipart?: { boundary: string; parts: ApiMultipartPlanPart[] }
   assertions: ReturnType<typeof parseApiRequestDraft>['assertions']
   /** 本次运行绑定的测试用例身份；未按用例跑时缺省。 */
   caseId?: string
@@ -281,25 +299,22 @@ export class ApiWorkbenchService {
       resolveFile: (ref) => this.files.metadata(context.workspaceId, ref),
       resolveSecret: ({ ref, owner }) => this.store.resolveSecret(context.workspaceId, ref, owner),
     })
-    /** 含附件的请求要把文件字节读进来合成待发正文；公开投影只保留摘要。 */
-    let rawRequest = resolved.request
-    if (resolved.multipart) {
-      /** 字段名按引用对应，读取时一起产出可留存的附件摘要。 */
-      const fieldByRef = new Map(resolved.multipart.parts.flatMap((part) => part.kind === 'file' ? [[part.ref, part.name] as const] : []))
-      const attachments: NonNullable<ApiResolvedRequest['attachments']> = []
-      const composed = composeMultipartBody(resolved.multipart.boundary, resolved.multipart.parts, (ref) => {
-        const file = this.files.read(context.workspaceId, ref)
-        attachments.push({ field: fieldByRef.get(ref) ?? '', fileName: file.summary.fileName, sizeBytes: file.summary.sizeBytes, sha256: file.summary.sha256 })
-        return file.bytes
-      })
-      if (composed.byteLength > API_LIMITS.bodyBytes) throw new Error('API_WORKBENCH_MULTIPART_TOO_LARGE: 附件与字段合计超过单次请求正文上限')
-      rawRequest = { ...resolved.request, bodyBase64: composed.toString('base64'), attachments }
+    /**
+     * multipart 只冻结待发计划：**准备阶段绝不读取文件字节**，
+     * 字节与 sha256 摘要都留到真正派发（人点发送 / Agent 批准后）时才产生。
+     */
+    const multipart = resolved.multipart
+    if (multipart) {
+      /** 附件大小在 stat 阶段已知，先判上限，避免为一条发不出去的请求弹出确认框。 */
+      const declaredBytes = multipart.parts.reduce((sum, part) => sum + (part.kind === 'file' ? part.sizeBytes : 0), 0)
+      if (declaredBytes > API_LIMITS.bodyBytes) throw new Error('API_WORKBENCH_MULTIPART_TOO_LARGE: 附件合计超过单次请求正文上限')
     }
+    const rawRequest = resolved.request
     const createdAt = this.now()
     const preparedId = parseApiId(this.uuid())
     const preview = parseApiPreparedPreview({
       preparedId,
-      /** 预览基于可派发的请求（含附件摘要）再脱敏；二进制正文由脱敏函数剥掉。 */
+      /** 预览基于待发请求再脱敏；附件字节与 sha256 摘要都不在这一步产生。 */
       request: redactApiRequest(rawRequest, resolved.secretValues),
       requestName: request.name,
       catalogRevision: catalog.revision,
@@ -316,6 +331,7 @@ export class ApiWorkbenchService {
       ...(requestId ? { requestId } : {}),
       preview,
       rawRequest,
+      ...(multipart ? { multipart } : {}),
       assertions: (testCase?.assertions ?? request.assertions).map((assertion) => ({ ...assertion })),
       ...(testCase ? { caseId: testCase.id } : {}),
       extractions: (request.extractions ?? []).map((rule) => ({ ...rule })),
@@ -356,6 +372,12 @@ export class ApiWorkbenchService {
       return this.store.getRun(context.workspaceId, prepared.runId, false)
     }
     if (signal?.aborted) throw new Error('API_WORKBENCH_CANCELLED')
+    /**
+     * 附件字节在这里才读：这条路径只在人点发送或 Agent 拿到批准后进入，
+     * 因此「批准前不碰文件内容」是时序保证，而不是约定。
+     */
+    const dispatch = this.composeAttachments(prepared)
+    prepared.rawRequest = dispatch.request
     const runId = parseApiId(this.uuid())
     const queued = parseApiRun({
       id: runId,
@@ -369,7 +391,8 @@ export class ApiWorkbenchService {
       catalogRevision: prepared.preview.catalogRevision,
       createdAt: this.now(),
       state: 'queued',
-      request: prepared.preview.request,
+      /** 记录里的附件摘要（含 sha256）在这一刻才有，因此按派发结果补进公开投影。 */
+      request: dispatch.attachments ? { ...prepared.preview.request, attachments: dispatch.attachments } : prepared.preview.request,
       hops: [],
       body: createEmptyApiBody(),
       assertions: [],
@@ -520,6 +543,65 @@ export class ApiWorkbenchService {
   /** 清空一个 workspace 的文件引用，返回被清掉的数量。 */
   clearFiles(workspaceId: string): number {
     return this.files.clear(parseApiId(workspaceId))
+  }
+
+  /**
+   * 登记 Agent 显式声明的待上传文件（B12b）。
+   *
+   * 只做 realpath + stat：**不读文件字节**，字节与 sha256 都在批准后的 send 阶段才产生。
+   * 路径因此只出现在返回的审批行与文件仓库里，不进请求定义、运行记录或模型上下文。
+   * @param workspaceId 归属工作区。
+   * @param files Agent 声明的文件（字段名 + 路径 + 可选 Content-Type）。
+   * @returns 请求定义用的引用元数据，以及只给审批卡看的真实路径与大小。
+   */
+  registerAgentFiles(workspaceId: string, files: readonly ApiAgentDeclaredFile[]): ApiAgentFileRegistration {
+    const id = parseApiId(workspaceId)
+    /** 解析在此重跑一次：服务层不信任调用方已经校验过入参。 */
+    const declared = parseApiAgentDeclaredFiles({ kind: 'multipart', text: '', fields: [], files: [...files] })
+    const parts: ApiFilePart[] = []
+    const approvals: ApiAgentFileRegistration['approvals'] = []
+    try {
+      for (const file of declared) {
+        const meta = this.files.register(id, file.path)
+        const located = this.files.locate(id, meta.ref)
+        /** 刚登记完就查不到属于内部错误，必须直接拒绝而不是签发一条没有路径的审批行。 */
+        if (!located) throw new Error('API_WORKBENCH_FILE_REF_NOT_FOUND: 文件引用登记失败')
+        parts.push({ id: file.id, name: file.name, fileName: meta.fileName, sizeBytes: meta.sizeBytes, contentType: file.contentType ?? meta.contentType, ref: meta.ref })
+        approvals.push({ field: file.name, path: located.path, sizeBytes: located.sizeBytes })
+      }
+    } catch (error) {
+      /** 批量登记里任一条非法（目录、设备、超限）都整批作废，不留下半截引用。 */
+      this.files.release(id, parts.map((part) => part.ref))
+      throw error
+    }
+    return { parts, approvals }
+  }
+
+  /** 释放一批刚登记但没能进入请求定义的引用（准备失败时回滚）。 */
+  releaseFiles(workspaceId: string, refs: readonly string[]): number {
+    return this.files.release(parseApiId(workspaceId), refs)
+  }
+
+  /**
+   * 按待发计划读取附件并合成待发正文。
+   *
+   * 只有真正派发时才会调用：读取前由文件仓库复核 inode 与时间戳，文件被换掉即拒绝。
+   * @param prepared 已准备记录。
+   * @returns 待发请求与可留存的附件摘要；没有附件时原样返回。
+   */
+  private composeAttachments(prepared: PreparedRecord): { request: ApiResolvedRequest; attachments?: ApiAttachmentSummary[] } {
+    const plan = prepared.multipart
+    if (!plan) return { request: prepared.rawRequest }
+    /** 字段名按引用对应，读取时一起产出可留存的附件摘要。 */
+    const fieldByRef = new Map(plan.parts.flatMap((part) => part.kind === 'file' ? [[part.ref, part.name] as const] : []))
+    const attachments: ApiAttachmentSummary[] = []
+    const composed = composeMultipartBody(plan.boundary, plan.parts, (ref) => {
+      const file = this.files.read(prepared.context.workspaceId, ref)
+      attachments.push({ field: fieldByRef.get(ref) ?? '', fileName: file.summary.fileName, sizeBytes: file.summary.sizeBytes, sha256: file.summary.sha256 })
+      return file.bytes
+    })
+    if (composed.byteLength > API_LIMITS.bodyBytes) throw new Error('API_WORKBENCH_MULTIPART_TOO_LARGE: 附件与字段合计超过单次请求正文上限')
+    return { request: { ...prepared.rawRequest, bodyBase64: composed.toString('base64'), attachments }, attachments }
   }
 
   /** 从队列填充全局/来源槽位；不使用定时轮询。 */

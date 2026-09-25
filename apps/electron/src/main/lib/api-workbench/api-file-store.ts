@@ -118,7 +118,40 @@ export class ApiFileStore {
   }
 
   /**
-   * 读取一个已登记文件的字节与摘要。仅主进程在准备/派发请求时调用。
+   * 读取一条引用的真实路径与大小，**只给（B12b 的）审批快照用**。
+   *
+   * 约束：路径因此只存在于「审批快照 + 本仓库」两处，既不进请求定义、也不进运行记录与模型上下文。
+   * @param workspaceId 归属工作区。
+   * @param ref 文件引用。
+   * @returns 真实路径与大小；引用失效时返回 undefined。
+   */
+  locate(workspaceId: string, ref: string): { path: string; sizeBytes: number } | undefined {
+    const stored = this.files.get(this.key(workspaceId, ref))
+    if (!stored) return undefined
+    return { path: stored.realPath, sizeBytes: stored.sizeBytes }
+  }
+
+  /**
+   * 释放一批引用，供「登记后准备失败」回滚使用，避免失败的准备长期占满文件槽位。
+   *
+   * 只用于回滚尚未进入任何请求定义的引用；已经被保存的请求定义仍然按既有失效语义处理。
+   * @param workspaceId 归属工作区。
+   * @param refs 需要释放的引用。
+   * @returns 实际释放的条数（未知引用与跨工作区引用都不计数）。
+   */
+  release(workspaceId: string, refs: readonly string[]): number {
+    let removed = 0
+    for (const ref of refs) {
+      if (this.files.delete(this.key(workspaceId, ref))) removed += 1
+    }
+    return removed
+  }
+
+  /**
+   * 读取一个已登记文件的字节与摘要。
+   *
+   * 只有**真正派发**（人点发送，或 Agent 拿到批准后调用 send）才会走到这里：
+   * 准备阶段只做 realpath + stat，所以批准之前不会读到任何文件内容。
    * @param workspaceId 归属工作区。
    * @param ref 文件引用。
    * @returns 文件字节、sha256 与可供记录展示的摘要。

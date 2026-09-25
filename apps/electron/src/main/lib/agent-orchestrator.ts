@@ -1517,7 +1517,14 @@ export class AgentOrchestrator {
             const snapshot = await apiFacade.approval(toolName, input)
             const permission = currentMode === 'bypassPermissions'
               ? { behavior: 'allow' as const, updatedInput: input }
-              : await permissionService.requestSingleApproval(sessionId, toolName, { ...input, preview: snapshot.preview, ...(snapshot.save ? { save: snapshot.save } : {}) }, options, (request) => {
+              : await permissionService.requestSingleApproval(sessionId, toolName, {
+                ...input,
+                preview: snapshot.preview,
+                /** 审批卡要逐行展示附件真实路径与大小；这也是路径唯一离开主进程内存的场合（只给本机 UI）。 */
+                ...(snapshot.files ? { files: snapshot.files } : {}),
+                ...(snapshot.send ? { send: snapshot.send } : {}),
+                ...(snapshot.save ? { save: snapshot.save } : {}),
+              }, options, (request) => {
                 if (!denyStaleToolRun()) this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_request', request } })
               })
             const checked = revalidateSingleApprovalResult(permission, denyStaleToolRun, getPermissionMode)
