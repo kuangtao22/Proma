@@ -17,6 +17,8 @@ apps/electron/resources/stable-directory/
 apps/electron/resources/server-ops-config-lock/
 # OfficeCLI 随构建脚本下载、校验并嵌入安装包，不提交大体积第三方二进制。
 apps/electron/resources/officecli/
+# OfficeCLI 校验通过的正本缓存（工作副本会被打包签名改写，正本用于免下载恢复）。
+apps/electron/.officecli-cache/
 # bun build --compile 的临时中间产物
 *.bun-build
 

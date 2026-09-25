@@ -4,12 +4,17 @@
  *
  * 每次 Electron build / dev 启动前按当前构建目标的平台与架构从 OfficeCLI 官方 GitHub
  * Release 取得固定版本，流式校验文件大小及 SHA-256，再原子写入 resources/officecli/。
+ *
+ * 工作副本会被 electron-builder 的 `binaries` 签名步骤就地改写（签名后字节变化、哈希不再匹配），
+ * 因此这里额外把校验通过的正本缓存到 .officecli-cache/：工作副本被签名后，下次打包直接从正本恢复，
+ * 不再重复下载几十兆的官方资产（这一步曾经是打包失败的主要来源）。
+ *
  * 对交叉架构打包，可通过 OFFICECLI_PLATFORM / OFFICECLI_ARCH 指定安装包目标；默认使用宿主。
  * 该目录被 gitignore，避免将大体积第三方二进制提交进源码仓库。
  */
 
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, open, rename, rm } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, open, rename, rm } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
@@ -17,6 +22,11 @@ const OFFICECLI_VERSION = 'v1.0.145'
 const RELEASE_BASE_URL = `https://github.com/iOfficeAI/OfficeCLI/releases/download/${OFFICECLI_VERSION}`
 const MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
 const OUTPUT_DIR = join(resolve(import.meta.dir, '..'), 'resources', 'officecli')
+/**
+ * 校验通过的正本缓存目录（在 apps/electron 下，不进入安装包：electron-builder 的 files 是显式白名单）。
+ * 按「平台-架构」分目录，避免交叉架构打包互相覆盖。
+ */
+const CACHE_DIR = join(resolve(import.meta.dir, '..'), '.officecli-cache')
 const targetPlatform = process.env.OFFICECLI_PLATFORM || process.platform
 const targetArch = process.env.OFFICECLI_ARCH || process.arch
 const outputName = targetPlatform === 'win32' ? 'officecli.exe' : 'officecli'
@@ -142,15 +152,36 @@ if (targetPlatform !== process.platform) {
 }
 
 await mkdir(OUTPUT_DIR, { recursive: true })
+const cachePath = join(CACHE_DIR, key, outputName)
 if (await verifyExisting(outputPath, asset)) {
   if (targetPlatform !== 'win32') await chmod(outputPath, 0o755)
   console.log(`[prepare:officecli] 已验证 ${OFFICECLI_VERSION}（${key}）`)
+} else if (await verifyExisting(cachePath, asset)) {
+  /** 工作副本被签名改写（或被人为改动）时，用正本快速恢复，避免重新下载。 */
+  const restorePath = `${outputPath}.restore-${process.pid}-${Date.now()}`
+  try {
+    await copyFile(cachePath, restorePath)
+    if (targetPlatform !== 'win32') await chmod(restorePath, 0o755)
+    await rename(restorePath, outputPath)
+    console.log(`[prepare:officecli] 已从正本缓存恢复 ${OFFICECLI_VERSION}（${key}）`)
+  } catch (error) {
+    await rm(restorePath, { force: true }).catch(() => {})
+    throw error
+  }
 } else {
   const temporaryPath = `${outputPath}.download-${process.pid}-${Date.now()}`
   try {
     console.log(`[prepare:officecli] 下载并校验 ${OFFICECLI_VERSION}（${key}）`)
     await downloadAndVerify(asset, temporaryPath)
     if (targetPlatform !== 'win32') await chmod(temporaryPath, 0o755)
+    /** 先落正本再落工作副本：正本必须保持未签名状态，后续打包才能跳过下载。 */
+    try {
+      await mkdir(join(CACHE_DIR, key), { recursive: true })
+      await copyFile(temporaryPath, cachePath)
+      if (targetPlatform !== 'win32') await chmod(cachePath, 0o755)
+    } catch (cacheError) {
+      console.warn(`[prepare:officecli] 正本缓存写入失败，本次打包不受影响：${String(cacheError)}`)
+    }
     await rename(temporaryPath, outputPath)
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => {})
