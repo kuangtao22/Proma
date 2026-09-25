@@ -141,6 +141,27 @@ export function createImportedRequestTabs(
   return drafts.map((draft) => createRequestTab(createId(), draft))
 }
 
+/**
+ * 把一个已保存请求移动到目标集合与分组（文件夹）。
+ *
+ * 只改归属，不碰任何内容字段：URL、参数、断言、用例都原样保留。
+ * 目标集合不存在时返回原目录（界面只会在合法选项里选，这里兜住脏输入）。
+ * @param catalog 当前目录。
+ * @param requestId 要移动的请求。
+ * @param target 目标集合与分组；分组为空字符串表示集合根目录。
+ * @returns 移动后的新目录。
+ */
+export function moveApiRequest(catalog: ApiCatalog, requestId: string, target: { collectionId: string; folder: string }): ApiCatalog {
+  if (!catalog.collections.some((collection) => collection.id === target.collectionId)) return catalog
+  if (!catalog.requests.some((request) => request.id === requestId)) return catalog
+  return {
+    ...catalog,
+    requests: catalog.requests.map((request) => request.id === requestId
+      ? { ...request, collectionId: target.collectionId, folder: target.folder.trim() }
+      : request),
+  }
+}
+
 /** 创建一个独立请求编辑标签；未绑定已保存请求时默认标记为未保存。 */
 export function createRequestTab(
   id: string,

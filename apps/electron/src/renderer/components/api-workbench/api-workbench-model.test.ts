@@ -10,6 +10,7 @@ import {
   createApiWorkbenchController,
   createRequestTab,
   draftFromRun,
+  moveApiRequest,
   draftAssertions,
   editApiValue,
   formatCookieExpiry,
@@ -591,3 +592,42 @@ describe('接口工作台编辑模型', () => {
 
 // 保证模型只依赖工作台合同的窄接口，避免测试替身随 preload 其它能力膨胀。
 void ({} as Pick<ApiWorkbenchApi, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel'>)
+
+describe('把请求移动到其他分组 / 集合', () => {
+  /** 两个集合 + 一条位于「默认/用户模块」的请求。 */
+  function catalog(): ApiCatalog {
+    const base = createApiRequestDraft('default')
+    return {
+      version: 1, revision: 3,
+      collections: [
+        { id: 'default', name: '后台', description: '', variables: [] },
+        { id: 'app', name: 'App', description: '', variables: [] },
+      ],
+      environments: [],
+      requests: [{ ...base, id: 'request_a', revision: 1, updatedAt: 1, name: '管理员列表', folder: '用户模块', url: '{{baseUrl}}/admin' }],
+    }
+  }
+
+  test('Given 同集合换分组 When 移动 Then 只改归属其余字段原样', () => {
+    const moved = moveApiRequest(catalog(), 'request_a', { collectionId: 'default', folder: '订单模块' })
+
+    expect(moved.requests[0]?.folder).toBe('订单模块')
+    expect(moved.requests[0]?.name).toBe('管理员列表')
+    expect(moved.requests[0]?.url).toBe('{{baseUrl}}/admin')
+    expect(moved.collections).toEqual(catalog().collections)
+  })
+
+  test('Given 换集合并回到根目录 When 移动 Then 归到目标集合且分组清空', () => {
+    const moved = moveApiRequest(catalog(), 'request_a', { collectionId: 'app', folder: '   ' })
+
+    expect(moved.requests[0]?.collectionId).toBe('app')
+    expect(moved.requests[0]?.folder).toBe('')
+  })
+
+  test('Given 目标集合或请求不存在 When 移动 Then 原目录原样返回', () => {
+    const source = catalog()
+
+    expect(moveApiRequest(source, 'request_a', { collectionId: 'missing', folder: 'x' })).toBe(source)
+    expect(moveApiRequest(source, 'request_missing', { collectionId: 'app', folder: 'x' })).toBe(source)
+  })
+})

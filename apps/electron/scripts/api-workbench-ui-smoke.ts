@@ -148,6 +148,46 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.collections.some((item) => (item.variables ?? []).some((variable) => variable.name === 'baseUrl' && variable.value === 'https://api.example.com'))", '主机没有抽成集合变量')
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => item.url === '{{baseUrl}}/imported')", '请求 URL 没有改写成 {{baseUrl}}')
     console.log('[API Workbench UI smoke] 主机提取为集合变量已验证')
+    /** 移动到其他分组：打开已保存请求 → 工具栏「移动到其他分组 / 集合」→ 新建分组 → 确认。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const row = [...document.querySelectorAll('button')].find((item) => item.textContent?.includes('/imported'))
+      if (!(row instanceof HTMLButtonElement)) return false
+      row.click()
+      return true
+    })()`), true, '打不开已保存的导入请求')
+    await waitFor(window, "Boolean(document.querySelector('button[aria-label=" + JSON.stringify('移动到其他分组 / 集合') + "]'))", '编辑器没有移动入口')
+    await clickLabel(window, '移动到其他分组 / 集合')
+    await waitFor(window, `(() => {
+      const dialog = [...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open')
+      return Boolean(dialog?.textContent?.includes('移动到其他分组 / 集合'))
+    })()`, '移动对话框未打开')
+    /** Radix Select 用指针事件打开与选中。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const press = (node) => {
+        if (!(node instanceof HTMLElement)) return false
+        node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+        node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }))
+        node.click()
+        return true
+      }
+      const dialog = [...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open')
+      const trigger = dialog?.querySelector('[aria-label="目标分组"]')
+      return press(trigger)
+    })()`), true, '找不到目标分组选择器')
+    await waitFor(window, "Boolean([...document.querySelectorAll('[role=option]')].find((item) => item.textContent?.includes('新建分组')))", '分组下拉没有「新建分组」')
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const node = [...document.querySelectorAll('[role=option]')].find((item) => item.textContent?.includes('新建分组'))
+      if (!(node instanceof HTMLElement)) return false
+      node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+      node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }))
+      node.click()
+      return true
+    })()`), true, '选不中「新建分组」')
+    await fill(window, 'input[aria-label="新建分组名称"]', '订单模块')
+    await clickText(window, '移动')
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => item.folder === '订单模块')", '请求没有被移动到新分组')
+    await waitFor(window, "document.body.textContent?.includes('已把')", '缺少移动完成提示')
+    console.log('[API Workbench UI smoke] 移动到其他分组已验证')
     console.log('[API Workbench UI smoke] cURL 导入与保存已验证')
     /** 导入集合快照：以新增方式合并，并提示需要重填的秘密。 */
     const snapshot = createApiCatalogSnapshotExport({
@@ -537,7 +577,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

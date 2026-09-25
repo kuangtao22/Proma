@@ -14,6 +14,7 @@ import {
   FileInput,
   Folder,
   FolderPlus,
+  FolderInput,
   GitCompare,
   GitCompareArrows,
   History,
@@ -111,6 +112,7 @@ import {
   formatApiResponseBody,
   isAgentApiCase,
   isApiRequestDirty,
+  moveApiRequest,
   removeApiCase,
   renameCatalogFolder,
   renameApiCase,
@@ -123,6 +125,8 @@ import {
 import type { ApiRunDiff, ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbenchRequestTab } from './api-workbench-model'
 import { ApiImportDialog } from './ApiImportDialog'
 import { ApiScenarioPanel } from './ApiScenarioPanel'
+import { ApiRequestMoveDialog } from './ApiRequestMoveDialog'
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
 export const RESEND_API_RUN_EVENT = 'proma:resend-api-run'
@@ -313,6 +317,7 @@ function CatalogPanel({
   onCreateFolder,
   onExtractBaseUrl,
   onExtractBaseUrlToEnvironment,
+  onMoveRequest,
   onRenameFolder,
   onDeleteFolder,
   onExportSnapshot,
@@ -330,6 +335,8 @@ function CatalogPanel({
   onExtractBaseUrl: (collection: ApiCollection) => void
   /** 同上，但抽到当前选中的环境里，并把这些请求绑定到该环境（对应「测试环境 http://...」）。 */
   onExtractBaseUrlToEnvironment: (collection: ApiCollection) => void
+  /** 把一条请求移动到别的集合 / 分组。 */
+  onMoveRequest: (request: ApiRequestDefinition) => void
   onRenameFolder: (collectionId: string, folder: string) => void
   onDeleteFolder: (collectionId: string, folder: string) => void
   onExportSnapshot: () => void
@@ -393,7 +400,7 @@ function CatalogPanel({
               </div>
               {isExpanded && (
                 <div className="ml-4 border-l border-border/50 pl-1.5">
-                  {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
+                  {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                   {folders.map((folder) => (
                     <div key={folder} className="group/folder">
                       <div className="flex items-center gap-1 px-1 py-1 text-[11px] text-muted-foreground">
@@ -404,7 +411,7 @@ function CatalogPanel({
                         <ToolButton label="删除文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onDeleteFolder(collection.id, folder)}><Trash2 className="size-3" /></ToolButton>
                       </div>
                       <div className="ml-3">
-                        {visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder).map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
+                        {visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder).map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                       </div>
                     </div>
                   ))}
@@ -446,10 +453,12 @@ function CatalogNameDialog({ action, onOpenChange, onSubmit }: { action: Catalog
 }
 
 /** 目录中的请求入口。 */
-function RequestTreeButton({ request, activeTabId, onOpen, environmentKind }: {
+function RequestTreeButton({ request, activeTabId, onOpen, onMove, environmentKind }: {
   request: ApiRequestDefinition
   activeTabId: string | null
   onOpen: (request: ApiRequestDefinition) => void
+  /** 右键菜单里的「移动到其他分组 / 集合」。 */
+  onMove: (request: ApiRequestDefinition) => void
   environmentKind?: ApiEnvironment['kind']
 }): React.ReactElement {
   /** 请求已打开时由 requestId 定位标签，按钮仍负责切换活动项。 */
@@ -457,12 +466,19 @@ function RequestTreeButton({ request, activeTabId, onOpen, environmentKind }: {
   /** 该接口声明的用例数量；为 0 时不显示徽标。 */
   const caseCount = request.cases?.length ?? 0
   return (
-    <button type="button" className={cn('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted/60', active && 'bg-muted text-foreground')} onClick={() => onOpen(request)}>
-      <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
-      {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
-      <span className="min-w-0 flex-1 truncate">{request.name}</span>
-      {caseCount > 0 && <span className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground" title={`该接口有 ${caseCount} 条测试用例`}>{caseCount} 用例</span>}
-    </button>
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <button type="button" className={cn('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted/60', active && 'bg-muted text-foreground')} onClick={() => onOpen(request)}>
+          <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
+          {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
+          <span className="min-w-0 flex-1 truncate">{request.name}</span>
+          {caseCount > 0 && <span className="ml-auto shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground" title={`该接口有 ${caseCount} 条测试用例`}>{caseCount} 用例</span>}
+        </button>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onSelect={() => onMove(request)}>移动到其他分组 / 集合…</ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   )
 }
 
@@ -483,7 +499,7 @@ function RequestTabBar({ tabs, activeTabId, onSelect, onClose }: { tabs: ApiWork
 }
 
 /** 请求编辑器主体。 */
-function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel, onPickFiles }: {
+function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onMove, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel, onPickFiles }: {
   tab: ApiWorkbenchRequestTab
   environmentId: string | null
   /** 用于「目标环境」标记选择：标记只区分开发/测试/生产，不改变发送权限。 */
@@ -494,6 +510,8 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
   onCasesChange: (draft: ApiRequestDraft, activeCaseId: string | undefined) => void
   onActiveCaseChange: (caseId: string | undefined) => void
   onRunAllCases: () => void
+  /** 移动当前请求到其他集合 / 分组。 */
+  onMove: () => void
   onSave: () => void
   onDuplicate: () => void
   onCopyCurl: () => void
@@ -520,6 +538,7 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
         <ToolButton label="保存请求 (⌘S)" onClick={onSave} disabled={tab.saving}><Save className="size-3.5" /></ToolButton>
         <ToolButton label="复制请求" onClick={onDuplicate}><Copy className="size-3.5" /></ToolButton>
         <ToolButton label="复制为 cURL" onClick={onCopyCurl}><Terminal className="size-3.5" /></ToolButton>
+        <ToolButton label="移动到其他分组 / 集合" onClick={onMove}><FolderInput className="size-3.5" /></ToolButton>
         <ToolButton label="删除请求" onClick={onDelete}><Trash2 className="size-3.5" /></ToolButton>
       </div>
       <div className="flex shrink-0 items-center gap-1.5 px-3 py-2">
@@ -1270,6 +1289,8 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   const [catalog, setCatalog] = React.useState<ApiCatalog | null>(null)
   /** 初始化或目录写入错误。 */
   const [loadError, setLoadError] = React.useState<string | null>(null)
+  /** 正在「移动到其他分组 / 集合」的请求身份。 */
+  const [movingRequestId, setMovingRequestId] = React.useState<string | null>(null)
   /** 当前会话编辑状态。 */
   const [view, setView] = useAtom(apiWorkbenchSessionStateAtomFamily(uiScope))
   /** Agent 卡片请求定位的运行目标。 */
@@ -1535,6 +1556,31 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     void mutateCatalog((latest) => extractApiBaseUrlVariable(latest, collection.id, { environmentId }).catalog)
       .then((saved) => { if (saved) setNotice(`已把 ${preview.origin} 抽成环境「${preview.environmentName}」的 {{${preview.variableName}}}，并绑定 ${preview.updated} 条请求`) })
   }, [catalog, mutateCatalog, view.environmentId])
+
+  /**
+   * 把一条请求移动到目标集合 / 分组。
+   *
+   * 只改归属：目录写入走统一的 CAS 保存，revision/updatedAt 由 Store 维护；
+   * 如果这条请求正开着编辑标签，草稿与基线一起跟上，避免之后按保存又把旧归属写回去。
+   * @param request 被移动的请求。
+   * @param target 目标集合与分组（空字符串表示集合根目录）。
+   */
+  const moveRequest = React.useCallback((request: ApiRequestDefinition, target: { collectionId: string; folder: string }): void => {
+    const collectionName = catalog?.collections.find((item) => item.id === target.collectionId)?.name ?? target.collectionId
+    void mutateCatalog((latest) => moveApiRequest(latest, request.id, target))
+      .then((saved) => {
+        if (!saved) return
+        /** 已打开的标签同步新归属，并把基线一起更新，避免显示成「未保存的改动」。 */
+        setView((previous) => ({
+          ...previous,
+          tabs: previous.tabs.map((tab) => tab.requestId === request.id
+            ? { ...tab, draft: { ...tab.draft, collectionId: target.collectionId, folder: target.folder }, savedDraft: tab.savedDraft ? { ...tab.savedDraft, collectionId: target.collectionId, folder: target.folder } : tab.savedDraft }
+            : tab),
+        }))
+        setNotice(`已把「${request.name}」移动到 ${collectionName}${target.folder ? ` · ${target.folder}` : '（根目录）'}`)
+        setMovingRequestId(null)
+      })
+  }, [catalog, mutateCatalog, setView])
 
   /** 保存当前请求并更新标签基线。 */
   const saveActive = React.useCallback(async (): Promise<void> => {
@@ -1830,6 +1876,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     onCreateFolder={(collection) => setCatalogNameAction({ kind: 'create-folder', collection })}
     onExtractBaseUrl={extractBaseUrl}
     onExtractBaseUrlToEnvironment={extractBaseUrlToEnvironment}
+    onMoveRequest={(request) => setMovingRequestId(request.id)}
     onRenameFolder={(collectionId, folder) => setCatalogNameAction({ kind: 'rename-folder', collectionId, folder })}
     onDeleteFolder={(collectionId, folder) => {
       if (!window.confirm(`删除文件夹“${folder}”及其中所有请求？`)) return
@@ -1896,13 +1943,20 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId && !window.confirm(`删除请求“${activeTab.draft.name}”？`)) return
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
-              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} onPickFiles={pickFiles} /></section>}
+              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onMove={() => { if (activeTab.requestId) setMovingRequestId(activeTab.requestId) }} onSend={() => void sendActive()} onCancel={cancelActive} onPickFiles={pickFiles} /></section>}
               {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} onSetBaseline={setBaseline} onCompareBaseline={(run) => void compareWithBaseline(run)} baselineRunId={baselineRun?.id ?? null} /></section>}
             </div>
           )}
         </main>
       </div>
       <ApiCatalogDrawer open={catalogDrawerOpen} onClose={() => setCatalogDrawerOpen(false)}>{catalogPanel}</ApiCatalogDrawer>
+      <ApiRequestMoveDialog
+        open={movingRequestId !== null}
+        request={catalog.requests.find((item) => item.id === movingRequestId) ?? null}
+        catalog={catalog}
+        onOpenChange={(open) => { if (!open) setMovingRequestId(null) }}
+        onMove={(target) => { const request = catalog.requests.find((item) => item.id === movingRequestId); if (request) moveRequest(request, target) }}
+      />
       <CatalogNameDialog action={catalogNameAction} onOpenChange={(open) => { if (!open) setCatalogNameAction(null) }} onSubmit={(name) => {
         /** 提交后立即关闭，失败信息由工作台顶部统一展示。 */
         const action = catalogNameAction
