@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { apiWorkbenchAgentDenialReason, apiWorkbenchManualDenialReason, isAgentSessionUserVisible, isOrdinaryTopLevelAgentSession, requireOrdinaryTopLevelAgentSession }
+import { apiWorkbenchManualDenialReason, isAgentSessionUserVisible, isOrdinaryTopLevelAgentSession, requireOrdinaryTopLevelAgentSession }
   from './agent-session-eligibility'
 import type { AgentSessionMeta } from './agent'
 
@@ -63,31 +63,31 @@ describe('Agent 会话归属与可见性判定', () => {
     expect(() => requireOrdinaryTopLevelAgentSession(undefined)).toThrow('Agent 会话不存在')
   })
 
-  test('Given 普通会话且有项目 When 判定 Agent 出网 Then 允许', () => {
+  test('Given 普通会话且有项目 When 判定界面手发 Then 允许', () => {
     const session = createSession({ workspaceId: 'workspace-1' })
 
-    expect(apiWorkbenchAgentDenialReason(session, true)).toBeNull()
     expect(apiWorkbenchManualDenialReason(session, true)).toBeNull()
   })
 
-  test('Given 探索或委派子会话 When 判定 Then Agent 出网拒绝、界面手发放行', () => {
-    /** 现场案例：用户在被委派/探索出来的子会话里点开接口标签。 */
+  test('Given 探索或委派子会话 When 判定界面手发 Then 放行（Agent 出网另由普通顶层判定把关）', () => {
+    /** 现场案例：用户在被委派/探索出来的子会话里点开接口标签，现在这里允许人自己点发送。 */
     const exploration = createSession({ workspaceId: 'workspace-1', explorationParentSessionId: 'parent-1' })
     const delegated = createSession({ workspaceId: 'workspace-1', parentSessionId: 'parent-1' })
 
-    expect(apiWorkbenchAgentDenialReason(exploration, true)).toBe('这是探索子会话；Agent 出网能力只在主会话开放')
-    expect(apiWorkbenchAgentDenialReason(delegated, true)).toBe('接口工作台只在普通交互会话可用（后台任务、委派与画布会话不开放）')
-    /** 界面手发只要「会话可见 + 未归档 + 有项目」：人在界面点发送，意图明确。 */
     expect(apiWorkbenchManualDenialReason(exploration, true)).toBeNull()
     expect(apiWorkbenchManualDenialReason(delegated, true)).toBeNull()
+    /**
+     * Agent 自己出网仍被拒：委派子会话直接被「普通顶层」判定排除；
+     * 探索子会话则由 facade 额外显式拦截 `explorationParentSessionId`（见 api-agent-facade 的门禁与其测试）。
+     */
+    expect(isOrdinaryTopLevelAgentSession(delegated)).toBe(false)
   })
 
-  test('Given 归档、无项目或项目已删 When 判定 Then 两条路径都给出可行动原因', () => {
+  test('Given 归档、无项目或项目已删 When 判定界面手发 Then 各自给出可行动原因', () => {
     const archived = createSession({ workspaceId: 'workspace-1', archived: true })
     const noProject = createSession()
     const missingProject = createSession({ workspaceId: 'workspace-1' })
 
-    expect(apiWorkbenchAgentDenialReason(archived, true)).toBe('当前会话已归档；请在未归档的会话里打开接口工作台')
     expect(apiWorkbenchManualDenialReason(archived, true)).toBe('当前会话已归档；请在未归档的会话里打开接口工作台')
     expect(apiWorkbenchManualDenialReason(noProject, true)).toBe('当前会话没有归属项目；请先在项目里打开会话')
     expect(apiWorkbenchManualDenialReason(missingProject, false)).toBe('会话归属的项目已不存在；请重新选择项目')
@@ -97,7 +97,7 @@ describe('Agent 会话归属与可见性判定', () => {
   test('Given 后台会话 When 判定 Then Agent 出网拒绝，但人在界面手发仍可用', () => {
     for (const override of [...ineligibleOverrides, { sourceAutomationId: 'automation-1' }]) {
       const session = createSession({ workspaceId: 'workspace-1', ...override })
-      expect(apiWorkbenchAgentDenialReason(session, true)).toBe('接口工作台只在普通交互会话可用（后台任务、委派与画布会话不开放）')
+      expect(isOrdinaryTopLevelAgentSession(session)).toBe(false)
       expect(apiWorkbenchManualDenialReason(session, true)).toBeNull()
     }
   })
@@ -106,7 +106,7 @@ describe('Agent 会话归属与可见性判定', () => {
     /** 这些会话对用户不可见，人的界面手发也无从谈起。 */
     for (const override of [{ sourceCanvasId: 'canvas-1' }, { sourceDesignProjectId: 'project-1' }]) {
       const session = createSession({ workspaceId: 'workspace-1', ...override })
-      expect(apiWorkbenchAgentDenialReason(session, true)).toBe('接口工作台只在普通交互会话可用（后台任务、委派与画布会话不开放）')
+      expect(isOrdinaryTopLevelAgentSession(session)).toBe(false)
       expect(apiWorkbenchManualDenialReason(session, true)).toBe('当前会话已不可见或已被删除（画布或设计内部会话不开放）')
     }
   })
