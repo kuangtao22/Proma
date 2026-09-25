@@ -57,6 +57,9 @@ describe('Agent 接口工作台授权边界', () => {
       expect(createApiAgentFacade({ ...f.options, toolMode: 'server-ops-read' })).toBeUndefined()
       f.change({ parentSessionId: 'parent' })
       expect(createApiAgentFacade(f.options)).toBeUndefined()
+      /** 放宽的是界面手发；Agent 自己出网在探索子会话里依然没有能力。 */
+      f.change({ parentSessionId: undefined, explorationParentSessionId: 'parent-1' })
+      expect(createApiAgentFacade(f.options)).toBeUndefined()
     } finally { f.cleanup() }
   })
   test('Given 已准备请求 When 未授权直接发送 Then 无网络调用；批准后重复调用仍只发送一次', async () => {

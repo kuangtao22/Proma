@@ -125,7 +125,7 @@ import { PreviewPanel } from '@/components/diff/PreviewPanel'
 import { clearPreviewContentCacheForFile } from '@/lib/preview-content-cache'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { FileEntry, AgentPendingFile, AgentSessionMeta, CanvasSessionMeta, SDKMessage, WorktreeInfo } from '@proma/shared'
-import { apiWorkbenchDenialReason } from '@proma/shared'
+import { apiWorkbenchManualDenialReason } from '@proma/shared'
 import { setFilePanelDragData, getMediaTypeFromFilename, dispatchInsertFileMention } from '@/lib/file-panel-drag'
 import { CLOSE_ACTIVE_RIGHT_WORKSPACE_TAB_EVENT } from '@/lib/right-workspace-events'
 import {
@@ -610,11 +610,11 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const sessions = useAtomValue(agentSessionsAtom)
   const currentWorkspaceId = sessions.find((session) => session.id === sessionId)?.workspaceId ?? selectedWorkspaceId
   /**
-   * 接口工作台只对普通顶层交互会话开放：不适用的会话直接不提供入口，
-   * 万一标签已经开着也给出原因，而不是丢一个 API_ACCESS_DENIED 错误码。
+   * 界面手发的可用性：会话可见、未归档、项目还在即可（探索/委派子会话也能用）。
+   * 真正需要收紧的是 Agent 自己出网，那条由主进程 facade 单独把关。
    */
   const apiWorkbenchSession = sessions.find((item) => item.id === sessionId)
-  const apiWorkbenchDenial = apiWorkbenchDenialReason(
+  const apiWorkbenchDenial = apiWorkbenchManualDenialReason(
     apiWorkbenchSession,
     Boolean(apiWorkbenchSession?.workspaceId && workspaces.some((workspace) => workspace.id === apiWorkbenchSession.workspaceId)),
   )

@@ -1,4 +1,4 @@
-import { API_WORKBENCH_CHANNELS, apiWorkbenchDenialReason, isOrdinaryTopLevelAgentSession } from '@proma/shared'
+import { API_WORKBENCH_CHANNELS, apiWorkbenchManualDenialReason, isOrdinaryTopLevelAgentSession } from '@proma/shared'
 import { registerApiWorkbenchIpc } from './lib/api-workbench/api-ipc'
 import { getApiWorkbenchService, hasActiveApiWorkbenchRequests, setApiWorkbenchEventSink, setApiWorkbenchStreamSink, shutdownApiWorkbench } from './lib/api-workbench/api-workbench-singleton'
 /**
@@ -2333,8 +2333,11 @@ export function registerIpcHandlers(): void {
     requireSession: (sessionId) => {
       const session = requireVisibleSession(sessionId)
       const workspaceId = session.workspaceId
-      /** 拒绝时带上可行动原因：界面直接把这句话展示给用户，而不是只给一个错误码。 */
-      const denial = apiWorkbenchDenialReason(session, Boolean(workspaceId && getAgentWorkspace(workspaceId)))
+      /**
+       * 这条 IPC 服务的是**人在界面上手发**：只要会话可见、未归档、项目还在就放行
+       * （委派与探索子会话也允许）。Agent 自己发起出网的路径走 facade，那条仍只给普通顶层会话。
+       */
+      const denial = apiWorkbenchManualDenialReason(session, Boolean(workspaceId && getAgentWorkspace(workspaceId)))
       if (denial || !workspaceId) throw new Error(`API_ACCESS_DENIED: ${denial ?? '当前会话不能使用接口工作台'}`)
       return { id: session.id, workspaceId }
     },
