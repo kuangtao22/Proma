@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft, parseApiScenario } from '@proma/shared'
+import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, extractApiBaseUrlVariable, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft, parseApiScenario } from '@proma/shared'
 import type { AgentSessionMeta, ApiCatalog, ApiEnvironment, ApiPreparedPreview, ApiRequestDraft, ApiRun, ApiScenario, ApiScenarioPreparedPreview, ApiScenarioRun } from '@proma/shared'
 import type { ApiWorkbenchService } from './api-workbench-service'
 import { stampApiAgentCases } from './api-agent-case-ownership'
@@ -23,6 +23,14 @@ export interface ApiAgentApproval {
    * 变量值在这里一律遮罩（密钥类变量由 Store 转 safeStorage 密文），审批卡只展示名字与条数。
    */
   environmentSave?: { expectedRevision: number; environment: ApiEnvironment; environmentId?: string; warnings: string[] }
+  /** 批量配置变更快照：逐条列出「改哪条接口、从什么改成什么」。 */
+  requestUpdates?: {
+    expectedRevision: number
+    updates: ApiAgentRequestUpdate[]
+    warnings: string[]
+  }
+  /** 剥离测试环境地址：把硬编码主机抽成集合/环境变量，并绑定命中请求。 */
+  baseUrlExtract?: { expectedRevision: number; collectionId: string; environmentId?: string; variableName: string; origin: string; updated: number; environmentName?: string }
   /**
    * 本次要读取并上传的附件：字段名、`realpath` 与大小。
    *
@@ -61,6 +69,18 @@ export interface ApiAgentRunSummary {
   assertions: { passed: number; total: number }; recording: ApiRun['recording']; error?: ApiRun['error']
   /** 本次运行所跑的测试用例；未按用例跑时缺省。 */
   caseId?: string
+}
+/** 一条批量配置变更：只含「能批量改」的字段，URL 与正文各自走专用路径。 */
+export interface ApiAgentRequestUpdate {
+  requestId: string
+  name: string
+  before: { name: string; folder: string; collectionId: string; targetEnvironmentId?: string }
+  after: { name: string; folder: string; collectionId: string; targetEnvironmentId?: string }
+}
+/** 有界文本：拒绝非字符串、超长与控制字符（与共享解析器同一套规则）。 */
+function agentText(value: unknown, path: string, max: number): string {
+  if (typeof value !== 'string' || value.length > max || value.includes('\0')) throw new Error(`API_WORKBENCH_INVALID: ${path}`)
+  return value
 }
 /** 模型输出按实际 UTF-8 字节限额；过大只返回标记清晰的文本预览。 */
 export function boundApiAgentResult(value: unknown): unknown {
@@ -125,6 +145,16 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const environmentId = args.environmentId === undefined ? 'new' : parseApiId(args.environmentId)
       return { preparedId: `${environmentId}_${expectedRevision}`, expectedRevision }
     }
+    /** 批量类工具的身份只绑「工具 + 目录版本」，内容绑定交给快照的逐字比较。 */
+    if (tool === 'api_update_requests') {
+      const args = apiRecord(input, ['updates', 'expectedRevision'])
+      return { preparedId: `${tool}_${apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')}`, expectedRevision: apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision') }
+    }
+    if (tool === 'api_extract_base_url') {
+      const args = apiRecord(input, ['collectionId', 'environmentId', 'variableName', 'expectedRevision'])
+      const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+      return { preparedId: `${tool}_${expectedRevision}`, expectedRevision }
+    }
     throw new Error('API_AGENT_UNKNOWN_MUTATION')
   }
   /**
@@ -166,6 +196,37 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
         value: field.secret || field.secretRef || /authorization|cookie|api[-_]?key|token|password|passwd|secret/i.test(field.name) ? '[REDACTED]' : field.value,
       })),
     }
+  }
+  /** 解析批量配置变更：只允许改名字、文件夹、集合与环境绑定，不碰 URL 与正文。 */
+  function parseRequestUpdates(catalog: ApiCatalog, input: unknown): { expectedRevision: number; updates: ApiAgentRequestUpdate[] } {
+    const args = apiRecord(input, ['updates', 'expectedRevision'])
+    const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+    if (!Array.isArray(args.updates) || args.updates.length === 0 || args.updates.length > API_LIMITS.maxRequestUpdates) {
+      throw new Error(`API_WORKBENCH_INVALID: updates（一次最多 ${API_LIMITS.maxRequestUpdates} 条）`)
+    }
+    const updates = args.updates.map((item, index) => {
+      const entry = apiRecord(item, ['requestId', 'name', 'folder', 'collectionId', 'targetEnvironmentId'], `updates[${index}]`)
+      const requestId = parseApiId(entry.requestId)
+      const request = catalog.requests.find((candidate) => candidate.id === requestId)
+      if (!request) throw new Error(`API_WORKBENCH_REQUEST_NOT_FOUND: ${requestId}`)
+      const name = entry.name === undefined ? request.name : agentText(entry.name, `updates[${index}].name`, 128)
+      if (!name.trim()) throw new Error(`API_WORKBENCH_INVALID: updates[${index}].name`)
+      const folder = entry.folder === undefined ? request.folder : agentText(entry.folder, `updates[${index}].folder`, 256)
+      const collectionId = entry.collectionId === undefined ? request.collectionId : parseApiId(entry.collectionId)
+      if (!catalog.collections.some((collection) => collection.id === collectionId)) throw new Error(`API_WORKBENCH_COLLECTION_NOT_FOUND: ${collectionId}`)
+      const targetEnvironmentId = entry.targetEnvironmentId === null ? undefined
+        : entry.targetEnvironmentId === undefined ? request.targetEnvironmentId : parseApiId(entry.targetEnvironmentId)
+      if (targetEnvironmentId && !catalog.environments.some((environment) => environment.id === targetEnvironmentId)) {
+        throw new Error(`API_WORKBENCH_ENVIRONMENT_NOT_FOUND: ${targetEnvironmentId}`)
+      }
+      return {
+        requestId,
+        name,
+        before: { name: request.name, folder: request.folder, collectionId: request.collectionId, ...(request.targetEnvironmentId ? { targetEnvironmentId: request.targetEnvironmentId } : {}) },
+        after: { name, folder, collectionId, ...(targetEnvironmentId ? { targetEnvironmentId } : {}) },
+      }
+    })
+    return { expectedRevision, updates }
   }
   /**
    * 请求草稿的「好不好用」提醒（不是拒绝）。
@@ -262,6 +323,48 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
             ...(pending.environment.kind === 'production' ? ['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'] : []),
             ...(pending.environment.variables.some((field) => field.name.trim() === '') ? ['有变量没有名字：没有名字的变量不会被任何请求引用'] : []),
           ],
+        },
+      }
+    }
+    /** 批量配置变更：一次批准改一批（分组 / 取名 / 绑定环境），卡上逐条列出改动。 */
+    if (tool === 'api_update_requests') {
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      current()
+      const pending = parseRequestUpdates(catalog, input)
+      if (catalog.revision !== pending.expectedRevision) throw new Error('API_WORKBENCH_PREPARED_STALE')
+      const stillGeneric = pending.updates.filter((update) => /^(?:\[[^\]]+\]\s*)?(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+$/.test(update.after.name.trim())).length
+      return {
+        tool,
+        preparedId: `${tool}_${pending.expectedRevision}`,
+        requestUpdates: {
+          expectedRevision: pending.expectedRevision,
+          updates: pending.updates,
+          warnings: pending.updates.length === 0 ? [] : [
+            ...(stillGeneric > 0 ? [`其中 ${stillGeneric} 条的「新名字」仍然是「方法 + 路径」生成的，建议改成业务可读名`] : []),
+            ...(pending.updates.length > 20 ? [`本次一次改动 ${pending.updates.length} 条接口，请抽查几条确认分组与命名符合预期`] : []),
+          ],
+        },
+      }
+    }
+    /** 剥离测试环境地址：交给共享纯函数算，模型不能自己改写 URL。 */
+    if (tool === 'api_extract_base_url') {
+      const args = apiRecord(input, ['collectionId', 'environmentId', 'variableName', 'expectedRevision'])
+      const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+      const collectionId = parseApiId(args.collectionId)
+      const environmentId = args.environmentId === undefined ? undefined : parseApiId(args.environmentId)
+      const variableName = args.variableName === undefined ? 'baseUrl' : agentText(args.variableName, 'variableName', 128)
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      current()
+      if (catalog.revision !== expectedRevision) throw new Error('API_WORKBENCH_PREPARED_STALE')
+      const extraction = extractApiBaseUrlVariable(catalog, collectionId, { ...(environmentId ? { environmentId } : {}), variableName })
+      if (!extraction.variableName || extraction.updated === 0) throw new Error(`API_WORKBENCH_BASE_URL_NOTHING_TO_EXTRACT: ${extraction.message ?? '这个集合里没有硬编码主机的请求'}`)
+      return {
+        tool,
+        preparedId: `${tool}_${expectedRevision}`,
+        baseUrlExtract: {
+          expectedRevision, collectionId, variableName, origin: extraction.origin!, updated: extraction.updated,
+          ...(environmentId ? { environmentId } : {}),
+          ...(extraction.environmentName ? { environmentName: extraction.environmentName } : {}),
         },
       }
     }
@@ -459,6 +562,58 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       current()
       grants.delete('api_save_environment:' + snapshot.preparedId)
       return { environmentId: definition.id, catalogRevision: saved.revision, saved: true }
+    },
+    /**
+     * 批量配置变更：一次批准改一批接口（分组 / 取名 / 绑定环境），一次原子落库。
+     *
+     * 这是「让 Agent 把之前建的接口整理一遍」的入口：126 条不再需要 126 次审批，
+     * 但仍逐条校验身份与目标集合/环境，且快照里会列出「从什么改成什么」。
+     * @param input 工具入参（updates + 目录版本）。
+     * @returns 改动条数与新目录版本。
+     */
+    async updateRequests(input: unknown) {
+      const snapshot = await requireGrant('api_update_requests', input)
+      const pending = snapshot.requestUpdates!
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      writable()
+      /** 用同一份入参重新解析：审批期间内容被改过会在 requireGrant 处就失效。 */
+      const reparsed = parseRequestUpdates(catalog, input)
+      const byId = new Map(reparsed.updates.map((update) => [update.requestId, update]))
+      const requests = catalog.requests.map((request) => {
+        const update = byId.get(request.id)
+        if (!update) return request
+        return {
+          ...request,
+          name: update.after.name,
+          folder: update.after.folder,
+          collectionId: update.after.collectionId,
+          /** 显式清掉环境绑定时也要落成「没有绑定」，不能沿用旧值。 */
+          targetEnvironmentId: update.after.targetEnvironmentId,
+          /** revision 与 updatedAt 由 Store 按「内容是否变化」统一维护，这里不能自己加。 */
+        }
+      })
+      const saved = await write(() => options.service.saveCatalog(context.workspaceId, pending.expectedRevision, { ...catalog, requests }))
+      current()
+      grants.delete('api_update_requests:' + snapshot.preparedId)
+      return { updated: reparsed.updates.length, catalogRevision: saved.revision }
+    },
+    /**
+     * 剥离测试环境地址：把硬编码主机抽成集合/环境变量，并把命中请求绑定到目标环境。
+     *
+     * 改写由共享纯函数执行（模型不能自己拼 URL），所以这次批准既安全又可复算。
+     * @param input 工具入参（集合、可选环境与变量名、目录版本）。
+     * @returns 改写条数、变量名与主机。
+     */
+    async extractBaseUrl(input: unknown) {
+      const snapshot = await requireGrant('api_extract_base_url', input)
+      const pending = snapshot.baseUrlExtract!
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      writable()
+      const extraction = extractApiBaseUrlVariable(catalog, pending.collectionId, { ...(pending.environmentId ? { environmentId: pending.environmentId } : {}), variableName: pending.variableName })
+      const saved = await write(() => options.service.saveCatalog(context.workspaceId, pending.expectedRevision, extraction.catalog))
+      current()
+      grants.delete('api_extract_base_url:' + snapshot.preparedId)
+      return { updated: extraction.updated, variableName: extraction.variableName, origin: extraction.origin, catalogRevision: saved.revision }
     },
     /** 使用精确批准派发一次请求；停止 Agent 会同步取消对应网络任务。 */
     async send(input: unknown, signal?: AbortSignal): Promise<ApiAgentRunSummary> {

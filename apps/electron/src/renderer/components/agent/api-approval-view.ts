@@ -32,7 +32,7 @@ export interface ApiApprovalFileLine {
 
 /** 审批卡要展示的接口视图；caseDiff 为空表示这次没有用例改动。 */
 export interface ApiWorkbenchApprovalView {
-  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save' | 'api-environment-save'
+  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save' | 'api-environment-save' | 'api-request-updates' | 'api-base-url-extract'
   title: string
   lines: string[]
   /** 本次要读取并上传的文件；为空表示没有附件（普通请求或保存审批）。 */
@@ -205,6 +205,58 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
       files: [],
       steps: [],
       warnings: warnings(save.warnings),
+      caseDiff: [],
+    }
+  }
+  /** 批量整理接口：逐条列出「从什么改成什么」，这是用户批准的唯一依据。 */
+  if (toolName === 'api_update_requests') {
+    const pending = record(toolInput.requestUpdates)
+    if (!pending) return null
+    const updates = Array.isArray(pending.updates) ? pending.updates : []
+    const steps = updates.flatMap((item, index) => {
+      const entry = record(item)
+      const before = entry ? record(entry.before) : undefined
+      const after = entry ? record(entry.after) : undefined
+      if (!entry || !before || !after) return []
+      const requestId = string(entry.requestId) ?? '（未知接口）'
+      const changes: string[] = []
+      if (string(before.name) !== string(after.name)) changes.push(`改名：${string(before.name) ?? '（空）'} → ${string(after.name) ?? '（空）'}`)
+      if ((string(before.folder) ?? '') !== (string(after.folder) ?? '')) changes.push(`分组：${string(before.folder) || '根目录'} → ${string(after.folder) || '根目录'}`)
+      if ((string(before.collectionId) ?? '') !== (string(after.collectionId) ?? '')) changes.push(`集合：${string(before.collectionId) ?? '（未知）'} → ${string(after.collectionId) ?? '（未知）'}`)
+      const beforeEnvironment = string(before.targetEnvironmentId)
+      const afterEnvironment = string(after.targetEnvironmentId)
+      if (beforeEnvironment !== afterEnvironment) changes.push(`环境：${beforeEnvironment ?? '未绑定'} → ${afterEnvironment ?? '解除绑定'}`)
+      return [{ index, text: `${index + 1}. ${requestId}｜${changes.length > 0 ? changes.join('；') : '无变化（仅提升版本）'}` }]
+    })
+    return {
+      kind: 'api-request-updates',
+      title: `批量整理接口（一次批准 ${steps.length} 条）`,
+      lines: ['只修改名字 / 分组 / 集合 / 环境绑定；URL 与请求参数不在本次改动范围内'],
+      files: [],
+      steps,
+      warnings: warnings(pending.warnings),
+      caseDiff: [],
+    }
+  }
+  /** 剥离测试环境地址：显示抽哪个主机、写到哪一层、改多少条。 */
+  if (toolName === 'api_extract_base_url') {
+    const pending = record(toolInput.baseUrlExtract)
+    if (!pending) return null
+    const origin = string(pending.origin) ?? '（未知主机）'
+    const variableName = string(pending.variableName) ?? 'baseUrl'
+    const environmentName = string(pending.environmentName)
+    const scope = environmentName ? `环境「${environmentName}」` : '集合'
+    return {
+      kind: 'api-base-url-extract',
+      title: '剥离测试环境地址',
+      lines: [
+        `把 ${origin} 抽成${scope}的变量 {{${variableName}}}`,
+        `将改写 ${typeof pending.updated === 'number' ? pending.updated : 0} 条请求：URL 变成 {{${variableName}}}/...`,
+        environmentName ? '这些请求会同时绑定到该环境（换环境只改一处）' : '变量写在集合里，所有绑定该集合的请求都能用',
+      ],
+      files: [],
+      steps: [],
+      warnings: [],
       caseDiff: [],
     }
   }

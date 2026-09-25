@@ -233,4 +233,49 @@ describe('接口工作台审批卡视图', () => {
     expect(JSON.stringify(view)).not.toContain('secret-value')
     expect(view?.warnings).toEqual(['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'])
   })
+
+  test('Given 批量整理接口审批 When 解析 Then 逐条列出改名与分组变化', () => {
+    const view = describeApiWorkbenchApproval('api_update_requests', {
+      requestUpdates: {
+        expectedRevision: 5,
+        warnings: ['本次一次改动 30 条接口，请抽查几条确认分组与命名符合预期'],
+        updates: [
+          {
+            requestId: 'request_a',
+            name: '管理员列表查询',
+            before: { name: '[后台] POST /admin/v1/admin-accounts/query', folder: '', collectionId: 'default' },
+            after: { name: '管理员列表查询', folder: '用户模块', collectionId: 'default' },
+          },
+          {
+            requestId: 'request_b',
+            name: '管理员登录',
+            before: { name: '管理员登录', folder: '用户模块', collectionId: 'default', targetEnvironmentId: 'env_test' },
+            after: { name: '管理员登录', folder: '用户模块', collectionId: 'default' },
+          },
+        ],
+      },
+    })
+
+    expect(view?.kind).toBe('api-request-updates')
+    expect(view?.title).toBe('批量整理接口（一次批准 2 条）')
+    expect(view?.steps.map((step) => step.text)).toEqual([
+      '1. request_a｜改名：[后台] POST /admin/v1/admin-accounts/query → 管理员列表查询；分组：根目录 → 用户模块',
+      '2. request_b｜环境：env_test → 解除绑定',
+    ])
+    expect(view?.warnings).toEqual(['本次一次改动 30 条接口，请抽查几条确认分组与命名符合预期'])
+  })
+
+  test('Given 剥离测试环境地址审批 When 解析 Then 说明抽哪个主机、写到哪一层、改多少条', () => {
+    const view = describeApiWorkbenchApproval('api_extract_base_url', {
+      baseUrlExtract: { expectedRevision: 5, collectionId: 'default', environmentId: 'env_test', variableName: 'baseUrl', origin: 'http://127.0.0.1:18080', updated: 126, environmentName: '测试环境' },
+    })
+
+    expect(view?.kind).toBe('api-base-url-extract')
+    expect(view?.title).toBe('剥离测试环境地址')
+    expect(view?.lines).toEqual([
+      '把 http://127.0.0.1:18080 抽成环境「测试环境」的变量 {{baseUrl}}',
+      '将改写 126 条请求：URL 变成 {{baseUrl}}/...',
+      '这些请求会同时绑定到该环境（换环境只改一处）',
+    ])
+  })
 })

@@ -4,7 +4,7 @@ import { boundApiAgentResult } from './api-agent-facade'
 import type { ApiAgentFacade } from './api-agent-facade'
 
 /** 精确工具名集合用于权限分派，禁止前缀放行未知能力。 */
-export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario', 'api_save_environment'] as const
+export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario', 'api_save_environment', 'api_update_requests', 'api_extract_base_url'] as const
 /** Pi SDK 在此只需要工具定义工厂，不引入另一套 Agent runtime。 */
 type ApiToolSdk = Pick<typeof import('@earendil-works/pi-coding-agent'), 'defineTool'>
 /** 将有界工具结果写入文本与 details；响应始终视作数据，不能成为指令。 */
@@ -115,6 +115,35 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
         expectedRevision: Type.Integer({ minimum: 0 }),
       }, { additionalProperties: false }),
       async execute(_id, input) { return result(await facade.saveEnvironment(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_update_requests',
+      label: '批量整理接口',
+      description: 'Bulk-edit configuration of existing requests with ONE approval: rename them to business-readable names, move them into folders (folder is the module, e.g. "用户模块") or another collection (collection is the product line, e.g. "后台"), and bind them to an environment. Up to 50 requests per call; the approval card lists every "from → to" change, so call it in a few batches instead of saving requests one by one. It never changes URLs or bodies — use api_extract_base_url for hosts and api_prepare_request/api_save_request for parameters. Prefer names taken from the endpoint\'s real purpose (read the backend source if needed); do not leave "[端] POST /path" style names.',
+      parameters: Type.Object({
+        updates: Type.Array(Type.Object({
+          requestId: id,
+          name: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+          folder: Type.Optional(Type.String({ maxLength: 256 })),
+          collectionId: Type.Optional(id),
+          /** null 表示解除环境绑定；缺省表示不动。 */
+          targetEnvironmentId: Type.Optional(Type.Union([id, Type.Null()])),
+        }, { additionalProperties: false }), { minItems: 1, maxItems: 50 }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.updateRequests(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_extract_base_url',
+      label: '剥离测试环境地址',
+      description: 'Take the hardcoded host out of a collection\'s request URLs with ONE approval: the host that appears in most requests becomes a variable (baseUrl by default) declared on the collection or on an environment, and the matching URLs are rewritten to {{baseUrl}}/... . Pass environmentId to put the address on that environment (create it first with api_save_environment, e.g. kind=test + baseUrl=http://127.0.0.1:18080); the affected requests are then bound to that environment too. The host is picked and rewritten by the host process, not by you, and it refuses when a same-named variable already holds a different value. Use this instead of editing URLs by hand.',
+      parameters: Type.Object({
+        collectionId: id,
+        environmentId: Type.Optional(id),
+        variableName: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.extractBaseUrl(input)) },
     }),
   ]
 }

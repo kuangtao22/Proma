@@ -102,6 +102,127 @@ describe('Agent 接口工作台授权边界', () => {
   })
 })
 
+/** 写入若干条「批量整理」用的请求，并返回目录版本与身份。 */
+async function saveBulkFixture(f: ReturnType<typeof fixture>): Promise<{ revision: number; ids: string[] }> {
+  const catalog = await f.service.getCatalog('workspace')
+  const base = createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
+  const requests = ['admin-accounts/query', 'admin-accounts/create', 'auth/login'].map((path, index) => ({
+    ...base, id: `request_${index}`, revision: 1, updatedAt: 1,
+    name: `[后台] POST /admin/v1/${path}`, method: 'POST' as const, url: `http://127.0.0.1:18080/admin/v1/${path}`,
+  }))
+  const saved = await f.service.saveCatalog('workspace', catalog.revision, { ...catalog, requests })
+  return { revision: saved.revision, ids: requests.map((item) => item.id) }
+}
+
+describe('Agent 批量整理接口（分组 / 取名 / 绑定环境）', () => {
+  test('Given 未批准 When 批量改名分组 Then 拒绝且目录不变', async () => {
+    const f = fixture()
+    try {
+      const { revision, ids } = await saveBulkFixture(f)
+      const pending = { updates: ids.map((requestId) => ({ requestId, name: '管理员列表', folder: '用户模块' })), expectedRevision: revision }
+
+      await expect(f.facade.updateRequests(pending)).rejects.toThrow('APPROVAL_REQUIRED')
+      expect((await f.service.getCatalog('workspace')).requests[0]?.folder).toBe('')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 已批准 When 批量改名分组 Then 一次原子落库且卡上列出逐条改动', async () => {
+    const f = fixture()
+    try {
+      const { revision, ids } = await saveBulkFixture(f)
+      const pending = {
+        updates: [
+          { requestId: ids[0]!, name: '管理员列表查询', folder: '用户模块' },
+          { requestId: ids[1]!, name: '管理员创建', folder: '用户模块' },
+          { requestId: ids[2]!, name: '管理员登录', folder: '用户模块' },
+        ],
+        expectedRevision: revision,
+      }
+
+      const snapshot = await f.facade.approval('api_update_requests', pending)
+
+      expect(snapshot.requestUpdates?.updates[0]?.before.name).toBe('[后台] POST /admin/v1/admin-accounts/query')
+      expect(snapshot.requestUpdates?.updates[0]?.after.name).toBe('管理员列表查询')
+      /** 名字业务化之后不该再有命名提醒；3 条也不到「请抽查」的规模，因此没有噪音。 */
+      expect(snapshot.requestUpdates?.warnings).toEqual([])
+
+      await f.facade.authorize('api_update_requests', pending, snapshot)
+      const saved = await f.facade.updateRequests(pending)
+      const stored = (await f.service.getCatalog('workspace')).requests
+
+      expect(saved.updated).toBe(3)
+      expect(stored.map((item) => `${item.name}|${item.folder}`)).toEqual([
+        '管理员列表查询|用户模块', '管理员创建|用户模块', '管理员登录|用户模块',
+      ])
+      /** 批量整理不碰 URL 与正文。 */
+      expect(stored[0]?.url).toBe('http://127.0.0.1:18080/admin/v1/admin-accounts/query')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 新名字仍是方法加路径 When 请求批量审批 Then 卡上提醒业务化命名', async () => {
+    const f = fixture()
+    try {
+      const { revision, ids } = await saveBulkFixture(f)
+      const snapshot = await f.facade.approval('api_update_requests', {
+        updates: [{ requestId: ids[0]!, name: '[后台] POST /admin/v1/admin-accounts/query', folder: '用户模块' }],
+        expectedRevision: revision,
+      })
+
+      expect(snapshot.requestUpdates?.warnings).toEqual(['其中 1 条的「新名字」仍然是「方法 + 路径」生成的，建议改成业务可读名'])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 引用了不存在的接口 When 请求批量审批 Then 审批之前就拒绝', async () => {
+    const f = fixture()
+    try {
+      const { revision } = await saveBulkFixture(f)
+
+      await expect(f.facade.approval('api_update_requests', { updates: [{ requestId: 'request_missing', folder: '用户模块' }], expectedRevision: revision }))
+        .rejects.toThrow('API_WORKBENCH_REQUEST_NOT_FOUND')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 已批准 When 剥离测试环境地址 Then 变量落库、URL 改写并把请求绑定到环境', async () => {
+    const f = fixture()
+    try {
+      const { revision } = await saveBulkFixture(f)
+      const catalog = await f.service.getCatalog('workspace')
+      const withEnvironment = await f.service.saveCatalog('workspace', revision, {
+        ...catalog,
+        environments: [{ id: 'env_test', name: '测试环境', kind: 'test', variables: [] }],
+      })
+      const pending = { collectionId: 'default', environmentId: 'env_test', expectedRevision: withEnvironment.revision }
+
+      const snapshot = await f.facade.approval('api_extract_base_url', pending)
+      expect(snapshot.baseUrlExtract).toMatchObject({ origin: 'http://127.0.0.1:18080', updated: 3, variableName: 'baseUrl', environmentName: '测试环境' })
+
+      await f.facade.authorize('api_extract_base_url', pending, snapshot)
+      const saved = await f.facade.extractBaseUrl(pending)
+      const stored = await f.service.getCatalog('workspace')
+
+      expect(saved.updated).toBe(3)
+      expect(stored.environments[0]?.variables).toEqual([{ id: 'var_baseUrl', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true }])
+      expect(stored.requests.map((item) => `${item.url}|${item.targetEnvironmentId}`)).toEqual([
+        '{{baseUrl}}/admin/v1/admin-accounts/query|env_test',
+        '{{baseUrl}}/admin/v1/admin-accounts/create|env_test',
+        '{{baseUrl}}/admin/v1/auth/login|env_test',
+      ])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 集合里没有硬编码主机 When 请求剥离地址 Then 审批之前就拒绝并说明', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const base = createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
+      const saved = await f.service.saveCatalog('workspace', catalog.revision, { ...catalog, requests: [{ ...base, id: 'request_a', revision: 1, updatedAt: 1, name: '已经用变量', url: '{{baseUrl}}/ping' }] })
+
+      await expect(f.facade.approval('api_extract_base_url', { collectionId: 'default', expectedRevision: saved.revision }))
+        .rejects.toThrow('API_WORKBENCH_BASE_URL_NOTHING_TO_EXTRACT')
+    } finally { f.cleanup() }
+  })
+})
+
 describe('Agent 保存环境（公共地址与变量）', () => {
   test('Given 未批准 When 保存环境 Then 拒绝且目录不变', async () => {
     const f = fixture()

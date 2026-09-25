@@ -118,4 +118,24 @@ describe('接口工作台 Agent 工具合同', () => {
     /** 请求草稿可以绑定目标环境：{{baseUrl}} 才有地方解析。 */
     expect(accepts('api_prepare_request', { request: { url: '{{baseUrl}}/ping', targetEnvironmentId: 'env_test' } })).toBe(true)
   })
+
+  test('Given Agent 批量整理接口 When 校验参数 Then 单次上限 50 条且只允许配置字段', () => {
+    const one = { requestId: 'request_1', name: '管理员列表查询', folder: '用户模块' }
+
+    expect(accepts('api_update_requests', { updates: [one], expectedRevision: 3 })).toBe(true)
+    expect(accepts('api_update_requests', { updates: [{ ...one, collectionId: 'default', targetEnvironmentId: null }], expectedRevision: 3 })).toBe(true)
+    /** 空批次没有意义；超过 50 条要拆批（一次审批一张卡）。 */
+    expect(accepts('api_update_requests', { updates: [], expectedRevision: 3 })).toBe(false)
+    expect(accepts('api_update_requests', { updates: Array.from({ length: 51 }, (_value, index) => ({ ...one, requestId: `request_${index}` })), expectedRevision: 3 })).toBe(false)
+    /** 批量整理不碰 URL 与正文：出现这些字段直接判非法。 */
+    expect(accepts('api_update_requests', { updates: [{ ...one, url: 'https://example.test/x' }], expectedRevision: 3 })).toBe(false)
+    expect(accepts('api_update_requests', { updates: [one], expectedRevision: '3' })).toBe(false)
+  })
+
+  test('Given Agent 剥离测试环境地址 When 校验参数 Then 只需要集合与目录版本', () => {
+    expect(accepts('api_extract_base_url', { collectionId: 'default', expectedRevision: 3 })).toBe(true)
+    expect(accepts('api_extract_base_url', { collectionId: 'default', environmentId: 'env_test', variableName: 'baseUrl', expectedRevision: 3 })).toBe(true)
+    expect(accepts('api_extract_base_url', { collectionId: 'default', expectedRevision: 3, url: 'https://example.test' })).toBe(false)
+    expect(accepts('api_extract_base_url', { collectionId: 'default' })).toBe(false)
+  })
 })

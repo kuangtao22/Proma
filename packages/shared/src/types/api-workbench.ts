@@ -18,6 +18,8 @@ export const API_LIMITS = {
   maxFileParts: 16,
   /** 单个 workspace 可保存的场景数量、单个场景的步骤数量，以及保留的场景运行条数。 */
   maxScenarios: 64, maxScenarioSteps: 20, maxScenarioRuns: 200,
+  /** 一次批量配置变更（分组 / 取名 / 绑定环境）可携带的接口条数。 */
+  maxRequestUpdates: 50,
   /** 一次场景运行的总时限：到点不再启动后续步骤，避免流程无限挂住。 */
   scenarioTotalMs: 10 * 60 * 1000,
 } as const
