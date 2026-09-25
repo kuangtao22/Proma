@@ -392,34 +392,39 @@ function CatalogPanel({
                * 分不清自己在哪个集合里（现场反馈「一级类不见了」就是这个观感）。
                */}
               {/* 一级行沿用应用自带列表风格：无边框方块、rounded-[10px]、foreground 透明层 hover。 */}
-              <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center gap-1 rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
+              <div data-api-collection-header={collection.id} className="group relative sticky top-0 z-10 flex items-center rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
                 <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] font-medium" onClick={() => setExpanded((previous) => {
                   /** 复制集合，避免原地修改 React 状态。 */
                   const next = new Set(previous)
                   if (next.has(collection.id)) next.delete(collection.id); else next.add(collection.id)
                   return next
                 })}>
-                  {/** 与应用内建项目行一致：小箭头 + 文件夹图标（展开时用 FolderOpen）。 */}
-                  {isExpanded ? <ChevronDown className="size-3.5 text-foreground/45" /> : <ChevronRight className="size-3.5 text-foreground/45" />}
-                  {isExpanded ? <FolderOpen className="size-3.5 text-foreground/45" /> : <Folder className="size-3.5 text-foreground/45" />}
+                  {/** 不要折叠箭头：整行就是开关；文件夹图标放大，展开时用 FolderOpen。 */}
+                  {isExpanded ? <FolderOpen className="size-4 shrink-0 text-foreground/50" /> : <Folder className="size-4 shrink-0 text-foreground/50" />}
                   {/* 名称损坏（历史数据或导入）时也要看得见这一级，而不是渲染成空白行。 */}
                   <span className="truncate">{collection.name.trim() || '（未命名集合）'}</span>
                 </button>
+                {/** 操作按钮改成右侧悬浮层：不再占宽度，集合名因此可以完整显示。 */}
+                <div className="absolute right-1 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded-[8px] bg-content-area px-1 shadow-sm group-hover:flex">
                 <ToolButton label="新建请求" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateRequest(collection.id)}><Plus className="size-3" /></ToolButton>
                 <ToolButton label="新建文件夹" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateFolder(collection)}><FolderPlus className="size-3" /></ToolButton>
                 <ToolButton label="主机提取为变量" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrl(collection)}><Link2 className="size-3" /></ToolButton>
                 <ToolButton label="主机提取到环境" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrlToEnvironment(collection)}><Server className="size-3" /></ToolButton>
                 <ToolButton label="重命名集合" className="opacity-0 group-hover:opacity-100" onClick={() => onRenameCollection(collection)}><MoreHorizontal className="size-3" /></ToolButton>
                 <ToolButton label="删除集合" className="opacity-0 group-hover:opacity-100" onClick={() => onDeleteCollection(collection)}><Trash2 className="size-3" /></ToolButton>
+                </div>
               </div>
               {isExpanded && (
                 <div className="ml-4 border-l border-border/50 pl-1.5">
                   {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                   {folders.map((folder) => (
-                    <div key={folder} className="group/folder">
+                    <div key={folder} className="group/folder relative">
                       {/** 文件夹图标属于一级（集合）；分组行只保留缩进与名称，层级一眼分明。 */}
-                      <div className="flex items-center gap-1 rounded-[10px] px-2 py-1 text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
+                      <div className="flex items-center rounded-[10px] px-2 py-1 text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
                         <span className="min-w-0 flex-1 truncate">{folder}</span>
+                      </div>
+                      {/** 分组行的操作按钮同样走右侧悬浮层，不再挤压分组名。 */}
+                      <div className="absolute right-1 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded-[8px] bg-content-area px-1 shadow-sm group-hover/folder:flex">
                         <ToolButton label="在文件夹中新建请求" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onCreateRequest(collection.id, folder)}><Plus className="size-3" /></ToolButton>
                         <ToolButton label="重命名文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onRenameFolder(collection.id, folder)}><MoreHorizontal className="size-3" /></ToolButton>
                         <ToolButton label="删除文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onDeleteFolder(collection.id, folder)}><Trash2 className="size-3" /></ToolButton>
