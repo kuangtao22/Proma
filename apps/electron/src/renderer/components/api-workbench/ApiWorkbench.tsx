@@ -15,6 +15,7 @@ import {
   Folder,
   FolderPlus,
   FolderInput,
+  FolderOpen,
   GitCompare,
   GitCompareArrows,
   History,
@@ -398,7 +399,9 @@ function CatalogPanel({
                   if (next.has(collection.id)) next.delete(collection.id); else next.add(collection.id)
                   return next
                 })}>
-                  {isExpanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+                  {/** 与应用内建项目行一致：小箭头 + 文件夹图标（展开时用 FolderOpen）。 */}
+                  {isExpanded ? <ChevronDown className="size-3.5 text-foreground/45" /> : <ChevronRight className="size-3.5 text-foreground/45" />}
+                  {isExpanded ? <FolderOpen className="size-3.5 text-foreground/45" /> : <Folder className="size-3.5 text-foreground/45" />}
                   {/* 名称损坏（历史数据或导入）时也要看得见这一级，而不是渲染成空白行。 */}
                   <span className="truncate">{collection.name.trim() || '（未命名集合）'}</span>
                 </button>
@@ -414,8 +417,8 @@ function CatalogPanel({
                   {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                   {folders.map((folder) => (
                     <div key={folder} className="group/folder">
+                      {/** 文件夹图标属于一级（集合）；分组行只保留缩进与名称，层级一眼分明。 */}
                       <div className="flex items-center gap-1 rounded-[10px] px-2 py-1 text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
-                        <Folder className="size-3.5 text-foreground/35" />
                         <span className="min-w-0 flex-1 truncate">{folder}</span>
                         <ToolButton label="在文件夹中新建请求" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onCreateRequest(collection.id, folder)}><Plus className="size-3" /></ToolButton>
                         <ToolButton label="重命名文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onRenameFolder(collection.id, folder)}><MoreHorizontal className="size-3" /></ToolButton>
