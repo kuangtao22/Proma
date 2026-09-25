@@ -27,11 +27,20 @@
 4. 界面 Body 分区的文件行 + 界面 smoke（夹具扮演主进程返回引用）。
 5. 真实 Electron 端到端：临时目录造一个二进制文件（含非 UTF-8 字节），注册后发送，服务端按 multipart 解析校验字节完全一致；断言运行记录里查不到文件内容、只有摘要。
 
-**B12b：Agent 指定文件 + 确认授权**
-6. 工具 schema：文件字段接受路径；facade 生成待批准的文件清单。
-7. 审批卡显示 realpath/大小/字段；批准后登记引用；拒绝后 preparedId 作废。
-8. 真实 Electron 端到端：Agent 声明路径 → 未批准时发送被拒 → 批准后真实上传成功；符号链接按 realpath 展示；目录/设备文件被拒。
-9. 计划文档补验收证据，按显式路径合入 main。
+**B12b：Agent 指定文件 + 确认授权**（授权流已定稿，见下节「B12b 定稿」，下一步一次做完）
+6. 工具 schema：`request.body.files` 接受 `{ id, name, path, contentType? }`（路径只在审批快照里出现，不进请求定义）。
+7. facade 在 prepare 阶段**只做 stat/realpath 校验并登记引用**（不读内容），把路径换成 B12a 的 `ApiFilePart`；审批快照带 `files: [{ field, path(=realpath), sizeBytes }]`。
+8. 审批卡逐行显示 realpath/大小/目标字段；批准后 preparedId 才能发送；**字节在 send 时才读**（沿用 B12a 的 inode/时间戳复核，换文件即拒绝）。
+9. 真实 Electron 端到端：Agent 声明路径 → 未批准时发送被拒 → 批准后真实上传成功；符号链接按 realpath 展示；目录/设备文件被拒。
+10. 计划文档补验收证据，按显式路径合入 main。
+
+### B12b 定稿（2026-09-25，供下次直接实施）
+
+- **路径只活在两处**：facade 的待批准快照（内存）与 B12a 的文件仓库（内存）。请求定义、运行记录、模型可见的预览里都只有引用与元数据。
+- **时序**：`api_prepare_request` → Host `realpath + stat`（不读字节）→ 登记引用并把路径替换成 `ApiFilePart` → `approval('api_send_request')` 快照里带 `files[{field, path, sizeBytes}]` → 审批卡展示（路径用 realpath，符号链接无法伪装）→ 批准后 `send` 读取字节（inode/时间戳复核）→ 记录只留摘要。
+- **拒绝即作废**：未批准或拒绝时 preparedId 不能发送（现有 `API_AGENT_APPROVAL_REQUIRED` 语义已覆盖）。
+- **错误可行动**：目录/FIFO/设备/悬空链接 → `API_WORKBENCH_FILE_INVALID_TYPE` / `_MISSING`；超过 16 个 → `_FILE_LIMIT`；准备后文件被换掉 → `_FILE_CHANGED`（都已有稳定错误码）。
+- **不做**：Agent 读取文件内容、跨会话复用引用、批准后换文件重发。
 
 ## 4. 明确不做
 
