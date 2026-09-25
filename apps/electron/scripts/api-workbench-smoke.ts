@@ -1,6 +1,6 @@
 /** 独立 Electron 验收：真实 preload/IPC → Service → Utility → 回环 HTTP，数据只写临时目录。 */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,9 +26,22 @@ const payload = '{"id":90071992547409931234,"token":"fixture-secret","ok":true}'
 let receivedAuthorization = ''
 /** 会话型接口真实收到的 Cookie 头，用于证明自动 Cookie 确实生效。 */
 let receivedCookie = ''
+/** multipart 上传接口收到的原始正文，用于逐字节校验附件。 */
+let receivedUpload: Buffer = Buffer.alloc(0)
 const server = createServer((request, response) => {
   calls += 1
   if (request.url === '/slow') { response.writeHead(200); response.write('partial'); return }
+  if (request.url === '/upload') {
+    /** 原样收集正文：附件必须按字节到达，不能被 UTF-8 编解码改写。 */
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      receivedUpload = Buffer.concat(chunks)
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end('{"ok":true}')
+    })
+    return
+  }
   if (request.url === '/session') {
     /** 第一次下发 cookie；之后靠 cookie 才算已登录，服务端只回显收到的 Cookie。 */
     receivedCookie = String(request.headers.cookie ?? '')
@@ -340,10 +353,40 @@ async function smoke(): Promise<void> {
   /** 清空丢掉的是已有 cookie；这次请求又拿到了服务端新下发的那两条。 */
   const jarAfterClear = await call('getCookieJar', { sessionId: 'smoke-session' }) as { cookies: Array<{ name: string }> }
   assert.deepEqual(jarAfterClear.cookies.map((cookie) => cookie.name).sort(), ['sid', 'theme'])
+  /** multipart 上传：附件必须逐字节到达，且运行记录里不留存文件内容。 */
+  const uploadBytes = Buffer.from([0x2d, 0x2d, 0x00, 0xff, 0xfe, 0x80, 0x0a, 0x0d])
+  const uploadPath = join(directory, 'upload.bin')
+  writeFileSync(uploadPath, uploadBytes)
+  const [pickedFile] = service!.registerPickedFiles('smoke-project', [uploadPath])
+  const uploadPrepared = await call('prepare', { sessionId: 'smoke-session', request: {
+    ...draft,
+    url: baseUrl + '/upload',
+    method: 'POST',
+    body: {
+      kind: 'multipart' as const, text: '',
+      fields: [{ id: 'field_note', name: 'note', value: 'hello 中文', enabled: true }],
+      files: [{ id: 'part_1', name: 'file', fileName: pickedFile!.fileName, sizeBytes: pickedFile!.sizeBytes, contentType: pickedFile!.contentType, ref: pickedFile!.ref }],
+    },
+  } }) as ApiPreparedPreview
+  /** 预览只给摘要：不发字节、也不回路径。 */
+  assert.ok(uploadPrepared.request.body.includes('<文件内容未留存：upload.bin（8 字节）>'), uploadPrepared.request.body)
+  assert.equal(JSON.stringify(uploadPrepared.request).includes('upload.bin'), true)
+  assert.equal(JSON.stringify(uploadPrepared.request).includes(directory), false, '预览不该带真实路径')
+  const uploadRun = await call('send', { sessionId: 'smoke-session', preparedId: uploadPrepared.preparedId }) as ApiRun
+  assert.equal(uploadRun.state, 'completed', JSON.stringify(uploadRun))
+  /** 服务端按字节收到附件，字段与文件名都在。 */
+  assert.ok(receivedUpload.includes(uploadBytes), '服务端没有收到完整附件字节')
+  const uploadText = receivedUpload.toString('utf8')
+  assert.ok(uploadText.includes('name="file"; filename="upload.bin"'), uploadText)
+  assert.ok(uploadText.includes('name="note"') && uploadText.includes('hello 中文'), uploadText)
+  /** 记录里只有摘要，没有 base64 正文。 */
+  assert.deepEqual(uploadRun.request.attachments?.map((item) => item.field), ['file'])
+  assert.equal(uploadRun.request.attachments?.[0]?.sha256.length, 64)
+  assert.equal(JSON.stringify(uploadRun).includes(uploadBytes.toString('base64').slice(0, 12)), false, '运行记录不该带二进制正文')
   const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 15)
-  assert.equal(calls, 15)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'history'] }))
+  assert.equal(history.runs.length, 16)
+  assert.equal(calls, 16)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

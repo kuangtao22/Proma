@@ -403,7 +403,50 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-run-diff.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] 运行对比已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、运行对比、宽布局、亮暗主题与窄 Pane 已验证')
+    /** multipart 文件上传：原生对话框（夹具扮演主进程）→ 文件行 → 保存后只存引用元数据。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const dialog = [...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open')
+      const button = [...(dialog?.querySelectorAll('button') ?? [])].find((item) => item.textContent?.trim() === '关闭')
+      if (button instanceof HTMLButtonElement) button.click()
+      return true
+    })()`), true, '对比面板未关闭')
+    await waitFor(window, "![...document.querySelectorAll('[role=dialog]')].some((item) => item.getAttribute('data-state') === 'open')", '对比面板仍在原位')
+    await clickText(window, 'Body')
+    await waitFor(window, "Boolean(document.querySelector('[role=combobox]'))", 'Body 分区未渲染')
+    /** Radix Select 用指针事件打开与选中，直接 click 不会生效。 */
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const press = (node) => {
+        if (!(node instanceof HTMLElement)) return false
+        node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+        node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }))
+        node.click()
+        return true
+      }
+      const trigger = [...document.querySelectorAll('[role=combobox]')].find((item) => item.textContent?.trim() === 'none')
+      return press(trigger)
+    })()`), true, '找不到正文类型选择器')
+    await waitFor(window, "Boolean(document.querySelector('[role=option]'))", '正文类型下拉未展开')
+    assert.equal(await window.webContents.executeJavaScript(`(() => {
+      const node = [...document.querySelectorAll('[role=option]')].find((item) => item.textContent?.trim() === 'multipart/form-data')
+      if (!(node instanceof HTMLElement)) return false
+      node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+      node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }))
+      node.click()
+      return true
+    })()`), true, '找不到 multipart 选项')
+    await waitFor(window, "document.body.textContent?.includes('选择文件')", 'multipart 正文未出现文件入口')
+    await clickText(window, '选择文件')
+    await waitFor(window, "document.body.textContent?.includes('smoke.png')", '选中的文件没有出现在编辑器里')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('附件内容不写入运行记录') ?? false"), true, '缺少附件不落盘说明')
+    await clickLabel(window, '保存请求 (⌘S)')
+    /** 载入的历史草稿会另存为一条新请求，因此按「任意请求上出现该文件」判断。 */
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => (item.body.files ?? []).some((file) => file.fileName === 'smoke.png'))", '文件引用没有随请求保存')
+    /** 定义里只有引用与展示元数据：出现路径字段即失败（注意 MIME 里的斜杠不算路径）。 */
+    assert.equal(await window.webContents.executeJavaScript("JSON.stringify(Object.keys(window.__apiWorkbenchSmoke.catalog.requests.flatMap((item) => item.body.files ?? [])[0] ?? {}).sort())"), '["contentType","fileName","id","name","ref","sizeBytes"]', '文件元数据字段不符合预期')
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
+    console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

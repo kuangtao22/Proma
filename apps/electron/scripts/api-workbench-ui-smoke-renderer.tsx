@@ -116,6 +116,8 @@ const api: ApiWorkbenchApi = {
     return { cleared }
   },
   /** Cookie 面板只回元数据：夹具里也没有取值字段。 */
+  /** 原生文件对话框由主进程打开；夹具直接回一个引用与元数据（不含路径）。 */
+  pickApiFiles: async () => ({ files: [{ ref: 'file_fixture1', fileName: 'smoke.png', sizeBytes: 2048, contentType: 'image/png' }] }),
   getCookieJar: async () => ({ cookies: state.cookies.map((item) => ({ ...item })) }),
   clearCookieJar: async () => {
     const cleared = state.cookies.length
