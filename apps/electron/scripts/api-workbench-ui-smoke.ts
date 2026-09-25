@@ -309,11 +309,16 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await waitFor(window, `(() => {
       const input = document.querySelector('input[aria-label="搜索请求"]')
       const drawer = input?.closest('[role="dialog"]')
-      if (!(drawer instanceof HTMLElement) || drawer.dataset.state !== 'open') return false
+      const root = document.querySelector('[data-api-workbench-root]')
+      if (!(drawer instanceof HTMLElement) || !(root instanceof HTMLElement)) return false
       const rect = drawer.getBoundingClientRect()
+      const rootRect = root.getBoundingClientRect()
       const transform = getComputedStyle(drawer).transform
-      return Math.abs(rect.left) <= 1 && rect.width >= 300 && rect.height >= 700 && (transform === 'none' || transform === 'matrix(1, 0, 0, 1, 0, 0)')
-    })()`, '窄 Pane 目录抽屉未稳定打开')
+      /** 这个窗口里工作台铺满全窗，所以这里只用「落在工作台范围内」兜底；跨栏位置由 offset-pane 窗口验证。 */
+      return rect.width >= 300 && rect.height >= 700
+        && rect.left >= rootRect.left - 1 && rect.right <= rootRect.right + 1
+        && (transform === 'none' || transform === 'matrix(1, 0, 0, 1, 0, 0)')
+    })()`, '窄 Pane 目录抽屉没有落在工作台范围内')
     await waitForClosedLayersToLeave(window)
     await new Promise<void>((resolve) => setTimeout(resolve, 300))
     const lightImage = await window.webContents.capturePage()
@@ -408,6 +413,28 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
       console.log('[API Workbench UI smoke] 流程运行、逐步结果与打开运行已验证')
     } finally {
       scenarioWindow.destroy()
+    }
+    /** 跨栏回归：左栏有占位时，窄栏目录抽屉必须停在工作台这一栏内，而不是贴到窗口最左侧。 */
+    const offsetWindow = new BrowserWindow({ width: 900, height: 780, show: false, backgroundColor: '#ffffff', webPreferences: { backgroundThrottling: false } })
+    try {
+      await offsetWindow.loadURL(`${process.env.PROMA_API_UI_SMOKE_URL!}?offset-pane=1`)
+      await waitFor(offsetWindow, "document.body.dataset.smokeReady === 'true' && Boolean(document.querySelector('[data-api-workbench-root]'))", '偏移栏窗口未挂载')
+      await waitFor(offsetWindow, "Boolean(document.querySelector('button[aria-label=" + JSON.stringify('打开目录') + "]'))", '偏移栏未出现目录入口')
+      await clickLabel(offsetWindow, '打开目录')
+      await waitFor(offsetWindow, `(() => {
+        const drawer = document.querySelector('input[aria-label="搜索请求"]')?.closest('[role="dialog"]')
+        const root = document.querySelector('[data-api-workbench-root]')
+        if (!(drawer instanceof HTMLElement) || !(root instanceof HTMLElement)) return false
+        const rect = drawer.getBoundingClientRect()
+        const rootRect = root.getBoundingClientRect()
+        /** 左栏占位 320px：抽屉左边缘必须贴住工作台栏（≈320），而不是窗口的 0。 */
+        return rect.left >= rootRect.left - 1 && rect.right <= rootRect.right + 1 && rect.left > 200
+      })()`, '窄栏目录抽屉贴到了窗口最左侧，而不是停在工作台栏内')
+      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      await writeFile('/private/tmp/api-workbench-ui-offset-drawer.png', (await offsetWindow.webContents.capturePage()).toPNG())
+      console.log('[API Workbench UI smoke] 窄栏目录抽屉停在当前栏内已验证')
+    } finally {
+      offsetWindow.destroy()
     }
     /** 历史载入编辑器：把运行里的真实请求还原成未保存草稿，并列出必须重填的遮罩位置。 */
     await clickLabel(window, '运行历史')

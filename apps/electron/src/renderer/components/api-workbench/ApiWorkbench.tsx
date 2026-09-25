@@ -82,7 +82,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet'
+import { ApiCatalogDrawer } from './ApiCatalogDrawer'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import {
@@ -1785,7 +1785,11 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   />
 
   return (
-    <div ref={rootRef} className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-content-area text-foreground">
+    /**
+     * relative：窄栏抽屉要在这一栏内部绝对定位，不能跑到窗口最左侧。
+     * data-api-workbench-root 供真机验收（界面 smoke）量抽屉是否仍在工作台范围内。
+     */
+    <div ref={rootRef} data-api-workbench-root="true" className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-content-area text-foreground">
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border/50 px-2.5">
         {compact && <ToolButton label="打开目录" onClick={() => setCatalogDrawerOpen(true)}><Menu className="size-4" /></ToolButton>}
         <span className="text-xs font-semibold">接口工作台</span>
@@ -1844,7 +1848,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
           )}
         </main>
       </div>
-      <Sheet open={catalogDrawerOpen} onOpenChange={setCatalogDrawerOpen}><SheetContent side="left" className="w-[min(86vw,320px)] p-0"><SheetTitle className="sr-only">接口目录</SheetTitle>{catalogPanel}</SheetContent></Sheet>
+      <ApiCatalogDrawer open={catalogDrawerOpen} onClose={() => setCatalogDrawerOpen(false)}>{catalogPanel}</ApiCatalogDrawer>
       <CatalogNameDialog action={catalogNameAction} onOpenChange={(open) => { if (!open) setCatalogNameAction(null) }} onSubmit={(name) => {
         /** 提交后立即关闭，失败信息由工作台顶部统一展示。 */
         const action = catalogNameAction

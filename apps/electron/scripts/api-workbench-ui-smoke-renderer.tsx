@@ -252,6 +252,22 @@ function SmokeApp(): React.ReactElement {
 }
 
 /**
+ * 偏移栏窗口：左边放一条占位栏（模拟聊天栏），工作台只占右侧一栏。
+ * 用来验证「窄栏目录抽屉必须停在工作台这一栏内」，而不是贴到窗口最左侧。
+ */
+function OffsetPaneApp(): React.ReactElement {
+  React.useEffect(() => { document.body.dataset.smokeReady = 'true' }, [])
+  return (
+    <TooltipProvider delayDuration={0}>
+      <div className="flex h-screen w-screen bg-background">
+        <div aria-label="左侧占位栏" className="w-80 shrink-0 border-r border-border/50 bg-muted/20" />
+        <div className="min-w-0 flex-1"><ApiWorkbench sessionId="session-smoke" workspaceScope="workspace-smoke" /></div>
+      </div>
+    </TooltipProvider>
+  )
+}
+
+/**
  * 审批卡窗口：夹具扮演 Host 推入一条「Agent 指定文件」的发送审批，
  * 重点是让「允许」按钮走真实组件逻辑（respondPermission），而不是 smoke 直接改状态。
  */
@@ -287,6 +303,8 @@ if (search.has('approval')) {
   const store = createStore()
   store.set(allPendingPermissionRequestsAtom, new Map([['session-approval', [approvalRequest]]]))
   createRoot(document.getElementById('root')!).render(<Provider store={store}><ApprovalApp /></Provider>)
+} else if (search.has('offset-pane')) {
+  createRoot(document.getElementById('root')!).render(<OffsetPaneApp />)
 } else {
   createRoot(document.getElementById('root')!).render(<SmokeApp />)
 }
