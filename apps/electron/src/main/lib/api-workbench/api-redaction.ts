@@ -217,8 +217,15 @@ export function redactApiRequest(request: ApiResolvedRequest, secrets: readonly 
     ? expandedUrl
     : `${url.origin}/${REDACTED_URL_VALUE}`
   return {
-    ...request,
+    method: request.method,
     url: redactedUrl,
+    timeoutMs: request.timeoutMs,
+    followRedirects: request.followRedirects,
+    maxRedirects: request.maxRedirects,
+    sensitiveHeaderNames: request.sensitiveHeaderNames,
+    sensitiveQueryNames: request.sensitiveQueryNames,
+    /** 附件摘要可以公开；二进制正文（bodyBase64）永远不进公开投影。 */
+    ...(request.attachments ? { attachments: request.attachments } : {}),
     headers: request.headers.map((header) => ({
       ...header,
       value: sensitiveHeaders.has(header.name.toLowerCase()) || COMMON_SENSITIVE_NAME.test(header.name)

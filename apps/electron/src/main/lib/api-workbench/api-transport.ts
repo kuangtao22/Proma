@@ -4,6 +4,7 @@ import { Readable } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 import { createBrotliDecompress, createGunzip, createInflate, type BrotliDecompress, type Gunzip, type Inflate } from 'node:zlib'
+import { API_LIMITS } from '@proma/shared'
 import type {
   ApiBodyInfo,
   ApiConnectionInfo,
@@ -138,7 +139,7 @@ interface HopResponse {
 /** 重定向决策只允许继续、停止或解释性拒绝三种结果。 */
 type RedirectDecision =
   | { kind: 'none' }
-  | { kind: 'follow'; url: URL; method: ApiMethod; body: string }
+  | { kind: 'follow'; url: URL; method: ApiMethod; body: Buffer }
   | { kind: 'reject'; error: ApiTransportError }
 
 /** 生成无响应或尚未读取正文时的空事实。 */
@@ -254,9 +255,11 @@ function networkError(error: unknown): ApiTransportError {
   return new ApiTransportError('API_REQUEST_FAILED', 'request', message)
 }
 
-/** 建立一跳 HTTP/1.1 请求并在收到响应头时返回。 */
-function openHop(url: URL, method: ApiMethod, bodyText: string, headers: ApiHeader[], deadline: number, signal?: AbortSignal): Promise<HopResponse> {
-  const body = Buffer.from(bodyText)
+/**
+ * 建立一跳 HTTP/1.1 请求并在收到响应头时返回。
+ * @param body 本跳的正文缓冲区；含附件的请求由主进程提前合成好字节。
+ */
+function openHop(url: URL, method: ApiMethod, body: Buffer, headers: ApiHeader[], deadline: number, signal?: AbortSignal): Promise<HopResponse> {
   const startedAt = performance.now()
   const observation: SocketObservation = { closePromise: Promise.resolve(), resolveClose: () => {}, reused: false }
   return new Promise<HopResponse>((resolve, reject) => {
@@ -402,7 +405,7 @@ function bodyInfo(response: IncomingMessage | undefined, capture: BodyCapture, c
 }
 
 /** 根据状态码执行阶段 A 的方法改写，并在网络动作前拒绝越界来源。 */
-function redirectDecision(currentUrl: URL, method: ApiMethod, body: string, status: number, location: string | undefined, request: ApiResolvedRequest, hopCount: number): RedirectDecision {
+function redirectDecision(currentUrl: URL, method: ApiMethod, body: Buffer, status: number, location: string | undefined, request: ApiResolvedRequest, hopCount: number): RedirectDecision {
   if (!request.followRedirects || !location || ![301, 302, 303, 307, 308].includes(status)) return { kind: 'none' }
   if (hopCount >= request.maxRedirects) return { kind: 'reject', error: new ApiTransportError('API_REDIRECT_LIMIT', 'redirect', '重定向次数超过配置上限') }
   let target: URL
@@ -413,7 +416,7 @@ function redirectDecision(currentUrl: URL, method: ApiMethod, body: string, stat
   let nextMethod = method
   if ((status === 301 || status === 302) && method === 'POST') nextMethod = 'GET'
   if (status === 303 && method !== 'HEAD') nextMethod = 'GET'
-  return { kind: 'follow', url: target, method: nextMethod, body: nextMethod === 'GET' ? '' : body }
+  return { kind: 'follow', url: target, method: nextMethod, body: nextMethod === 'GET' ? Buffer.alloc(0) : body }
 }
 
 /** 将内部错误转换为不会携带秘密正文或 Header 值的失败事实。 */
@@ -441,7 +444,9 @@ export async function executeApiTransport(request: ApiResolvedRequest, options: 
     return { state: 'failed', hops, body: emptyBody(), error: failure(error) }
   }
   let method = request.method
-  let body = request.body
+  /** 含附件的请求带的是已经合成好的二进制正文；其余请求按 UTF-8 文本发送。 */
+  let body: Buffer = request.bodyBase64 === undefined ? Buffer.from(request.body) : Buffer.from(request.bodyBase64, 'base64')
+  if (body.byteLength > API_LIMITS.bodyBytes) throw new ApiTransportError('API_REQUEST_BODY_LIMIT', 'request', '请求正文超过上限')
   let finalBody = emptyBody()
   for (;;) {
     const capture: BodyCapture = { rawBytes: 0, decodedBytes: 0, previewChunks: [], previewBytes: 0, previewTruncated: false }
@@ -451,8 +456,7 @@ export async function executeApiTransport(request: ApiResolvedRequest, options: 
     try {
       if (options.signal?.aborted) throw new ApiTransportError('API_ABORTED', 'cancel', '请求已取消')
       if (Date.now() >= deadline) throw new ApiTransportError('API_TOTAL_TIMEOUT', 'timeout', '请求总时限已到')
-      const bodyBuffer = Buffer.from(body)
-      const requestHeaders = prepareRequestHeaders(currentUrl, request.headers, bodyBuffer)
+      const requestHeaders = prepareRequestHeaders(currentUrl, request.headers, body)
       opened = await openHop(currentUrl, method, body, requestHeaders, deadline, options.signal)
       hops.push(opened.hop)
       const locationValue = opened.response.headers.location

@@ -6,7 +6,12 @@ export interface ApiIpcEvent { sender: { id: number } }
 /** 服务对象由生产 singleton 或测试夹具提供。 */
 export interface ApiIpcDependencies {
   ipc: { handle(channel: string, listener: (event: ApiIpcEvent, input: unknown) => Promise<unknown>): void; removeHandler(channel: string): void }
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles'>
+  /**
+   * 原生文件对话框由主进程打开；这是全流程唯一接受路径字符串的入口，
+   * 渲染层与模型都只能拿到文件引用与元数据。
+   */
+  pickFilePaths?(event: ApiIpcEvent): Promise<string[]>
   isAuthorizedSender(event: ApiIpcEvent): boolean
   requireSession(sessionId: string): { id: string; workspaceId: string }
   assertWorkspaceWritable?(workspaceId: string): void
@@ -44,6 +49,12 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
       case 'clearRuntimeVariables': result = { cleared: service.clearRuntimeVariables(context.workspaceId) }; break
       case 'getCookieJar': result = { cookies: service.getCookieJar(context.workspaceId) }; break
       case 'clearCookieJar': result = { cleared: service.clearCookieJar(context.workspaceId) }; break
+      case 'pickApiFiles': {
+        /** 用户在对话框里取消时返回空列表，不制造任何引用。 */
+        const paths = dependencies.pickFilePaths ? await dependencies.pickFilePaths(event) : []
+        result = { files: service.registerPickedFiles(context.workspaceId, paths) }
+        break
+      }
     }
     assertCurrent()
     return parseApiResponse(command.method, result)

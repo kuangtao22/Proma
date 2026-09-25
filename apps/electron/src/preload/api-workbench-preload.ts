@@ -27,6 +27,7 @@ export function createApiWorkbenchPreload(invoke: ApiWorkbenchInvoke, subscribe:
     clearRuntimeVariables: (input) => call('clearRuntimeVariables', input),
     getCookieJar: (input) => call('getCookieJar', input),
     clearCookieJar: (input) => call('clearCookieJar', input),
+    pickApiFiles: (input) => call('pickApiFiles', input),
     onChanged: (callback) => subscribe(API_WORKBENCH_CHANNELS.CHANGED, (value) => { callback(parseApiRunChanged(value)) }),
     /** 流式事件同样先过 parser；损坏消息直接丢弃，不进入渲染层。 */
     onStream: (callback) => subscribe(API_WORKBENCH_CHANNELS.STREAM, (value) => {

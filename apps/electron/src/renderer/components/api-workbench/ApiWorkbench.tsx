@@ -42,6 +42,7 @@ import type {
   ApiExtraction,
   ApiField,
   ApiMethod,
+  ApiPickedFile,
   ApiRequestBody,
   ApiRequestDraft,
   ApiRequestDefinition,
@@ -184,6 +185,14 @@ function errorMessage(error: unknown, fallback: string): string {
     API_WORKBENCH_SECRET_BUDGET_EXCEEDED: '秘密值总量超过 1 MiB 上限，请减少后再保存',
     API_WORKBENCH_CAPACITY_LIMIT: '运行历史空间已满，请取消部分收藏后重试',
     API_WORKBENCH_USER_CASE_PROTECTED: '人工创建的用例不能被 Agent 修改或删除，请在界面上手动调整',
+    API_WORKBENCH_FILE_REF_NOT_FOUND: '所选文件在本机已失效（应用重启或引用被清理），请重新选择文件',
+    API_WORKBENCH_FILE_CHANGED: '所选文件在选择之后发生了变化，请重新选择文件',
+    API_WORKBENCH_FILE_UNREADABLE: '所选文件已不存在或不可读，请重新选择文件',
+    API_WORKBENCH_FILE_MISSING: '文件不存在或无法解析真实路径',
+    API_WORKBENCH_FILE_INVALID_TYPE: '只支持常规文件，目录与特殊文件不可上传',
+    API_WORKBENCH_FILE_TOO_LARGE: '文件超过单次上传上限（20 MiB）',
+    API_WORKBENCH_FILE_LIMIT: '本次请求可携带的文件数量已达上限（16 个）',
+    API_WORKBENCH_MULTIPART_TOO_LARGE: '附件与字段合计超过单次请求正文上限（20 MiB）',
   }
   /** 错误码位于冒号前，后续 Host 中文细节可以继续展示。 */
   const code = error.message.split(':', 1)[0]!
@@ -447,7 +456,7 @@ function RequestTabBar({ tabs, activeTabId, onSelect, onClose }: { tabs: ApiWork
 }
 
 /** 请求编辑器主体。 */
-function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel }: {
+function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel, onPickFiles }: {
   tab: ApiWorkbenchRequestTab
   environmentId: string | null
   /** 用于「目标环境」标记选择：标记只区分开发/测试/生产，不改变发送权限。 */
@@ -464,6 +473,8 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
   onDelete: () => void
   onSend: () => void
   onCancel: () => void
+  /** 打开原生文件对话框选择待上传文件（multipart 正文用）。 */
+  onPickFiles: () => Promise<ApiPickedFile[]>
 }): React.ReactElement {
   /** 当前编辑分区。 */
   const [section, setSection] = React.useState<EditorSection>('query')
@@ -505,7 +516,7 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         {section === 'query' && <FieldRows rows={tab.draft.query} allowSecrets onChange={(rows) => patchDraft('query', rows)} namePlaceholder="参数" />}
         {section === 'headers' && <FieldRows rows={tab.draft.headers} allowSecrets onChange={(rows) => patchDraft('headers', rows)} namePlaceholder="Header" />}
-        {section === 'body' && <BodyEditor body={tab.draft.body} onChange={(body) => patchDraft('body', body)} />}
+        {section === 'body' && <BodyEditor body={tab.draft.body} onChange={(body) => patchDraft('body', body)} onPickFiles={onPickFiles} />}
         {section === 'auth' && <AuthEditor draft={tab.draft} onChange={onChange} />}
         {section === 'cases' && <CaseEditor draft={tab.draft} activeCaseId={activeCase?.id} onCasesChange={onCasesChange} onActiveCaseChange={onActiveCaseChange} />}
         {section === 'assertions' && <AssertionEditor assertions={draftAssertions(tab.draft, activeCase?.id)} target={assertionTarget} onChange={(assertions) => onChange(withDraftAssertions(tab.draft, activeCase?.id, assertions))} />}
@@ -516,18 +527,61 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
   )
 }
 
-/** 正文类型和内容编辑器。 */
-function BodyEditor({ body, onChange }: { body: ApiRequestBody; onChange: (body: ApiRequestBody) => void }): React.ReactElement {
+/** 正文类型和内容编辑器；multipart 的文件只能经原生对话框选择。 */
+function BodyEditor({ body, onChange, onPickFiles }: {
+  body: ApiRequestBody
+  onChange: (body: ApiRequestBody) => void
+  /** 打开原生文件对话框并登记引用；取消时返回空数组。 */
+  onPickFiles: () => Promise<ApiPickedFile[]>
+}): React.ReactElement {
+  /** 文件选择中的忙碌标记，避免重复弹窗。 */
+  const [picking, setPicking] = React.useState(false)
+  /** 本地展示的错误（例如文件超限），不污染请求状态。 */
+  const [pickError, setPickError] = React.useState<string | null>(null)
+  /** 选择文件并追加到草稿；引用失效由发送阶段 fail closed。 */
+  const pickFiles = async (): Promise<void> => {
+    if (picking) return
+    setPicking(true)
+    setPickError(null)
+    try {
+      const picked = await onPickFiles()
+      if (picked.length === 0) return
+      const files = [...(body.files ?? []), ...picked.map((file) => ({ id: createLocalId('part'), name: 'file', fileName: file.fileName, sizeBytes: file.sizeBytes, contentType: file.contentType, ref: file.ref }))]
+      onChange({ ...body, files })
+    } catch (error) {
+      setPickError(errorMessage(error, '选择文件失败'))
+    } finally {
+      setPicking(false)
+    }
+  }
   return (
     <div className="space-y-3">
       <Select value={body.kind} onValueChange={(kind) => onChange({ ...body, kind: kind as ApiRequestBody['kind'] })}>
         <SelectTrigger className="h-8 w-44 text-xs"><SelectValue /></SelectTrigger>
         <SelectContent>
-          <SelectItem value="none">none</SelectItem><SelectItem value="json">JSON</SelectItem><SelectItem value="text">Text</SelectItem><SelectItem value="urlencoded">x-www-form-urlencoded</SelectItem>
+          <SelectItem value="none">none</SelectItem><SelectItem value="json">JSON</SelectItem><SelectItem value="text">Text</SelectItem><SelectItem value="urlencoded">x-www-form-urlencoded</SelectItem><SelectItem value="multipart">multipart/form-data</SelectItem>
         </SelectContent>
       </Select>
       {(body.kind === 'json' || body.kind === 'text') && <Textarea value={body.text} onChange={(event) => onChange({ ...body, text: event.target.value })} className="min-h-40 resize-y font-mono text-xs" placeholder={body.kind === 'json' ? '{\n  "name": "Proma"\n}' : '请求正文'} />}
       {body.kind === 'urlencoded' && <FieldRows rows={body.fields} allowSecrets onChange={(fields) => onChange({ ...body, fields })} namePlaceholder="字段" />}
+      {body.kind === 'multipart' && (
+        <div className="space-y-3">
+          <FieldRows rows={body.fields} allowSecrets onChange={(fields) => onChange({ ...body, fields })} namePlaceholder="字段" />
+          <div className="space-y-1.5">
+            {(body.files ?? []).map((file) => (
+              <div key={file.id} className="grid grid-cols-[minmax(96px,140px)_minmax(120px,1fr)_auto_32px] items-center gap-2">
+                <Input value={file.name} aria-label="文件字段名" onChange={(event) => onChange({ ...body, files: (body.files ?? []).map((item) => item.id === file.id ? { ...item, name: event.target.value } : item) })} className="h-8 text-xs" />
+                <span className="min-w-0 truncate text-xs text-muted-foreground" title={file.fileName}>{file.fileName} · {(file.sizeBytes / 1024).toFixed(1)} KiB</span>
+                <span className="shrink-0 rounded bg-muted px-1 text-[9px] text-muted-foreground">{file.contentType ?? 'application/octet-stream'}</span>
+                <ToolButton label={`移除文件 ${file.fileName}`} onClick={() => onChange({ ...body, files: (body.files ?? []).filter((item) => item.id !== file.id) })}><Trash2 className="size-3.5" /></ToolButton>
+              </div>
+            ))}
+            <Button type="button" variant="ghost" size="sm" className="h-7 gap-1.5 px-2 text-xs" disabled={picking} onClick={() => void pickFiles()}><Plus className="size-3.5" />选择文件</Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">文件只在主进程内存里保存引用，不写入请求定义；应用重启后需要重新选择。附件内容不写入运行记录，只保留文件名、大小与 sha256。</p>
+          {pickError && <p className="text-[11px] text-destructive">{pickError}</p>}
+        </div>
+      )}
       {body.kind === 'none' && <div className="rounded-md border border-dashed border-border/60 px-3 py-8 text-center text-xs text-muted-foreground">该请求不发送正文</div>}
     </div>
   )
@@ -1502,6 +1556,16 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   const resolveCaseName = React.useCallback((run: ApiRun): string | null => resolveApiCaseName(run, activeTab?.draft ?? null, catalog), [activeTab, catalog])
 
   /**
+   * 打开原生文件对话框选择待上传文件。
+   * 渲染层只拿到引用与元数据；路径始终留在主进程。
+   */
+  const pickFiles = React.useCallback(async (): Promise<ApiPickedFile[]> => {
+    if (!api) return []
+    const result = await api.pickApiFiles({ sessionId })
+    return result.files
+  }, [api, sessionId])
+
+  /**
    * 把一次运行的真实请求载入成新的未保存草稿。
    * 记录里的取值是遮罩过的，因此这里只还原可见事实：被遮罩的位置留空并列入提示，绝不写回 [REDACTED]。
    */
@@ -1757,7 +1821,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId && !window.confirm(`删除请求“${activeTab.draft.name}”？`)) return
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
-              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} /></section>}
+              }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} onPickFiles={pickFiles} /></section>}
               {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} onSetBaseline={setBaseline} onCompareBaseline={(run) => void compareWithBaseline(run)} baselineRunId={baselineRun?.id ?? null} /></section>}
             </div>
           )}

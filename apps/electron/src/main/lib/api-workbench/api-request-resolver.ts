@@ -1,4 +1,5 @@
 import { API_LIMITS } from '@proma/shared'
+import { randomUUID } from 'node:crypto'
 import type {
   ApiCatalog,
   ApiField,
@@ -8,6 +9,8 @@ import type {
 } from '@proma/shared'
 import { cookieHeaderValue } from './api-cookies'
 import type { ApiCookieJarRecord } from './api-cookies'
+import { createMultipartBoundary, summarizeMultipart } from './api-multipart'
+import type { ApiMultipartPlanPart } from './api-multipart'
 
 /** 秘密解析结果同时携带版本，供 prepared 快照发送前复核。 */
 export interface ApiResolvedSecret {
@@ -34,6 +37,10 @@ export interface ResolveApiRequestInput {
   cookieJar?: readonly ApiCookieJarRecord[]
   /** 判定 cookie 是否过期用的时间；默认取当前时间。 */
   now?: number
+  /** 解析文件引用；只有 multipart 请求会用到，返回 undefined 表示引用已失效。 */
+  resolveFile?: (ref: string) => { fileName: string; sizeBytes: number; contentType: string } | undefined
+  /** multipart 边界生成器，便于测试固定输出。 */
+  createBoundary?: () => string
   resolveSecret: (lookup: ApiSecretLookup) => ApiResolvedSecret | undefined
 }
 
@@ -43,6 +50,17 @@ export interface ResolveApiRequestResult {
   environmentKind?: 'local' | 'test' | 'production'
   secretRevisions: Record<string, string>
   secretValues: string[]
+  /**
+   * multipart 的待发计划：文本字段已解析完毕，文件部分只带引用与元数据。
+   * 真实字节由服务层读取（含上限与失效复核）后合成 base64 正文，本层不做 IO。
+   */
+  multipart?: {
+    boundary: string
+    parts: Array<
+      | { kind: 'field'; name: string; value: string }
+      | { kind: 'file'; name: string; fileName: string; contentType: string; sizeBytes: number; ref: string }
+    >
+  }
 }
 
 interface VariableValue {
@@ -275,6 +293,8 @@ export function resolveApiRequest(input: ResolveApiRequestInput): ResolveApiRequ
   }
 
   let body = ''
+  /** multipart 的待发计划；文件字节由服务层读取后合成。 */
+  let multipart: ResolveApiRequestResult['multipart']
   if (input.request.body.kind === 'json') {
     body = interpolateJson(input.request.body.text, variables)
     if (!headers.some((header) => header.name.toLowerCase() === 'content-type')) {
@@ -299,6 +319,39 @@ export function resolveApiRequest(input: ResolveApiRequestInput): ResolveApiRequ
     if (!headers.some((header) => header.name.toLowerCase() === 'content-type')) {
       headers.push({ name: 'Content-Type', value: 'application/x-www-form-urlencoded', source: 'generated' })
     }
+  } else if (input.request.body.kind === 'multipart') {
+    /** 边界每次都重新生成，避免跨请求复用一个可预测的分隔符。 */
+    const boundary = input.createBoundary?.() ?? createMultipartBoundary(randomUUID())
+    const parts: ApiMultipartPlanPart[] = []
+    for (const field of input.request.body.fields) {
+      if (!field.enabled || !field.name) continue
+      const owner = `request:${input.requestId ?? 'draft'}:body:${field.id}`
+      const resolved = resolveValue(field, owner, input.resolveSecret, secretRevisions, secretValues)
+      const value = interpolate(resolved.value, variables, (item) => item)
+      /** 文本字段同样可能是秘密：取值只用于发送与脱敏，不进公开投影的明文之外的地方。 */
+      if (resolved.secret || containsSecretTemplate(field.value, variables)) secretValues.add(value)
+      parts.push({ kind: 'field', name: interpolate(field.name, variables, (item) => item), value })
+    }
+    for (const file of input.request.body.files ?? []) {
+      const meta = input.resolveFile?.(file.ref)
+      /** 引用失效必须在这里拒绝：否则会静默发出不带附件的请求。 */
+      if (!meta) throw new Error('API_WORKBENCH_FILE_REF_NOT_FOUND: 所选文件已失效，请重新选择文件')
+      parts.push({
+        kind: 'file',
+        name: interpolate(file.name, variables, (item) => item),
+        fileName: meta.fileName,
+        contentType: file.contentType ?? meta.contentType,
+        sizeBytes: meta.sizeBytes,
+        ref: file.ref,
+      })
+    }
+    if (parts.length === 0) throw new Error('API_WORKBENCH_MULTIPART_EMPTY: multipart 请求至少需要一个字段或文件')
+    multipart = { boundary, parts }
+    /** 公开投影只保留结构摘要：文件字节绝不进入运行记录与模型上下文。 */
+    body = summarizeMultipart(boundary, parts)
+    if (!headers.some((header) => header.name.toLowerCase() === 'content-type')) {
+      headers.push({ name: 'Content-Type', value: `multipart/form-data; boundary=${boundary}`, source: 'generated' })
+    }
   }
 
   checkRequestBytes(Buffer.byteLength(body) + Buffer.byteLength(url.toString()) + headers.reduce((sum, header) => sum + Buffer.byteLength(header.name) + Buffer.byteLength(header.value), 0))
@@ -318,5 +371,6 @@ export function resolveApiRequest(input: ResolveApiRequestInput): ResolveApiRequ
     ...(environment ? { environmentKind: environment.kind } : {}),
     secretRevisions,
     secretValues: [...secretValues].filter(Boolean),
+    ...(multipart ? { multipart } : {}),
   }
 }

@@ -2337,6 +2337,18 @@ export function registerIpcHandlers(): void {
     },
     assertWorkspaceWritable: (workspaceId) => workspaceOperationGuard.assertWorkspaceWritable(workspaceId),
     runWorkspaceWrite: (workspaceId, effect) => workspaceOperationGuard.runWorkspaceWrite(workspaceId, effect),
+    /**
+     * 待上传文件只允许经原生对话框选择：渲染层与模型都拿不到路径，
+     * 服务层只登记用户这次显式选中的那些文件。
+     */
+    pickFilePaths: async (event) => {
+      /** 对话框挂在发起请求的窗口上，避免无主窗口时阻塞。 */
+      const parent = BrowserWindow.fromWebContents(event.sender as WebContents) ?? undefined
+      const result = parent
+        ? await dialog.showOpenDialog(parent, { properties: ['openFile', 'multiSelections'], title: '选择要上传的文件' })
+        : await dialog.showOpenDialog({ properties: ['openFile', 'multiSelections'], title: '选择要上传的文件' })
+      return result.canceled ? [] : result.filePaths
+    },
   })
   setApiWorkbenchEventSink((event) => {
     for (const contents of listAuthorizedDesignWebContents()) contents.send(API_WORKBENCH_CHANNELS.CHANGED, event)

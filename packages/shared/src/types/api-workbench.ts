@@ -14,6 +14,8 @@ export const API_LIMITS = {
   maxExtractions: 16, extractionValueChars: 4096,
   /** 单个请求可声明的测试用例数量。 */
   maxCases: 16,
+  /** 单次请求可携带的文件数量（multipart）。 */
+  maxFileParts: 16,
 } as const
 /** 一条具名测试用例：同一接口的不同预期，可带用例级变量覆盖。 */
 export interface ApiTestCase {
@@ -86,7 +88,44 @@ export interface ApiHeader { name: string; value: string; source?: 'user' | 'gen
 /** 鉴权值为 token、password 或 API Key；无鉴权仍保留空 value 便于受控表单。 */
 export interface ApiAuth { type: 'none' | 'bearer' | 'basic' | 'api-key'; value: ApiValue; username?: string; name?: string; in?: 'header' | 'query' }
 /** 请求正文；urlencoded 使用 fields，json/text 使用 text。 */
-export interface ApiRequestBody { kind: 'none' | 'json' | 'text' | 'urlencoded'; text: string; fields: ApiField[] }
+export interface ApiRequestBody {
+  kind: 'none' | 'json' | 'text' | 'urlencoded' | 'multipart'
+  text: string
+  fields: ApiField[]
+  /**
+   * multipart 的文件部分。**只存引用，不存路径**：真实路径留在主进程内存里，服务重启即失效。
+   * 可选是为了兼容升级前保存的请求，解析时缺省补成空数组。
+   */
+  files?: ApiFilePart[]
+}
+/**
+ * 一个待上传的文件：引用由主进程签发，界面与模型都拿不到真实路径。
+ * 引用失效（重启/文件被移动）时必须在派发前拒绝，不能静默发出不带附件的请求。
+ */
+export interface ApiFilePart {
+  id: string
+  /** 表单字段名，例如 `file`。 */
+  name: string
+  /** 只用于展示与 Content-Disposition 的文件名。 */
+  fileName: string
+  sizeBytes: number
+  contentType?: string
+  ref: string
+}
+/** 运行记录与预览里的附件摘要：不含字节、不含路径。 */
+export interface ApiAttachmentSummary {
+  field: string
+  fileName: string
+  sizeBytes: number
+  sha256: string
+}
+/** 用户通过原生对话框选择文件后回传的元数据；**不含路径**（路径只在主进程内存）。 */
+export interface ApiPickedFile {
+  ref: string
+  fileName: string
+  sizeBytes: number
+  contentType: string
+}
 /**
  * 无脚本断言。JSON 路径使用简单点路径和数组下标；事件流断言只看有界事实：
  * sse-count/sse-first-event 复用 `<=10` 形式的比较，sse-ended 比较结束原因，
@@ -139,6 +178,13 @@ export interface ApiResolvedRequest {
   timeoutMs: number; followRedirects: boolean; maxRedirects: number
   /** 敏感查询参数和头名称由 Host 标记，重定向与公开投影共用。 */
   sensitiveHeaderNames: string[]; sensitiveQueryNames: string[]
+  /**
+   * 含二进制附件时的待发正文（base64）：只在主进程与 Utility 之间流转，
+   * **绝不进入预览、运行记录或模型上下文**；记录里只保留 body 的摘要与 attachments。
+   */
+  bodyBase64?: string
+  /** 附件摘要；运行记录与预览展示它而不是文件内容。 */
+  attachments?: ApiAttachmentSummary[]
 }
 /** 发送前公开的固定快照，request 已脱敏。 */
 export interface ApiPreparedPreview {
@@ -229,12 +275,14 @@ export interface ApiWorkbenchApi {
   getCookieJar(input: ApiTarget): Promise<{ cookies: ApiCookieJarEntry[] }>
   /** 清空当前 workspace 的 Cookie Jar。 */
   clearCookieJar(input: ApiTarget): Promise<{ cleared: number }>
+  /** 打开原生文件对话框选择待上传文件；返回元数据，渲染层永远拿不到路径。 */
+  pickApiFiles(input: ApiTarget): Promise<{ files: ApiPickedFile[] }>
   onChanged(callback: (event: ApiRunChanged) => void): () => void
   onStream(callback: (event: ApiRunStreamChanged) => void): () => void
 }
 /** 创建不包含自动网络行为的新草稿。 */
 export function createApiRequestDraft(collectionId = 'default'): ApiRequestDraft {
-  return { name: '新请求', collectionId, folder: '', description: '', method: 'GET', url: '', query: [], headers: [], body: { kind: 'none', text: '', fields: [] }, auth: { type: 'none', value: { value: '' } }, timeoutMs: 30_000, followRedirects: false, maxRedirects: 5, assertions: [], extractions: [], cases: [], useCookieJar: false }
+  return { name: '新请求', collectionId, folder: '', description: '', method: 'GET', url: '', query: [], headers: [], body: { kind: 'none', text: '', fields: [], files: [] }, auth: { type: 'none', value: { value: '' } }, timeoutMs: 30_000, followRedirects: false, maxRedirects: 5, assertions: [], extractions: [], cases: [], useCookieJar: false }
 }
 /** 稳定的合同错误，附带字段名但不回显字段值。 */
 function invalid(path: string): never { throw new Error('API_WORKBENCH_INVALID: ' + path) }
@@ -303,6 +351,18 @@ function assertion(value: unknown): ApiAssertion {
 }
 /** 草稿字段白名单，定义解析也复用此表。 */
 const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases', 'useCookieJar'] as const
+/** 解析一个待上传文件的引用；路径不在合同里，只有引用与展示元数据。 */
+function filePart(value: unknown): ApiFilePart {
+  const record = apiRecord(value, ['id', 'name', 'fileName', 'sizeBytes', 'contentType', 'ref'], 'body.file')
+  return {
+    id: parseApiId(record.id),
+    name: text(record.name, 'body.file.name', 256),
+    fileName: text(record.fileName, 'body.file.fileName', 256),
+    sizeBytes: apiInteger(record.sizeBytes, 0, API_LIMITS.bodyBytes, 'body.file.sizeBytes'),
+    ...(record.contentType === undefined ? {} : { contentType: text(record.contentType, 'body.file.contentType', 256) }),
+    ref: parseApiId(record.ref),
+  }
+}
 /** 解析单条测试用例；用例名可有界重复，身份必须唯一。 */
 function testCase(value: unknown): ApiTestCase {
   const record = apiRecord(value, ['id', 'name', 'assertions', 'overrides', 'environmentId', 'source'], 'case')
@@ -340,12 +400,18 @@ export function parseApiRequestDraft(value: unknown): ApiRequestDraft {
     if (header.name && !/^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/.test(header.name)) return invalid('header.name')
     if (/[\r\n]/.test(header.value)) return invalid('header.value')
   }
-  const body = apiRecord(record.body, ['kind', 'text', 'fields'], 'body')
+  const body = apiRecord(record.body, ['kind', 'text', 'fields', 'files'], 'body')
   return {
     name: text(record.name, 'request.name', 128), collectionId: parseApiId(record.collectionId), folder: text(record.folder, 'request.folder', 256), description: text(record.description, 'request.description', 4096),
     method: choice(record.method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'], 'request.method'), url,
     query: parseApiFields(record.query), headers,
-    body: { kind: choice(body.kind, ['none', 'json', 'text', 'urlencoded'], 'body.kind'), text: text(body.text, 'body.text', 131072), fields: parseApiFields(body.fields) },
+    body: {
+      kind: choice(body.kind, ['none', 'json', 'text', 'urlencoded', 'multipart'], 'body.kind'),
+      text: text(body.text, 'body.text', 131072),
+      fields: parseApiFields(body.fields),
+      /** 升级前保存的请求没有 files 字段，解析时补空数组而不是报错。 */
+      files: rows(body.files ?? [], filePart, API_LIMITS.maxFileParts, 'body.files'),
+    },
     auth: auth(record.auth), timeoutMs: apiInteger(record.timeoutMs, 100, 300000, 'timeoutMs'), followRedirects: flag(record.followRedirects, 'followRedirects'),
     maxRedirects: apiInteger(record.maxRedirects, 0, 10, 'maxRedirects'), assertions: rows(record.assertions, assertion, 64, 'assertions'),
     extractions: rows(record.extractions ?? [], extraction, API_LIMITS.maxExtractions, 'extractions'),

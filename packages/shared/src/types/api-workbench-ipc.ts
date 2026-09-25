@@ -1,10 +1,10 @@
 import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
-import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiConnectionInfo } from './api-workbench'
+import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo } from './api-workbench'
 
 /** IPC 命令的输入映射，拒绝用户自行声明 workspace。 */
-export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget }
+export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget }
 /** IPC 返回值映射，preload 必须验证实际响应。 */
-export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number } }
+export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number }; pickApiFiles: { files: ApiPickedFile[] } }
 /** 严格分派所支持的方法。 */
 export type ApiCommandMethod = keyof ApiCommandInputs
 /** 方法与输入保持关联，主进程 switch 可直接收窄。 */
@@ -29,7 +29,7 @@ function target(record: Record<string, unknown>): ApiTarget { return parseApiTar
 /** 解析单个 IPC 命令，复制所有字段避免调用方后续变更输入。 */
 export function parseApiCommand(value: unknown): ApiCommand {
   const root = apiRecord(value, ['method', 'input'], 'command')
-  const method = one(root.method, ['getCatalog', 'saveCatalog', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar'])
+  const method = one(root.method, ['getCatalog', 'saveCatalog', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar', 'pickApiFiles'])
   switch (method) {
     case 'getCatalog': return { method, input: parseApiTarget(root.input) }
     case 'saveCatalog': {
@@ -63,6 +63,7 @@ export function parseApiCommand(value: unknown): ApiCommand {
     /** 运行时变量命令只接收会话身份，workspace 由主进程解析。 */
     case 'getRuntimeVariables': case 'clearRuntimeVariables': return { method, input: parseApiTarget(root.input) }
     case 'getCookieJar': case 'clearCookieJar': return { method, input: parseApiTarget(root.input) }
+    case 'pickApiFiles': return { method, input: parseApiTarget(root.input) }
   }
 }
 /** 原始响应头值允许协议字符，但始终限定字符串长度。 */
@@ -70,11 +71,33 @@ function header(value: unknown): ApiHeader {
   const record = apiRecord(value, ['name', 'value', 'source'])
   return { name: str(record.name, 'header.name', 256), value: str(record.value, 'header.value', 65536), ...(record.source === undefined ? {} : { source: one(record.source, ['user', 'generated'] as const) }) }
 }
+/** base64 正文的字符上限：按 20 MiB 原始字节的最坏膨胀再加边界余量。 */
+const MAX_BODY_BASE64_CHARS = Math.ceil((API_LIMITS.bodyBytes * 4) / 3) + 4096
+/** 解析附件摘要；只允许字段名、文件名、大小与 sha256。 */
+function attachmentSummary(value: unknown) {
+  const record = apiRecord(value, ['field', 'fileName', 'sizeBytes', 'sha256'])
+  const sha256 = str(record.sha256, 'attachment.sha256', 64)
+  if (!/^[0-9a-f]{64}$/.test(sha256)) return bad('attachment.sha256')
+  return {
+    field: str(record.field, 'attachment.field', 256),
+    fileName: str(record.fileName, 'attachment.fileName', 256),
+    sizeBytes: apiInteger(record.sizeBytes, 0, API_LIMITS.bodyBytes, 'attachment.sizeBytes'),
+    sha256,
+  }
+}
 /** 准备结果的请求已经是解析后的公开投影，敏感部分应被 Host 遮罩。 */
 export function parseApiResolvedRequest(value: unknown): ApiResolvedRequest {
-  const record = apiRecord(value, ['method', 'url', 'headers', 'body', 'timeoutMs', 'followRedirects', 'maxRedirects', 'sensitiveHeaderNames', 'sensitiveQueryNames'])
+  const record = apiRecord(value, ['method', 'url', 'headers', 'body', 'timeoutMs', 'followRedirects', 'maxRedirects', 'sensitiveHeaderNames', 'sensitiveQueryNames', 'bodyBase64', 'attachments'])
   if (typeof record.body !== 'string' || new TextEncoder().encode(record.body).byteLength > API_LIMITS.requestBytes) return bad('request.bodyBytes')
-  return { method: one(record.method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']), url: str(record.url, 'url', 16384), headers: list(record.headers, header, 256), body: str(record.body, 'body', API_LIMITS.bodyBytes), timeoutMs: apiInteger(record.timeoutMs, 100, 300000, 'timeoutMs'), followRedirects: bool(record.followRedirects), maxRedirects: apiInteger(record.maxRedirects, 0, 10, 'maxRedirects'), sensitiveHeaderNames: list(record.sensitiveHeaderNames, (item) => str(item, 'sensitiveHeader', 256)), sensitiveQueryNames: list(record.sensitiveQueryNames, (item) => str(item, 'sensitiveQuery', 256)) }
+  /** 二进制正文只在主进程与 Utility 之间流转；这里同样按上限收紧。 */
+  const bodyBase64 = record.bodyBase64 === undefined ? undefined : str(record.bodyBase64, 'bodyBase64', MAX_BODY_BASE64_CHARS)
+  return {
+    method: one(record.method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']), url: str(record.url, 'url', 16384), headers: list(record.headers, header, 256), body: str(record.body, 'body', API_LIMITS.bodyBytes),
+    timeoutMs: apiInteger(record.timeoutMs, 100, 300000, 'timeoutMs'), followRedirects: bool(record.followRedirects), maxRedirects: apiInteger(record.maxRedirects, 0, 10, 'maxRedirects'),
+    sensitiveHeaderNames: list(record.sensitiveHeaderNames, (item) => str(item, 'sensitiveHeader', 256)), sensitiveQueryNames: list(record.sensitiveQueryNames, (item) => str(item, 'sensitiveQuery', 256)),
+    ...(bodyBase64 === undefined ? {} : { bodyBase64 }),
+    ...(record.attachments === undefined ? {} : { attachments: list(record.attachments, attachmentSummary, API_LIMITS.maxFileParts) }),
+  }
 }
 /** 解析准备回执，不能携带内部密钥和路径。 */
 export function parseApiPreparedPreview(value: unknown): ApiPreparedPreview {
@@ -215,6 +238,19 @@ export function parseApiResponse<M extends ApiCommandMethod>(method: M, value: u
     case 'clearCookieJar': {
       const record = apiRecord(value, ['cleared'])
       result = { cleared: apiInteger(record.cleared, 0, 128, 'cleared') }; break
+    }
+    case 'pickApiFiles': {
+      const record = apiRecord(value, ['files'])
+      /** 回执里只允许元数据；出现路径或字节一律判损坏协议。 */
+      result = { files: list(record.files, (item): ApiPickedFile => {
+        const entry = apiRecord(item, ['ref', 'fileName', 'sizeBytes', 'contentType'])
+        return {
+          ref: parseApiId(entry.ref),
+          fileName: str(entry.fileName, 'file.fileName', 256),
+          sizeBytes: apiInteger(entry.sizeBytes, 0, API_LIMITS.bodyBytes, 'file.sizeBytes'),
+          contentType: str(entry.contentType, 'file.contentType', 256),
+        }
+      }, API_LIMITS.maxFileParts) }; break
     }
     case 'listRuns': {
       const record = apiRecord(value, ['runs', 'nextCursor'])

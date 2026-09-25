@@ -26,6 +26,9 @@ import { evaluateApiAssertions } from './api-assertions'
 import { isCookieExpired, parseApiSetCookie, MAX_COOKIE_JAR_ENTRIES } from './api-cookies'
 import type { ApiCookieJarRecord } from './api-cookies'
 import { evaluateApiExtractions } from './api-extractions'
+import { ApiFileStore } from './api-file-store'
+import type { ApiPickedFileMeta } from './api-file-store'
+import { composeMultipartBody } from './api-multipart'
 import { redactApiBody, redactApiRequest } from './api-redaction'
 import { resolveApiRequest } from './api-request-resolver'
 import type { ApiWorkbenchStore } from './api-workbench-store'
@@ -41,6 +44,21 @@ const PREPARED_REASON_TTL_MS = 60 * 60 * 1000
 /** 运行时变量只活在本次会话：一小时过期，重启即失效，不落盘。 */
 const RUNTIME_VARIABLE_TTL_MS = 60 * 60 * 1000
 const MAX_RUNTIME_VARIABLES = 64
+
+/**
+ * 落盘/公开前剥掉二进制正文。
+ *
+ * `bodyBase64` 只在主进程与 Utility 之间流转；记录里保留 body 摘要与 attachments，
+ * 这样「发了什么」可核对，而文件字节不会被复制进应用数据根。
+ * @param request 实际派发用的请求。
+ * @returns 可写入运行记录的副本。
+ */
+function requestForRecord(request: ApiResolvedRequest): ApiResolvedRequest {
+  if (!request.bodyBase64) return request
+  const { bodyBase64: _ignored, ...rest } = request
+  void _ignored
+  return rest
+}
 
 /** 主进程内存里的运行时变量；值只在这里保存，绝不写入记录。 */
 interface StoredRuntimeVariable {
@@ -84,6 +102,8 @@ export type ApiWorkbenchTransport = (
 export interface ApiWorkbenchServiceOptions {
   store: ApiWorkbenchStore
   transport: ApiWorkbenchTransport
+  /** 待上传文件的引用仓库；默认用真实实现，测试可注入窄替身。 */
+  files?: ApiFileStore
   now?: () => number
   uuid?: () => string
   onChanged?: (event: ApiRunChanged) => void
@@ -191,6 +211,8 @@ function redactTransportResult(result: ApiTransportResult, request: ApiResolvedR
 export class ApiWorkbenchService {
   private readonly store: ApiWorkbenchStore
   private readonly transport: ApiWorkbenchTransport
+  /** 待上传文件的引用仓库：路径只在这里，只活在主进程内存。 */
+  private readonly files: ApiFileStore
   private readonly now: () => number
   private readonly uuid: () => string
   private readonly onChanged?: (event: ApiRunChanged) => void
@@ -211,6 +233,7 @@ export class ApiWorkbenchService {
   constructor(options: ApiWorkbenchServiceOptions) {
     this.store = options.store
     this.transport = options.transport
+    this.files = options.files ?? new ApiFileStore()
     this.now = options.now ?? Date.now
     this.uuid = options.uuid ?? randomUUID
     this.onChanged = options.onChanged
@@ -254,13 +277,30 @@ export class ApiWorkbenchService {
       ...((testCase?.overrides?.length || input.overrides?.length) ? { overrides: [...(testCase?.overrides ?? []), ...(input.overrides ?? [])] } : {}),
       runtimeVariables: this.runtimeVariableFields(context.workspaceId),
       ...(cookies.length > 0 ? { cookieJar: cookies, now: this.now() } : {}),
+      /** multipart 的文件引用只在这里解析；失效引用会在解析阶段直接拒绝。 */
+      resolveFile: (ref) => this.files.metadata(context.workspaceId, ref),
       resolveSecret: ({ ref, owner }) => this.store.resolveSecret(context.workspaceId, ref, owner),
     })
+    /** 含附件的请求要把文件字节读进来合成待发正文；公开投影只保留摘要。 */
+    let rawRequest = resolved.request
+    if (resolved.multipart) {
+      /** 字段名按引用对应，读取时一起产出可留存的附件摘要。 */
+      const fieldByRef = new Map(resolved.multipart.parts.flatMap((part) => part.kind === 'file' ? [[part.ref, part.name] as const] : []))
+      const attachments: NonNullable<ApiResolvedRequest['attachments']> = []
+      const composed = composeMultipartBody(resolved.multipart.boundary, resolved.multipart.parts, (ref) => {
+        const file = this.files.read(context.workspaceId, ref)
+        attachments.push({ field: fieldByRef.get(ref) ?? '', fileName: file.summary.fileName, sizeBytes: file.summary.sizeBytes, sha256: file.summary.sha256 })
+        return file.bytes
+      })
+      if (composed.byteLength > API_LIMITS.bodyBytes) throw new Error('API_WORKBENCH_MULTIPART_TOO_LARGE: 附件与字段合计超过单次请求正文上限')
+      rawRequest = { ...resolved.request, bodyBase64: composed.toString('base64'), attachments }
+    }
     const createdAt = this.now()
     const preparedId = parseApiId(this.uuid())
     const preview = parseApiPreparedPreview({
       preparedId,
-      request: redactApiRequest(resolved.request, resolved.secretValues),
+      /** 预览基于可派发的请求（含附件摘要）再脱敏；二进制正文由脱敏函数剥掉。 */
+      request: redactApiRequest(rawRequest, resolved.secretValues),
       requestName: request.name,
       catalogRevision: catalog.revision,
       ...(effectiveEnvironmentId ? { environmentId: effectiveEnvironmentId } : {}),
@@ -275,7 +315,7 @@ export class ApiWorkbenchService {
       context: { ...context },
       ...(requestId ? { requestId } : {}),
       preview,
-      rawRequest: resolved.request,
+      rawRequest,
       assertions: (testCase?.assertions ?? request.assertions).map((assertion) => ({ ...assertion })),
       ...(testCase ? { caseId: testCase.id } : {}),
       extractions: (request.extractions ?? []).map((rule) => ({ ...rule })),
@@ -336,7 +376,8 @@ export class ApiWorkbenchService {
       recording: 'memory-only',
       pinned: false,
     })
-    const created = this.store.createRun(queued, prepared.rawRequest, prepared.secretValues)
+    /** 落盘的是脱敏可留存的投影：二进制正文（bodyBase64）不进记录。 */
+    const created = this.store.createRun(queued, requestForRecord(prepared.rawRequest), prepared.secretValues)
     prepared.runId = runId
     prepared.artifacts = created.artifacts
     const pending = deferred<ApiRun>()
@@ -459,6 +500,26 @@ export class ApiWorkbenchService {
     this.runtimeVariables.clear()
     /** Cookie 同样只活在主进程内存：关闭服务即清空，重启不残留。 */
     this.cookieJar.clear()
+    /** 文件引用同理：关闭服务即失效，下次必须重新选择文件。 */
+    this.files.clear()
+  }
+
+  /**
+   * 登记用户通过原生对话框显式选择的一批文件。
+   *
+   * 这是本进程内唯一接受**路径**的入口，调用方只有原生对话框回调（B12b 的 Agent 审批在批准后复用同一入口）。
+   * @param workspaceId 归属工作区。
+   * @param paths 用户选择的路径；逐个校验，任一条不合法即整批失败。
+   * @returns 可放进请求定义的文件元数据（不含路径）。
+   */
+  registerPickedFiles(workspaceId: string, paths: readonly string[]): ApiPickedFileMeta[] {
+    const id = parseApiId(workspaceId)
+    return paths.map((path) => this.files.register(id, path))
+  }
+
+  /** 清空一个 workspace 的文件引用，返回被清掉的数量。 */
+  clearFiles(workspaceId: string): number {
+    return this.files.clear(parseApiId(workspaceId))
   }
 
   /** 从队列填充全局/来源槽位；不使用定时轮询。 */
@@ -496,7 +557,7 @@ export class ApiWorkbenchService {
       /** 只有开启自动 Cookie 的请求才写 jar：关闭的请求不产生任何 cookie 副作用。 */
       this.recordCookies(task, result)
       let recordingFailed = result.error?.code === 'API_ARTIFACT_UNAVAILABLE'
-      try { this.store.saveRawDetails(task.prepared.context.workspaceId, runId, task.prepared.rawRequest, result.hops) }
+      try { this.store.saveRawDetails(task.prepared.context.workspaceId, runId, requestForRecord(task.prepared.rawRequest), result.hops) }
       catch { recordingFailed = true }
       const publicResult = redactTransportResult(result, task.prepared.rawRequest, task.prepared.secretValues)
       const state = result.state
