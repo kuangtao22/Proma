@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import {
   API_LIMITS,
+  apiDraftFromDefinition,
   parseApiCatalog,
   parseApiId,
   parseApiPreparedPreview,
   parseApiRequestDraft,
   parseApiRun,
+  parseApiScenarioPreparedPreview,
+  parseApiScenarioRun,
 } from '@proma/shared'
 import type {
   ApiBodySlice,
@@ -13,11 +16,16 @@ import type {
   ApiExtractionOutcome,
   ApiField,
   ApiFilePart,
+  ApiMethod,
   ApiPreparedPreview,
   ApiResolvedRequest,
   ApiRun,
   ApiRunChanged,
   ApiRunStreamChanged,
+  ApiScenarioFailurePolicy,
+  ApiScenarioPreparedPreview,
+  ApiScenarioRun,
+  ApiScenarioStepOutcome,
   ApiSseEvent,
   ApiRuntimeVariable,
   ApiCookieJarEntry,
@@ -90,6 +98,14 @@ export interface ApiWorkbenchPrepareInput {
   overrides?: ApiField[]
   /** 指定测试用例：断言与变量覆盖都来自该用例。 */
   caseId?: string
+  /**
+   * **仅供场景展示阶段**：把「本流程稍后才会提取出来」的运行时变量先按字面值解析。
+   *
+   * 登录流程的第二步要带 `{{token}}`，而这个值要等第一步跑完才有；审批卡仍必须先把
+   * 每一步的方法与 URL 列清楚，所以展示阶段允许对这类变量先放占位值。
+   * 真正派发时**绝不带这个字段**（facade 与 IPC 都不会传），占位值不可能被发出去。
+   */
+  deferredRuntimeVariables?: Array<{ name: string; value: string }>
 }
 
 /** Agent 附件登记结果：请求定义用的引用 + 只给审批卡看的真实路径与大小。 */
@@ -159,6 +175,55 @@ interface ScheduledTask {
   sseDropped: number
   externalSignal?: AbortSignal
   externalAbort?: () => void
+}
+
+/**
+ * 已准备场景：每一步在准备阶段就冻结成独立的 prepared 记录，批准后按顺序派发。
+ *
+ * 这样「一次批准」不会退化成「按当前目录重新解析一遍再发」——批准时列的 URL 就是执行时发的 URL。
+ */
+interface PreparedScenarioRecord {
+  context: ApiWorkbenchContext
+  preview: ApiScenarioPreparedPreview
+  scenarioId: string
+  scenarioName: string
+  onFailure: ApiScenarioFailurePolicy
+  /**
+   * 执行用的步骤身份：保存**当时解析出来的定义事实**（方法 / URL / 环境）与执行参数。
+   *
+   * 执行时按这些参数逐步重新准备并发送，再把真正发出的方法与 URL 与这里核对；
+   * 不在准备阶段冻结每一步的请求，因为后面的步骤往往依赖前面步骤提取出来的变量。
+   */
+  steps: Array<{
+    stepId: string
+    name: string
+    requestId: string
+    caseId?: string
+    environmentId?: string
+    overrides?: ApiField[]
+    method: ApiMethod
+    url: string
+    environmentKind?: 'local' | 'test' | 'production'
+    assertionCount: number
+    onFailure: ApiScenarioFailurePolicy
+  }>
+  /** 已登记的场景运行身份；重复调用不再跑第二遍。 */
+  scenarioRunId?: string
+}
+
+/** 在途场景：只用于取消与重复调用去重。 */
+interface RunningScenario {
+  context: ApiWorkbenchContext
+  scenarioRunId: string
+  promise: Promise<ApiScenarioRun>
+}
+
+/** 已完成的场景身份：重复调用返回同一份终态，不会第二次出网。 */
+interface CompletedScenario {
+  context: ApiWorkbenchContext
+  scenarioRunId: string
+  completedAt: number
+  terminal: ApiScenarioRun
 }
 
 /** 已完成身份保留有界终态投影；磁盘失败时重复调用仍不会回到在途状态。 */
@@ -243,6 +308,11 @@ export class ApiWorkbenchService {
   private readonly prepared = new Map<string, PreparedRecord>()
   private readonly tasks = new Map<string, ScheduledTask>()
   private readonly completed = new Map<string, CompletedIdentity>()
+  /** 已准备场景 / 在途场景 / 已完成场景身份：与单次请求同一套「一份身份只跑一次」语义。 */
+  private readonly scenarios = new Map<string, PreparedScenarioRecord>()
+  private readonly scenarioTasks = new Map<string, RunningScenario>()
+  private readonly scenarioControllers = new Map<string, AbortController>()
+  private readonly completedScenarios = new Map<string, CompletedScenario>()
   private readonly queue: ScheduledTask[] = []
   private readonly activeByOrigin = new Map<string, number>()
   private activeCount = 0
@@ -293,7 +363,11 @@ export class ApiWorkbenchService {
       ...(effectiveEnvironmentId ? { environmentId: effectiveEnvironmentId } : {}),
       /** 用例覆盖低于显式单次覆盖、高于运行时变量与环境。 */
       ...((testCase?.overrides?.length || input.overrides?.length) ? { overrides: [...(testCase?.overrides ?? []), ...(input.overrides ?? [])] } : {}),
-      runtimeVariables: this.runtimeVariableFields(context.workspaceId),
+      /** 展示阶段允许对「稍后才提取出来」的变量放占位值；派发阶段永远没有这一项。 */
+      runtimeVariables: [
+        ...this.runtimeVariableFields(context.workspaceId),
+        ...(input.deferredRuntimeVariables ?? []).map((item) => ({ id: `deferred_${item.name}`, name: item.name, value: item.value, enabled: true })),
+      ],
       ...(cookies.length > 0 ? { cookieJar: cookies, now: this.now() } : {}),
       /** multipart 的文件引用只在这里解析；失效引用会在解析阶段直接拒绝。 */
       resolveFile: (ref) => this.files.metadata(context.workspaceId, ref),
@@ -516,6 +590,11 @@ export class ApiWorkbenchService {
     const contexts = [...this.tasks.entries()].map(([preparedId, task]) => ({ preparedId, context: task.prepared.context }))
     await Promise.all(contexts.map(({ preparedId, context }) => this.cancel(context, preparedId).catch(() => undefined)))
     await Promise.all([...this.tasks.values()].map((task) => task.promise.catch(() => undefined)))
+    /** 在途流程先取消再等待：已完成的步骤保留证据，剩余步骤按跳过收尾。 */
+    for (const controller of this.scenarioControllers.values()) controller.abort()
+    await Promise.all([...this.scenarioTasks.values()].map((task) => task.promise.catch(() => undefined)))
+    this.scenarios.clear()
+    this.completedScenarios.clear()
     this.store.shutdown()
     this.prepared.clear()
     this.completed.clear()
@@ -580,6 +659,325 @@ export class ApiWorkbenchService {
   /** 释放一批刚登记但没能进入请求定义的引用（准备失败时回滚）。 */
   releaseFiles(workspaceId: string, refs: readonly string[]): number {
     return this.files.release(parseApiId(workspaceId), refs)
+  }
+
+  /**
+   * 准备一次场景（流程）运行：逐步校验引用，并把每一步冻结成独立快照。
+   *
+   * 准备阶段不出网、不读附件字节；批准的是一份「步骤清单」，执行时逐步核对真正发出去的请求。
+   * @param context 可信身份。
+   * @param input 场景身份、默认环境与本次变量覆盖。
+   * @returns 审批卡与界面共用的步骤清单。
+   */
+  async prepareScenario(
+    context: ApiWorkbenchContext,
+    input: { scenarioId: string; environmentId?: string; overrides?: ApiField[] },
+  ): Promise<ApiScenarioPreparedPreview> {
+    this.assertContext(context)
+    if (this.shuttingDown) throw new Error('API_WORKBENCH_SHUTTING_DOWN')
+    this.pruneCaches()
+    const catalog = this.store.getCatalog(context.workspaceId)
+    const scenarioId = parseApiId(input.scenarioId)
+    const scenario = (catalog.scenarios ?? []).find((item) => item.id === scenarioId)
+    if (!scenario) throw new Error('API_WORKBENCH_SCENARIO_NOT_FOUND')
+    if (scenario.steps.length === 0) throw new Error('API_WORKBENCH_SCENARIO_EMPTY: 场景至少需要一个步骤')
+    const requestedEnvironmentId = input.environmentId === undefined ? undefined : parseApiId(input.environmentId)
+    /**
+     * 本流程稍后才会提取出来的变量名：展示阶段先按 `{{名字}}` 放占位值，避免「登录还没跑」
+     * 就把审批卡卡住；真正派发时按当时的运行时变量重新解析。
+     */
+    const existingRuntimeNames = new Set(this.runtimeVariableFields(context.workspaceId).map((field) => field.name))
+    const deferredRuntimeVariables = [...new Set(catalog.requests.flatMap((request) => (request.extractions ?? []).map((rule) => rule.name)))]
+      .filter((name) => !existingRuntimeNames.has(name))
+      .map((name) => ({ name, value: `{{${name}}}` }))
+    const steps: PreparedScenarioRecord['steps'] = []
+    for (const [index, step] of scenario.steps.entries()) {
+      const definition = catalog.requests.find((item) => item.id === step.requestId)
+      if (!definition) throw new Error(`API_WORKBENCH_SCENARIO_REQUEST_NOT_FOUND: 第 ${index + 1} 步引用的接口已不存在`)
+      if (step.caseId && !(definition.cases ?? []).some((item) => item.id === step.caseId)) {
+        throw new Error(`API_WORKBENCH_SCENARIO_CASE_NOT_FOUND: 第 ${index + 1} 步引用的用例已不存在`)
+      }
+      /**
+       * 环境优先级：步骤 > 本次入参 > 场景 > 请求自身标记（仅当该环境仍然存在）。
+       * 最后一级让「只标了目标环境的请求」放进流程后也能跑对目标。
+       */
+      const stepEnvironmentId = step.environmentId ?? requestedEnvironmentId ?? scenario.environmentId
+        ?? (definition.targetEnvironmentId && catalog.environments.some((item) => item.id === definition.targetEnvironmentId) ? definition.targetEnvironmentId : undefined)
+      /** 展示校验：解析一遍拿到最终方法/URL/环境，并提前撞出引用失效、模板未解析等错误。 */
+      const preview = await this.prepare(context, {
+        request: apiDraftFromDefinition(definition),
+        requestId: definition.id,
+        ...(stepEnvironmentId ? { environmentId: stepEnvironmentId } : {}),
+        ...((step.overrides?.length ?? 0) + (input.overrides?.length ?? 0) > 0 ? { overrides: [...(step.overrides ?? []), ...(input.overrides ?? [])] } : {}),
+        ...(step.caseId ? { caseId: step.caseId } : {}),
+        ...(deferredRuntimeVariables.length > 0 ? { deferredRuntimeVariables } : {}),
+      })
+      /** 该步实际跑的断言集合：用例优先，其次请求自身的默认断言。 */
+      const assertions = (step.caseId ? (definition.cases ?? []).find((item) => item.id === step.caseId)?.assertions : undefined) ?? definition.assertions
+      steps.push({
+        stepId: step.id,
+        name: step.name || definition.name,
+        requestId: definition.id,
+        ...(step.caseId ? { caseId: step.caseId } : {}),
+        ...(stepEnvironmentId ? { environmentId: stepEnvironmentId } : {}),
+        ...((step.overrides?.length ?? 0) > 0 ? { overrides: step.overrides } : {}),
+        method: preview.request.method,
+        url: preview.request.url,
+        ...(preview.environmentKind ? { environmentKind: preview.environmentKind } : {}),
+        assertionCount: assertions.length,
+        onFailure: step.onFailure ?? scenario.onFailure,
+      })
+    }
+    const productionSteps = steps.filter((step) => step.environmentKind === 'production').length
+    const preparedId = parseApiId(this.uuid())
+    const createdAt = this.now()
+    const environmentId = requestedEnvironmentId ?? scenario.environmentId
+    const preview = parseApiScenarioPreparedPreview({
+      preparedId,
+      scenarioId: scenario.id,
+      scenarioName: scenario.name,
+      catalogRevision: catalog.revision,
+      ...(environmentId ? { environmentId } : {}),
+      onFailure: scenario.onFailure,
+      createdAt,
+      expiresAt: createdAt + PREPARED_TTL_MS,
+      warnings: [
+        ...(productionSteps > 0 ? [`流程中有 ${productionSteps} 个步骤指向 production 环境，运行前必须逐次复核`] : []),
+        ...(scenario.onFailure === 'continue' ? ['失败策略为 continue：某一步失败后仍会继续执行后续步骤'] : []),
+      ],
+      steps: steps.map((step, index) => ({
+        index,
+        stepId: step.stepId,
+        name: step.name,
+        requestId: step.requestId,
+        ...(step.caseId ? { caseId: step.caseId } : {}),
+        method: step.method,
+        url: step.url,
+        ...(step.environmentKind ? { environmentKind: step.environmentKind } : {}),
+        assertionCount: step.assertionCount,
+      })),
+    })
+    this.scenarios.set(preparedId, { context: { ...context }, preview, scenarioId: scenario.id, scenarioName: scenario.name, onFailure: scenario.onFailure, steps })
+    this.pruneCaches()
+    return parseApiScenarioPreparedPreview(preview)
+  }
+
+  /** 审批展示与运行前复核共用同一份场景快照投影。 */
+  async getScenarioPrepared(context: ApiWorkbenchContext, preparedId: string): Promise<ApiScenarioPreparedPreview> {
+    return parseApiScenarioPreparedPreview(this.requireScenarioPrepared(context, preparedId).preview)
+  }
+
+  /**
+   * 执行一次已批准的场景：串行跑完步骤，逐步留下证据。
+   *
+   * 每一步仍走既有 `send`（去重、调度、取消、落盘都不另起一套）；本层只负责顺序、
+   * 失败策略、总时限，以及「发出去的必须就是批准时冻结的那一条」的核对。
+   * @param context 可信身份。
+   * @param preparedId 场景准备身份。
+   * @param signal 外部取消信号（Agent 停止 / 界面取消）。
+   * @returns 场景运行摘要。
+   */
+  async runScenario(context: ApiWorkbenchContext, preparedId: string, signal?: AbortSignal): Promise<ApiScenarioRun> {
+    this.assertContext(context)
+    const id = parseApiId(preparedId)
+    this.pruneCaches()
+    const completed = this.completedScenarios.get(id)
+    if (completed) {
+      this.assertSameContext(completed.context, context)
+      try { return this.store.getScenarioRun(context.workspaceId, completed.scenarioRunId) } catch { return parseApiScenarioRun(completed.terminal) }
+    }
+    const active = this.scenarioTasks.get(id)
+    if (active) {
+      this.assertSameContext(active.context, context)
+      return active.promise
+    }
+    const prepared = this.requireScenarioPrepared(context, id)
+    if (prepared.scenarioRunId) return this.store.getScenarioRun(context.workspaceId, prepared.scenarioRunId)
+    const startedAt = this.now()
+    const running = this.store.createScenarioRun({
+      id: parseApiId(this.uuid()),
+      workspaceId: context.workspaceId,
+      sessionId: context.sessionId,
+      source: context.source,
+      scenarioId: prepared.scenarioId,
+      scenarioName: prepared.scenarioName,
+      catalogRevision: prepared.preview.catalogRevision,
+      ...(prepared.preview.environmentId ? { environmentId: prepared.preview.environmentId } : {}),
+      state: 'running',
+      startedAt,
+      steps: [],
+      assertions: [],
+    })
+    prepared.scenarioRunId = running.id
+    /** 取消只作用于当前在途步骤：每一步自身仍是既有的一次派发。 */
+    const controller = new AbortController()
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+    const pending = deferred<ApiScenarioRun>()
+    this.scenarioControllers.set(id, controller)
+    this.scenarioTasks.set(id, { context: { ...context }, scenarioRunId: running.id, promise: pending.promise })
+    void this.executeScenario(context, prepared, running, combined, pending.resolve, startedAt)
+    return pending.promise
+  }
+
+  /** 取消场景：只中止当前在途步骤，已完成的步骤保留证据。 */
+  async cancelScenario(context: ApiWorkbenchContext, preparedId: string): Promise<void> {
+    this.assertContext(context)
+    const id = parseApiId(preparedId)
+    const completed = this.completedScenarios.get(id)
+    if (completed) { this.assertSameContext(completed.context, context); return }
+    const prepared = this.scenarios.get(id)
+    if (!prepared || prepared.context.workspaceId !== context.workspaceId || prepared.context.sessionId !== context.sessionId || prepared.context.source !== context.source) {
+      throw new Error('API_WORKBENCH_SCENARIO_PREPARED_NOT_FOUND')
+    }
+    this.scenarioControllers.get(id)?.abort()
+  }
+
+  /** 场景运行列表：界面看整个 workspace，Agent 只看自己会话。 */
+  async listScenarioRuns(context: ApiWorkbenchContext, options: { cursor?: number; limit?: number } = {}): Promise<{ runs: ApiScenarioRun[]; nextCursor: number | null }> {
+    this.assertContext(context)
+    const cursor = Math.max(0, Math.trunc(options.cursor ?? 0))
+    const limit = Math.min(50, Math.max(1, Math.trunc(options.limit ?? 20)))
+    return this.store.listScenarioRuns(context.workspaceId, cursor, limit, context.source === 'agent' ? context.sessionId : undefined)
+  }
+
+  /** 读取一条场景运行；Agent 不能读别的会话的流程。 */
+  async getScenarioRun(context: ApiWorkbenchContext, scenarioRunId: string): Promise<ApiScenarioRun> {
+    this.assertContext(context)
+    const run = this.store.getScenarioRun(context.workspaceId, parseApiId(scenarioRunId))
+    if (context.source === 'agent' && run.sessionId !== context.sessionId) throw new Error('API_WORKBENCH_SCENARIO_RUN_FORBIDDEN')
+    return run
+  }
+
+  /** 场景执行主体：顺序、失败策略、总时限、逐步核对与逐步落盘。 */
+  private async executeScenario(
+    context: ApiWorkbenchContext,
+    prepared: PreparedScenarioRecord,
+    running: ApiScenarioRun,
+    signal: AbortSignal,
+    resolve: (run: ApiScenarioRun) => void,
+    startedAt: number,
+  ): Promise<void> {
+    const preparedId = prepared.preview.preparedId
+    const outcomes: ApiScenarioStepOutcome[] = []
+    let stopped = false
+    let stoppedMessage = ''
+    let failure: ApiScenarioRun['error']
+    try {
+      for (const step of prepared.steps) {
+        if (signal.aborted) {
+          outcomes.push({ stepId: step.stepId, name: step.name, state: 'skipped', status: null, assertionPassed: 0, assertionTotal: 0, durationMs: null, message: '流程已取消' })
+          continue
+        }
+        if (stopped) {
+          outcomes.push({ stepId: step.stepId, name: step.name, state: 'skipped', status: null, assertionPassed: 0, assertionTotal: 0, durationMs: null, message: stoppedMessage })
+          continue
+        }
+        /** 总时限：到点不再启动后续步骤，避免一条流程无限挂住。 */
+        if (this.now() - startedAt > API_LIMITS.scenarioTotalMs) {
+          stopped = true
+          stoppedMessage = '流程总时限已到，未执行的步骤被跳过'
+          failure = { code: 'API_WORKBENCH_SCENARIO_TIMEOUT', phase: 'scenario', message: stoppedMessage }
+          outcomes.push({ stepId: step.stepId, name: step.name, state: 'skipped', status: null, assertionPassed: 0, assertionTotal: 0, durationMs: null, message: stoppedMessage })
+          continue
+        }
+        try {
+          /**
+           * 按**当时**的运行时变量准备这一步：登录流程的后续步骤要用上一步提取出来的值，
+           * 所以不能拿准备阶段（那时还没有 token）的解析结果去发请求。
+           */
+          const definition = this.store.getCatalog(context.workspaceId).requests.find((item) => item.id === step.requestId)
+          if (!definition) throw new Error(`API_WORKBENCH_SCENARIO_REQUEST_NOT_FOUND: 步骤「${step.name}」引用的接口已不存在`)
+          const preview = await this.prepare(context, {
+            request: apiDraftFromDefinition(definition),
+            requestId: definition.id,
+            ...(step.environmentId ? { environmentId: step.environmentId } : {}),
+            ...(step.overrides?.length ? { overrides: step.overrides } : {}),
+            ...(step.caseId ? { caseId: step.caseId } : {}),
+          })
+          const run = await this.send(context, preview.preparedId, signal)
+          /** 逐步核对：真正发出去的必须就是批准时冻结的那一条。 */
+          if (run.request.method !== step.method || run.request.url !== step.url) {
+            throw new Error(`API_WORKBENCH_SCENARIO_APPROVAL_STALE: 步骤「${step.name}」与批准快照不一致`)
+          }
+          const failedAssertion = run.assertions.find((item) => !item.passed)
+          const passed = run.state === 'completed' && run.assertions.every((item) => item.passed)
+          outcomes.push({
+            stepId: step.stepId, name: step.name, state: passed ? 'passed' : 'failed', runId: run.id,
+            status: run.hops.at(-1)?.status ?? null,
+            assertionPassed: run.assertions.filter((item) => item.passed).length, assertionTotal: run.assertions.length,
+            durationMs: run.finishedAt === undefined ? null : Math.max(0, run.finishedAt - run.createdAt),
+            ...(passed ? {} : { message: run.error?.message ?? failedAssertion?.message ?? (run.state === 'cancelled' ? '步骤已取消' : '步骤未通过') }),
+          })
+          /** 取消或失败都不悄悄继续：剩下的步骤按跳过记录，绝不替人补发请求。 */
+          if (run.state === 'cancelled') { stopped = true; stoppedMessage = '上一步已取消，后续步骤不再执行' }
+          else if (!passed && step.onFailure === 'stop') { stopped = true; stoppedMessage = '上一步失败后按 stop 策略跳过后续步骤' }
+        } catch (error) {
+          outcomes.push({
+            stepId: step.stepId, name: step.name, state: 'error', status: null, assertionPassed: 0, assertionTotal: 0, durationMs: null,
+            message: error instanceof Error ? error.message.slice(0, 4096) : '步骤执行失败',
+          })
+          if (step.onFailure === 'stop') { stopped = true; stoppedMessage = '上一步失败后按 stop 策略跳过后续步骤' }
+        }
+        /** 逐步落盘：界面与人都能看到流程当前进度，而不是只在最后拿到结论。 */
+        this.store.updateScenarioRun(context.workspaceId, running.id, ['running'], (current) => ({ ...current, steps: [...outcomes] }))
+      }
+      const cancelled = signal.aborted
+      const failedStep = outcomes.find((step) => step.state === 'failed' || step.state === 'error')
+      /** 超时或失败都会把流程判为失败：跳过不等于通过。 */
+      const finalState: ApiScenarioRun['state'] = cancelled ? 'cancelled' : failedStep || failure ? 'failed' : 'completed'
+      const final = this.store.updateScenarioRun(context.workspaceId, running.id, ['running'], (current) => ({
+        ...current,
+        state: finalState,
+        finishedAt: this.now(),
+        steps: outcomes,
+        /** 流程结论由每步结论聚合：步骤全通过才算流程通过。 */
+        assertions: outcomes.map((step) => ({
+          id: step.stepId,
+          passed: step.state === 'passed',
+          expected: '步骤通过',
+          actual: step.state,
+          message: step.message ?? '步骤通过',
+        })),
+        ...(cancelled
+          ? { error: { code: 'API_WORKBENCH_CANCELLED', phase: 'scenario', message: '流程已取消' } }
+          : failure ? { error: failure }
+            : failedStep ? { error: { code: 'API_WORKBENCH_SCENARIO_FAILED', phase: 'scenario', message: `步骤「${failedStep.name}」未通过` } } : {}),
+      }))
+      this.completedScenarios.set(preparedId, { context: { ...context }, scenarioRunId: final.id, completedAt: this.now(), terminal: final })
+      this.scenarios.delete(preparedId)
+      resolve(parseApiScenarioRun(final))
+    } catch (error) {
+      /** 执行体自身失败（例如落盘损坏）也要给出终态，不能留下永远 running 的流程。 */
+      const failed = this.store.updateScenarioRun(context.workspaceId, running.id, ['running'], (current) => ({
+        ...current,
+        state: 'failed',
+        finishedAt: this.now(),
+        steps: outcomes,
+        error: { code: 'API_WORKBENCH_SCENARIO_FAILED', phase: 'scenario', message: error instanceof Error ? error.message.slice(0, 4096) : '流程执行失败' },
+      }))
+      this.completedScenarios.set(preparedId, { context: { ...context }, scenarioRunId: failed.id, completedAt: this.now(), terminal: failed })
+      this.scenarios.delete(preparedId)
+      resolve(parseApiScenarioRun(failed))
+    } finally {
+      this.scenarioControllers.delete(preparedId)
+      this.scenarioTasks.delete(preparedId)
+    }
+  }
+
+  /** 场景准备记录的共用校验：身份、有效期与目录 revision 三者都要对得上。 */
+  private requireScenarioPrepared(context: ApiWorkbenchContext, preparedId: string): PreparedScenarioRecord {
+    this.assertContext(context)
+    const record = this.scenarios.get(parseApiId(preparedId))
+    if (!record
+      || record.context.workspaceId !== context.workspaceId
+      || record.context.sessionId !== context.sessionId
+      || record.context.source !== context.source) {
+      throw new Error('API_WORKBENCH_SCENARIO_PREPARED_NOT_FOUND')
+    }
+    if (this.now() > record.preview.expiresAt) throw new Error('API_WORKBENCH_SCENARIO_PREPARED_EXPIRED')
+    /** 目录被改动（含请求被编辑/删除）就拒绝：批准的是当时那一份流程。 */
+    if (this.store.getCatalog(context.workspaceId).revision !== record.preview.catalogRevision) throw new Error('API_WORKBENCH_SCENARIO_PREPARED_STALE')
+    return record
   }
 
   /**
@@ -972,6 +1370,25 @@ export class ApiWorkbenchService {
       const oldest = [...this.completed.entries()].sort((a, b) => a[1].completedAt - b[1].completedAt)[0]
       if (!oldest) break
       this.completed.delete(oldest[0])
+    }
+    /** 场景准备记录沿用单次请求的过期与条数上限；在途流程不清理。 */
+    for (const [id, record] of this.scenarios) {
+      if (record.preview.expiresAt + PREPARED_REASON_TTL_MS < now && !this.scenarioTasks.has(id)) this.scenarios.delete(id)
+    }
+    while (this.scenarios.size > MAX_PREPARED_RECORDS) {
+      const removable = [...this.scenarios.entries()]
+        .filter(([id]) => !this.scenarioTasks.has(id))
+        .sort((a, b) => a[1].preview.createdAt - b[1].preview.createdAt)[0]
+      if (!removable) break
+      this.scenarios.delete(removable[0])
+    }
+    for (const [id, record] of this.completedScenarios) {
+      if (record.completedAt + COMPLETED_IDENTITY_TTL_MS < now) this.completedScenarios.delete(id)
+    }
+    while (this.completedScenarios.size > MAX_COMPLETED_IDENTITIES) {
+      const oldest = [...this.completedScenarios.entries()].sort((a, b) => a[1].completedAt - b[1].completedAt)[0]
+      if (!oldest) break
+      this.completedScenarios.delete(oldest[0])
     }
   }
 

@@ -1,5 +1,5 @@
 import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
-import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo } from './api-workbench'
+import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview } from './api-workbench'
 
 /** IPC 命令的输入映射，拒绝用户自行声明 workspace。 */
 export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget }
@@ -143,6 +143,77 @@ export function parseApiRun(value: unknown): ApiRun {
     ...(record.sse === undefined ? {} : { sse: sseStream(record.sse) }),
     ...(record.extracted === undefined ? {} : { extracted: list(record.extracted, extractionOutcome, API_LIMITS.maxExtractions) }),
     ...(record.caseId === undefined ? {} : { caseId: parseApiId(record.caseId) }),
+  }
+}
+/** 解析场景步骤投影；index 必须连续，界面据此逐行展示执行顺序。 */
+export function parseApiScenarioPreparedPreview(value: unknown): ApiScenarioPreparedPreview {
+  const record = apiRecord(value, ['preparedId', 'scenarioId', 'scenarioName', 'catalogRevision', 'environmentId', 'onFailure', 'createdAt', 'expiresAt', 'warnings', 'steps'])
+  const steps = list(record.steps, (item): ApiScenarioStepPreview => {
+    const entry = apiRecord(item, ['index', 'stepId', 'name', 'requestId', 'caseId', 'method', 'url', 'environmentKind', 'assertionCount'])
+    return {
+      index: apiInteger(entry.index, 0, API_LIMITS.maxScenarioSteps - 1, 'step.index'),
+      stepId: parseApiId(entry.stepId),
+      name: str(entry.name, 'step.name', 128),
+      requestId: parseApiId(entry.requestId),
+      ...(entry.caseId === undefined ? {} : { caseId: parseApiId(entry.caseId) }),
+      method: one(entry.method, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const),
+      url: str(entry.url, 'step.url', 16384),
+      ...(entry.environmentKind === undefined ? {} : { environmentKind: one(entry.environmentKind, ['local', 'test', 'production'] as const) }),
+      assertionCount: apiInteger(entry.assertionCount, 0, 64, 'step.assertionCount'),
+    }
+  }, API_LIMITS.maxScenarioSteps)
+  if (steps.some((step, index) => step.index !== index)) return bad('scenario.steps.index')
+  return {
+    preparedId: parseApiId(record.preparedId),
+    scenarioId: parseApiId(record.scenarioId),
+    scenarioName: str(record.scenarioName, 'scenarioName', 128),
+    catalogRevision: apiInteger(record.catalogRevision, 0, Number.MAX_SAFE_INTEGER, 'catalogRevision'),
+    ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
+    onFailure: one(record.onFailure, ['stop', 'continue'] as const),
+    createdAt: apiInteger(record.createdAt, 0, Number.MAX_SAFE_INTEGER, 'createdAt'),
+    expiresAt: apiInteger(record.expiresAt, 0, Number.MAX_SAFE_INTEGER, 'expiresAt'),
+    warnings: list(record.warnings, (item) => str(item, 'warning', 2048), 32),
+    steps,
+  }
+}
+/** 场景单步结论：只保留状态与计数，正文留在该步自己的运行记录里。 */
+function scenarioStepOutcome(value: unknown): ApiScenarioStepOutcome {
+  const record = apiRecord(value, ['stepId', 'name', 'state', 'runId', 'status', 'assertionPassed', 'assertionTotal', 'durationMs', 'message'])
+  return {
+    stepId: parseApiId(record.stepId),
+    name: str(record.name, 'step.name', 128),
+    state: one(record.state, ['passed', 'failed', 'skipped', 'error'] as const),
+    ...(record.runId === undefined ? {} : { runId: parseApiId(record.runId) }),
+    status: record.status === null ? null : apiInteger(record.status, 100, 599, 'step.status'),
+    assertionPassed: apiInteger(record.assertionPassed, 0, 64, 'step.assertionPassed'),
+    assertionTotal: apiInteger(record.assertionTotal, 0, 64, 'step.assertionTotal'),
+    durationMs: nullableDuration(record.durationMs),
+    ...(record.message === undefined ? {} : { message: str(record.message, 'step.message', 4096) }),
+  }
+}
+/** 解析场景运行摘要；步骤 stepId 必须唯一，避免结果与步骤对不上。 */
+export function parseApiScenarioRun(value: unknown): ApiScenarioRun {
+  const record = apiRecord(value, ['id', 'workspaceId', 'sessionId', 'source', 'scenarioId', 'scenarioName', 'catalogRevision', 'environmentId', 'state', 'startedAt', 'finishedAt', 'steps', 'assertions', 'error'])
+  const steps = list(record.steps, scenarioStepOutcome, API_LIMITS.maxScenarioSteps)
+  if (new Set(steps.map((step) => step.stepId)).size !== steps.length) return bad('scenarioRun.steps.duplicateId')
+  return {
+    id: parseApiId(record.id),
+    workspaceId: parseApiId(record.workspaceId),
+    sessionId: parseApiId(record.sessionId),
+    source: one(record.source, ['manual', 'agent'] as const),
+    ...(record.scenarioId === undefined ? {} : { scenarioId: parseApiId(record.scenarioId) }),
+    scenarioName: str(record.scenarioName, 'scenarioName', 128),
+    catalogRevision: apiInteger(record.catalogRevision, 0, Number.MAX_SAFE_INTEGER, 'catalogRevision'),
+    ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
+    state: one(record.state, ['running', 'completed', 'failed', 'cancelled'] as const),
+    startedAt: apiInteger(record.startedAt, 0, Number.MAX_SAFE_INTEGER, 'startedAt'),
+    ...(record.finishedAt === undefined ? {} : { finishedAt: apiInteger(record.finishedAt, 0, Number.MAX_SAFE_INTEGER, 'finishedAt') }),
+    steps,
+    assertions: list(record.assertions, (item) => {
+      const entry = apiRecord(item, ['id', 'passed', 'expected', 'actual', 'message'])
+      return { id: parseApiId(entry.id), passed: bool(entry.passed), expected: str(entry.expected, 'expected', 4096), actual: str(entry.actual, 'actual', 4096), message: str(entry.message, 'message', 4096) }
+    }, API_LIMITS.maxScenarioSteps),
+    ...(record.error === undefined ? {} : { error: failure(record.error) }),
   }
 }
 /** 解析运行时变量元数据；出现 value 等取值字段一律拒绝。 */

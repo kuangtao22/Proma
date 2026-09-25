@@ -16,6 +16,10 @@ export const API_LIMITS = {
   maxCases: 16,
   /** 单次请求可携带的文件数量（multipart）。 */
   maxFileParts: 16,
+  /** 单个 workspace 可保存的场景数量、单个场景的步骤数量，以及保留的场景运行条数。 */
+  maxScenarios: 64, maxScenarioSteps: 20, maxScenarioRuns: 200,
+  /** 一次场景运行的总时限：到点不再启动后续步骤，避免流程无限挂住。 */
+  scenarioTotalMs: 10 * 60 * 1000,
 } as const
 /** 一条具名测试用例：同一接口的不同预期，可带用例级变量覆盖。 */
 export interface ApiTestCase {
@@ -170,8 +174,104 @@ export interface ApiRequestDefinition extends ApiRequestDraft { id: string; revi
 export interface ApiCollection { id: string; name: string; description: string; variables: ApiField[] }
 /** 环境用途是展示和执行策略事实，不根据方法推断生产副作用。 */
 export interface ApiEnvironment { id: string; name: string; kind: 'local' | 'test' | 'production'; variables: ApiField[] }
+/**
+ * 场景里的一个步骤：只引用已保存的请求（含可选用例），不内联请求定义。
+ *
+ * 理由：内联会让同一条请求出现两份定义，跑出来的证据无法对人维护的那一份；
+ * 步骤级覆盖只在本次运行生效，不写回请求定义。
+ */
+export interface ApiScenarioStep {
+  id: string
+  /** 展示名；缺省用请求名。 */
+  name: string
+  requestId: string
+  /** 按用例执行该步骤；缺省用请求自身的默认断言。 */
+  caseId?: string
+  /** 步骤级环境覆盖；缺省用场景环境，再缺省用请求自身标记。 */
+  environmentId?: string
+  /** 步骤级变量覆盖，优先级高于运行时变量与环境，不写入任何定义。 */
+  overrides?: ApiField[]
+  /** 该步失败后的走向；缺省沿用场景级策略。 */
+  onFailure?: ApiScenarioFailurePolicy
+}
+/** 步骤失败后的走向：停止（后续标记跳过）或继续跑完。 */
+export type ApiScenarioFailurePolicy = 'stop' | 'continue'
+/** 一条可重复执行的接口流程：有序步骤 + 默认环境 + 默认失败策略。 */
+export interface ApiScenario {
+  id: string
+  name: string
+  description: string
+  /** 归入某个集合（集合即端 / 产品线，文件夹即模块）。 */
+  collectionId: string
+  folder: string
+  steps: ApiScenarioStep[]
+  /** 场景默认环境；步骤可覆盖。 */
+  environmentId?: string
+  onFailure: ApiScenarioFailurePolicy
+  revision: number
+  updatedAt: number
+}
+/** 场景里单步的执行结论；runId 指向该步真实的运行记录。 */
+export interface ApiScenarioStepOutcome {
+  stepId: string
+  name: string
+  state: 'passed' | 'failed' | 'skipped' | 'error'
+  /** 该步真实运行身份；被跳过或准备失败时缺省。 */
+  runId?: string
+  status: number | null
+  assertionPassed: number
+  assertionTotal: number
+  durationMs: number | null
+  message?: string
+}
+/** 一次场景运行：紧凑摘要，不携带任何正文与秘密；每步证据在各自 ApiRun 里。 */
+export interface ApiScenarioRun {
+  id: string
+  workspaceId: string
+  sessionId: string
+  source: 'manual' | 'agent'
+  scenarioId?: string
+  scenarioName: string
+  catalogRevision: number
+  environmentId?: string
+  state: 'running' | 'completed' | 'failed' | 'cancelled'
+  startedAt: number
+  finishedAt?: number
+  steps: ApiScenarioStepOutcome[]
+  /** 流程结论：所有已执行步骤的断言结论聚合。 */
+  assertions: ApiAssertionResult[]
+  error?: ApiFailure
+}
+/** 场景准备后的单步投影：审批卡与界面据此逐行核对「即将发出的请求」。 */
+export interface ApiScenarioStepPreview {
+  /** 执行顺序，从 0 开始。 */
+  index: number
+  stepId: string
+  name: string
+  requestId: string
+  caseId?: string
+  method: ApiMethod
+  /** 解析后的最终 URL：批准的是这一串地址，执行时也必须是同一串。 */
+  url: string
+  environmentKind?: ApiEnvironment['kind']
+  assertionCount: number
+}
+/** 场景准备结果：一次批准针对的就是这份步骤清单。 */
+export interface ApiScenarioPreparedPreview {
+  preparedId: string
+  scenarioId: string
+  scenarioName: string
+  catalogRevision: number
+  environmentId?: string
+  onFailure: ApiScenarioFailurePolicy
+  createdAt: number
+  expiresAt: number
+  /** 生产中环境等必须让用户先看到的提醒。 */
+  warnings: string[]
+  steps: ApiScenarioStepPreview[]
+}
 /** workspace 的有界目录；不包含运行正文和秘密明文。 */
-export interface ApiCatalog { version: 1; revision: number; collections: ApiCollection[]; environments: ApiEnvironment[]; requests: ApiRequestDefinition[] }
+export interface ApiCatalog { version: 1; revision: number; collections: ApiCollection[]; environments: ApiEnvironment[]; requests: ApiRequestDefinition[]; scenarios?: ApiScenario[] }
 /** Host 准备完成的网络输入；此类型的原文只在可信执行边界流转。 */
 export interface ApiResolvedRequest {
   method: ApiMethod; url: string; headers: ApiHeader[]; body: string
@@ -433,9 +533,42 @@ export function parseApiRequestDefinition(value: unknown): ApiRequestDefinition 
   const record = apiRecord(value, [...DRAFT_KEYS, 'id', 'revision', 'updatedAt'], 'definition')
   return { ...parseApiRequestDraft(Object.fromEntries(DRAFT_KEYS.map((key) => [key, record[key]]))), id: parseApiId(record.id), revision: apiInteger(record.revision, 1, Number.MAX_SAFE_INTEGER, 'revision'), updatedAt: apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'updatedAt') }
 }
+/** 场景级与步骤级的失败策略；只允许两种取值，「静默继续」不能成为默认。 */
+function scenarioFailurePolicy(value: unknown, path: string): ApiScenarioFailurePolicy {
+  return choice(value, ['stop', 'continue'] as const, path)
+}
+/** 解析一个场景步骤；只接受已保存请求的身份，不接收内联定义。 */
+function scenarioStep(value: unknown): ApiScenarioStep {
+  const record = apiRecord(value, ['id', 'name', 'requestId', 'caseId', 'environmentId', 'overrides', 'onFailure'], 'scenario.step')
+  return {
+    id: parseApiId(record.id),
+    name: text(record.name, 'scenario.step.name', 128),
+    requestId: parseApiId(record.requestId),
+    ...(record.caseId === undefined ? {} : { caseId: parseApiId(record.caseId) }),
+    ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
+    ...(record.overrides === undefined ? {} : { overrides: parseApiFields(record.overrides) }),
+    ...(record.onFailure === undefined ? {} : { onFailure: scenarioFailurePolicy(record.onFailure, 'scenario.step.onFailure') }),
+  }
+}
+/** 解析一条场景定义；步骤身份必须唯一，数组顺序即执行顺序。 */
+export function parseApiScenario(value: unknown): ApiScenario {
+  const record = apiRecord(value, ['id', 'name', 'description', 'collectionId', 'folder', 'steps', 'environmentId', 'onFailure', 'revision', 'updatedAt'], 'scenario')
+  return {
+    id: parseApiId(record.id),
+    name: text(record.name, 'scenario.name', 128),
+    description: text(record.description, 'scenario.description', 4096),
+    collectionId: parseApiId(record.collectionId),
+    folder: text(record.folder, 'scenario.folder', 256),
+    steps: rows(record.steps, scenarioStep, API_LIMITS.maxScenarioSteps, 'scenario.steps'),
+    ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
+    onFailure: scenarioFailurePolicy(record.onFailure ?? 'stop', 'scenario.onFailure'),
+    revision: apiInteger(record.revision, 1, Number.MAX_SAFE_INTEGER, 'scenario.revision'),
+    updatedAt: apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'scenario.updatedAt'),
+  }
+}
 /** 解析目录并验证关系，不允许孤儿集合引用。 */
 export function parseApiCatalog(value: unknown): ApiCatalog {
-  const record = apiRecord(value, ['version', 'revision', 'collections', 'environments', 'requests'], 'catalog')
+  const record = apiRecord(value, ['version', 'revision', 'collections', 'environments', 'requests', 'scenarios'], 'catalog')
   if (record.version !== 1 || new TextEncoder().encode(JSON.stringify(value)).byteLength > API_LIMITS.catalogBytes) return invalid('catalog.versionOrSize')
   const collections = rows(record.collections, (item): ApiCollection => {
     const entry = apiRecord(item, ['id', 'name', 'description', 'variables'], 'collection')
@@ -447,7 +580,10 @@ export function parseApiCatalog(value: unknown): ApiCatalog {
   }, 64, 'environments')
   const requests = rows(record.requests, parseApiRequestDefinition, API_LIMITS.maxRequests, 'requests')
   if (requests.some((request) => !collections.some((collection) => collection.id === request.collectionId))) return invalid('request.collectionId')
-  return { version: 1, revision: apiInteger(record.revision, 0, Number.MAX_SAFE_INTEGER, 'catalog.revision'), collections, environments, requests }
+  /** 升级前保存的目录没有 scenarios 字段，解析时补空数组而不是报错。 */
+  const scenarios = rows(record.scenarios ?? [], parseApiScenario, API_LIMITS.maxScenarios, 'scenarios')
+  if (scenarios.some((scenario) => !collections.some((collection) => collection.id === scenario.collectionId))) return invalid('scenario.collectionId')
+  return { version: 1, revision: apiInteger(record.revision, 0, Number.MAX_SAFE_INTEGER, 'catalog.revision'), collections, environments, requests, scenarios }
 }
 /** 主进程从该会话推导 workspace；拒绝外部附带 workspaceId。 */
 export function parseApiTarget(value: unknown): ApiTarget { const record = apiRecord(value, ['sessionId']); return { sessionId: parseApiId(record.sessionId) } }

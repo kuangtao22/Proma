@@ -22,6 +22,7 @@ import {
   parseApiId,
   parseApiResolvedRequest,
   parseApiRun,
+  parseApiScenarioRun,
 } from '@proma/shared'
 import type {
   ApiBodySlice,
@@ -29,6 +30,7 @@ import type {
   ApiField,
   ApiResolvedRequest,
   ApiRun,
+  ApiScenarioRun,
   ApiValue,
 } from '@proma/shared'
 import { getConfigDir } from '../config-paths'
@@ -52,6 +54,8 @@ const EMPTY_BODY = {
 } as const
 const MAX_CATALOG_BYTES = API_LIMITS.catalogBytes + 256 * 1024
 const MAX_RUN_BYTES = API_LIMITS.requestBytes * 6 + API_LIMITS.previewBytes * 4
+/** 场景摘要只有步骤与结论，上限按最大步骤数留足余量。 */
+const MAX_SCENARIO_RUN_BYTES = 64 * 1024
 /** 含 raw/decoded 正文、原始请求及备份的保守预留，防止落盘中途挤掉最新记录。 */
 const RUN_RESERVATION_BYTES = API_LIMITS.bodyBytes * 2 + MAX_RUN_BYTES * 3
 const MAX_PRIVATE_BYTES = API_LIMITS.requestBytes * 8
@@ -140,6 +144,10 @@ function isCatalog(value: unknown): value is ApiCatalog {
 /** 公开 run 文件不允许携带任何私有键。 */
 function isRun(value: unknown): value is ApiRun {
   try { parseApiRun(value); return true } catch { return false }
+}
+/** 场景运行摘要同样按合同校验，避免坏文件被当成事实。 */
+function isScenarioRun(value: unknown): value is ApiScenarioRun {
+  try { parseApiScenarioRun(value); return true } catch { return false }
 }
 
 /** 验证密文秘密文件的 exact shape。 */
@@ -626,6 +634,7 @@ export class ApiWorkbenchStore {
     catalog: string
     secrets: string
     runs: string
+    scenarioRuns: string
     lock: string
   } {
     parseApiId(workspaceId)
@@ -633,12 +642,99 @@ export class ApiWorkbenchStore {
     const directory = ensureDirectory(join(workspacesRoot, workspaceId))
     assertContained(workspacesRoot, directory)
     const runs = ensureDirectory(join(directory, 'runs'))
+    /** 场景运行摘要与单次运行分开存放：它没有正文，只有步骤与结论。 */
+    const scenarioRuns = ensureDirectory(join(directory, 'scenario-runs'))
     return {
       directory,
       catalog: join(directory, 'catalog.json'),
       secrets: join(directory, 'secrets.json'),
       runs,
+      scenarioRuns,
       lock: join(directory, '.store.lock'),
+    }
+  }
+
+  /**
+   * 写入一次场景运行的紧凑摘要（无正文、无秘密）。
+   *
+   * 每步的完整证据仍在 `runs/<runId>/` 里，这里只保留「哪一步、什么结论、对应哪个 runId」。
+   * @param run 场景运行摘要。
+   * @returns 落盘后的摘要。
+   */
+  createScenarioRun(run: ApiScenarioRun): ApiScenarioRun {
+    const parsed = parseApiScenarioRun(run)
+    const paths = this.workspacePaths(parsed.workspaceId)
+    return this.transaction(parsed.workspaceId, () => {
+      this.writeJson(this.scenarioRunPath(parsed.workspaceId, parsed.id), parsed)
+      this.applyScenarioRunRetention(parsed.workspaceId)
+      return parseApiScenarioRun(parsed)
+    })
+  }
+
+  /** 按状态守卫更新场景运行；终态之后不再改写。 */
+  updateScenarioRun(workspaceId: string, scenarioRunId: string, states: readonly ApiScenarioRun['state'][], update: (run: ApiScenarioRun) => ApiScenarioRun): ApiScenarioRun {
+    return this.transaction(workspaceId, () => {
+      const current = this.getScenarioRun(workspaceId, scenarioRunId)
+      if (!states.includes(current.state)) return current
+      const next = parseApiScenarioRun(update(current))
+      if (next.id !== current.id) throw new Error('API_WORKBENCH_SCENARIO_RUN_ID_MISMATCH')
+      this.writeJson(this.scenarioRunPath(workspaceId, scenarioRunId), next, current)
+      return next
+    })
+  }
+
+  /** 读取场景运行摘要；缺失或损坏都抛稳定错误。 */
+  getScenarioRun(workspaceId: string, scenarioRunId: string): ApiScenarioRun {
+    const path = this.scenarioRunPath(workspaceId, scenarioRunId)
+    if (!existsSync(path)) throw new Error('API_WORKBENCH_SCENARIO_RUN_NOT_FOUND')
+    const loaded = readJsonFileStrict<ApiScenarioRun>(path, {
+      validate: isScenarioRun,
+      description: '接口工作台场景运行',
+      maxBytes: MAX_SCENARIO_RUN_BYTES,
+      secureRecovery: true,
+    })
+    if (!loaded) throw new Error('API_WORKBENCH_SCENARIO_RUN_NOT_FOUND')
+    return parseApiScenarioRun(loaded)
+  }
+
+  /** 场景运行列表：最新在前；Agent 只看自己会话的流程。 */
+  listScenarioRuns(workspaceId: string, cursor = 0, limit = 20, sessionId?: string): { runs: ApiScenarioRun[]; nextCursor: number | null } {
+    const directory = this.workspacePaths(workspaceId).scenarioRuns
+    const runs = readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .flatMap((entry) => {
+        try { return [this.getScenarioRun(workspaceId, entry.name.slice(0, -'.json'.length))] } catch { return [] }
+      })
+      .filter((run) => sessionId === undefined || run.sessionId === sessionId)
+      .sort((a, b) => b.startedAt - a.startedAt)
+    const page = runs.slice(cursor, cursor + limit)
+    return { runs: page, nextCursor: cursor + limit < runs.length ? cursor + limit : null }
+  }
+
+  /** 场景摘要路径：单文件，便于按条数裁剪。 */
+  private scenarioRunPath(workspaceId: string, scenarioRunId: string): string {
+    parseApiId(scenarioRunId)
+    const directory = this.workspacePaths(workspaceId).scenarioRuns
+    const path = join(directory, `${scenarioRunId}.json`)
+    assertContained(directory, resolve(path))
+    return path
+  }
+
+  /** 只保留最新 N 条场景摘要；正在运行的条目不淘汰。 */
+  private applyScenarioRunRetention(workspaceId: string): void {
+    const directory = this.workspacePaths(workspaceId).scenarioRuns
+    const entries = readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .flatMap((entry) => {
+        const id = entry.name.slice(0, -'.json'.length)
+        try { return [{ id, run: this.getScenarioRun(workspaceId, id), path: join(directory, entry.name) }] } catch { return [] }
+      })
+      .sort((a, b) => b.run.startedAt - a.run.startedAt)
+    for (const entry of entries.slice(API_LIMITS.maxScenarioRuns)) {
+      if (entry.run.state === 'running') continue
+      const real = realpathSync(entry.path)
+      assertContained(directory, real)
+      rmSync(real, { force: true })
     }
   }
 
