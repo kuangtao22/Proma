@@ -22,7 +22,7 @@ const safeStorage = {
 }
 
 /** 建立不访问真实网络、不读用户配置的 Agent 场景；可注入窄上限的文件仓库以验证回滚。 */
-function fixture(files?: ApiFileStore) {
+function fixture(files?: ApiFileStore, overrides: { maxDrafts?: number } = {}) {
   /** macOS 的 `/var` 指向 `/private/var`，先固定 realpath 让审批路径断言稳定。 */
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'api-agent-')))
   let session = { id: 'session', workspaceId: 'workspace' } as AgentSessionMeta
@@ -44,7 +44,7 @@ function fixture(files?: ApiFileStore) {
       body: { rawBytes: 2, decodedBytes: 2, contentType: 'text/plain', encoding: '', preview: '{"token":"fixture-token-1"}', previewTruncated: false, complete: true, decoded: true },
     }
   }, ...(files ? { files } : {}) })
-  const options = { sessionId: 'session', toolMode: 'standard', getSession: () => session, service, runSignal: abort.signal, assertRunActive: () => { if (abort.signal.aborted) throw new Error('stopped') } }
+  const options = { sessionId: 'session', toolMode: 'standard', getSession: () => session, service, runSignal: abort.signal, assertRunActive: () => { if (abort.signal.aborted) throw new Error('stopped') }, ...overrides }
   const facade = createApiAgentFacade(options)!
   return { facade, options, service, abort, root, sent, sends: () => sends, change: (next: Partial<AgentSessionMeta>) => { session = { ...session, ...next } }, cleanup: () => rmSync(root, { recursive: true, force: true }) }
 }
@@ -98,6 +98,48 @@ describe('Agent 接口工作台授权边界', () => {
       f.change({ workspaceId: 'workspace' })
       f.abort.abort()
       await expect(f.facade.list({})).rejects.toThrow()
+    } finally { f.cleanup() }
+  })
+})
+
+describe('Agent 准备配额不会挡住批量整理', () => {
+  test('Given 已发送的草稿占满配额 When 继续 prepare Then 回收后继续而不是限流', async () => {
+    const f = fixture(undefined, { maxDrafts: 2 })
+    try {
+      for (const url of ['https://example.test/a', 'https://example.test/b']) {
+        const prepared = await f.facade.prepare({ request: { url, method: 'POST' } })
+        const args = { preparedId: prepared.preparedId }
+        await f.facade.authorize('api_send_request', args, await f.facade.approval('api_send_request', args))
+        await f.facade.send(args)
+      }
+      /** 两条已发送的草稿占满上限：第三条应当回收旧草稿后正常准备（现场案例：126 条补参数被限流）。 */
+      const third = await f.facade.prepare({ request: { url: 'https://example.test/c', method: 'POST' } })
+
+      expect(third.preparedId).toBeTruthy()
+    } finally { f.cleanup() }
+  })
+
+  test('Given 未发送的草稿占满配额 When 继续 prepare Then 明确拒绝并给出替代做法', async () => {
+    const f = fixture(undefined, { maxDrafts: 2 })
+    try {
+      await f.facade.prepare({ request: { url: 'https://example.test/a', method: 'POST' } })
+      await f.facade.prepare({ request: { url: 'https://example.test/b', method: 'POST' } })
+
+      await expect(f.facade.prepare({ request: { url: 'https://example.test/c', method: 'POST' } }))
+        .rejects.toThrow('API_AGENT_PREPARE_LIMIT: 同时可用的准备草稿已达上限；请先保存或改用批量整理工具（api_update_requests）')
+    } finally { f.cleanup() }
+  })
+
+  test('Given 已保存的草稿 When 再次请求保存审批 Then 草稿名额已释放', async () => {
+    const f = fixture()
+    try {
+      const prepared = await f.facade.prepare({ request: { name: '管理员登录', url: 'https://example.test/login', method: 'POST' } })
+      const saving = { preparedId: prepared.preparedId, expectedRevision: prepared.catalogRevision }
+      await f.facade.authorize('api_save_request', saving, await f.facade.approval('api_save_request', saving))
+      await f.facade.save(saving)
+
+      /** 保存成功后草稿即释放：同一身份不会再占用名额，也不会被二次保存。 */
+      await expect(f.facade.approval('api_save_request', saving)).rejects.toThrow('API_AGENT_PREPARED_NOT_FOUND')
     } finally { f.cleanup() }
   })
 })

@@ -61,6 +61,8 @@ export interface ApiAgentFacadeOptions {
   assertWorkspaceWritable?(workspaceId: string): void
   canMutate?(): boolean
   runWorkspaceWrite?<T>(workspaceId: string, effect: () => T): T
+  /** 同时可用的准备草稿上限；默认 {@link MAX_AGENT_DRAFTS}，测试可注入更小值。 */
+  maxDrafts?: number
 }
 /** 会话聊天卡片只引用一次真实运行，不包含任意文件路径或执行入口。 */
 export interface ApiAgentRunSummary {
@@ -82,6 +84,8 @@ function agentText(value: unknown, path: string, max: number): string {
   if (typeof value !== 'string' || value.length > max || value.includes('\0')) throw new Error(`API_WORKBENCH_INVALID: ${path}`)
   return value
 }
+/** 同时可用的准备草稿上限：批量整理上百条接口时不必反复等待。 */
+const MAX_AGENT_DRAFTS = 256
 /** 模型输出按实际 UTF-8 字节限额；过大只返回标记清晰的文本预览。 */
 export function boundApiAgentResult(value: unknown): unknown {
   const serialized = JSON.stringify(value)
@@ -115,6 +119,18 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
   }
   /** 变更入口额外复用项目迁移写锁。 */
   function writable(): void { current(); if (options.canMutate?.() === false) throw new Error('API_AGENT_MUTATION_DENIED'); options.assertWorkspaceWritable?.(context.workspaceId) }
+  /**
+   * 回收「已经发送过、且已经保存过」的草稿，给后续 prepare 腾出名额。
+   *
+   * 只回收已完成发送的：`sent` 仍然保留去重身份，所以重复调用 send 依旧不会再次出网；
+   * 未发送的草稿一律保留（可能马上要批准执行）。
+   */
+  function reclaimSentDrafts(): void {
+    for (const [preparedId] of drafts) {
+      if (!sent.has(preparedId)) continue
+      drafts.delete(preparedId)
+    }
+  }
   /** 持有当前项目写租约直到真实网络与记录完成，迁移不能穿过异步间隙。 */
   function write<T>(effect: () => T): T { writable(); return options.runWorkspaceWrite ? options.runWorkspaceWrite(context.workspaceId, effect) : effect() }
   /** 解析发送或保存参数，模型无法传入 reveal、workspace 或私有执行路径。 */
@@ -457,7 +473,17 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
     /** 仅准备请求；允许局部草稿覆盖，绝不在 prepare 时出网或修改环境。 */
     async prepare(input: unknown): Promise<ApiPreparedPreview & { draftWarnings?: string[] }> {
       current()
-      if (drafts.size >= 128) throw new Error('API_AGENT_PREPARE_LIMIT')
+      /**
+       * 准备配额是「同时可用的草稿数」，不是「本次运行最多准备几次」。
+       *
+       * 批量导入一次要改上百条接口，若已完成的草稿一直占着名额，Agent 会把配额烧光并
+       * 拿到 `API_AGENT_PREPARE_LIMIT`（现场案例：126 条补参数时被限流，改名因此没做）。
+       * 这里的策略：先回收**已经发过**的草稿（它的运行记录已经落盘，`sent` 仍保留去重身份），
+       * 实在没有可回收的才拒绝。
+       */
+      const draftLimit = options.maxDrafts ?? MAX_AGENT_DRAFTS
+      if (drafts.size >= draftLimit) reclaimSentDrafts()
+      if (drafts.size >= draftLimit) throw new Error('API_AGENT_PREPARE_LIMIT: 同时可用的准备草稿已达上限；请先保存或改用批量整理工具（api_update_requests）')
       const args = apiRecord(input, ['request', 'requestId', 'environmentId', 'overrides', 'caseId'])
       const requestId = args.requestId === undefined ? undefined : parseApiId(args.requestId)
       const catalog = await options.service.getCatalog(context.workspaceId)
@@ -642,6 +668,8 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const saved = await write(() => options.service.saveCatalog(context.workspaceId, snapshot.save!.expectedRevision, { ...catalog, requests }))
       current()
       grants.delete('api_save_request:' + snapshot.preparedId)
+      /** 保存成功后释放草稿名额：批量整理上百条时不再被「同时可用的准备数」卡住。 */
+      drafts.delete(snapshot.preparedId)
       return { requestId: definition.id, catalogRevision: saved.revision, saved: true }
     },
     /** 只读查询自己会话的同一次 run；正文、头和断言按页读，不能 reveal。 */
