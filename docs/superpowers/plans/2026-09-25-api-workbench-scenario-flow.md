@@ -56,12 +56,16 @@
 - 不做步骤并行、不做条件分支/循环/重试策略，不做场景级自定义断言（第一版用每步用例的断言聚合出流程结论）。
 - 不把场景定义复制成第二份请求定义；不做跨会话复用文件引用；不做流程级秘密（沿用请求与环境的秘密解析）。
 
-## 6. 验收证据（实施后补）
+## 6. 验收证据
+
+已完成第 1～3 步与真实端到端（第 4 步界面仍待做）：
 
 | 验证 | 结果 | 日志 |
 | --- | --- | --- |
-| 定向回归（共享合同 / 服务层 / facade / IPC / 渲染层 / preload） | 待实施 | — |
-| `bun run typecheck` | 待实施 | — |
-| `bun run electron:build` | 待实施 | — |
-| 真实 Electron 端到端（三步骤流程，一次批准） | 待实施 | — |
-| 真实界面（场景分区 + 运行确认 + 逐步结果） | 待实施 | — |
+| 定向回归（工作台主进程 / agent 组件 / preload / 共享合同） | 869 pass / 0 fail，104 文件 | `/tmp/proma-api-b12b-targeted.log`（B12b 记录）与本次运行输出 |
+| `bun run typecheck` | 7 workspace 全部通过 | — |
+| `bun run electron:build` | 通过，仅既有 EventKit 告警 | `/tmp/proma-api-b13-build.log` |
+| 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS，网络调用 19 次：Agent 准备流程（准备阶段只给方法 + 解析后 URL，0 次出网）→ **未批准运行被拒且 0 次出网** → 经真实权限服务「点允许」一次 → 两步按顺序出网、第二步确实带上了第一步提取的 `Bearer fixture-token-9` → 每步都有独立 runId → 重复调用复用同一次结论不再出网 → 流程摘要里没有秘密明文 | `/tmp/proma-api-b13-smoke.log` |
+| 真实界面（场景分区 + 运行确认 + 逐步结果） | 待实施（第 4 步） | — |
+
+实施中再次踩到并确认的坑：**改了 `packages/shared` 的解析合同后必须先 `bun run electron:build`**，否则 smoke 用的 `dist/main.cjs` / `dist/preload.cjs` 还是旧解析器——旧目录白名单会把带 `scenarios` 的目录当成非法输入；本次的症状是**全链路挂起**（而不是清晰报错），因为主进程侧的解析失败让验收脚本停在等待里，最后只留下看门狗超时日志。

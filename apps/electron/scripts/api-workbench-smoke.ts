@@ -168,6 +168,27 @@ async function smoke(): Promise<void> {
     if (result.behavior === 'allow') await facade.authorize('api_send_request', input, snapshot)
     return { behavior: result.behavior, cardFiles: (card.toolInput as { files?: unknown }).files }
   }
+  /**
+   * 按生产装配走一次**流程**审批：卡片入参带 `scenario` 步骤清单，
+   * 批准一次即授权整条流程（B13c）。
+   * @param input 运行流程的工具入参（只有 preparedId）。
+   * @param behavior 卡片上被点击的按钮。
+   * @returns 权限判定与卡片上实际展示的步骤清单。
+   */
+  async function resolveScenarioApproval(input: { preparedId: string }, behavior: 'allow' | 'deny'): Promise<{ behavior: string; cardSteps: unknown }> {
+    const snapshot = await facade.approval('api_run_scenario', input)
+    const controller = new AbortController()
+    const pending = permissionService.requestSingleApproval('smoke-session', 'api_run_scenario', {
+      ...input,
+      ...(snapshot.scenario ? { scenario: snapshot.scenario } : {}),
+    }, { signal: controller.signal, toolUseID: `tool-approval-${approvalCount++}` }, (request) => { approvalCards.push(request) })
+    const card = approvalCards.at(-1)
+    assert.ok(card, '流程审批卡没有推到界面')
+    assert.equal(permissionService.respondToPermission(card.requestId, behavior, false), 'smoke-session')
+    const result = await pending
+    if (result.behavior === 'allow') await facade.authorize('api_run_scenario', input, snapshot)
+    return { behavior: result.behavior, cardSteps: (card.toolInput as { scenario?: { steps?: unknown } }).scenario?.steps }
+  }
   const agentPrepared = await facade.prepare({ request: { url: baseUrl, method: 'POST' } })
   const args = { preparedId: agentPrepared.preparedId }
   await assert.rejects(facade.send(args), /APPROVAL_REQUIRED/)
@@ -490,9 +511,52 @@ async function smoke(): Promise<void> {
   await assert.rejects(withPath(directory), /API_WORKBENCH_FILE_INVALID_TYPE/)
   if (process.platform !== 'win32') await assert.rejects(withPath('/dev/null'), /API_WORKBENCH_FILE_INVALID_TYPE/)
   assert.equal(calls, 17)
-  const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 17)
+  /** B13：一次批准跑完整条流程——登录提取 token，第二步用它访问用户接口。 */
+  const scenarioCatalog = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
+  const loginRequest = { ...draft, name: '流程·登录', method: 'POST' as const, url: baseUrl + '/login', extractions: [{ id: 'ex_scenario_token', name: 'scenarioToken', from: 'json' as const, path: 'token', secret: true }], assertions: [{ id: 'a_login', kind: 'status' as const, path: '', expected: '200' }] }
+  const profileRequest = { ...draft, name: '流程·用户详情', method: 'GET' as const, url: baseUrl + '/me', headers: [{ id: 'h_auth', name: 'Authorization', value: 'Bearer {{scenarioToken}}', enabled: true }], assertions: [{ id: 'a_profile', kind: 'status' as const, path: '', expected: '200' }] }
+  const scenarioDefinition = {
+    id: 'scenario_login_profile', name: '登录后看用户详情', description: '一次批准跑完两步', collectionId: scenarioCatalog.collections[0]?.id ?? 'default', folder: '用户模块',
+    steps: [
+      { id: 'step_login', name: '登录', requestId: 'request_flow_login' },
+      { id: 'step_profile', name: '用户详情', requestId: 'request_flow_profile' },
+    ],
+    onFailure: 'stop' as const, revision: 1, updatedAt: Date.now(),
+  }
+  await call('saveCatalog', { sessionId: 'smoke-session', expectedRevision: scenarioCatalog.revision, catalog: {
+    ...scenarioCatalog,
+    requests: [...scenarioCatalog.requests, { ...loginRequest, id: 'request_flow_login', revision: 1, updatedAt: Date.now() }, { ...profileRequest, id: 'request_flow_profile', revision: 1, updatedAt: Date.now() }],
+    scenarios: [scenarioDefinition],
+  } })
+  const scenarioPrepared = await facade.prepareScenario({ scenarioId: 'scenario_login_profile' })
+  /** 准备阶段只给步骤清单：方法 + 解析后的 URL，且不出网。 */
+  assert.deepEqual(scenarioPrepared.steps.map((step) => `${step.method} ${step.url}`), ['POST ' + baseUrl + '/login', 'GET ' + baseUrl + '/me'])
   assert.equal(calls, 17)
+  /** 未批准不能跑；批准一次即授权整条流程。 */
+  const scenarioArgs = { preparedId: scenarioPrepared.preparedId }
+  await assert.rejects(facade.runScenario(scenarioArgs), /APPROVAL_REQUIRED/)
+  assert.equal(calls, 17)
+  receivedAuthorization = ''
+  const scenarioApproval = await resolveScenarioApproval(scenarioArgs, 'allow')
+  assert.equal(scenarioApproval.behavior, 'allow')
+  assert.deepEqual(scenarioApproval.cardSteps, scenarioPrepared.steps)
+  const scenarioRun = await facade.runScenario(scenarioArgs)
+  assert.equal(scenarioRun.state, 'completed', JSON.stringify(scenarioRun))
+  assert.deepEqual(scenarioRun.steps.map((step) => step.state), ['passed', 'passed'])
+  /** 顺序出网，且第二步真的带上了第一步提取出来的 token。 */
+  assert.equal(calls, 19)
+  assert.equal(receivedAuthorization, 'Bearer fixture-token-9', '流程第二步没有带上第一步提取的 token')
+  assert.ok(scenarioRun.steps.every((step) => step.runId !== undefined), '流程步骤没有各自的运行记录')
+  /** 重复调用复用同一次结论，不会第二次出网。 */
+  assert.equal((await facade.runScenario(scenarioArgs)).id, scenarioRun.id)
+  assert.equal(calls, 19)
+  /** 流程摘要里没有秘密与正文。 */
+  assert.equal(JSON.stringify(scenarioRun).includes('fixture-token-9'), false, '流程摘要不该带秘密明文')
+  const scenarioStored = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
+  assert.equal(scenarioStored.scenarios?.[0]?.folder, '用户模块')
+  const history = await call('listRuns', { sessionId: 'smoke-session' })
+  assert.equal(history.runs.length, 19)
+  assert.equal(calls, 19)
   console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval via permission service', 'agent file deny blocks send', 'agent file changed rejection', 'agent file type rejection', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
