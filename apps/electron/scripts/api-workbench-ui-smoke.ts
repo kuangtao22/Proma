@@ -205,6 +205,47 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-splitters.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] 可拖动分隔条已验证')
+    /** 一级（集合）行吸顶：在 60 条请求的大目录里滚到底，集合名仍贴在目录区顶部可见。 */
+    const stickyWindow = new BrowserWindow({ width: 1200, height: 800, show: false, backgroundColor: '#ffffff', webPreferences: { backgroundThrottling: false } })
+    try {
+      await stickyWindow.loadURL(`${process.env.PROMA_API_UI_SMOKE_URL!}?big-catalog=1`)
+      await waitFor(stickyWindow, "document.body.dataset.smokeReady === 'true' && Boolean(document.querySelector('[data-api-collection-header]'))", '大目录窗口未挂载')
+      const sticky = await stickyWindow.webContents.executeJavaScript(`(async () => {
+        const header = document.querySelector('[data-api-collection-header]')
+        const scroller = header?.parentElement?.parentElement
+        if (!(header instanceof HTMLElement) || !(scroller instanceof HTMLElement)) return null
+        const name = header.textContent?.trim() ?? ''
+        scroller.scrollTop = scroller.scrollHeight
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        const headerTop = header.getBoundingClientRect().top
+        const scrollerTop = scroller.getBoundingClientRect().top
+        const scrolled = scroller.scrollTop > 0
+        const inView = headerTop >= scrollerTop - 1 && headerTop - scrollerTop < 24
+        /** 顺带取头行的可见尺寸，避免「位置对了但没显示出来」这种假通过。 */
+        const rect = header.getBoundingClientRect()
+        const opaque = getComputedStyle(header).opacity
+        const label = header.querySelector('span')
+        const labelStyle = label ? getComputedStyle(label) : undefined
+        return {
+          name, inView, scrolled, width: Math.round(rect.width), height: Math.round(rect.height),
+          rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
+          labelColor: labelStyle?.color ?? 'none', labelSize: labelStyle?.fontSize ?? 'none', labelText: label?.textContent ?? '',
+        }
+      })()`) as { name: string; inView: boolean; scrolled: boolean } | null
+      console.log('[API Workbench UI smoke] 吸顶头行测量', JSON.stringify(sticky))
+      assert.ok(sticky, '找不到集合一级行')
+      assert.equal(sticky.scrolled, true, '大目录没有滚起来，无法验证吸顶')
+      assert.equal(sticky.name, '后台接口', '集合一级行名称不对')
+      assert.equal(sticky.inView, true, `滚到底后集合一级行不可见（应吸顶，当前名称 ${sticky.name}）`)
+      await writeFile('/private/tmp/api-workbench-ui-sticky-collection.png', (await stickyWindow.webContents.capturePage()).toPNG())
+      /** 头行必须真在容器顶部且文字有实际颜色与字号，避免「位置对但没显示」的假通过。 */
+      const stickyDetail = sticky as unknown as { labelColor: string; labelSize: string; labelText: string }
+      assert.equal(stickyDetail.labelText, '后台接口', '吸顶头行文字不对')
+      assert.notEqual(stickyDetail.labelColor, 'rgba(0, 0, 0, 0)', '吸顶头行文字被设成透明')
+      console.log('[API Workbench UI smoke] 集合一级行吸顶已验证')
+    } finally {
+      stickyWindow.destroy()
+    }
     console.log('[API Workbench UI smoke] cURL 导入与保存已验证')
     /** 导入集合快照：以新增方式合并，并提示需要重填的秘密。 */
     const snapshot = createApiCatalogSnapshotExport({

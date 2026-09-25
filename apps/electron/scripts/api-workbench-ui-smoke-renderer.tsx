@@ -305,6 +305,24 @@ if (search.has('approval')) {
   const store = createStore()
   store.set(allPendingPermissionRequestsAtom, new Map([['session-approval', [approvalRequest]]]))
   createRoot(document.getElementById('root')!).render(<Provider store={store}><ApprovalApp /></Provider>)
+} else if (search.has('big-catalog')) {
+  /** 大目录窗口：60 条请求铺满目录区，用来验证「一级（集合）行吸顶」。 */
+  state.catalog = {
+    version: 1, revision: 9,
+    collections: [{ id: 'default', name: '后台接口', description: '', variables: [] }],
+    environments: [],
+    requests: Array.from({ length: 60 }, (_value, index) => ({
+      ...createApiRequestDraft('default'),
+      id: `request_${index}`,
+      revision: 1,
+      updatedAt: 1,
+      name: `渠道模型绑定 ${index}`,
+      method: 'POST' as const,
+      url: `{{baseUrl}}/admin/v1/channel/${index}`,
+      folder: index % 2 === 0 ? 'AI 能力与模型' : '',
+    })),
+  }
+  createRoot(document.getElementById('root')!).render(<SmokeApp />)
 } else if (search.has('offset-pane')) {
   createRoot(document.getElementById('root')!).render(<OffsetPaneApp />)
 } else {

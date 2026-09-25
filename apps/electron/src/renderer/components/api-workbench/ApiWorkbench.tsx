@@ -386,7 +386,11 @@ function CatalogPanel({
           const isExpanded = Boolean(query.trim()) || expanded.has(collection.id)
           return (
             <section key={collection.id} className="mb-1">
-              <div className="group flex items-center gap-1 rounded-md hover:bg-muted/60">
+              {/**
+               * 一级（集合）行吸顶：一个集合下可能有上百条请求，滚到中间时单看分组名
+               * 分不清自己在哪个集合里（现场反馈「一级类不见了」就是这个观感）。
+               */}
+              <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center gap-1 border-b border-border/40 bg-background hover:bg-muted/60">
                 <button type="button" className="flex min-w-0 flex-1 items-center gap-1.5 px-1.5 py-1.5 text-left text-xs font-medium" onClick={() => setExpanded((previous) => {
                   /** 复制集合，避免原地修改 React 状态。 */
                   const next = new Set(previous)
@@ -394,7 +398,8 @@ function CatalogPanel({
                   return next
                 })}>
                   {isExpanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-                  <span className="truncate">{collection.name}</span>
+                  {/* 名称损坏（历史数据或导入）时也要看得见这一级，而不是渲染成空白行。 */}
+                  <span className="truncate">{collection.name.trim() || '（未命名集合）'}</span>
                 </button>
                 <ToolButton label="新建请求" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateRequest(collection.id)}><Plus className="size-3" /></ToolButton>
                 <ToolButton label="新建文件夹" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateFolder(collection)}><FolderPlus className="size-3" /></ToolButton>
