@@ -13,7 +13,9 @@
 ## 2. 硬约束（B13b / B13c 新增，实施前先认这几条）
 
 1. **场景不复制请求定义**：`ApiScenarioStep` 只引用 `requestId`（+ 可选 `caseId`、环境覆盖、变量覆盖、失败策略），不内联 draft。理由：内联会出现「同一条请求两处定义」，跑出来的证据无法对上人维护的那一份。Agent 想内联内容，先 `api_save_request` 建请求。
-2. **一次批准 = 整流程一次出网授权**：审批卡逐行列出「序号 / 步骤名 / 方法 / host+path / 环境 / 用例 / 断言条数」；发送时逐步与批准快照核对（方法、最终 URL 的 origin 与 path、caseId、环境），任何一步不一致 → 整流程拒绝（`API_WORKBENCH_SCENARIO_APPROVAL_STALE`），已完成的步骤保留证据但不再继续。这条替代了原来的「一次批准只发一次请求」，是本轮唯一的授权语义放宽，因此必须**逐步核对**而不是只核对了流程 ID。
+2. **一次批准 = 整流程一次出网授权**：审批卡逐行列出「序号 / 步骤名 / 方法 / 最终 URL / 环境 / 用例 / 断言条数」，并在批准时冻结目录 revision；执行时逐步把**真正发出的方法与 URL** 与批准快照逐字核对，任何一步不一致 → 整流程拒绝（`API_WORKBENCH_SCENARIO_APPROVAL_STALE`），已完成的步骤保留证据但不再继续。这条替代了原来的「一次批准只发一次请求」，是本轮唯一的授权语义放宽，因此必须逐步核对而不是只核对流程 ID。
+   - **实现细节（实施时核对代码后修正）**：审批 `METHOD URL` 在准备阶段解析得到，而不是把每一步的请求冻结成 prepared 记录——因为后面的步骤常要带前面步骤提取出来的变量（`{{token}}`，登录流程的基本形态），冻结式准备会直接以 `API_WORKBENCH_VARIABLE_UNRESOLVED` 失败。准备阶段对这类「本流程稍后才会提取出来」的变量按占位值解析，只为把方法 / URL / 环境展示清楚；执行时按**当时**的运行时变量重新解析再发送。
+   - URL 本身**不允许**引用运行时变量（B4 起就是这条约束：模板名必须来自集合 / 环境 / 覆盖），所以审批卡上的 URL 一定是确定的；只有 Header / 正文可以依赖运行时变量，而它们不在授权判据里。
 3. **串行、有界**：步骤严格按声明顺序串行执行（不并发）；单步沿用请求自身 `timeoutMs`；整流程有总时限（默认 10 分钟），到点不再启动后续步骤并把剩余步骤标为 `skipped`；步骤数上限 20。
 4. **失败策略显式**：`onFailure: 'stop' | 'continue'`，默认 `stop`（后续步骤标 `skipped`）；`continue` 时后续步骤照跑，流程结论仍按「任一步失败即失败」表达。
 5. **环境与 production**：场景有默认环境，步骤可覆盖（优先级：步骤覆盖 > 场景环境 > 请求自身标记）；解析结果里只要出现 `production`，审批卡与警告必须显著标注，UI 运行确认框同样显示。
@@ -31,7 +33,7 @@
   - `ApiCatalog` 增加**可选** `scenarios`（解析缺省补空数组，与 `cases`/`extractions` 同一套升级兼容模式，`version` 仍为 1）。
   - 新错误码：`API_WORKBENCH_SCENARIO_NOT_FOUND`、`_STEP_LIMIT`、`_REQUEST_NOT_FOUND`、`_CASE_NOT_FOUND`、`_APPROVAL_STALE`、`_TIMEOUT`、`_RUNNING`。
 - **存储**：`ApiWorkbenchStore` 增加场景运行的紧凑记录（`workspaces/<id>/scenario-runs/<runId>.json` + 一个 `list` 用轻量索引），复用 `safe-file` 原子写与 workspace 事务；目录/摘要随 workspace 删除，另有 200 条上限。
-- **服务层执行器**：`ApiWorkbenchService.runScenario(context, preparedId, signal)`——按批准快照逐步 `prepare → send`，逐步核对步骤身份，聚合断言结论，产出 `ApiScenarioRun`；沿用现有调度、去重、取消与脱敏。
+- **服务层执行器**：`ApiWorkbenchService.prepareScenario`（逐步校验引用、解析出方法 / URL / 环境、产出步骤清单与 `preparedId`）+ `runScenario(context, preparedId, signal)`（逐步 `prepare → send`、逐步核对方法 + URL、按失败策略停 / 续、总时限、逐步落盘进度），聚合断言结论并产出 `ApiScenarioRun`；沿用现有调度、去重、取消与脱敏。
 - **facade**：新增三个窄工具，保持「精确快照 + 独立批准」的既有形状：
   - `api_list_scenarios`（并入 `api_list` 输出，不新增工具）
   - `api_save_scenario`（draft + `expectedRevision` 审批；与 `api_save_request` 同样的目录 CAS）
