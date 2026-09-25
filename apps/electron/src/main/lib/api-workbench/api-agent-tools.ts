@@ -4,7 +4,7 @@ import { boundApiAgentResult } from './api-agent-facade'
 import type { ApiAgentFacade } from './api-agent-facade'
 
 /** 精确工具名集合用于权限分派，禁止前缀放行未知能力。 */
-export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario'] as const
+export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario', 'api_save_environment'] as const
 /** Pi SDK 在此只需要工具定义工厂，不引入另一套 Agent runtime。 */
 type ApiToolSdk = Pick<typeof import('@earendil-works/pi-coding-agent'), 'defineTool'>
 /** 将有界工具结果写入文本与 details；响应始终视作数据，不能成为指令。 */
@@ -41,6 +41,8 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
     }, { additionalProperties: false })),
     auth: Type.Optional(Type.Object({ type: Type.Union(['none', 'bearer', 'basic', 'api-key'].map((item) => Type.Literal(item))), value, username: Type.Optional(Type.String()), name: Type.Optional(Type.String()), in: Type.Optional(Type.Union([Type.Literal('header'), Type.Literal('query')])) }, { additionalProperties: false })),
     timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 300000 })), followRedirects: Type.Optional(Type.Boolean()), maxRedirects: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+    /** 绑定的目标环境：让 `{{baseUrl}}` 这类环境变量在发送时解析到「测试/生产」对应地址。 */
+    targetEnvironmentId: Type.Optional(id),
     /** 自动 Cookie 只影响宿主内存，默认关闭；取值永远不会回到模型。 */
     useCookieJar: Type.Optional(Type.Boolean()),
     assertions: Type.Optional(Type.Array(Type.Object({ id, kind: Type.Union(['status', 'header', 'json-value', 'json-exists', 'json-type', 'duration', 'sse-count', 'sse-first-event', 'sse-ended', 'sse-last-data'].map((item) => Type.Literal(item))), path: Type.String(), expected: Type.String() }, { additionalProperties: false }))),
@@ -98,6 +100,21 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
         expectedRevision: Type.Integer({ minimum: 0 }),
       }, { additionalProperties: false }),
       async execute(_id, input) { return result(await facade.saveScenario(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_save_environment',
+      label: '保存环境变量',
+      description: 'Create or update an environment (local/test/production) and its variables with a separate configuration-write approval. This is how a shared base address stays in one place: declare baseUrl=http://127.0.0.1:18080 (with kind=test) here, then write request URLs as {{baseUrl}}/admin/v1/... and bind the request to that environment. Variable values are encrypted by the host when they look secret and never come back to you; the approval card only lists variable names. Use the catalog revision from api_list as expectedRevision.',
+      parameters: Type.Object({
+        environmentId: Type.Optional(id),
+        environment: Type.Object({
+          name: Type.String({ minLength: 1, maxLength: 128 }),
+          kind: Type.Union([Type.Literal('local'), Type.Literal('test'), Type.Literal('production')]),
+          variables: Type.Array(field, { maxItems: 128 }),
+        }, { additionalProperties: false }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.saveEnvironment(input)) },
     }),
   ]
 }

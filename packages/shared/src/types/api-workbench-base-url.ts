@@ -13,12 +13,22 @@ export interface ApiBaseUrlExtraction {
   catalog: ApiCatalog
   /** 选中的变量名；没有可抽取的主机时为 undefined。 */
   variableName?: string
+  /** 变量落在哪一层：集合变量，还是某个环境（并把请求绑定到该环境）。 */
+  target?: 'collection' | 'environment'
+  /** 抽到环境时的环境名，用于提示文案。 */
+  environmentName?: string
   /** 抽出来的主机值。 */
   origin?: string
   /** 被改写的请求条数。 */
   updated: number
   /** 无法处理时的说明（例如同名变量已有别的值）。 */
   message?: string
+}
+
+/** 抽取目标：默认写进集合变量；给了 environmentId 就写进该环境并把请求绑定过去。 */
+export interface ApiBaseUrlExtractionOptions {
+  variableName?: string
+  environmentId?: string
 }
 
 /** 只认字面量 http(s) 主机；已经是 `{{var}}` 开头的 URL 天然不会被选中。 */
@@ -33,9 +43,13 @@ function literalOrigin(url: string): string | undefined {
  * @param variableName 变量名，默认 `baseUrl`。
  * @returns 改写后的目录与事实说明；没有可抽取的主机时 catalogs 原样返回。
  */
-export function extractApiBaseUrlVariable(catalog: ApiCatalog, collectionId: string, variableName = 'baseUrl'): ApiBaseUrlExtraction {
+export function extractApiBaseUrlVariable(catalog: ApiCatalog, collectionId: string, options: ApiBaseUrlExtractionOptions = {}): ApiBaseUrlExtraction {
+  const variableName = options.variableName ?? 'baseUrl'
   const collection = catalog.collections.find((item) => item.id === collectionId)
   if (!collection) return { catalog, updated: 0, message: '集合不存在' }
+  /** 抽到环境时先把环境取出来：不存在就拒绝，避免改了一半。 */
+  const environment = options.environmentId ? catalog.environments.find((item) => item.id === options.environmentId) : undefined
+  if (options.environmentId && !environment) return { catalog, updated: 0, message: '目标环境不存在' }
   /** 统计该集合里每个字面量主机的出现次数与被引用的请求。 */
   const counts = new Map<string, { origin: string; count: number; requests: ApiRequestDefinition[] }>()
   for (const request of catalog.requests) {
@@ -51,29 +65,38 @@ export function extractApiBaseUrlVariable(catalog: ApiCatalog, collectionId: str
   const best = [...counts.values()].sort((a, b) => b.count - a.count || a.origin.localeCompare(b.origin))[0]
   if (!best) return { catalog, updated: 0, message: '这个集合里没有硬编码主机的请求' }
   /** 同名变量已存在时只在值一致时复用，值不同就拒绝，避免把别人的环境地址悄悄改掉。 */
-  const existing = collection.variables.find((item) => item.name === variableName)
+  const targetVariables = environment ? environment.variables : collection.variables
+  const existing = targetVariables.find((item) => item.name === variableName)
   if (existing && existing.value !== best.origin) {
-    return { catalog, updated: 0, message: `集合里已有变量 ${variableName}=${existing.value}，与要抽取的 ${best.origin} 不一致；请先改名或手动处理` }
+    const scope = environment ? `环境「${environment.name}」` : '集合'
+    return { catalog, updated: 0, message: `${scope}里已有变量 ${variableName}=${existing.value}，与要抽取的 ${best.origin} 不一致；请先改名或手动处理` }
   }
   const prefix = `{{${variableName}}}`
-  /** 只替换完全匹配该主机的 URL 前缀，路径与查询串原样保留。 */
+  /** 只替换完全匹配该主机的 URL 前缀，路径与查询串原样保留；抽到环境时同时把请求绑定过去。 */
   const rewritten = catalog.requests.map((request) => {
     if (request.collectionId !== collectionId) return request
     const origin = literalOrigin(request.url)
     if (!origin || origin.toLowerCase() !== best.origin.toLowerCase()) return request
-    return { ...request, url: `${prefix}${request.url.trim().slice(origin.length)}` }
+    return {
+      ...request,
+      url: `${prefix}${request.url.trim().slice(origin.length)}`,
+      ...(environment ? { targetEnvironmentId: environment.id } : {}),
+    }
   })
   const updated = rewritten.filter((request, index) => request.url !== catalog.requests[index]!.url).length
   const variables = existing
-    ? collection.variables
-    : [...collection.variables, { id: `var_${variableName}`.replace(/[^A-Za-z0-9_-]/g, '_'), name: variableName, value: best.origin, enabled: true }]
+    ? targetVariables
+    : [...targetVariables, { id: `var_${variableName}`.replace(/[^A-Za-z0-9_-]/g, '_'), name: variableName, value: best.origin, enabled: true }]
   return {
     catalog: {
       ...catalog,
-      collections: catalog.collections.map((item) => item.id === collectionId ? { ...item, variables } : item),
+      collections: environment ? catalog.collections : catalog.collections.map((item) => item.id === collectionId ? { ...item, variables } : item),
+      environments: environment ? catalog.environments.map((item) => item.id === environment.id ? { ...item, variables } : item) : catalog.environments,
       requests: rewritten,
     },
     variableName,
+    target: environment ? 'environment' : 'collection',
+    ...(environment ? { environmentName: environment.name } : {}),
     origin: best.origin,
     updated,
   }

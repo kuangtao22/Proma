@@ -206,4 +206,31 @@ describe('接口工作台审批卡视图', () => {
     expect(view?.lines).toContain('失败策略：continue（失败后继续执行后续步骤）')
     expect(view?.steps.map((step) => step.text)).toEqual(['1. 好的步骤 · GET https://example.test/a'])
   })
+
+  test('Given 保存环境审批 When 解析 Then 只列变量名与个数并带生产环境提醒', () => {
+    const view = describeApiWorkbenchApproval('api_save_environment', {
+      environmentSave: {
+        expectedRevision: 3,
+        environment: {
+          id: 'env_prod', name: '生产环境', kind: 'production',
+          variables: [
+            { id: 'var_base', name: 'baseUrl', value: 'https://api.example.test', enabled: true },
+            { id: 'var_token', name: 'adminToken', value: '[REDACTED]', enabled: true, secret: true },
+          ],
+        },
+        warnings: ['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'],
+      },
+    })
+
+    expect(view?.kind).toBe('api-environment-save')
+    expect(view?.title).toBe('保存环境变量')
+    expect(view?.lines).toEqual([
+      '环境：生产环境（生产）',
+      '变量：baseUrl、adminToken（2 个）',
+      '保存后请求 URL 里可以写 {{变量名}}，例如 {{baseUrl}}/admin/v1/...',
+    ])
+    /** 变量取值不在卡片上出现（秘密值已被 Host 遮罩）。 */
+    expect(JSON.stringify(view)).not.toContain('secret-value')
+    expect(view?.warnings).toEqual(['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'])
+  })
 })

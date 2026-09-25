@@ -32,7 +32,7 @@ export interface ApiApprovalFileLine {
 
 /** 审批卡要展示的接口视图；caseDiff 为空表示这次没有用例改动。 */
 export interface ApiWorkbenchApprovalView {
-  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save'
+  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save' | 'api-environment-save'
   title: string
   lines: string[]
   /** 本次要读取并上传的文件；为空表示没有附件（普通请求或保存审批）。 */
@@ -178,6 +178,33 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
       files: [],
       steps,
       warnings: [],
+      caseDiff: [],
+    }
+  }
+  /** 保存环境：只列变量名与个数（取值已被 Host 遮罩），生产环境单独提醒。 */
+  if (toolName === 'api_save_environment') {
+    const save = record(toolInput.environmentSave)
+    const environment = save ? record(save.environment) : undefined
+    if (!save || !environment) return null
+    const name = string(environment.name) ?? '未命名环境'
+    const kind = string(environment.kind) ?? 'test'
+    const variables = Array.isArray(environment.variables) ? environment.variables : []
+    const names = variables.flatMap((item) => {
+      const entry = record(item)
+      const variableName = entry ? string(entry.name) : undefined
+      return variableName ? [variableName] : []
+    })
+    return {
+      kind: 'api-environment-save',
+      title: '保存环境变量',
+      lines: [
+        `环境：${name}（${kind === 'production' ? '生产' : kind === 'local' ? '开发' : '测试'}）`,
+        `变量：${names.length > 0 ? `${names.join('、')}（${names.length} 个）` : '（本次不写变量）'}`,
+        '保存后请求 URL 里可以写 {{变量名}}，例如 {{baseUrl}}/admin/v1/...',
+      ],
+      files: [],
+      steps: [],
+      warnings: warnings(save.warnings),
       caseDiff: [],
     }
   }

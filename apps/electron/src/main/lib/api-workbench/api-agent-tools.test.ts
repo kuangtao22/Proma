@@ -98,4 +98,24 @@ describe('接口工作台 Agent 工具合同', () => {
     expect(accepts('api_save_scenario', { ...valid, definition: {} })).toBe(false)
     expect(accepts('api_run_scenario', { scenarioId: 'scenario_1' })).toBe(false)
   })
+
+  test('Given Agent 建环境 When 校验参数 Then 只接受定义字段且类型必须是三选一', () => {
+    const valid = {
+      environment: {
+        name: '测试环境', kind: 'test',
+        variables: [{ id: 'var_base', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true }],
+      },
+      expectedRevision: 3,
+    }
+
+    expect(accepts('api_save_environment', valid)).toBe(true)
+    expect(accepts('api_save_environment', { ...valid, environmentId: 'env_test' })).toBe(true)
+    /** 类型只允许开发/测试/生产；名称必填；未知字段与字符串版本号一律拒绝。 */
+    expect(accepts('api_save_environment', { ...valid, environment: { ...valid.environment, kind: 'staging' } })).toBe(false)
+    expect(accepts('api_save_environment', { ...valid, environment: { ...valid.environment, name: '' } })).toBe(false)
+    expect(accepts('api_save_environment', { ...valid, environment: { ...valid.environment, secretRef: 'x' } })).toBe(false)
+    expect(accepts('api_save_environment', { ...valid, expectedRevision: '3' })).toBe(false)
+    /** 请求草稿可以绑定目标环境：{{baseUrl}} 才有地方解析。 */
+    expect(accepts('api_prepare_request', { request: { url: '{{baseUrl}}/ping', targetEnvironmentId: 'env_test' } })).toBe(true)
+  })
 })

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { API_LIMITS, apiRecord, apiInteger, apiDraftFromDefinition, createApiRequestDraft, isOrdinaryTopLevelAgentSession, parseApiFields, parseApiId, parseApiRequestDraft, parseApiScenario } from '@proma/shared'
-import type { AgentSessionMeta, ApiCatalog, ApiPreparedPreview, ApiRequestDraft, ApiRun, ApiScenario, ApiScenarioPreparedPreview, ApiScenarioRun } from '@proma/shared'
+import type { AgentSessionMeta, ApiCatalog, ApiEnvironment, ApiPreparedPreview, ApiRequestDraft, ApiRun, ApiScenario, ApiScenarioPreparedPreview, ApiScenarioRun } from '@proma/shared'
 import type { ApiWorkbenchService } from './api-workbench-service'
 import { stampApiAgentCases } from './api-agent-case-ownership'
 import type { ApiAgentCaseChange } from './api-agent-case-ownership'
@@ -18,6 +18,11 @@ export interface ApiAgentApproval {
   scenario?: ApiScenarioPreparedPreview
   /** 场景保存快照：规范化后的定义与目录版本。 */
   scenarioSave?: { expectedRevision: number; scenario: ApiScenario; scenarioId?: string }
+  /**
+   * 环境保存快照：规范化后的环境定义与目录版本。
+   * 变量值在这里一律遮罩（密钥类变量由 Store 转 safeStorage 密文），审批卡只展示名字与条数。
+   */
+  environmentSave?: { expectedRevision: number; environment: ApiEnvironment; environmentId?: string; warnings: string[] }
   /**
    * 本次要读取并上传的附件：字段名、`realpath` 与大小。
    *
@@ -114,7 +119,53 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       const scenarioId = args.scenarioId === undefined ? 'new' : parseApiId(args.scenarioId)
       return { preparedId: `${scenarioId}_${expectedRevision}`, expectedRevision }
     }
+    if (tool === 'api_save_environment') {
+      const args = apiRecord(input, ['environmentId', 'environment', 'expectedRevision'])
+      const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+      const environmentId = args.environmentId === undefined ? 'new' : parseApiId(args.environmentId)
+      return { preparedId: `${environmentId}_${expectedRevision}`, expectedRevision }
+    }
     throw new Error('API_AGENT_UNKNOWN_MUTATION')
+  }
+  /**
+   * 解析环境保存入参。
+   *
+   * 变量的秘密值走与人有界面同一条 Store 处理（明文 → safeStorage 密文引用），
+   * 因此模型可以声明 `baseUrl` 这类公共变量，也可以声明密钥类变量，但取值永远不会回给模型。
+   * @param input 工具入参。
+   * @param catalog 当前目录，用于校验被修改的环境确实存在。
+   * @returns 目录版本、目标环境身份与规范化定义。
+   */
+  function parseEnvironmentMutation(input: unknown, catalog: ApiCatalog): { expectedRevision: number; environmentId?: string; environment: ApiEnvironment } {
+    const args = apiRecord(input, ['environmentId', 'environment', 'expectedRevision'])
+    const expectedRevision = apiInteger(args.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision')
+    const environmentId = args.environmentId === undefined ? undefined : parseApiId(args.environmentId)
+    const existing = environmentId ? catalog.environments.find((item) => item.id === environmentId) : undefined
+    if (environmentId && !existing) throw new Error('API_WORKBENCH_ENVIRONMENT_NOT_FOUND')
+    /** 只接受定义字段；id 由 Host 盖章，变量行沿用共享解析器（含秘密引用白名单）。 */
+    const draft = apiRecord(args.environment, ['name', 'kind', 'variables'], 'environment')
+    /** 名称与类型都必须明确给出：猜一个「测试环境」比拒绝更危险。 */
+    const name = typeof draft.name === 'string' ? draft.name.trim() : ''
+    if (!name) throw new Error('API_WORKBENCH_INVALID: environment.name')
+    const kind = draft.kind
+    if (kind !== 'local' && kind !== 'test' && kind !== 'production') throw new Error('API_WORKBENCH_INVALID: environment.kind')
+    const environment: ApiEnvironment = {
+      id: existing?.id ?? 'env_agent_new',
+      name,
+      kind,
+      variables: parseApiFields(draft.variables ?? []),
+    }
+    return { expectedRevision, ...(environmentId ? { environmentId } : {}), environment }
+  }
+  /** 审批卡只展示变量名与「已设置」状态，秘密值不回到渲染层。 */
+  function redactEnvironment(environment: ApiEnvironment): ApiEnvironment {
+    return {
+      ...environment,
+      variables: environment.variables.map((field) => ({
+        ...field,
+        value: field.secret || field.secretRef || /authorization|cookie|api[-_]?key|token|password|passwd|secret/i.test(field.name) ? '[REDACTED]' : field.value,
+      })),
+    }
   }
   /**
    * 请求草稿的「好不好用」提醒（不是拒绝）。
@@ -191,6 +242,28 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       })
       validateScenario(catalog, scenario)
       return { tool, preparedId: `${scenarioId ?? 'new'}_${expectedRevision}`, scenarioSave: { expectedRevision, scenario: { ...scenario, id: existing?.id ?? scenario.id }, ...(scenarioId ? { scenarioId } : {}) } }
+    }
+    /** 环境保存：变量取值在快照里遮罩，生产环境单独点名提醒。 */
+    if (tool === 'api_save_environment') {
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      current()
+      const pending = parseEnvironmentMutation(input, catalog)
+      /** 目录版本在解析之后复核，保证审批期间有人改动目录时批准立即失效。 */
+      if (catalog.revision !== pending.expectedRevision) throw new Error('API_WORKBENCH_PREPARED_STALE')
+      const redacted = redactEnvironment(pending.environment)
+      return {
+        tool,
+        preparedId: `${pending.environmentId ?? 'new'}_${pending.expectedRevision}`,
+        environmentSave: {
+          expectedRevision: pending.expectedRevision,
+          environment: redacted,
+          ...(pending.environmentId ? { environmentId: pending.environmentId } : {}),
+          warnings: [
+            ...(pending.environment.kind === 'production' ? ['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'] : []),
+            ...(pending.environment.variables.some((field) => field.name.trim() === '') ? ['有变量没有名字：没有名字的变量不会被任何请求引用'] : []),
+          ],
+        },
+      }
     }
     if (tool !== 'api_send_request' && tool !== 'api_save_request') throw new Error('API_AGENT_UNKNOWN_MUTATION')
     const args = mutation(tool, input)
@@ -361,6 +434,31 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       current()
       grants.delete('api_save_scenario:' + snapshot.preparedId)
       return { scenarioId: definition.id, catalogRevision: saved.revision, saved: true }
+    },
+    /**
+     * 保存环境（含公共变量，例如 `baseUrl`）：独立批准的配置变更。
+     *
+     * 这条补上「测试环境 http://127.0.0.1:18080 这种公共地址」的最后一环：
+     * Agent 可以用它建环境、写变量，之后请求的 URL 就能写成 `{{baseUrl}}/...`。
+     * @param input 工具入参（环境定义 + 目录版本）。
+     * @returns 落库后的环境身份与目录版本。
+     */
+    async saveEnvironment(input: unknown) {
+      const snapshot = await requireGrant('api_save_environment', input)
+      const pending = snapshot.environmentSave!
+      const catalog = await options.service.getCatalog(context.workspaceId)
+      writable()
+      /** 写入的是**未遮罩**的原始定义（秘密值由 Store 转密文），快照只用于展示。 */
+      const parsed = parseEnvironmentMutation(input, catalog)
+      const existing = pending.environmentId ? catalog.environments.find((item) => item.id === pending.environmentId) : undefined
+      const definition: ApiEnvironment = { ...parsed.environment, id: existing?.id ?? randomUUID() }
+      const environments = existing
+        ? catalog.environments.map((item) => item.id === existing.id ? definition : item)
+        : [...catalog.environments, definition]
+      const saved = await write(() => options.service.saveCatalog(context.workspaceId, pending.expectedRevision, { ...catalog, environments }))
+      current()
+      grants.delete('api_save_environment:' + snapshot.preparedId)
+      return { environmentId: definition.id, catalogRevision: saved.revision, saved: true }
     },
     /** 使用精确批准派发一次请求；停止 Agent 会同步取消对应网络任务。 */
     async send(input: unknown, signal?: AbortSignal): Promise<ApiAgentRunSummary> {

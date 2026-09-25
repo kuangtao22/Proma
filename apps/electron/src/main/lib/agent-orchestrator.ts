@@ -1511,7 +1511,7 @@ export class AgentOrchestrator {
         if (API_AGENT_TOOL_NAMES.some((name) => name === toolName)) {
           if (!apiFacade) return { behavior: 'deny', message: '当前会话不具备接口工作台能力' }
           /** 只有「会出网」与「会改目录」的四个工具需要逐次批准，其余只读工具直接放行。 */
-          if (!['api_send_request', 'api_save_request', 'api_run_scenario', 'api_save_scenario'].includes(toolName)) return { behavior: 'allow', updatedInput: input }
+          if (!['api_send_request', 'api_save_request', 'api_run_scenario', 'api_save_scenario', 'api_save_environment'].includes(toolName)) return { behavior: 'allow', updatedInput: input }
           try {
             if (toolName === 'api_send_request' && apiFacade.hasCompletedSend(input)) return { behavior: 'allow', updatedInput: input }
             /** 同一份场景身份已跑完：重复调用不再弹审批，也不会第二次出网。 */
@@ -1526,6 +1526,7 @@ export class AgentOrchestrator {
                 /** 场景运行：审批卡逐行展示即将发出的每一步方法与 URL。 */
                 ...(snapshot.scenario ? { scenario: snapshot.scenario } : {}),
                 ...(snapshot.scenarioSave ? { scenarioSave: snapshot.scenarioSave } : {}),
+                ...(snapshot.environmentSave ? { environmentSave: snapshot.environmentSave } : {}),
                 /** 审批卡要逐行展示附件真实路径与大小；这也是路径唯一离开主进程内存的场合（只给本机 UI）。 */
                 ...(snapshot.files ? { files: snapshot.files } : {}),
                 ...(snapshot.send ? { send: snapshot.send } : {}),

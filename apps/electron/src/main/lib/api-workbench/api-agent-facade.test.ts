@@ -102,6 +102,83 @@ describe('Agent 接口工作台授权边界', () => {
   })
 })
 
+describe('Agent 保存环境（公共地址与变量）', () => {
+  test('Given 未批准 When 保存环境 Then 拒绝且目录不变', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const pending = {
+        environment: { name: '测试环境', kind: 'test' as const, variables: [{ id: 'var_base', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true }] },
+        expectedRevision: catalog.revision,
+      }
+
+      await expect(f.facade.saveEnvironment(pending)).rejects.toThrow('APPROVAL_REQUIRED')
+      expect((await f.service.getCatalog('workspace')).environments).toEqual([])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 已批准 When 保存环境 Then 公共地址落库、秘密值只以密文引用保存且生产环境有提醒', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const pending = {
+        environment: {
+          name: '生产环境', kind: 'production' as const,
+          variables: [
+            { id: 'var_base', name: 'baseUrl', value: 'https://api.example.test', enabled: true },
+            { id: 'var_token', name: 'adminToken', value: 'secret-value-1', enabled: true, secret: true },
+          ],
+        },
+        expectedRevision: catalog.revision,
+      }
+
+      const snapshot = await f.facade.approval('api_save_environment', pending)
+
+      /** 审批卡只给变量名与遮罩值：界面与模型都拿不到明文。 */
+      expect(snapshot.environmentSave?.environment.variables.map((item) => `${item.name}=${item.value}`)).toEqual(['baseUrl=https://api.example.test', 'adminToken=[REDACTED]'])
+      expect(snapshot.environmentSave?.warnings).toEqual(['这是生产环境：请求会指向真实线上地址，请确认这些变量值来自生产'])
+
+      await f.facade.authorize('api_save_environment', pending, snapshot)
+      const saved = await f.facade.saveEnvironment(pending)
+      const stored = (await f.service.getCatalog('workspace')).environments.find((item) => item.id === saved.environmentId)!
+
+      expect(stored.name).toBe('生产环境')
+      expect(stored.kind).toBe('production')
+      /** 公共地址保持明文，供 {{baseUrl}} 解析；密钥类变量转成 safeStorage 密文引用。 */
+      expect(stored.variables.find((item) => item.name === 'baseUrl')?.value).toBe('https://api.example.test')
+      expect(stored.variables.find((item) => item.name === 'adminToken')?.value).toBe('')
+      expect(stored.variables.find((item) => item.name === 'adminToken')?.secretRef).toBeTruthy()
+    } finally { f.cleanup() }
+  })
+
+  test('Given 审批后目录被改动 When 保存环境 Then 整次批准失效', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const pending = {
+        environment: { name: '测试环境', kind: 'test' as const, variables: [{ id: 'var_base', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true }] },
+        expectedRevision: catalog.revision,
+      }
+      const snapshot = await f.facade.approval('api_save_environment', pending)
+      await f.service.saveCatalog('workspace', catalog.revision, catalog)
+
+      await expect(f.facade.authorize('api_save_environment', pending, snapshot)).rejects.toThrow('STALE')
+      expect((await f.service.getCatalog('workspace')).environments).toEqual([])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 环境类型非法 When 请求审批 Then 审批之前就拒绝', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      await expect(f.facade.approval('api_save_environment', {
+        environment: { name: '测试环境', kind: 'staging', variables: [] },
+        expectedRevision: catalog.revision,
+      })).rejects.toThrow('API_WORKBENCH_INVALID')
+    } finally { f.cleanup() }
+  })
+})
+
 test('Given 请求测试完成 When 另行批准保存 Then 仍可保存原草稿且不重发', async () => {
   const f = fixture()
   try {

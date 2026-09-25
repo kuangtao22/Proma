@@ -71,9 +71,48 @@ describe('把硬编码主机抽成集合变量', () => {
     expect(extractApiBaseUrlVariable(already, 'default').message).toBe('这个集合里没有硬编码主机的请求')
 
     const other = catalog([request('request_a', '别的服务', 'https://api.example.test/ping')], [{ id: 'var_x', name: 'x', value: '1', enabled: true }])
-    const result = extractApiBaseUrlVariable(other, 'default', 'baseUrl')
+    const result = extractApiBaseUrlVariable(other, 'default', { variableName: 'baseUrl' })
     expect(result.updated).toBe(1)
     expect(result.catalog.requests[0]?.url).toBe('{{baseUrl}}/ping')
+  })
+
+  test('Given 指定环境 When 抽取 Then 变量写进环境并把这些请求绑定到该环境', () => {
+    const source: ApiCatalog = {
+      ...catalog([
+        request('request_a', '管理员登录', 'http://127.0.0.1:18080/admin/v1/auth/login'),
+        request('request_b', '管理员列表', 'http://127.0.0.1:18080/admin/v1/admin-accounts/query'),
+      ]),
+      environments: [{ id: 'env_test', name: '测试环境', kind: 'test', variables: [] }],
+    }
+
+    const result = extractApiBaseUrlVariable(source, 'default', { environmentId: 'env_test' })
+
+    expect(result.target).toBe('environment')
+    expect(result.environmentName).toBe('测试环境')
+    expect(result.updated).toBe(2)
+    /** 变量落在环境里，集合变量保持为空；请求同时被绑定到该环境。 */
+    expect(result.catalog.collections[0]?.variables).toEqual([])
+    expect(result.catalog.environments[0]?.variables).toEqual([{ id: 'var_baseUrl', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true }])
+    expect(result.catalog.requests.map((item) => `${item.url}|${item.targetEnvironmentId}`)).toEqual([
+      '{{baseUrl}}/admin/v1/auth/login|env_test',
+      '{{baseUrl}}/admin/v1/admin-accounts/query|env_test',
+    ])
+  })
+
+  test('Given 目标环境不存在或环境里同名变量值不同 When 抽取 Then 拒绝且不改目录', () => {
+    const source: ApiCatalog = {
+      ...catalog([request('request_a', '管理员登录', 'http://127.0.0.1:18080/admin/v1/auth/login')]),
+      environments: [{ id: 'env_test', name: '测试环境', kind: 'test', variables: [{ id: 'var_baseUrl', name: 'baseUrl', value: 'https://prod.example.test', enabled: true }] }],
+    }
+
+    const missing = extractApiBaseUrlVariable(source, 'default', { environmentId: 'env_missing' })
+    expect(missing.updated).toBe(0)
+    expect(missing.message).toBe('目标环境不存在')
+
+    const conflict = extractApiBaseUrlVariable(source, 'default', { environmentId: 'env_test' })
+    expect(conflict.updated).toBe(0)
+    expect(conflict.message).toContain('环境「测试环境」里已有变量 baseUrl=https://prod.example.test')
+    expect(conflict.catalog.requests[0]?.url).toBe('http://127.0.0.1:18080/admin/v1/auth/login')
   })
 
   test('Given 主机大小写不同 When 抽取 Then 视为同一主机并只替换前缀', () => {

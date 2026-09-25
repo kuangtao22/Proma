@@ -26,6 +26,7 @@ import {
   Plus,
   Save,
   Search,
+  Server,
   Settings2,
   ShieldCheck,
   Terminal,
@@ -311,6 +312,7 @@ function CatalogPanel({
   onDeleteCollection,
   onCreateFolder,
   onExtractBaseUrl,
+  onExtractBaseUrlToEnvironment,
   onRenameFolder,
   onDeleteFolder,
   onExportSnapshot,
@@ -326,6 +328,8 @@ function CatalogPanel({
   onCreateFolder: (collection: ApiCollection) => void
   /** 把集合里硬编码的主机抽成 `baseUrl` 变量：批量导入后的一键整理。 */
   onExtractBaseUrl: (collection: ApiCollection) => void
+  /** 同上，但抽到当前选中的环境里，并把这些请求绑定到该环境（对应「测试环境 http://...」）。 */
+  onExtractBaseUrlToEnvironment: (collection: ApiCollection) => void
   onRenameFolder: (collectionId: string, folder: string) => void
   onDeleteFolder: (collectionId: string, folder: string) => void
   onExportSnapshot: () => void
@@ -383,6 +387,7 @@ function CatalogPanel({
                 <ToolButton label="新建请求" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateRequest(collection.id)}><Plus className="size-3" /></ToolButton>
                 <ToolButton label="新建文件夹" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateFolder(collection)}><FolderPlus className="size-3" /></ToolButton>
                 <ToolButton label="主机提取为变量" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrl(collection)}><Link2 className="size-3" /></ToolButton>
+                <ToolButton label="主机提取到环境" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrlToEnvironment(collection)}><Server className="size-3" /></ToolButton>
                 <ToolButton label="重命名集合" className="opacity-0 group-hover:opacity-100" onClick={() => onRenameCollection(collection)}><MoreHorizontal className="size-3" /></ToolButton>
                 <ToolButton label="删除集合" className="opacity-0 group-hover:opacity-100" onClick={() => onDeleteCollection(collection)}><Trash2 className="size-3" /></ToolButton>
               </div>
@@ -1508,6 +1513,29 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       .then((saved) => { if (saved) setNotice(`已把 ${preview.origin} 抽成 {{${preview.variableName}}}，改写 ${preview.updated} 条请求`) })
   }, [catalog, mutateCatalog])
 
+  /**
+   * 把硬编码主机抽到**当前选中的环境**里，并把这些请求绑定到该环境。
+   *
+   * 这才是「测试环境 http://127.0.0.1:18080」的标准形态：地址属于环境，请求只写 `{{baseUrl}}/...`，
+   * 换生产环境时改一处即可。没选环境时给出可行动提示，而不是默默抽成集合变量。
+   */
+  const extractBaseUrlToEnvironment = React.useCallback((collection: ApiCollection): void => {
+    if (!catalog) return
+    const environmentId = view.environmentId
+    if (!environmentId) {
+      setLoadError('先在右上角选择一个环境（例如「测试环境」），再把这个集合的主机提取到该环境')
+      return
+    }
+    const preview = extractApiBaseUrlVariable(catalog, collection.id, { environmentId })
+    if (!preview.variableName || preview.updated === 0) {
+      setLoadError(preview.message ?? '这个集合里没有可抽取的主机')
+      return
+    }
+    if (!window.confirm(`把 ${preview.origin} 抽成环境「${preview.environmentName}」的变量 {{${preview.variableName}}}？\n将改写并绑定 ${preview.updated} 条请求到该环境。`)) return
+    void mutateCatalog((latest) => extractApiBaseUrlVariable(latest, collection.id, { environmentId }).catalog)
+      .then((saved) => { if (saved) setNotice(`已把 ${preview.origin} 抽成环境「${preview.environmentName}」的 {{${preview.variableName}}}，并绑定 ${preview.updated} 条请求`) })
+  }, [catalog, mutateCatalog, view.environmentId])
+
   /** 保存当前请求并更新标签基线。 */
   const saveActive = React.useCallback(async (): Promise<void> => {
     if (!activeTab) return
@@ -1801,6 +1829,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     }}
     onCreateFolder={(collection) => setCatalogNameAction({ kind: 'create-folder', collection })}
     onExtractBaseUrl={extractBaseUrl}
+    onExtractBaseUrlToEnvironment={extractBaseUrlToEnvironment}
     onRenameFolder={(collectionId, folder) => setCatalogNameAction({ kind: 'rename-folder', collectionId, folder })}
     onDeleteFolder={(collectionId, folder) => {
       if (!window.confirm(`删除文件夹“${folder}”及其中所有请求？`)) return
