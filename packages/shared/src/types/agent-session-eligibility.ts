@@ -130,3 +130,26 @@ export function requireOrdinaryTopLevelAgentSession(
   if (!isOrdinaryTopLevelAgentSession(session)) throw new Error('Agent 会话不存在')
   return session
 }
+
+/**
+ * 接口工作台对会话形态的要求：普通顶层交互会话、未归档，且归属的项目仍然存在。
+ *
+ * 主进程与渲染层共用同一条判断：主进程据此拒绝越界调用并给出原因，
+ * 渲染层据此在不适用的会话里直接不提供入口（而不是等用户点开才看到错误码）。
+ * @param session 会话元数据；缺失表示会话已不可见。
+ * @param workspaceExists 该会话的 workspaceId 是否仍存在于项目索引。
+ * @returns 不允许时返回可直接展示给用户的中文原因；允许时返回 null。
+ */
+export function apiWorkbenchDenialReason(
+  session: AgentSessionMeta | undefined,
+  workspaceExists: boolean,
+): string | null {
+  if (!session) return '当前会话已不可见或已被删除'
+  if (session.archived) return '当前会话已归档；请在未归档的会话里打开接口工作台'
+  /** 探索子会话最容易被误用：它是派生出来的只读探索上下文，不承载出网与保存能力。 */
+  if (session.explorationParentSessionId !== undefined) return '这是探索子会话；请回到主会话打开接口工作台'
+  if (!isOrdinaryTopLevelAgentSession(session)) return '接口工作台只在普通交互会话可用（后台任务、委派与画布会话不开放）'
+  if (!session.workspaceId) return '当前会话没有归属项目；请先在项目里打开会话'
+  if (!workspaceExists) return '会话归属的项目已不存在；请重新选择项目'
+  return null
+}

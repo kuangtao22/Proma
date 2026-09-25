@@ -125,6 +125,7 @@ import { PreviewPanel } from '@/components/diff/PreviewPanel'
 import { clearPreviewContentCacheForFile } from '@/lib/preview-content-cache'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import type { FileEntry, AgentPendingFile, AgentSessionMeta, CanvasSessionMeta, SDKMessage, WorktreeInfo } from '@proma/shared'
+import { apiWorkbenchDenialReason } from '@proma/shared'
 import { setFilePanelDragData, getMediaTypeFromFilename, dispatchInsertFileMention } from '@/lib/file-panel-drag'
 import { CLOSE_ACTIVE_RIGHT_WORKSPACE_TAB_EVENT } from '@/lib/right-workspace-events'
 import {
@@ -608,6 +609,15 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const workspaces = useAtomValue(agentWorkspacesAtom)
   const sessions = useAtomValue(agentSessionsAtom)
   const currentWorkspaceId = sessions.find((session) => session.id === sessionId)?.workspaceId ?? selectedWorkspaceId
+  /**
+   * 接口工作台只对普通顶层交互会话开放：不适用的会话直接不提供入口，
+   * 万一标签已经开着也给出原因，而不是丢一个 API_ACCESS_DENIED 错误码。
+   */
+  const apiWorkbenchSession = sessions.find((item) => item.id === sessionId)
+  const apiWorkbenchDenial = apiWorkbenchDenialReason(
+    apiWorkbenchSession,
+    Boolean(apiWorkbenchSession?.workspaceId && workspaces.some((workspace) => workspace.id === apiWorkbenchSession.workspaceId)),
+  )
   const currentWorkspace = workspaces.find((workspace) => workspace.id === currentWorkspaceId)
   const workspaceSlug = currentWorkspace?.slug ?? null
   const projectRootPath = currentWorkspace?.projectRootPath ?? null
@@ -1757,7 +1767,8 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
       closable: true,
       activity: isAgentCanvasActivityUnread(canvas),
     })),
-    ...workspaceComponentTabs.map((component) => {
+    /** 接口工作台对不适用的会话不列在「添加标签」里，避免点开才发现不可用。 */
+    ...workspaceComponentTabs.filter((component) => component !== 'api-workbench' || apiWorkbenchDenial === null).map((component) => {
       const meta: Record<WorkspaceComponentTab, { label: string; icon: React.ReactNode }> = {
         todos: { label: 'Todo', icon: <ListTodo className="size-3.5" /> },
         calendar: { label: '日程', icon: <CalendarDays className="size-3.5" /> },
@@ -2189,11 +2200,20 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
     ) : paneTab === 'server-ops' ? (
       <ServerOpsWorkspace viewScope={`${sessionId}:${pane ?? 'single'}`} paneActive={paneActive} />
     ) : paneTab === 'api-workbench' ? (
-      <ApiWorkbench
-        sessionId={sessionId}
-        workspaceScope={currentWorkspaceId ?? undefined}
-        workspaceLabel={workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name}
-      />
+      apiWorkbenchDenial ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <div className="max-w-sm space-y-1 text-center">
+            <p className="text-sm font-medium">当前会话不能使用接口工作台</p>
+            <p className="text-xs text-muted-foreground">{apiWorkbenchDenial}</p>
+          </div>
+        </div>
+      ) : (
+        <ApiWorkbench
+          sessionId={sessionId}
+          workspaceScope={currentWorkspaceId ?? undefined}
+          workspaceLabel={workspaces.find((workspace) => workspace.id === currentWorkspaceId)?.name}
+        />
+      )
     ) : paneTab === 'changes' ? (
       sessionPath ? (
         <DiffChangesList

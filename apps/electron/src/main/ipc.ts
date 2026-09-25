@@ -1,4 +1,4 @@
-import { API_WORKBENCH_CHANNELS, isOrdinaryTopLevelAgentSession } from '@proma/shared'
+import { API_WORKBENCH_CHANNELS, apiWorkbenchDenialReason, isOrdinaryTopLevelAgentSession } from '@proma/shared'
 import { registerApiWorkbenchIpc } from './lib/api-workbench/api-ipc'
 import { getApiWorkbenchService, hasActiveApiWorkbenchRequests, setApiWorkbenchEventSink, setApiWorkbenchStreamSink, shutdownApiWorkbench } from './lib/api-workbench/api-workbench-singleton'
 /**
@@ -2332,8 +2332,11 @@ export function registerIpcHandlers(): void {
     isAuthorizedSender: (event) => listAuthorizedDesignWebContents().some((contents) => contents.id === event.sender.id),
     requireSession: (sessionId) => {
       const session = requireVisibleSession(sessionId)
-      if (!isOrdinaryTopLevelAgentSession(session) || session.archived || session.explorationParentSessionId !== undefined || !session.workspaceId || !getAgentWorkspace(session.workspaceId)) throw new Error('API_ACCESS_DENIED')
-      return { id: session.id, workspaceId: session.workspaceId }
+      const workspaceId = session.workspaceId
+      /** 拒绝时带上可行动原因：界面直接把这句话展示给用户，而不是只给一个错误码。 */
+      const denial = apiWorkbenchDenialReason(session, Boolean(workspaceId && getAgentWorkspace(workspaceId)))
+      if (denial || !workspaceId) throw new Error(`API_ACCESS_DENIED: ${denial ?? '当前会话不能使用接口工作台'}`)
+      return { id: session.id, workspaceId }
     },
     assertWorkspaceWritable: (workspaceId) => workspaceOperationGuard.assertWorkspaceWritable(workspaceId),
     runWorkspaceWrite: (workspaceId, effect) => workspaceOperationGuard.runWorkspaceWrite(workspaceId, effect),

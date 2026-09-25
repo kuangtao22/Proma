@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { isAgentSessionUserVisible, isOrdinaryTopLevelAgentSession, requireOrdinaryTopLevelAgentSession }
+import { apiWorkbenchDenialReason, isAgentSessionUserVisible, isOrdinaryTopLevelAgentSession, requireOrdinaryTopLevelAgentSession }
   from './agent-session-eligibility'
 import type { AgentSessionMeta } from './agent'
 
@@ -61,5 +61,35 @@ describe('Agent 会话归属与可见性判定', () => {
   test('Given 会话缺失 When 判定 Then 拒绝授权入口', () => {
     expect(isOrdinaryTopLevelAgentSession(undefined)).toBe(false)
     expect(() => requireOrdinaryTopLevelAgentSession(undefined)).toThrow('Agent 会话不存在')
+  })
+
+  test('Given 普通会话且有项目 When 判定接口工作台 Then 允许并给出可读原因', () => {
+    const session = createSession({ workspaceId: 'workspace-1' })
+
+    expect(apiWorkbenchDenialReason(session, true)).toBeNull()
+  })
+
+  test('Given 探索子会话 When 判定接口工作台 Then 明确提示回到主会话', () => {
+    /** 现场案例：在「探索」派生的子会话里点开接口标签，主进程按设计拒绝。 */
+    const session = createSession({ workspaceId: 'workspace-1', explorationParentSessionId: 'parent-1' })
+
+    expect(apiWorkbenchDenialReason(session, true)).toBe('这是探索子会话；请回到主会话打开接口工作台')
+  })
+
+  test('Given 归档、无项目或项目已删 When 判定接口工作台 Then 各自给出可行动原因', () => {
+    expect(apiWorkbenchDenialReason(createSession({ workspaceId: 'workspace-1', archived: true }), true))
+      .toBe('当前会话已归档；请在未归档的会话里打开接口工作台')
+    expect(apiWorkbenchDenialReason(createSession(), true))
+      .toBe('当前会话没有归属项目；请先在项目里打开会话')
+    expect(apiWorkbenchDenialReason(createSession({ workspaceId: 'workspace-1' }), false))
+      .toBe('会话归属的项目已不存在；请重新选择项目')
+    expect(apiWorkbenchDenialReason(undefined, true)).toBe('当前会话已不可见或已被删除')
+  })
+
+  test('Given 后台、委派或画布会话 When 判定接口工作台 Then 拒绝且不再单独提示项目', () => {
+    for (const override of [...ineligibleOverrides, { sourceAutomationId: 'automation-1' }, { sourceCanvasId: 'canvas-1' }]) {
+      expect(apiWorkbenchDenialReason(createSession({ workspaceId: 'workspace-1', ...override }), true))
+        .toBe('接口工作台只在普通交互会话可用（后台任务、委派与画布会话不开放）')
+    }
   })
 })
