@@ -209,7 +209,8 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
   lines.push(`保存到集合：${collectionId ?? '未知集合'}`)
   const diff = caseDiff(save?.caseDiff)
   if (diff.length === 0) lines.push('用例：本次没有改动')
-  return { kind: 'api-save', title: '保存接口定义', lines, files: [], steps: [], warnings: [], caseDiff: diff }
+  /** 保存审批要带上「好不好用」的提醒（名字、硬编码主机、空参数）。 */
+  return { kind: 'api-save', title: '保存接口定义', lines, files: [], steps: [], warnings: warnings(save?.warnings), caseDiff: diff }
 }
 
 /** 用例差异的展示文本，删除项单独标红由调用方处理。 */

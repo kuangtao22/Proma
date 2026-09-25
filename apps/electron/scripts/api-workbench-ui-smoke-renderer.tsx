@@ -186,6 +186,8 @@ Object.defineProperty(window, 'electronAPI', {
   },
 })
 Object.defineProperty(window, '__apiWorkbenchSmoke', { configurable: true, get: () => structuredClone(state) })
+/** smoke 夹具：确认框一律「确认」，避免隐藏窗口里的 window.confirm 把流程挂住。 */
+Object.defineProperty(window, 'confirm', { configurable: true, value: () => true })
 /** 记录「打开运行」事件：验证流程里的某一步能跳到它自己的运行记录。 */
 window.addEventListener('proma:open-api-run', (event) => {
   const detail = (event as CustomEvent<{ runId?: string }>).detail

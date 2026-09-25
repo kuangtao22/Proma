@@ -20,6 +20,7 @@ import {
   KeyRound,
   ListChecks,
   Menu,
+  Link2,
   MoreHorizontal,
   Play,
   Plus,
@@ -57,6 +58,7 @@ import {
   createApiCatalogSnapshotExport,
   createApiRequestDraft,
   createCurlCommand,
+  extractApiBaseUrlVariable,
   formatApiCaseReportCells,
   formatApiCaseReportMarkdown,
   mergeApiCatalogSnapshot,
@@ -308,6 +310,7 @@ function CatalogPanel({
   onRenameCollection,
   onDeleteCollection,
   onCreateFolder,
+  onExtractBaseUrl,
   onRenameFolder,
   onDeleteFolder,
   onExportSnapshot,
@@ -321,6 +324,8 @@ function CatalogPanel({
   onRenameCollection: (collection: ApiCollection) => void
   onDeleteCollection: (collection: ApiCollection) => void
   onCreateFolder: (collection: ApiCollection) => void
+  /** 把集合里硬编码的主机抽成 `baseUrl` 变量：批量导入后的一键整理。 */
+  onExtractBaseUrl: (collection: ApiCollection) => void
   onRenameFolder: (collectionId: string, folder: string) => void
   onDeleteFolder: (collectionId: string, folder: string) => void
   onExportSnapshot: () => void
@@ -377,6 +382,7 @@ function CatalogPanel({
                 </button>
                 <ToolButton label="新建请求" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateRequest(collection.id)}><Plus className="size-3" /></ToolButton>
                 <ToolButton label="新建文件夹" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateFolder(collection)}><FolderPlus className="size-3" /></ToolButton>
+                <ToolButton label="主机提取为变量" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrl(collection)}><Link2 className="size-3" /></ToolButton>
                 <ToolButton label="重命名集合" className="opacity-0 group-hover:opacity-100" onClick={() => onRenameCollection(collection)}><MoreHorizontal className="size-3" /></ToolButton>
                 <ToolButton label="删除集合" className="opacity-0 group-hover:opacity-100" onClick={() => onDeleteCollection(collection)}><Trash2 className="size-3" /></ToolButton>
               </div>
@@ -1484,6 +1490,24 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
     }
   }, [api, sessionId, setView])
 
+  /**
+   * 把集合里硬编码的主机一键抽成集合变量。
+   *
+   * 批量导入最常见的劣化就是「126 条请求各自写着同一个 host」；这里先在当前目录上算一遍，
+   * 把「抽哪个主机、改几条」讲清楚再落库，避免静默改写用户的请求。
+   */
+  const extractBaseUrl = React.useCallback((collection: ApiCollection): void => {
+    if (!catalog) return
+    const preview = extractApiBaseUrlVariable(catalog, collection.id)
+    if (!preview.variableName || preview.updated === 0) {
+      setLoadError(preview.message ?? '这个集合里没有可抽取的主机')
+      return
+    }
+    if (!window.confirm(`把 ${preview.origin} 抽成集合变量 {{${preview.variableName}}}？\n将改写 ${preview.updated} 条请求的 URL，其它请求不动。`)) return
+    void mutateCatalog((latest) => extractApiBaseUrlVariable(latest, collection.id).catalog)
+      .then((saved) => { if (saved) setNotice(`已把 ${preview.origin} 抽成 {{${preview.variableName}}}，改写 ${preview.updated} 条请求`) })
+  }, [catalog, mutateCatalog])
+
   /** 保存当前请求并更新标签基线。 */
   const saveActive = React.useCallback(async (): Promise<void> => {
     if (!activeTab) return
@@ -1776,6 +1800,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       void mutateCatalog((latest) => ({ ...latest, collections: latest.collections.filter((item) => item.id !== collection.id), requests: latest.requests.filter((request) => request.collectionId !== collection.id) }))
     }}
     onCreateFolder={(collection) => setCatalogNameAction({ kind: 'create-folder', collection })}
+    onExtractBaseUrl={extractBaseUrl}
     onRenameFolder={(collectionId, folder) => setCatalogNameAction({ kind: 'rename-folder', collectionId, folder })}
     onDeleteFolder={(collectionId, folder) => {
       if (!window.confirm(`删除文件夹“${folder}”及其中所有请求？`)) return

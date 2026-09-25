@@ -26,7 +26,15 @@ export interface ApiAgentApproval {
   files?: Array<{ field: string; path: string; sizeBytes: number }>
   /** 发送审批的结构化摘要：这次跑的是哪一组断言。 */
   send?: { caseId?: string; caseName?: string; assertionCount: number }
-  save?: { expectedRevision: number; requestName: string; collectionId: string; definition: ApiRequestDraft; caseDiff: ApiAgentCaseChange[] }
+  save?: {
+    expectedRevision: number
+    requestName: string
+    collectionId: string
+    definition: ApiRequestDraft
+    caseDiff: ApiAgentCaseChange[]
+    /** 请求质量提醒（名字/硬编码主机/空参数）：让人在批准前看见，也让模型有机会自己改。 */
+    warnings?: string[]
+  }
 }
 /** 一次普通 Agent 运行的真实身份与能力依赖。 */
 export interface ApiAgentFacadeOptions {
@@ -108,6 +116,36 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
     }
     throw new Error('API_AGENT_UNKNOWN_MUTATION')
   }
+  /**
+   * 请求草稿的「好不好用」提醒（不是拒绝）。
+   *
+   * 批量导入最容易留下的三种劣化：名字只是「方法 + 路径」（侧栏一截断全一样）、
+   * 每个请求都硬编码同一个主机（换环境要改 N 处）、JSON 正文是空对象 `{}`（参数其实没填）。
+   * 这些既回给模型让它自己纠正，也放进保存审批卡让人在批准前看见。
+   * @param catalog 当前目录，用于判断同一主机是否被多条请求重复硬编码。
+   * @param definition 待保存的请求草稿（已脱敏版本同样适用）。
+   * @returns 面向用户的中文提醒；没有明显问题时返回空数组。
+   */
+  function requestQualityWarnings(catalog: ApiCatalog, definition: ApiRequestDraft): string[] {
+    const warnings: string[] = []
+    /** 名字只剩「[端] 方法 /路径」时提醒业务化命名；带业务后缀（如「— 管理员登录」）不提醒。 */
+    if (/^(?:\[[^\]]+\]\s*)?(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+$/.test(definition.name.trim())) {
+      warnings.push(`「${definition.name}」这个名字是「方法 + 路径」生成的，建议改成业务可读名（例如「管理员登录」），否则侧栏截断后多条请求看起来一样`)
+    }
+    /** 主机被硬编码：同一 origin 在本集合里出现 ≥2 次就值得抽成变量。 */
+    const literalOrigin = /^(https?:\/\/[^/]+)\//i.exec(definition.url.trim())?.[1]?.toLowerCase()
+    if (literalOrigin) {
+      const sameOrigin = catalog.requests.filter((item) => item.collectionId === definition.collectionId && item.url.trim().toLowerCase().startsWith(`${literalOrigin}/`)).length + 1
+      if (sameOrigin >= 2) {
+        warnings.push(`有 ${sameOrigin} 条请求都把 ${literalOrigin} 写进 URL：建议在集合或环境里声明一个变量（例如 baseUrl），请求写成 {{baseUrl}}/... ，换环境时只改一处`)
+      }
+    }
+    /** JSON 正文是空对象：多半是「参数没填」而不是「真的不需要参数」。 */
+    if (definition.body.kind === 'json' && definition.body.text.replace(/\s/g, '') === '{}') {
+      warnings.push('JSON 正文是空对象 {}：确认是否需要补上请求参数，否则这条请求只能验证「有没有权限访问」')
+    }
+    return warnings
+  }
   /** 场景定义的关系校验：越界引用在弹审批卡之前就拒绝，不展示一份已经越界的确认框。 */
   function validateScenario(catalog: ApiCatalog, scenario: ApiScenario): void {
     if (scenario.steps.length === 0) throw new Error('API_WORKBENCH_SCENARIO_EMPTY: 流程至少需要一个步骤')
@@ -170,7 +208,14 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       )
       const fields = (rows: ApiRequestDraft['headers']) => rows.map((field) => ({ ...field, value: field.secret || field.secretRef || /authorization|cookie|api[-_]?key|token|password|secret/i.test(field.name) ? '[REDACTED]' : field.value }))
       const definition: ApiRequestDraft = { ...draft.request, cases: ownership.cases, headers: fields(draft.request.headers), query: fields(draft.request.query), body: { ...draft.request.body, text: redactApiBody(draft.request.body.text), fields: fields(draft.request.body.fields) }, auth: { ...draft.request.auth, value: { value: draft.request.auth.type === 'none' ? '' : '[REDACTED]' } } }
-      return { tool, preparedId: args.preparedId, preview: draft.preview, save: { expectedRevision: args.expectedRevision!, requestName: draft.request.name, collectionId: draft.request.collectionId, definition, caseDiff: ownership.diff } }
+      return {
+        tool, preparedId: args.preparedId, preview: draft.preview,
+        save: {
+          expectedRevision: args.expectedRevision!, requestName: draft.request.name, collectionId: draft.request.collectionId, definition, caseDiff: ownership.diff,
+          /** 批量导入最容易留下的三处劣化，先在审批卡上说清楚再让人批准。 */
+          warnings: requestQualityWarnings(catalog, definition),
+        },
+      }
     }
     const preview = await options.service.getPrepared(context, args.preparedId)
     current()
@@ -234,7 +279,7 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
       return { catalogRevision: catalog.revision, request }
     },
     /** 仅准备请求；允许局部草稿覆盖，绝不在 prepare 时出网或修改环境。 */
-    async prepare(input: unknown): Promise<ApiPreparedPreview> {
+    async prepare(input: unknown): Promise<ApiPreparedPreview & { draftWarnings?: string[] }> {
       current()
       if (drafts.size >= 128) throw new Error('API_AGENT_PREPARE_LIMIT')
       const args = apiRecord(input, ['request', 'requestId', 'environmentId', 'overrides', 'caseId'])
@@ -269,7 +314,9 @@ export function createApiAgentFacade(options: ApiAgentFacadeOptions) {
         ...(requestId ? { requestId } : {}),
         ...(args.caseId === undefined ? {} : { caseId: parseApiId(args.caseId) }),
       })
-      return preview
+      /** 顺手把「好不好用」的提醒回给模型：它可以在保存前自己改名字、抽主机变量、补参数。 */
+      const draftWarnings = requestQualityWarnings(catalog, request)
+      return draftWarnings.length > 0 ? { ...preview, draftWarnings } : preview
     },
     /** 仅准备一条流程：返回逐步清单与 preparedId，绝不出网。 */
     async prepareScenario(input: unknown): Promise<ApiScenarioPreparedPreview> {

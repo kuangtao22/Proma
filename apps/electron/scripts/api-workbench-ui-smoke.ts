@@ -136,6 +136,18 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     assert.equal(imported?.method, 'POST', '导入请求的方法不正确')
     assert.equal(imported?.body.kind, 'urlencoded', '导入请求的正文类型不正确')
     assert.equal(imported?.headers[0]?.value, 'curl', '导入请求的请求头不正确')
+    /** 批量导入整理：把集合里硬编码的主机一键抽成集合变量（确认框由夹具固定为确认）。 */
+    const extractClicked = await window.webContents.executeJavaScript(`(() => {
+      const section = [...document.querySelectorAll('section')].find((item) => item.textContent?.includes('/imported'))
+      const button = section?.querySelector('button[aria-label="主机提取为变量"]')
+      if (!(button instanceof HTMLButtonElement)) return false
+      button.click()
+      return true
+    })()`)
+    assert.equal(extractClicked, true, '集合菜单里没有「主机提取为变量」入口')
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.collections.some((item) => (item.variables ?? []).some((variable) => variable.name === 'baseUrl' && variable.value === 'https://api.example.com'))", '主机没有抽成集合变量')
+    await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => item.url === '{{baseUrl}}/imported')", '请求 URL 没有改写成 {{baseUrl}}')
+    console.log('[API Workbench UI smoke] 主机提取为集合变量已验证')
     console.log('[API Workbench UI smoke] cURL 导入与保存已验证')
     /** 导入集合快照：以新增方式合并，并提示需要重填的秘密。 */
     const snapshot = createApiCatalogSnapshotExport({
@@ -525,7 +537,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

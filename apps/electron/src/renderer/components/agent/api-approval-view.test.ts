@@ -111,6 +111,24 @@ describe('接口工作台审批卡视图', () => {
     expect(view?.caseDiff).toEqual([])
   })
 
+  test('Given 保存草稿存在质量劣化 When 解析 Then 把提醒一并列出', () => {
+    const view = describeApiWorkbenchApproval('api_save_request', {
+      preview: { requestName: '[后台] POST /admin/v1/x', request: { method: 'POST', url: 'http://127.0.0.1:18080/admin/v1/x' } },
+      save: {
+        collectionId: 'default',
+        warnings: [
+          '「[后台] POST /admin/v1/x」这个名字是「方法 + 路径」生成的，建议改成业务可读名',
+          '有 126 条请求都把 http://127.0.0.1:18080 写进 URL：建议在集合或环境里声明一个变量（例如 baseUrl）',
+        ],
+      },
+    })
+
+    expect(view?.warnings).toEqual([
+      '「[后台] POST /admin/v1/x」这个名字是「方法 + 路径」生成的，建议改成业务可读名',
+      '有 126 条请求都把 http://127.0.0.1:18080 写进 URL：建议在集合或环境里声明一个变量（例如 baseUrl）',
+    ])
+  })
+
   test('Given 快照缺字段或损坏 When 解析 Then 不猜测而是丢弃坏项', () => {
     expect(describeApiWorkbenchApproval('api_save_request', {})).toBeNull()
     expect(describeApiWorkbenchApproval('api_save_request', { preview: 'not-object' })).toBeNull()

@@ -112,6 +112,7 @@ export * from './server-ops-database-agent-policy'
 export * from './server-ops-agent-access-impact'
 
 export * from './api-workbench'
+export * from './api-workbench-base-url'
 export * from './api-workbench-curl'
 export * from './api-workbench-ipc'
 export * from './api-workbench-sharing'

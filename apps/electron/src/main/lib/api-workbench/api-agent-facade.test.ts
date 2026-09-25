@@ -471,3 +471,51 @@ describe('Agent 流程（场景）授权边界', () => {
     } finally { f.cleanup() }
   })
 })
+
+describe('批量导入的质量提醒', () => {
+  test('Given 名字只有方法加路径 When 准备 Then 回给模型业务化命名提醒', async () => {
+    const f = fixture()
+    try {
+      const prepared = await f.facade.prepare({ request: { name: '[后台] POST /admin/v1/admin-accounts/query', url: 'https://example.test/admin/v1/admin-accounts/query', method: 'POST' } })
+
+      expect(prepared.draftWarnings).toEqual([`「[后台] POST /admin/v1/admin-accounts/query」这个名字是「方法 + 路径」生成的，建议改成业务可读名（例如「管理员登录」），否则侧栏截断后多条请求看起来一样`])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 同一主机被多条请求硬编码 When 准备 Then 提醒抽成变量并给出条数', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const base = createApiRequestDraft(catalog.collections[0]?.id ?? 'default')
+      await f.service.saveCatalog('workspace', catalog.revision, { ...catalog, requests: [
+        { ...base, id: 'request_a', revision: 1, updatedAt: 1, name: '管理员登录', url: 'http://127.0.0.1:18080/admin/v1/auth/login', method: 'POST' },
+      ] })
+
+      const prepared = await f.facade.prepare({ request: { name: '管理员列表查询', url: 'http://127.0.0.1:18080/admin/v1/admin-accounts/query', method: 'POST' } })
+
+      expect(prepared.draftWarnings).toEqual(['有 2 条请求都把 http://127.0.0.1:18080 写进 URL：建议在集合或环境里声明一个变量（例如 baseUrl），请求写成 {{baseUrl}}/... ，换环境时只改一处'])
+    } finally { f.cleanup() }
+  })
+
+  test('Given JSON 正文是空对象 When 准备 Then 提醒确认参数是否漏填', async () => {
+    const f = fixture()
+    try {
+      const prepared = await f.facade.prepare({ request: { name: '管理员列表查询', url: 'https://example.test/query', method: 'POST', body: { kind: 'json', text: '{}', fields: [], files: [] } } })
+
+      expect(prepared.draftWarnings).toEqual(['JSON 正文是空对象 {}：确认是否需要补上请求参数，否则这条请求只能验证「有没有权限访问」'])
+    } finally { f.cleanup() }
+  })
+
+  test('Given 名字业务化且主机用变量且参数齐备 When 准备 Then 不产生噪音提醒', async () => {
+    const f = fixture()
+    try {
+      const catalog = await f.service.getCatalog('workspace')
+      const collectionId = catalog.collections[0]?.id ?? 'default'
+      await f.service.saveCatalog('workspace', catalog.revision, { ...catalog, collections: [{ ...catalog.collections[0]!, variables: [{ id: 'var_base', name: 'baseUrl', value: 'https://example.test', enabled: true }] }] })
+
+      const prepared = await f.facade.prepare({ request: { name: '管理员登录', collectionId, url: '{{baseUrl}}/admin/v1/auth/login', method: 'POST', body: { kind: 'json', text: '{"username":"admin"}', fields: [], files: [] } } })
+
+      expect(prepared.draftWarnings).toBeUndefined()
+    } finally { f.cleanup() }
+  })
+})
