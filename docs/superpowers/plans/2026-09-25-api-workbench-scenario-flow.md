@@ -58,14 +58,16 @@
 
 ## 6. 验收证据
 
-已完成第 1～3 步与真实端到端（第 4 步界面仍待做）：
+第 1～4 步与真实验收全部完成：
 
 | 验证 | 结果 | 日志 |
 | --- | --- | --- |
-| 定向回归（工作台主进程 / agent 组件 / preload / 共享合同） | 869 pass / 0 fail，104 文件 | `/tmp/proma-api-b12b-targeted.log`（B12b 记录）与本次运行输出 |
+| 定向回归（工作台主进程与界面 / agent 组件 / preload / 共享合同） | 917 pass / 0 fail，107 文件 | 本次运行输出 |
 | `bun run typecheck` | 7 workspace 全部通过 | — |
 | `bun run electron:build` | 通过，仅既有 EventKit 告警 | `/tmp/proma-api-b13-build.log` |
 | 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS，网络调用 19 次：Agent 准备流程（准备阶段只给方法 + 解析后 URL，0 次出网）→ **未批准运行被拒且 0 次出网** → 经真实权限服务「点允许」一次 → 两步按顺序出网、第二步确实带上了第一步提取的 `Bearer fixture-token-9` → 每步都有独立 runId → 重复调用复用同一次结论不再出网 → 流程摘要里没有秘密明文 | `/tmp/proma-api-b13-smoke.log` |
-| 真实界面（场景分区 + 运行确认 + 逐步结果） | 待实施（第 4 步） | — |
+| 真实界面（`api-workbench-ui-smoke.ts`） | PASS：流程分区列出「登录后看详情 · 用户模块 · 2 步 · 失败策略 停止」→ 运行确认框逐行列出 `1. 登录 · POST …`、`2. 用户详情 · GET …`、`1 条断言` 与 `环境：env_test` → 确认运行 → 逐步结果「登录：通过 / 用户详情：通过」含 `HTTP 200` → 点某一步的「运行」派发打开运行事件；截图 `/private/tmp/api-workbench-ui-scenario-confirm.png`、`/private/tmp/api-workbench-ui-scenario-result.png` | `/tmp/proma-api-b13-ui-smoke.log` |
+
+界面边界（有意保留）：界面只做**运行与看结果**（列表 / 一键运行确认框 / 逐步结果 / 跳转运行）；流程定义仍由 Agent 的 `api_save_scenario` 或导入维护，不在界面里编辑，避免出现两套定义真相。
 
 实施中再次踩到并确认的坑：**改了 `packages/shared` 的解析合同后必须先 `bun run electron:build`**，否则 smoke 用的 `dist/main.cjs` / `dist/preload.cjs` 还是旧解析器——旧目录白名单会把带 `scenarios` 的目录当成非法输入；本次的症状是**全链路挂起**（而不是清晰报错），因为主进程侧的解析失败让验收脚本停在等待里，最后只留下看门狗超时日志。
