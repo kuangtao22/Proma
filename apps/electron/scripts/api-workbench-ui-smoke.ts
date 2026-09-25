@@ -226,10 +226,29 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
         const opaque = getComputedStyle(header).opacity
         const label = header.querySelector('span')
         const labelStyle = label ? getComputedStyle(label) : undefined
+        /** 名称可用宽度看行内按钮（flex-1 容器）：旧实现里 6 个行内按钮会和它分摊行宽。 */
+        const rowButton = header.querySelector('button')
+        /** 一级行的可读性契约：没有折叠箭头、文件夹图标放大到 16px、名称不被按钮挤到截断。 */
+        const headerSvgs = [...header.querySelectorAll('svg')]
+        const hasChevron = headerSvgs.some((icon) => (icon.getAttribute('class') ?? '').includes('lucide-chevron'))
+        /** 只认一级行主体（按钮里的「新建文件夹」图标 FolderPlus 也在悬浮层内，必须排除）。 */
+        const folderIcon = headerSvgs.find((icon) => (icon.getAttribute('class') ?? '').includes('lucide-folder') && icon.closest('div.absolute') === null)
+        const folderIconSize = folderIcon ? Math.round(folderIcon.getBoundingClientRect().width) : 0
+        /** 操作按钮是右侧悬浮层：绝对定位、右边缘贴行，且不参与行内宽度分配。 */
+        const overlay = header.querySelector('div.absolute')
+        const overlayStyle = overlay ? getComputedStyle(overlay) : undefined
         return {
           name, inView, scrolled, width: Math.round(rect.width), height: Math.round(rect.height),
           rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
           labelColor: labelStyle?.color ?? 'none', labelSize: labelStyle?.fontSize ?? 'none', labelText: label?.textContent ?? '',
+          hasChevron, folderIconSize,
+          availableWidth: rowButton ? Math.round(rowButton.clientWidth) : 0,
+          nameTruncated: label ? label.scrollWidth > label.clientWidth + 1 : true,
+          rowWidth: Math.round(rect.width),
+          /** 未悬停时悬浮层应隐藏；right 取计算样式，避免 display:none 让 rect 全为 0 造成误判。 */
+          overlayHidden: overlayStyle?.display === 'none',
+          overlayPosition: overlayStyle?.position ?? 'none',
+          overlayRight: overlayStyle?.right ?? 'none',
         }
       })()`) as { name: string; inView: boolean; scrolled: boolean } | null
       console.log('[API Workbench UI smoke] 吸顶头行测量', JSON.stringify(sticky))
@@ -242,6 +261,55 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
       const stickyDetail = sticky as unknown as { labelColor: string; labelSize: string; labelText: string }
       assert.equal(stickyDetail.labelText, '后台接口', '吸顶头行文字不对')
       assert.notEqual(stickyDetail.labelColor, 'rgba(0, 0, 0, 0)', '吸顶头行文字被设成透明')
+      const headerDetail = sticky as unknown as {
+        hasChevron: boolean
+        folderIconSize: number
+        nameWidth: number
+        availableWidth: number
+        nameTruncated: boolean
+        rowWidth: number
+        overlayHidden: boolean
+        overlayPosition: string
+        overlayRight: string
+      }
+      assert.equal(headerDetail.hasChevron, false, '集合一级行仍在渲染折叠箭头')
+      assert.equal(headerDetail.folderIconSize, 16, `文件夹图标没有放大到 16px（当前 ${headerDetail.folderIconSize}px）`)
+      assert.equal(headerDetail.nameTruncated, false, '集合名称被操作按钮挤到截断（应完整显示）')
+      /** 名称可用宽度必须接近整行：旧实现里 6 个行内按钮会吃掉约 150px，这条断言就是那次回归的门禁。 */
+      assert.ok(
+        headerDetail.availableWidth >= headerDetail.rowWidth - 60,
+        `操作按钮仍占用行内宽度（名称可用 ${headerDetail.availableWidth}px / 行宽 ${headerDetail.rowWidth}px）`,
+      )
+      assert.equal(headerDetail.overlayPosition, 'absolute', '操作按钮没有改成右侧悬浮层')
+      assert.equal(headerDetail.overlayHidden, true, '未悬停时操作按钮不应常驻显示')
+      assert.equal(headerDetail.overlayRight, '4px', `操作按钮没有贴住行右侧（当前 right: ${headerDetail.overlayRight}）`)
+      /** 悬停浮现：用真实鼠标事件触发 :hover，再确认按钮层贴在右边缘、且没把名称挤窄。 */
+      stickyWindow.webContents.sendInputEvent({
+        type: 'mouseMove',
+        x: Math.round((sticky as unknown as { rect: { x: number; y: number; height: number } }).rect.x + 24),
+        y: Math.round((sticky as unknown as { rect: { x: number; y: number; height: number } }).rect.y + (sticky as unknown as { rect: { height: number } }).rect.height / 2),
+      })
+      await waitFor(stickyWindow, `(() => { const header = document.querySelector('[data-api-collection-header]'); const overlay = header?.querySelector('div.absolute'); return Boolean(overlay) && getComputedStyle(overlay).display === 'flex' })()`, '悬停后集合操作按钮没有浮现')
+      const hoveredOverlay = await stickyWindow.webContents.executeJavaScript(`(() => {
+        const header = document.querySelector('[data-api-collection-header]')
+        const overlay = header?.querySelector('div.absolute')
+        const label = header?.querySelector('span')
+        const rowButton = header?.querySelector('button')
+        if (!(header instanceof HTMLElement) || !(overlay instanceof HTMLElement) || !(label instanceof HTMLElement)) return null
+        const rowRect = header.getBoundingClientRect()
+        const overlayRect = overlay.getBoundingClientRect()
+        return {
+          rightGap: Math.round(rowRect.right - overlayRect.right),
+          availableWidth: rowButton ? Math.round(rowButton.clientWidth) : 0,
+          nameTruncated: label.scrollWidth > label.clientWidth + 1,
+          insideRow: overlayRect.left >= rowRect.left && overlayRect.right <= rowRect.right + 1,
+        }
+      })()`) as { rightGap: number; availableWidth: number; nameTruncated: boolean; insideRow: boolean } | null
+      assert.ok(hoveredOverlay, '悬停后取不到集合操作按钮')
+      const hovered = hoveredOverlay as { rightGap: number; availableWidth: number; nameTruncated: boolean; insideRow: boolean }
+      assert.ok(hovered.rightGap >= 0 && hovered.rightGap <= 8, `悬停时操作按钮没有贴住行右侧（距右边缘 ${hovered.rightGap}px）`)
+      assert.equal(hovered.insideRow, true, '悬停时操作按钮溢出了集合行')
+      assert.equal(hovered.availableWidth, headerDetail.availableWidth, '按钮浮现时集合名称被重新挤窄（应保持同宽）')
       console.log('[API Workbench UI smoke] 集合一级行吸顶已验证')
     } finally {
       stickyWindow.destroy()
