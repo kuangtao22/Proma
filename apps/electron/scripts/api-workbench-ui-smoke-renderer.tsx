@@ -3,7 +3,7 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { createStore, Provider } from 'jotai'
 import { createApiRequestDraft } from '@proma/shared'
-import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
+import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiScenarioRun, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
 import { ApiWorkbench } from '../src/renderer/components/api-workbench/ApiWorkbench'
 import { PermissionBanner } from '../src/renderer/components/agent/PermissionBanner'
 import { TooltipProvider } from '../src/renderer/components/ui/tooltip'
@@ -11,7 +11,7 @@ import { allPendingPermissionRequestsAtom } from '../src/renderer/atoms/agent-at
 import '../src/renderer/styles/globals.css'
 
 /** smoke 运行状态只记录公开计数和目录，不包含凭据。 */
-interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string; respondPermissionCalls: PermissionResponseRecord[] }
+interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string; respondPermissionCalls: PermissionResponseRecord[]; scenarioPrepareCalls: number; scenarioRunCalls: number; scenarioRun: ApiScenarioRun | null }
 
 /** 审批卡点击「允许/拒绝」时通过 preload 回传的载荷（夹具只记录，不真的授权）。 */
 interface PermissionResponseRecord { requestId: string; behavior: 'allow' | 'deny'; alwaysAllow: boolean }
@@ -20,6 +20,7 @@ interface PermissionResponseRecord { requestId: string; behavior: 'allow' | 'den
 const state: ApiSmokeState = {
   catalog: { version: 1, revision: 0, collections: [{ id: 'default', name: '默认集合', description: '', variables: [] }], environments: [], requests: [] },
   runs: [], cookies: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '', respondPermissionCalls: [],
+  scenarioPrepareCalls: 0, scenarioRunCalls: 0, scenarioRun: null,
 }
 /** 最近一次准备后的固定请求。 */
 let preparedRequest: ApiResolvedRequest | null = null
@@ -124,6 +125,47 @@ const api: ApiWorkbenchApi = {
   /** Cookie 面板只回元数据：夹具里也没有取值字段。 */
   /** 原生文件对话框由主进程打开；夹具直接回一个引用与元数据（不含路径）。 */
   pickApiFiles: async () => ({ files: [{ ref: 'file_fixture1', fileName: 'smoke.png', sizeBytes: 2048, contentType: 'image/png' }] }),
+  /** 流程：夹具扮演 Host 给出步骤清单与逐步结果，界面只负责展示与调度。 */
+  prepareScenario: async (input) => {
+    state.scenarioPrepareCalls += 1
+    return {
+      preparedId: 'prepared-scenario-smoke',
+      scenarioId: input.scenarioId,
+      scenarioName: '登录后看详情',
+      catalogRevision: state.catalog.revision,
+      environmentId: 'env_test',
+      onFailure: 'stop',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      warnings: [],
+      steps: [
+        { index: 0, stepId: 'step_login', name: '登录', requestId: 'request_login', method: 'POST', url: 'https://example.test/login', environmentKind: 'test', assertionCount: 1 },
+        { index: 1, stepId: 'step_profile', name: '用户详情', requestId: 'request_profile', method: 'GET', url: 'https://example.test/profile', environmentKind: 'test', assertionCount: 2 },
+      ],
+    }
+  },
+  runScenario: async (input) => {
+    state.scenarioRunCalls += 1
+    const run: ApiScenarioRun = {
+      id: 'scenario-run-smoke', workspaceId: 'workspace-smoke', sessionId: 'session-smoke', source: 'manual',
+      scenarioId: 'scenario_login_profile', scenarioName: '登录后看详情', catalogRevision: state.catalog.revision, environmentId: 'env_test',
+      state: 'completed', startedAt: Date.now() - 40, finishedAt: Date.now(),
+      steps: [
+        { stepId: 'step_login', name: '登录', state: 'passed', runId: 'run-step-login', status: 200, assertionPassed: 1, assertionTotal: 1, durationMs: 18 },
+        { stepId: 'step_profile', name: '用户详情', state: 'passed', runId: 'run-step-profile', status: 200, assertionPassed: 2, assertionTotal: 2, durationMs: 22 },
+      ],
+      assertions: [
+        { id: 'step_login', passed: true, expected: '步骤通过', actual: 'passed', message: '步骤通过' },
+        { id: 'step_profile', passed: true, expected: '步骤通过', actual: 'passed', message: '步骤通过' },
+      ],
+    }
+    state.scenarioRun = run
+    void input
+    return structuredClone(run)
+  },
+  cancelScenario: async () => undefined,
+  listScenarioRuns: async () => ({ runs: state.scenarioRun ? [structuredClone(state.scenarioRun)] : [], nextCursor: null }),
+  getScenarioRun: async (input) => structuredClone(state.scenarioRun ?? { id: input.scenarioRunId } as ApiScenarioRun),
   getCookieJar: async () => ({ cookies: state.cookies.map((item) => ({ ...item })) }),
   clearCookieJar: async () => {
     const cleared = state.cookies.length
@@ -144,6 +186,11 @@ Object.defineProperty(window, 'electronAPI', {
   },
 })
 Object.defineProperty(window, '__apiWorkbenchSmoke', { configurable: true, get: () => structuredClone(state) })
+/** 记录「打开运行」事件：验证流程里的某一步能跳到它自己的运行记录。 */
+window.addEventListener('proma:open-api-run', (event) => {
+  const detail = (event as CustomEvent<{ runId?: string }>).detail
+  ;(window as typeof window & { __apiWorkbenchOpenRun?: string }).__apiWorkbenchOpenRun = detail?.runId
+})
 /** smoke 唯一的流式注入入口；只接受已通过合同校验的事件。 */
 Object.defineProperty(window, '__apiWorkbenchEmitStream', {
   configurable: true,
@@ -173,6 +220,27 @@ if (new URLSearchParams(location.search).has('agent-case')) {
         { id: 'case_agent_ok', name: 'Agent 猜的下单成功', assertions: [{ id: 'agent_a', kind: 'status', path: '', expected: '201' }], source: 'agent' },
         { id: 'case_human_deny', name: '人工写的越权', assertions: [{ id: 'human_a', kind: 'status', path: '', expected: '403' }], source: 'user' },
       ],
+    }],
+  }
+}
+
+/** 流程窗口：夹具提供两条请求与一条引用它们的流程，用于验证「运行 → 逐步结果」。 */
+if (new URLSearchParams(location.search).has('scenario')) {
+  state.catalog = {
+    version: 1, revision: 6,
+    collections: [{ id: 'default', name: '后台', description: '', variables: [] }],
+    environments: [{ id: 'env_test', name: '测试环境', kind: 'test', variables: [] }],
+    requests: [
+      { ...createApiRequestDraft('default'), id: 'request_login', revision: 1, updatedAt: 1, name: '登录', method: 'POST', url: 'https://example.test/login' },
+      { ...createApiRequestDraft('default'), id: 'request_profile', revision: 1, updatedAt: 1, name: '用户详情', method: 'GET', url: 'https://example.test/profile' },
+    ],
+    scenarios: [{
+      id: 'scenario_login_profile', name: '登录后看详情', description: '', collectionId: 'default', folder: '用户模块',
+      steps: [
+        { id: 'step_login', name: '登录', requestId: 'request_login' },
+        { id: 'step_profile', name: '用户详情', requestId: 'request_profile', caseId: 'case_smoke' },
+      ],
+      environmentId: 'env_test', onFailure: 'stop', revision: 1, updatedAt: 1,
     }],
   }
 }

@@ -6,7 +6,7 @@ export interface ApiIpcEvent { sender: { id: number } }
 /** 服务对象由生产 singleton 或测试夹具提供。 */
 export interface ApiIpcDependencies {
   ipc: { handle(channel: string, listener: (event: ApiIpcEvent, input: unknown) => Promise<unknown>): void; removeHandler(channel: string): void }
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles' | 'prepareScenario' | 'runScenario' | 'cancelScenario' | 'listScenarioRuns' | 'getScenarioRun'>
   /**
    * 原生文件对话框由主进程打开；这是全流程唯一接受路径字符串的入口，
    * 渲染层与模型都只能拿到文件引用与元数据。
@@ -24,7 +24,7 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
     const command = parseApiCommand(value)
     const session = dependencies.requireSession(command.input.sessionId)
     const context = { workspaceId: session.workspaceId, sessionId: session.id, source: 'manual' as const }
-    if (['saveCatalog', 'send', 'pinRun'].includes(command.method)) dependencies.assertWorkspaceWritable?.(context.workspaceId)
+    if (['saveCatalog', 'send', 'pinRun', 'runScenario', 'cancelScenario'].includes(command.method)) dependencies.assertWorkspaceWritable?.(context.workspaceId)
     /** IPC 等待结束后再次验证窗口与会话，禁止迟到结果进入新的所有权范围。 */
     const assertCurrent = (): void => {
       if (!dependencies.isAuthorizedSender(event)) throw new Error('API_ACCESS_DENIED')
@@ -55,6 +55,12 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
         result = { files: service.registerPickedFiles(context.workspaceId, paths) }
         break
       }
+      /** 流程：准备只出步骤清单；运行/取消沿用同一条写租约；列表与读取是查询。 */
+      case 'prepareScenario': result = await service.prepareScenario(context, command.input); break
+      case 'runScenario': result = await write(() => service.runScenario(context, command.input.preparedId)); break
+      case 'cancelScenario': await service.cancelScenario(context, command.input.preparedId); result = undefined; break
+      case 'listScenarioRuns': result = await service.listScenarioRuns(context, command.input); break
+      case 'getScenarioRun': result = await service.getScenarioRun(context, command.input.scenarioRunId); break
     }
     assertCurrent()
     return parseApiResponse(command.method, result)

@@ -378,6 +378,37 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     } finally {
       approvalWindow.destroy()
     }
+    /** 流程分区：列表 → 运行确认框（列出步骤与目标环境）→ 逐步结果 → 打开某一步的运行。 */
+    const scenarioWindow = new BrowserWindow({ width: 1180, height: 760, show: false, backgroundColor: '#ffffff', webPreferences: { backgroundThrottling: false } })
+    try {
+      await scenarioWindow.loadURL(`${process.env.PROMA_API_UI_SMOKE_URL!}?scenario=1`)
+      await waitFor(scenarioWindow, "document.body.dataset.smokeReady === 'true' && document.body.textContent?.includes('登录后看详情')", '流程分区未挂载')
+      await clickLabel(scenarioWindow, '运行流程 登录后看详情')
+      await waitFor(scenarioWindow, "Boolean([...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open' && item.textContent?.includes('运行流程')))", '运行确认框未打开')
+      /** 确认框必须逐步列出「方法 + URL + 接口名 + 断言条数」，并给出环境。 */
+      assert.equal(await scenarioWindow.webContents.executeJavaScript(`(() => {
+        const dialog = [...document.querySelectorAll('[role=dialog]')].find((item) => item.getAttribute('data-state') === 'open')
+        const text = dialog?.textContent ?? ''
+        return text.includes('1. 登录 · POST https://example.test/login') && text.includes('2. 用户详情 · GET https://example.test/profile')
+          && text.includes('1 条断言') && text.includes('环境：env_test')
+      })()`), true, '运行确认框缺少步骤或环境')
+      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      await writeFile('/private/tmp/api-workbench-ui-scenario-confirm.png', (await scenarioWindow.webContents.capturePage()).toPNG())
+      await clickText(scenarioWindow, '确认运行')
+      await waitFor(scenarioWindow, "window.__apiWorkbenchSmoke.scenarioRunCalls === 1 && document.body.textContent?.includes('全部通过')", '流程没有跑出结果')
+      /** 桥接提交的正是准备好的身份，界面没有自行拼参数。 */
+      assert.equal(await scenarioWindow.webContents.executeJavaScript('window.__apiWorkbenchSmoke.scenarioPrepareCalls'), 1)
+      assert.equal(await scenarioWindow.webContents.executeJavaScript("document.body.textContent.includes('登录：通过') && document.body.textContent.includes('用户详情：通过')"), true, '逐步结果缺少步骤结论')
+      assert.equal(await scenarioWindow.webContents.executeJavaScript("document.body.textContent.includes('HTTP 200')"), true, '逐步结果缺少 HTTP 状态')
+      /** 点「运行」应打开该步的运行记录（SidePanel 监听的事件）。 */
+      await clickLabel(scenarioWindow, '打开步骤运行 用户详情')
+      await waitFor(scenarioWindow, "window.__apiWorkbenchOpenRun === 'run-step-profile'", '没有派发打开运行事件')
+      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      await writeFile('/private/tmp/api-workbench-ui-scenario-result.png', (await scenarioWindow.webContents.capturePage()).toPNG())
+      console.log('[API Workbench UI smoke] 流程运行、逐步结果与打开运行已验证')
+    } finally {
+      scenarioWindow.destroy()
+    }
     /** 历史载入编辑器：把运行里的真实请求还原成未保存草稿，并列出必须重填的遮罩位置。 */
     await clickLabel(window, '运行历史')
     await clickLabel(window, '打开运行 Smoke 请求')
@@ -467,7 +498,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

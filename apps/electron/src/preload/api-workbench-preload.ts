@@ -28,6 +28,11 @@ export function createApiWorkbenchPreload(invoke: ApiWorkbenchInvoke, subscribe:
     getCookieJar: (input) => call('getCookieJar', input),
     clearCookieJar: (input) => call('clearCookieJar', input),
     pickApiFiles: (input) => call('pickApiFiles', input),
+    prepareScenario: (input) => call('prepareScenario', input),
+    runScenario: (input) => call('runScenario', input),
+    cancelScenario: (input) => call('cancelScenario', input),
+    listScenarioRuns: (input) => call('listScenarioRuns', input),
+    getScenarioRun: (input) => call('getScenarioRun', input),
     onChanged: (callback) => subscribe(API_WORKBENCH_CHANNELS.CHANGED, (value) => { callback(parseApiRunChanged(value)) }),
     /** 流式事件同样先过 parser；损坏消息直接丢弃，不进入渲染层。 */
     onStream: (callback) => subscribe(API_WORKBENCH_CHANNELS.STREAM, (value) => {

@@ -119,6 +119,7 @@ import {
 } from './api-workbench-model'
 import type { ApiRunDiff, ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbenchRequestTab } from './api-workbench-model'
 import { ApiImportDialog } from './ApiImportDialog'
+import { ApiScenarioPanel } from './ApiScenarioPanel'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
 export const RESEND_API_RUN_EVENT = 'proma:resend-api-run'
@@ -291,6 +292,7 @@ function FieldRows({
 /** 请求目录，集合和文件夹操作都直接落到最新目录 revision。 */
 function CatalogPanel({
   catalog,
+  sessionId,
   activeTabId,
   onOpenRequest,
   onCreateRequest,
@@ -303,6 +305,7 @@ function CatalogPanel({
   onExportSnapshot,
 }: {
   catalog: ApiCatalog
+  sessionId: string
   activeTabId: string | null
   onOpenRequest: (request: ApiRequestDefinition) => void
   onCreateRequest: (collectionId: string, folder?: string) => void
@@ -391,6 +394,11 @@ function CatalogPanel({
             </section>
           )
         })}
+        <ApiScenarioPanel
+          sessionId={sessionId}
+          scenarios={catalog.scenarios ?? []}
+          requestNames={new Map(catalog.requests.map((request) => [request.id, request.name]))}
+        />
       </div>
     </aside>
   )
@@ -1749,6 +1757,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** 目录组件共用属性。 */
   const catalogPanel = <CatalogPanel
     catalog={catalog}
+    sessionId={sessionId}
     activeTabId={view.activeTabId}
     onOpenRequest={openRequest}
     onCreateRequest={createRequest}

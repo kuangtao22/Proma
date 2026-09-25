@@ -355,6 +355,12 @@ export interface ApiRunInput extends ApiTarget { runId: string; reveal?: boolean
 export interface ApiReadBodyInput extends ApiRunInput { offset?: number; limit?: number }
 /** 历史默认返回最新一页；cursor 为非负条目位置。 */
 export interface ApiListRunsInput extends ApiTarget { cursor?: number; limit?: number }
+/** 准备一条流程：界面先拿到步骤清单，人确认后再运行。 */
+export interface ApiPrepareScenarioInput extends ApiTarget { scenarioId: string; environmentId?: string; overrides?: ApiField[] }
+/** 运行/取消一条已准备的流程：只认 Host 签发的身份。 */
+export interface ApiScenarioPreparedInput extends ApiTarget { preparedId: string }
+/** 读取一条流程运行摘要。 */
+export interface ApiScenarioRunInput extends ApiTarget { scenarioRunId: string }
 /** 收藏保留同一个运行，不会再次发起请求。 */
 export interface ApiPinRunInput extends ApiTarget { runId: string; pinned: boolean }
 /** 事件只推送当前所属会话，正文通过专用读取按需获取。 */
@@ -380,6 +386,16 @@ export interface ApiWorkbenchApi {
   clearCookieJar(input: ApiTarget): Promise<{ cleared: number }>
   /** 打开原生文件对话框选择待上传文件；返回元数据，渲染层永远拿不到路径。 */
   pickApiFiles(input: ApiTarget): Promise<{ files: ApiPickedFile[] }>
+  /** 准备一条流程：只返回逐步清单，不出网。 */
+  prepareScenario(input: ApiPrepareScenarioInput): Promise<ApiScenarioPreparedPreview>
+  /** 运行已准备的流程：界面里人点「运行」即授权这一次。 */
+  runScenario(input: ApiScenarioPreparedInput): Promise<ApiScenarioRun>
+  /** 取消流程：只中止当前在途步骤。 */
+  cancelScenario(input: ApiScenarioPreparedInput): Promise<void>
+  /** 流程运行列表：摘要里没有正文与秘密。 */
+  listScenarioRuns(input: ApiListRunsInput): Promise<{ runs: ApiScenarioRun[]; nextCursor: number | null }>
+  /** 读取一条流程运行摘要。 */
+  getScenarioRun(input: ApiScenarioRunInput): Promise<ApiScenarioRun>
   onChanged(callback: (event: ApiRunChanged) => void): () => void
   onStream(callback: (event: ApiRunStreamChanged) => void): () => void
 }

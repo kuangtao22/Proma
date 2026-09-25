@@ -1,10 +1,10 @@
 import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
-import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview } from './api-workbench'
+import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview, ApiPrepareScenarioInput, ApiScenarioPreparedInput, ApiScenarioRunInput } from './api-workbench'
 
 /** IPC 命令的输入映射，拒绝用户自行声明 workspace。 */
-export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget }
+export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget; prepareScenario: ApiPrepareScenarioInput; runScenario: ApiScenarioPreparedInput; cancelScenario: ApiScenarioPreparedInput; listScenarioRuns: ApiListRunsInput; getScenarioRun: ApiScenarioRunInput }
 /** IPC 返回值映射，preload 必须验证实际响应。 */
-export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number }; pickApiFiles: { files: ApiPickedFile[] } }
+export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number }; pickApiFiles: { files: ApiPickedFile[] }; prepareScenario: ApiScenarioPreparedPreview; runScenario: ApiScenarioRun; cancelScenario: void; listScenarioRuns: { runs: ApiScenarioRun[]; nextCursor: number | null }; getScenarioRun: ApiScenarioRun }
 /** 严格分派所支持的方法。 */
 export type ApiCommandMethod = keyof ApiCommandInputs
 /** 方法与输入保持关联，主进程 switch 可直接收窄。 */
@@ -29,7 +29,7 @@ function target(record: Record<string, unknown>): ApiTarget { return parseApiTar
 /** 解析单个 IPC 命令，复制所有字段避免调用方后续变更输入。 */
 export function parseApiCommand(value: unknown): ApiCommand {
   const root = apiRecord(value, ['method', 'input'], 'command')
-  const method = one(root.method, ['getCatalog', 'saveCatalog', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar', 'pickApiFiles'])
+  const method = one(root.method, ['getCatalog', 'saveCatalog', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar', 'pickApiFiles', 'prepareScenario', 'runScenario', 'cancelScenario', 'listScenarioRuns', 'getScenarioRun'])
   switch (method) {
     case 'getCatalog': return { method, input: parseApiTarget(root.input) }
     case 'saveCatalog': {
@@ -64,6 +64,23 @@ export function parseApiCommand(value: unknown): ApiCommand {
     case 'getRuntimeVariables': case 'clearRuntimeVariables': return { method, input: parseApiTarget(root.input) }
     case 'getCookieJar': case 'clearCookieJar': return { method, input: parseApiTarget(root.input) }
     case 'pickApiFiles': return { method, input: parseApiTarget(root.input) }
+    /** 流程：准备只带场景身份与环境，运行/取消只认 Host 签发的 preparedId。 */
+    case 'prepareScenario': {
+      const input = apiRecord(root.input, ['sessionId', 'scenarioId', 'environmentId', 'overrides'])
+      return { method, input: { ...target(input), scenarioId: parseApiId(input.scenarioId), ...(input.environmentId === undefined ? {} : { environmentId: parseApiId(input.environmentId) }), ...(input.overrides === undefined ? {} : { overrides: parseApiFields(input.overrides) }) } }
+    }
+    case 'runScenario': case 'cancelScenario': {
+      const input = apiRecord(root.input, ['sessionId', 'preparedId'])
+      return { method, input: { ...target(input), preparedId: parseApiId(input.preparedId) } }
+    }
+    case 'listScenarioRuns': {
+      const input = apiRecord(root.input, ['sessionId', 'cursor', 'limit'])
+      return { method, input: { ...target(input), ...(input.cursor === undefined ? {} : { cursor: apiInteger(input.cursor, 0, API_LIMITS.maxScenarioRuns, 'cursor') }), ...(input.limit === undefined ? {} : { limit: apiInteger(input.limit, 1, 50, 'limit') }) } }
+    }
+    case 'getScenarioRun': {
+      const input = apiRecord(root.input, ['sessionId', 'scenarioRunId'])
+      return { method, input: { ...target(input), scenarioRunId: parseApiId(input.scenarioRunId) } }
+    }
   }
 }
 /** 原始响应头值允许协议字符，但始终限定字符串长度。 */
@@ -328,6 +345,15 @@ export function parseApiResponse<M extends ApiCommandMethod>(method: M, value: u
       result = { runs: list(record.runs, parseApiRun, 50), nextCursor: record.nextCursor === null ? null : apiInteger(record.nextCursor, 0, API_LIMITS.maxRuns, 'nextCursor') }; break
     }
     case 'cancel': if (value !== undefined && value !== null) return bad('cancel.result'); result = undefined; break
+    /** 流程：准备回执是步骤清单，运行/读取回执是紧凑摘要。 */
+    case 'prepareScenario': result = parseApiScenarioPreparedPreview(value); break
+    case 'runScenario': case 'getScenarioRun': result = parseApiScenarioRun(value); break
+    case 'cancelScenario': if (value !== undefined && value !== null) return bad('cancelScenario.result'); result = undefined; break
+    case 'listScenarioRuns': {
+      const record = apiRecord(value, ['runs', 'nextCursor'])
+      result = { runs: list(record.runs, parseApiScenarioRun, 50), nextCursor: record.nextCursor === null ? null : apiInteger(record.nextCursor, 0, API_LIMITS.maxScenarioRuns, 'nextCursor') }
+      break
+    }
   }
   return result as ApiCommandResults[M]
 }
