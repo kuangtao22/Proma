@@ -1,19 +1,25 @@
 import '@fontsource-variable/inter/index.css'
 import * as React from 'react'
 import { createRoot } from 'react-dom/client'
+import { createStore, Provider } from 'jotai'
 import { createApiRequestDraft } from '@proma/shared'
-import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiWorkbenchApi } from '@proma/shared'
+import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
 import { ApiWorkbench } from '../src/renderer/components/api-workbench/ApiWorkbench'
+import { PermissionBanner } from '../src/renderer/components/agent/PermissionBanner'
 import { TooltipProvider } from '../src/renderer/components/ui/tooltip'
+import { allPendingPermissionRequestsAtom } from '../src/renderer/atoms/agent-atoms'
 import '../src/renderer/styles/globals.css'
 
 /** smoke 运行状态只记录公开计数和目录，不包含凭据。 */
-interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string }
+interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string; respondPermissionCalls: PermissionResponseRecord[] }
+
+/** 审批卡点击「允许/拒绝」时通过 preload 回传的载荷（夹具只记录，不真的授权）。 */
+interface PermissionResponseRecord { requestId: string; behavior: 'allow' | 'deny'; alwaysAllow: boolean }
 
 /** 初始目录提供一个可点击集合。 */
 const state: ApiSmokeState = {
   catalog: { version: 1, revision: 0, collections: [{ id: 'default', name: '默认集合', description: '', variables: [] }], environments: [], requests: [] },
-  runs: [], cookies: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '',
+  runs: [], cookies: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '', respondPermissionCalls: [],
 }
 /** 最近一次准备后的固定请求。 */
 let preparedRequest: ApiResolvedRequest | null = null
@@ -128,7 +134,15 @@ const api: ApiWorkbenchApi = {
 
 /** 让生产组件读取合成 preload，并向 Electron 验收暴露只读状态。 */
 /** 复制走真实 preload 能力：这里记录文本，供 smoke 校验报告内容。 */
-Object.defineProperty(window, 'electronAPI', { configurable: true, value: { apiWorkbench: api, writeClipboardText: async (text: string) => { state.clipboard = text } } })
+/** respondPermission 记录载荷：审批卡的「允许」必须走这条真实通道，而不是直接改状态。 */
+Object.defineProperty(window, 'electronAPI', {
+  configurable: true,
+  value: {
+    apiWorkbench: api,
+    writeClipboardText: async (text: string) => { state.clipboard = text },
+    respondPermission: async (response: PermissionResponseRecord) => { state.respondPermissionCalls.push({ ...response }) },
+  },
+})
 Object.defineProperty(window, '__apiWorkbenchSmoke', { configurable: true, get: () => structuredClone(state) })
 /** smoke 唯一的流式注入入口；只接受已通过合同校验的事件。 */
 Object.defineProperty(window, '__apiWorkbenchEmitStream', {
@@ -169,4 +183,42 @@ function SmokeApp(): React.ReactElement {
   return <TooltipProvider delayDuration={0}><div className="h-screen w-screen bg-background"><ApiWorkbench sessionId="session-smoke" workspaceScope="workspace-smoke" /></div></TooltipProvider>
 }
 
-createRoot(document.getElementById('root')!).render(<SmokeApp />)
+/**
+ * 审批卡窗口：夹具扮演 Host 推入一条「Agent 指定文件」的发送审批，
+ * 重点是让「允许」按钮走真实组件逻辑（respondPermission），而不是 smoke 直接改状态。
+ */
+function ApprovalApp(): React.ReactElement {
+  React.useEffect(() => { document.body.dataset.smokeReady = 'true' }, [])
+  return (
+    <TooltipProvider delayDuration={0}>
+      <div className="flex h-screen w-screen items-end bg-background">
+        <PermissionBanner sessionId="session-approval" onStop={() => undefined} />
+      </div>
+    </TooltipProvider>
+  )
+}
+
+/** 夹具里的审批请求：工具名、附件行与真实运行同形，路径用 realpath 形态。 */
+const approvalRequest: PermissionRequest = {
+  requestId: 'permission-smoke',
+  sessionId: 'session-approval',
+  toolName: 'api_send_request',
+  toolInput: {
+    preparedId: 'prepared-smoke',
+    preview: { requestName: 'Agent 上传附件', environmentId: 'env_test', request: { method: 'POST', url: 'https://example.test/upload' } },
+    send: { assertionCount: 0 },
+    files: [{ field: 'file', path: '/Users/ada/secret/id_rsa', sizeBytes: 1675 }],
+  },
+  description: '发送接口请求',
+  dangerLevel: 'dangerous',
+  allowAlways: false,
+}
+
+const search = new URLSearchParams(location.search)
+if (search.has('approval')) {
+  const store = createStore()
+  store.set(allPendingPermissionRequestsAtom, new Map([['session-approval', [approvalRequest]]]))
+  createRoot(document.getElementById('root')!).render(<Provider store={store}><ApprovalApp /></Provider>)
+} else {
+  createRoot(document.getElementById('root')!).render(<SmokeApp />)
+}

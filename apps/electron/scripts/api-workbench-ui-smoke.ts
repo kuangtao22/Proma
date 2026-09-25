@@ -357,6 +357,27 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     } finally {
       agentWindow.destroy()
     }
+    /** 审批卡：真实点击「允许」必须走 respondPermission 通道，附件行显示的是 realpath 与大小。 */
+    const approvalWindow = new BrowserWindow({ width: 900, height: 520, show: false, backgroundColor: '#ffffff', webPreferences: { backgroundThrottling: false } })
+    try {
+      await approvalWindow.loadURL(`${process.env.PROMA_API_UI_SMOKE_URL!}?approval=1`)
+      await waitFor(approvalWindow, "document.body.dataset.smokeReady === 'true' && document.body.textContent?.includes('本次将读取并上传的文件')", '审批卡未挂载')
+      assert.equal(await approvalWindow.webContents.executeJavaScript("document.body.textContent.includes('字段 file：/Users/ada/secret/id_rsa（1675 字节）')"), true, '审批卡没有逐行显示字段/真实路径/大小')
+      assert.equal(await approvalWindow.webContents.executeJavaScript("document.body.textContent.includes('POST https://example.test/upload')"), true, '审批卡缺少目标请求')
+      /** 「总是允许」对出网审批必须缺席：附件审批只能逐次确认。 */
+      assert.equal(await approvalWindow.webContents.executeJavaScript("[...document.querySelectorAll('button')].some((item) => item.textContent?.includes('总是允许'))"), false, '出网审批不该提供会话白名单')
+      await clickText(approvalWindow, '允许')
+      await waitFor(approvalWindow, 'window.__apiWorkbenchSmoke.respondPermissionCalls.length === 1', '「允许」没有走 respondPermission 通道')
+      const response = await approvalWindow.webContents.executeJavaScript('window.__apiWorkbenchSmoke.respondPermissionCalls[0]')
+      assert.deepEqual(response, { requestId: 'permission-smoke', behavior: 'allow', alwaysAllow: false })
+      /** 批准后卡片必须出队，不能留在聊天流里重复展示。 */
+      await waitFor(approvalWindow, "!document.body.textContent.includes('本次将读取并上传的文件')", '批准后审批卡没有出队')
+      await new Promise<void>((resolve) => setTimeout(resolve, 200))
+      await writeFile('/private/tmp/api-workbench-ui-approval.png', (await approvalWindow.webContents.capturePage()).toPNG())
+      console.log('[API Workbench UI smoke] 审批卡附件行与「允许」通道已验证')
+    } finally {
+      approvalWindow.destroy()
+    }
     /** 历史载入编辑器：把运行里的真实请求还原成未保存草稿，并列出必须重填的遮罩位置。 */
     await clickLabel(window, '运行历史')
     await clickLabel(window, '打开运行 Smoke 请求')
@@ -446,7 +467,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

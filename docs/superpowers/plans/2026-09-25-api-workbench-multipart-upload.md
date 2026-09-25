@@ -58,18 +58,27 @@
 - **字节读取时点**：B12a 原本在 prepare 阶段读字节合成 `bodyBase64` + `attachments`，本轮改成**真正派发时**（`send`）读取——否则 Agent 声明的文件会在用户批准之前被读。已知大小之和仍会在 prepare 阶段先判 `API_WORKBENCH_MULTIPART_TOO_LARGE`，避免为发不出去的请求弹确认。
 - **审批卡**：复用 `api-approval-view` 与 `PermissionBanner`，新增「本次将读取并上传的文件（批准后才读取字节）」区块，逐行 `字段 X：<realpath>（n 字节）`，并写明符号链接已按 realpath 展开、目录与特殊文件不会出现。
 - **失败可行动**：目录/设备/FIFO → `API_WORKBENCH_FILE_INVALID_TYPE`；悬空链接/不存在 → `_MISSING`；超 16 个 → `_FILE_LIMIT`；声明了文件但正文不是 multipart → `API_WORKBENCH_INVALID: body.files.multipartOnly`；批量登记中任一条非法整批回滚，准备失败也会回滚已登记的引用（否则失败的准备会白占文件槽位）。
+- **批准来源是真按钮**：验收不再自己调 `authorize`，而是与 orchestrator 相同地组装 `{...input, preview, files, send}` 交给真实 `AgentPermissionService.requestSingleApproval`，再由「用户点按钮」触发 `respondToPermission`（`ipc.ts` 的 `PERMISSION_RESPOND` 分支就是这个调用），只有 `allow` 才登记精确授权；`deny` 之后 preparedId 依旧不能发送。
 
 | 验证 | 结果 | 日志 |
 | --- | --- | --- |
-| 定向回归（工作台主进程 / agent 组件 / preload / 共享合同与 IPC） | 417 pass / 0 fail，61 文件 | `/tmp/proma-api-b12b-targeted.log` |
+| 定向回归（工作台主进程 / agent 组件 / preload / 共享合同与 IPC / 发布版本校验） | 431 pass / 0 fail，63 文件 | `/tmp/proma-api-b12b-targeted.log` |
 | 全量回归（`bun test --isolate`） | 8169 pass / 6 skip / 5 fail；5 条失败都在未改动文件里（`release-workflow.test.ts` 2 条、`agent-service-route-rebind.test.ts` 3 条 `assertAgentSessionAcceptsInput is not defined`），与本增量无关 | `/tmp/proma-b12b-full-escalated.log` |
 | `bun run typecheck` | 7 workspace 全部通过 | `/tmp/proma-api-b12b-typecheck.log` |
 | `bun run electron:build` | 通过，仅既有 EventKit 告警 | `/tmp/proma-api-b12b-build.log` |
-| 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS，网络调用 17 次：Agent 声明符号链接路径 → 准备回执不含真实路径、摘要用真实文件名 → **未批准发送被拒且 0 次网络调用** → 审批快照给出 `{field:'file', path: realpath, sizeBytes}` → 批准后服务端逐字节收到附件、文件名来自 realpath → 运行记录只有 sha256 摘要、无路径无字节 → 批准后换文件被 `FILE_CHANGED` 拒绝（网络调用数不变）→ 目录与 `/dev/null` 在准备阶段被拒 | `/tmp/proma-api-b12b-smoke.log` |
-| 真实界面（`api-workbench-ui-smoke.ts`） | PASS（无回归）：multipart 选择文件、文件行、保存后定义只含引用元数据仍全部通过 | `/tmp/proma-api-b12b-ui-smoke.log` |
+| 真实 Electron 端到端（`api-workbench-smoke.ts`） | PASS，网络调用 17 次：Agent 声明符号链接路径 → 准备回执不含真实路径、摘要用真实文件名 → **未批准发送被拒且 0 次网络调用** → 审批快照给出 `{field:'file', path: realpath, sizeBytes}` → **真实权限服务批准后才登记授权**（拒绝时 preparedId 仍不可发送）→ 批准后服务端逐字节收到附件、文件名来自 realpath → 运行记录只有 sha256 摘要、无路径无字节 → 批准后换文件被 `FILE_CHANGED` 拒绝（网络调用数不变）→ 目录与 `/dev/null` 在准备阶段被拒 | `/tmp/proma-api-b12b-smoke.log` |
+| 真实界面（`api-workbench-ui-smoke.ts`） | PASS：multipart 选择文件与保存无回归，且审批卡真实点击验收——卡片逐行显示 `字段 file：/Users/ada/secret/id_rsa（1675 字节）`、出网审批不提供「总是允许」、点击「允许」后经真实 `respondPermission` 回传 `{behavior:'allow', alwaysAllow:false}` 并出队；截图 `/private/tmp/api-workbench-ui-approval.png` | `/tmp/proma-api-b12b-ui-smoke.log` |
+| 打包冒烟（`bun run dist:mac`） | PASS：产出 `Proma-0.19.53-bone.9-macos-arm64.dmg` / `.zip`；包内 `Info.plist` 版本为 `0.19.53-bone.9`，`app.asar` 能查到 B12b 专属错误码（证明新代码进了安装包） | `/tmp/proma-api-b12b-dist-mac.log` |
+
+发布元数据：`apps/electron/package.json` 递增为 `0.19.53-bone.9`，并补 `release-notes/bone/v0.19.53-bone.9.md`（覆盖 bone.8 之后未发布的**接口工作台阶段 A–B12b** 与**本机数据源凭据发现 L1**）。发布标签 `v0.19.53-bone.9` 未创建（推 `v*` 标签会触发 GitHub Release 工作流），需要单独确认。
 
 已知边界（有意保留）：
 
 - 模型自己的工具调用参数（含路径）由 SDK 写进会话记录，这一点不由本应用控制；本应用保证的是**自己的**请求定义、运行记录、预览与模型回执里不再出现路径。
 - 保存下来的请求只保留引用，重启后引用失效，必须重新声明路径或重新选择文件（这正是「路径不入库」的代价）。
 - 审批快照里的附件行只随权限事件发到本机渲染进程用于展示（Agent 岛、桌面通知与 LAN 订阅只读工具名/状态，拿不到附件行），不落盘、不复用。
+
+踩坑（本次新增，已记入 MEMORY）：
+
+- macOS 的 `/tmp` 经 `/var → /private/var` realpath 后路径会变一层，凡是拿 realpath 做断言的测试/验收都必须先把临时根 realpath 化，否则出现「路径差一层」的假失败。
+- `bun run dist:mac` 会按设计裁剪 `apps/electron/node_modules` 里的运行时依赖（`electron` 与 `@proma/*` 一并被清掉），打包后直接再跑验收脚本会报 `Cannot find module '@proma/shared'`，必须先 `bun install --frozen-lockfile` 恢复开发依赖。

@@ -7,7 +7,8 @@ import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
 import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
 import { API_WORKBENCH_CHANNELS, createApiCaseReportRow, createApiRequestDraft, apiDraftFromDefinition, formatApiCaseReportMarkdown } from '@proma/shared'
-import type { AgentSessionMeta, ApiCatalog, ApiPreparedPreview, ApiRun, ApiWorkbenchApi } from '@proma/shared'
+import type { AgentSessionMeta, ApiCatalog, ApiPreparedPreview, ApiRun, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
+import { AgentPermissionService } from '../src/main/lib/agent-permission-service'
 import { ApiWorkbenchService } from '../src/main/lib/api-workbench/api-workbench-service'
 import { ApiWorkbenchStore } from '../src/main/lib/api-workbench/api-workbench-store'
 import { ApiRuntimeClient } from '../src/main/lib/api-workbench/api-runtime-client'
@@ -138,6 +139,35 @@ async function smoke(): Promise<void> {
   }
   const abort = new AbortController()
   const facade = createApiAgentFacade({ sessionId: 'smoke-session', toolMode: 'standard', getSession: () => ({ id: 'smoke-session', workspaceId: 'smoke-project' } as AgentSessionMeta), service, runSignal: abort.signal, assertRunActive: () => { assert.equal(abort.signal.aborted, false) } })!
+  /** 真实权限服务：批准来源必须是「审批卡上的按钮」这条路，而不是验收自己调 authorize。 */
+  const permissionService = new AgentPermissionService()
+  /** 扮演 orchestrator 推给界面的卡片；真实应用里这一步会经 permission_request 事件进渲染进程。 */
+  const approvalCards: PermissionRequest[] = []
+  let approvalCount = 0
+  /**
+   * 按生产装配走一次审批：与 agent-orchestrator 相同地组装 `{...input, preview, files, send}`，
+   * 再由「用户点按钮」触发 `respondToPermission`（ipc.ts 的 PERMISSION_RESPOND 分支就是这么调的）。
+   * @param input 发送工具入参（只有 preparedId）。
+   * @param behavior 卡片上被点击的按钮。
+   * @returns 权限判定与卡片上实际展示的附件行。
+   */
+  async function resolveSendApproval(input: { preparedId: string }, behavior: 'allow' | 'deny'): Promise<{ behavior: string; cardFiles: unknown }> {
+    const snapshot = await facade.approval('api_send_request', input)
+    const controller = new AbortController()
+    const pending = permissionService.requestSingleApproval('smoke-session', 'api_send_request', {
+      ...input,
+      preview: snapshot.preview,
+      ...(snapshot.files ? { files: snapshot.files } : {}),
+      ...(snapshot.send ? { send: snapshot.send } : {}),
+    }, { signal: controller.signal, toolUseID: `tool-approval-${approvalCount++}` }, (request) => { approvalCards.push(request) })
+    const card = approvalCards.at(-1)
+    assert.ok(card, '审批卡没有推到界面')
+    /** 点了「允许/拒绝」：只有 allow 才会让 orchestrator 去登记精确授权。 */
+    assert.equal(permissionService.respondToPermission(card.requestId, behavior, false), 'smoke-session')
+    const result = await pending
+    if (result.behavior === 'allow') await facade.authorize('api_send_request', input, snapshot)
+    return { behavior: result.behavior, cardFiles: (card.toolInput as { files?: unknown }).files }
+  }
   const agentPrepared = await facade.prepare({ request: { url: baseUrl, method: 'POST' } })
   const args = { preparedId: agentPrepared.preparedId }
   await assert.rejects(facade.send(args), /APPROVAL_REQUIRED/)
@@ -408,10 +438,10 @@ async function smoke(): Promise<void> {
   const agentUploadArgs = { preparedId: agentUpload.preparedId }
   await assert.rejects(facade.send(agentUploadArgs), /APPROVAL_REQUIRED/)
   assert.equal(calls, 16)
-  /** 审批快照逐行给出目标字段、realpath 与大小。 */
-  const agentSnapshot = await facade.approval('api_send_request', agentUploadArgs)
-  assert.deepEqual(agentSnapshot.files, [{ field: 'file', path: agentFilePath, sizeBytes: agentBytes.length }])
-  await facade.authorize('api_send_request', agentUploadArgs, agentSnapshot)
+  /** 批准走真实权限服务：装配与 orchestrator 相同，卡片内容由 Host 生成。 */
+  const approved = await resolveSendApproval(agentUploadArgs, 'allow')
+  assert.deepEqual(approved.cardFiles, [{ field: 'file', path: agentFilePath, sizeBytes: agentBytes.length }])
+  assert.equal(approved.behavior, 'allow')
   const agentUploadRun = await facade.send(agentUploadArgs)
   assert.equal(agentUploadRun.status, 200)
   assert.equal(calls, 17)
@@ -434,9 +464,20 @@ async function smoke(): Promise<void> {
     body: { kind: 'multipart', text: '', fields: [{ id: 'field_agent', name: 'note', value: 'agent 中文', enabled: true }], files: [{ id: 'part_agent', name: 'file', path: agentFilePath }] },
   } })
   const swappedArgs = { preparedId: swapped.preparedId }
-  const swappedSnapshot = await facade.approval('api_send_request', swappedArgs)
+  /** 拒绝同样走真实权限服务：拒绝后 preparedId 依旧不能发送。 */
+  const denied = await facade.prepare({ request: {
+    name: 'Agent 上传附件',
+    url: baseUrl + '/upload',
+    method: 'POST',
+    body: { kind: 'multipart', text: '', fields: [{ id: 'field_agent', name: 'note', value: 'agent 中文', enabled: true }], files: [{ id: 'part_agent', name: 'file', path: agentFilePath }] },
+  } })
+  const deniedArgs = { preparedId: denied.preparedId }
+  assert.equal((await resolveSendApproval(deniedArgs, 'deny')).behavior, 'deny')
+  await assert.rejects(facade.send(deniedArgs), /APPROVAL_REQUIRED/)
+  assert.equal(calls, 17)
+  /** 批准后换掉文件：必须拒绝派发，而不是发出另一个版本。 */
+  assert.equal((await resolveSendApproval(swappedArgs, 'allow')).behavior, 'allow')
   writeFileSync(agentFilePath, Buffer.from('完全换过的内容'))
-  await facade.authorize('api_send_request', swappedArgs, swappedSnapshot)
   await assert.rejects(facade.send(swappedArgs), /API_WORKBENCH_FILE_CHANGED/)
   assert.equal(calls, 17)
   /** 目录与设备文件在准备阶段就被拒绝，不会签发 preparedId。 */
@@ -452,7 +493,7 @@ async function smoke(): Promise<void> {
   const history = await call('listRuns', { sessionId: 'smoke-session' })
   assert.equal(history.runs.length, 17)
   assert.equal(calls, 17)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval + realpath', 'agent file changed rejection', 'agent file type rejection', 'history'] }))
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval via permission service', 'agent file deny blocks send', 'agent file changed rejection', 'agent file type rejection', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {
