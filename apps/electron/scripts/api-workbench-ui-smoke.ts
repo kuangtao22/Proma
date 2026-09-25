@@ -48,6 +48,46 @@ async function clickText(window: BrowserWindow, text: string): Promise<void> {
 }
 
 /**
+ * 打开目录行的「…」操作菜单。
+ *
+ * Radix 的菜单触发器只认指针事件，直接 .click() 不会展开，因此这里合成 pointerdown/pointerup。
+ *
+ * @param kind 行类型：集合一级行或分组行
+ * @param name 行名称（集合名或分组名），用于在正确的行上定位触发器
+ */
+async function openCatalogRowMenu(window: BrowserWindow, kind: 'collection' | 'folder', name: string): Promise<void> {
+  const rowSelector = kind === 'collection' ? '[data-api-collection-header]' : '[data-api-folder-header]'
+  const labelPrefix = kind === 'collection' ? '集合操作 ' : '分组操作 '
+  const pressed = await window.webContents.executeJavaScript(`(() => {
+    const row = [...document.querySelectorAll(${JSON.stringify(rowSelector)})].find((node) => (node.textContent ?? '').includes(${JSON.stringify(name)}))
+    const trigger = [...(row?.querySelectorAll('[aria-label]') ?? [])].find((node) => (node.getAttribute('aria-label') ?? '').startsWith(${JSON.stringify(labelPrefix)}))
+    if (!(trigger instanceof HTMLElement)) return false
+    const init = { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0, buttons: 1 }
+    trigger.dispatchEvent(new PointerEvent('pointerdown', init))
+    trigger.dispatchEvent(new PointerEvent('pointerup', { ...init, buttons: 0 }))
+    return true
+  })()`)
+  assert.equal(pressed, true, `找不到${kind === 'collection' ? '集合' : '分组'}「${name}」的「…」入口`)
+  await waitFor(window, "Boolean(document.querySelector('[role=menuitem]'))", `「${name}」的操作菜单未打开`)
+}
+
+/** 选择已打开的「…」菜单项（同样只认指针事件）。 */
+async function chooseCatalogMenuItem(window: BrowserWindow, text: string): Promise<void> {
+  await waitFor(window, `Boolean([...document.querySelectorAll('[role=menuitem]')].find((item) => item.textContent?.trim() === ${JSON.stringify(text)}))`, `菜单里没有「${text}」`)
+  const pressed = await window.webContents.executeJavaScript(`(() => {
+    const item = [...document.querySelectorAll('[role=menuitem]')].find((node) => node.textContent?.trim() === ${JSON.stringify(text)})
+    if (!(item instanceof HTMLElement)) return false
+    const init = { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0, buttons: 1 }
+    item.dispatchEvent(new PointerEvent('pointerdown', init))
+    item.dispatchEvent(new PointerEvent('pointerup', { ...init, buttons: 0 }))
+    item.click()
+    return true
+  })()`)
+  assert.equal(pressed, true, `无法点击菜单项「${text}」`)
+  await waitForClosedLayersToLeave(window)
+}
+
+/**
  * 在历史列表里按行内文本条件点击一条运行。
  * 同一请求名会出现多条运行，只按 aria-label 无法区分，因此必须用行内文本（用例名/状态）来挑。
  */
@@ -107,8 +147,10 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await clickText(window, '确认')
     await waitFor(window, "document.body.textContent?.includes('Smoke 集合')", '新集合未保存')
     console.log('[API Workbench UI smoke] 集合 Dialog 已验证')
-    const opened = await window.webContents.executeJavaScript(`(() => { const section = [...document.querySelectorAll('section')].find((item) => item.textContent?.includes('Smoke 集合')); const button = section?.querySelector('button[aria-label="新建请求"]'); if (!(button instanceof HTMLButtonElement)) return false; button.click(); return true })()`)
-    assert.equal(opened, true, '新集合中没有新建请求入口')
+    /** 集合动作收进「…」菜单后，新建请求必须从菜单进入。 */
+    await openCatalogRowMenu(window, 'collection', 'Smoke 集合')
+    await chooseCatalogMenuItem(window, '新建请求')
+    await waitFor(window, "Boolean(document.querySelector('input[aria-label=\"请求名称\"]'))", '集合菜单的「新建请求」没有打开编辑器')
     await fill(window, 'input[aria-label="请求名称"]', 'Smoke 请求')
     await fill(window, 'input[aria-label="请求 URL"]', 'http://127.0.0.1:8080/smoke')
     await clickLabel(window, '保存请求 (⌘S)')
@@ -137,14 +179,13 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     assert.equal(imported?.body.kind, 'urlencoded', '导入请求的正文类型不正确')
     assert.equal(imported?.headers[0]?.value, 'curl', '导入请求的请求头不正确')
     /** 批量导入整理：把集合里硬编码的主机一键抽成集合变量（确认框由夹具固定为确认）。 */
-    const extractClicked = await window.webContents.executeJavaScript(`(() => {
+    const extractionCollection = await window.webContents.executeJavaScript(`(() => {
       const section = [...document.querySelectorAll('section')].find((item) => item.textContent?.includes('/imported'))
-      const button = section?.querySelector('button[aria-label="主机提取为变量"]')
-      if (!(button instanceof HTMLButtonElement)) return false
-      button.click()
-      return true
-    })()`)
-    assert.equal(extractClicked, true, '集合菜单里没有「主机提取为变量」入口')
+      return section?.querySelector('[data-api-collection-header]')?.textContent?.trim() ?? null
+    })()`) as string | null
+    assert.ok(extractionCollection, '找不到包含导入请求的集合')
+    await openCatalogRowMenu(window, 'collection', extractionCollection)
+    await chooseCatalogMenuItem(window, '主机提取为变量')
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.collections.some((item) => (item.variables ?? []).some((variable) => variable.name === 'baseUrl' && variable.value === 'https://api.example.com'))", '主机没有抽成集合变量')
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => item.url === '{{baseUrl}}/imported')", '请求 URL 没有改写成 {{baseUrl}}')
     console.log('[API Workbench UI smoke] 主机提取为集合变量已验证')
@@ -231,12 +272,12 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
         /** 一级行的可读性契约：没有折叠箭头、文件夹图标放大到 16px、名称不被按钮挤到截断。 */
         const headerSvgs = [...header.querySelectorAll('svg')]
         const hasChevron = headerSvgs.some((icon) => (icon.getAttribute('class') ?? '').includes('lucide-chevron'))
-        /** 只认一级行主体（按钮里的「新建文件夹」图标 FolderPlus 也在悬浮层内，必须排除）。 */
-        const folderIcon = headerSvgs.find((icon) => (icon.getAttribute('class') ?? '').includes('lucide-folder') && icon.closest('div.absolute') === null)
+        const folderIcon = headerSvgs.find((icon) => (icon.getAttribute('class') ?? '').includes('lucide-folder'))
         const folderIconSize = folderIcon ? Math.round(folderIcon.getBoundingClientRect().width) : 0
-        /** 操作按钮是右侧悬浮层：绝对定位、右边缘贴行，且不参与行内宽度分配。 */
-        const overlay = header.querySelector('div.absolute')
-        const overlayStyle = overlay ? getComputedStyle(overlay) : undefined
+        /** 行内动作入口：所有集合动作收进「…」后，一级行只能有一个触发器，且必须落在行内。 */
+        const triggers = [...header.querySelectorAll('[aria-label]')].filter((node) => (node.getAttribute('aria-label') ?? '').startsWith('集合操作 '))
+        const trigger = triggers[0]
+        const triggerRect = trigger instanceof HTMLElement ? trigger.getBoundingClientRect() : undefined
         return {
           name, inView, scrolled, width: Math.round(rect.width), height: Math.round(rect.height),
           rect: { x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height) },
@@ -245,10 +286,9 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
           availableWidth: rowButton ? Math.round(rowButton.clientWidth) : 0,
           nameTruncated: label ? label.scrollWidth > label.clientWidth + 1 : true,
           rowWidth: Math.round(rect.width),
-          /** 未悬停时悬浮层应隐藏；right 取计算样式，避免 display:none 让 rect 全为 0 造成误判。 */
-          overlayHidden: overlayStyle?.display === 'none',
-          overlayPosition: overlayStyle?.position ?? 'none',
-          overlayRight: overlayStyle?.right ?? 'none',
+          triggerCount: triggers.length,
+          triggerVisible: trigger instanceof HTMLElement ? getComputedStyle(trigger).display !== 'none' : false,
+          triggerInsideRow: triggerRect ? triggerRect.top >= rect.top - 1 && triggerRect.bottom <= rect.bottom + 1 : false,
         }
       })()`) as { name: string; inView: boolean; scrolled: boolean } | null
       console.log('[API Workbench UI smoke] 吸顶头行测量', JSON.stringify(sticky))
@@ -264,13 +304,12 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
       const headerDetail = sticky as unknown as {
         hasChevron: boolean
         folderIconSize: number
-        nameWidth: number
         availableWidth: number
         nameTruncated: boolean
         rowWidth: number
-        overlayHidden: boolean
-        overlayPosition: string
-        overlayRight: string
+        triggerCount: number
+        triggerVisible: boolean
+        triggerInsideRow: boolean
       }
       assert.equal(headerDetail.hasChevron, false, '集合一级行仍在渲染折叠箭头')
       assert.equal(headerDetail.folderIconSize, 16, `文件夹图标没有放大到 16px（当前 ${headerDetail.folderIconSize}px）`)
@@ -280,37 +319,78 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
         headerDetail.availableWidth >= headerDetail.rowWidth - 60,
         `操作按钮仍占用行内宽度（名称可用 ${headerDetail.availableWidth}px / 行宽 ${headerDetail.rowWidth}px）`,
       )
-      assert.equal(headerDetail.overlayPosition, 'absolute', '操作按钮没有改成右侧悬浮层')
-      assert.equal(headerDetail.overlayHidden, true, '未悬停时操作按钮不应常驻显示')
-      assert.equal(headerDetail.overlayRight, '4px', `操作按钮没有贴住行右侧（当前 right: ${headerDetail.overlayRight}）`)
-      /** 悬停浮现：用真实鼠标事件触发 :hover，再确认按钮层贴在右边缘、且没把名称挤窄。 */
-      stickyWindow.webContents.sendInputEvent({
-        type: 'mouseMove',
-        x: Math.round((sticky as unknown as { rect: { x: number; y: number; height: number } }).rect.x + 24),
-        y: Math.round((sticky as unknown as { rect: { x: number; y: number; height: number } }).rect.y + (sticky as unknown as { rect: { height: number } }).rect.height / 2),
-      })
-      await waitFor(stickyWindow, `(() => { const header = document.querySelector('[data-api-collection-header]'); const overlay = header?.querySelector('div.absolute'); return Boolean(overlay) && getComputedStyle(overlay).display === 'flex' })()`, '悬停后集合操作按钮没有浮现')
-      const hoveredOverlay = await stickyWindow.webContents.executeJavaScript(`(() => {
-        const header = document.querySelector('[data-api-collection-header]')
-        const overlay = header?.querySelector('div.absolute')
-        const label = header?.querySelector('span')
-        const rowButton = header?.querySelector('button')
-        if (!(header instanceof HTMLElement) || !(overlay instanceof HTMLElement) || !(label instanceof HTMLElement)) return null
-        const rowRect = header.getBoundingClientRect()
-        const overlayRect = overlay.getBoundingClientRect()
+      /** 集合行只留一个「…」入口，且常驻显示、落在行内（不再出现「按钮浮到请求列表上」）。 */
+      assert.equal(headerDetail.triggerCount, 1, `集合一级行应只有一个「…」动作入口（当前 ${headerDetail.triggerCount} 个）`)
+      assert.equal(headerDetail.triggerVisible, true, '集合「…」动作入口没有常驻显示')
+      assert.equal(headerDetail.triggerInsideRow, true, '集合「…」动作入口跑到行外')
+      /** 菜单项契约：集合的全部动作都必须能在「…」里找到。 */
+      await openCatalogRowMenu(stickyWindow, 'collection', '后台接口')
+      /** 等入场动画结束再断言与截图，否则拿到的是半透明的过渡帧。 */
+      await waitFor(stickyWindow, `(() => { const menu = document.querySelector('[role=menu]'); if (!(menu instanceof HTMLElement)) return false; const style = getComputedStyle(menu); return style.opacity === '1' && style.backgroundColor !== 'rgba(0, 0, 0, 0)' })()`, '集合「…」菜单没有渲染出不透明面板')
+      await writeFile('/private/tmp/api-workbench-ui-collection-menu.png', (await stickyWindow.webContents.capturePage()).toPNG())
+      const collectionItems = await stickyWindow.webContents.executeJavaScript("[...document.querySelectorAll('[role=menuitem]')].map((item) => item.textContent?.trim() ?? '')") as string[]
+      assert.deepEqual(
+        collectionItems,
+        ['新建请求', '新建文件夹', '主机提取为变量', '主机提取到环境', '重命名集合', '删除集合'],
+        `集合「…」菜单项不符合预期：${collectionItems.join(' / ')}`,
+      )
+      stickyWindow.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+      stickyWindow.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+      await waitFor(stickyWindow, "!document.querySelector('[role=menuitem]')", '集合「…」菜单没有关闭')
+      /**
+       * 分组行：动作入口必须挂在分组标题行内部。
+       * 现场缺陷正是它挂在「分组 + 全部请求」的容器上，于是按钮浮到请求列表中间并压住请求名。
+       */
+      const folderProbe = await stickyWindow.webContents.executeJavaScript(`(() => {
+        const folderHeader = document.querySelector('[data-api-folder-header]')
+        const trigger = [...(folderHeader?.querySelectorAll('[aria-label]') ?? [])].find((node) => (node.getAttribute('aria-label') ?? '').startsWith('分组操作 '))
+        if (!(folderHeader instanceof HTMLElement) || !(trigger instanceof HTMLElement)) return null
+        const headerRect = folderHeader.getBoundingClientRect()
+        const triggerRect = trigger.getBoundingClientRect()
+        const groupRect = folderHeader.parentElement.getBoundingClientRect()
         return {
-          rightGap: Math.round(rowRect.right - overlayRect.right),
-          availableWidth: rowButton ? Math.round(rowButton.clientWidth) : 0,
-          nameTruncated: label.scrollWidth > label.clientWidth + 1,
-          insideRow: overlayRect.left >= rowRect.left && overlayRect.right <= rowRect.right + 1,
+          headerHeight: Math.round(headerRect.height),
+          groupHeight: Math.round(groupRect.height),
+          triggerCenterOffset: Math.round(triggerRect.top + triggerRect.height / 2 - (headerRect.top + headerRect.height / 2)),
+          triggerInsideHeader: triggerRect.top >= headerRect.top - 1 && triggerRect.bottom <= headerRect.bottom + 1,
+          visibleRequests: document.querySelectorAll('[data-api-request-id]').length,
         }
-      })()`) as { rightGap: number; availableWidth: number; nameTruncated: boolean; insideRow: boolean } | null
-      assert.ok(hoveredOverlay, '悬停后取不到集合操作按钮')
-      const hovered = hoveredOverlay as { rightGap: number; availableWidth: number; nameTruncated: boolean; insideRow: boolean }
-      assert.ok(hovered.rightGap >= 0 && hovered.rightGap <= 8, `悬停时操作按钮没有贴住行右侧（距右边缘 ${hovered.rightGap}px）`)
-      assert.equal(hovered.insideRow, true, '悬停时操作按钮溢出了集合行')
-      assert.equal(hovered.availableWidth, headerDetail.availableWidth, '按钮浮现时集合名称被重新挤窄（应保持同宽）')
-      console.log('[API Workbench UI smoke] 集合一级行吸顶已验证')
+      })()`) as { headerHeight: number; groupHeight: number; triggerCenterOffset: number; triggerInsideHeader: boolean; visibleRequests: number } | null
+      assert.ok(folderProbe, '大目录里找不到分组行')
+      const folder = folderProbe as { headerHeight: number; groupHeight: number; triggerCenterOffset: number; triggerInsideHeader: boolean; visibleRequests: number }
+      assert.equal(folder.triggerInsideHeader, true, '分组「…」入口不在分组标题行内（会浮到请求列表上压住请求名）')
+      assert.ok(Math.abs(folder.triggerCenterOffset) <= 3, `分组「…」入口没有与标题行垂直居中（偏移 ${folder.triggerCenterOffset}px）`)
+      assert.ok(folder.groupHeight > folder.headerHeight * 3, '大目录分组高度不足，无法证明「入口属于标题行而不是整组」')
+      assert.equal(folder.visibleRequests, 60, `大目录可见请求应为 60 条（当前 ${folder.visibleRequests}）`)
+      /** 分组可收起：收起后该分组的请求不再渲染，再点一次恢复。 */
+      const clickFolderToggle = async (prefix: string): Promise<void> => {
+        const clicked = await stickyWindow.webContents.executeJavaScript(`(() => {
+          const header = document.querySelector('[data-api-folder-header]')
+          const toggle = [...(header?.querySelectorAll('button[aria-label]') ?? [])].find((node) => (node.getAttribute('aria-label') ?? '').startsWith(${JSON.stringify(prefix)}))
+          if (!(toggle instanceof HTMLButtonElement)) return false
+          toggle.click()
+          return true
+        })()`)
+        assert.equal(clicked, true, `找不到分组「${prefix}」入口`)
+      }
+      await clickFolderToggle('收起分组')
+      await waitFor(stickyWindow, "document.querySelectorAll('[data-api-request-id]').length === 30", '收起分组后分组的请求没有被隐藏')
+      /** 只数条数不够：必须确认剩下的都是根目录请求，分组的请求真的不再渲染。 */
+      const collapsedRows = await stickyWindow.webContents.executeJavaScript("[...document.querySelectorAll('[data-api-request-id]')].map((node) => node.getAttribute('data-api-request-id'))") as string[]
+      assert.equal(collapsedRows.length, 30, `收起分组后可见请求应为 30 条（当前 ${collapsedRows.length}）`)
+      const leftoverFolderRows = collapsedRows.filter((id) => Number(id.split('_')[1]) % 2 === 0)
+      assert.equal(leftoverFolderRows.length, 0, `收起分组后仍渲染了该分组的请求：${leftoverFolderRows.slice(0, 5).join(', ')}`)
+      await writeFile('/private/tmp/api-workbench-ui-folder-collapsed.png', (await stickyWindow.webContents.capturePage()).toPNG())
+      await clickFolderToggle('展开分组')
+      await waitFor(stickyWindow, "document.querySelectorAll('[data-api-request-id]').length === 60", '展开分组后请求没有恢复')
+      /** 搜索必须强制展开：命中的请求不能被分组折叠状态藏起来。 */
+      await clickFolderToggle('收起分组')
+      await waitFor(stickyWindow, "document.querySelectorAll('[data-api-request-id]').length === 30", '第二次收起分组失败')
+      await fill(stickyWindow, 'input[aria-label="搜索请求"]', '渠道模型绑定 2')
+      await waitFor(stickyWindow, "document.querySelectorAll('[data-api-request-id]').length === 11", '搜索没有让已收起的分组强制展开')
+      await fill(stickyWindow, 'input[aria-label="搜索请求"]', '')
+      await waitFor(stickyWindow, "document.querySelectorAll('[data-api-request-id]').length === 30", '清空搜索后分组没有回到收起状态')
+      console.log('[API Workbench UI smoke] 集合一级行吸顶、动作收敛与分组收缩已验证')
     } finally {
       stickyWindow.destroy()
     }
@@ -703,7 +783,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、可拖动分隔条、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、可拖动分隔条、一级行吸顶与「…」动作收敛、分组收缩与搜索强制展开、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

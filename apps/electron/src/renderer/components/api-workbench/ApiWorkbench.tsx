@@ -26,6 +26,7 @@ import {
   MoreHorizontal,
   Play,
   Plus,
+  Pencil,
   Save,
   Search,
   Server,
@@ -133,6 +134,7 @@ import { ApiScenarioPanel } from './ApiScenarioPanel'
 import { ApiRequestMoveDialog } from './ApiRequestMoveDialog'
 import { ApiSplitHandle } from './ApiSplitHandle'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
 export const RESEND_API_RUN_EVENT = 'proma:resend-api-run'
@@ -310,6 +312,50 @@ function FieldRows({
   )
 }
 
+/**
+ * 集合与分组共用的「…」操作入口。
+ *
+ * 用途：把一行的所有动作收进下拉菜单，行宽不再被按钮分摊（现场反馈「名字被挤成默..」）；
+ * 触发器常驻显示（悬停前是弱化的 45% 前景色），保证动作入口可发现而不是靠猜悬停。
+ *
+ * @param label 触发器无障碍名称（同时供界面回归测试定位）
+ * @param items 菜单项；destructive 项会自动前置分隔线并使用危险色
+ */
+function CatalogRowActions({ label, items }: {
+  label: string
+  items: Array<{ key: string; label: string; icon: React.ReactNode; onSelect: () => void; destructive?: boolean }>
+}): React.ReactElement {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label={label}
+          className="mr-1 size-6 shrink-0 rounded-[8px] text-foreground/45 transition-colors hover:bg-foreground/[0.06] hover:text-foreground data-[state=open]:bg-foreground/[0.06] data-[state=open]:text-foreground"
+        >
+          <MoreHorizontal className="size-3.5" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-44">
+        {items.map((item, index) => (
+          <React.Fragment key={item.key}>
+            {item.destructive && index > 0 && <DropdownMenuSeparator />}
+            <DropdownMenuItem
+              className={item.destructive ? 'text-destructive focus:text-destructive' : undefined}
+              onSelect={item.onSelect}
+            >
+              {item.icon}
+              {item.label}
+            </DropdownMenuItem>
+          </React.Fragment>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 /** 请求目录，集合和文件夹操作都直接落到最新目录 revision。 */
 function CatalogPanel({
   catalog,
@@ -349,6 +395,8 @@ function CatalogPanel({
 }): React.ReactElement {
   /** 当前展开的集合。 */
   const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set(catalog.collections.map((item) => item.id)))
+  /** 已收起的分组（键为「集合ID + 分组名」）；搜索时强制展开，避免命中结果被折叠藏起来。 */
+  const [collapsedFolders, setCollapsedFolders] = React.useState<Set<string>>(() => new Set())
   /** 目录内请求搜索词，只影响当前渲染投影。 */
   const [query, setQuery] = React.useState('')
   /** 当前搜索命中的请求。 */
@@ -392,7 +440,7 @@ function CatalogPanel({
                * 分不清自己在哪个集合里（现场反馈「一级类不见了」就是这个观感）。
                */}
               {/* 一级行沿用应用自带列表风格：无边框方块、rounded-[10px]、foreground 透明层 hover。 */}
-              <div data-api-collection-header={collection.id} className="group relative sticky top-0 z-10 flex items-center rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
+              <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
                 <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] font-medium" onClick={() => setExpanded((previous) => {
                   /** 复制集合，避免原地修改 React 状态。 */
                   const next = new Set(previous)
@@ -404,36 +452,68 @@ function CatalogPanel({
                   {/* 名称损坏（历史数据或导入）时也要看得见这一级，而不是渲染成空白行。 */}
                   <span className="truncate">{collection.name.trim() || '（未命名集合）'}</span>
                 </button>
-                {/** 操作按钮改成右侧悬浮层：不再占宽度，集合名因此可以完整显示。 */}
-                <div className="absolute right-1 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded-[8px] bg-content-area px-1 shadow-sm group-hover:flex">
-                <ToolButton label="新建请求" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateRequest(collection.id)}><Plus className="size-3" /></ToolButton>
-                <ToolButton label="新建文件夹" className="opacity-0 group-hover:opacity-100" onClick={() => onCreateFolder(collection)}><FolderPlus className="size-3" /></ToolButton>
-                <ToolButton label="主机提取为变量" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrl(collection)}><Link2 className="size-3" /></ToolButton>
-                <ToolButton label="主机提取到环境" className="opacity-0 group-hover:opacity-100" onClick={() => onExtractBaseUrlToEnvironment(collection)}><Server className="size-3" /></ToolButton>
-                <ToolButton label="重命名集合" className="opacity-0 group-hover:opacity-100" onClick={() => onRenameCollection(collection)}><MoreHorizontal className="size-3" /></ToolButton>
-                <ToolButton label="删除集合" className="opacity-0 group-hover:opacity-100" onClick={() => onDeleteCollection(collection)}><Trash2 className="size-3" /></ToolButton>
-                </div>
+                {/** 所有集合动作收进「…」菜单：行内只留一个触发器，名称拿到整行宽度。 */}
+                <CatalogRowActions
+                  label={`集合操作 ${collection.name.trim() || '（未命名集合）'}`}
+                  items={[
+                    { key: 'create-request', label: '新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id) },
+                    { key: 'create-folder', label: '新建文件夹', icon: <FolderPlus />, onSelect: () => onCreateFolder(collection) },
+                    { key: 'extract-variable', label: '主机提取为变量', icon: <Link2 />, onSelect: () => onExtractBaseUrl(collection) },
+                    { key: 'extract-environment', label: '主机提取到环境', icon: <Server />, onSelect: () => onExtractBaseUrlToEnvironment(collection) },
+                    { key: 'rename-collection', label: '重命名集合', icon: <Pencil />, onSelect: () => onRenameCollection(collection) },
+                    { key: 'delete-collection', label: '删除集合', icon: <Trash2 />, destructive: true, onSelect: () => onDeleteCollection(collection) },
+                  ]}
+                />
               </div>
               {isExpanded && (
                 <div className="ml-4 border-l border-border/50 pl-1.5">
                   {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
-                  {folders.map((folder) => (
-                    <div key={folder} className="group/folder relative">
-                      {/** 文件夹图标属于一级（集合）；分组行只保留缩进与名称，层级一眼分明。 */}
-                      <div className="flex items-center rounded-[10px] px-2 py-1 text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
-                        <span className="min-w-0 flex-1 truncate">{folder}</span>
+                  {folders.map((folder) => {
+                    /** 分组收起键：同一分组名可能出现在不同集合里，必须带上集合 ID。 */
+                    const folderKey = `${collection.id}\u0000${folder}`
+                    /** 搜索时强制展开，否则命中的请求会被折叠藏起来。 */
+                    const isFolderCollapsed = !query.trim() && collapsedFolders.has(folderKey)
+                    /** 当前分组下的请求，用于渲染列表与显示数量。 */
+                    const folderRequests = visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder)
+                    return (
+                      <div key={folder} className="group">
+                        {/** 分组标题行：整行可点收起/展开；「…」菜单挂在这一行内部，不会跑到请求列表上。 */}
+                        <div data-api-folder-header={`${collection.id}:${folder}`} className="flex items-center rounded-[10px] text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
+                          <button
+                            type="button"
+                            aria-expanded={!isFolderCollapsed}
+                            aria-label={`${isFolderCollapsed ? '展开' : '收起'}分组 ${folder}`}
+                            className="flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left"
+                            onClick={() => setCollapsedFolders((previous) => {
+                              /** 复制集合，避免原地修改 React 状态。 */
+                              const next = new Set(previous)
+                              if (next.has(folderKey)) next.delete(folderKey); else next.add(folderKey)
+                              return next
+                            })}
+                          >
+                            {/** 分组的箭头只表示「可收缩」，与集合一级行（整行即开关、不带箭头）区分开。 */}
+                            {isFolderCollapsed ? <ChevronRight className="size-3.5 shrink-0 text-foreground/40" /> : <ChevronDown className="size-3.5 shrink-0 text-foreground/40" />}
+                            <span className="min-w-0 flex-1 truncate">{folder}</span>
+                            <span className="shrink-0 text-[10px] text-foreground/35">{folderRequests.length}</span>
+                          </button>
+                          {/** 分组动作同样收进「…」菜单。 */}
+                          <CatalogRowActions
+                            label={`分组操作 ${folder}`}
+                            items={[
+                              { key: 'create-request-in-folder', label: '在文件夹中新建请求', icon: <Plus />, onSelect: () => onCreateRequest(collection.id, folder) },
+                              { key: 'rename-folder', label: '重命名文件夹', icon: <Pencil />, onSelect: () => onRenameFolder(collection.id, folder) },
+                              { key: 'delete-folder', label: '删除文件夹', icon: <Trash2 />, destructive: true, onSelect: () => onDeleteFolder(collection.id, folder) },
+                            ]}
+                          />
+                        </div>
+                        {!isFolderCollapsed && (
+                          <div className="ml-3">
+                            {folderRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
+                          </div>
+                        )}
                       </div>
-                      {/** 分组行的操作按钮同样走右侧悬浮层，不再挤压分组名。 */}
-                      <div className="absolute right-1 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded-[8px] bg-content-area px-1 shadow-sm group-hover/folder:flex">
-                        <ToolButton label="在文件夹中新建请求" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onCreateRequest(collection.id, folder)}><Plus className="size-3" /></ToolButton>
-                        <ToolButton label="重命名文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onRenameFolder(collection.id, folder)}><MoreHorizontal className="size-3" /></ToolButton>
-                        <ToolButton label="删除文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onDeleteFolder(collection.id, folder)}><Trash2 className="size-3" /></ToolButton>
-                      </div>
-                      <div className="ml-3">
-                        {visibleRequests.filter((request) => request.collectionId === collection.id && request.folder === folder).map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
-                      </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </section>
@@ -487,7 +567,8 @@ function RequestTreeButton({ request, activeTabId, onOpen, onMove, environmentKi
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <button type="button" className={cn('flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-[12px] text-foreground/80 transition-colors hover:bg-foreground/[0.04] hover:text-foreground', active && 'bg-foreground/[0.06] text-foreground')} onClick={() => onOpen(request)}>
+        {/** data-api-request-id 只用于界面回归统计「目录里可见的请求条数」（收起分组后必须变少）。 */}
+        <button type="button" data-api-request-id={request.id} className={cn('flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-[12px] text-foreground/80 transition-colors hover:bg-foreground/[0.04] hover:text-foreground', active && 'bg-foreground/[0.06] text-foreground')} onClick={() => onOpen(request)}>
           <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
           {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
           <span className="min-w-0 flex-1 truncate">{request.name}</span>
