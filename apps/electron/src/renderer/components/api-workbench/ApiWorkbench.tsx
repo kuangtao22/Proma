@@ -390,8 +390,9 @@ function CatalogPanel({
                * 一级（集合）行吸顶：一个集合下可能有上百条请求，滚到中间时单看分组名
                * 分不清自己在哪个集合里（现场反馈「一级类不见了」就是这个观感）。
                */}
-              <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center gap-1 border-b border-border/40 bg-background hover:bg-muted/60">
-                <button type="button" className="flex min-w-0 flex-1 items-center gap-1.5 px-1.5 py-1.5 text-left text-xs font-medium" onClick={() => setExpanded((previous) => {
+              {/* 一级行沿用应用自带列表风格：无边框方块、rounded-[10px]、foreground 透明层 hover。 */}
+              <div data-api-collection-header={collection.id} className="group sticky top-0 z-10 flex items-center gap-1 rounded-[10px] bg-content-area text-[12px] text-foreground/70 transition-colors hover:bg-foreground/[0.04] hover:text-foreground">
+                <button type="button" className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] font-medium" onClick={() => setExpanded((previous) => {
                   /** 复制集合，避免原地修改 React 状态。 */
                   const next = new Set(previous)
                   if (next.has(collection.id)) next.delete(collection.id); else next.add(collection.id)
@@ -413,8 +414,8 @@ function CatalogPanel({
                   {rootRequests.map((request) => <RequestTreeButton key={request.id} request={request} activeTabId={activeTabId} onOpen={onOpenRequest} onMove={onMoveRequest} environmentKind={catalog.environments.find((item) => item.id === request.targetEnvironmentId)?.kind} />)}
                   {folders.map((folder) => (
                     <div key={folder} className="group/folder">
-                      <div className="flex items-center gap-1 px-1 py-1 text-[11px] text-muted-foreground">
-                        <Folder className="size-3.5" />
+                      <div className="flex items-center gap-1 rounded-[10px] px-2 py-1 text-[12px] text-foreground/50 transition-colors hover:bg-foreground/[0.04] hover:text-foreground/70">
+                        <Folder className="size-3.5 text-foreground/35" />
                         <span className="min-w-0 flex-1 truncate">{folder}</span>
                         <ToolButton label="在文件夹中新建请求" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onCreateRequest(collection.id, folder)}><Plus className="size-3" /></ToolButton>
                         <ToolButton label="重命名文件夹" className="opacity-0 group-hover/folder:opacity-100" onClick={() => onRenameFolder(collection.id, folder)}><MoreHorizontal className="size-3" /></ToolButton>
@@ -478,7 +479,7 @@ function RequestTreeButton({ request, activeTabId, onOpen, onMove, environmentKi
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <button type="button" className={cn('flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted/60', active && 'bg-muted text-foreground')} onClick={() => onOpen(request)}>
+        <button type="button" className={cn('flex w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-[12px] text-foreground/80 transition-colors hover:bg-foreground/[0.04] hover:text-foreground', active && 'bg-foreground/[0.06] text-foreground')} onClick={() => onOpen(request)}>
           <span className={cn('w-10 shrink-0 font-mono text-[9px] font-semibold', request.method === 'GET' ? 'text-emerald-600 dark:text-emerald-400' : 'text-sky-600 dark:text-sky-400')}>{request.method}</span>
           {environmentKind && <EnvironmentKindBadge kind={environmentKind} />}
           <span className="min-w-0 flex-1 truncate">{request.name}</span>
