@@ -216,4 +216,16 @@ describe('接口工作台 UI 集成', () => {
     expect(source).toContain('<SelectItem value="json-type">JSON 类型</SelectItem>')
     expect(source).toContain("assertion.kind === 'json-type' ? 'string/number/boolean/object/array/null'")
   })
+
+  test('Given 已交付运行对比 When 检查组件源码 Then 基线与对比入口接线且只读脱敏投影', async () => {
+    const source = await Bun.file(new URL('./ApiWorkbench.tsx', import.meta.url)).text()
+
+    expect(source).toContain('function RunDiffDialog')
+    expect(source).toContain('label="设为对比基线"')
+    expect(source).toContain('label="与基线对比"')
+    expect(source).toContain('diffApiRuns(baselineRecord, candidateRecord)')
+    expect(source).toContain('两侧都是脱敏投影')
+    /** 对比只读：不得在对比流程里 reveal。 */
+    expect(source).not.toContain('reveal: true, runId: baselineRun.id')
+  })
 })

@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import type { ApiCatalog, ApiRequestDraft, ApiRun, ApiWorkbenchApi } from '@proma/shared'
+import type { ApiCatalog, ApiHttpHop, ApiRequestDraft, ApiRun, ApiWorkbenchApi } from '@proma/shared'
 import { createApiCatalogSnapshotExport, createApiRequestDraft } from '@proma/shared'
 import {
   appendBodySlice,
   clearApiValue,
   createApiCase,
+  diffApiRuns,
   createImportedRequestTabs,
   createApiWorkbenchController,
   createRequestTab,
@@ -62,6 +63,26 @@ function createRun(id: string): ApiRun {
     assertions: [],
     recording: 'saved',
     pinned: false,
+  }
+}
+
+/** 对比测试用的固定计时事实。 */
+function hopTimings(): ApiHttpHop['timings'] {
+  return { dnsMs: 1, connectMs: 1, tlsMs: null, sendMs: 1, ttfbMs: 2, downloadMs: 1, totalMs: 7 }
+}
+
+/** 默认运行没有跳转；对比需要真实响应头与耗时，因此这里补一个可覆盖的跳转。 */
+function withHop(run: ApiRun, overrides: Partial<ApiHttpHop> = {}): ApiRun {
+  return {
+    ...run,
+    hops: [{
+      url: 'https://example.test/users', method: 'GET', requestHeaders: [], requestHeadersSource: 'captured',
+      status: 200, statusText: 'OK', httpVersion: '1.1',
+      responseHeaders: [{ name: 'X-Trace', value: 'abc' }], trailers: [],
+      timings: hopTimings(),
+      connection: { reused: false },
+      ...overrides,
+    }],
   }
 }
 
@@ -472,6 +493,99 @@ describe('接口工作台编辑模型', () => {
     expect(result.redacted).toEqual(['URL'])
     /** 目录为空时仍可载入，落到默认集合。 */
     expect(result.draft.collectionId).toBe('default')
+  })
+
+  test('Given 两次相同运行 When 对比 Then 判一致且不产出任何差异行', () => {
+    const run = withHop(createRun('run-1'))
+
+    const diff = diffApiRuns(run, { ...run, id: 'run-2' })
+
+    expect(diff.identical).toBe(true)
+    expect(diff.headers).toEqual([])
+    expect(diff.assertions).toEqual([])
+    expect(diff.body).toEqual({ compared: true, lines: [], truncated: false })
+    expect(diff.rows.every((row) => !row.changed)).toBe(true)
+  })
+
+  test('Given 状态码、耗时、大小与用例不同 When 对比 Then 逐项标出变化', () => {
+    const baseline = withHop(createRun('run-1'))
+    const candidate: ApiRun = {
+      ...withHop(baseline, { status: 401, timings: { ...hopTimings(), totalMs: 42 } }),
+      id: 'run-2',
+      caseId: 'case_401',
+      body: { ...baseline.body, rawBytes: 99, decodedBytes: 99, contentType: 'text/plain' },
+    }
+
+    const diff = diffApiRuns(baseline, candidate)
+    const changed = diff.rows.filter((row) => row.changed).map((row) => `${row.label}:${row.baseline}→${row.candidate}`)
+
+    expect(changed).toEqual([
+      '状态码:200→401',
+      '内容类型:application/json→text/plain',
+      '原始字节:2→99',
+      '解码字节:2→99',
+      '总耗时(ms):7→42',
+      '用例:—→case_401',
+    ])
+    expect(diff.identical).toBe(false)
+  })
+
+  test('Given 响应头与断言结论变化 When 对比 Then 按名称与断言 id 给出差异', () => {
+    const baseline = withHop(createRun('run-1'))
+    const candidate: ApiRun = {
+      ...withHop(baseline, { responseHeaders: [{ name: 'X-Trace', value: 'def' }, { name: 'X-New', value: '1' }] }),
+      id: 'run-2',
+      assertions: [{ id: 'status', passed: false, expected: '200', actual: '500', message: '断言失败' }, { id: 'typed', passed: true, expected: 'number', actual: 'number', message: '断言通过' }],
+    }
+    const changedHeaders = diffApiRuns(baseline, candidate).headers
+    const sameAssertions = diffApiRuns(baseline, { ...baseline, assertions: candidate.assertions }).assertions
+    const changed = diffApiRuns({ ...baseline, assertions: [{ id: 'status', passed: true, expected: '200', actual: '200', message: '断言通过' }] }, candidate).assertions
+
+    /** 基线响应头是 X-Trace，候选多了 X-New 且少了 X-Trace。 */
+    expect(changedHeaders).toEqual([
+      { name: 'x-new', change: 'added', baseline: '—', candidate: '1' },
+      { name: 'x-trace', change: 'changed', baseline: 'abc', candidate: 'def' },
+    ])
+    /** 基线没有这两条断言，因此都是「未执行 → 结论」。 */
+    expect(sameAssertions).toEqual([
+      { id: 'status', baseline: '未执行', candidate: '失败', changed: true },
+      { id: 'typed', baseline: '未执行', candidate: '通过', changed: true },
+    ])
+    expect(changed).toEqual([
+      { id: 'status', baseline: '通过', candidate: '失败', changed: true },
+      { id: 'typed', baseline: '未执行', candidate: '通过', changed: true },
+    ])
+  })
+
+  test('Given 正文有少量变化 When 对比 Then 只列变化行并跳过共同前后缀', () => {
+    const baseline = createRun('run-1')
+    const candidate: ApiRun = {
+      ...baseline,
+      id: 'run-2',
+      body: { ...baseline.body, preview: '{"a":1,\n"b":2,\n"c":3}' },
+    }
+    const withBody: ApiRun = { ...baseline, body: { ...baseline.body, preview: '{"a":1,\n"b":9,\n"c":3}' } }
+
+    const diff = diffApiRuns(withBody, candidate)
+
+    expect(diff.body.compared).toBe(true)
+    expect(diff.body.lines).toEqual([{ kind: 'removed', text: '"b":9,' }, { kind: 'added', text: '"b":2,' }])
+    expect(diff.body.truncated).toBe(false)
+    /** 正文一致时不给逐行差异。 */
+    expect(diffApiRuns(withBody, { ...withBody, id: 'run-3' }).body.lines).toEqual([])
+  })
+
+  test('Given 正文超过逐行对比上限 When 对比 Then 明确报无法逐行对比而不是给出错误差异', () => {
+    const baseline = createRun('run-1')
+    const long = Array.from({ length: 401 }, (_value, index) => `line-${index}`).join('\n')
+
+    const diff = diffApiRuns({ ...baseline, body: { ...baseline.body, preview: long } }, { ...baseline, id: 'run-2', body: { ...baseline.body, preview: `${long}-changed` } })
+
+    expect(diff.body.compared).toBe(false)
+    expect(diff.body.lines).toEqual([])
+    expect(diff.body.reason).toContain('超过逐行对比上限')
+    /** 无法逐行对比也不能说两次运行一致。 */
+    expect(diff.identical).toBe(false)
   })
 })
 

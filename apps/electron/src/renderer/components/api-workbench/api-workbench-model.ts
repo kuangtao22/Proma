@@ -174,6 +174,194 @@ export interface ApiRunDraftResult {
   redacted: string[]
 }
 
+/** 两次运行对比里的一个标量字段。 */
+export interface ApiRunDiffRow {
+  label: string
+  baseline: string
+  candidate: string
+  changed: boolean
+}
+
+/** 响应头差异；重复头按名称合并后比较。 */
+export interface ApiRunHeaderDiff {
+  name: string
+  change: 'added' | 'removed' | 'changed'
+  baseline: string
+  candidate: string
+}
+
+/** 断言结论差异；按断言 id 对齐。 */
+export interface ApiRunAssertionDiff {
+  id: string
+  baseline: string
+  candidate: string
+  changed: boolean
+}
+
+/** 正文逐行差异；无法逐行比较时 compared 为 false 并给出原因。 */
+export interface ApiRunBodyDiff {
+  compared: boolean
+  reason?: string
+  /** 只保留变化行，不重复相同的上下文。 */
+  lines: Array<{ kind: 'added' | 'removed'; text: string }>
+  /** 变化行超出展示上限时置真，界面据此提示。 */
+  truncated: boolean
+}
+
+/** 一次运行对比的完整结果。 */
+export interface ApiRunDiff {
+  rows: ApiRunDiffRow[]
+  headers: ApiRunHeaderDiff[]
+  assertions: ApiRunAssertionDiff[]
+  body: ApiRunBodyDiff
+  /** 结构化字段、响应头、断言与正文全部一致。 */
+  identical: boolean
+}
+
+/** 逐行对比的行数上限：两侧都超过就不再逐行比较，避免大正文拖垮界面。 */
+const MAX_DIFF_SOURCE_LINES = 400
+/** 变化行的展示上限。 */
+const MAX_DIFF_OUTPUT_LINES = 200
+
+/** 对比展示文本；不可观测时用短横线而不是 0。 */
+function diffText(value: string | number | null | undefined): string {
+  if (value === null || value === undefined) return '—'
+  return String(value)
+}
+
+/** 最终跳转的响应头按名称小写合并重复值，保留出现顺序。 */
+function headerValues(run: ApiRun): Map<string, string> {
+  const merged = new Map<string, string[]>()
+  for (const header of run.hops.at(-1)?.responseHeaders ?? []) {
+    const key = header.name.toLowerCase()
+    const existing = merged.get(key)
+    if (existing) existing.push(header.value)
+    else merged.set(key, [header.value])
+  }
+  return new Map([...merged].map(([name, values]) => [name, values.join(', ')]))
+}
+
+/**
+ * 逐行差异：先去掉共同前后缀，再对小规模中段做 LCS。
+ * @param baseline 基线正文按行拆分的数组。
+ * @param candidate 对比正文按行拆分的数组。
+ * @returns 只含变化行的差异序列。
+ */
+function diffBodyLines(baseline: readonly string[], candidate: readonly string[]): Array<{ kind: 'added' | 'removed'; text: string }> {
+  /** 共同前缀不参与差异。 */
+  let start = 0
+  while (start < baseline.length && start < candidate.length && baseline[start] === candidate[start]) start += 1
+  /** 共同后缀同样跳过。 */
+  let baselineEnd = baseline.length
+  let candidateEnd = candidate.length
+  while (baselineEnd > start && candidateEnd > start && baseline[baselineEnd - 1] === candidate[candidateEnd - 1]) {
+    baselineEnd -= 1
+    candidateEnd -= 1
+  }
+  const left = baseline.slice(start, baselineEnd)
+  const right = candidate.slice(start, candidateEnd)
+  if (left.length === 0) return right.map((text) => ({ kind: 'added' as const, text }))
+  if (right.length === 0) return left.map((text) => ({ kind: 'removed' as const, text }))
+  /** LCS 长度表；中段规模已由调用方限制，因此这里是 O(n*m) 的有界计算。 */
+  const table: number[][] = Array.from({ length: left.length + 1 }, () => new Array<number>(right.length + 1).fill(0))
+  for (let row = left.length - 1; row >= 0; row -= 1) {
+    for (let column = right.length - 1; column >= 0; column -= 1) {
+      table[row]![column] = left[row] === right[column]
+        ? table[row + 1]![column + 1]! + 1
+        : Math.max(table[row + 1]![column]!, table[row]![column + 1]!)
+    }
+  }
+  const lines: Array<{ kind: 'added' | 'removed'; text: string }> = []
+  let row = 0
+  let column = 0
+  while (row < left.length && column < right.length) {
+    if (left[row] === right[column]) { row += 1; column += 1; continue }
+    if (table[row + 1]![column]! >= table[row]![column + 1]!) {
+      lines.push({ kind: 'removed', text: left[row]! })
+      row += 1
+    } else {
+      lines.push({ kind: 'added', text: right[column]! })
+      column += 1
+    }
+  }
+  while (row < left.length) { lines.push({ kind: 'removed', text: left[row]! }); row += 1 }
+  while (column < right.length) { lines.push({ kind: 'added', text: right[column]! }); column += 1 }
+  return lines
+}
+
+/**
+ * 比较两次运行，产出界面直接可用的差异事实。
+ *
+ * 两侧都应该是 `getRun` 的默认（脱敏）投影：被遮罩的秘密不会出现在差异里，也不需要 reveal。
+ * @param baseline 作为参照的基线运行。
+ * @param candidate 与基线对比的运行。
+ * @returns 标量字段、响应头、断言与正文四部分差异。
+ */
+export function diffApiRuns(baseline: ApiRun, candidate: ApiRun): ApiRunDiff {
+  /** 标量字段逐项比较；顺序固定，便于界面稳定阅读。 */
+  const fields: Array<[string, string | number | null | undefined, string | number | null | undefined]> = [
+    ['状态码', baseline.hops.at(-1)?.status ?? baseline.state, candidate.hops.at(-1)?.status ?? candidate.state],
+    ['方法 URL', `${baseline.request.method} ${baseline.request.url}`, `${candidate.request.method} ${candidate.request.url}`],
+    ['跳转数', baseline.hops.length, candidate.hops.length],
+    ['内容类型', baseline.body.contentType, candidate.body.contentType],
+    ['原始字节', baseline.body.rawBytes, candidate.body.rawBytes],
+    ['解码字节', baseline.body.decodedBytes, candidate.body.decodedBytes],
+    ['总耗时(ms)', baseline.hops.at(-1)?.timings.totalMs, candidate.hops.at(-1)?.timings.totalMs],
+    ['事件数量', baseline.sse?.totalEvents, candidate.sse?.totalEvents],
+    ['事件结束', baseline.sse?.endedReason, candidate.sse?.endedReason],
+    ['用例', baseline.caseId, candidate.caseId],
+    ['断言通过', `${baseline.assertions.filter((item) => item.passed).length}/${baseline.assertions.length}`, `${candidate.assertions.filter((item) => item.passed).length}/${candidate.assertions.length}`],
+  ]
+  const rows = fields.map(([label, before, after]) => ({
+    label, baseline: diffText(before), candidate: diffText(after), changed: diffText(before) !== diffText(after),
+  }))
+  /** 响应头差异。 */
+  const baselineHeaders = headerValues(baseline)
+  const candidateHeaders = headerValues(candidate)
+  const headers: ApiRunHeaderDiff[] = []
+  for (const name of [...new Set([...baselineHeaders.keys(), ...candidateHeaders.keys()])].sort()) {
+    const before = baselineHeaders.get(name)
+    const after = candidateHeaders.get(name)
+    if (before === after) continue
+    headers.push({
+      name,
+      change: before === undefined ? 'added' : after === undefined ? 'removed' : 'changed',
+      baseline: before ?? '—',
+      candidate: after ?? '—',
+    })
+  }
+  /** 断言按 id 对齐；只保留结论变化的项。 */
+  const baselineAssertions = new Map(baseline.assertions.map((item) => [item.id, item.passed]))
+  const candidateAssertions = new Map(candidate.assertions.map((item) => [item.id, item.passed]))
+  const text = (value: boolean | undefined): string => value === undefined ? '未执行' : value ? '通过' : '失败'
+  const assertions: ApiRunAssertionDiff[] = []
+  for (const id of [...new Set([...baselineAssertions.keys(), ...candidateAssertions.keys()])].sort()) {
+    const before = baselineAssertions.get(id)
+    const after = candidateAssertions.get(id)
+    if (before === after) continue
+    assertions.push({ id, baseline: text(before), candidate: text(after), changed: true })
+  }
+  /** 正文差异：行数超上限时明确说明无法逐行对比，不伪造结论。 */
+  const baselineLines = baseline.body.preview === '' ? [] : baseline.body.preview.split('\n')
+  const candidateLines = candidate.body.preview === '' ? [] : candidate.body.preview.split('\n')
+  let body: ApiRunBodyDiff
+  if (baseline.body.preview === candidate.body.preview) {
+    body = { compared: true, lines: [], truncated: false }
+  } else if (baselineLines.length > MAX_DIFF_SOURCE_LINES || candidateLines.length > MAX_DIFF_SOURCE_LINES) {
+    body = { compared: false, reason: `正文超过逐行对比上限（${MAX_DIFF_SOURCE_LINES} 行），只显示结构化差异`, lines: [], truncated: false }
+  } else {
+    const lines = diffBodyLines(baselineLines, candidateLines)
+    body = { compared: true, lines: lines.slice(0, MAX_DIFF_OUTPUT_LINES), truncated: lines.length > MAX_DIFF_OUTPUT_LINES }
+  }
+  return {
+    rows,
+    headers,
+    assertions,
+    body,
+    identical: rows.every((row) => !row.changed) && headers.length === 0 && assertions.length === 0 && body.compared && body.lines.length === 0,
+  }
+}
+
 /** 脱敏遮罩：Header/Query/正文里的取值，以及 URL 里的百分号编码形态。 */
 const REDACTED_TEXT = '[REDACTED]'
 const REDACTED_URL = '%5BREDACTED%5D'

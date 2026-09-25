@@ -14,6 +14,8 @@ import {
   FileInput,
   Folder,
   FolderPlus,
+  GitCompare,
+  GitCompareArrows,
   History,
   KeyRound,
   ListChecks,
@@ -97,6 +99,7 @@ import {
   createApiWorkbenchController,
   createImportedRequestTabs,
   createRequestTab,
+  diffApiRuns,
   draftFromRun,
   draftAssertions,
   editApiValue,
@@ -113,7 +116,7 @@ import {
   upsertCatalogRequest,
   withDraftAssertions,
 } from './api-workbench-model'
-import type { ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbenchRequestTab } from './api-workbench-model'
+import type { ApiRunDiff, ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbenchRequestTab } from './api-workbench-model'
 import { ApiImportDialog } from './ApiImportDialog'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
@@ -721,7 +724,7 @@ function RequestSettings({ draft, environments, activeEnvironmentId, onChange }:
 }
 
 /** 响应与历史区域。 */
-function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, resolveCaseName, onLoadToEditor, historyHasMore = false, onLoadMoreHistory }: {
+function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistoryOpenChange, onOpenRun, onPinRun, resolveCaseName, onLoadToEditor, onSetBaseline, onCompareBaseline, baselineRunId, historyHasMore = false, onLoadMoreHistory }: {
   api: ApiWorkbenchApi
   sessionId: string
   run: ApiRun | null
@@ -734,6 +737,12 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
   resolveCaseName: (run: ApiRun) => string | null
   /** 把这次运行的真实请求载入成一份新的未保存草稿。 */
   onLoadToEditor: (run: ApiRun) => void
+  /** 记录当前显示运行作为对比基线；可选给出随行提示。 */
+  onSetBaseline: (run: ApiRun) => void
+  /** 与已记录的基线对比当前运行。 */
+  onCompareBaseline: (run: ApiRun) => void
+  /** 当前基线运行身份；为空表示还没设过基线。 */
+  baselineRunId: string | null
   historyHasMore?: boolean
   onLoadMoreHistory?: () => void
 }): React.ReactElement {
@@ -866,6 +875,8 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
         <ToolButton label="运行历史" onClick={() => onHistoryOpenChange(true)}><History className="size-3.5" /></ToolButton>
         {displayedRun.requestId && <ToolButton label="用当前定义重发" onClick={() => { dispatchResendApiRun(displayedRun, sessionId) }}><Play className="size-3.5" /></ToolButton>}
         <ToolButton label="载入编辑器" onClick={() => onLoadToEditor(displayedRun)}><FileInput className="size-3.5" /></ToolButton>
+        <ToolButton label="设为对比基线" onClick={() => onSetBaseline(displayedRun)} disabled={baselineRunId === displayedRun.id}><GitCompare className="size-3.5" /></ToolButton>
+        <ToolButton label="与基线对比" onClick={() => onCompareBaseline(displayedRun)} disabled={baselineRunId === null || baselineRunId === displayedRun.id}><GitCompareArrows className="size-3.5" /></ToolButton>
       </div>
       <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/50 px-3 scrollbar-none">
         {sections.map(([id, label]) => <button key={id} type="button" className={cn('h-8 shrink-0 border-b-2 px-2 text-xs', section === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground')} onClick={() => setSection(id)}>{label}</button>)}
@@ -952,6 +963,83 @@ function CaseReportDialog({ batch, onOpenChange, onCopy, onOpenRun, onCancel }: 
           <Button type="button" variant="outline" disabled={rows.length === 0} onClick={onCopy}>复制报告</Button>
           <Button type="button" disabled={batch?.running} title={batch?.running ? '跑完之后再关闭，避免看不到中途结果' : undefined} onClick={() => onOpenChange(false)}>关闭</Button>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** 运行对比面板：两次运行的差异事实，两侧都是脱敏投影。 */
+function RunDiffDialog({ open, diff, baselineLabel, candidateLabel, onOpenChange }: {
+  open: boolean
+  diff: ApiRunDiff | null
+  baselineLabel: string
+  candidateLabel: string
+  onOpenChange: (open: boolean) => void
+}): React.ReactElement {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>运行对比</DialogTitle>
+          <DialogDescription>
+            基线：{baselineLabel} · 对比：{candidateLabel}。两侧都是脱敏投影，被遮罩的秘密不会出现在差异里。
+          </DialogDescription>
+        </DialogHeader>
+        {diff === null ? <p className="text-xs text-muted-foreground">正在读取两次运行…</p> : (
+          <div className="space-y-3 text-xs">
+            <p className={cn('font-medium', diff.identical ? 'text-emerald-600 dark:text-emerald-400' : 'text-foreground')}>
+              {diff.identical ? '两次运行一致' : `共 ${diff.rows.filter((row) => row.changed).length} 个字段、${diff.headers.length} 个响应头、${diff.assertions.length} 条断言有变化`}
+            </p>
+            <div className="space-y-1">
+              {diff.rows.map((row) => (
+                <div key={row.label} className={cn('grid grid-cols-[110px_minmax(0,1fr)_minmax(0,1fr)] items-start gap-2 rounded-md border border-border/50 px-2 py-1', row.changed && 'border-amber-500/40 bg-amber-500/5')}>
+                  <span className="text-muted-foreground">{row.label}</span>
+                  <span className="break-all font-mono">{row.baseline}</span>
+                  <span className="break-all font-mono">{row.candidate}</span>
+                </div>
+              ))}
+            </div>
+            {diff.headers.length > 0 && (
+              <section className="space-y-1">
+                <h4 className="font-semibold">响应头差异</h4>
+                {diff.headers.map((header) => (
+                  <div key={header.name} className="grid grid-cols-[110px_minmax(0,1fr)_minmax(0,1fr)] items-start gap-2 rounded-md border border-border/50 px-2 py-1">
+                    <span className="text-muted-foreground">{header.name} · {header.change === 'added' ? '新增' : header.change === 'removed' ? '删除' : '变化'}</span>
+                    <span className="break-all font-mono">{header.baseline}</span>
+                    <span className="break-all font-mono">{header.candidate}</span>
+                  </div>
+                ))}
+              </section>
+            )}
+            {diff.assertions.length > 0 && (
+              <section className="space-y-1">
+                <h4 className="font-semibold">断言结论变化</h4>
+                {diff.assertions.map((assertion) => (
+                  <div key={assertion.id} className="flex items-center gap-2 rounded-md border border-border/50 px-2 py-1">
+                    <span className="font-mono">{assertion.id}</span>
+                    <span className="text-muted-foreground">{assertion.baseline} → {assertion.candidate}</span>
+                  </div>
+                ))}
+              </section>
+            )}
+            <section className="space-y-1">
+              <h4 className="font-semibold">正文</h4>
+              {!diff.body.compared
+                ? <p className="text-muted-foreground">{diff.body.reason}</p>
+                : diff.body.lines.length === 0
+                  ? <p className="text-muted-foreground">正文相同</p>
+                  : (
+                    <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/50 bg-muted/20 p-2 font-mono text-[11px] leading-5">
+                      {diff.body.lines.map((line, index) => (
+                        <div key={index} className={line.kind === 'added' ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive'}>{line.kind === 'added' ? '+' : '-'}{line.text}</div>
+                      ))}
+                    </pre>
+                  )}
+              {diff.body.truncated && <p className="text-muted-foreground">变化行超过展示上限，只显示前 200 行。</p>}
+            </section>
+          </div>
+        )}
+        <DialogFooter><Button type="button" onClick={() => onOpenChange(false)}>关闭</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   )
@@ -1134,6 +1222,10 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** Cookie 面板开关与元数据列表；取值不在这条通道上。 */
   const [cookieOpen, setCookieOpen] = React.useState(false)
   const [cookies, setCookies] = React.useState<ApiCookieJarEntry[]>([])
+  /** 运行对比：基线身份与标签，以及本次对比结果。 */
+  const [baselineRun, setBaselineRun] = React.useState<{ id: string; label: string } | null>(null)
+  const [runDiff, setRunDiff] = React.useState<{ diff: ApiRunDiff; baselineLabel: string; candidateLabel: string } | null>(null)
+  const [runDiffOpen, setRunDiffOpen] = React.useState(false)
   /** 一次「跑全部用例」的报告状态；关闭弹窗即清空，不写入目录。 */
   const [caseBatch, setCaseBatch] = React.useState<ApiWorkbenchCaseBatch | null>(null)
   /** 批量用例代次；取消后置空，后续用例不再派发。 */
@@ -1424,6 +1516,44 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       : '已按历史还原成未保存草稿；鉴权已体现在请求头里，确认后再发送或保存')
   }, [catalog, setView])
 
+  /** 运行在界面上的稳定标签：请求名 + 创建时间 + 运行号尾段，同一秒内也能分辨是哪两次。 */
+  const describeRun = React.useCallback((run: ApiRun): string => `${run.requestName} · ${new Date(run.createdAt).toLocaleTimeString()} · ${run.id.slice(-6)}`, [])
+
+  /** 记录当前显示运行作为对比基线；只存在界面状态，不写目录。 */
+  const setBaseline = React.useCallback((run: ApiRun): void => {
+    setBaselineRun({ id: run.id, label: describeRun(run) })
+    setNotice(`已把「${describeRun(run)}」设为对比基线；打开另一条运行后点「与基线对比」`)
+  }, [describeRun])
+
+  /** 读取两条运行（默认脱敏投影）并计算差异。 */
+  const compareWithBaseline = React.useCallback(async (run: ApiRun): Promise<void> => {
+    if (!api || !baselineRun) return
+    if (baselineRun.id === run.id) {
+      setLoadError('当前运行就是基线，请先打开另一条运行再对比')
+      return
+    }
+    try {
+      /** 两侧都用默认投影：绝不 reveal，差异里不会出现被遮罩的秘密。 */
+      const [baselineRecord, candidateRecord] = await Promise.all([
+        api.getRun({ sessionId, runId: baselineRun.id }),
+        api.getRun({ sessionId, runId: run.id }),
+      ])
+      /** 用例一行显示可读名称，而不是把 caseId 原样丢给用户。 */
+      const diff = diffApiRuns(baselineRecord, candidateRecord)
+      const caseLabels: Record<'baseline' | 'candidate', string> = {
+        baseline: resolveCaseName(baselineRecord) ?? '未按用例',
+        candidate: resolveCaseName(candidateRecord) ?? '未按用例',
+      }
+      const rows = diff.rows.map((row) => row.label === '用例'
+        ? { ...row, baseline: caseLabels.baseline, candidate: caseLabels.candidate, changed: caseLabels.baseline !== caseLabels.candidate }
+        : row)
+      setRunDiff({ diff: { ...diff, rows }, baselineLabel: baselineRun.label, candidateLabel: describeRun(run) })
+      setRunDiffOpen(true)
+    } catch (error) {
+      setLoadError(errorMessage(error, '读取对比运行失败'))
+    }
+  }, [api, baselineRun, describeRun, resolveCaseName, sessionId])
+
   /** 导入的 cURL 草稿一律新开标签，确认无误后才写入目录。 */
   const importDrafts = React.useCallback((drafts: ApiRequestDraft[]): void => {
     if (drafts.length === 0) return
@@ -1628,7 +1758,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
               }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onSend={() => void sendActive()} onCancel={cancelActive} /></section>}
-              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} /></section>}
+              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} onSetBaseline={setBaseline} onCompareBaseline={(run) => void compareWithBaseline(run)} baselineRunId={baselineRun?.id ?? null} /></section>}
             </div>
           )}
         </main>
@@ -1660,6 +1790,13 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
         onOpenChange={setCookieOpen}
         onRefresh={() => void loadCookies()}
         onClear={() => void clearCookies()}
+      />
+      <RunDiffDialog
+        open={runDiffOpen}
+        diff={runDiff?.diff ?? null}
+        baselineLabel={runDiff?.baselineLabel ?? ''}
+        candidateLabel={runDiff?.candidateLabel ?? ''}
+        onOpenChange={setRunDiffOpen}
       />
       <RuntimeVariablesDialog
         open={runtimeOpen}

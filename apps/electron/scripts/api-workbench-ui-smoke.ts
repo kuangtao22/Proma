@@ -47,6 +47,27 @@ async function clickText(window: BrowserWindow, text: string): Promise<void> {
   assert.equal(clicked, true, `找不到按钮 ${text}`)
 }
 
+/**
+ * 在历史列表里按行内文本条件点击一条运行。
+ * 同一请求名会出现多条运行，只按 aria-label 无法区分，因此必须用行内文本（用例名/状态）来挑。
+ */
+async function clickHistoryRow(window: BrowserWindow, options: { includes?: string; excludes?: string }): Promise<void> {
+  const clicked = await window.webContents.executeJavaScript(`(() => {
+    const includes = ${JSON.stringify(options.includes ?? null)}
+    const excludes = ${JSON.stringify(options.excludes ?? null)}
+    const button = [...document.querySelectorAll('[aria-label^="打开运行"]')].find((item) => {
+      const text = item.textContent ?? ''
+      if (includes !== null && !text.includes(includes)) return false
+      if (excludes !== null && text.includes(excludes)) return false
+      return true
+    })
+    if (!(button instanceof HTMLButtonElement)) return false
+    button.click()
+    return true
+  })()`)
+  assert.equal(clicked, true, `找不到历史运行 ${JSON.stringify(options)}`)
+}
+
 /** 等待 Radix 弹层完成退出动画，避免截图捕获关闭中的残影。 */
 async function waitForClosedLayersToLeave(window: BrowserWindow): Promise<void> {
   await waitFor(window, `![...document.querySelectorAll('[data-state="closed"]')].some((item) => {
@@ -357,7 +378,32 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-load-run.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] 历史载入编辑器已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、宽布局、亮暗主题与窄 Pane 已验证')
+    /** 运行对比：把当前运行设为基线，再打开另一条运行对比。 */
+    /** 前面的窄 Pane 截图把窗口调小了，对比步骤先恢复到宽布局。 */
+    window.setContentSize(1180, 820)
+    await waitFor(window, "document.querySelector('button[aria-label=\"打开目录\"]') === null", '宽布局未恢复')
+    await clickLabel(window, '运行历史')
+    await waitFor(window, "Boolean(document.querySelector('[aria-label^=\"打开运行\"]'))", '历史列表未渲染')
+    /** 基线选不带用例的那条运行；带用例的运行留作对比候选。 */
+    await clickHistoryRow(window, { excludes: '用例' })
+    await waitFor(window, "document.body.textContent?.includes('200')", '基线运行未打开')
+    await clickLabel(window, '设为对比基线')
+    await waitFor(window, "document.body.textContent?.includes('设为对比基线；打开另一条运行') ?? false", '设置基线后没有提示')
+    /** 对比候选选带用例的那条运行（需重新打开历史列表）。 */
+    await clickLabel(window, '运行历史')
+    await waitFor(window, "Boolean(document.querySelector('[aria-label^=\"打开运行\"]'))", '历史列表第二次未渲染')
+    await clickHistoryRow(window, { includes: '正常用例' })
+    await waitFor(window, "document.body.textContent?.includes('用例 正常用例')", '对比候选未打开')
+    await waitFor(window, "Boolean(document.querySelector('[aria-label=\"与基线对比\"]:not([disabled])'))", '对比入口不可用')
+    await clickLabel(window, '与基线对比')
+    await waitFor(window, "document.body.textContent?.includes('运行对比') && document.body.textContent?.includes('两次运行一致') === false", '对比面板未显示差异结论')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('正文相同') ?? false"), true, '对比面板缺少正文结论')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('用例') ?? false"), true, '对比面板缺少用例差异')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('断言结论变化') ?? false"), true, '对比面板缺少断言差异')
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-run-diff.png', (await window.webContents.capturePage()).toPNG())
+    console.log('[API Workbench UI smoke] 运行对比已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、自动 Cookie 开关与面板、历史载入编辑器、运行对比、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error
