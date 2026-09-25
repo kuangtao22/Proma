@@ -141,6 +141,21 @@ export function createImportedRequestTabs(
   return drafts.map((draft) => createRequestTab(createId(), draft))
 }
 
+/** 目录栏宽度（像素）的可拖动范围：太窄放不下请求名，太宽会把编辑器挤没。 */
+export const API_WORKBENCH_CATALOG_WIDTH = { min: 160, max: 460, step: 16, initial: 224 } as const
+/** 请求区占上下分割的百分比范围：两侧都要留出可用的可视高度。 */
+export const API_WORKBENCH_EDITOR_SHARE = { min: 25, max: 80, step: 4, initial: 58 } as const
+/** 把目录栏宽度收敛到可拖动范围；非法输入回落到初始值而不是让布局塌掉。 */
+export function clampApiWorkbenchCatalogWidth(value: number): number {
+  if (!Number.isFinite(value)) return API_WORKBENCH_CATALOG_WIDTH.initial
+  return Math.min(API_WORKBENCH_CATALOG_WIDTH.max, Math.max(API_WORKBENCH_CATALOG_WIDTH.min, Math.round(value)))
+}
+/** 把「请求区占多少百分比」收敛到可拖动范围。 */
+export function clampApiWorkbenchEditorShare(value: number): number {
+  if (!Number.isFinite(value)) return API_WORKBENCH_EDITOR_SHARE.initial
+  return Math.min(API_WORKBENCH_EDITOR_SHARE.max, Math.max(API_WORKBENCH_EDITOR_SHARE.min, Math.round(value)))
+}
+
 /**
  * 把一个已保存请求移动到目标集合与分组（文件夹）。
  *

@@ -11,6 +11,10 @@ import {
   createRequestTab,
   draftFromRun,
   moveApiRequest,
+  clampApiWorkbenchCatalogWidth,
+  clampApiWorkbenchEditorShare,
+  API_WORKBENCH_CATALOG_WIDTH,
+  API_WORKBENCH_EDITOR_SHARE,
   draftAssertions,
   editApiValue,
   formatCookieExpiry,
@@ -592,6 +596,23 @@ describe('接口工作台编辑模型', () => {
 
 // 保证模型只依赖工作台合同的窄接口，避免测试替身随 preload 其它能力膨胀。
 void ({} as Pick<ApiWorkbenchApi, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel'>)
+
+describe('可拖动分隔条的范围', () => {
+  test('Given 拖动目录栏 When 越界 Then 收敛到可拖动范围而不是塌陷', () => {
+    expect(clampApiWorkbenchCatalogWidth(API_WORKBENCH_CATALOG_WIDTH.min - 50)).toBe(API_WORKBENCH_CATALOG_WIDTH.min)
+    expect(clampApiWorkbenchCatalogWidth(API_WORKBENCH_CATALOG_WIDTH.max + 50)).toBe(API_WORKBENCH_CATALOG_WIDTH.max)
+    expect(clampApiWorkbenchCatalogWidth(300.6)).toBe(301)
+    /** 非法值（NaN / 非数字）回落到初始宽度，避免脏输入让布局算不出来。 */
+    expect(clampApiWorkbenchCatalogWidth(Number.NaN)).toBe(API_WORKBENCH_CATALOG_WIDTH.initial)
+  })
+
+  test('Given 拖动请求区高度 When 越界 Then 两侧都保留可用可视高度', () => {
+    expect(clampApiWorkbenchEditorShare(API_WORKBENCH_EDITOR_SHARE.min - 10)).toBe(API_WORKBENCH_EDITOR_SHARE.min)
+    expect(clampApiWorkbenchEditorShare(API_WORKBENCH_EDITOR_SHARE.max + 10)).toBe(API_WORKBENCH_EDITOR_SHARE.max)
+    expect(clampApiWorkbenchEditorShare(58.4)).toBe(58)
+    expect(clampApiWorkbenchEditorShare(Number.POSITIVE_INFINITY)).toBe(API_WORKBENCH_EDITOR_SHARE.initial)
+  })
+})
 
 describe('把请求移动到其他分组 / 集合', () => {
   /** 两个集合 + 一条位于「默认/用户模块」的请求。 */

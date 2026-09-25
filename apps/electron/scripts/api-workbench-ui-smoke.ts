@@ -188,6 +188,23 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.some((item) => item.folder === '订单模块')", '请求没有被移动到新分组')
     await waitFor(window, "document.body.textContent?.includes('已把')", '缺少移动完成提示')
     console.log('[API Workbench UI smoke] 移动到其他分组已验证')
+    /** 可拖动分隔条：左右拖目录宽度、上下拖请求/响应高度，键盘也能调整。 */
+    const splitStart = await window.webContents.executeJavaScript(`(() => { const v = document.querySelector('[role=separator][aria-label="调整目录宽度"]'); const h = document.querySelector('[role=separator][aria-label="调整请求与响应高度"]'); const catalog = v?.previousElementSibling; const section = h?.previousElementSibling; if (!(v instanceof HTMLElement) || !(h instanceof HTMLElement) || !(catalog instanceof HTMLElement) || !(section instanceof HTMLElement)) return null; return { catalogWidth: Math.round(catalog.getBoundingClientRect().width), requestHeight: Math.round(section.getBoundingClientRect().height) }; })()`) as { catalogWidth: number; requestHeight: number } | null
+    assert.ok(splitStart, '工作台没有渲染出两条可拖动分隔条')
+    /** 拖动：pointerdown → pointermove → pointerup；目录分隔条右移 60px 应变宽。 */
+    await window.webContents.executeJavaScript(`(() => { const handle = document.querySelector('[role=separator][aria-label="调整目录宽度"]'); const rect = handle.getBoundingClientRect(); const x = rect.left + rect.width / 2; const y = rect.top + rect.height / 2; handle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, clientX: x, clientY: y })); handle.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, pointerId: 1, clientX: x + 60, clientY: y })); handle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 1, clientX: x + 60, clientY: y })); return true; })()`)
+    await waitFor(window, `(() => { const handle = document.querySelector('[role=separator][aria-label="调整目录宽度"]'); const catalog = handle?.previousElementSibling; return catalog instanceof HTMLElement && Math.round(catalog.getBoundingClientRect().width) >= ${splitStart.catalogWidth} + 50; })()`, '拖动目录分隔条后宽度没有变化')
+    /** 键盘：左移一格应缩窄目录（状态更新是异步的，所以要等宽度真的变小）。 */
+    const beforeArrow = await window.webContents.executeJavaScript(`Math.round(document.querySelector('[role=separator][aria-label="调整目录宽度"]').previousElementSibling.getBoundingClientRect().width)`) as number
+    await window.webContents.executeJavaScript(`document.querySelector('[role=separator][aria-label="调整目录宽度"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true, cancelable: true }))`)
+    await waitFor(window, `Math.round(document.querySelector('[role=separator][aria-label="调整目录宽度"]').previousElementSibling.getBoundingClientRect().width) < ${beforeArrow}`, '方向键没有缩窄目录宽度')
+    /** 上下拖动：请求/响应分隔条上移 80px，请求区应明显变矮。 */
+    await window.webContents.executeJavaScript(`(() => { const handle = document.querySelector('[role=separator][aria-label="调整请求与响应高度"]'); const rect = handle.getBoundingClientRect(); const x = rect.left + rect.width / 2; const y = rect.top + rect.height / 2; handle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 2, clientX: x, clientY: y })); handle.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, pointerId: 2, clientX: x, clientY: y - 80 })); handle.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 2, clientX: x, clientY: y - 80 })); return true; })()`)
+    const horizontalAfter = await window.webContents.executeJavaScript(`(() => { const handle = document.querySelector('[role=separator][aria-label="调整请求与响应高度"]'); const section = handle?.previousElementSibling; return { height: section ? Math.round(section.getBoundingClientRect().height) : -1, tag: section ? section.tagName : 'none', handleHeight: Math.round(handle.getBoundingClientRect().height), parentHeight: Math.round(handle.parentElement.getBoundingClientRect().height) }; })()`) as { height: number; tag: string; handleHeight: number; parentHeight: number }
+    assert.ok(horizontalAfter.height <= splitStart.requestHeight - 40, `向上拖动后请求区高度没有变化（起始 ${splitStart.requestHeight}，当前 ${horizontalAfter.height}，兄弟 ${horizontalAfter.tag}，分隔条高 ${horizontalAfter.handleHeight}，容器高 ${horizontalAfter.parentHeight}）`)
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-splitters.png', (await window.webContents.capturePage()).toPNG())
+    console.log('[API Workbench UI smoke] 可拖动分隔条已验证')
     console.log('[API Workbench UI smoke] cURL 导入与保存已验证')
     /** 导入集合快照：以新增方式合并，并提示需要重填的秘密。 */
     const snapshot = createApiCatalogSnapshotExport({
@@ -577,7 +594,7 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、可拖动分隔条、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

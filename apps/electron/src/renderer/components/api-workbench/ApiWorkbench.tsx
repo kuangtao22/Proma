@@ -113,6 +113,10 @@ import {
   isAgentApiCase,
   isApiRequestDirty,
   moveApiRequest,
+  API_WORKBENCH_CATALOG_WIDTH,
+  API_WORKBENCH_EDITOR_SHARE,
+  clampApiWorkbenchCatalogWidth,
+  clampApiWorkbenchEditorShare,
   removeApiCase,
   renameCatalogFolder,
   renameApiCase,
@@ -126,6 +130,7 @@ import type { ApiRunDiff, ApiWorkbenchBodyPage, ApiWorkbenchCaseBatch, ApiWorkbe
 import { ApiImportDialog } from './ApiImportDialog'
 import { ApiScenarioPanel } from './ApiScenarioPanel'
 import { ApiRequestMoveDialog } from './ApiRequestMoveDialog'
+import { ApiSplitHandle } from './ApiSplitHandle'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
 
 /** 历史运行的重发事件名；只携带身份，执行由会话决定。 */
@@ -1291,6 +1296,11 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   const [loadError, setLoadError] = React.useState<string | null>(null)
   /** 正在「移动到其他分组 / 集合」的请求身份。 */
   const [movingRequestId, setMovingRequestId] = React.useState<string | null>(null)
+  /** 目录栏宽度与「请求区占上下分割的百分比」：两条分隔条各拖自己的。 */
+  const [catalogWidth, setCatalogWidth] = React.useState<number>(API_WORKBENCH_CATALOG_WIDTH.initial)
+  const [editorShare, setEditorShare] = React.useState<number>(API_WORKBENCH_EDITOR_SHARE.initial)
+  /** 请求/响应分割容器的引用：把鼠标拖动像素换算成百分比。 */
+  const splitRef = React.useRef<HTMLDivElement | null>(null)
   /** 当前会话编辑状态。 */
   const [view, setView] = useAtom(apiWorkbenchSessionStateAtomFamily(uiScope))
   /** Agent 卡片请求定位的运行目标。 */
@@ -1920,7 +1930,17 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       )}
       {compact && <div className="flex h-9 shrink-0 items-center justify-center border-b border-border/50 bg-muted/20"><div className="flex rounded-md bg-muted p-0.5"><button type="button" className={cn('rounded px-3 py-1 text-xs', compactView === 'request' && 'bg-background shadow-sm')} onClick={() => setCompactView('request')}>请求</button><button type="button" className={cn('rounded px-3 py-1 text-xs', compactView === 'response' && 'bg-background shadow-sm')} onClick={() => setCompactView('response')}>响应</button></div></div>}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {!compact && <div className="w-56 shrink-0">{catalogPanel}</div>}
+        {!compact && (
+          <>
+            <div className="shrink-0" style={{ width: catalogWidth }}>{catalogPanel}</div>
+            <ApiSplitHandle
+              orientation="vertical"
+              label="调整目录宽度"
+              onDrag={(delta) => setCatalogWidth((previous) => clampApiWorkbenchCatalogWidth(previous + delta))}
+              onStep={(direction) => setCatalogWidth((previous) => clampApiWorkbenchCatalogWidth(previous + direction * API_WORKBENCH_CATALOG_WIDTH.step))}
+            />
+          </>
+        )}
         <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <RequestTabBar tabs={view.tabs} activeTabId={view.activeTabId} onSelect={(activeTabId) => setView((previous) => ({ ...previous, activeTabId, selectedRun: previous.tabs.find((tab) => tab.id === activeTabId)?.run ?? null }))} onClose={(tabId) => setView((previous) => {
             /** 关闭后优先选择相邻标签。 */
@@ -1934,8 +1954,8 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
           {!activeTab && !view.historyOpen && !activeRun ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 text-center text-xs text-muted-foreground"><Archive className="size-6" /><span>从目录打开请求，或新建一个请求</span>{catalog.collections[0] && <Button type="button" variant="outline" size="sm" onClick={() => createRequest(catalog.collections[0]!.id)}><Plus className="mr-1 size-3.5" />新建请求</Button>}</div>
           ) : (
-            <div className={cn('flex min-h-0 flex-1 overflow-hidden', compact ? 'flex-col' : 'flex-col')}>
-              {activeTab && !view.historyOpen && (!compact || compactView === 'request') && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : 'basis-[58%] border-b border-border/50')}><RequestEditor tab={activeTab} environmentId={view.environmentId} onChange={(draft) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft }; return { ...next, dirty: isApiRequestDirty(next) } })} onSave={() => void saveActive()} onDuplicate={() => {
+            <div ref={splitRef} className={cn('flex min-h-0 flex-1 overflow-hidden', compact ? 'flex-col' : 'flex-col')}>
+              {activeTab && !view.historyOpen && (!compact || compactView === 'request') && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : 'border-b border-border/50')} style={compact ? undefined : { flexBasis: `${editorShare}%` }}><RequestEditor tab={activeTab} environmentId={view.environmentId} onChange={(draft) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft }; return { ...next, dirty: isApiRequestDirty(next) } })} onSave={() => void saveActive()} onDuplicate={() => {
                 /** 复制出的草稿使用独立身份且不覆盖原请求。 */
                 const tabId = createLocalId('draft')
                 setView((previous) => ({ ...previous, tabs: [...previous.tabs, createRequestTab(tabId, { ...cloneApiRequestDraft(activeTab.draft), name: `${activeTab.draft.name} 副本` })], activeTabId: tabId, selectedRun: null }))
@@ -1944,7 +1964,15 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
                 if (activeTab.requestId) void mutateCatalog((latest) => ({ ...latest, requests: latest.requests.filter((request) => request.id !== activeTab.requestId) }))
                 setView((previous) => ({ ...previous, tabs: previous.tabs.filter((tab) => tab.id !== activeTab.id), activeTabId: null, selectedRun: null }))
               }} onCopyCurl={() => void copyActiveCurl()} environments={catalog.environments} casesRunning={caseBatch !== null && caseBatch.tabId === activeTab.id && caseBatch.running} onCasesChange={(draft, activeCaseId) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft, activeCaseId }; return { ...next, dirty: isApiRequestDirty(next) } })} onActiveCaseChange={(activeCaseId) => updateTab(activeTab.id, (tab) => ({ ...tab, activeCaseId }))} onRunAllCases={() => void runAllCases()} onMove={() => { if (activeTab.requestId) setMovingRequestId(activeTab.requestId) }} onSend={() => void sendActive()} onCancel={cancelActive} onPickFiles={pickFiles} /></section>}
-              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : activeTab ? 'basis-[42%]' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} onSetBaseline={setBaseline} onCompareBaseline={(run) => void compareWithBaseline(run)} baselineRunId={baselineRun?.id ?? null} /></section>}
+              {!compact && activeTab && !view.historyOpen && (
+                <ApiSplitHandle
+                  orientation="horizontal"
+                  label="调整请求与响应高度"
+                  onDrag={(delta) => setEditorShare((previous) => clampApiWorkbenchEditorShare(previous + delta / Math.max(1, splitRef.current?.clientHeight ?? 1) * 100))}
+                  onStep={(direction) => setEditorShare((previous) => clampApiWorkbenchEditorShare(previous + direction * API_WORKBENCH_EDITOR_SHARE.step))}
+                />
+              )}
+              {(!compact || compactView === 'response' || view.historyOpen || !activeTab) && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : 'flex-1')}><ResponsePanel api={api} sessionId={sessionId} run={activeRun} historyRuns={historyRuns} historyOpen={view.historyOpen} historyHasMore={historyNextCursor !== null} onLoadMoreHistory={() => void loadMoreHistory()} onHistoryOpenChange={(historyOpen) => setView((previous) => ({ ...previous, historyOpen }))} onOpenRun={openRun} onPinRun={(run) => { void api.pinRun({ sessionId, runId: run.id, pinned: !run.pinned }).then(() => refreshHistory()).catch((error: unknown) => setLoadError(errorMessage(error, '更新运行收藏失败'))) }} resolveCaseName={resolveCaseName} onLoadToEditor={loadRunToEditor} onSetBaseline={setBaseline} onCompareBaseline={(run) => void compareWithBaseline(run)} baselineRunId={baselineRun?.id ?? null} /></section>}
             </div>
           )}
         </main>
