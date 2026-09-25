@@ -176,7 +176,7 @@ function createAssertion(): ApiAssertion {
 }
 
 /** 统一显示未知异常，不回显对象内部字段。 */
-function errorMessage(error: unknown, fallback: string): string {
+export function errorMessage(error: unknown, fallback: string): string {
   if (!(error instanceof Error) || !error.message) return fallback
   /** 将稳定 Host 错误转换成用户可采取行动的说明。 */
   const messages: Record<string, string> = {
@@ -194,10 +194,18 @@ function errorMessage(error: unknown, fallback: string): string {
     API_WORKBENCH_FILE_TOO_LARGE: '文件超过单次上传上限（20 MiB）',
     API_WORKBENCH_FILE_LIMIT: '本次请求可携带的文件数量已达上限（16 个）',
     API_WORKBENCH_MULTIPART_TOO_LARGE: '附件与字段合计超过单次请求正文上限（20 MiB）',
+    API_WORKBENCH_SHUTTING_DOWN: '应用正在退出或需要重启客户端：请重启 Proma 后重试',
+    API_WORKBENCH_SCENARIO_PREPARED_NOT_FOUND: '这条流程的准备工作已失效，请重新点运行',
+    API_WORKBENCH_SCENARIO_PREPARED_STALE: '目录在这条流程准备之后被改动过，请重新点运行',
+    API_WORKBENCH_SCENARIO_PREPARED_EXPIRED: '这条流程的准备已过期，请重新点运行',
+    API_WORKBENCH_SCENARIO_RUN_NOT_FOUND: '找不到这次流程运行记录，请刷新后重试',
   }
-  /** 错误码位于冒号前，后续 Host 中文细节可以继续展示。 */
-  const code = error.message.split(':', 1)[0]!
-  return messages[code] ?? error.message
+  /** 错误码位于冒号前，后续 Host 中文细节单独取出。 */
+  const [code, ...detailParts] = error.message.split(':')
+  const detail = detailParts.join(':').trim()
+  /** 拒绝类错误的可行动原因就在 Host 细节里（例如「这是探索子会话…」），直接展示它。 */
+  if (code === 'API_ACCESS_DENIED') return detail || '当前会话不能使用接口工作台；请回到有项目的会话或重启客户端后重试'
+  return messages[code!] ?? error.message
 }
 
 /** 按名称、方法、URL 或文件夹过滤请求目录，不修改原始顺序。 */
