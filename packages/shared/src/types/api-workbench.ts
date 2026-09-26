@@ -701,12 +701,18 @@ export function parseApiScenario(value: unknown): ApiScenario {
     updatedAt: apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'scenario.updatedAt'),
   }
 }
-/** 允许的算法白名单：写死在解析层，历史数据带进未实现算法时会直接解析失败，而不是留到运行时才炸。 */
+/**
+ * 允许的算法白名单：写死在解析层，历史数据带进未实现算法时会直接解析失败，而不是留到运行时才炸。
+ *
+ * 国密（SM3/SM4）**不在 P1 白名单内**：Electron 与 Bun 都用 BoringSSL，运行时不提供这两个算法
+ * （只有 OpenSSL 3 的 node 才有）。留着它们会让人配出一套「保存得了、执行时被跳过」的方案，
+ * 结果就是以为加密了其实发的是明文。等 P3 用纯 JS/WASM 实现后再加回来。
+ */
 export const API_CRYPTO_ALGOS = {
   derive: ['timestamp-nonce'],
-  sign: ['MD5', 'SHA1', 'SHA256', 'HMAC-SHA1', 'HMAC-SHA256', 'SM3'],
-  encrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'SM4-CBC'],
-  decrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'SM4-CBC'],
+  sign: ['MD5', 'SHA1', 'SHA256', 'HMAC-SHA1', 'HMAC-SHA256'],
+  encrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM'],
+  decrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM'],
 } as const
 /** 步骤输出目标：请求头 / 查询参数 / 正文。 */
 function cryptoTarget(value: unknown): { in: 'header' | 'query' | 'body'; name: string } {

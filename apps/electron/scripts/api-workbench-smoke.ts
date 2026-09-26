@@ -14,6 +14,7 @@ import { ApiWorkbenchStore } from '../src/main/lib/api-workbench/api-workbench-s
 import { ApiRuntimeClient } from '../src/main/lib/api-workbench/api-runtime-client'
 import { registerApiWorkbenchIpc } from '../src/main/lib/api-workbench/api-ipc'
 import { createApiAgentFacade } from '../src/main/lib/api-workbench/api-agent-facade'
+import { decryptValue, digestValue, encryptValue } from '../src/main/lib/api-workbench/api-crypto'
 
 /**
  * 临时根和该验收拥有的 Electron 内部目录，不触碰用户工作区。
@@ -24,6 +25,12 @@ mkdirSync(join(directory, 'electron'))
 app.setPath('userData', join(directory, 'electron'))
 /** 只对本机合成请求计数，以证明重试/打开历史不会重复出网。 */
 let calls = 0
+/** 加密端到端用的固定夹具密钥；只出现在这条合成链路里。 */
+const cryptoKey = '9f2c8a1d4b6e7f03'
+const cryptoIv = '1029384756abcdef'
+const appSecretValue = 'cb-app-2026-9f2c8a1d'
+/** 加密端点观察到的事实：验签是否一致、收到的密文解出来是什么、这次到底是不是密文。 */
+const cryptoServer = { signMatched: false, decryptedField: '', sawCiphertext: false }
 /** 保留包含大整数和秘密回显的原始正文，检测脱敏和原文读取。 */
 const payload = '{"id":90071992547409931234,"token":"fixture-secret","ok":true}'
 /** 本测试的 HTTP server，慢接口供取消验证。 */
@@ -62,6 +69,32 @@ const server = createServer((request, response) => {
     receivedAuthorization = String(request.headers.authorization ?? '')
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify({ ok: true }))
+    return
+  }
+  if (request.url === '/crypto') {
+    /**
+     * 加密端点按真实协议处理：先解密密文，再用**明文**重算签名比对。
+     * 这样「签名签的是明文还是密文」这件事在服务端被真实验证，而不是只在客户端自证。
+     */
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = Buffer.concat(chunks).toString('utf8')
+      const timestamp = String(request.headers['x-timestamp'] ?? '')
+      const sign = String(request.headers['x-sign'] ?? '')
+      let plaintext = body
+      try {
+        plaintext = decryptValue('AES-128-CBC', cryptoKey, cryptoIv, body, { encoding: 'base64' })
+        cryptoServer.sawCiphertext = true
+      } catch { cryptoServer.sawCiphertext = false }
+      const expected = digestValue('HMAC-SHA256', appSecretValue, `POST\n/crypto\n${timestamp}\n${digestValue('SHA256', '', plaintext, 'hex')}`, 'hex')
+      cryptoServer.signMatched = sign === expected
+      cryptoServer.decryptedField = plaintext
+      /** 响应同样按方案加密：客户端必须先解密才能断言与提取。 */
+      const encrypted = encryptValue('AES-128-CBC', cryptoKey, cryptoIv, '{"code":0,"capabilityId":1024}', { encoding: 'base64' })
+      response.writeHead(200, { 'Content-Type': 'text/plain' })
+      response.end(encrypted.ciphertext)
+    })
     return
   }
   if (request.url === '/stream') {
@@ -554,10 +587,75 @@ async function smoke(): Promise<void> {
   assert.equal(JSON.stringify(scenarioRun).includes('fixture-token-9'), false, '流程摘要不该带秘密明文')
   const scenarioStored = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
   assert.equal(scenarioStored.scenarios?.[0]?.folder, '用户模块')
-  const history = await call('listRuns', { sessionId: 'smoke-session' })
-  assert.equal(history.runs.length, 19)
-  assert.equal(calls, 19)
-  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval via permission service', 'agent file deny blocks send', 'agent file changed rejection', 'agent file type rejection', 'history'] }))
+  /**
+   * 加密接口端到端：公共配置声明密钥 → 保存方案 → 绑定接口 → 发送时真实签名与加密 →
+   * 服务端验签并解出明文 → 响应解密后交给断言。密钥值全程不进记录。
+   */
+  await call('saveWorkspaceVariables', { sessionId: 'smoke-session', variables: [
+    { id: 'var_app_secret', name: 'appSecret', value: appSecretValue, enabled: true, secret: true },
+    { id: 'var_aes_key', name: 'aesKey', value: cryptoKey, enabled: true, secret: true },
+    { id: 'var_aes_iv', name: 'aesIv', value: cryptoIv, enabled: true, secret: true },
+  ] })
+  const cryptoProfile = await call('saveCryptoProfile', { sessionId: 'smoke-session', expectedRevision: null, profile: {
+    id: 'profile_smoke', name: '烟测签名加密', description: '端到端验签与加解密', scope: 'workspace', appliesTo: 'all', revision: 0, updatedAt: 0,
+    requestSteps: [
+      { id: 'cs_derive', kind: 'derive', enabled: true, algo: 'timestamp-nonce', target: { in: 'header', name: 'X-Timestamp' } },
+      { id: 'cs_sign', kind: 'sign', enabled: true, algo: 'HMAC-SHA256', keyRef: 'appSecret', encoding: 'hex', target: { in: 'header', name: 'X-Sign' }, template: '{{method}}\n{{path}}\n{{timestamp}}\n{{body.sha256}}' },
+      { id: 'cs_encrypt', kind: 'encrypt', enabled: true, algo: 'AES-128-CBC', keyRef: 'aesKey', ivRef: 'aesIv', encoding: 'base64', source: 'body', target: { in: 'body', name: 'body' } },
+    ],
+    responseSteps: [
+      { id: 'cs_decrypt', kind: 'decrypt', enabled: true, algo: 'AES-128-CBC', keyRef: 'aesKey', ivRef: 'aesIv', encoding: 'base64', source: 'response-body', onFailure: 'stop' },
+    ],
+  } })
+  assert.equal(cryptoProfile.revision, 1)
+  const boundCatalog = await call('getCatalog', { sessionId: 'smoke-session' }) as ApiCatalog
+  const cryptoDefinition = {
+    ...draft, name: '加密接口', method: 'POST' as const, url: baseUrl + '/crypto',
+    body: { kind: 'text' as const, text: 'capabilityId=1024', fields: [] },
+    selectedProfileId: 'profile_smoke',
+    assertions: [{ id: 'a_crypto', kind: 'json-value' as const, path: 'capabilityId', expected: '1024' }],
+  }
+  await call('saveCatalog', { sessionId: 'smoke-session', expectedRevision: boundCatalog.revision, catalog: {
+    ...boundCatalog,
+    requests: [...boundCatalog.requests, { ...cryptoDefinition, id: 'request_crypto', revision: 1, updatedAt: Date.now() }],
+  } })
+  const cryptoPrepared = await call('prepare', { sessionId: 'smoke-session', requestId: 'request_crypto', request: cryptoDefinition })
+  const cryptoRun = await call('send', { sessionId: 'smoke-session', preparedId: cryptoPrepared.preparedId }) as ApiRun
+  assert.equal(cryptoServer.signMatched, true, '服务端校验 HMAC-SHA256 签名不一致')
+  assert.equal(cryptoServer.sawCiphertext, true, '服务端收到的不是密文')
+  assert.equal(cryptoServer.decryptedField, 'capabilityId=1024', '服务端解出的正文不对')
+  assert.equal(cryptoRun.crypto?.decrypted, true, '响应没有解密')
+  assert.equal(cryptoRun.crypto?.plaintextSent, false, '完整密钥时不该标记明文发出')
+  assert.deepEqual(cryptoRun.crypto?.executed.map((step) => step.kind), ['derive', 'sign', 'encrypt', 'decrypt'])
+  assert.equal(cryptoRun.assertions[0]?.passed, true, '断言没有跑在解密后的正文上')
+  /** 记录里保存的是实际发出的形态：带签名头、正文是密文，并留一份变形前明文。 */
+  assert.ok(cryptoRun.request.headers.some((header) => header.name === 'X-Sign'), '记录里没有实际发出的签名头')
+  assert.equal(cryptoRun.crypto?.bodyBeforeTransform, 'capabilityId=1024')
+  const cryptoRecord = JSON.stringify(await call('getRun', { sessionId: 'smoke-session', runId: cryptoRun.id }))
+  for (const secret of [cryptoKey, cryptoIv, appSecretValue]) assert.equal(cryptoRecord.includes(secret), false, '运行记录泄漏了密钥值')
+  /** 缺密钥不阻断：去掉 aesKey 后重发，服务端照样收到请求，但这次是明文。 */
+  await call('saveWorkspaceVariables', { sessionId: 'smoke-session', variables: [
+    { id: 'var_app_secret', name: 'appSecret', value: appSecretValue, enabled: true, secret: true },
+    { id: 'var_aes_iv', name: 'aesIv', value: cryptoIv, enabled: true, secret: true },
+  ] })
+  const cryptoPlainPrepared = await call('prepare', { sessionId: 'smoke-session', requestId: 'request_crypto', request: cryptoDefinition })
+  const cryptoPlainRun = await call('send', { sessionId: 'smoke-session', preparedId: cryptoPlainPrepared.preparedId }) as ApiRun
+  assert.equal(cryptoPlainRun.crypto?.plaintextSent, true, '缺密钥时必须标记明文发出')
+  assert.equal(cryptoPlainRun.crypto?.skipped.some((step) => step.reason === 'missing-secret' && step.keyRef === 'aesKey'), true)
+  assert.equal(cryptoServer.sawCiphertext, false, '缺密钥时不该发密文')
+  assert.equal(cryptoServer.signMatched, true, '缺的是加密密钥，签名仍然应该成立')
+  /**
+   * 国密边界在真实运行时定案：Electron 用的是 BoringSSL，不提供 SM3/SM4
+   * （只有 OpenSSL 3 的 node 才有），所以它们不在 P1 白名单里。
+   * 这里固定住「调用它们得到可分类错误」，避免有人以为配了国密就能跑。
+   */
+  assert.throws(() => digestValue('SM3', '', 'abc', 'hex'), /API_CRYPTO_UNSUPPORTED_ALGO/, 'Electron 运行时本不该提供 SM3')
+  assert.throws(() => encryptValue('SM4-CBC', '0123456789abcdef', '0000000000000000', '国密正文', { encoding: 'base64' }), /API_CRYPTO_UNSUPPORTED_ALGO/, 'Electron 运行时本不该提供 SM4')
+  /** 显式放大分页：默认 20 条会把这次新增的运行截掉，断言就失去意义。 */
+  const history = await call('listRuns', { sessionId: 'smoke-session', limit: 50 })
+  assert.equal(history.runs.length, 21)
+  assert.equal(calls, 21)
+  console.log('[API smoke] PASS', JSON.stringify({ electron: process.versions.electron, node: process.versions.node, encrypted: safeStorage.isEncryptionAvailable(), networkCalls: calls, streamBatches: streamBatches.length, checks: ['preload IPC', 'save reopen', '401 gzip raw headers', 'bigint preservation', 'secret redaction', 'agent approval', 'deduplicated send', 'cancel partial', 'sse frames', 'sse live broadcast', 'sse partial keep', 'extract reuse in memory', 'case runs and report', 'agent authored cases', 'human case protection', 'cookie jar send/clear', 'json type assertions', 'multipart upload bytes', 'agent file approval via permission service', 'agent file deny blocks send', 'agent file changed rejection', 'agent file type rejection', 'scenario one approval', 'crypto sign+encrypt end to end', 'crypto response decrypt before assertions', 'crypto plaintext send when key missing', 'crypto record has no key values', 'SM3/SM4 rejected as unsupported in Electron runtime', 'history'] }))
 }
 /** 清理该验收拥有的进程、窗口和端口，最后删除合成记录。 */
 async function finish(code: number): Promise<void> {

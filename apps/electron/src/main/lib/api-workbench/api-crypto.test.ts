@@ -1,20 +1,9 @@
-import { createHash } from 'node:crypto'
 import { describe, expect, test } from 'bun:test'
 import { ApiCryptoError, decodeValue, decryptValue, digestValue, encodeValue, encryptValue, evaluateCryptoTemplate } from './api-crypto'
 
 /** 密钥与 IV 在测试里按 UTF-8 字节使用，长度刚好对应 AES-128。 */
 const AES_KEY = '9f2c8a1d4b6e7f03'
 const AES_IV = '1029384756abcdef'
-
-/** Bun 的 BoringSSL 不带国密实现，Electron/Node 的 OpenSSL 3 才有；据此决定向量用例是否执行。 */
-function runtimeHasSm3(): boolean {
-  try {
-    createHash('sm3')
-    return true
-  } catch {
-    return false
-  }
-}
 
 describe('加解密引擎', () => {
   test('摘要与 HMAC 与公开测试向量一致', () => {
@@ -84,12 +73,11 @@ describe('加解密引擎', () => {
     expect(error.message).toContain('API_CRYPTO_KEY_MISMATCH')
   })
 
-  test.skipIf(!runtimeHasSm3())('SM3 与公开测试向量一致（需要 OpenSSL 3 运行时）', () => {
-    expect(digestValue('SM3', '', 'abc', 'hex')).toBe('66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0')
-  })
-
-  test('当前运行时缺少国密实现时给出可分类错误而不是崩在底层', () => {
-    if (runtimeHasSm3()) return
+  test('国密不在 P1 支持范围内：给出可分类错误而不是崩在底层', () => {
+    /**
+     * Electron 与 Bun 都用 BoringSSL，运行时不提供 SM3/SM4；共享层白名单也已移除这两个算法。
+     * 这里固定住「调用它们会得到可分类错误」，避免以后误以为配了国密就能跑。
+     */
     expect(() => digestValue('SM3', '', 'abc', 'hex')).toThrow('API_CRYPTO_UNSUPPORTED_ALGO')
     expect(() => encryptValue('SM4-CBC', AES_KEY, AES_IV, 'x', { encoding: 'base64' })).toThrow('API_CRYPTO_UNSUPPORTED_ALGO')
   })

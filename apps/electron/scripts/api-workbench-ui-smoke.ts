@@ -862,7 +862,42 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await new Promise<void>((resolve) => setTimeout(resolve, 200))
     await writeFile('/private/tmp/api-workbench-ui-multipart.png', (await window.webContents.capturePage()).toPNG())
     console.log('[API Workbench UI smoke] multipart 选择文件与保存已验证')
-    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、可拖动分隔条、一级行吸顶与 ＋/… 入口、整行右键菜单、分组收缩与搜索强制展开、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、宽布局、亮暗主题与窄 Pane 已验证')
+    /**
+     * 加密接口界面：请求侧选方案 → 只读步骤预览 → 跳公共配置；
+     * 变量表的秘密值默认遮蔽，点 👁 才揭示一次并留下审计提示。
+     */
+    const cryptoSectionClicked = await window.webContents.executeJavaScript(`(() => { const item = document.querySelector('[data-editor-section="crypto"]'); if (!(item instanceof HTMLElement)) return false; item.click(); return true })()`)
+    assert.equal(cryptoSectionClicked, true, '找不到「加密签名」分区页签')
+    await waitFor(window, "Boolean(document.querySelector('select[aria-label=\"使用签名方案\"]'))", '加密签名分区缺少方案选择器')
+    const selectedProfile = await window.webContents.executeJavaScript(`(() => {
+      const select = document.querySelector('select[aria-label="使用签名方案"]')
+      if (!(select instanceof HTMLSelectElement)) return false
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set?.call(select, 'profile_smoke')
+      select.dispatchEvent(new Event('change', { bubbles: true }))
+      return true
+    })()`)
+    assert.equal(selectedProfile, true, '无法在请求上选择加密方案')
+    await waitFor(window, "document.body.textContent?.includes('在公共配置里修改') && document.body.textContent?.includes('HMAC-SHA256')", '选中方案后没有显示只读步骤预览')
+    await clickText(window, '在公共配置里修改 →')
+    await waitFor(window, "Boolean(document.querySelector('[data-common-panel=\"schemes\"]'))", '公共配置没有打开方案页签')
+    assert.equal(await window.webContents.executeJavaScript("document.querySelectorAll('[data-crypto-profile]').length >= 1"), true, '方案列表没有渲染')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('修改这个方案会影响') ?? false"), true, '方案详情缺少影响面提示')
+    const variablesTabClicked = await window.webContents.executeJavaScript(`(() => { const item = document.querySelector('[data-common-tab="variables"]'); if (!(item instanceof HTMLElement)) return false; item.click(); return true })()`)
+    assert.equal(variablesTabClicked, true, '找不到「变量与密钥」页签')
+    await waitFor(window, "document.querySelectorAll('[data-variable-row]').length >= 2", '变量表格没有行')
+    assert.equal(await window.webContents.executeJavaScript("document.body.textContent?.includes('••••••')"), true, '秘密值默认应当遮蔽')
+    await clickText(window, '添加变量')
+    await waitFor(window, "document.querySelectorAll('[data-variable-row]').length >= 3", '「添加变量」没有新增行')
+    await clickLabel(window, '明文显示 appSecret')
+    /** 明文落在输入框的 value 上，textContent 看不到，必须直接读控件值。 */
+    await waitFor(window, "window.__apiWorkbenchSmoke.revealVariableCalls === 1 && [...document.querySelectorAll('input[aria-label=\"变量值\"]')].some((input) => input.value === 'cb-app-2026-9f2c8a1d')", '点 👁 没有取回明文')
+    await waitFor(window, "document.body.textContent?.includes('已明文显示') && document.body.textContent?.includes('已记入主进程日志')", '明文显示没有留下审计提示')
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-crypto.png', (await window.webContents.capturePage()).toPNG())
+    window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+    await waitForClosedLayersToLeave(window)
+    console.log('[API Workbench UI smoke] 加密签名分区与公共配置已验证')
+    console.log('[API Workbench UI smoke] PASS: Dialog、保存、发送、原文、cURL 导入与主机提取为变量、移动到其他分组、可拖动分隔条、一级行吸顶与 ＋/… 入口、整行右键菜单、分组收缩与搜索强制展开、快照导入、历史只读、用例页签与报告（含来源列）、Agent 用例徽标、审批卡附件行与「允许」通道、流程运行与逐步结果、窄栏目录抽屉停在当前栏内、自动 Cookie 开关与面板、历史载入编辑器、运行对比、multipart 选择文件、请求侧加密分区与公共配置（方案列表、影响面、变量表、明文揭示）、宽布局、亮暗主题与窄 Pane 已验证')
   } catch (error) {
     console.error('[API Workbench UI smoke] 组件交互失败', error)
     throw error

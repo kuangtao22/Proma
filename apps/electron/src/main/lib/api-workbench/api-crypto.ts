@@ -18,10 +18,14 @@ export class ApiCryptoError extends Error {
   }
 }
 
-/** 白名单算法到 Node 摘要名 / 密码名的映射；表里没有的名字一律视为未实现。 */
-const DIGEST_ALGOS: Record<string, string> = { MD5: 'md5', SHA1: 'sha1', SHA256: 'sha256', SM3: 'sm3' }
+/**
+ * 白名单算法到运行时摘要名 / 密码名的映射；表里没有的名字一律视为未实现。
+ * 与 `API_CRYPTO_ALGOS` 一一对应：这里不留「解析得到但跑不了」的算法。
+ * 国密（sm3/sm4）不在此列：Electron 与 Bun 的 BoringSSL 都不提供（见共享层白名单注释）。
+ */
+const DIGEST_ALGOS: Record<string, string> = { MD5: 'md5', SHA1: 'sha1', SHA256: 'sha256' }
 const HMAC_ALGOS: Record<string, string> = { 'HMAC-SHA1': 'sha1', 'HMAC-SHA256': 'sha256' }
-const CIPHER_ALGOS: Record<string, string> = { 'AES-128-CBC': 'aes-128-cbc', 'AES-256-CBC': 'aes-256-cbc', 'AES-128-GCM': 'aes-128-gcm', 'SM4-CBC': 'sm4-cbc' }
+const CIPHER_ALGOS: Record<string, string> = { 'AES-128-CBC': 'aes-128-cbc', 'AES-256-CBC': 'aes-256-cbc', 'AES-128-GCM': 'aes-128-gcm' }
 /** 需要认证标签的算法：必须按名字显式判断，`getAuthTag` 在非 GCM 的 cipher 上也存在、调用才抛错。 */
 const AUTH_TAGGED_ALGOS = new Set(['AES-128-GCM'])
 

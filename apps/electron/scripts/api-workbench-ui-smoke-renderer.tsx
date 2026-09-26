@@ -3,7 +3,7 @@ import * as React from 'react'
 import { createRoot } from 'react-dom/client'
 import { createStore, Provider } from 'jotai'
 import { createApiRequestDraft } from '@proma/shared'
-import type { ApiCatalog, ApiCookieJarEntry, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiScenarioRun, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
+import type { ApiCatalog, ApiCookieJarEntry, ApiCryptoProfile, ApiPreparedPreview, ApiResolvedRequest, ApiRun, ApiRunStreamChanged, ApiRuntimeVariable, ApiScenarioRun, ApiWorkbenchApi, PermissionRequest } from '@proma/shared'
 import { ApiWorkbench } from '../src/renderer/components/api-workbench/ApiWorkbench'
 import { PermissionBanner } from '../src/renderer/components/agent/PermissionBanner'
 import { TooltipProvider } from '../src/renderer/components/ui/tooltip'
@@ -11,16 +11,35 @@ import { allPendingPermissionRequestsAtom } from '../src/renderer/atoms/agent-at
 import '../src/renderer/styles/globals.css'
 
 /** smoke 运行状态只记录公开计数和目录，不包含凭据。 */
-interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string; respondPermissionCalls: PermissionResponseRecord[]; scenarioPrepareCalls: number; scenarioRunCalls: number; scenarioRun: ApiScenarioRun | null }
+interface ApiSmokeState { catalog: ApiCatalog; runs: ApiRun[]; cookies: ApiCookieJarEntry[]; prepareCalls: number; sendCalls: number; getRunCalls: number; revealGetRunCalls: number; revealBodyCalls: number; clipboard: string; respondPermissionCalls: PermissionResponseRecord[]; scenarioPrepareCalls: number; scenarioRunCalls: number; scenarioRun: ApiScenarioRun | null; revealVariableCalls: number; savedProfileCalls: number }
 
 /** 审批卡点击「允许/拒绝」时通过 preload 回传的载荷（夹具只记录，不真的授权）。 */
 interface PermissionResponseRecord { requestId: string; behavior: 'allow' | 'deny'; alwaysAllow: boolean }
 
 /** 初始目录提供一个可点击集合。 */
+/** 公共配置夹具：一套方案 + 两个变量（一个秘密、一个普通），供加密分区与变量表格使用。 */
+const cryptoProfile: ApiCryptoProfile = {
+  id: 'profile_smoke', name: '烟测方案', description: '签名后加密正文', scope: 'workspace', appliesTo: 'all', revision: 1, updatedAt: 1,
+  requestSteps: [
+    { id: 'cs_sign', kind: 'sign', enabled: true, algo: 'HMAC-SHA256', keyRef: 'appSecret', encoding: 'hex', target: { in: 'header', name: 'X-Sign' }, template: '{{method}}\n{{path}}' },
+    { id: 'cs_encrypt', kind: 'encrypt', enabled: true, algo: 'AES-128-CBC', keyRef: 'aesKey', ivRef: 'aesIv', encoding: 'base64', source: 'body', target: { in: 'body', name: 'body' } },
+  ],
+  responseSteps: [{ id: 'cs_decrypt', kind: 'decrypt', enabled: true, algo: 'AES-128-CBC', keyRef: 'aesKey', ivRef: 'aesIv', encoding: 'base64', source: 'response-body', onFailure: 'stop' }],
+}
+
 const state: ApiSmokeState = {
-  catalog: { version: 1, revision: 0, collections: [{ id: 'default', name: '默认集合', description: '', variables: [] }], environments: [], requests: [] },
+  catalog: {
+    version: 1, revision: 0,
+    collections: [{ id: 'default', name: '默认集合', description: '', variables: [] }],
+    environments: [], requests: [],
+    cryptoProfiles: [cryptoProfile],
+    workspaceVariables: [
+      { id: 'v_secret', name: 'appSecret', value: '', enabled: true, secret: true, secretRef: 'ref_secret' },
+      { id: 'v_plain', name: 'baseUrl', value: 'http://127.0.0.1:18080', enabled: true },
+    ],
+  },
   runs: [], cookies: [], prepareCalls: 0, sendCalls: 0, getRunCalls: 0, revealGetRunCalls: 0, revealBodyCalls: 0, clipboard: '', respondPermissionCalls: [],
-  scenarioPrepareCalls: 0, scenarioRunCalls: 0, scenarioRun: null,
+  scenarioPrepareCalls: 0, scenarioRunCalls: 0, scenarioRun: null, revealVariableCalls: 0, savedProfileCalls: 0,
 }
 /** 最近一次准备后的固定请求。 */
 let preparedRequest: ApiResolvedRequest | null = null
@@ -171,6 +190,23 @@ const api: ApiWorkbenchApi = {
     const cleared = state.cookies.length
     state.cookies = []
     return { cleared }
+  },
+  /** 公共配置：变量批写、方案保存、引用检查与「点 👁 才明文显示」。 */
+  saveWorkspaceVariables: async (input) => {
+    state.catalog = { ...state.catalog, revision: state.catalog.revision + 1, workspaceVariables: structuredClone(input.variables) }
+    return { variables: structuredClone(input.variables) }
+  },
+  saveCryptoProfile: async (input) => {
+    state.savedProfileCalls += 1
+    const saved = { ...input.profile, revision: (input.profile.revision || 0) + 1, updatedAt: Date.now() }
+    state.catalog = { ...state.catalog, revision: state.catalog.revision + 1, cryptoProfiles: [...(state.catalog.cryptoProfiles ?? []).filter((item) => item.id !== saved.id), saved] }
+    return structuredClone(saved)
+  },
+  deleteCryptoProfile: async () => ({ removed: false, referencedBy: 1 }),
+  getCryptoReferences: async (input) => ({ profiles: [cryptoProfile.name], requests: input.kind === 'profile' ? 1 : 0, collections: ['默认集合'] }),
+  revealVariable: async () => {
+    state.revealVariableCalls += 1
+    return { name: 'appSecret', value: 'cb-app-2026-9f2c8a1d' }
   },
 }
 
