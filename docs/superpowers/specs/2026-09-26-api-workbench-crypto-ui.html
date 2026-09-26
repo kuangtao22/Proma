@@ -1,0 +1,1295 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>接口工作台 · 加密与签名 界面稿 v2</title>
+<style>
+  /* 视觉 token 取 Proma 主题变量（graphite 亮/暗），保证稿子与产品一致。 */
+  :root, [data-theme="light"] {
+    --background: hsl(0 0% 100%);
+    --content-area: hsl(0 0% 100%);
+    --sidebar: hsl(0 0% 97.5%);
+    --foreground: hsl(0 0% 3.9%);
+    --muted: hsl(0 0% 96.1%);
+    --muted-foreground: hsl(0 0% 45.1%);
+    --border: hsl(0 0% 89.8%);
+    --border-soft: hsl(0 0% 89.8% / 0.55);
+    --primary: hsl(0 0% 9%);
+    --primary-foreground: hsl(0 0% 98%);
+    --success: hsl(161 94% 30%);
+    --info: hsl(200 98% 32%);
+    --warning: hsl(32 95% 40%);
+    --danger: hsl(0 72% 44%);
+    --violet: hsl(280 60% 42%);
+    --ring: hsl(217 91% 55%);
+    --shadow-lg: 0 18px 48px hsl(0 0% 0% / 0.14);
+    --shadow-sm: 0 1px 2px hsl(0 0% 0% / 0.06);
+    --chip: hsl(0 0% 96.1%);
+  }
+  [data-theme="dark"] {
+    --background: hsl(0 0% 10%);
+    --content-area: hsl(0 0% 7%);
+    --sidebar: hsl(0 0% 12%);
+    --foreground: hsl(0 0% 98%);
+    --muted: hsl(0 0% 17%);
+    --muted-foreground: hsl(0 0% 63.9%);
+    --border: hsl(0 0% 22%);
+    --border-soft: hsl(0 0% 22% / 0.6);
+    --primary: hsl(0 0% 98%);
+    --primary-foreground: hsl(0 0% 9%);
+    --success: hsl(158 64% 52%);
+    --info: hsl(198 93% 60%);
+    --warning: hsl(43 96% 56%);
+    --danger: hsl(0 91% 71%);
+    --violet: hsl(280 65% 68%);
+    --ring: hsl(217 91% 65%);
+    --shadow-lg: 0 18px 48px hsl(0 0% 0% / 0.45);
+    --shadow-sm: 0 1px 2px hsl(0 0% 0% / 0.3);
+    --chip: hsl(0 0% 17%);
+  }
+
+  * { box-sizing: border-box; }
+  /* hidden 必须胜过组件自身的 display（状态条是 flex，否则两种响应态会同屏）。 */
+  [hidden] { display: none !important; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1100px 520px at 12% -8%, hsl(0 0% 50% / 0.10), transparent 60%),
+      radial-gradient(900px 480px at 100% 0%, hsl(217 90% 50% / 0.07), transparent 55%),
+      var(--background);
+    color: var(--foreground);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    padding: 26px 30px 60px;
+  }
+  code, pre, .mono, .url, .tmpl { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "JetBrains Mono", monospace; }
+  h1, h2, h3, h4 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  button { font: inherit; color: inherit; }
+  a { color: var(--ring); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── 页头 ───────────────────────────────────────────── */
+  .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; flex-wrap: wrap; }
+  .page-head h1 { font-size: 19px; }
+  .page-head .sub { margin-top: 6px; color: var(--muted-foreground); font-size: 12.5px; max-width: 820px; }
+  .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .seg { display: inline-flex; padding: 2px; gap: 2px; background: var(--muted); border-radius: 9px; }
+  .seg button {
+    border: 0; background: transparent; border-radius: 7px; padding: 5px 11px; font-size: 12px;
+    color: var(--muted-foreground); cursor: pointer; transition: background 120ms ease, color 120ms ease;
+  }
+  .seg button[aria-selected="true"] { background: var(--content-area); color: var(--foreground); box-shadow: var(--shadow-sm); }
+  .seg button:hover[aria-selected="false"] { color: var(--foreground); }
+
+  /* ── 版面 ───────────────────────────────────────────── */
+  .stage { display: grid; grid-template-columns: minmax(0, 1fr) 366px; gap: 18px; align-items: start; }
+  @media (max-width: 1320px) { .stage { grid-template-columns: minmax(0, 1fr); } }
+
+  .window {
+    border: 1px solid var(--border-soft); border-radius: 14px; background: var(--background);
+    box-shadow: var(--shadow-lg); overflow: hidden;
+  }
+  .window + .window { margin-top: 18px; }
+  .titlebar {
+    display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px;
+    border-bottom: 1px solid var(--border-soft); background: var(--sidebar); font-size: 12px;
+  }
+  .dots { display: flex; gap: 6px; }
+  .dots i { width: 10px; height: 10px; border-radius: 999px; background: var(--border); display: block; }
+  .titlebar .name { font-weight: 600; }
+  .titlebar .env { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); }
+
+  .wb { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 520px; }
+  @media (max-width: 980px) { .wb { grid-template-columns: 1fr; } }
+
+  /* 目录 */
+  .catalog { border-right: 1px solid var(--border-soft); background: hsl(0 0% 50% / 0.03); padding: 8px 8px 12px; }
+  .catalog .head { display: flex; align-items: center; justify-content: space-between; height: 26px; padding: 0 4px; font-size: 11px; color: var(--muted-foreground); }
+  .search { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; margin: 4px 0 8px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted-foreground); font-size: 12px; }
+  .tree-row { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px; border-radius: 10px; font-size: 12px; }
+  .tree-row:hover { background: hsl(0 0% 50% / 0.06); }
+  .tree-row.group { color: var(--muted-foreground); }
+  .tree-row.active { background: hsl(0 0% 50% / 0.10); color: var(--foreground); }
+  .tree-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tree-row .ops { display: flex; align-items: center; gap: 2px; color: var(--muted-foreground); opacity: .85; }
+  .ico { width: 15px; height: 15px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .indent { padding-left: 18px; }
+  .indent-2 { padding-left: 34px; }
+  .method { width: 34px; flex: none; font-size: 9px; font-weight: 700; letter-spacing: .02em; }
+  .method.post { color: var(--info); }
+  .method.get { color: var(--success); }
+  .lock { flex: none; }
+  .solink { display: inline-flex; align-items: center; gap: 3px; height: 17px; padding: 0 6px; border-radius: 6px; background: hsl(217 91% 55% / 0.12); color: var(--ring); font-size: 10px; flex: none; }
+
+  /* 编辑器 */
+  .editor { min-width: 0; display: flex; flex-direction: column; }
+  .req-tabs { display: flex; align-items: flex-end; gap: 4px; height: 34px; padding: 0 8px; border-bottom: 1px solid var(--border-soft); overflow: hidden; }
+  .req-tab { display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border: 1px solid transparent; border-bottom: 0; border-radius: 7px 7px 0 0; font-size: 12px; color: var(--muted-foreground); }
+  .req-tab.active { background: var(--content-area); border-color: var(--border-soft); color: var(--foreground); }
+  .req-tab .x { opacity: .6; }
+
+  .urlbar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); }
+  select, input[type="text"] {
+    height: 30px; border: 1px solid var(--border); border-radius: 8px; background: var(--content-area);
+    color: var(--foreground); font: inherit; font-size: 12px; padding: 0 9px; max-width: 100%;
+  }
+  .urlbar .url { flex: 1; min-width: 0; height: 30px; display: flex; align-items: center; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--content-area); font-size: 12px; overflow: hidden; white-space: nowrap; }
+  .btn { height: 30px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--content-area); font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { background: var(--muted); }
+  .btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
+  .btn.primary:hover { opacity: .9; background: var(--primary); }
+  .btn.tiny { height: 24px; padding: 0 8px; font-size: 11px; border-radius: 7px; }
+  .kbd { border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 0 4px; font-size: 10px; color: var(--muted-foreground); }
+
+  .section-tabs { display: flex; align-items: center; gap: 2px; padding: 8px 10px 0; border-bottom: 1px solid var(--border-soft); overflow-x: auto; }
+  .section-tabs button {
+    border: 0; background: transparent; padding: 7px 10px; border-radius: 8px 8px 0 0; font-size: 12px;
+    color: var(--muted-foreground); cursor: pointer; white-space: nowrap; position: relative;
+  }
+  .section-tabs button[aria-selected="true"] { color: var(--foreground); }
+  .section-tabs button[aria-selected="true"]::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--foreground); }
+  .badge { display: inline-flex; align-items: center; gap: 4px; height: 16px; padding: 0 6px; margin-left: 6px; border-radius: 999px; background: var(--muted); font-size: 10px; color: var(--muted-foreground); }
+  .badge.on { background: hsl(43 96% 56% / 0.18); color: var(--warning); }
+
+  .panel { padding: 14px 14px 18px; }
+  .notice { display: flex; gap: 10px; padding: 10px 12px; border: 1px solid var(--border-soft); border-left: 3px solid var(--warning); border-radius: 10px; background: hsl(43 96% 56% / 0.07); font-size: 12px; color: var(--muted-foreground); }
+  .notice b { color: var(--foreground); font-weight: 600; }
+  .notice.info { border-left-color: var(--info); background: hsl(200 98% 40% / 0.07); }
+
+  /* 方案选择区 */
+  .scheme-bar { border: 1px solid var(--border); border-radius: 12px; background: var(--content-area); padding: 12px; margin-top: 14px; }
+  .scheme-bar .top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .scheme-bar .top > label { font-size: 12px; color: var(--muted-foreground); flex: none; }
+  .scheme-bar .picker { flex: 1; min-width: 240px; }
+  .scheme-bar .picker select { width: 100%; height: 34px; font-size: 12.5px; }
+  .scheme-bar .meta { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .scheme-bar .hint { margin-top: 8px; font-size: 11px; color: var(--muted-foreground); }
+  .chip { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 10.5px; color: var(--muted-foreground); background: var(--content-area); }
+  .chip.key { border-color: hsl(32 95% 45% / 0.35); color: var(--warning); background: hsl(32 95% 45% / 0.08); }
+  .chip.algo { border-color: hsl(217 91% 55% / 0.30); color: var(--ring); background: hsl(217 91% 55% / 0.08); }
+  .chip.crypt { border-color: hsl(280 60% 45% / 0.32); color: var(--violet); background: hsl(280 60% 45% / 0.08); }
+  .chip.plain { border-color: hsl(161 94% 30% / 0.30); color: var(--success); background: hsl(161 94% 30% / 0.08); }
+  .chip.mono { font-family: ui-monospace, Menlo, monospace; }
+
+  .phase { margin-top: 16px; }
+  .phase-head { display: flex; align-items: center; gap: 8px; padding: 0 2px 8px; }
+  .phase-head .lead { display: flex; align-items: baseline; gap: 8px; }
+  .phase-head h4 { font-size: 12.5px; }
+  .phase-head .hint { font-size: 11px; color: var(--muted-foreground); }
+
+  /* 只读步骤行（来自公共方案） */
+  .step { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--content-area); }
+  .step + .step { margin-top: 8px; }
+  .step .order { width: 18px; height: 18px; flex: none; display: grid; place-items: center; border-radius: 999px; background: var(--muted); font-size: 10.5px; color: var(--muted-foreground); }
+  .kind { flex: none; height: 18px; padding: 0 7px; display: inline-flex; align-items: center; border-radius: 6px; font-size: 10.5px; font-weight: 600; }
+  .kind.sign { background: hsl(217 91% 55% / 0.14); color: var(--ring); }
+  .kind.crypt { background: hsl(280 60% 55% / 0.14); color: var(--violet); }
+  .kind.derive { background: hsl(161 94% 30% / 0.14); color: var(--success); }
+  .kind.decrypt { background: hsl(32 95% 45% / 0.16); color: var(--warning); }
+  .step .title { min-width: 0; }
+  .step .title b { font-weight: 600; font-size: 12.5px; }
+  .step .title small { display: block; color: var(--muted-foreground); font-size: 11px; }
+  .step .chips { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .step .edit-link { flex: none; font-size: 11px; }
+
+  /* 覆盖项 */
+  .override { margin-top: 14px; border: 1px dashed var(--border); border-radius: 10px; padding: 10px 12px; background: hsl(0 0% 50% / 0.03); }
+  .override .row { display: flex; align-items: center; gap: 10px; }
+  .override .row b { font-size: 12px; }
+  .override .row span { font-size: 11px; color: var(--muted-foreground); }
+  .override .list { margin-top: 10px; display: grid; gap: 8px; }
+  .override .item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--content-area); font-size: 12px; }
+  .override .item .k { width: 132px; flex: none; color: var(--muted-foreground); }
+
+  /* 公共配置：两栏 */
+  .two-col { display: grid; grid-template-columns: 268px minmax(0, 1fr); min-height: 520px; }
+  @media (max-width: 1040px) { .two-col { grid-template-columns: 1fr; } }
+  .scheme-list { border-right: 1px solid var(--border-soft); background: hsl(0 0% 50% / 0.03); padding: 10px; }
+  .scheme-list .head { display: flex; align-items: center; justify-content: space-between; font-size: 11px; color: var(--muted-foreground); padding: 2px 4px 8px; }
+  .scheme-item { padding: 9px 10px; border-radius: 10px; cursor: pointer; }
+  .scheme-item:hover { background: hsl(0 0% 50% / 0.06); }
+  .scheme-item.active { background: hsl(0 0% 50% / 0.10); }
+  .scheme-item .name { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; }
+  .scheme-item .desc { margin-top: 3px; font-size: 11px; color: var(--muted-foreground); }
+  .scheme-item .usage { margin-top: 6px; display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted-foreground); }
+  .scheme-detail { padding: 12px 14px 16px; }
+  .detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .detail-head input { height: 30px; width: 220px; font-weight: 600; }
+  .detail-head .spacer { margin-left: auto; display: flex; gap: 8px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 12px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 14px; margin-top: 10px; }
+  @media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field > label { font-size: 11px; color: var(--muted-foreground); display: flex; align-items: center; gap: 6px; }
+  .field .control { display: flex; align-items: center; gap: 6px; }
+  .field select, .field input { flex: 1; min-width: 0; width: 100%; }
+  .tmpl { width: 100%; min-height: 58px; padding: 8px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--content-area); color: var(--foreground); font-size: 11.5px; line-height: 1.6; resize: vertical; }
+  .field .tip { font-size: 10.5px; color: var(--muted-foreground); }
+  .token { color: var(--ring); }
+  .step-card { margin-top: 8px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--content-area); overflow: hidden; }
+  .step-card[data-open="true"] { border-color: var(--border); box-shadow: var(--shadow-sm); }
+  .step-card .head { display: flex; align-items: center; gap: 10px; padding: 9px 10px; cursor: pointer; }
+  .step-card .head:hover { background: hsl(0 0% 50% / 0.04); }
+  /* 与请求视图的只读步骤保持同一排版：标题一行、说明一行、右侧 chips 贴右。 */
+  .step-card .order { width: 18px; height: 18px; flex: none; display: grid; place-items: center; border-radius: 999px; background: var(--muted); font-size: 10.5px; color: var(--muted-foreground); }
+  .step-card .title { min-width: 0; }
+  .step-card .title b { font-weight: 600; font-size: 12.5px; }
+  .step-card .title small { display: block; color: var(--muted-foreground); font-size: 11px; }
+  .step-card .chips { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  .step-card .body { display: none; padding: 2px 12px 14px 40px; border-top: 1px dashed var(--border-soft); }
+  .step-card[data-open="true"] .body { display: block; }
+  .handle { color: var(--muted-foreground); letter-spacing: -2px; cursor: grab; }
+  .sw { width: 30px; height: 17px; border-radius: 999px; background: var(--muted); position: relative; flex: none; cursor: pointer; border: 0; }
+  .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 999px; background: var(--content-area); box-shadow: var(--shadow-sm); transition: transform 140ms ease; }
+  .sw[aria-checked="true"] { background: var(--success); }
+  .sw[aria-checked="true"]::after { transform: translateX(13px); }
+  .icon-btn { width: 24px; height: 24px; border-radius: 7px; border: 0; background: transparent; color: var(--muted-foreground); cursor: pointer; }
+  .icon-btn:hover { background: hsl(0 0% 50% / 0.12); color: var(--foreground); }
+
+  .impact { margin-top: 14px; border: 1px solid hsl(32 95% 45% / 0.35); background: hsl(32 95% 45% / 0.08); border-radius: 10px; padding: 10px 12px; font-size: 12px; }
+  .impact b { font-weight: 600; }
+  .impact .list { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .keycheck { margin-top: 12px; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; }
+  .keycheck .row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; font-size: 12px; border-bottom: 1px solid var(--border-soft); }
+  .keycheck .row:last-child { border-bottom: 0; }
+  .dot-ok { width: 8px; height: 8px; border-radius: 999px; background: var(--success); flex: none; }
+  .dot-warn { width: 8px; height: 8px; border-radius: 999px; background: var(--warning); flex: none; }
+
+  /* ── 统一管理列表（查看 / 操作 / 编辑 / 添加 四件套） ───────────── */
+  .mtoolbar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
+  .mtoolbar .grow { flex: 1; min-width: 140px; }
+  .mtoolbar .search { margin: 0; height: 30px; }
+  .mtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .mtable th {
+    text-align: left; font-weight: 500; font-size: 11px; color: var(--muted-foreground);
+    padding: 8px 10px; border-bottom: 1px solid var(--border-soft); background: hsl(0 0% 50% / 0.03); white-space: nowrap;
+  }
+  .mtable td { padding: 7px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+  .mtable tr:hover td { background: hsl(0 0% 50% / 0.04); }
+  .mtable tr.editing td { background: hsl(217 91% 55% / 0.06); }
+  .mtable tr.group-row td { background: hsl(0 0% 50% / 0.05); font-size: 11px; color: var(--muted-foreground); }
+  .mtable .name { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; }
+  .mtable .value { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); }
+  .mtable .value.secret { letter-spacing: 2px; color: var(--muted-foreground); }
+  .mtable .rowops { display: flex; align-items: center; gap: 2px; justify-content: flex-end; opacity: .55; }
+  .mtable tr:hover .rowops, .mtable tr.editing .rowops { opacity: 1; }
+  .mtable .editable { height: 26px; font-size: 11.5px; }
+  .add-row { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: var(--muted-foreground); font-size: 12px; cursor: pointer; }
+  .add-row:hover { background: hsl(0 0% 50% / 0.04); color: var(--foreground); }
+  .type-tag { display: inline-flex; align-items: center; gap: 4px; height: 18px; padding: 0 6px; border-radius: 6px; font-size: 10.5px; border: 1px solid var(--border); color: var(--muted-foreground); }
+  .type-tag.secret { border-color: hsl(32 95% 45% / 0.35); color: var(--warning); background: hsl(32 95% 45% / 0.08); }
+  .mtable .scope { color: var(--muted-foreground); }
+  /* 被引用列不拆词：一句「1 个方案 · 后台签名」必须整段可读。 */
+  .mtable .refs { color: var(--muted-foreground); white-space: nowrap; }
+  .mtable .refs a { color: var(--ring); }
+  .drawer-note { margin: 10px 12px 12px; border: 1px solid var(--border-soft); border-radius: 10px; background: hsl(0 0% 50% / 0.03); padding: 10px 12px; font-size: 11.5px; color: var(--muted-foreground); }
+  .drawer-note b { color: var(--foreground); }
+  .bulk { margin: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--content-area); overflow: hidden; }
+  .bulk .head { padding: 9px 12px; border-bottom: 1px solid var(--border-soft); font-size: 12.5px; font-weight: 600; background: hsl(0 0% 50% / 0.04); }
+  .bulk .body { padding: 12px; }
+  .bulk textarea { width: 100%; min-height: 108px; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.7; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--content-area); color: var(--foreground); resize: vertical; }
+  .two-col-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); font-size: 11px; color: var(--muted-foreground); }
+
+  /* 响应区 */
+  .response { border-top: 1px solid var(--border-soft); background: var(--content-area); }
+  .status { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--border-soft); font-size: 12px; flex-wrap: wrap; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; height: 20px; padding: 0 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+  .pill.ok { border-color: hsl(161 94% 30% / 0.35); color: var(--success); background: hsl(161 94% 30% / 0.08); }
+  .pill.warn { border-color: hsl(32 95% 45% / 0.35); color: var(--warning); background: hsl(32 95% 45% / 0.08); }
+  .pill.bad { border-color: hsl(0 72% 44% / 0.35); color: var(--danger); background: hsl(0 72% 44% / 0.08); }
+  .resp-tabs { display: flex; gap: 2px; padding: 8px 10px 0; border-bottom: 1px solid var(--border-soft); }
+  .resp-tabs button { border: 0; background: transparent; padding: 6px 9px; font-size: 12px; color: var(--muted-foreground); cursor: pointer; border-radius: 7px 7px 0 0; }
+  .resp-tabs button[aria-selected="true"] { color: var(--foreground); background: hsl(0 0% 50% / 0.06); }
+  .code-block { margin: 0; padding: 12px 14px; font-size: 11.5px; line-height: 1.65; overflow: auto; max-height: 200px; }
+  .code-block .k { color: var(--info); }
+  .code-block .s { color: var(--success); }
+  .code-block .n { color: var(--warning); }
+  .code-block .cipher { color: var(--muted-foreground); word-break: break-all; }
+
+  /* 右栏 */
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .card { border: 1px solid var(--border-soft); border-radius: 12px; background: var(--content-area); box-shadow: var(--shadow-sm); overflow: hidden; }
+  .card > header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); font-size: 12.5px; font-weight: 600; }
+  .card > header .tag { margin-left: auto; font-weight: 500; font-size: 10.5px; color: var(--muted-foreground); }
+  .card .body { padding: 12px; }
+  .card p { margin: 0 0 10px; font-size: 12px; color: var(--muted-foreground); }
+  .card p:last-child { margin-bottom: 0; }
+  .kv { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+  .kv .k { width: 66px; flex: none; color: var(--muted-foreground); }
+  .kv .v { min-width: 0; word-break: break-all; }
+  .perm-actions { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border-soft); background: hsl(0 0% 50% / 0.03); }
+  .perm-actions .btn { flex: 1; justify-content: center; }
+  .btn.danger { border-color: hsl(0 72% 44% / 0.4); color: var(--danger); }
+  .secret-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px dashed var(--border-soft); font-size: 12px; }
+  .secret-row:last-child { border-bottom: 0; }
+  .secret-row .name { font-family: ui-monospace, Menlo, monospace; }
+  .secret-row .dotsv { margin-left: auto; color: var(--muted-foreground); letter-spacing: 2px; }
+  ul.rules { margin: 0; padding-left: 16px; font-size: 12px; color: var(--muted-foreground); }
+  ul.rules li { margin-bottom: 7px; }
+  ul.rules b { color: var(--foreground); font-weight: 600; }
+  .footnote { margin-top: 18px; font-size: 11.5px; color: var(--muted-foreground); }
+  .footnote code { background: var(--chip); border-radius: 5px; padding: 1px 5px; }
+
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; border-radius: 6px; }
+  .reveal { animation: rise 420ms cubic-bezier(.22,.8,.28,1) both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <div>
+    <h1>接口工作台 · 公共配置与加密 —— 界面稿 v6</h1>
+    <div class="sub">
+      三层结构：<b>公共配置统一管理</b>（变量与密钥、签名与加密方案、公共请求头/参数/鉴权）→
+      <b>每个接口只选择用哪套方案</b> → 发送与接收时按方案步骤执行。每个列表都是「查看 → 编辑 → 操作 → 添加」同一套交互。
+      <b>已确认：</b>作用域含工作区级；缺密钥不预校验阻断、照常发送并如实展示服务端返回；密钥值在本界面明文可见；
+      <b>Agent 负责配置，密钥值只由你填</b>。数据均为假数据。
+    </div>
+  </div>
+  <div class="head-actions">
+    <div class="seg" role="tablist" aria-label="界面视图">
+      <button role="tab" aria-selected="true" data-view="request">① 请求 · 选方案</button>
+      <button role="tab" aria-selected="false" data-view="common">② 公共配置 · 管理列表</button>
+      <button role="tab" aria-selected="false" data-view="agent">③ Agent 配置 · 待你补密钥</button>
+    </div>
+    <div class="seg" role="tablist" aria-label="主题">
+      <button role="tab" aria-selected="true" data-theme-btn="light">亮色</button>
+      <button role="tab" aria-selected="false" data-theme-btn="dark">暗色</button>
+    </div>
+    <div class="seg" role="tablist" aria-label="响应示例">
+      <button role="tab" aria-selected="true" data-resp="ok">解密成功</button>
+      <button role="tab" aria-selected="false" data-resp="bad">解密失败</button>
+      <button role="tab" aria-selected="false" data-resp="plain">缺密钥 · 明文发出</button>
+    </div>
+  </div>
+</div>
+
+<div class="stage">
+  <div>
+    <!-- ══════════ 视图 ①：请求 · 选方案 ══════════ -->
+    <section class="window reveal" id="view-request">
+      <div class="titlebar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="name">接口工作台</span>
+        <span style="color:var(--muted-foreground)">· 当前项目</span>
+        <span class="env">
+          环境
+          <select aria-label="环境"><option>车本本-测试</option><option>车本本-生产</option></select>
+        </span>
+      </div>
+
+      <div class="wb">
+        <aside class="catalog">
+          <div class="head"><span>目录</span><span>⤓ ＋</span></div>
+          <div class="search">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+            搜索请求
+          </div>
+          <div class="tree-row">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.4.6L11.4 7H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="grow">后台接口</span><span class="ops">＋ ⋯</span>
+          </div>
+          <div class="tree-row group indent"><span class="grow">AI 能力与模型</span><span class="ops">＋ ⋯</span></div>
+          <div class="tree-row indent-2 active">
+            <span class="method post">POST</span>
+            <span class="grow">保存 AI 能力</span>
+            <span class="solink" title="使用公共方案：车本本-后台签名">🔒 后台签名</span>
+          </div>
+          <div class="tree-row indent-2">
+            <span class="method post">POST</span>
+            <span class="grow">渠道模型绑定查询</span>
+            <span class="solink" title="使用公共方案：车本本-后台签名">🔒 后台签名</span>
+          </div>
+          <div class="tree-row indent-2">
+            <span class="method post">POST</span>
+            <span class="grow">回滚 AI 能力版本</span>
+          </div>
+          <div class="tree-row">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.4.6L11.4 7H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <span class="grow">APP 接口</span><span class="ops">＋ ⋯</span>
+          </div>
+          <div class="tree-row indent">
+            <span class="method get">GET</span>
+            <span class="grow">查询会员权益</span>
+            <span class="solink" title="使用公共方案：车本本-APP 签名">🔒 APP 签名</span>
+          </div>
+        </aside>
+
+        <div class="editor">
+          <div class="req-tabs">
+            <div class="req-tab active">保存 AI 能力 <span class="x">×</span></div>
+            <div class="req-tab">查询会员权益 <span class="x">×</span></div>
+          </div>
+
+          <div class="urlbar">
+            <select aria-label="方法" style="width:82px"><option>POST</option><option>GET</option></select>
+            <div class="url"><span class="mono">{{baseUrl}}/admin/v1/ai/capability/save</span></div>
+            <button class="btn primary">发送 <span class="kbd">⌘↵</span></button>
+            <button class="btn">保存 <span class="kbd">⌘S</span></button>
+          </div>
+
+          <div class="section-tabs" role="tablist" aria-label="请求分区">
+            <button role="tab" aria-selected="false" data-panel="other">参数</button>
+            <button role="tab" aria-selected="false" data-panel="other">请求头</button>
+            <button role="tab" aria-selected="false" data-panel="other">Body</button>
+            <button role="tab" aria-selected="false" data-panel="other">鉴权</button>
+            <button role="tab" aria-selected="true" data-panel="crypto">加密签名<span class="badge on">后台签名</span></button>
+            <button role="tab" aria-selected="false" data-panel="other">测试<span class="badge">4</span></button>
+            <button role="tab" aria-selected="false" data-panel="other">设置</button>
+          </div>
+
+          <div class="panel">
+            <div id="panel-crypto">
+              <!-- 方案选择 -->
+              <div class="scheme-bar">
+                <div class="top">
+                  <label for="scheme-picker">使用签名方案</label>
+                  <div class="picker">
+                    <select id="scheme-picker" aria-label="使用签名方案">
+                      <option selected>车本本-后台签名 —— HMAC-SHA256 签名 + AES-128-CBC 加密正文</option>
+                      <option>车本本-APP 签名 —— MD5 签名（正文明文）</option>
+                      <option>第三方支付回调 —— 仅响应验签</option>
+                      <option>不使用签名/加密</option>
+                    </select>
+                  </div>
+                  <button class="btn tiny" data-view-jump="common">编辑这个方案 ↗</button>
+                </div>
+                <div class="meta">
+                  <span class="chip algo">HMAC-SHA256</span>
+                  <span class="chip crypt">AES-128-CBC</span>
+                  <span class="chip key">🔒 appSecret = cb-app-2026-9f2c8a1d</span>
+                  <span class="chip key">🔒 aesKey = 9f2c8a1d4b6e7f03</span>
+                  <span class="chip key">🔒 aesIv = 1029384756abcdef</span>
+                  <span class="chip" style="border-color:hsl(32 95% 45% / 0.4);color:var(--warning)">👁 明文显示已开启</span>
+                  <span class="chip">失败则跳过断言</span>
+                </div>
+                <div class="hint">
+                  方案在「公共配置」里统一维护，本接口只记录「用哪一套」。<b>修改方案会影响引用它的 13 个接口</b>，
+                  所以方案本身的编辑要单独确认；接口这里改的只是选择。密钥值按你的要求明文可见，想看遮蔽态可随时关掉右上角的「明文显示」。
+                </div>
+              </div>
+
+              <div class="notice info" style="margin-top:12px">
+                <span>ℹ️</span>
+                <div>
+                  密钥只来自环境变量：切换环境即换密钥（同一套方案，不同环境各填各的）。值在本机公共配置里明文可见（👁 可切回遮蔽），
+                  但<b>不会进入运行记录、日志与导出快照</b>。
+                </div>
+              </div>
+
+              <!-- 只读步骤 -->
+              <div class="phase">
+                <div class="phase-head">
+                  <div class="lead"><h4>发送前</h4><span class="hint">来自公共方案的步骤，顺序即执行顺序</span></div>
+                  <a class="edit-link" href="#" data-view-jump="common">在公共配置里修改 →</a>
+                </div>
+                <div class="step">
+                  <span class="order">1</span><span class="kind derive">派生</span>
+                  <span class="title"><b>生成时间戳与随机数</b><small>每次发送重新生成，实际取值写入运行记录</small></span>
+                  <span class="chips"><span class="chip mono">X-Timestamp</span><span class="chip mono">X-Nonce</span></span>
+                </div>
+                <div class="step">
+                  <span class="order">2</span><span class="kind sign">签名</span>
+                  <span class="title"><b>HMAC-SHA256 签名</b><small>排在加密之前 → 签的是明文正文</small></span>
+                  <span class="chips"><span class="chip key">🔒 appSecret = cb-app-2026-9f2c8a1d</span><span class="chip mono">hex → X-Sign</span></span>
+                </div>
+                <div class="step">
+                  <span class="order">3</span><span class="kind crypt">加密</span>
+                  <span class="title"><b>AES-128-CBC 加密正文</b><small>覆盖请求正文；界面预览仍显示明文</small></span>
+                  <span class="chips"><span class="chip key">🔒 aesKey = 9f2c8a1d4b6e7f03</span><span class="chip key">🔒 aesIv = 1029384756abcdef</span><span class="chip mono">base64</span></span>
+                </div>
+              </div>
+
+              <div class="phase">
+                <div class="phase-head">
+                  <div class="lead"><h4>收到后</h4><span class="hint">在断言与提取之前还原</span></div>
+                  <a class="edit-link" href="#" data-view-jump="common">在公共配置里修改 →</a>
+                </div>
+                <div class="step">
+                  <span class="order">1</span><span class="kind decrypt">解密</span>
+                  <span class="title"><b>AES-128-CBC 解密响应正文</b><small>解密后的明文交给断言、提取与预览</small></span>
+                  <span class="chips"><span class="chip key">🔒 aesKey</span><span class="chip key">🔒 aesIv</span><span class="chip warn">失败停止断言</span></span>
+                </div>
+              </div>
+
+              <!-- 覆盖项 -->
+              <div class="override">
+                <div class="row">
+                  <b>本接口覆盖项</b>
+                  <span>默认全部跟随公共方案；只在这条接口确实不一样时才用</span>
+                  <button class="btn tiny" style="margin-left:auto" id="override-toggle" aria-expanded="false">展开 3 项</button>
+                </div>
+                <div class="list" id="override-list" hidden>
+                  <div class="item"><span class="k">签名密钥变量</span><span class="chip key">🔒 appSecret</span><span style="color:var(--muted-foreground)">跟随方案</span></div>
+                  <div class="item"><span class="k">签名输出名称</span><span class="chip mono">X-Sign</span><span style="color:var(--muted-foreground)">跟随方案</span></div>
+                  <div class="item"><span class="k">解密失败时</span><span class="chip">停止断言</span><span style="color:var(--muted-foreground)">跟随方案</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div id="panel-other" hidden>
+              <div class="notice" style="border-left-color:var(--border)">
+                <span>📄</span>
+                <div>本稿只设计「<b>加密签名</b>」分区，其余分区沿用现有界面。</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="response">
+            <div class="status" data-resp-view="ok">
+              <span class="pill ok">HTTP 200</span>
+              <span style="color:var(--muted-foreground)">128 ms · 1.2 KB → 4.6 KB</span>
+              <span class="pill ok">🔓 已解密 · AES-128-CBC</span>
+              <span class="pill">4 断言通过</span>
+              <span class="pill">方案 后台签名</span>
+              <span style="margin-left:auto;color:var(--muted-foreground)">2026-09-26 10:12:07</span>
+            </div>
+            <div class="status" data-resp-view="plain" hidden style="background:hsl(32 95% 45% / 0.07)">
+              <span class="pill ok">HTTP 200</span>
+              <span style="color:var(--muted-foreground)">126 ms · 1.1 KB</span>
+              <span class="pill warn">⚠️ 本次未加密 · 明文发出（缺 aesKey / aesIv）</span>
+              <span class="pill warn">未签名（缺 appSecret）</span>
+              <span class="pill">服务端返回：200，未要求签名</span>
+              <span style="margin-left:auto;color:var(--muted-foreground)">2026-09-26 10:18:02</span>
+            </div>
+            <div class="status" data-resp-view="bad" hidden>
+              <span class="pill ok">HTTP 200</span>
+              <span style="color:var(--muted-foreground)">131 ms · 4.6 KB</span>
+              <span class="pill bad">🔒 未解密 · 本地缺少 aesIv</span>
+              <span class="pill warn">断言已跳过</span>
+              <span style="margin-left:auto;color:var(--muted-foreground)">2026-09-26 10:15:44</span>
+            </div>
+            <div class="resp-tabs" role="tablist" aria-label="响应分区">
+              <button role="tab" aria-selected="true">正文</button>
+              <button role="tab" aria-selected="false">密文原文</button>
+              <button role="tab" aria-selected="false">解密事实</button>
+              <button role="tab" aria-selected="false">请求头</button>
+              <button role="tab" aria-selected="false">断言</button>
+            </div>
+            <pre class="code-block" data-resp-view="ok">{
+  <span class="k">"code"</span>: <span class="n">0</span>,
+  <span class="k">"message"</span>: <span class="s">"ok"</span>,
+  <span class="k">"data"</span>: { <span class="k">"capabilityId"</span>: <span class="n">1024</span>, <span class="k">"updatedAt"</span>: <span class="s">"2026-09-26T02:12:07Z"</span> }
+}</pre>
+            <div data-resp-view="plain" hidden style="padding:12px 14px">
+              <div class="impact">
+                <b>不阻断的结果就是这样：服务端返回 200，说明这个环境并不校验签名。</b>
+                请求照常发出，运行记录里标成「明文发出」，因此你能一眼看到"这条接口在生产其实是裸奔的"——
+                这是排查信息，不是本地错误。要恢复加密，把缺的密钥填上即可，无需改任何配置。
+              </div>
+              <div style="display:flex;gap:8px;margin-top:10px">
+                <button class="btn">去填 aesKey / aesIv</button>
+                <button class="btn">在历史里筛选「明文发出」</button>
+                <button class="btn">复制本次实际发出的请求</button>
+              </div>
+            </div>
+            <pre class="code-block" data-resp-view="bad" hidden><span class="cipher">k3Jd8Qp2mZ0aVr9wLxT4bN7sQe1yHcUfJgDlZmOaXpYtCqBvK5nR3wEiS6hM8uGjF2dP0oLzVxQaTbCeWrYiUmOkNpLsJdHfG…（已截断，完整密文在运行记录里）</span></pre>
+            <div data-resp-view="bad" hidden style="padding:12px 14px">
+              <div class="impact">
+                <b>不阻断、也不编造错误：服务端返回什么就显示什么。</b>
+                这次是本地缺少 <code>aesIv</code>，所以只标注「未解密」，密文原文照常可查；断言与提取跳过。
+                <br>若本地有密钥但解不开，状态条会显示「解密失败 · 密钥不匹配（填充无效）」，排查顺序：① 密钥/IV 与这次响应不匹配（切环境后仍用旧密钥）② 响应根本不是密文（网关错误页）③ 算法或编码不符（AES-256-GCM / hex）。
+              </div>
+              <div style="display:flex;gap:8px;margin-top:10px">
+                <button class="btn">查看密文原文</button>
+                <button class="btn">切换到其他环境密钥重试</button>
+                <button class="btn">临时指定密钥（仅本次）</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════ 视图 ②：公共配置 · 统一管理列表 ══════════ -->
+    <section class="window" id="view-common" hidden>
+      <div class="titlebar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="name">公共配置</span>
+        <span style="color:var(--muted-foreground)">· 当前项目 · 变量 12 · 方案 4 · 引用 13 个接口</span>
+        <span class="env">所有条目都是「查看列表 → 编辑列表 → 添加/删除」，影响面在保存前确认</span>
+      </div>
+
+      <div class="section-tabs" role="tablist" aria-label="公共配置分区" style="padding:8px 12px 0">
+        <button role="tab" aria-selected="true" data-common-tab="variables">变量与密钥<span class="badge on">12</span></button>
+        <button role="tab" aria-selected="false" data-common-tab="schemes">签名与加密方案<span class="badge">4</span></button>
+        <button role="tab" aria-selected="false" data-common-tab="headers">公共请求头<span class="badge">6</span></button>
+        <button role="tab" aria-selected="false" data-common-tab="query">公共查询参数<span class="badge">2</span></button>
+        <button role="tab" aria-selected="false" data-common-tab="auth">公共鉴权<span class="badge">2</span></button>
+      </div>
+
+      <!-- ── 列表 1：变量与密钥（对应 Postman 的环境变量表格） ── -->
+      <div data-common-panel="variables">
+        <div class="notice" style="margin:12px 12px 0;border-left-color:var(--warning)">
+          <span>🤖</span>
+          <div>
+            <b>Agent 刚刚新增了 3 个密钥变量（值留空）。</b>
+            方案与变量结构可以由 Agent 一次配好，<b>但密钥值只能由你填入</b>；Agent 读不到、也写不了这些值。
+            <a href="#" data-view-jump-link="agent">看它做了什么 →</a>
+          </div>
+        </div>
+        <div class="mtoolbar">
+          <select aria-label="作用域" style="width:170px"><option>全部作用域</option><option>工作区</option><option>车本本-测试</option><option>车本本-生产</option><option>集合：后台接口</option></select>
+          <div class="search" style="width:200px">
+            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+            搜索变量名
+          </div>
+          <button class="btn tiny" aria-pressed="true" style="border-color:hsl(32 95% 45% / 0.45);color:var(--warning)">👁 明文显示：开</button>
+          <div class="grow"></div>
+          <button class="btn tiny">批量编辑</button>
+          <button class="btn tiny">导入 .env / 粘贴</button>
+          <button class="btn tiny">导出</button>
+          <button class="btn tiny primary">＋ 添加变量</button>
+        </div>
+
+        <table class="mtable">
+          <thead>
+            <tr>
+              <th style="width:28px"><input type="checkbox" aria-label="全选"></th>
+              <th>名称</th><th style="width:96px">类型</th><th>值</th>
+              <th style="width:140px">作用域</th><th style="width:120px">被引用</th><th style="width:96px"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="group-row"><td colspan="7">车本本-测试 · 6 个变量（含 3 个秘密）</td></tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 baseUrl"></td>
+              <td class="name">baseUrl</td>
+              <td><span class="type-tag">文本</span></td>
+              <td class="value">http://127.0.0.1:18080</td>
+              <td class="scope">环境 · 车本本-测试</td>
+              <td class="refs">218 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr class="editing">
+              <td><input type="checkbox" aria-label="选择 appSecret" checked></td>
+              <td class="name">appSecret</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td><input class="editable" type="text" value="cb-app-2026-9f2c8a1d" aria-label="appSecret 的值" style="width:210px"></td>
+              <td class="scope">环境 · 车本本-测试</td>
+              <td class="refs">1 个方案 · <a href="#">后台签名</a></td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="保存">✓</button><button class="icon-btn" aria-label="取消">✕</button></div></td>
+            </tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 aesKey"></td>
+              <td class="name">aesKey</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td class="value mono">9f2c8a1d4b6e7f03</td>
+              <td class="scope">环境 · 车本本-测试</td>
+              <td class="refs">1 个方案 · <a href="#">后台签名</a></td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 aesIv"></td>
+              <td class="name">aesIv</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td class="value mono">1029384756abcdef</td>
+              <td class="scope">环境 · 车本本-测试</td>
+              <td class="refs">1 个方案 · <a href="#">后台签名</a></td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 adminToken"></td>
+              <td class="name">adminToken</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td class="value" style="color:var(--warning)">待填写 · 只有你能填　<span class="type-tag" style="border-color:hsl(32 95% 45% / 0.4);color:var(--warning)">Agent 已建</span></td>
+              <td class="scope">环境 · 车本本-测试</td>
+              <td class="refs">3 个请求</td>
+              <td><div class="rowops"><button class="btn tiny primary" aria-label="填入值">填入值</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr class="group-row"><td colspan="7">车本本-生产 · 5 个变量（⚠️ 缺少 aesIv：发送时该步骤跳过、按明文发出去，服务端返回什么就显示什么）</td></tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择生产 appSecret"></td>
+              <td class="name">appSecret</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td class="value mono" style="color:var(--danger)">cb-prod-2026-7d1e5b93　<span class="type-tag" style="border-color:hsl(0 72% 44% / 0.4);color:var(--danger)">生产明文</span></td>
+              <td class="scope">环境 · 车本本-生产</td>
+              <td class="refs">1 个方案 · <a href="#">后台签名</a></td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择生产 aesIv"></td>
+              <td class="name">aesIv</td>
+              <td><span class="type-tag secret">🔒 秘密</span></td>
+              <td class="value" style="color:var(--warning)">待填写 · 只有你能填（Agent 已建，值留空）</td>
+              <td class="scope">环境 · 车本本-生产</td>
+              <td class="refs">1 个方案 · <a href="#">后台签名</a></td>
+              <td><div class="rowops"><button class="btn tiny primary" aria-label="填入值">填入值</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr class="group-row"><td colspan="7">工作区（跨集合共用） · 1 个变量</td></tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 workspaceId"></td>
+              <td class="name">workspaceId</td>
+              <td><span class="type-tag">文本</span></td>
+              <td class="value">adabf9f3-17ec-…</td>
+              <td class="scope">工作区</td>
+              <td class="refs">—</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="add-row">＋ 添加一行（输入名称后选择类型：文本 / 秘密；秘密值保存后不再回显）</div>
+
+        <div class="drawer-note">
+          <b>删除前会先看引用：</b>例如删除 <code>aesIv</code> 会提示「被 1 个方案（车本本-后台签名）引用，删掉后该方案在车本本-测试/生产都无法发送」，
+          可以一键查看引用它的请求与方案，避免出现「接口昨天还能发、今天报密钥缺失」。
+          <br><b>明文显示是显式状态：</b>默认按你的要求开启（本页与方案里的密钥值可直接读），关掉后恢复 ••••；
+          开启期间留审计记录；导出集合快照时仍然只导占位符，不会把密钥写进可分享的文件。
+        </div>
+
+        <div class="bulk">
+          <div class="head">批量编辑（粘贴 .env / key=value，一次导入多行）</div>
+          <div class="body">
+            <textarea spellcheck="false" aria-label="批量编辑变量">baseUrl=http://127.0.0.1:18080
+appSecret=xxx
+aesKey=xxx
+aesIv=xxx</textarea>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+              <span style="font-size:11px;color:var(--muted-foreground)">导入时按名称匹配作用域；带 <code>🔒</code> 的行按秘密处理（本界面明文可见，但不进运行记录、日志与导出快照）。</span>
+              <button class="btn tiny" style="margin-left:auto">取消</button>
+              <button class="btn tiny primary">预览差异并保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── 列表 2：签名与加密方案 ── -->
+      <div data-common-panel="schemes" hidden>
+      <div class="two-col">
+        <!-- 方案列表 -->
+        <div class="scheme-list">
+          <div class="head"><span>方案</span><span>＋ 新建方案</span></div>
+          <div class="scheme-item active">
+            <div class="name">🔒 车本本-后台签名</div>
+            <div class="desc">HMAC-SHA256 签名 + AES-128-CBC 加密正文</div>
+            <div class="usage"><span class="chip">13 个接口</span><span>密钥 3/3 齐全</span></div>
+          </div>
+          <div class="scheme-item">
+            <div class="name">🔒 车本本-APP 签名</div>
+            <div class="desc">MD5 签名（正文明文，不加密）</div>
+            <div class="usage"><span class="chip">41 个接口</span><span>密钥 2/2 齐全</span></div>
+          </div>
+          <div class="scheme-item">
+            <div class="name">🔒 第三方支付回调</div>
+            <div class="desc">仅响应验签（SHA256），不签名不加密请求</div>
+            <div class="usage"><span class="chip">2 个接口</span><span style="color:var(--warning)">生产缺少 callKey</span></div>
+          </div>
+          <div class="scheme-item">
+            <div class="name">不使用签名/加密</div>
+            <div class="desc">默认项，供未加密的接口选择</div>
+            <div class="usage"><span class="chip">139 个接口</span></div>
+          </div>
+        </div>
+
+        <!-- 方案详情 -->
+        <div class="scheme-detail">
+          <div class="detail-head">
+            <input type="text" value="车本本-后台签名" aria-label="方案名称">
+            <select aria-label="适用环境" style="width:120px"><option>全部环境</option><option>仅测试</option></select>
+            <div class="spacer">
+              <button class="btn">复制方案</button>
+              <button class="btn primary">保存并应用</button>
+            </div>
+          </div>
+          <div class="mono-line" style="margin-top:8px;color:var(--muted-foreground);font-size:11px">
+            说明：后台管理接口统一签名与加密方式，模板随签名算法约定固定；如需个别接口不同，复制一个方案再改。
+          </div>
+
+          <div class="phase">
+            <div class="phase-head">
+              <div class="lead"><h4>发送前</h4><span class="hint">按编号顺序执行</span></div>
+              <button class="btn tiny" style="margin-left:auto">＋ 添加步骤</button>
+            </div>
+
+            <div class="step-card" data-open="false">
+              <div class="head">
+                <span class="handle">⋮⋮</span><span class="order">1</span><span class="kind derive">派生</span>
+                <span class="title"><b>生成时间戳与随机数</b><small>秒级时间戳 + 16 位随机数</small></span>
+                <span class="chips" style="margin-left:auto"><span class="chip mono">X-Timestamp</span><span class="chip mono">X-Nonce</span></span>
+                <button class="sw" role="switch" aria-checked="true" aria-label="启用"></button>
+              </div>
+              <div class="body">
+                <div class="grid3">
+                  <div class="field"><label>时间戳格式</label><div class="control"><select><option>秒（10 位）</option><option>毫秒（13 位）</option></select></div></div>
+                  <div class="field"><label>随机数长度</label><div class="control"><select><option>16 位十六进制</option><option>UUID</option></select></div></div>
+                  <div class="field"><label>注入位置</label><div class="control"><select><option>请求头</option><option>查询参数</option></select></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="step-card" data-open="true">
+              <div class="head">
+                <span class="handle">⋮⋮</span><span class="order">2</span><span class="kind sign">签名</span>
+                <span class="title"><b>HMAC-SHA256 签名</b><small>在加密之前执行 → 签的是明文正文</small></span>
+                <span class="chips" style="margin-left:auto"><span class="chip key">🔒 appSecret</span><span class="chip mono">→ X-Sign</span></span>
+                <button class="sw" role="switch" aria-checked="true" aria-label="启用"></button>
+              </div>
+              <div class="body">
+                <div class="grid2">
+                  <div class="field"><label>算法</label><div class="control"><select><option>HMAC-SHA256</option><option>HMAC-SHA1</option><option>MD5</option><option>SHA256</option><option>SM3</option></select></div></div>
+                  <div class="field"><label>密钥来源 <span class="tip">只能选环境变量</span></label><div class="control"><span class="chip key">🔒 appSecret</span><select style="max-width:150px"><option>车本本-测试 / appSecret</option></select></div></div>
+                </div>
+                <div class="field" style="margin-top:10px">
+                  <label>待签内容模板</label>
+                  <textarea class="tmpl" spellcheck="false">{{method}}\n{{path}}\n{{timestamp}}\n{{nonce}}\n{{body.sha256}}</textarea>
+                  <span class="tip">
+                    可用：<span class="token">{{method}}</span> <span class="token">{{path}}</span> <span class="token">{{query.sorted}}</span>
+                    <span class="token">{{body.raw}}</span> <span class="token">{{body.sha256}}</span> <span class="token">{{timestamp}}</span> <span class="token">{{nonce}}</span>。
+                    模板放在公共方案里，所有引用它的接口共用同一套拼串规则。
+                  </span>
+                </div>
+                <div class="grid3">
+                  <div class="field"><label>输出编码</label><div class="control"><select><option>hex</option><option>base64</option></select></div></div>
+                  <div class="field"><label>注入位置</label><div class="control"><select><option>请求头</option><option>查询参数</option></select></div></div>
+                  <div class="field"><label>输出名称</label><div class="control"><input type="text" value="X-Sign"></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="step-card" data-open="false">
+              <div class="head">
+                <span class="handle">⋮⋮</span><span class="order">3</span><span class="kind crypt">加密</span>
+                <span class="title"><b>AES-128-CBC 加密正文</b><small>覆盖请求正文；界面预览仍显示明文</small></span>
+                <span class="chips" style="margin-left:auto"><span class="chip key">🔒 aesKey</span><span class="chip key">🔒 aesIv</span><span class="chip mono">base64</span></span>
+                <button class="sw" role="switch" aria-checked="true" aria-label="启用"></button>
+              </div>
+              <div class="body">
+                <div class="grid2">
+                  <div class="field"><label>算法</label><div class="control"><select><option>AES-128-CBC</option><option>AES-256-CBC</option><option>AES-128-GCM</option><option>SM4-CBC</option></select></div></div>
+                  <div class="field"><label>填充</label><div class="control"><select><option>PKCS#7</option><option>NoPadding</option></select></div></div>
+                  <div class="field"><label>密钥来源</label><div class="control"><span class="chip key">🔒 aesKey</span></div></div>
+                  <div class="field"><label>IV 来源</label><div class="control"><span class="chip key">🔒 aesIv</span></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="phase-head" style="margin-top:14px">
+              <div class="lead"><h4>收到后</h4><span class="hint">在断言与提取之前还原</span></div>
+              <button class="btn tiny" style="margin-left:auto">＋ 添加步骤</button>
+            </div>
+            <div class="step-card" data-open="false">
+              <div class="head">
+                <span class="handle">⋮⋮</span><span class="order">1</span><span class="kind decrypt">解密</span>
+                <span class="title"><b>AES-128-CBC 解密响应正文</b><small>解密后的明文交给断言、提取与预览</small></span>
+                <span class="chips" style="margin-left:auto"><span class="chip key">🔒 aesKey</span><span class="chip">失败停止断言</span></span>
+                <button class="sw" role="switch" aria-checked="true" aria-label="启用"></button>
+              </div>
+              <div class="body">
+                <div class="grid2">
+                  <div class="field"><label>输入</label><div class="control"><select><option>响应正文（原始字节）</option><option>响应字段 data</option></select></div></div>
+                  <div class="field"><label>输入编码</label><div class="control"><select><option>base64</option><option>hex</option><option>原文</option></select></div></div>
+                  <div class="field"><label>解密成功后</label><div class="control"><span class="chip">断言</span><span class="chip">提取</span><span class="chip">预览</span></div></div>
+                  <div class="field"><label>解密失败时</label><div class="control"><select><option>停止后续断言（默认）</option><option>继续并标注未解密</option></select></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 影响面与密钥检查 -->
+          <div class="impact">
+            <b>修改这个方案会影响 13 个接口。</b>
+            算法、模板或步骤顺序的改动会改变它们实际发出的请求；保存前会再确认一次，并把这次变更写入方案 revision。
+            <div class="list">
+              <span class="chip">后台接口 9</span><span class="chip">APP 接口 4</span>
+              <span class="chip">其中 2 个在生产环境使用</span>
+            </div>
+          </div>
+          <div class="keycheck">
+            <div class="row"><span class="dot-ok"></span><b style="font-weight:600">车本本-测试</b><span style="color:var(--muted-foreground)">appSecret · aesKey · aesIv 均已配置，三步都会执行</span><span style="margin-left:auto"><a href="#">查看</a></span></div>
+            <div class="row"><span class="dot-warn"></span><b style="font-weight:600">车本本-生产</b><span style="color:var(--warning)">缺少 aesIv：不阻断发送，加密步骤会跳过（明文发出），服务端返回什么就显示什么</span><span style="margin-left:auto"><a href="#">去补</a></span></div>
+          </div>
+        </div>
+      </div>
+      </div>
+
+      <!-- ── 列表 3：公共请求头 ── -->
+      <div data-common-panel="headers" hidden>
+        <div class="mtoolbar">
+          <select aria-label="作用域" style="width:170px"><option>全部作用域</option><option>工作区</option><option>车本本-测试</option></select>
+          <div class="grow"></div>
+          <button class="btn tiny">批量编辑</button>
+          <button class="btn tiny primary">＋ 添加请求头</button>
+        </div>
+        <table class="mtable">
+          <thead><tr><th style="width:28px"></th><th>名称</th><th>值</th><th style="width:140px">作用域</th><th style="width:110px">被引用</th><th style="width:96px"></th></tr></thead>
+          <tbody>
+            <tr class="group-row"><td colspan="6">工作区（所有请求默认带上）</td></tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 X-App-Version"></td>
+              <td class="name">X-App-Version</td><td class="value">2.14.0</td>
+              <td class="scope">工作区</td><td class="refs">245 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 Authorization"></td>
+              <td class="name">Authorization</td><td class="value secret">Bearer ••••••••</td>
+              <td class="scope">环境 · 车本本-测试</td><td class="refs">3 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="add-row">＋ 添加一行（支持 <code>{{变量}}</code> 与 🔒 秘密类型）</div>
+      </div>
+
+      <!-- ── 列表 4：公共查询参数 ── -->
+      <div data-common-panel="query" hidden>
+        <div class="mtoolbar">
+          <select aria-label="作用域" style="width:170px"><option>全部作用域</option><option>集合：后台接口</option></select>
+          <div class="grow"></div>
+          <button class="btn tiny primary">＋ 添加参数</button>
+        </div>
+        <table class="mtable">
+          <thead><tr><th style="width:28px"></th><th>名称</th><th>值</th><th style="width:140px">作用域</th><th style="width:110px">被引用</th><th style="width:96px"></th></tr></thead>
+          <tbody>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 ts"></td>
+              <td class="name">ts</td><td class="value">{{timestamp}}</td>
+              <td class="scope">集合 · 后台接口</td><td class="refs">218 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="add-row">＋ 添加一行（顺序可拖动；签名前会按名称排序后再拼串）</div>
+      </div>
+
+      <!-- ── 列表 5：公共鉴权 ── -->
+      <div data-common-panel="auth" hidden>
+        <div class="mtoolbar">
+          <div class="grow" style="font-size:11.5px;color:var(--muted-foreground)">鉴权与签名方案同属公共配置：请求可继承，也可在接口里覆盖。</div>
+          <button class="btn tiny primary">＋ 添加鉴权</button>
+        </div>
+        <table class="mtable">
+          <thead><tr><th style="width:28px"></th><th>名称</th><th>类型</th><th>凭据来源</th><th style="width:140px">作用域</th><th style="width:96px"></th></tr></thead>
+          <tbody>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 后台管理令牌"></td>
+              <td class="name">后台管理令牌</td><td><span class="type-tag">Bearer</span></td>
+              <td class="value">🔒 adminToken（环境变量）</td>
+              <td class="scope">集合 · 后台接口</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="drawer-note"><b>继承顺序（接口里要能查看实际生效来源）：</b>接口覆盖 → 运行时变量 → 环境 → 集合 → 工作区。签名方案与鉴权同样按这个顺序取最后生效的那个。</div>
+      </div>
+    </section>
+
+    <!-- ══════════ 视图 ③：Agent 配置 · 待你补密钥 ══════════ -->
+    <section class="window" id="view-agent" hidden>
+      <div class="titlebar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="name">Agent 配置加密</span>
+        <span style="color:var(--muted-foreground)">· 会话里的一次对话</span>
+        <span class="env">Agent 只配置结构，密钥值由你填</span>
+      </div>
+
+      <div class="two-col" style="grid-template-columns:minmax(0,1fr) 340px">
+        <div class="scheme-detail" style="padding:14px 16px">
+          <!-- 你说的一句话 -->
+          <div class="notice info">
+            <span>🙋</span>
+            <div>「后台接口都要签名和加密，你按我们文档配一下：HMAC-SHA256 签名放 X-Sign，正文 AES-128-CBC，响应也解密；密钥我一会儿自己填。」</div>
+          </div>
+
+          <!-- Agent 提案 -->
+          <div class="step-card" data-open="true" style="margin-top:12px">
+            <div class="head">
+              <span class="kind sign">提案</span>
+              <span class="title"><b>Agent 已按文档配好 1 个方案 + 3 个密钥变量，并把 9 个接口绑上</b><small>等你填 3 个密钥值；填完就能发送</small></span>
+              <span class="chips"><span class="chip">待你操作 · 3 项</span></span>
+            </div>
+            <div class="body">
+              <table class="mtable" style="margin-top:6px">
+                <thead><tr><th>它会做什么</th><th>对象</th><th style="width:150px">是否需要你</th></tr></thead>
+                <tbody>
+                  <tr><td>新建签名与加密方案</td><td class="mono">车本本-后台签名（派生 → HMAC-SHA256 → AES-128-CBC；收到后解密）</td><td><span class="type-tag">不需要</span></td></tr>
+                  <tr><td>新建密钥变量（值留空）</td><td class="mono">appSecret · aesKey · aesIv（车本本-测试）</td><td><span class="type-tag secret">等你填值</span></td></tr>
+                  <tr><td>绑定接口到该方案</td><td>后台接口 9 个请求（含「保存 AI 能力」）</td><td><span class="type-tag">不需要</span></td></tr>
+                  <tr><td>公共查询参数 <code>ts={{timestamp}}</code></td><td>集合：后台接口</td><td><span class="type-tag">不需要</span></td></tr>
+                </tbody>
+              </table>
+              <div class="drawer-note" style="margin:10px 0 0">
+                <b>Agent 的权限边界：</b>可以新建/修改方案、变量、公共请求头与参数、给接口选方案；
+                <b>但不能读取、不能写入、不能覆盖任何密钥值</b>——它只知道变量名和"是否已填"。
+              </div>
+            </div>
+          </div>
+
+          <!-- 待你补的密钥 -->
+          <div class="letter-head" style="display:flex;align-items:center;gap:8px;margin:16px 0 8px">
+            <h4 style="font-size:12.5px">等你填的密钥（3）</h4>
+            <span style="font-size:11px;color:var(--muted-foreground)">填完这一屏就清空；复制粘贴或从密码管理器导入都行</span>
+          </div>
+          <table class="mtable">
+            <thead><tr><th>变量</th><th>类型</th><th>值</th><th style="width:120px">被谁需要</th><th style="width:110px"></th></tr></thead>
+            <tbody>
+              <tr class="editing">
+                <td class="name">appSecret</td><td><span class="type-tag secret">🔒 秘密</span></td>
+                <td><input class="editable" type="text" value="cb-app-2026-9f2c8a1d" aria-label="填入 appSecret" style="width:230px"></td>
+                <td class="refs">方案：后台签名</td>
+                <td><div class="rowops"><button class="btn tiny primary">保存</button></div></td>
+              </tr>
+              <tr>
+                <td class="name">aesKey</td><td><span class="type-tag secret">🔒 秘密</span></td>
+                <td class="value" style="color:var(--warning)">待填写</td>
+                <td class="refs">方案：后台签名</td>
+                <td><div class="rowops"><button class="btn tiny">填入值</button></div></td>
+              </tr>
+              <tr>
+                <td class="name">aesIv</td><td><span class="type-tag secret">🔒 秘密</span></td>
+                <td class="value" style="color:var(--warning)">待填写</td>
+                <td class="refs">方案：后台签名</td>
+                <td><div class="rowops"><button class="btn tiny">填入值</button></div></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="drawer-note" style="margin:10px 0 0">
+            这些值进入系统安全存储后，界面按你的要求明文可见（👁 可切回遮蔽），但不会进入运行记录、日志与导出快照；
+            Agent 在会话里也永远拿不到它们。
+          </div>
+
+          <!-- 配好之后 -->
+          <div class="impact" style="border-color:hsl(161 94% 30% / 0.35);background:hsl(161 94% 30% / 0.08)">
+            <b>填完之后的验证（Agent 会自己做，不用你点）：</b>
+            <div class="list">
+              <span class="chip">用 1 个接口试发，确认 X-Sign 与服务端一致</span>
+              <span class="chip">确认响应能被解密并跑通断言</span>
+              <span class="chip">失败时给出「不是密文 / 算法不符 / 密钥不符」的分类结论</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 审批卡 -->
+        <div class="scheme-list" style="border-right:0;border-left:1px solid var(--border-soft)">
+          <div class="card" style="border:0;background:transparent;box-shadow:none">
+            <header>🛡️ 审批卡（配置类动作） <span class="tag">一次批准</span></header>
+            <div class="body">
+              <p><b style="color:var(--foreground)">Agent 想配置加密</b><br>新建 1 个方案、3 个密钥变量、绑定 9 个接口</p>
+              <div class="kv"><span class="k">影响面</span><span class="v">方案被 9 个接口选择（后台接口）；变量新增 3 条（值留空）</span></div>
+              <div class="kv"><span class="k">读密钥</span><span class="v">否 —— 配置阶段不读取任何密钥值</span></div>
+              <div class="kv"><span class="k">写密钥</span><span class="v">否 —— 只创建变量名与类型，值留空等你填</span></div>
+              <div class="kv"><span class="k">可回滚</span><span class="v">本次变更留 revision，可在审批详情里一键撤销</span></div>
+              <div class="kv"><span class="k">后续发送</span><span class="v">发送加密请求仍需单独审批（那时才会读取密钥值）</span></div>
+            </div>
+            <div class="perm-actions">
+              <button class="btn danger">拒绝</button>
+              <button class="btn primary">允许配置</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ══════════ 右栏 ══════════ -->
+  <aside class="side">
+    <div class="card reveal">
+      <header>🛡️ Agent 审批卡 <span class="tag">PermissionBanner</span></header>
+      <div class="body">
+        <p><b style="color:var(--foreground)">Agent 想用方案「车本本-后台签名」发送请求</b><br>POST <span class="mono">/admin/v1/ai/capability/save</span></p>
+        <div class="kv"><span class="k">方案</span><span class="v"><span class="chip algo">HMAC-SHA256</span> <span class="chip crypt">AES-128-CBC</span></span></div>
+        <div class="kv"><span class="k">将读取密钥</span><span class="v"><span class="chip key">🔒 appSecret</span> <span class="chip key">🔒 aesKey</span> <span class="chip key">🔒 aesIv</span> <span style="color:var(--muted-foreground)">（审批卡只列名称；值在本机公共配置里明文可见）</span></span></div>
+        <div class="kv"><span class="k">目标</span><span class="v mono">POST http://127.0.0.1:18080/admin/v1/ai/capability/save</span></div>
+        <div class="kv"><span class="k">记录写入</span><span class="v">方案名、算法、密钥引用名、实际密文与变形前明文；不写密钥值</span></div>
+        <div class="kv" style="padding:6px 8px;border-radius:8px;background:hsl(32 95% 45% / 0.10)"><span class="k" style="color:var(--warning)">本次发送</span><span class="v" style="color:var(--warning)">缺 aesKey / aesIv → 按明细：<b>跳过加密、明文发出</b>，服务端返回什么就显示什么（不阻断；记录标「明文发出」）</span></div>
+        <div class="kv"><span class="k">不可越界</span><span class="v">Agent 不能修改公共方案；要改方案必须单独提交并审批一次</span></div>
+      </div>
+      <div class="perm-actions">
+        <button class="btn danger">拒绝</button>
+        <button class="btn">允许一次</button>
+        <button class="btn primary">本次会话允许</button>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>⚠️ 改公共方案的影响面 <span class="tag">保存前确认</span></header>
+      <div class="body">
+        <p>方案是共享资产，改它等同于同时改 13 个接口的行为。保存时会显示这次改动的差异与受影响接口清单。</p>
+        <div class="kv"><span class="k">引用接口</span><span class="v">13 个（后台 9 / APP 4）</span></div>
+        <div class="kv"><span class="k">涉及环境</span><span class="v">车本本-测试、车本本-生产</span></div>
+        <div class="kv"><span class="k">历史</span><span class="v">方案每次保存生成 revision；运行记录会记下当时用的 revision，便于回溯「为什么昨天还能通过」</span></div>
+        <div class="kv"><span class="k">只改选择</span><span class="v">接口里切换方案不触发这条确认（只影响它自己）</span></div>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>🔑 环境密钥 <span class="tag">测试明文 · 生产遮蔽</span></header>
+      <div class="body">
+        <div class="secret-row"><span>🔒</span><span class="name">appSecret</span><span class="chip">签名密钥</span><span class="dotsv" style="font-family:ui-monospace;letter-spacing:0">cb-app-2026-9f2c8a1d</span></div>
+        <div class="secret-row"><span>🔒</span><span class="name">aesKey</span><span class="chip">AES 128 位</span><span class="dotsv" style="font-family:ui-monospace;letter-spacing:0">9f2c8a1d4b6e7f03</span></div>
+        <div class="secret-row"><span>🔒</span><span class="name">aesIv</span><span class="chip">固定 IV</span><span class="dotsv" style="font-family:ui-monospace;letter-spacing:0">1029384756abcdef</span></div>
+        <div class="secret-row" style="color:var(--muted-foreground)"><span>🔒</span><span class="name">appSecret</span><span class="chip" style="border-color:hsl(0 72% 44% / 0.35);color:var(--danger)">生产</span><span class="dotsv">••••••••••••</span><span style="font-size:11px">默认遮蔽 · 点 👁 显示并留审计</span></div>
+        <div class="secret-row"><span>📄</span><span class="name">baseUrl</span><span class="chip">非秘密</span><span class="dotsv" style="font-family:ui-monospace;letter-spacing:0">http://127.0.0.1:18080</span></div>
+        <p style="margin-top:10px;font-size:11px">
+          测试/本地：按你的要求默认明文可见；<b>生产：默认遮蔽，点 👁 才显示并留审计</b>（你已确认）。
+          三条边界不变：<b>不进运行记录</b>、<b>不进日志</b>、<b>导出快照只导占位符</b>。
+        </p>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>🧱 作用域是什么 <span class="tag">回答你的第 1 个问题</span></header>
+      <div class="body">
+        <div class="kv"><span class="k">工作区级</span><span class="v"><b>不是"每个接口一份"</b>，而是整个项目共用的那一份：这个 workspace 下所有集合、所有接口都能用，改一次全体生效。适合放公司级固定值。</span></div>
+        <div class="kv"><span class="k">集合级</span><span class="v">只在某个集合内生效，例如「后台接口」专用的签名参数。</span></div>
+        <div class="kv"><span class="k">环境级</span><span class="v">同一个变量名在不同环境各存一份值，例如 <code>baseUrl</code> 测试是 127.0.0.1，生产是真实域名。</span></div>
+        <div class="kv"><span class="k">接口级</span><span class="v">接口本身不存值，只存「用哪套方案」+ 可选的覆盖项；需要时覆盖工作区/集合/环境里的值。</span></div>
+        <p style="margin-top:8px;font-size:11px">取值顺序：接口覆盖 → 运行时变量 → 环境 → 集合 → 工作区。接口里会显示"这个值最终来自哪一层"。</p>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>🔗 变量与方案的引用关系 <span class="tag">删之前先看引用</span></header>
+      <div class="body">
+        <p>列表里每一项都显示「被引用」，点击可跳到引用它的请求或方案。删除或改名前的提示都用同一份引用数据。</p>
+        <div class="kv"><span class="k">变量</span><span class="v">aesIv → 被 1 个方案引用（车本本-后台签名）→ 影响 13 个接口</span></div>
+        <div class="kv"><span class="k">方案</span><span class="v">车本本-后台签名 → 被 13 个接口选择</span></div>
+        <div class="kv"><span class="k">请求头</span><span class="v">X-App-Version → 245 个请求继承</span></div>
+        <div class="kv"><span class="k">生效来源</span><span class="v">接口里会显示「这个值最终来自哪一层」，避免改了不生效</span></div>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>📋 与 Postman 的对照</header>
+      <div class="body">
+        <ul class="rules">
+          <li><b>照抄：</b>「列表页 + 表格内联编辑 + 批量编辑（粘贴 key=value）+ 作用域分层 + 继承」这套交互，它是被验证过最快的批量维护方式。</li>
+          <li><b>照抄：</b>变量、请求头、参数、鉴权、加解密都放在同一个管理入口下，用页签切列表，而不是散落在各个请求里。</li>
+          <li><b>不照抄双值：</b>Postman 的 Initial / Current 两列是为了在会话里临时改值，代价是两处都可能明文；我们只保留一个「当前值」，要临时换值用「本次运行覆盖」。</li>
+          <li><b>不照抄脚本：</b>Postman 用 Pre-request Script 做签名，灵活但不可审计；我们用声明式步骤，Agent 也改不了方案本身。</li>
+          <li><b>改进继承：</b>Postman 的 Globals 与 Environments 是两套；我们统一成「作用域」一列（工作区 / 环境 / 集合），并在接口上显示实际生效来源。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>🤖 Agent 能做什么 / 不能做什么 <span class="tag">你只需填密钥</span></header>
+      <div class="body">
+        <div class="kv"><span class="k">可以</span><span class="v">新建与修改签名/加密方案、创建变量条目（含秘密变量，值留空）、维护公共请求头与查询参数、给接口批量绑定方案、按文档补齐签名字段</span></div>
+        <div class="kv"><span class="k">不可以</span><span class="v">读不到、写不了、覆盖不了任何密钥值；审批卡与工具返回里都只有变量名与「是否已填」</span></div>
+        <div class="kv"><span class="k">需要你</span><span class="v">填入密钥值（一个「待你补密钥」清单，填完即清空）</span></div>
+        <div class="kv"><span class="k">边界</span><span class="v">配置类动作一次审批；后续真正发送加密请求时另算一次审批（那次才会读取密钥）</span></div>
+      </div>
+    </div>
+
+    <div class="card reveal">
+      <header>🧭 设计取舍</header>
+      <div class="body">
+        <ul class="rules">
+          <li><b>密钥明文可见（你确认）。</b>管理列表与方案里直接显示值，👁 可一键切回遮蔽；不进运行记录、日志与导出快照。<b>代价：截屏、录屏、远程协助会连密钥一起被看到</b>，所以我建议生产环境的秘密默认保持遮蔽（要不要也默认明文，见页脚待确认）。</li>
+          <li><b>方案公共、选择私有。</b>算法与模板是系统级约定，按接口复制一定会漂移；接口只保存「用哪一套」，改一处全体生效。</li>
+          <li><b>顺序就是语义。</b>签名签明文还是密文取决于它在加密前/后，所以方案里用编号显式排序。</li>
+          <li><b>缺密钥绝不阻断（你确认，理由成立）。</b>本地无法判断服务端到底验不验签名——如果生产的服务端本来不需要密钥，阻断就等于"永远发不出去"。所以缺哪一步就跳过哪一步、照常发出去、返回什么显示什么；<b>代价用可见性补，不用阻断补</b>：请求状态条、运行记录、Agent 审批卡三处都标「本次未签名/未加密」，运行历史可按「明文发出」筛选，避免"以为加密了其实发的明文"。</li>
+          <li><b>不做任意 JS 脚本。</b>脚本能读凭据、能出网、Agent 也能改，声明式步骤可审计、可 diff。</li>
+          <li><b>Agent 不越界。</b>Agent 只能选方案；要新建或修改方案，必须单独走一次审批并展示影响面。</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footnote">
+      本轮决定已全部确认：作用域含<b>工作区级</b>；缺密钥<b>绝不阻断</b>（本地判断不了服务端要不要密钥），改为三处显式标注「明文发出」；
+      <b>不要双值</b>；测试/本地密钥<b>明文显示</b>、<b>生产默认遮蔽</b>；<b>Agent 负责配置结构、密钥值只由你填</b>。
+      下一步：我把这份稿子落成设计文档，再出实施计划。
+    </div>
+  </aside>
+</div>
+
+<script>
+  /** 视图切换：请求视角 / 公共配置视角 / Agent 配置视角。 */
+  document.querySelectorAll('[data-view]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const view = button.dataset.view
+      document.querySelectorAll('[data-view]').forEach((item) => item.setAttribute('aria-selected', String(item === button)))
+      document.querySelectorAll('[id^="view-"]').forEach((section) => { section.hidden = section.id !== `view-${view}` })
+    })
+  })
+
+  /** 公共配置里的提示条可以直接跳到 Agent 配置视图。 */
+  document.querySelectorAll('[data-view-jump-link]').forEach((node) => {
+    node.addEventListener('click', (event) => {
+      event.preventDefault()
+      document.querySelector(`[data-view="${node.dataset.viewJumpLink}"]`).click()
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+  })
+
+  /** 「编辑这个方案 ↗」跳转到公共配置视图。 */
+  document.querySelectorAll('[data-view-jump]').forEach((node) => {
+    node.addEventListener('click', (event) => {
+      event.preventDefault()
+      document.querySelector('[data-view="common"]').click()
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
+  })
+
+  /** 主题切换。 */
+  document.querySelectorAll('[data-theme-btn]').forEach((button) => {
+    button.addEventListener('click', () => {
+      document.documentElement.dataset.theme = button.dataset.themeBtn
+      document.querySelectorAll('[data-theme-btn]').forEach((item) => item.setAttribute('aria-selected', String(item === button)))
+    })
+  })
+
+  /** 响应示例切换：成功态与失败态是两种界面密度。 */
+  document.querySelectorAll('[data-resp]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const mode = button.dataset.resp
+      document.querySelectorAll('[data-resp]').forEach((item) => item.setAttribute('aria-selected', String(item === button)))
+      document.querySelectorAll('[data-resp-view]').forEach((node) => { node.hidden = node.dataset.respView !== mode })
+    })
+  })
+
+  /** 请求分区切换。 */
+  document.querySelectorAll('[data-panel]').forEach((button) => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('[data-panel]').forEach((item) => item.setAttribute('aria-selected', String(item === button)))
+      const showCrypto = button.dataset.panel === 'crypto'
+      document.getElementById('panel-crypto').hidden = !showCrypto
+      document.getElementById('panel-other').hidden = showCrypto
+    })
+  })
+
+  /** 公共配置的列表切换：变量与密钥 / 签名方案 / 公共请求头 / 公共查询参数 / 公共鉴权。 */
+  document.querySelectorAll('[data-common-tab]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const key = button.dataset.commonTab
+      document.querySelectorAll('[data-common-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === button)))
+      document.querySelectorAll('[data-common-panel]').forEach((panel) => { panel.hidden = panel.dataset.commonPanel !== key })
+    })
+  })
+
+  /** 公共方案步骤展开/收起。 */
+  document.querySelectorAll('.step-card .head').forEach((head) => {
+    head.addEventListener('click', (event) => {
+      if (event.target.closest('.sw, .icon-btn')) return
+      const card = head.closest('.step-card')
+      card.dataset.open = card.dataset.open === 'true' ? 'false' : 'true'
+    })
+  })
+
+  /** 开关。 */
+  document.querySelectorAll('.sw').forEach((sw) => {
+    sw.addEventListener('click', (event) => {
+      event.stopPropagation()
+      sw.setAttribute('aria-checked', sw.getAttribute('aria-checked') === 'true' ? 'false' : 'true')
+    })
+  })
+
+  /** 覆盖项展开。 */
+  const overrideButton = document.getElementById('override-toggle')
+  overrideButton.addEventListener('click', () => {
+    const list = document.getElementById('override-list')
+    const open = list.hidden
+    list.hidden = !open
+    overrideButton.setAttribute('aria-expanded', String(open))
+    overrideButton.textContent = open ? '收起覆盖项' : '展开 3 项'
+  })
+</script>
+</body>
+</html>
