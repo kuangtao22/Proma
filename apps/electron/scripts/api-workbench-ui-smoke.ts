@@ -192,6 +192,8 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     await waitFor(window, "window.__apiWorkbenchSmoke.catalog.requests.length === 1", '请求未保存')
     await clickText(window, '发送')
     await waitFor(window, "window.__apiWorkbenchSmoke.sendCalls === 1 && document.body.textContent?.includes('200')", '请求未进入响应视图')
+    /** 缺密钥时状态条必须显式写「本次未加密 · 明文发出」，不能让 200 掩盖未加密。 */
+    await waitFor(window, "Boolean(document.querySelector('[data-api-run-crypto]')) && document.body.textContent?.includes('本次未加密 · 明文发出') && document.body.textContent?.includes('aesKey')", '状态条没有标注本次未加密')
     console.log('[API Workbench UI smoke] 保存与发送已验证')
     await clickLabel(window, '查看本地原始内容')
     await waitFor(window, "window.__apiWorkbenchSmoke.revealGetRunCalls === 1 && window.__apiWorkbenchSmoke.revealBodyCalls === 1 && document.body.textContent?.includes('本地原始内容')", '原始内容 reveal 未完成')
@@ -878,6 +880,8 @@ async function runElectronSmoke(app: import('electron').App, BrowserWindow: type
     })()`)
     assert.equal(selectedProfile, true, '无法在请求上选择加密方案')
     await waitFor(window, "document.body.textContent?.includes('在公共配置里修改') && document.body.textContent?.includes('HMAC-SHA256')", '选中方案后没有显示只读步骤预览')
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    await writeFile('/private/tmp/api-workbench-ui-crypto-request.png', (await window.webContents.capturePage()).toPNG())
     await clickText(window, '在公共配置里修改 →')
     await waitFor(window, "Boolean(document.querySelector('[data-common-panel=\"schemes\"]'))", '公共配置没有打开方案页签')
     assert.equal(await window.webContents.executeJavaScript("document.querySelectorAll('[data-crypto-profile]').length >= 1"), true, '方案列表没有渲染')

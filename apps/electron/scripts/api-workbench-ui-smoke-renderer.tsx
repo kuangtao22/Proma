@@ -76,6 +76,16 @@ function createRun(request: ApiResolvedRequest, requestId?: string, caseId?: str
       ? [{ id: 'status', passed: true, expected: '200', actual: '200', message: '状态码匹配' }]
       : [{ id: casePassed ? 'case_pass' : 'case_fail', passed: casePassed, expected: casePassed ? '200' : '401', actual: '200', message: casePassed ? '断言通过' : '断言失败' }],
     recording: 'memory-only', pinned: false,
+    /**
+     * 加密事实：夹具固定给一条「缺密钥 → 明文发出」的记录。
+     * 状态下必须显式标出来——一个 200 不能让人以为加密生效了。
+     */
+    crypto: {
+      profileId: 'profile_smoke', profileName: '烟测方案', profileRevision: 1,
+      executed: [{ id: 'cs_sign', kind: 'sign', algo: 'HMAC-SHA256' }],
+      skipped: [{ id: 'cs_encrypt', kind: 'encrypt', algo: 'AES-128-CBC', reason: 'missing-secret', keyRef: 'aesKey' }],
+      plaintextSent: true, decrypted: false,
+    },
     /** 事件流事实与实时增量共用同一渲染路径。 */
     sse: {
       events: [
