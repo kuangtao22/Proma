@@ -77,3 +77,4 @@ pnpm-workspace.yaml
 .omx/state/
 .omx/context/
 .superpowers/
+.omx/
