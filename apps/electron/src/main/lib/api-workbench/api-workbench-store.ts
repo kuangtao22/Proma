@@ -27,6 +27,7 @@ import {
 import type {
   ApiBodySlice,
   ApiCatalog,
+  ApiCryptoProfile,
   ApiField,
   ApiResolvedRequest,
   ApiRun,
@@ -268,28 +269,106 @@ export class ApiWorkbenchStore {
   /** 在跨进程短事务中比较 revision、秘密化字段并原子提交完整目录。 */
   saveCatalog(workspaceId: string, expectedRevision: number, catalog: ApiCatalog): ApiCatalog {
     parseApiId(workspaceId)
+    return this.transaction(workspaceId, () => this.commitCatalog(workspaceId, catalog, expectedRevision))
+  }
+
+  /**
+   * 原子提交整份目录：比较 revision、维护请求版本、秘密化字段后落盘。
+   * 这是唯一的目录写入路径，工作区变量与方案的批写都复用它，避免出现第二套落盘语义。
+   * @param expectedRevision 为 null 表示调用方只改自己负责的片段、接受当前版本（片段批写走这条路）。
+   */
+  private commitCatalog(workspaceId: string, catalog: ApiCatalog, expectedRevision: number | null): ApiCatalog {
     const input = parseApiCatalog(catalog)
+    const current = this.getCatalog(workspaceId)
+    if (expectedRevision !== null && current.revision !== expectedRevision) throw new Error('API_WORKBENCH_REVISION_CONFLICT')
+    const nextRevision = current.revision + 1
+    const now = this.dependencies.now()
+    const requests = input.requests.map((request) => {
+      const previous = current.requests.find((item) => item.id === request.id)
+      if (previous && request.revision !== previous.revision) throw new Error('API_WORKBENCH_REQUEST_REVISION_CONFLICT')
+      const changed = !previous || JSON.stringify({ ...request, revision: 0, updatedAt: 0 }) !== JSON.stringify({ ...previous, revision: 0, updatedAt: 0 })
+      return {
+        ...request,
+        revision: previous ? previous.revision + (changed ? 1 : 0) : 1,
+        updatedAt: previous && !changed ? previous.updatedAt : now,
+      }
+    })
+    const draft: ApiCatalog = { ...input, revision: nextRevision, requests }
+    const sanitized = this.sanitizeCatalogSecrets(workspaceId, draft)
+    const paths = this.workspacePaths(workspaceId)
+    this.writeJson(paths.catalog, sanitized, current.revision === 0 && !existsSync(paths.catalog) ? undefined : current)
+    return parseApiCatalog(sanitized)
+  }
+
+  /**
+   * 批量写工作区变量（跨集合共用）。
+   * 只替换 `workspaceVariables` 一个片段，其余目录内容原样提交；秘密值仍走 safeStorage。
+   * @returns 落盘后的变量列表（秘密值已替换为引用，明文不返回）。
+   */
+  saveWorkspaceVariables(workspaceId: string, variables: readonly ApiField[]): ApiField[] {
+    parseApiId(workspaceId)
     return this.transaction(workspaceId, () => {
       const current = this.getCatalog(workspaceId)
-      if (current.revision !== expectedRevision) throw new Error('API_WORKBENCH_REVISION_CONFLICT')
-      const nextRevision = current.revision + 1
-      const now = this.dependencies.now()
-      const requests = input.requests.map((request) => {
-        const previous = current.requests.find((item) => item.id === request.id)
-        if (previous && request.revision !== previous.revision) throw new Error('API_WORKBENCH_REQUEST_REVISION_CONFLICT')
-        const changed = !previous || JSON.stringify({ ...request, revision: 0, updatedAt: 0 }) !== JSON.stringify({ ...previous, revision: 0, updatedAt: 0 })
-        return {
-          ...request,
-          revision: previous ? previous.revision + (changed ? 1 : 0) : 1,
-          updatedAt: previous && !changed ? previous.updatedAt : now,
-        }
-      })
-      const draft: ApiCatalog = { ...input, revision: nextRevision, requests }
-      const sanitized = this.sanitizeCatalogSecrets(workspaceId, draft)
-      const paths = this.workspacePaths(workspaceId)
-      this.writeJson(paths.catalog, sanitized, current.revision === 0 && !existsSync(paths.catalog) ? undefined : current)
-      return parseApiCatalog(sanitized)
+      const saved = this.commitCatalog(workspaceId, { ...current, workspaceVariables: [...variables] }, null)
+      return saved.workspaceVariables ?? []
     })
+  }
+
+  /**
+   * 保存签名/加密方案（新增或更新）。
+   * 方案 revision 由 Store 维护；expectedRevision 为 null 表示新增或强制覆盖。
+   */
+  saveCryptoProfile(workspaceId: string, profile: ApiCryptoProfile, expectedRevision: number | null): ApiCryptoProfile {
+    parseApiId(workspaceId)
+    return this.transaction(workspaceId, () => {
+      const current = this.getCatalog(workspaceId)
+      const profiles = current.cryptoProfiles ?? []
+      const previous = profiles.find((item) => item.id === profile.id)
+      if (expectedRevision !== null && (previous?.revision ?? 0) !== expectedRevision) throw new Error('API_WORKBENCH_CRYPTO_REVISION_CONFLICT')
+      const next: ApiCryptoProfile = { ...profile, revision: (previous?.revision ?? 0) + 1, updatedAt: this.dependencies.now() }
+      const cryptoProfiles = previous ? profiles.map((item) => (item.id === next.id ? next : item)) : [...profiles, next]
+      const saved = this.commitCatalog(workspaceId, { ...current, cryptoProfiles }, null)
+      const persisted = (saved.cryptoProfiles ?? []).find((item) => item.id === next.id)
+      if (!persisted) throw new Error('API_WORKBENCH_CRYPTO_PROFILE_MISSING')
+      return persisted
+    })
+  }
+
+  /**
+   * 删除方案；默认拒绝删除仍被请求引用的方案，force 时强制删除并留下悬空引用。
+   * @returns removed 是否真的删除；referencedBy 引用它的请求条数。
+   */
+  deleteCryptoProfile(workspaceId: string, id: string, force = false): { removed: boolean; referencedBy: number } {
+    parseApiId(workspaceId)
+    return this.transaction(workspaceId, () => {
+      const current = this.getCatalog(workspaceId)
+      const profiles = current.cryptoProfiles ?? []
+      if (!profiles.some((item) => item.id === id)) return { removed: false, referencedBy: 0 }
+      const referencedBy = current.requests.filter((request) => request.selectedProfileId === id).length
+      if (referencedBy > 0 && !force) return { removed: false, referencedBy }
+      this.commitCatalog(workspaceId, { ...current, cryptoProfiles: profiles.filter((item) => item.id !== id) }, null)
+      return { removed: true, referencedBy }
+    })
+  }
+
+  /**
+   * 变量 / 方案的引用检查：给删除确认与重命名提示共用。
+   * @param kind `variable` 按变量名匹配方案步骤的 keyRef/ivRef 与请求覆盖项；`profile` 按方案 id 匹配请求选择。
+   * @returns 相关方案名、受影响的请求条数与被涉及集合名（界面直接展示，不再二次查询）。
+   */
+  inspectCryptoReferences(workspaceId: string, kind: 'variable' | 'profile', name: string): { profiles: string[]; requests: number; collections: string[] } {
+    parseApiId(workspaceId)
+    const current = this.getCatalog(workspaceId)
+    const profiles = current.cryptoProfiles ?? []
+    const matched = kind === 'profile'
+      ? profiles.filter((item) => item.id === name)
+      : profiles.filter((item) => [...item.requestSteps, ...item.responseSteps].some((step) => step.keyRef === name || step.ivRef === name))
+    const matchedIds = new Set(matched.map((item) => item.id))
+    const requests = current.requests.filter((request) => kind === 'profile'
+      ? request.selectedProfileId === name
+      : (request.selectedProfileId !== undefined && matchedIds.has(request.selectedProfileId)) || Object.values(request.cryptoOverrides?.keyRefs ?? {}).includes(name))
+    const collections = [...new Set(requests.map((request) => current.collections.find((collection) => collection.id === request.collectionId)?.name ?? request.collectionId))]
+    return { profiles: matched.map((item) => item.name), requests: requests.length, collections }
   }
 
   /** 按 workspace 与精确 owner 解析秘密，跨资源复用一律视为不存在。 */
@@ -557,6 +636,8 @@ export class ApiWorkbenchStore {
     }))
     const sanitized: ApiCatalog = {
       ...catalog,
+      /** 工作区变量与请求头同样按名称强制秘密化：叫 appSecret / token 的变量不允许明文落盘。 */
+      workspaceVariables: fields(catalog.workspaceVariables ?? [], 'workspace:variable', true),
       collections: catalog.collections.map((collection) => ({
         ...collection,
         variables: fields(collection.variables, `collection:${collection.id}:variable`),

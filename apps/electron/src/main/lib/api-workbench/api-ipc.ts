@@ -6,7 +6,7 @@ export interface ApiIpcEvent { sender: { id: number } }
 /** 服务对象由生产 singleton 或测试夹具提供。 */
 export interface ApiIpcDependencies {
   ipc: { handle(channel: string, listener: (event: ApiIpcEvent, input: unknown) => Promise<unknown>): void; removeHandler(channel: string): void }
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles' | 'prepareScenario' | 'runScenario' | 'cancelScenario' | 'listScenarioRuns' | 'getScenarioRun'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'saveCryptoProfile' | 'deleteCryptoProfile' | 'saveWorkspaceVariables' | 'getCryptoReferences' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles' | 'prepareScenario' | 'runScenario' | 'cancelScenario' | 'listScenarioRuns' | 'getScenarioRun'>
   /**
    * 原生文件对话框由主进程打开；这是全流程唯一接受路径字符串的入口，
    * 渲染层与模型都只能拿到文件引用与元数据。
@@ -24,7 +24,7 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
     const command = parseApiCommand(value)
     const session = dependencies.requireSession(command.input.sessionId)
     const context = { workspaceId: session.workspaceId, sessionId: session.id, source: 'manual' as const }
-    if (['saveCatalog', 'send', 'pinRun', 'runScenario', 'cancelScenario'].includes(command.method)) dependencies.assertWorkspaceWritable?.(context.workspaceId)
+    if (['saveCatalog', 'saveCryptoProfile', 'deleteCryptoProfile', 'saveWorkspaceVariables', 'send', 'pinRun', 'runScenario', 'cancelScenario'].includes(command.method)) dependencies.assertWorkspaceWritable?.(context.workspaceId)
     /** IPC 等待结束后再次验证窗口与会话，禁止迟到结果进入新的所有权范围。 */
     const assertCurrent = (): void => {
       if (!dependencies.isAuthorizedSender(event)) throw new Error('API_ACCESS_DENIED')
@@ -38,6 +38,11 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
     switch (command.method) {
       case 'getCatalog': result = await service.getCatalog(context.workspaceId); break
       case 'saveCatalog': result = await write(() => service.saveCatalog(context.workspaceId, command.input.expectedRevision, command.input.catalog)); break
+      /** 公共配置写入与目录写入共用同一条迁移写租约。 */
+      case 'saveCryptoProfile': result = await write(() => service.saveCryptoProfile(context.workspaceId, command.input)); break
+      case 'deleteCryptoProfile': result = await write(() => service.deleteCryptoProfile(context.workspaceId, command.input)); break
+      case 'saveWorkspaceVariables': result = await write(() => service.saveWorkspaceVariables(context.workspaceId, command.input)); break
+      case 'getCryptoReferences': result = await service.getCryptoReferences(context.workspaceId, command.input); break
       case 'prepare': result = await service.prepare(context, command.input); break
       case 'send': result = await write(() => service.send(context, command.input.preparedId)); break
       case 'cancel': await service.cancel(context, command.input.preparedId); result = undefined; break

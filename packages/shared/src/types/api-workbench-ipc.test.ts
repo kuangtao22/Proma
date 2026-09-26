@@ -29,6 +29,53 @@ test('Given 合法正文包含 NUL When 跨 IPC 读取 Then 不把正文误判�
   expect(parseApiResponse('readBody', { text: 'a\0b', offset: 0, nextOffset: null, totalChars: 3, truncated: false }).text).toBe('a\0b')
 })
 
+/** 公共配置四命令的合法输入工厂；用例只改动被验证的那一个字段。 */
+function cryptoProfileInput(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'profile_backend', name: '后台签名', description: '', scope: 'workspace', appliesTo: 'all', revision: 0, updatedAt: 0,
+    requestSteps: [{ id: 's1', kind: 'sign', enabled: true, algo: 'HMAC-SHA256', keyRef: 'appSecret', encoding: 'hex', target: { in: 'header', name: 'X-Sign' }, template: '{{method}}' }],
+    responseSteps: [],
+    ...overrides,
+  }
+}
+
+test('Given 保存方案命令 When 解析 Then 校验算法白名单并拒绝伪造 workspace', () => {
+  const command = parseApiCommand({ method: 'saveCryptoProfile', input: { sessionId: 'session-1', profile: cryptoProfileInput(), expectedRevision: null } })
+  expect(command.method).toBe('saveCryptoProfile')
+  /** 方案是配置入口：非法算法与缺密钥引用必须在进主进程之前就被拒绝。 */
+  expect(() => parseApiCommand({ method: 'saveCryptoProfile', input: { sessionId: 'a', profile: cryptoProfileInput({ requestSteps: [{ id: 's1', kind: 'sign', enabled: true, algo: 'MD5-ROT13', keyRef: 'k', template: 'x', target: { in: 'header', name: 'X' } }] }), expectedRevision: null } })).toThrow()
+  expect(() => parseApiCommand({ method: 'saveCryptoProfile', input: { sessionId: 'a', profile: cryptoProfileInput({ requestSteps: [{ id: 's1', kind: 'sign', enabled: true, algo: 'MD5', template: 'x', target: { in: 'header', name: 'X' } }] }), expectedRevision: null } })).toThrow()
+  expect(() => parseApiCommand({ method: 'saveCryptoProfile', input: { sessionId: 'a', workspaceId: 'b', profile: cryptoProfileInput(), expectedRevision: null } })).toThrow()
+})
+
+test('Given 工作区变量批写 When 解析 Then 只接受有界字段并拒绝伪造 workspace', () => {
+  const command = parseApiCommand({ method: 'saveWorkspaceVariables', input: { sessionId: 'session-1', variables: [{ id: 'v1', name: 'appSecret', value: 'x', enabled: true, secret: true }] } })
+  expect(command.method).toBe('saveWorkspaceVariables')
+  expect(() => parseApiCommand({ method: 'saveWorkspaceVariables', input: { sessionId: 'a', variables: [{ id: 'v1', name: 'a', value: 'x', enabled: true, path: '/etc/passwd' }] } })).toThrow()
+  expect(() => parseApiCommand({ method: 'saveWorkspaceVariables', input: { sessionId: 'a', variables: Array.from({ length: API_LIMITS.maxFields + 1 }, (_, index) => ({ id: `v${index}`, name: 'a', value: '', enabled: true })) } })).toThrow()
+  expect(() => parseApiCommand({ method: 'saveWorkspaceVariables', input: { sessionId: 'a', workspaceId: 'b', variables: [] } })).toThrow()
+})
+
+test('Given 方案删除与引用检查命令 When 解析 Then 保留身份并校验枚举', () => {
+  expect(parseApiCommand({ method: 'deleteCryptoProfile', input: { sessionId: 'a', id: 'profile_backend', force: true } })).toMatchObject({ method: 'deleteCryptoProfile' })
+  expect(() => parseApiCommand({ method: 'deleteCryptoProfile', input: { sessionId: 'a', id: 'profile_backend', force: 'yes' } })).toThrow()
+  expect(parseApiCommand({ method: 'getCryptoReferences', input: { sessionId: 'a', kind: 'variable', name: 'aesIv' } })).toMatchObject({ method: 'getCryptoReferences' })
+  expect(() => parseApiCommand({ method: 'getCryptoReferences', input: { sessionId: 'a', kind: 'secret', name: 'aesIv' } })).toThrow()
+})
+
+test('Given 公共配置回执 When 解析 Then 只接受合同字段并拒绝畸形数值', () => {
+  expect(parseApiResponse('saveCryptoProfile', cryptoProfileInput()).id).toBe('profile_backend')
+  expect(() => parseApiResponse('saveCryptoProfile', { ...cryptoProfileInput(), secretValue: 'x' })).toThrow()
+  expect(parseApiResponse('deleteCryptoProfile', { removed: false, referencedBy: 2 })).toEqual({ removed: false, referencedBy: 2 })
+  expect(() => parseApiResponse('deleteCryptoProfile', { removed: false, referencedBy: -1 })).toThrow()
+  /** 变量回执只回引用与名称：出现取值以外的未知字段一律判损坏协议。 */
+  expect(parseApiResponse('saveWorkspaceVariables', { variables: [{ id: 'v1', name: 'appSecret', value: '', enabled: true, secret: true, secretRef: 'ref_1' }] }))
+    .toEqual({ variables: [{ id: 'v1', name: 'appSecret', value: '', enabled: true, secret: true, secretRef: 'ref_1' }] })
+  expect(() => parseApiResponse('saveWorkspaceVariables', { variables: [{ id: 'v1', name: 'a', value: '', enabled: true, plaintext: 'x' }] })).toThrow()
+  expect(parseApiResponse('getCryptoReferences', { profiles: ['后台签名'], requests: 3, collections: ['后台接口'] })).toEqual({ profiles: ['后台签名'], requests: 3, collections: ['后台接口'] })
+  expect(() => parseApiResponse('getCryptoReferences', { profiles: [1], requests: 3, collections: [] })).toThrow()
+})
+
 /** 构造含事件流的最小运行记录，避免每个用例重复展开字段。 */
 function runWithSse(sse: unknown): Record<string, unknown> {
   return {

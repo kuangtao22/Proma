@@ -1,10 +1,10 @@
-import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
-import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview, ApiPrepareScenarioInput, ApiScenarioPreparedInput, ApiScenarioRunInput } from './api-workbench'
+import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiCryptoProfile, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
+import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiCryptoProfile, ApiCryptoProfileSaveInput, ApiCryptoProfileDeleteInput, ApiCryptoProfileDeleteResult, ApiWorkspaceVariablesSaveInput, ApiWorkspaceVariablesSaveResult, ApiCryptoReferenceQuery, ApiCryptoReferences, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview, ApiPrepareScenarioInput, ApiScenarioPreparedInput, ApiScenarioRunInput } from './api-workbench'
 
 /** IPC 命令的输入映射，拒绝用户自行声明 workspace。 */
-export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget; prepareScenario: ApiPrepareScenarioInput; runScenario: ApiScenarioPreparedInput; cancelScenario: ApiScenarioPreparedInput; listScenarioRuns: ApiListRunsInput; getScenarioRun: ApiScenarioRunInput }
+export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; saveCryptoProfile: ApiCryptoProfileSaveInput; deleteCryptoProfile: ApiCryptoProfileDeleteInput; saveWorkspaceVariables: ApiWorkspaceVariablesSaveInput; getCryptoReferences: ApiCryptoReferenceQuery; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget; prepareScenario: ApiPrepareScenarioInput; runScenario: ApiScenarioPreparedInput; cancelScenario: ApiScenarioPreparedInput; listScenarioRuns: ApiListRunsInput; getScenarioRun: ApiScenarioRunInput }
 /** IPC 返回值映射，preload 必须验证实际响应。 */
-export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number }; pickApiFiles: { files: ApiPickedFile[] }; prepareScenario: ApiScenarioPreparedPreview; runScenario: ApiScenarioRun; cancelScenario: void; listScenarioRuns: { runs: ApiScenarioRun[]; nextCursor: number | null }; getScenarioRun: ApiScenarioRun }
+export interface ApiCommandResults { getCatalog: ApiCatalog; saveCatalog: ApiCatalog; saveCryptoProfile: ApiCryptoProfile; deleteCryptoProfile: ApiCryptoProfileDeleteResult; saveWorkspaceVariables: ApiWorkspaceVariablesSaveResult; getCryptoReferences: ApiCryptoReferences; prepare: ApiPreparedPreview; send: ApiRun; cancel: void; listRuns: { runs: ApiRun[]; nextCursor: number | null }; getRun: ApiRun; readBody: ApiBodySlice; pinRun: ApiRun; getRuntimeVariables: { variables: ApiRuntimeVariable[] }; clearRuntimeVariables: { cleared: number }; getCookieJar: { cookies: ApiCookieJarEntry[] }; clearCookieJar: { cleared: number }; pickApiFiles: { files: ApiPickedFile[] }; prepareScenario: ApiScenarioPreparedPreview; runScenario: ApiScenarioRun; cancelScenario: void; listScenarioRuns: { runs: ApiScenarioRun[]; nextCursor: number | null }; getScenarioRun: ApiScenarioRun }
 /** 严格分派所支持的方法。 */
 export type ApiCommandMethod = keyof ApiCommandInputs
 /** 方法与输入保持关联，主进程 switch 可直接收窄。 */
@@ -29,12 +29,29 @@ function target(record: Record<string, unknown>): ApiTarget { return parseApiTar
 /** 解析单个 IPC 命令，复制所有字段避免调用方后续变更输入。 */
 export function parseApiCommand(value: unknown): ApiCommand {
   const root = apiRecord(value, ['method', 'input'], 'command')
-  const method = one(root.method, ['getCatalog', 'saveCatalog', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar', 'pickApiFiles', 'prepareScenario', 'runScenario', 'cancelScenario', 'listScenarioRuns', 'getScenarioRun'])
+  const method = one(root.method, ['getCatalog', 'saveCatalog', 'saveCryptoProfile', 'deleteCryptoProfile', 'saveWorkspaceVariables', 'getCryptoReferences', 'prepare', 'send', 'cancel', 'listRuns', 'getRun', 'readBody', 'pinRun', 'getRuntimeVariables', 'clearRuntimeVariables', 'getCookieJar', 'clearCookieJar', 'pickApiFiles', 'prepareScenario', 'runScenario', 'cancelScenario', 'listScenarioRuns', 'getScenarioRun'])
   switch (method) {
     case 'getCatalog': return { method, input: parseApiTarget(root.input) }
     case 'saveCatalog': {
       const input = apiRecord(root.input, ['sessionId', 'expectedRevision', 'catalog'])
       return { method, input: { ...target(input), expectedRevision: apiInteger(input.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision'), catalog: parseApiCatalog(input.catalog) } }
+    }
+    /** 公共配置：方案与工作区变量的批写；方案内容同样过解析层校验，非法算法不进主进程。 */
+    case 'saveCryptoProfile': {
+      const input = apiRecord(root.input, ['sessionId', 'profile', 'expectedRevision'])
+      return { method, input: { ...target(input), profile: parseApiCryptoProfile(input.profile), expectedRevision: input.expectedRevision === null ? null : apiInteger(input.expectedRevision, 0, Number.MAX_SAFE_INTEGER, 'expectedRevision') } }
+    }
+    case 'deleteCryptoProfile': {
+      const input = apiRecord(root.input, ['sessionId', 'id', 'force'])
+      return { method, input: { ...target(input), id: parseApiId(input.id), ...(input.force === undefined ? {} : { force: bool(input.force) }) } }
+    }
+    case 'saveWorkspaceVariables': {
+      const input = apiRecord(root.input, ['sessionId', 'variables'])
+      return { method, input: { ...target(input), variables: parseApiFields(input.variables) } }
+    }
+    case 'getCryptoReferences': {
+      const input = apiRecord(root.input, ['sessionId', 'kind', 'name'])
+      return { method, input: { ...target(input), kind: one(input.kind, ['variable', 'profile'] as const), name: str(input.name, 'name', 256) } }
     }
     case 'prepare': {
       const input = apiRecord(root.input, ['sessionId', 'request', 'requestId', 'environmentId', 'overrides', 'caseId'])
@@ -308,6 +325,24 @@ export function parseApiResponse<M extends ApiCommandMethod>(method: M, value: u
   let result: unknown
   switch (method) {
     case 'getCatalog': case 'saveCatalog': result = parseApiCatalog(value); break
+    case 'saveCryptoProfile': result = parseApiCryptoProfile(value); break
+    case 'deleteCryptoProfile': {
+      const record = apiRecord(value, ['removed', 'referencedBy'])
+      result = { removed: bool(record.removed), referencedBy: apiInteger(record.referencedBy, 0, API_LIMITS.maxRequests, 'referencedBy') }; break
+    }
+    /** 变量回执只回引用与名称：秘密值的明文根本不出主进程。 */
+    case 'saveWorkspaceVariables': {
+      const record = apiRecord(value, ['variables'])
+      result = { variables: parseApiFields(record.variables) }; break
+    }
+    case 'getCryptoReferences': {
+      const record = apiRecord(value, ['profiles', 'requests', 'collections'])
+      result = {
+        profiles: list(record.profiles, (item) => str(item, 'reference.profile', 128), API_LIMITS.maxCryptoProfiles),
+        requests: apiInteger(record.requests, 0, API_LIMITS.maxRequests, 'reference.requests'),
+        collections: list(record.collections, (item) => str(item, 'reference.collection', 128), 64),
+      }; break
+    }
     case 'prepare': result = parseApiPreparedPreview(value); break
     case 'send': case 'getRun': case 'pinRun': result = parseApiRun(value); break
     case 'readBody': result = bodySlice(value); break

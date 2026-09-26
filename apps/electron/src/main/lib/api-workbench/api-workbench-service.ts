@@ -13,6 +13,12 @@ import {
 import type {
   ApiBodySlice,
   ApiCatalog,
+  ApiCryptoProfile,
+  ApiCryptoProfileDeleteInput,
+  ApiCryptoProfileDeleteResult,
+  ApiCryptoProfileSaveInput,
+  ApiCryptoReferenceQuery,
+  ApiCryptoReferences,
   ApiExtractionOutcome,
   ApiField,
   ApiFilePart,
@@ -29,6 +35,8 @@ import type {
   ApiSseEvent,
   ApiRuntimeVariable,
   ApiCookieJarEntry,
+  ApiWorkspaceVariablesSaveInput,
+  ApiWorkspaceVariablesSaveResult,
   ApiAttachmentSummary,
   ApiTransportResult,
 } from '@proma/shared'
@@ -336,6 +344,26 @@ export class ApiWorkbenchService {
   /** 按全目录 revision CAS 保存，并由 Store 维护 request 独立 revision。 */
   async saveCatalog(workspaceId: string, expectedRevision: number, catalog: ApiCatalog): Promise<ApiCatalog> {
     return this.store.saveCatalog(parseApiId(workspaceId), expectedRevision, parseApiCatalog(catalog))
+  }
+
+  /** 保存签名/加密方案（公共配置）；方案 revision 由 Store 维护。 */
+  async saveCryptoProfile(workspaceId: string, input: ApiCryptoProfileSaveInput): Promise<ApiCryptoProfile> {
+    return this.store.saveCryptoProfile(parseApiId(workspaceId), input.profile, input.expectedRevision)
+  }
+
+  /** 删除方案；仍被请求引用时默认拒绝并返回引用条数。 */
+  async deleteCryptoProfile(workspaceId: string, input: ApiCryptoProfileDeleteInput): Promise<ApiCryptoProfileDeleteResult> {
+    return this.store.deleteCryptoProfile(parseApiId(workspaceId), parseApiId(input.id), input.force ?? false)
+  }
+
+  /** 批量写工作区变量；返回值只含引用与名称，秘密明文不出主进程。 */
+  async saveWorkspaceVariables(workspaceId: string, input: ApiWorkspaceVariablesSaveInput): Promise<ApiWorkspaceVariablesSaveResult> {
+    return { variables: this.store.saveWorkspaceVariables(parseApiId(workspaceId), input.variables) }
+  }
+
+  /** 变量/方案引用检查：删除确认与「改了会影响谁」共用。 */
+  async getCryptoReferences(workspaceId: string, input: ApiCryptoReferenceQuery): Promise<ApiCryptoReferences> {
+    return this.store.inspectCryptoReferences(parseApiId(workspaceId), input.kind, input.name)
   }
 
   /** 固定解析后的请求、环境、目录与秘密版本，返回脱敏审批预览。 */

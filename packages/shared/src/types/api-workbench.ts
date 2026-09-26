@@ -410,6 +410,20 @@ export interface ApiBodySlice { text: string; offset: number; nextOffset: number
 export interface ApiTarget { sessionId: string }
 /** 保存完整小目录；expectedRevision 防止多 Pane 丢失更新。 */
 export interface ApiSaveCatalogInput extends ApiTarget { expectedRevision: number; catalog: ApiCatalog }
+/** 保存方案：expectedRevision 为 null 表示新增或强制覆盖。 */
+export interface ApiCryptoProfileSaveInput extends ApiTarget { profile: ApiCryptoProfile; expectedRevision: number | null }
+/** 删除方案：仍被请求引用时默认拒绝，force 才强制删除。 */
+export interface ApiCryptoProfileDeleteInput extends ApiTarget { id: string; force?: boolean }
+/** 删除结论：removed 为假时说明还被 referencedBy 条请求引用。 */
+export interface ApiCryptoProfileDeleteResult { removed: boolean; referencedBy: number }
+/** 批量写工作区变量（跨集合共用）。 */
+export interface ApiWorkspaceVariablesSaveInput extends ApiTarget { variables: ApiField[] }
+/** 变量批写回执：秘密值只回引用，不回明文。 */
+export interface ApiWorkspaceVariablesSaveResult { variables: ApiField[] }
+/** 引用检查：kind=variable 按变量名，kind=profile 按方案 id。 */
+export interface ApiCryptoReferenceQuery extends ApiTarget { kind: 'variable' | 'profile'; name: string }
+/** 引用检查结论：相关方案名、受影响请求条数与被涉及集合名。 */
+export interface ApiCryptoReferences { profiles: string[]; requests: number; collections: string[] }
 /** 从已保存请求或本地草稿生成一次发送身份；单次覆盖不写回环境。 */
 export interface ApiPrepareInput extends ApiTarget { request: ApiRequestDraft; requestId?: string; environmentId?: string; overrides?: ApiField[]; caseId?: string }
 /** 发送或取消仅使用 Host 签发的准备身份。 */
@@ -434,6 +448,14 @@ export interface ApiRunChanged { sessionId: string; runId: string; state: ApiRun
 export interface ApiWorkbenchApi {
   getCatalog(input: ApiTarget): Promise<ApiCatalog>
   saveCatalog(input: ApiSaveCatalogInput): Promise<ApiCatalog>
+  /** 保存签名/加密方案（公共配置）；expectedRevision 为 null 表示新增。 */
+  saveCryptoProfile(input: ApiCryptoProfileSaveInput): Promise<ApiCryptoProfile>
+  /** 删除方案；仍被请求引用时默认返回 removed=false。 */
+  deleteCryptoProfile(input: ApiCryptoProfileDeleteInput): Promise<ApiCryptoProfileDeleteResult>
+  /** 批量写工作区变量；秘密值仍由主进程加密保存。 */
+  saveWorkspaceVariables(input: ApiWorkspaceVariablesSaveInput): Promise<ApiWorkspaceVariablesSaveResult>
+  /** 变量/方案引用检查，供删除确认与「改了会影响谁」提示。 */
+  getCryptoReferences(input: ApiCryptoReferenceQuery): Promise<ApiCryptoReferences>
   prepare(input: ApiPrepareInput): Promise<ApiPreparedPreview>
   send(input: ApiSendInput): Promise<ApiRun>
   cancel(input: ApiSendInput): Promise<void>
@@ -708,7 +730,8 @@ export function parseApiCryptoProfile(value: unknown): ApiCryptoProfile {
     appliesTo: record.appliesTo === undefined ? 'all' : choice(record.appliesTo, ['all', 'test', 'production'] as const, 'crypto.profile.appliesTo'),
     requestSteps: rows(record.requestSteps, parseApiCryptoStep, API_LIMITS.maxCryptoSteps, 'crypto.profile.requestSteps'),
     responseSteps: rows(record.responseSteps, parseApiCryptoStep, API_LIMITS.maxCryptoSteps, 'crypto.profile.responseSteps'),
-    revision: record.revision === undefined ? 1 : apiInteger(record.revision, 1, Number.MAX_SAFE_INTEGER, 'crypto.profile.revision'),
+    /** revision 允许 0：表示尚未落盘的新方案，Store 保存时统一赋成第一个正式版本。 */
+    revision: record.revision === undefined ? 1 : apiInteger(record.revision, 0, Number.MAX_SAFE_INTEGER, 'crypto.profile.revision'),
     updatedAt: record.updatedAt === undefined ? 0 : apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'crypto.profile.updatedAt'),
   }
 }
