@@ -633,6 +633,16 @@ async function smoke(): Promise<void> {
   assert.equal(cryptoRun.crypto?.bodyBeforeTransform, 'capabilityId=1024')
   const cryptoRecord = JSON.stringify(await call('getRun', { sessionId: 'smoke-session', runId: cryptoRun.id }))
   for (const secret of [cryptoKey, cryptoIv, appSecretValue]) assert.equal(cryptoRecord.includes(secret), false, '运行记录泄漏了密钥值')
+  /**
+   * 明文揭示与引用检查同样走真实 IPC：揭示一次只回一个字段，且是用户主动动作。
+   * 被请求引用的方案不允许直接删除，避免「删了方案 → 接口静默按明文发出」。
+   */
+  const revealedSecret = await call('revealVariable', { sessionId: 'smoke-session', scope: 'workspace', fieldId: 'var_app_secret' })
+  assert.equal(revealedSecret.value, appSecretValue, '明文揭示通道没有返回正确值')
+  const cryptoReferences = await call('getCryptoReferences', { sessionId: 'smoke-session', kind: 'profile', name: 'profile_smoke' })
+  assert.equal(cryptoReferences.requests, 1, '引用检查没有算出被引用的请求数')
+  const refusedDelete = await call('deleteCryptoProfile', { sessionId: 'smoke-session', id: 'profile_smoke' })
+  assert.deepEqual(refusedDelete, { removed: false, referencedBy: 1 }, '被引用的方案不该被直接删除')
   /** 缺密钥不阻断：去掉 aesKey 后重发，服务端照样收到请求，但这次是明文。 */
   await call('saveWorkspaceVariables', { sessionId: 'smoke-session', variables: [
     { id: 'var_app_secret', name: 'appSecret', value: appSecretValue, enabled: true, secret: true },
