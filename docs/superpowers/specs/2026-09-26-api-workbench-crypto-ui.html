@@ -344,7 +344,7 @@
 
 <div class="page-head">
   <div>
-    <h1>接口工作台 · 公共配置与加密 —— 界面稿 v6</h1>
+    <h1>接口工作台 · 公共配置与加密 —— 界面稿 v7</h1>
     <div class="sub">
       三层结构：<b>公共配置统一管理</b>（变量与密钥、签名与加密方案、公共请求头/参数/鉴权）→
       <b>每个接口只选择用哪套方案</b> → 发送与接收时按方案步骤执行。每个列表都是「查看 → 编辑 → 操作 → 添加」同一套交互。
@@ -442,6 +442,16 @@
             <button role="tab" aria-selected="true" data-panel="crypto">加密签名<span class="badge on">后台签名</span></button>
             <button role="tab" aria-selected="false" data-panel="other">测试<span class="badge">4</span></button>
             <button role="tab" aria-selected="false" data-panel="other">设置</button>
+          </div>
+
+          <!-- 令牌接入是项目级约定，请求页只显示「本请求从哪一层继承」，不重复配置。 -->
+          <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-soft);font-size:11.5px;background:hsl(200 98% 40% / 0.05)">
+            <span>🔑</span>
+            <span>
+              令牌接入（项目级）：由「后台管理令牌」继承 ·
+              <span class="mono">Authorization: Bearer {{sessionToken}}</span>
+            </span>
+            <a href="#" data-view-jump="common" style="margin-left:auto">查看 / 覆盖 →</a>
           </div>
 
           <div class="panel">
@@ -618,10 +628,87 @@
 
       <div class="section-tabs" role="tablist" aria-label="公共配置分区" style="padding:8px 12px 0">
         <button role="tab" aria-selected="true" data-common-tab="variables">变量与密钥<span class="badge on">12</span></button>
+        <button role="tab" aria-selected="false" data-common-tab="token">令牌接入<span class="badge on">2</span></button>
         <button role="tab" aria-selected="false" data-common-tab="schemes">签名与加密方案<span class="badge">4</span></button>
         <button role="tab" aria-selected="false" data-common-tab="headers">公共请求头<span class="badge">6</span></button>
         <button role="tab" aria-selected="false" data-common-tab="query">公共查询参数<span class="badge">2</span></button>
         <button role="tab" aria-selected="false" data-common-tab="auth">公共鉴权<span class="badge">2</span></button>
+      </div>
+
+      <!-- ── 列表 1.5：令牌接入（项目级约定：token 放哪、怎么拼） ── -->
+      <div data-common-panel="token" hidden>
+        <div class="mtoolbar">
+          <div class="grow" style="font-size:11.5px;color:var(--muted-foreground)">
+            「token 放在哪、怎么拼」是<b>项目级约定</b>：在这里配一次，接口默认全部继承；个别接口可以覆盖或关掉。
+          </div>
+          <button class="btn tiny primary">＋ 添加令牌接入</button>
+        </div>
+        <table class="mtable">
+          <thead><tr><th style="width:28px"></th><th>名称</th><th>作用域</th><th>放置方式</th><th>值怎么拼</th><th style="width:110px">继承接口</th><th style="width:96px"></th></tr></thead>
+          <tbody>
+            <tr class="group-row"><td colspan="7">工作区级（整个项目默认）</td></tr>
+            <tr class="editing">
+              <td><input type="checkbox" aria-label="选择 后台管理令牌" checked></td>
+              <td class="name">后台管理令牌</td>
+              <td class="scope">工作区</td>
+              <td class="value">请求头 · <span class="mono">Authorization</span></td>
+              <td class="value mono">Bearer {{sessionToken}}</td>
+              <td class="refs">218 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="保存">✓</button><button class="icon-btn" aria-label="取消">✕</button></div></td>
+            </tr>
+            <tr class="group-row"><td colspan="7">集合级（只影响该集合，覆盖工作区约定）</td></tr>
+            <tr>
+              <td><input type="checkbox" aria-label="选择 APP 令牌"></td>
+              <td class="name">APP 令牌</td>
+              <td class="scope">集合 · APP 接口</td>
+              <td class="value">请求头 · <span class="mono">X-Token</span></td>
+              <td class="value mono">{{appToken}}</td>
+              <td class="refs">41 个请求</td>
+              <td><div class="rowops"><button class="icon-btn" aria-label="编辑">✎</button><button class="icon-btn" aria-label="复制">⧉</button><button class="icon-btn" aria-label="删除">🗑</button></div></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- 选中项详情 -->
+        <div class="scheme-detail" style="border-top:1px solid var(--border-soft)">
+          <div class="detail-head">
+            <input type="text" value="后台管理令牌" aria-label="令牌接入名称">
+            <select aria-label="作用域" style="width:150px"><option>工作区（整个项目）</option><option>集合 · 后台接口</option></select>
+            <div class="spacer"><button class="btn">停用</button><button class="btn primary">保存并应用</button></div>
+          </div>
+
+          <div class="grid3">
+            <div class="field"><label>放置位置</label><div class="control"><select><option>请求头</option><option>查询参数</option><option>正文字段</option><option>Cookie</option></select></div></div>
+            <div class="field"><label>字段名</label><div class="control"><input type="text" value="Authorization"></div></div>
+            <div class="field"><label>值怎么拼</label><div class="control"><select><option>前缀 + 变量：Bearer {{token}}</option><option>只有变量：{{token}}</option><option>自定义模板…</option></select></div></div>
+          </div>
+          <div class="field" style="margin-top:10px">
+            <label>值模板</label>
+            <textarea class="tmpl" spellcheck="false" style="min-height:44px">Bearer {{sessionToken}}</textarea>
+            <span class="tip">
+              可用变量：<span class="token">{{sessionToken}}</span>（登录提取）· <span class="token">{{appToken}}</span>（手填）· <span class="token">{{timestamp}}</span>；
+              模板里出现 <code>Bearer </code> 这类固定前缀就直接写。若项目要求在 Body 里带，把位置改成「正文字段」并填字段名即可。
+            </span>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>token 来源</label><div class="control"><select><option>登录接口提取：POST /admin/v1/login → data.token</option><option>手填变量（只有你能填）</option><option>外部提供（浏览器 Cookie）</option></select></div></div>
+            <div class="field"><label>来源缺失时</label><div class="control"><select><option>照常发送（不带该字段）</option><option>跳过该请求</option></select></div></div>
+          </div>
+
+          <div class="preview">
+            <div class="preview-head">实际发出的样子</div>
+            <div class="preview-body" style="grid-template-columns:1fr">
+              <pre class="mono-line">POST /admin/v1/user/detail
+Authorization: Bearer eyJhbGciOi…（值来自运行时变量，不落盘、不给模型看）</pre>
+            </div>
+          </div>
+
+          <div class="impact">
+            <b>默认全部继承，个别接口可覆盖。</b>
+            请求页会显示「本请求的令牌来自哪里」；接口自己已经写了同名 Header 时，以接口为准并给出黄标提示，避免"两套约定打架"。
+            <div class="list"><span class="chip">继承 218 个请求</span><span class="chip">其中 12 个自带 Authorization</span><span class="chip">集合级覆盖 2 处</span></div>
+          </div>
+        </div>
       </div>
 
       <!-- ── 列表 1：变量与密钥（对应 Postman 的环境变量表格） ── -->
