@@ -155,6 +155,32 @@ describe('Pi Server Ops 工具合同', () => {
   })
 })
 
+describe('Pi 定时任务跨工作区工具合同', () => {
+  test('Given 普通用户会话 When 构建内置工具 Then 注册 list_workspaces 且 create_automation 改走目标工作区解析', async () => {
+    const result = await buildPiBuiltinTools(sdk, {
+      sessionId: 'session-1',
+      channelId: 'channel-1',
+      productivityTools: { todosEnabled: false, calendarEnabled: false, obsidianEnabled: false },
+    })
+    expect(result.tools.map((tool) => tool.name)).toContain('mcp__automation__list_workspaces')
+
+    /**
+     * 工具执行会读取真实数据根，单测环境不具备；这里只锁定接线契约：
+     * 创建任务必须先解析目标工作区，并用解析结果覆盖 ctx.workspaceId。
+     * 解析本身的正常路径与边界由 automation-workspace.test.ts 覆盖。
+     */
+    const source = readFileSync(join(import.meta.dir, 'pi-builtin-tools.ts'), 'utf8')
+    expect(source).toContain('const targetWorkspace = resolveAutomationWorkspace(args.workspaceId, ctx.workspaceId, getAgentWorkspace)')
+    expect(source).toContain('workspaceId: targetWorkspace?.id,')
+    expect(source).toContain('name: \'mcp__automation__list_workspaces\',')
+  })
+
+  test('Given create_automation 参数合同 When 读取 schema Then 暴露可选 workspaceId 且不要求必填', () => {
+    const source = readFileSync(join(import.meta.dir, 'automation-tool-schema.ts'), 'utf8')
+    expect(source).toContain('workspaceId: Type.Optional(Type.String(')
+  })
+})
+
 describe('Pi 图片工具运行上下文', () => {
   test('Given Host 固化参考图和请求审计 When 构建 Nano 工具 Then 适配层完整透传两个字段', () => {
     const source = readFileSync(join(import.meta.dir, 'pi-builtin-tools.ts'), 'utf8')
