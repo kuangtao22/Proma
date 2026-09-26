@@ -20,6 +20,8 @@ export const API_LIMITS = {
   maxScenarios: 64, maxScenarioSteps: 20, maxScenarioRuns: 200,
   /** 一次批量配置变更（分组 / 取名 / 绑定环境）可携带的接口条数。 */
   maxRequestUpdates: 50,
+  /** 单个 workspace 可保存的签名/加密方案数量，以及单个方案的步骤数量。 */
+  maxCryptoProfiles: 32, maxCryptoSteps: 12,
   /** 一次场景运行的总时限：到点不再启动后续步骤，避免流程无限挂住。 */
   scenarioTotalMs: 10 * 60 * 1000,
 } as const
@@ -169,6 +171,13 @@ export interface ApiRequestDraft {
    * 默认关闭是为了避免「某条请求因为上次的 cookie 而悄悄成功」。
    */
   useCookieJar?: boolean
+  /**
+   * 该接口选用的签名/加密方案 id；缺省表示既不签名也不加密。
+   * 请求只保存「选了哪套方案」，方案本身在公共配置里统一维护。
+   */
+  selectedProfileId?: string
+  /** 接口级覆盖项（密钥变量 / 输出名称 / 失败策略）；缺省表示完全跟随方案。 */
+  cryptoOverrides?: ApiCryptoOverrides
 }
 /** 已保存请求具有独立版本，更新采用 expected revision 比较。 */
 export interface ApiRequestDefinition extends ApiRequestDraft { id: string; revision: number; updatedAt: number }
@@ -176,6 +185,49 @@ export interface ApiRequestDefinition extends ApiRequestDraft { id: string; revi
 export interface ApiCollection { id: string; name: string; description: string; variables: ApiField[] }
 /** 环境用途是展示和执行策略事实，不根据方法推断生产副作用。 */
 export interface ApiEnvironment { id: string; name: string; kind: 'local' | 'test' | 'production'; variables: ApiField[] }
+/**
+ * 加解密与签名的一个步骤：请求侧按数组顺序执行，响应侧按数组顺序还原。
+ * 数组顺序即语义——签名签的是明文还是密文，完全取决于它排在加密步骤前还是后。
+ */
+export interface ApiCryptoStep {
+  id: string
+  kind: 'derive' | 'sign' | 'encrypt' | 'decrypt'
+  enabled: boolean
+  /** 算法名；必须在 API_CRYPTO_ALGOS 白名单内，解析层据此拒绝历史数据里的未实现算法。 */
+  algo: string
+  /** 密钥/IV 只引用变量名；密钥值永远不写进方案，也不会随方案导出。 */
+  keyRef?: string
+  ivRef?: string
+  /** 待签/待加密模板，支持 {{method}} 这类占位符。 */
+  template?: string
+  source?: 'body' | 'query' | 'response-body' | 'response-field'
+  target?: { in: 'header' | 'query' | 'body'; name: string }
+  encoding?: 'hex' | 'base64' | 'raw'
+  /** 步骤失败策略：stop 表示中止后续步骤，continue 表示继续执行剩余步骤。 */
+  onFailure?: 'stop' | 'continue'
+}
+/** 签名与加密方案：公共资产，接口只引用它的 id，改一次对所有引用方生效。 */
+export interface ApiCryptoProfile {
+  id: string
+  name: string
+  description: string
+  /** 作用域：工作区级共用，或限定到某个集合。 */
+  scope: 'workspace' | { collectionId: string }
+  appliesTo: 'all' | 'test' | 'production'
+  requestSteps: ApiCryptoStep[]
+  responseSteps: ApiCryptoStep[]
+  /** 方案自身的版本号：运行记录按 revision 回溯「当时用的是哪一版方案」。 */
+  revision: number
+  updatedAt: number
+}
+/** 接口级覆盖项：默认全部跟随方案，只有个别接口需要单独调整时才填写。 */
+export interface ApiCryptoOverrides {
+  /** 步骤 id → 密钥变量名。 */
+  keyRefs?: Record<string, string>
+  /** 步骤 id → 输出名称（请求头 / 参数名）。 */
+  targetNames?: Record<string, string>
+  onFailure?: 'stop' | 'continue'
+}
 /**
  * 场景里的一个步骤：只引用已保存的请求（含可选用例），不内联请求定义。
  *
@@ -273,7 +325,18 @@ export interface ApiScenarioPreparedPreview {
   steps: ApiScenarioStepPreview[]
 }
 /** workspace 的有界目录；不包含运行正文和秘密明文。 */
-export interface ApiCatalog { version: 1; revision: number; collections: ApiCollection[]; environments: ApiEnvironment[]; requests: ApiRequestDefinition[]; scenarios?: ApiScenario[] }
+export interface ApiCatalog {
+  version: 1
+  revision: number
+  collections: ApiCollection[]
+  environments: ApiEnvironment[]
+  requests: ApiRequestDefinition[]
+  scenarios?: ApiScenario[]
+  /** 工作区级变量：跨所有集合共用；缺省为空数组。 */
+  workspaceVariables?: ApiField[]
+  /** 签名与加密方案：公共配置里统一维护，接口只引用方案 id。 */
+  cryptoProfiles?: ApiCryptoProfile[]
+}
 /** Host 准备完成的网络输入；此类型的原文只在可信执行边界流转。 */
 export interface ApiResolvedRequest {
   method: ApiMethod; url: string; headers: ApiHeader[]; body: string
@@ -471,7 +534,7 @@ function assertion(value: unknown): ApiAssertion {
   }
 }
 /** 草稿字段白名单，定义解析也复用此表。 */
-const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases', 'useCookieJar'] as const
+const DRAFT_KEYS = ['name', 'collectionId', 'folder', 'description', 'method', 'url', 'query', 'headers', 'body', 'auth', 'timeoutMs', 'followRedirects', 'maxRedirects', 'assertions', 'extractions', 'targetEnvironmentId', 'cases', 'useCookieJar', 'selectedProfileId', 'cryptoOverrides'] as const
 /** 解析一个待上传文件的引用；路径不在合同里，只有引用与展示元数据。 */
 function filePart(value: unknown): ApiFilePart {
   const record = apiRecord(value, ['id', 'name', 'fileName', 'sizeBytes', 'contentType', 'ref'], 'body.file')
@@ -540,6 +603,9 @@ export function parseApiRequestDraft(value: unknown): ApiRequestDraft {
     cases: rows(record.cases ?? [], testCase, API_LIMITS.maxCases, 'cases'),
     /** 自动 Cookie 缺省关闭：升级前保存的请求不会突然开始读写 cookie。 */
     useCookieJar: record.useCookieJar === undefined ? false : flag(record.useCookieJar, 'useCookieJar'),
+    /** 方案选择与覆盖项缺省为空：升级前保存的请求仍是「不签名不加密」。 */
+    ...(record.selectedProfileId === undefined ? {} : { selectedProfileId: parseApiId(record.selectedProfileId) }),
+    ...(record.cryptoOverrides === undefined ? {} : { cryptoOverrides: parseApiCryptoOverrides(record.cryptoOverrides) }),
   }
 }
 /** 从定义提取编辑草稿，不把内部版本字段送入草稿解析器。 */
@@ -584,9 +650,81 @@ export function parseApiScenario(value: unknown): ApiScenario {
     updatedAt: apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'scenario.updatedAt'),
   }
 }
+/** 允许的算法白名单：写死在解析层，历史数据带进未实现算法时会直接解析失败，而不是留到运行时才炸。 */
+export const API_CRYPTO_ALGOS = {
+  derive: ['timestamp-nonce'],
+  sign: ['MD5', 'SHA1', 'SHA256', 'HMAC-SHA1', 'HMAC-SHA256', 'SM3'],
+  encrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'SM4-CBC'],
+  decrypt: ['AES-128-CBC', 'AES-256-CBC', 'AES-128-GCM', 'SM4-CBC'],
+} as const
+/** 步骤输出目标：请求头 / 查询参数 / 正文。 */
+function cryptoTarget(value: unknown): { in: 'header' | 'query' | 'body'; name: string } {
+  const record = apiRecord(value, ['in', 'name'], 'crypto.step.target')
+  return { in: choice(record.in, ['header', 'query', 'body'] as const, 'crypto.step.target.in'), name: text(record.name, 'crypto.step.target.name', 256) }
+}
+/** 解析一个加解密步骤；derive 只生成时间戳与随机串，因此不要求 keyRef。 */
+export function parseApiCryptoStep(value: unknown): ApiCryptoStep {
+  const record = apiRecord(value, ['id', 'kind', 'enabled', 'algo', 'keyRef', 'ivRef', 'template', 'source', 'target', 'encoding', 'onFailure'], 'crypto.step')
+  const kind = choice(record.kind, ['derive', 'sign', 'encrypt', 'decrypt'] as const, 'crypto.step.kind')
+  const algorithms: readonly string[] = API_CRYPTO_ALGOS[kind]
+  /** 除 derive 外都必须声明密钥变量；密钥值本身永远不进入方案。 */
+  const keyRef = kind === 'derive' && record.keyRef === undefined ? undefined : parseApiId(record.keyRef)
+  return {
+    id: parseApiId(record.id), kind, enabled: flag(record.enabled, 'crypto.step.enabled'), algo: choice(record.algo, algorithms, 'crypto.step.algo'),
+    ...(keyRef === undefined ? {} : { keyRef }),
+    ...(record.ivRef === undefined ? {} : { ivRef: parseApiId(record.ivRef) }),
+    ...(record.template === undefined ? {} : { template: text(record.template, 'crypto.step.template', 8192) }),
+    ...(record.source === undefined ? {} : { source: choice(record.source, ['body', 'query', 'response-body', 'response-field'] as const, 'crypto.step.source') }),
+    ...(record.target === undefined ? {} : { target: cryptoTarget(record.target) }),
+    ...(record.encoding === undefined ? {} : { encoding: choice(record.encoding, ['hex', 'base64', 'raw'] as const, 'crypto.step.encoding') }),
+    ...(record.onFailure === undefined ? {} : { onFailure: choice(record.onFailure, ['stop', 'continue'] as const, 'crypto.step.onFailure') }),
+  }
+}
+/** 方案作用域：工作区级共用，或限定到某个集合。 */
+function cryptoScope(value: unknown): ApiCryptoProfile['scope'] {
+  if (value === 'workspace') return 'workspace'
+  const record = apiRecord(value, ['collectionId'], 'crypto.profile.scope')
+  return { collectionId: parseApiId(record.collectionId) }
+}
+/** {步骤 id → 变量名/输出名} 映射：键必须是稳定 id，条数受步骤上限约束。 */
+function cryptoRefMap(value: unknown, path: string): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return invalid(path)
+  const entries = Object.entries(value as Record<string, unknown>)
+  if (entries.length > API_LIMITS.maxCryptoSteps) return invalid(path)
+  const result: Record<string, string> = {}
+  for (const [key, item] of entries) result[parseApiId(key)] = text(item, path + '.value', 512)
+  return result
+}
+/** 解析签名与加密方案；步骤数组顺序即执行顺序，重复步骤 id 会被拒绝。 */
+export function parseApiCryptoProfile(value: unknown): ApiCryptoProfile {
+  const record = apiRecord(value, ['id', 'name', 'description', 'scope', 'appliesTo', 'requestSteps', 'responseSteps', 'revision', 'updatedAt'], 'crypto.profile')
+  const name = text(record.name, 'crypto.profile.name', 128)
+  if (!name) return invalid('crypto.profile.name')
+  return {
+    id: parseApiId(record.id), name,
+    /** 描述、作用域、适用范围与版本号都可缺省，便于最小化构造与升级兼容。 */
+    description: record.description === undefined ? '' : text(record.description, 'crypto.profile.description', 4096),
+    scope: record.scope === undefined ? 'workspace' : cryptoScope(record.scope),
+    appliesTo: record.appliesTo === undefined ? 'all' : choice(record.appliesTo, ['all', 'test', 'production'] as const, 'crypto.profile.appliesTo'),
+    requestSteps: rows(record.requestSteps, parseApiCryptoStep, API_LIMITS.maxCryptoSteps, 'crypto.profile.requestSteps'),
+    responseSteps: rows(record.responseSteps, parseApiCryptoStep, API_LIMITS.maxCryptoSteps, 'crypto.profile.responseSteps'),
+    revision: record.revision === undefined ? 1 : apiInteger(record.revision, 1, Number.MAX_SAFE_INTEGER, 'crypto.profile.revision'),
+    updatedAt: record.updatedAt === undefined ? 0 : apiInteger(record.updatedAt, 0, Number.MAX_SAFE_INTEGER, 'crypto.profile.updatedAt'),
+  }
+}
+/** 解析接口级覆盖项；整体缺省时返回 undefined，表示完全跟随方案。 */
+export function parseApiCryptoOverrides(value: unknown): ApiCryptoOverrides | undefined {
+  if (value === undefined) return undefined
+  const record = apiRecord(value, ['keyRefs', 'targetNames', 'onFailure'], 'crypto.overrides')
+  return {
+    ...(record.keyRefs === undefined ? {} : { keyRefs: cryptoRefMap(record.keyRefs, 'crypto.overrides.keyRefs') }),
+    ...(record.targetNames === undefined ? {} : { targetNames: cryptoRefMap(record.targetNames, 'crypto.overrides.targetNames') }),
+    ...(record.onFailure === undefined ? {} : { onFailure: choice(record.onFailure, ['stop', 'continue'] as const, 'crypto.overrides.onFailure') }),
+  }
+}
 /** 解析目录并验证关系，不允许孤儿集合引用。 */
 export function parseApiCatalog(value: unknown): ApiCatalog {
-  const record = apiRecord(value, ['version', 'revision', 'collections', 'environments', 'requests', 'scenarios'], 'catalog')
+  const record = apiRecord(value, ['version', 'revision', 'collections', 'environments', 'requests', 'scenarios', 'workspaceVariables', 'cryptoProfiles'], 'catalog')
   if (record.version !== 1 || new TextEncoder().encode(JSON.stringify(value)).byteLength > API_LIMITS.catalogBytes) return invalid('catalog.versionOrSize')
   const collections = rows(record.collections, (item): ApiCollection => {
     const entry = apiRecord(item, ['id', 'name', 'description', 'variables'], 'collection')
@@ -601,7 +739,10 @@ export function parseApiCatalog(value: unknown): ApiCatalog {
   /** 升级前保存的目录没有 scenarios 字段，解析时补空数组而不是报错。 */
   const scenarios = rows(record.scenarios ?? [], parseApiScenario, API_LIMITS.maxScenarios, 'scenarios')
   if (scenarios.some((scenario) => !collections.some((collection) => collection.id === scenario.collectionId))) return invalid('scenario.collectionId')
-  return { version: 1, revision: apiInteger(record.revision, 0, Number.MAX_SAFE_INTEGER, 'catalog.revision'), collections, environments, requests, scenarios }
+  /** 升级前保存的目录没有这两个字段，解析时补空数组而不是报错。 */
+  const workspaceVariables = parseApiFields(record.workspaceVariables ?? [])
+  const cryptoProfiles = rows(record.cryptoProfiles ?? [], parseApiCryptoProfile, API_LIMITS.maxCryptoProfiles, 'cryptoProfiles')
+  return { version: 1, revision: apiInteger(record.revision, 0, Number.MAX_SAFE_INTEGER, 'catalog.revision'), collections, environments, requests, scenarios, workspaceVariables, cryptoProfiles }
 }
 /** 主进程从该会话推导 workspace；拒绝外部附带 workspaceId。 */
 export function parseApiTarget(value: unknown): ApiTarget { const record = apiRecord(value, ['sessionId']); return { sessionId: parseApiId(record.sessionId) } }
