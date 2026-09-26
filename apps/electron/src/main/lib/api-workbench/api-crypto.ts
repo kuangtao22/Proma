@@ -25,6 +25,11 @@ const CIPHER_ALGOS: Record<string, string> = { 'AES-128-CBC': 'aes-128-cbc', 'AE
 /** 需要认证标签的算法：必须按名字显式判断，`getAuthTag` 在非 GCM 的 cipher 上也存在、调用才抛错。 */
 const AUTH_TAGGED_ALGOS = new Set(['AES-128-GCM'])
 
+/** 该算法是否需要认证标签；编排层据此判断标签落点（P1 尚未定义，见 api-crypto-plan）。 */
+export function isAuthenticatedCipher(algo: string): boolean {
+  return AUTH_TAGGED_ALGOS.has(algo)
+}
+
 /** 加解密调用参数：tag 只在 GCM 这类需要认证标签的算法上出现。 */
 export interface ApiCryptoCipherOptions {
   encoding: ApiCryptoEncoding
@@ -138,16 +143,24 @@ export function decryptValue(algo: string, key: string, iv: string, ciphertext: 
   }
 }
 
+/** 可按 `.` 逐层取值的占位符分组，例如 body.sha256、query.sorted。 */
+export interface ApiCryptoTemplateGroup {
+  raw?: string
+  sorted?: string
+  sha256?: string
+  md5?: string
+}
+
 /** 模板上下文：方法、路径、派生值与正文摘要；派生步骤注入的值也走同一张表。 */
 export interface ApiCryptoTemplateContext {
   method?: string
   path?: string
-  query?: string
   timestamp?: string
   nonce?: string
-  body?: { raw?: string; sha256?: string; md5?: string }
+  query?: string | ApiCryptoTemplateGroup
+  body?: ApiCryptoTemplateGroup
   /** 允许 timestamp / nonce 之外的派生占位符按名字直接注入。 */
-  [key: string]: string | { raw?: string; sha256?: string; md5?: string } | undefined
+  [key: string]: string | ApiCryptoTemplateGroup | undefined
 }
 
 /** 占位符名按 `.` 逐层取值；取不到或不是字符串时返回 undefined。 */
