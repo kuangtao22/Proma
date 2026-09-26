@@ -11,7 +11,7 @@
 import * as React from 'react'
 import { useAtom, useSetAtom, useAtomValue, useStore } from 'jotai'
 import { toast } from 'sonner'
-import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelRight, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, ChevronsDownUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw, Info } from 'lucide-react'
+import { Pin, PinOff, Star, Settings, Plus, CirclePlus, Trash2, Pencil, PanelLeft, PanelRight, ArrowRightLeft, Search, Archive, ArchiveRestore, ArrowLeft, Bot, MessageSquare, MoreHorizontal, FolderOpen, FolderInput, FolderPlus, GripVertical, Clock, CalendarDays, ChevronRight, ChevronDown, ChevronUp, ChevronsDownUp, Blocks, Brain, ListTodo, GitBranch, Download, Loader2, RotateCw, Info, History } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { ModeSwitcher } from './ModeSwitcher'
@@ -101,6 +101,11 @@ import {
 } from '@/atoms/tab-atoms'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { sidebarViewModeAtom } from '@/atoms/sidebar-atoms'
+import {
+  getTodayStartTimestamp,
+  selectTodayAgentSessions,
+  selectTodayConversations,
+} from '@/lib/sidebar-today-activity'
 import { searchDialogOpenAtom } from '@/atoms/search-atoms'
 import { hasUpdateAtom, updateStatusAtom, type UpdateStatus } from '@/atoms/updater'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
@@ -984,16 +989,56 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     [agentIndicatorMap, agentSessions, draftSessionIds, pinnedAgentSessions],
   )
 
-  /** 对话按日期分组（根据 viewMode 过滤归档状态，排除 draft） */
+  /** 对话按日期分组（根据 viewMode 过滤归档状态，排除 draft）；今日活动视图不使用该分组 */
   const conversationGroups = React.useMemo(
     () => {
-      const filtered = viewMode === 'archived'
-        ? conversations.filter((c) => c.archived && !draftSessionIds.has(c.id))
-        : conversations.filter((c) => !c.archived && !c.pinned && !draftSessionIds.has(c.id))
+      let filtered: ConversationMeta[] = []
+      if (viewMode === 'archived') {
+        filtered = conversations.filter((c) => c.archived && !draftSessionIds.has(c.id))
+      } else if (viewMode === 'active') {
+        filtered = conversations.filter((c) => !c.archived && !c.pinned && !draftSessionIds.has(c.id))
+      }
       return groupByDate(filtered)
     },
     [conversations, viewMode, draftSessionIds]
   )
+
+  /**
+   * 今日活动的「今天」起点（本地零点）。
+   *
+   * 由每分钟刷新的相对时间派生：当天内取值恒定，因此下面的今日列表不会每分钟
+   * 重算一次；跨过零点后该值变化，列表自动切换为新的一天。
+   */
+  const todayStartTimestamp = React.useMemo(
+    () => getTodayStartTimestamp(relativeTimeNow),
+    [relativeTimeNow],
+  )
+
+  /** 今日活动（Chat）：最后一次对话发生在今天的未归档对话，按时间降序 */
+  const todayConversations = React.useMemo(
+    () => selectTodayConversations({
+      conversations,
+      now: todayStartTimestamp,
+      excludedSessionIds: draftSessionIds,
+    }),
+    [conversations, draftSessionIds, todayStartTimestamp],
+  )
+
+  /**
+   * 今日活动（Agent）：最后一次对话发生在今天的未归档会话，按时间降序。
+   * 含委派子会话与定时任务会话，排除内部执行会话与草稿。
+   */
+  const todayAgentSessions = React.useMemo(
+    () => selectTodayAgentSessions({
+      sessions: agentSessions,
+      now: todayStartTimestamp,
+      excludedSessionIds: draftSessionIds,
+    }),
+    [agentSessions, draftSessionIds, todayStartTimestamp],
+  )
+
+  /** 「今日活动」入口计数：只统计当前模式的今日会话数，为 0 时不显示计数 */
+  const todayActivityCount = mode === 'agent' ? todayAgentSessions.length : todayConversations.length
 
   /** 已归档对话数量 */
   const archivedConversationCount = React.useMemo(
@@ -3173,6 +3218,118 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     viewMode,
   ])
 
+  /**
+   * 今日活动视图行：跨项目扁平列表，按最后一次对话时间降序。
+   *
+   * Agent 会话显示所属项目 Badge 以便跨项目辨认；委派子会话沿用活跃视图的
+   * 缩进行样式，避免在扁平列表里被误认为顶层会话。置顶会话不单独分组，
+   * 保持单条时间流水。
+   */
+  const todayVirtualRows = React.useMemo<VirtualSidebarRow[]>(() => {
+    if (viewMode !== 'today') return []
+
+    if (mode === 'chat') {
+      return todayConversations.map((conversation) => ({
+        id: `chat-today-${conversation.id}`,
+        estimateSize: 34,
+        content: (
+          <div className="px-3">
+            <ConversationItem
+              conversation={conversation}
+              active={conversation.id === activeSessionId}
+              streaming={streamingIds.has(conversation.id)}
+              showPinIcon={!!conversation.pinned}
+              relativeTimeNow={relativeTimeNow}
+              onSelect={handleSelectConversation}
+              onRequestDelete={handleRequestDelete}
+              onRename={handleRename}
+              onTogglePin={handleTogglePin}
+              onToggleArchive={handleToggleArchive}
+            />
+          </div>
+        ),
+      }))
+    }
+
+    return todayAgentSessions.map((session) => {
+      if (isDelegatedChildSession(session)) {
+        return {
+          id: `agent-today-child-${session.id}`,
+          estimateSize: 34,
+          content: (
+            <div className="ml-6 border-l border-foreground/10 pl-2 pr-3">
+              <DelegatedChildSessionItem
+                session={session}
+                activeSessionId={activeSessionId}
+                activeDelegationSessionId={activeDelegationSessionId}
+                agentIndicatorMap={agentIndicatorMap}
+                relativeTimeNow={relativeTimeNow}
+                workspaceName={session.workspaceId ? workspaceNameMap.get(session.workspaceId) : undefined}
+                onSelect={handleSelectAgentSession}
+                onRequestDelete={handleRequestDelete}
+                onRequestMove={handleRequestMove}
+                onRename={handleAgentRename}
+                onTogglePin={handleTogglePinAgent}
+                onToggleStar={handleToggleStarAgent}
+                onToggleArchive={handleToggleArchiveAgent}
+              />
+            </div>
+          ),
+        }
+      }
+
+      const rowStatus = agentIndicatorMap.get(session.id) ?? 'idle'
+      return {
+        id: `agent-today-${session.id}`,
+        estimateSize: 34,
+        content: (
+          <div className="px-3">
+            <AgentSessionItem
+              session={session}
+              active={session.id === activeSessionId}
+              indicatorStatus={rowStatus}
+              showPinIcon={!!session.pinned}
+              disableMiniMap={!sessionHoverPreviewEnabled}
+              leftAccent={getSessionLeftAccent(rowStatus)}
+              workspaceName={session.workspaceId ? workspaceNameMap.get(session.workspaceId) : undefined}
+              relativeTimeNow={relativeTimeNow}
+              onSelect={handleSelectAgentSession}
+              onRequestDelete={handleRequestDelete}
+              onRequestMove={handleRequestMove}
+              onRename={handleAgentRename}
+              onTogglePin={handleTogglePinAgent}
+              onToggleStar={handleToggleStarAgent}
+              onToggleArchive={handleToggleArchiveAgent}
+            />
+          </div>
+        ),
+      }
+    })
+  }, [
+    activeDelegationSessionId,
+    activeSessionId,
+    agentIndicatorMap,
+    handleAgentRename,
+    handleRequestDelete,
+    handleRequestMove,
+    handleRename,
+    handleSelectAgentSession,
+    handleSelectConversation,
+    handleToggleArchive,
+    handleToggleArchiveAgent,
+    handleTogglePin,
+    handleTogglePinAgent,
+    handleToggleStarAgent,
+    mode,
+    relativeTimeNow,
+    sessionHoverPreviewEnabled,
+    streamingIds,
+    todayAgentSessions,
+    todayConversations,
+    viewMode,
+    workspaceNameMap,
+  ])
+
   // ===== 折叠状态：精简图标视图 =====
   if (sidebarCollapsed) {
     const hasActiveCollapsedTool = [
@@ -3635,6 +3792,29 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
             <React.Fragment key={row.id}>{row.content}</React.Fragment>
           ))}
         </div>
+      ) : viewMode === 'today' ? (
+        <>
+          {/* 今日活动标题栏：与入口计数保持一致 */}
+          <div className="px-6 pt-3 pb-1">
+            <div className="text-[12px] font-medium text-foreground/40">
+              今日活动{todayActivityCount > 0 ? ` · ${todayActivityCount}` : ''}
+            </div>
+          </div>
+
+          {/* 今日活动：跨项目单列表，按最后一次对话时间降序 */}
+          {todayVirtualRows.length > 0 ? (
+            <VirtualSidebarList
+              key={mode === 'agent' ? 'agent-today-list' : 'chat-today-list'}
+              className="flex-1 px-3 pt-2 pb-3"
+              rows={todayVirtualRows}
+              activeRowId={activeSessionId ? `${mode === 'agent' ? 'agent' : 'chat'}-today-${activeSessionId}` : null}
+            />
+          ) : (
+            <div className="min-h-0 flex-1 px-6 pt-6 text-[12px] text-foreground/30 select-none">
+              今天还没有{mode === 'agent' ? '会话' : '对话'}
+            </div>
+          )}
+        </>
       ) : (
         <>
           {/* 归档视图标题栏 */}
@@ -3665,10 +3845,18 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
         </>
       )}
 
-      {/* 已归档入口 / 返回活跃对话 */}
+      {/* 今日活动入口 / 已归档入口 / 返回活跃对话 */}
       <div className="px-3 pb-1">
         {viewMode === 'active' ? (
           <>
+            {/* 今日活动：常驻入口，跨零点后仍可进入当日列表（无当日会话时不显示计数） */}
+            <button
+              onClick={() => setViewMode('today')}
+              className="w-full flex items-center gap-2 px-3 py-2 rounded-[10px] text-[12px] text-foreground/40 hover:bg-foreground/[0.04] hover:text-foreground/60 transition-colors titlebar-no-drag"
+            >
+              <History size={13} className="text-foreground/30" />
+              <span>今日活动{todayActivityCount > 0 ? ` (${todayActivityCount})` : ''}</span>
+            </button>
             {mode === 'chat' && archivedConversationCount > 0 && (
               <button
                 onClick={() => setViewMode('archived')}
