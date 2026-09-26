@@ -9,6 +9,7 @@ import {
   createImportedRequestTabs,
   createApiWorkbenchController,
   createRequestTab,
+  describeApiRunCrypto,
   draftFromRun,
   moveApiRequest,
   clampApiWorkbenchCatalogWidth,
@@ -650,5 +651,39 @@ describe('把请求移动到其他分组 / 集合', () => {
 
     expect(moveApiRequest(source, 'request_a', { collectionId: 'missing', folder: 'x' })).toBe(source)
     expect(moveApiRequest(source, 'request_missing', { collectionId: 'app', folder: 'x' })).toBe(source)
+  })
+})
+
+describe('运行加密状态文案', () => {
+  /** 请求侧事实的最小构造；用例只覆盖被断言的那一项。 */
+  const base = { executed: [], skipped: [], plaintextSent: false, decrypted: false }
+
+  test('缺密钥时明确写出「明文发出」并列出缺的变量', () => {
+    const status = describeApiRunCrypto({
+      ...base,
+      plaintextSent: true,
+      skipped: [
+        { id: 's3', kind: 'encrypt', algo: 'AES-128-CBC', reason: 'missing-secret', keyRef: 'aesKey' },
+        { id: 's3', kind: 'encrypt', algo: 'AES-128-CBC', reason: 'missing-secret', keyRef: 'aesKey' },
+      ],
+    })
+    expect(status.text).toContain('明文发出')
+    expect(status.text).toContain('aesKey')
+    /** 同一个变量被两步引用时只报一次。 */
+    expect(status.text.match(/aesKey/g)).toHaveLength(1)
+    expect(status.tone).toBe('warning')
+  })
+
+  test('配置不完整但与密钥无关时也不谎报缺密钥', () => {
+    const status = describeApiRunCrypto({ ...base, plaintextSent: true, skipped: [{ id: 's2', kind: 'sign', algo: 'HMAC-SHA256', reason: 'invalid-config' }] })
+    expect(status.text).toContain('明文发出')
+    expect(status.text).toContain('配置不完整')
+  })
+
+  test('解密成功给出实际算法，解密失败给出分类原因', () => {
+    expect(describeApiRunCrypto({ ...base, decrypted: true, executed: [{ id: 'r1', kind: 'decrypt', algo: 'AES-128-CBC' }] }).text).toBe('已解密 · AES-128-CBC')
+    const failed = describeApiRunCrypto({ ...base, failure: { code: 'API_CRYPTO_DECRYPT_FAILED', message: '解密失败：密钥或 IV 不匹配' } })
+    expect(failed.text).toContain('未解密')
+    expect(failed.tone).toBe('warning')
   })
 })

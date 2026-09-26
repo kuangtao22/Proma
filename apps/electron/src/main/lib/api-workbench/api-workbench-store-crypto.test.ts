@@ -133,4 +133,21 @@ describe('方案与工作区变量存储', () => {
       expect(after.workspaceVariables?.find((item) => item.name === 'aesKey')?.secretRef).toBeTruthy()
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
+
+  test('明文揭示通道：按 owner 精确读一个字段，跨作用域取不到', () => {
+    const root = mkdtempSync(join(tmpdir(), 'api-crypto-store-'))
+    try {
+      const store = new ApiWorkbenchStore(root, { safeStorage, now: () => 10, uuid: () => 'secret_ref' })
+      store.saveWorkspaceVariables('workspace', [
+        variable('v1', 'appSecret', APP_SECRET),
+        { id: 'v2', name: 'baseUrl', value: 'https://api.test', enabled: true },
+      ])
+      expect(store.revealVariable('workspace', { scope: 'workspace', fieldId: 'v1' })).toEqual({ name: 'appSecret', value: APP_SECRET })
+      /** 非秘密字段本来就在目录里，直接回原值。 */
+      expect(store.revealVariable('workspace', { scope: 'workspace', fieldId: 'v2' })).toEqual({ name: 'baseUrl', value: 'https://api.test' })
+      expect(() => store.revealVariable('workspace', { scope: 'collection', fieldId: 'v1' })).toThrow('API_WORKBENCH_VARIABLE_SCOPE_REQUIRED')
+      expect(() => store.revealVariable('workspace', { scope: 'environment', scopeId: 'missing', fieldId: 'v1' })).toThrow('API_WORKBENCH_VARIABLE_NOT_FOUND')
+      expect(() => store.revealVariable('workspace', { scope: 'workspace', fieldId: 'nope' })).toThrow('API_WORKBENCH_VARIABLE_NOT_FOUND')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
 })

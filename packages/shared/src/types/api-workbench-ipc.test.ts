@@ -76,6 +76,16 @@ test('Given 公共配置回执 When 解析 Then 只接受合同字段并拒绝�
   expect(() => parseApiResponse('getCryptoReferences', { profiles: [1], requests: 3, collections: [] })).toThrow()
 })
 
+test('Given 明文揭示命令 When 解析 Then 非工作区必须带 scopeId，回执只允许名字与值', () => {
+  expect(parseApiCommand({ method: 'revealVariable', input: { sessionId: 'a', scope: 'workspace', fieldId: 'v1' } })).toMatchObject({ method: 'revealVariable' })
+  expect(parseApiCommand({ method: 'revealVariable', input: { sessionId: 'a', scope: 'collection', scopeId: 'backend', fieldId: 'v1' } })).toMatchObject({ method: 'revealVariable' })
+  /** 集合/环境层级缺 scopeId 直接拒绝：否则会落到别的作用域去取值。 */
+  expect(() => parseApiCommand({ method: 'revealVariable', input: { sessionId: 'a', scope: 'collection', fieldId: 'v1' } })).toThrow()
+  expect(() => parseApiCommand({ method: 'revealVariable', input: { sessionId: 'a', scope: 'secret', fieldId: 'v1' } })).toThrow()
+  expect(parseApiResponse('revealVariable', { name: 'appSecret', value: 'cb-app-2026' })).toEqual({ name: 'appSecret', value: 'cb-app-2026' })
+  expect(() => parseApiResponse('revealVariable', { name: 'appSecret', value: 'x', secretRef: 'r1' })).toThrow()
+})
+
 /** 构造含事件流的最小运行记录，避免每个用例重复展开字段。 */
 function runWithSse(sse: unknown): Record<string, unknown> {
   return {

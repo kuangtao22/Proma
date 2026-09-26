@@ -371,6 +371,34 @@ export class ApiWorkbenchStore {
     return { profiles: matched.map((item) => item.name), requests: requests.length, collections }
   }
 
+  /**
+   * 读取单个变量字段的明文值。
+   *
+   * 这是**用户主动点 👁 才走**的窄通道：一次只揭示一个字段、不做批量，
+   * 调用方（IPC 层）会写审计日志；Agent 工具链没有任何入口调用它。
+   * @param input.scope 变量层级；`workspace` 不需要 scopeId。
+   * @returns 变量名与明文值。
+   */
+  revealVariable(workspaceId: string, input: { scope: 'workspace' | 'collection' | 'environment'; scopeId?: string; fieldId: string }): { name: string; value: string } {
+    parseApiId(workspaceId)
+    if (input.scope !== 'workspace' && !input.scopeId) throw new Error('API_WORKBENCH_VARIABLE_SCOPE_REQUIRED')
+    const catalog = this.getCatalog(workspaceId)
+    const scopeId = input.scope === 'workspace' ? undefined : parseApiId(input.scopeId as string)
+    /** owner 前缀必须与 sanitizeCatalogSecrets 写入时完全一致，否则会被判成跨资源引用。 */
+    const ownerPrefix = input.scope === 'workspace' ? 'workspace:variable' : `${input.scope}:${scopeId}:variable`
+    const fields = input.scope === 'workspace'
+      ? (catalog.workspaceVariables ?? [])
+      : input.scope === 'collection'
+        ? (catalog.collections.find((item) => item.id === scopeId)?.variables ?? [])
+        : (catalog.environments.find((item) => item.id === scopeId)?.variables ?? [])
+    const field = fields.find((item) => item.id === parseApiId(input.fieldId))
+    if (!field) throw new Error('API_WORKBENCH_VARIABLE_NOT_FOUND')
+    if (!field.secretRef) return { name: field.name, value: field.value }
+    const resolved = this.resolveSecret(workspaceId, field.secretRef, `${ownerPrefix}:${field.id}`)
+    if (!resolved) throw new Error('API_WORKBENCH_VARIABLE_NOT_FOUND')
+    return { name: field.name, value: resolved.value }
+  }
+
   /** 按 workspace 与精确 owner 解析秘密，跨资源复用一律视为不存在。 */
   resolveSecret(workspaceId: string, ref: string, owner: string): { value: string; revision: string } | undefined {
     parseApiId(workspaceId)

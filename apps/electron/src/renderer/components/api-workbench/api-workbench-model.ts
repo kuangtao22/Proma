@@ -10,6 +10,7 @@ import type {
   ApiRequestDraft,
   ApiRequestBody,
   ApiRun,
+  ApiRunCrypto,
   ApiTestCase,
   ApiValue,
   ApiWorkbenchApi,
@@ -154,6 +155,31 @@ export function clampApiWorkbenchCatalogWidth(value: number): number {
 export function clampApiWorkbenchEditorShare(value: number): number {
   if (!Number.isFinite(value)) return API_WORKBENCH_EDITOR_SHARE.initial
   return Math.min(API_WORKBENCH_EDITOR_SHARE.max, Math.max(API_WORKBENCH_EDITOR_SHARE.min, Math.round(value)))
+}
+
+/** 运行状态条上的加密文案与色调。 */
+export interface ApiRunCryptoStatus {
+  text: string
+  tone: 'ok' | 'warning' | 'muted'
+}
+
+/**
+ * 把一次运行的加密事实翻译成一句人话。
+ *
+ * 关键点：缺密钥时必须显式说「明文发出」，否则一个 200 会让用户以为加密生效了。
+ * @param crypto 运行记录里的加密事实。
+ * @returns 状态条文案与色调。
+ */
+export function describeApiRunCrypto(crypto: ApiRunCrypto): ApiRunCryptoStatus {
+  const decrypt = crypto.executed.find((step) => step.kind === 'decrypt')
+  if (crypto.plaintextSent) {
+    const missing = [...new Set(crypto.skipped.filter((step) => step.reason === 'missing-secret' && step.keyRef).map((step) => step.keyRef as string))]
+    const detail = missing.length > 0 ? `（缺 ${missing.join(' / ')}）` : '（方案配置不完整）'
+    return { text: `⚠️ 本次未加密 · 明文发出${detail}`, tone: 'warning' }
+  }
+  if (crypto.failure) return { text: `未解密 · ${crypto.failure.message}`, tone: 'warning' }
+  if (crypto.decrypted) return { text: `已解密 · ${decrypt?.algo ?? '对称算法'}`, tone: 'ok' }
+  return { text: `已加密发送 · ${crypto.profileName ?? '未命名方案'}`, tone: 'ok' }
 }
 
 /**

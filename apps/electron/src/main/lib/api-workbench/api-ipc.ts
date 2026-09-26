@@ -6,7 +6,7 @@ export interface ApiIpcEvent { sender: { id: number } }
 /** 服务对象由生产 singleton 或测试夹具提供。 */
 export interface ApiIpcDependencies {
   ipc: { handle(channel: string, listener: (event: ApiIpcEvent, input: unknown) => Promise<unknown>): void; removeHandler(channel: string): void }
-  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'saveCryptoProfile' | 'deleteCryptoProfile' | 'saveWorkspaceVariables' | 'getCryptoReferences' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles' | 'prepareScenario' | 'runScenario' | 'cancelScenario' | 'listScenarioRuns' | 'getScenarioRun'>
+  service: Pick<ApiWorkbenchService, 'getCatalog' | 'saveCatalog' | 'saveCryptoProfile' | 'deleteCryptoProfile' | 'saveWorkspaceVariables' | 'getCryptoReferences' | 'revealVariable' | 'prepare' | 'send' | 'cancel' | 'listRuns' | 'getRun' | 'readBody' | 'pinRun' | 'getRuntimeVariables' | 'clearRuntimeVariables' | 'getCookieJar' | 'clearCookieJar' | 'registerPickedFiles' | 'prepareScenario' | 'runScenario' | 'cancelScenario' | 'listScenarioRuns' | 'getScenarioRun'>
   /**
    * 原生文件对话框由主进程打开；这是全流程唯一接受路径字符串的入口，
    * 渲染层与模型都只能拿到文件引用与元数据。
@@ -43,6 +43,8 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
       case 'deleteCryptoProfile': result = await write(() => service.deleteCryptoProfile(context.workspaceId, command.input)); break
       case 'saveWorkspaceVariables': result = await write(() => service.saveWorkspaceVariables(context.workspaceId, command.input)); break
       case 'getCryptoReferences': result = await service.getCryptoReferences(context.workspaceId, command.input); break
+      /** 明文揭示是读命令：不写盘，但要过会话与窗口复核（assertCurrent 在返回前执行）。 */
+      case 'revealVariable': result = await service.revealVariable(context.workspaceId, command.input); break
       case 'prepare': result = await service.prepare(context, command.input); break
       case 'send': result = await write(() => service.send(context, command.input.preparedId)); break
       case 'cancel': await service.cancel(context, command.input.preparedId); result = undefined; break

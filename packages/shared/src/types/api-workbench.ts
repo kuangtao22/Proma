@@ -447,6 +447,10 @@ export interface ApiWorkspaceVariablesSaveResult { variables: ApiField[] }
 export interface ApiCryptoReferenceQuery extends ApiTarget { kind: 'variable' | 'profile'; name: string }
 /** 引用检查结论：相关方案名、受影响请求条数与被涉及集合名。 */
 export interface ApiCryptoReferences { profiles: string[]; requests: number; collections: string[] }
+/** 明文揭示输入：一次只点名一个字段，scopeId 在集合/环境层级必填。 */
+export interface ApiVariableRevealInput extends ApiTarget { scope: 'workspace' | 'collection' | 'environment'; scopeId?: string; fieldId: string }
+/** 明文揭示回执：只有变量名与值，没有其它字段。 */
+export interface ApiVariableRevealResult { name: string; value: string }
 /** 从已保存请求或本地草稿生成一次发送身份；单次覆盖不写回环境。 */
 export interface ApiPrepareInput extends ApiTarget { request: ApiRequestDraft; requestId?: string; environmentId?: string; overrides?: ApiField[]; caseId?: string }
 /** 发送或取消仅使用 Host 签发的准备身份。 */
@@ -479,6 +483,8 @@ export interface ApiWorkbenchApi {
   saveWorkspaceVariables(input: ApiWorkspaceVariablesSaveInput): Promise<ApiWorkspaceVariablesSaveResult>
   /** 变量/方案引用检查，供删除确认与「改了会影响谁」提示。 */
   getCryptoReferences(input: ApiCryptoReferenceQuery): Promise<ApiCryptoReferences>
+  /** 明文揭示一个变量字段：只由用户主动点 👁 触发，每次一个字段并留审计。 */
+  revealVariable(input: ApiVariableRevealInput): Promise<ApiVariableRevealResult>
   prepare(input: ApiPrepareInput): Promise<ApiPreparedPreview>
   send(input: ApiSendInput): Promise<ApiRun>
   cancel(input: ApiSendInput): Promise<void>

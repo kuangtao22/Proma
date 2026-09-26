@@ -37,6 +37,8 @@ import type {
   ApiSseEvent,
   ApiRuntimeVariable,
   ApiRequestDraft,
+  ApiVariableRevealInput,
+  ApiVariableRevealResult,
   ApiCookieJarEntry,
   ApiWorkspaceVariablesSaveInput,
   ApiWorkspaceVariablesSaveResult,
@@ -431,6 +433,16 @@ export class ApiWorkbenchService {
   /** 变量/方案引用检查：删除确认与「改了会影响谁」共用。 */
   async getCryptoReferences(workspaceId: string, input: ApiCryptoReferenceQuery): Promise<ApiCryptoReferences> {
     return this.store.inspectCryptoReferences(parseApiId(workspaceId), input.kind, input.name)
+  }
+
+  /**
+   * 明文揭示一个变量字段（用户主动点 👁 的窄通道）。
+   * 每次调用写一条主进程审计日志：只记变量名与作用域，不记值。
+   */
+  async revealVariable(workspaceId: string, input: ApiVariableRevealInput): Promise<ApiVariableRevealResult> {
+    const revealed = this.store.revealVariable(parseApiId(workspaceId), { scope: input.scope, ...(input.scopeId === undefined ? {} : { scopeId: input.scopeId }), fieldId: input.fieldId })
+    console.info(`[接口工作台] 明文显示密钥：${revealed.name}（作用域 ${input.scope}${input.scopeId ? `:${input.scopeId}` : ''}）`)
+    return revealed
   }
 
   /** 固定解析后的请求、环境、目录与秘密版本，返回脱敏审批预览。 */

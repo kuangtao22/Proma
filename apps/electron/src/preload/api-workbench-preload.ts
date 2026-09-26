@@ -20,6 +20,7 @@ export function createApiWorkbenchPreload(invoke: ApiWorkbenchInvoke, subscribe:
     deleteCryptoProfile: (input) => call('deleteCryptoProfile', input),
     saveWorkspaceVariables: (input) => call('saveWorkspaceVariables', input),
     getCryptoReferences: (input) => call('getCryptoReferences', input),
+    revealVariable: (input) => call('revealVariable', input),
     prepare: (input) => call('prepare', input),
     send: (input) => call('send', input),
     cancel: (input) => call('cancel', input),

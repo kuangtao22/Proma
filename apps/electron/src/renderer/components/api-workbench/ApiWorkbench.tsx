@@ -43,6 +43,8 @@ import type {
   ApiCatalogSnapshot,
   ApiCollection,
   ApiCookieJarEntry,
+  ApiCryptoOverrides,
+  ApiCryptoProfile,
   ApiEnvironment,
   ApiExtraction,
   ApiField,
@@ -106,6 +108,7 @@ import {
   createApiWorkbenchController,
   createImportedRequestTabs,
   createRequestTab,
+  describeApiRunCrypto,
   diffApiRuns,
   draftFromRun,
   draftAssertions,
@@ -133,6 +136,8 @@ import { ApiImportDialog } from './ApiImportDialog'
 import { ApiScenarioPanel } from './ApiScenarioPanel'
 import { ApiRequestMoveDialog } from './ApiRequestMoveDialog'
 import { ApiSplitHandle } from './ApiSplitHandle'
+import { API_WORKSPACE_VARIABLE_SCOPE, ApiCryptoConfigPanel } from './ApiCryptoConfigPanel'
+import type { ApiCryptoConfigOps } from './ApiCryptoConfigPanel'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
@@ -154,7 +159,7 @@ export function dispatchResendApiRun(run: ApiRun, currentSessionId: string | und
 /** 阶段 A 支持的请求方法。 */
 const METHODS: readonly ApiMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 /** 编辑器一级分区。 */
-type EditorSection = 'query' | 'headers' | 'body' | 'auth' | 'cases' | 'assertions' | 'extract' | 'settings'
+type EditorSection = 'query' | 'headers' | 'body' | 'auth' | 'crypto' | 'cases' | 'assertions' | 'extract' | 'settings'
 /** 窄 Pane 当前显示的主区域。 */
 type CompactView = 'request' | 'response'
 /** 目录命名弹窗支持的操作。 */
@@ -675,11 +680,13 @@ function RequestTabBar({ tabs, activeTabId, onSelect, onClose }: { tabs: ApiWork
 }
 
 /** 请求编辑器主体。 */
-function RequestEditor({ tab, environmentId, environments, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onMove, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel, onPickFiles }: {
+function RequestEditor({ tab, environmentId, environments, cryptoProfiles, casesRunning, onChange, onCasesChange, onActiveCaseChange, onRunAllCases, onMove, onSave, onDuplicate, onCopyCurl, onDelete, onSend, onCancel, onPickFiles, onOpenCryptoConfig }: {
   tab: ApiWorkbenchRequestTab
   environmentId: string | null
   /** 用于「目标环境」标记选择：标记只区分开发/测试/生产，不改变发送权限。 */
   environments: ApiEnvironment[]
+  /** 公共配置里的签名/加密方案；接口只保存「选了哪一套」。 */
+  cryptoProfiles: ApiCryptoProfile[]
   /** 是否正在跑全部用例：期间不允许再触发批量或改选用例。 */
   casesRunning: boolean
   onChange: (draft: ApiRequestDraft) => void
@@ -696,11 +703,15 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
   onCancel: () => void
   /** 打开原生文件对话框选择待上传文件（multipart 正文用）。 */
   onPickFiles: () => Promise<ApiPickedFile[]>
+  /** 跳到公共配置的方案页签（步骤只读，改动都在那里做）。 */
+  onOpenCryptoConfig: () => void
 }): React.ReactElement {
   /** 当前编辑分区。 */
   const [section, setSection] = React.useState<EditorSection>('query')
   /** 当前选中的用例；用例被删除后自动回落为请求默认断言。 */
   const activeCase = (tab.draft.cases ?? []).find((item) => item.id === tab.activeCaseId)
+  /** 当前接口选中的加密方案；未选或方案已被删除时为 undefined。 */
+  const selectedProfile = tab.draft.selectedProfileId === undefined ? undefined : cryptoProfiles.find((profile) => profile.id === tab.draft.selectedProfileId)
   /** 「断言」页当前编辑的对象说明。 */
   const assertionTarget = activeCase ? `用例「${activeCase.name}」的断言` : '请求默认断言（不随用例执行）'
   /** 只更新草稿某个顶层字段。 */
@@ -731,8 +742,11 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
       </div>
       {tab.error && <div className="mx-3 mb-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">{tab.error}</div>}
       <div className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/50 px-3 scrollbar-none">
-        {([['query', '查询'], ['headers', 'Headers'], ['body', 'Body'], ['auth', '鉴权'], ['cases', '用例'], ['assertions', '断言'], ['extract', '提取'], ['settings', '设置']] as const).map(([id, label]) => (
-          <button key={id} type="button" className={cn('h-8 shrink-0 border-b-2 px-2 text-xs', section === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => setSection(id)}>{label}</button>
+        {([['query', '查询'], ['headers', 'Headers'], ['body', 'Body'], ['auth', '鉴权'], ['crypto', '加密签名'], ['cases', '用例'], ['assertions', '断言'], ['extract', '提取'], ['settings', '设置']] as const).map(([id, label]) => (
+          <button key={id} type="button" data-editor-section={id} className={cn('h-8 shrink-0 border-b-2 px-2 text-xs', section === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground')} onClick={() => setSection(id)}>
+            {label}
+            {id === 'crypto' && selectedProfile && <span className="ml-1 text-[10px] text-muted-foreground">🔒 {selectedProfile.name}</span>}
+          </button>
         ))}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -740,11 +754,141 @@ function RequestEditor({ tab, environmentId, environments, casesRunning, onChang
         {section === 'headers' && <FieldRows rows={tab.draft.headers} allowSecrets onChange={(rows) => patchDraft('headers', rows)} namePlaceholder="Header" />}
         {section === 'body' && <BodyEditor body={tab.draft.body} onChange={(body) => patchDraft('body', body)} onPickFiles={onPickFiles} />}
         {section === 'auth' && <AuthEditor draft={tab.draft} onChange={onChange} />}
+        {section === 'crypto' && (
+          <CryptoSection
+            draft={tab.draft}
+            profiles={cryptoProfiles}
+            onChange={onChange}
+            onOpenCryptoConfig={onOpenCryptoConfig}
+          />
+        )}
         {section === 'cases' && <CaseEditor draft={tab.draft} activeCaseId={activeCase?.id} onCasesChange={onCasesChange} onActiveCaseChange={onActiveCaseChange} />}
         {section === 'assertions' && <AssertionEditor assertions={draftAssertions(tab.draft, activeCase?.id)} target={assertionTarget} onChange={(assertions) => onChange(withDraftAssertions(tab.draft, activeCase?.id, assertions))} />}
         {section === 'extract' && <ExtractionEditor extractions={tab.draft.extractions ?? []} onChange={(extractions) => patchDraft('extractions', extractions)} />}
         {section === 'settings' && <RequestSettings draft={tab.draft} environments={environments} activeEnvironmentId={environmentId} onChange={onChange} />}
       </div>
+    </div>
+  )
+}
+
+/**
+ * 请求侧的「加密签名」分区。
+ *
+ * 这里只做一件事：选方案。步骤内容全部只读，改动统一去公共配置，
+ * 避免每个接口各写一套算法导致漂移；覆盖项默认收起，只有个别接口要换密钥变量时才展开。
+ */
+function CryptoSection({ draft, profiles, onChange, onOpenCryptoConfig }: {
+  draft: ApiRequestDraft
+  profiles: ApiCryptoProfile[]
+  onChange: (draft: ApiRequestDraft) => void
+  onOpenCryptoConfig: () => void
+}): React.ReactElement {
+  const [overridesOpen, setOverridesOpen] = React.useState(false)
+  const selected = draft.selectedProfileId === undefined ? undefined : profiles.find((profile) => profile.id === draft.selectedProfileId)
+  /** 被删除的方案：显式提示，避免看起来像「本来就没配」。 */
+  const missing = draft.selectedProfileId !== undefined && !selected
+  const overrides = draft.cryptoOverrides
+  const patchOverrides = (patch: ApiCryptoOverrides): void => onChange({ ...draft, cryptoOverrides: { ...overrides, ...patch } })
+  const steps = selected ? [...selected.requestSteps.map((step, index) => ({ step, index, side: '发送前' as const })), ...selected.responseSteps.map((step, index) => ({ step, index, side: '收到后' as const }))] : []
+  return (
+    <div className="space-y-3" data-editor-crypto="true">
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="text-xs text-muted-foreground" htmlFor="api-crypto-profile">使用方案</label>
+        <select
+          id="api-crypto-profile"
+          aria-label="使用签名方案"
+          className="h-8 min-w-56 rounded-md border border-input bg-background px-2 text-xs"
+          value={draft.selectedProfileId ?? ''}
+          onChange={(event) => onChange({ ...draft, selectedProfileId: event.target.value === '' ? undefined : event.target.value })}
+        >
+          <option value="">不使用签名/加密</option>
+          {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+        </select>
+        <Button type="button" variant="outline" className="h-8 px-2 text-xs" onClick={onOpenCryptoConfig}>公共配置</Button>
+      </div>
+      {missing && <p className="rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">这条接口引用的方案已被删除：重新选一个，或改成「不使用签名/加密」。发送前会直接拒绝，不会静默按明文发出。</p>}
+      {!missing && !selected && <p className="text-xs text-muted-foreground">未启用加密：请求按原始内容发出。方案在「公共配置」里统一维护，选中后所有接口共用同一套算法与模板。</p>}
+      {selected && (
+        <>
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+            <Badge variant="secondary">🔒 {selected.name}</Badge>
+            <Badge variant="outline">revision {selected.revision}</Badge>
+            <Badge variant="outline">{selected.appliesTo === 'all' ? '所有环境' : selected.appliesTo === 'test' ? '仅测试' : '仅生产'}</Badge>
+            {selected.description && <span className="text-muted-foreground">{selected.description}</span>}
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium">执行步骤（只读预览）</span>
+              <button type="button" className="text-[11px] text-primary hover:underline" onClick={onOpenCryptoConfig}>在公共配置里修改 →</button>
+            </div>
+            {steps.length === 0 && <p className="text-[11px] text-muted-foreground">这套方案还没有步骤，选中它不会改变请求。</p>}
+            {steps.map(({ step, index, side }) => (
+              <div key={`${side}-${step.id}`} className="flex flex-wrap items-center gap-2 rounded-md border border-border/50 px-2 py-1.5 text-[11px]">
+                <span className="text-muted-foreground">{side} · {index + 1}</span>
+                <Badge variant="outline">{step.kind === 'derive' ? '派生' : step.kind === 'sign' ? '签名' : step.kind === 'encrypt' ? '加密' : '解密'}</Badge>
+                <span className="font-mono">{step.algo}</span>
+                {step.keyRef && <span className="text-muted-foreground">密钥 <span className="font-mono">🔒 {step.keyRef}</span></span>}
+                {step.ivRef && <span className="text-muted-foreground">IV <span className="font-mono">🔒 {step.ivRef}</span></span>}
+                {step.target && <span className="text-muted-foreground">写入 {step.target.in} · {step.target.name}</span>}
+                {!step.enabled && <Badge variant="destructive">已停用</Badge>}
+              </div>
+            ))}
+          </div>
+          <div className="rounded-md border border-border/50">
+            <button type="button" className="flex w-full items-center gap-1 px-2 py-1.5 text-[11px] text-muted-foreground hover:text-foreground" aria-expanded={overridesOpen} onClick={() => setOverridesOpen((previous) => !previous)}>
+              {overridesOpen ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+              本接口覆盖项（默认跟随方案，高级用法）
+            </button>
+            {overridesOpen && (
+              <div className="space-y-2 border-t border-border/50 px-2 py-2 text-[11px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-muted-foreground">失败策略</span>
+                  <Select value={overrides?.onFailure ?? 'follow'} onValueChange={(value) => patchOverrides({ onFailure: value === 'follow' ? undefined : value as 'stop' | 'continue' })}>
+                    <SelectTrigger className="h-7 w-32 text-[11px]" aria-label="解密失败策略"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="follow">跟随方案</SelectItem>
+                      <SelectItem value="stop">失败即停</SelectItem>
+                      <SelectItem value="continue">失败继续</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                {steps.filter(({ step }) => step.keyRef !== undefined || step.ivRef !== undefined).map(({ step, index, side }) => (
+                  <div key={`ov-${side}-${step.id}`} className="flex flex-wrap items-center gap-2">
+                    <span className="text-muted-foreground">{side} · {index + 1} · {step.kind}</span>
+                    <Input
+                      value={overrides?.keyRefs?.[step.id] ?? ''}
+                      onChange={(event) => {
+                        const next = { ...(overrides?.keyRefs ?? {}) }
+                        if (event.target.value === '') delete next[step.id]
+                        else next[step.id] = event.target.value
+                        patchOverrides({ keyRefs: Object.keys(next).length === 0 ? undefined : next })
+                      }}
+                      placeholder={step.keyRef ?? '密钥变量'}
+                      className="h-7 max-w-48 font-mono text-[11px]"
+                      aria-label={`${side}第 ${index + 1} 步密钥覆盖`}
+                    />
+                    {step.kind === 'sign' && (
+                      <Input
+                        value={overrides?.targetNames?.[step.id] ?? ''}
+                        onChange={(event) => {
+                          const next = { ...(overrides?.targetNames ?? {}) }
+                          if (event.target.value === '') delete next[step.id]
+                          else next[step.id] = event.target.value
+                          patchOverrides({ targetNames: Object.keys(next).length === 0 ? undefined : next })
+                        }}
+                        placeholder={step.target?.name ?? '输出名称'}
+                        className="h-7 max-w-48 font-mono text-[11px]"
+                        aria-label={`${side}第 ${index + 1} 步输出名覆盖`}
+                      />
+                    )}
+                  </div>
+                ))}
+                <p className="text-[11px] text-muted-foreground">覆盖项只影响这条接口；密钥值仍在公共配置里维护，这里只填变量名。</p>
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -1146,6 +1290,12 @@ function ResponsePanel({ api, sessionId, run, historyRuns, historyOpen, onHistor
         {displayedRun.assertions.length === 0
           ? <span className="text-muted-foreground">{caseName ? `用例 ${caseName} · 未验证` : '未验证'}</span>
           : <span className={cn('font-medium', assertionPassed !== displayedRun.assertions.length ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400')}>{caseName ? `用例 ${caseName} · ` : ''}断言 {assertionPassed}/{displayedRun.assertions.length}</span>}
+        {/** 加密事实必须始终可见：缺密钥时一个 200 也不能让人以为加密生效了。 */}
+        {displayedRun.crypto && (
+          <span data-api-run-crypto="true" className={cn('max-w-72 truncate', describeApiRunCrypto(displayedRun.crypto).tone === 'warning' ? 'font-medium text-amber-600 dark:text-amber-400' : 'text-muted-foreground')} title={describeApiRunCrypto(displayedRun.crypto).text}>
+            {describeApiRunCrypto(displayedRun.crypto).text}
+          </span>
+        )}
         <span className="ml-auto text-[10px] text-muted-foreground">{revealed ? '本地原始内容' : '默认脱敏'}</span>
         {!revealed && displayedRun.recording !== 'failed' && <ToolButton label="查看本地原始内容" onClick={revealOriginal}><Eye className="size-3.5" /></ToolButton>}
         <ToolButton label="运行历史" onClick={() => onHistoryOpenChange(true)}><History className="size-3.5" /></ToolButton>
@@ -1505,6 +1655,10 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
   /** Cookie 面板开关与元数据列表；取值不在这条通道上。 */
   const [cookieOpen, setCookieOpen] = React.useState(false)
   const [cookies, setCookies] = React.useState<ApiCookieJarEntry[]>([])
+  /** 公共配置面板：变量与密钥、签名与加密方案。 */
+  const [cryptoPanelOpen, setCryptoPanelOpen] = React.useState(false)
+  const [cryptoTab, setCryptoTab] = React.useState<'variables' | 'schemes'>('variables')
+  const [cryptoBusy, setCryptoBusy] = React.useState(false)
   /** 运行对比：基线身份与标签，以及本次对比结果。 */
   const [baselineRun, setBaselineRun] = React.useState<{ id: string; label: string } | null>(null)
   const [runDiff, setRunDiff] = React.useState<{ diff: ApiRunDiff; baselineLabel: string; candidateLabel: string } | null>(null)
@@ -1696,6 +1850,74 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
       return null
     }
   }, [api, sessionId, setView])
+
+  /**
+   * 公共配置的写入能力。
+   *
+   * 面板只拿到这一组函数，不直接接触 IPC：这样「谁在写、写完怎么刷新目录」只有一处实现，
+   * 明文揭示也只在这里经过一次（每次一个字段，主进程留审计）。
+   */
+  const cryptoOps = React.useMemo<ApiCryptoConfigOps>(() => ({
+    saveVariables: async (variables) => {
+      if (!api) return false
+      setCryptoBusy(true)
+      try {
+        await api.saveWorkspaceVariables({ sessionId, variables })
+        setCatalog(await api.getCatalog({ sessionId }))
+        return true
+      } catch (error) {
+        setLoadError(errorMessage(error, '保存工作区变量失败，请刷新后重试'))
+        return false
+      } finally { setCryptoBusy(false) }
+    },
+    saveCollectionVariables: async (collectionId, variables) => {
+      const saved = await mutateCatalog((latest) => ({
+        ...latest,
+        collections: latest.collections.map((collection) => (collection.id === collectionId ? { ...collection, variables } : collection)),
+      }))
+      return saved !== null
+    },
+    saveProfile: async (profile, expectedRevision) => {
+      if (!api) return null
+      setCryptoBusy(true)
+      try {
+        const saved = await api.saveCryptoProfile({ sessionId, profile, expectedRevision })
+        setCatalog(await api.getCatalog({ sessionId }))
+        return saved
+      } catch (error) {
+        setLoadError(errorMessage(error, '保存方案失败，请刷新后重试'))
+        return null
+      } finally { setCryptoBusy(false) }
+    },
+    deleteProfile: async (id, force) => {
+      if (!api) return false
+      setCryptoBusy(true)
+      try {
+        const result = await api.deleteCryptoProfile({ sessionId, id, force })
+        if (result.removed) setCatalog(await api.getCatalog({ sessionId }))
+        return result.removed
+      } catch (error) {
+        setLoadError(errorMessage(error, '删除方案失败，请刷新后重试'))
+        return false
+      } finally { setCryptoBusy(false) }
+    },
+    inspect: async (kind, name) => {
+      if (!api) return null
+      try { return await api.getCryptoReferences({ sessionId, kind, name }) } catch { return null }
+    },
+    reveal: async (scopeId, field) => {
+      if (!api) return null
+      /** 工作区是伪作用域，IPC 上按 workspace 传，不带 scopeId。 */
+      const scope = scopeId === API_WORKSPACE_VARIABLE_SCOPE ? 'workspace' as const : 'collection' as const
+      try {
+        const revealed = await api.revealVariable({ sessionId, scope, ...(scope === 'collection' ? { scopeId } : {}), fieldId: field.id })
+        return revealed.value
+      } catch (error) {
+        setLoadError(errorMessage(error, '读取明文失败：该字段可能还没填值'))
+        return null
+      }
+    },
+  }), [api, sessionId, mutateCatalog, setView])
 
   /**
    * 把集合里硬编码的主机一键抽成集合变量。
@@ -2088,6 +2310,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
           <ToolButton label="新建环境" onClick={() => { setEditingEnvironment({ id: createLocalId('environment'), name: '新环境', kind: 'local', variables: [] }); setEnvironmentDialogOpen(true) }}><Plus className="size-3.5" /></ToolButton>
           <ToolButton label="运行历史" onClick={() => setView((previous) => ({ ...previous, historyOpen: true }))}><History className="size-3.5" /></ToolButton>
           <ToolButton label="运行时变量" onClick={() => setRuntimeOpen(true)}><KeyRound className="size-3.5" /></ToolButton>
+          <ToolButton label="公共配置（变量与密钥、签名方案）" onClick={() => { setCryptoTab('variables'); setCryptoPanelOpen(true) }}><ShieldCheck className="size-3.5" /></ToolButton>
           <ToolButton label="Cookie" onClick={() => setCookieOpen(true)}><Cookie className="size-3.5" /></ToolButton>
           <ToolButton label="导入接口" onClick={() => setImportOpen(true)}><Upload className="size-3.5" /></ToolButton>
         </div>
@@ -2126,7 +2349,7 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 text-center text-xs text-muted-foreground"><Archive className="size-6" /><span>从目录打开请求，或新建一个请求</span>{catalog.collections[0] && <Button type="button" variant="outline" size="sm" onClick={() => createRequest(catalog.collections[0]!.id)}><Plus className="mr-1 size-3.5" />新建请求</Button>}</div>
           ) : (
             <div ref={splitRef} className={cn('flex min-h-0 flex-1 overflow-hidden', compact ? 'flex-col' : 'flex-col')}>
-              {activeTab && !view.historyOpen && (!compact || compactView === 'request') && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : 'border-b border-border/50')} style={compact ? undefined : { flexBasis: `${editorShare}%` }}><RequestEditor tab={activeTab} environmentId={view.environmentId} onChange={(draft) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft }; return { ...next, dirty: isApiRequestDirty(next) } })} onSave={() => void saveActive()} onDuplicate={() => {
+              {activeTab && !view.historyOpen && (!compact || compactView === 'request') && <section className={cn('flex min-h-0 flex-col', compact ? 'flex-1' : 'border-b border-border/50')} style={compact ? undefined : { flexBasis: `${editorShare}%` }}><RequestEditor tab={activeTab} environmentId={view.environmentId} cryptoProfiles={catalog?.cryptoProfiles ?? []} onOpenCryptoConfig={() => { setCryptoTab('schemes'); setCryptoPanelOpen(true) }} onChange={(draft) => updateTab(activeTab.id, (tab) => { const next = { ...tab, draft }; return { ...next, dirty: isApiRequestDirty(next) } })} onSave={() => void saveActive()} onDuplicate={() => {
                 /** 复制出的草稿使用独立身份且不覆盖原请求。 */
                 const tabId = createLocalId('draft')
                 setView((previous) => ({ ...previous, tabs: [...previous.tabs, createRequestTab(tabId, { ...cloneApiRequestDraft(activeTab.draft), name: `${activeTab.draft.name} 副本` })], activeTabId: tabId, selectedRun: null }))
@@ -2197,6 +2420,19 @@ function ApiWorkbenchSession({ sessionId, uiScope, workspaceLabel }: { sessionId
         onRefresh={() => void loadRuntimeVariables()}
         onClear={() => void clearRuntimeVariables()}
       />
+      {catalog && (
+        <ApiCryptoConfigPanel
+          open={cryptoPanelOpen}
+          tab={cryptoTab}
+          catalog={catalog}
+          environmentId={view.environmentId}
+          environmentLabel={catalog.environments.find((item) => item.id === view.environmentId)?.name ?? '无环境（仅工作区/集合变量）'}
+          busy={cryptoBusy}
+          ops={cryptoOps}
+          onTabChange={setCryptoTab}
+          onOpenChange={setCryptoPanelOpen}
+        />
+      )}
     </div>
   )
 }
