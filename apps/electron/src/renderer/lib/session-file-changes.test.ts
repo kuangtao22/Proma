@@ -1,5 +1,62 @@
 import { describe, expect, test } from 'bun:test'
-import { getOwnedSessionWatcherPaths } from './session-file-changes'
+import { getOwnedSessionWatcherPathMatches, getOwnedSessionWatcherPaths } from './session-file-changes'
+
+describe('getOwnedSessionWatcherPathMatches', () => {
+  test('Given 工作区级附加目录 When 命中 Then 带出该共享根供归属判定', () => {
+    const matches = getOwnedSessionWatcherPathMatches(
+      ['/external/workspace-directory/sub/a.ts'],
+      {
+        sessionExists: true,
+        sessionPath: '/workspaces/current-session',
+        sessionAttachedDirectories: [],
+        sessionAttachedFiles: [],
+        workspaceAttachmentsComplete: true,
+        workspaceFilesPath: '/workspaces/workspace-files',
+        workspaceAttachedDirectories: ['/external/workspace-directory'],
+        workspaceAttachedFiles: [],
+      },
+    )
+
+    expect(matches).toEqual([{ path: '/external/workspace-directory/sub/a.ts', root: '/external/workspace-directory' }])
+  })
+
+  test('Given 附加文件命中 When 命中 Then 根取所在目录以支持「证据就是该文件」', () => {
+    const matches = getOwnedSessionWatcherPathMatches(
+      ['/external/notes/spec.md'],
+      {
+        sessionExists: true,
+        sessionPath: '/workspaces/current-session',
+        sessionAttachedDirectories: [],
+        sessionAttachedFiles: ['/external/notes/spec.md'],
+        workspaceAttachmentsComplete: true,
+        workspaceFilesPath: '/workspaces/workspace-files',
+        workspaceAttachedDirectories: [],
+        workspaceAttachedFiles: [],
+      },
+    )
+
+    expect(matches).toEqual([{ path: '/external/notes/spec.md', root: '/external/notes' }])
+  })
+
+  test('Given 同一路径同时落在会话目录与工作区目录 When 命中 Then 只保留首个命中根', () => {
+    const matches = getOwnedSessionWatcherPathMatches(
+      ['/workspaces/current-session/workspace-files/a.ts'],
+      {
+        sessionExists: true,
+        sessionPath: '/workspaces/current-session',
+        sessionAttachedDirectories: [],
+        sessionAttachedFiles: [],
+        workspaceAttachmentsComplete: true,
+        workspaceFilesPath: '/workspaces/current-session/workspace-files',
+        workspaceAttachedDirectories: [],
+        workspaceAttachedFiles: [],
+      },
+    )
+
+    expect(matches).toHaveLength(1)
+    expect(matches[0]?.root).toBe('/workspaces/current-session')
+  })
+})
 
 describe('getOwnedSessionWatcherPaths', () => {
   test('does not attribute paths for a missing session', () => {

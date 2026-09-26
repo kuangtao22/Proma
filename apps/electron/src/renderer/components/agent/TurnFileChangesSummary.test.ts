@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { SDKMessage } from '@proma/shared'
-import { collectFilePaths } from './TurnFileChangesSummary'
+import { collectFilePaths, hasShellToolCall } from './TurnFileChangesSummary'
 
 /** 构造 assistant 侧的工具调用消息。 */
 function toolUse(id: string, toolName: string, filePath: string): SDKMessage {
@@ -63,5 +63,27 @@ describe('本轮文件改动汇总', () => {
       toolUse('call-7', 'Read', '/tmp/project/e.ts'),
       toolResult('call-7'),
     ])).toEqual([])
+  })
+})
+
+describe('命令行工具识别', () => {
+  test('Given 本轮调用了命令行 When 识别 Then 认为可能存在范围外写入', () => {
+    expect(hasShellToolCall([
+      toolUse('call-shell', 'Bash', '/tmp/project/f.ts'),
+      toolResult('call-shell'),
+    ])).toBe(true)
+  })
+
+  test('Given 本轮只有读写文件工具 When 识别 Then 不追加范围说明', () => {
+    expect(hasShellToolCall([
+      toolUse('call-8', 'Edit', '/tmp/project/g.ts'),
+      toolResult('call-8'),
+      toolUse('call-9', 'Read', '/tmp/project/h.ts'),
+      toolResult('call-9'),
+    ])).toBe(false)
+  })
+
+  test('Given 本轮没有工具调用 When 识别 Then 返回 false', () => {
+    expect(hasShellToolCall([])).toBe(false)
   })
 })

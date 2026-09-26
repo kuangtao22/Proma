@@ -14,10 +14,65 @@ function renderSummary(props: Parameters<typeof TurnFileChangesSummary>[0]): str
 }
 
 describe('本轮文件改动汇总渲染', () => {
-  test('Given 已完整跟踪且无改动 When 渲染 Then 明示本轮未检测到文件改动', () => {
+  test('Given 已完整跟踪且无改动 When 渲染 Then 只断言受管范围内没有改动', () => {
     const html = renderSummary({ turnMessages: [], runObserved: true })
 
-    expect(html).toContain('本轮未检测到文件改动')
+    // 证据源只覆盖受管根/附加目录/项目根与写类工具入参，不能断言「本轮没有任何改动」。
+    expect(html).toContain('本轮未检测到受管范围内的文件改动')
+  })
+
+  test('Given 本轮用过命令行且无改动 When 渲染 Then 追加范围说明', () => {
+    const html = renderSummary({
+      turnMessages: [{
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'call-shell',
+            name: 'Bash',
+            input: { command: "python3 - <<'PY'\nopen('/tmp/a','w').write('x')\nPY" },
+          }],
+        },
+      } as unknown as Parameters<typeof TurnFileChangesSummary>[0]['turnMessages'][number]],
+      runObserved: true,
+    })
+
+    expect(html).toContain('本轮未检测到受管范围内的文件改动')
+    expect(html).toContain('本轮有命令行工具调用，工作区外的写入不计入这里')
+  })
+
+  test('Given 本轮只用写类工具且无改动 When 渲染 Then 不追加范围说明', () => {
+    const html = renderSummary({
+      turnMessages: [{
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: {
+          content: [{ type: 'tool_use', id: 'call-edit', name: 'Edit', input: { file_path: '/p/a.ts' } }],
+        },
+      } as unknown as Parameters<typeof TurnFileChangesSummary>[0]['turnMessages'][number]],
+      runObserved: true,
+    })
+
+    expect(html).toContain('本轮未检测到受管范围内的文件改动')
+    expect(html).not.toContain('本轮有命令行工具调用')
+  })
+
+  test('Given 共享目录有改动但无法归属 When 渲染 Then 不再断言未检测到改动', () => {
+    const html = renderSummary({
+      turnMessages: [{
+        type: 'assistant',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id: 'call-bash', name: 'Bash', input: { command: 'ls /repo' } }] },
+      } as unknown as Parameters<typeof TurnFileChangesSummary>[0]['turnMessages'][number]],
+      runObserved: true,
+      runUnattributed: true,
+    })
+
+    expect(html).toContain('本轮检测到共享目录有改动，但无法归属到本会话')
+    expect(html).not.toContain('本轮未检测到受管范围内的文件改动')
+    // 已有更准确的解释，不再叠加命令行范围说明。
+    expect(html).not.toContain('本轮有命令行工具调用')
   })
 
   test('Given 未完整跟踪且无改动 When 渲染 Then 保持静默不写结论', () => {

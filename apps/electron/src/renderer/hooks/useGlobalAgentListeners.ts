@@ -122,7 +122,8 @@ import {
 } from '@/lib/agent-completion-presence'
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 import { detectIsWindows } from '@/lib/platform'
-import { arePathsEqual, getInactiveSessionFileChangePaths, getSessionFileChangeKind, getOwnedSessionWatcherPaths, removeSessionFileChange, upsertSessionFileChange, type SessionFileChange } from '@/lib/session-file-changes'
+import { arePathsEqual, getInactiveSessionFileChangePaths, getSessionFileChangeKind, getOwnedSessionWatcherPathMatches, removeSessionFileChange, upsertSessionFileChange, type SessionFileChange } from '@/lib/session-file-changes'
+import { extractToolActivityPaths, resolveWatcherPathAttribution } from '@/lib/agent-watcher-attribution'
 import { upsertAgentRunFileChanges } from '@/lib/agent-run-file-changes'
 import { rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { doesWorkspaceChangeAffectPreview } from '@/components/diff/preview-open-path'
@@ -916,6 +917,48 @@ export function useGlobalAgentListeners(): void {
     }>()
     /** 正在执行的 git 突变 Bash 命令：toolUseId → sessionId（完成后触发 diff 刷新） */
     const pendingGitMutateTools = new Map<string, string>()
+    /**
+     * 本轮工具调用触碰过的绝对路径：会话 id → { runId, paths }。
+     *
+     * 工作区级附加目录与工作区项目根对该工作区的所有会话共享，两个会话并行时仅凭受管根
+     * 无法判定写入者；这里保留「谁本轮碰过哪个子目录」作为归属证据。换轮即重置，避免拿
+     * 上一轮的路径给这一轮作证。
+     */
+    const sessionActivityPaths = new Map<string, { runId: string; paths: string[] }>()
+    /** 单个会话保留的证据条数上限：命令行文本可能很长，避免长会话内存单调增长。 */
+    const MAX_SESSION_ACTIVITY_PATHS = 64
+    /** 同时保留证据的会话数上限：超出时按插入顺序淘汰最早记录，避免长时间运行的渲染进程堆积。 */
+    const MAX_SESSION_ACTIVITY_ENTRIES = 200
+
+    /**
+     * 记录一次工具调用触碰过的绝对路径。
+     *
+     * @param sessionId 目标会话。
+     * @param runId 本轮运行标识；与已存记录不同则视为新一轮，重置证据。
+     * @param input 工具调用入参。
+     */
+    const rememberSessionActivityPaths = (sessionId: string, runId: string, input: unknown): void => {
+      const extracted = extractToolActivityPaths(input, MAX_SESSION_ACTIVITY_PATHS)
+      if (extracted.length === 0) return
+
+      const existing = sessionActivityPaths.get(sessionId)
+      if (!existing || existing.runId !== runId) {
+        if (sessionActivityPaths.size >= MAX_SESSION_ACTIVITY_ENTRIES) {
+          const oldestSessionId = sessionActivityPaths.keys().next().value
+          if (typeof oldestSessionId === 'string' && oldestSessionId !== sessionId) {
+            sessionActivityPaths.delete(oldestSessionId)
+          }
+        }
+        sessionActivityPaths.set(sessionId, { runId, paths: extracted.slice(0, MAX_SESSION_ACTIVITY_PATHS) })
+        return
+      }
+
+      for (const path of extracted) {
+        if (existing.paths.includes(path)) continue
+        if (existing.paths.length >= MAX_SESSION_ACTIVITY_PATHS) break
+        existing.paths.push(path)
+      }
+    }
     /** 当前聊天修改自动定位；后台委托只补充所属聊天的变化摘要。 */
     const canvasChangeConsumer = startGlobalAgentCanvasChangeConsumer(store)
     /** 主进程仍持有的审批与问答必须随运行态一并恢复，避免重载后只剩运行计时。 */
@@ -1246,12 +1289,12 @@ export function useGlobalAgentListeners(): void {
      *
      * @param sessionId 目标会话。
      * @param startedAt 本轮运行开始时间戳（毫秒）。
-     * @param update 本次新增的路径、跟踪标记或终态时间。
+     * @param update 本次新增的路径、跟踪标记、无法归属标记或终态时间。
      */
     const trackRunFileChanges = (
       sessionId: string,
       startedAt: number,
-      update: { path?: string; observed?: boolean; endedAt?: number },
+      update: { path?: string; observed?: boolean; endedAt?: number; unattributed?: boolean },
     ): void => {
       if (!Number.isFinite(startedAt)) return
       const runId = String(startedAt)
@@ -1377,7 +1420,8 @@ export function useGlobalAgentListeners(): void {
           const workspaceProjectRootPath = session?.workspaceId
             ? (store.get(agentWorkspacesAtom).find((item) => item.id === session.workspaceId)?.projectRootPath ?? null)
             : null
-          const matchingPaths = getOwnedSessionWatcherPaths(filePaths, {
+          /** 命中的受管根一并带出：共享根场景下要用它判断证据是否更具体。 */
+          const matches = getOwnedSessionWatcherPathMatches(filePaths, {
             sessionExists: Boolean(session),
             sessionPath,
             sessionAttachedDirectories: session?.attachedDirectories ?? [],
@@ -1388,20 +1432,28 @@ export function useGlobalAgentListeners(): void {
             workspaceAttachedDirectories: workspaceAttachments.directories,
             workspaceAttachedFiles: workspaceAttachments.files,
           }, isWindows)
-          return { sessionId, matchingPaths }
+          return { sessionId, matches }
         }))
 
-        for (const { sessionId, matchingPaths } of candidates) {
-          // watcher 事件没有来源 session。路径被多个运行中会话覆盖时不能可靠归属，
-          // 因此仅记录唯一匹配的路径，避免把后台会话的写入显示在错误会话中。
-          const uniquelyMatchingPaths = matchingPaths.filter((changedPath) => (
-            candidates.filter((candidate) => candidate.matchingPaths.includes(changedPath)).length === 1
-          ))
-          if (uniquelyMatchingPaths.length === 0) continue
+        /** 改动路径 → 覆盖它的运行中会话（含各自命中的受管根）。 */
+        const ownersByPath = new Map<string, Array<{ sessionId: string; ownedRoot: string }>>()
+        for (const { sessionId, matches } of candidates) {
+          for (const match of matches) {
+            const owners = ownersByPath.get(match.path) ?? []
+            owners.push({ sessionId, ownedRoot: match.root })
+            ownersByPath.set(match.path, owners)
+          }
+        }
 
+        /**
+         * 把改动记到某一轮的记录里。
+         *
+         * @param sessionId 归属会话。
+         * @param changedPath 改动路径。
+         */
+        const attributeChangedPath = async (sessionId: string, changedPath: string): Promise<void> => {
           const runId = store.get(agentFileChangesCurrentRunAtom).get(sessionId)
             ?? String(streamingStates.get(sessionId)?.startedAt ?? Date.now())
-          for (const changedPath of uniquelyMatchingPaths) {
             // watcher 现在也会携带删除/目录路径；这些不应进入会话的文件改动记录。
             const existingFile = await window.electronAPI.resolveAndReadFile(changedPath, { sessionId, unrestricted: true })
             if (!existingFile) {
@@ -1414,7 +1466,7 @@ export function useGlobalAgentListeners(): void {
                 map.set(sessionId, removeSessionFileChange(current, changedPath, isWindows))
                 return map
               })
-              continue
+              return
             }
             const previewFile = await buildWrittenFilePreviewInfo(sessionId, changedPath)
             // 真实落盘证据：无论是否 Git 仓库都记入本轮分桶，使 Bash/脚本/格式化器的
@@ -1433,7 +1485,40 @@ export function useGlobalAgentListeners(): void {
                 return map
               })
             }
+        }
+
+        /**
+         * 标记某会话本轮存在无法归属的共享根改动。
+         *
+         * 路径不记给任何会话（不能猜写入者），但必须留下痕迹：否则两个会话并行时双方都会
+         * 显示「未检测到改动」，把遗漏写成结论。
+         *
+         * @param sessionId 覆盖该路径的运行中会话。
+         */
+        const markUnattributedChanges = (sessionId: string): void => {
+          const runId = store.get(agentFileChangesCurrentRunAtom).get(sessionId)
+            ?? String(streamingStates.get(sessionId)?.startedAt ?? Date.now())
+          trackRunFileChanges(sessionId, Number(runId), { unattributed: true })
+        }
+
+        for (const [changedPath, owners] of ownersByPath) {
+          // 归属规则全部在纯函数里：唯一覆盖者直接归属，共享根则要求活动证据。
+          const attribution = resolveWatcherPathAttribution(
+            changedPath,
+            owners.map((owner) => ({
+              sessionId: owner.sessionId,
+              ownedRoot: owner.ownedRoot,
+              activityPaths: sessionActivityPaths.get(owner.sessionId)?.paths ?? [],
+            })),
+            isWindows,
+          )
+
+          if (attribution.kind !== 'unique') {
+            for (const owner of owners) markUnattributedChanges(owner.sessionId)
+            continue
           }
+
+          await attributeChangedPath(attribution.sessionId, changedPath)
         }
       })().catch(() => { /* 文件监听不应影响会话流 */ })
     })
@@ -1784,6 +1869,14 @@ export function useGlobalAgentListeners(): void {
           }
 
           // Agent 写入完成后刷新 Git / 非 Git 改动数据，并保留未读改动提示。
+
+          // 记录本轮工具调用触碰过的路径：共享根（工作区级附加目录/项目根）上的监听
+          // 事件要靠它判定唯一写入者，否则同项目两个会话并行时两边都会被过滤掉。
+          if (event.type === 'tool_start') {
+            const activityRunId = store.get(agentFileChangesCurrentRunAtom).get(sessionId)
+              ?? String(store.get(agentSessionStreamingStateAtomFamily(sessionId))?.startedAt ?? event.turnId ?? Date.now())
+            rememberSessionActivityPaths(sessionId, activityRunId, event.input)
+          }
 
           // Agent 修改文件时，记入「最近修改」状态，用于 60s 内左侧竖条标记
           if (event.type === 'tool_start' && WRITE_TOOLS.has(event.toolName)) {

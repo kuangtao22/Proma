@@ -28,6 +28,13 @@ export interface AgentRunFileChanges {
    * 只有为 true 时才允许断言「本轮无文件改动」：中途重载或事后补建的记录可能漏掉早期改动。
    */
   observed: boolean
+  /**
+   * 本轮是否存在「看到了改动但无法归属到本会话」的监听事件。
+   *
+   * 工作区级附加目录与工作区项目根对该工作区所有会话共享，两个会话并行时无法确定写入者；
+   * 这种路径不会记给任何会话，但必须留下痕迹，否则空态会把遗漏写成结论。
+   */
+  hasUnattributedChanges?: boolean
 }
 
 /** 每个会话保留的最大运行记录数：覆盖当前会话可见历史，同时避免长会话内存单调增长。 */
@@ -53,6 +60,8 @@ export interface AgentRunFileChangesInput {
   path?: string
   /** 本轮结束时间戳（毫秒）；只在首次收到终态时写入。 */
   endedAt?: number
+  /** 本轮出现无法归属的共享根改动；一旦为 true 不再回退。 */
+  unattributed?: boolean
 }
 
 /**
@@ -77,8 +86,11 @@ export function upsertAgentRunFileChanges(
   const shouldAppendPath = normalizedPath !== undefined
     && !(existing?.paths.some((path) => arePathsEqual(path, normalizedPath, caseInsensitive)) ?? false)
   const shouldCloseRun = input.endedAt !== undefined && existing?.endedAt === undefined
+  const shouldMarkUnattributed = input.unattributed === true && existing?.hasUnattributedChanges !== true
 
-  if (existing && !shouldAppendPath && !shouldCloseRun) return records as AgentRunFileChanges[]
+  if (existing && !shouldAppendPath && !shouldCloseRun && !shouldMarkUnattributed) {
+    return records as AgentRunFileChanges[]
+  }
 
   let next: AgentRunFileChanges[]
   if (!existing) {
@@ -96,6 +108,7 @@ export function upsertAgentRunFileChanges(
       paths: normalizedPath !== undefined ? [normalizedPath] : [],
       // observed 只在创建时确定：事后补建的记录无法代表本轮完整改动，必须保持 false。
       observed: input.observed === true,
+      ...(input.unattributed === true ? { hasUnattributedChanges: true } : {}),
     }]
   } else {
     const updated: AgentRunFileChanges = {
@@ -104,6 +117,7 @@ export function upsertAgentRunFileChanges(
         ? [...existing.paths, normalizedPath]
         : existing.paths,
       ...(shouldCloseRun && input.endedAt !== undefined ? { endedAt: input.endedAt } : {}),
+      ...(shouldMarkUnattributed ? { hasUnattributedChanges: true } : {}),
     }
     next = records.map((record, index) => (index === existingIndex ? updated : record))
   }

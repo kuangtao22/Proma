@@ -21,6 +21,26 @@ function run(startedAt: number, overrides: Partial<AgentRunFileChanges> = {}): A
 }
 
 describe('本轮文件改动分桶', () => {
+  test('Given 共享根改动无法归属 When 标记 Then 记录上留下痕迹且一旦为真不回退', () => {
+    const marked = upsertAgentRunFileChanges([], {
+      runId: '2000',
+      startedAt: 2000,
+      observed: true,
+      unattributed: true,
+    })
+
+    expect(marked[0]?.hasUnattributedChanges).toBe(true)
+
+    // 后续普通路径写入不能把标记清掉（否则空态又会把遗漏写成结论）。
+    const afterPath = upsertAgentRunFileChanges(marked, {
+      runId: '2000',
+      startedAt: 2000,
+      path: '/project/a.ts',
+    })
+    expect(afterPath[0]?.hasUnattributedChanges).toBe(true)
+    expect(afterPath[0]?.paths).toEqual(['/project/a.ts'])
+  })
+
   test('Given 新运行 When 写入监听器路径 Then 建立记录并保留跟踪标记', () => {
     const records = upsertAgentRunFileChanges([], {
       runId: '1000',

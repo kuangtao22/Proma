@@ -1,3 +1,5 @@
+import { dirname } from 'node:path'
+
 // 高频变动目录：跳过依赖、缓存和构建中间物，防止产生 IPC 事件风暴。
 const HIGH_NOISE_SEGMENTS = new Set([
   'node_modules', '.next', '.nuxt', '.git', 'dist', 'build',
@@ -48,4 +50,57 @@ export function classifyWorkspaceWatchFilename(filename: string | Buffer | null)
   if ((parts.length === 2 && parts[1] === 'mcp.json')
     || parts[1] === 'skills' || parts[1] === 'skills-inactive') return 'capabilities'
   return 'files'
+}
+
+/** 启动恢复监听所需的索引输入：只取与监听范围相关的字段。 */
+export interface WatcherRestoreIndex {
+  /** 会话级附加目录与附加文件（只对该会话生效）。 */
+  sessions: ReadonlyArray<{
+    attachedDirectories?: readonly string[]
+    attachedFiles?: readonly string[]
+  }>
+  /** 工作区级项目根、附加目录与附加文件（对该工作区所有会话生效）。 */
+  workspaces: ReadonlyArray<{
+    projectRootPath?: string
+    attachedDirectories?: readonly string[]
+    attachedFiles?: readonly string[]
+  }>
+}
+
+/**
+ * 计算启动时必须恢复监听的目录清单。
+ *
+ * 主进程监听器只在用户「添加/关联」的那一刻挂上，进程重启后必须按索引重建，否则
+ * 关联目录会静默失去监听——历史缺陷正是工作区级附加目录没有恢复入口，导致重启后
+ * 外部业务项目里的改动收不到任何事件（右侧文件列表不刷新、「本轮文件改动」永远空态）。
+ * 三类来源缺一不可：
+ * 1. 会话级附加目录，以及会话级附加文件所在目录；
+ * 2. 工作区级附加目录，以及工作区级附加文件所在目录；
+ * 3. 工作区项目根（本地目录项目）。
+ *
+ * @param index 当前会话与工作区索引；字段缺失按「无」处理。
+ * @returns 去重后的目录清单，保持「会话 → 工作区」的发现顺序；空值被丢弃，目录是否
+ *          存在交给 watchAttachedDirectory 自行降级为父目录监听。
+ */
+export function collectWatcherRestoreDirectories(index: WatcherRestoreIndex): string[] {
+  /** 按发现顺序去重：`attachedWatchers` 以原始字符串为键，这里保持同样的判等口径。 */
+  const directories: string[] = []
+  const pushDirectory = (dirPath: string | undefined): void => {
+    if (typeof dirPath !== 'string' || dirPath.length === 0) return
+    if (directories.includes(dirPath)) return
+    directories.push(dirPath)
+  }
+
+  for (const session of index.sessions) {
+    for (const dirPath of session.attachedDirectories ?? []) pushDirectory(dirPath)
+    for (const filePath of session.attachedFiles ?? []) pushDirectory(dirname(filePath))
+  }
+
+  for (const workspace of index.workspaces) {
+    pushDirectory(workspace.projectRootPath)
+    for (const dirPath of workspace.attachedDirectories ?? []) pushDirectory(dirPath)
+    for (const filePath of workspace.attachedFiles ?? []) pushDirectory(dirname(filePath))
+  }
+
+  return directories
 }

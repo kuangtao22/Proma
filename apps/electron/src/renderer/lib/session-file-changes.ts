@@ -30,12 +30,42 @@ export interface SessionWatcherOwnershipScope {
   workspaceAttachedFiles: readonly string[]
 }
 
-/** Returns watcher paths that can be attributed from the available session scope. */
-export function getOwnedSessionWatcherPaths(
+/** 单个改动路径的归属命中。 */
+export interface SessionWatcherPathMatch {
+  /** 命中的改动路径。 */
+  path: string
+  /**
+   * 命中的受管根。
+   * 附加文件命中时取「其所在目录」：共享根场景下的证据判据要求证据严格深于该根，
+   * 用所在目录才能让「证据就是该文件本身」成立。
+   */
+  root: string
+}
+
+/** 取父目录；仅用于渲染进程字符串处理，不依赖 node:path。 */
+function getParentDirectory(path: string): string {
+  const normalized = path.replace(/\\/g, '/')
+  const index = normalized.lastIndexOf('/')
+  return index <= 0 ? '' : normalized.slice(0, index)
+}
+
+/**
+ * 返回改动路径与「命中的受管根」的配对。
+ *
+ * 与 [[getOwnedSessionWatcherPaths]] 同一套作用域判据，额外把命中的根带出来：当一个
+ * 改动路径同时落在多个运行中会话的根里（工作区级附加目录/项目根是该工作区所有会话
+ * 共享的），调用方需要用根信息判断活动证据是否比共享根更具体。
+ *
+ * @param changedPaths 监听器上报的改动路径。
+ * @param scope 目标会话的受管作用域。
+ * @param caseInsensitive 是否按大小写不敏感比较（Windows 为 true）。
+ * @returns 按改动路径顺序排列的命中列表；同一路径只保留首个命中的根。
+ */
+export function getOwnedSessionWatcherPathMatches(
   changedPaths: readonly string[],
   scope: SessionWatcherOwnershipScope,
   caseInsensitive = false,
-): string[] {
+): SessionWatcherPathMatch[] {
   if (!scope.sessionExists) return []
 
   const directoryRoots = [
@@ -53,14 +83,34 @@ export function getOwnedSessionWatcherPaths(
     attachedFiles.push(...scope.workspaceAttachedFiles)
   }
 
-  return changedPaths.filter((changedPath) => (
-    directoryRoots.some((rootPath) => (
+  const matches: SessionWatcherPathMatch[] = []
+  for (const changedPath of changedPaths) {
+    const matchedRoot = directoryRoots.find((rootPath) => (
       typeof rootPath === 'string'
       && rootPath.length > 0
       && isPathWithinRoot(rootPath, changedPath, caseInsensitive)
     ))
-    || attachedFiles.some((filePath) => arePathsEqual(filePath, changedPath, caseInsensitive))
-  ))
+    if (matchedRoot) {
+      matches.push({ path: changedPath, root: matchedRoot })
+      continue
+    }
+
+    const matchedFile = attachedFiles.find((filePath) => arePathsEqual(filePath, changedPath, caseInsensitive))
+    if (matchedFile) {
+      matches.push({ path: changedPath, root: getParentDirectory(matchedFile) || matchedFile })
+    }
+  }
+  return matches
+}
+
+/** Returns watcher paths that can be attributed from the available session scope. */
+export function getOwnedSessionWatcherPaths(
+  changedPaths: readonly string[],
+  scope: SessionWatcherOwnershipScope,
+  caseInsensitive = false,
+): string[] {
+  return getOwnedSessionWatcherPathMatches(changedPaths, scope, caseInsensitive)
+    .map((match) => match.path)
 }
 
 export type SessionFileChangeKind = "created" | "edited";

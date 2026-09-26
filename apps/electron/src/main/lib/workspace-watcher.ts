@@ -18,9 +18,19 @@ import type { BrowserWindow } from 'electron'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import { getAgentWorkspacesDir } from './config-paths'
 import { listAgentSessions } from './agent-session-manager'
-import { listAgentWorkspaces } from './agent-workspace-manager'
+import {
+  getWorkspaceAttachedDirectories,
+  getWorkspaceAttachedFiles,
+  listAgentWorkspaces,
+} from './agent-workspace-manager'
 import { invalidateGitDiffCache } from './git-diff-service'
-import { classifyWorkspaceWatchFilename, isHighNoisePath, normalizeWatchFilename, shouldNotifyForWatchFilename } from './workspace-watcher-utils'
+import {
+  classifyWorkspaceWatchFilename,
+  collectWatcherRestoreDirectories,
+  isHighNoisePath,
+  normalizeWatchFilename,
+  shouldNotifyForWatchFilename,
+} from './workspace-watcher-utils'
 
 /** debounce 延迟（ms） */
 const DEBOUNCE_MS = 300
@@ -114,21 +124,27 @@ function releaseUnavailableDirectoryWatcher(dirPath: string): void {
   console.log('[附加目录监听] 已停止父目录监听:', parentPath)
 }
 
-function restoreAgentSessionAttachedDirectoryWatchers(): void {
-  for (const session of listAgentSessions()) {
-    for (const dirPath of session.attachedDirectories ?? []) {
-      watchAttachedDirectory(dirPath)
-    }
-    for (const filePath of session.attachedFiles ?? []) {
-      watchAttachedDirectory(dirname(filePath))
-    }
-  }
-}
+/**
+ * 按最新索引重建全部外部目录监听。
+ *
+ * 监听器只在用户添加/关联的那一刻挂上，重启后必须重新挂，否则关联目录会静默失去监听
+ * （工作区级附加目录此前没有恢复入口，重启后外部业务项目里的改动收不到任何事件）。
+ * 覆盖会话级附加目录/附加文件、工作区级附加目录/附加文件与工作区项目根；工作区级附加
+ * 目录与项目根必须分别从索引与工作区配置读取，两者不在同一份数据里。
+ */
+function restoreAttachedDirectoryWatchers(): void {
+  const dirPaths = collectWatcherRestoreDirectories({
+    sessions: listAgentSessions(),
+    // 工作区附加目录/附加文件存在各自工作区的 config.json，索引里没有这两个字段。
+    workspaces: listAgentWorkspaces().map((workspace) => ({
+      projectRootPath: workspace.projectRootPath,
+      attachedDirectories: getWorkspaceAttachedDirectories(workspace.slug),
+      attachedFiles: getWorkspaceAttachedFiles(workspace.slug),
+    })),
+  })
 
-/** 从最新索引恢复全部外部项目根监听，迁移恢复后不会继续监听旧根。 */
-function restoreAgentWorkspaceProjectRootWatchers(): void {
-  for (const workspace of listAgentWorkspaces()) {
-    if (workspace.projectRootPath) watchAttachedDirectory(workspace.projectRootPath)
+  for (const dirPath of dirPaths) {
+    watchAttachedDirectory(dirPath)
   }
 }
 
@@ -203,10 +219,9 @@ function watchUnavailableDirectoryParent(dirPath: string): void {
 export function startWorkspaceWatcher(win: BrowserWindow): void {
   workspaceWatcherActive = true
   mainWin = win
-  // 会话附加目录只需在启动/监听器重启时恢复一次；LIST_SESSIONS 是高频读取路径，
-  // 不能随每次列表 IPC 再遍历全部会话并触发同步 stat。
-  restoreAgentSessionAttachedDirectoryWatchers()
-  restoreAgentWorkspaceProjectRootWatchers()
+  // 附加目录（会话级 + 工作区级 + 项目根）只需在启动/监听器重启时恢复一次；
+  // LIST_SESSIONS/LIST_WORKSPACES 是高频读取路径，不能随每次列表 IPC 再遍历全部索引。
+  restoreAttachedDirectoryWatchers()
   const watchDir = getAgentWorkspacesDir()
 
   if (!existsSync(watchDir)) {
