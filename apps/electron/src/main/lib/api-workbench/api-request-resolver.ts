@@ -2,6 +2,8 @@ import { API_LIMITS } from '@proma/shared'
 import { randomUUID } from 'node:crypto'
 import type {
   ApiCatalog,
+  ApiCollection,
+  ApiEnvironment,
   ApiField,
   ApiResolvedRequest,
   ApiRequestDraft,
@@ -66,6 +68,71 @@ export interface ResolveApiRequestResult {
 interface VariableValue {
   value: string
   secret: boolean
+}
+
+/**
+ * 合并变量作用域链：工作区 < 集合 < 环境 < 运行时 < 单次覆盖。
+ * 请求解析与加密密钥解析共用这一条链路，避免「模板里取到的值」和「签名用的密钥」来自不同作用域。
+ */
+function mergeVariables(input: {
+  catalog: ApiCatalog
+  collection: ApiCollection
+  environment?: ApiEnvironment
+  overrides?: ApiField[]
+  runtimeVariables?: ApiField[]
+  resolveSecret: (lookup: ApiSecretLookup) => ApiResolvedSecret | undefined
+  secretRevisions: Record<string, string>
+  secretValues: Set<string>
+}): Map<string, VariableValue> {
+  const variables = new Map<string, VariableValue>()
+  /** 工作区级变量优先级最低：集合、环境、运行时与单次覆盖都能盖掉它。 */
+  applyVariables(variables, input.catalog.workspaceVariables ?? [], 'workspace:variable', input.resolveSecret, input.secretRevisions, input.secretValues)
+  applyVariables(variables, input.collection.variables, `collection:${input.collection.id}:variable`, input.resolveSecret, input.secretRevisions, input.secretValues)
+  if (input.environment) applyVariables(variables, input.environment.variables, `environment:${input.environment.id}:variable`, input.resolveSecret, input.secretRevisions, input.secretValues)
+  if (input.runtimeVariables) applyVariables(variables, input.runtimeVariables, 'runtime:variable', input.resolveSecret, input.secretRevisions, input.secretValues)
+  if (input.overrides) applyVariables(variables, input.overrides, 'override:runtime:variable', input.resolveSecret, input.secretRevisions, input.secretValues)
+  return variables
+}
+
+/** 加密密钥解析输入：只按名字取被方案显式引用的变量。 */
+export interface ResolveApiCryptoSecretsInput {
+  catalog: ApiCatalog
+  /** 请求所属集合 id：决定集合级变量层。 */
+  collectionId: string
+  environmentId?: string
+  overrides?: ApiField[]
+  runtimeVariables?: ApiField[]
+  /** 方案里引用的密钥变量名（keyRef / ivRef 去重后）。 */
+  names: readonly string[]
+  resolveSecret: (lookup: ApiSecretLookup) => ApiResolvedSecret | undefined
+}
+
+/**
+ * 解析加密方案需要的密钥取值。
+ * 只返回被显式点名的变量：方案没引用到的变量不会因为这条路径被读出来；
+ * 找不到或取值为空的变量直接缺席，由编排层判成「缺密钥」并跳过该步。
+ */
+export function resolveApiCryptoSecrets(input: ResolveApiCryptoSecretsInput): Record<string, string> {
+  const collection = input.catalog.collections.find((item) => item.id === input.collectionId)
+  if (!collection) throw new Error('API_WORKBENCH_COLLECTION_NOT_FOUND')
+  const environment = input.environmentId ? input.catalog.environments.find((item) => item.id === input.environmentId) : undefined
+  if (input.environmentId && !environment) throw new Error('API_WORKBENCH_ENVIRONMENT_NOT_FOUND')
+  const variables = mergeVariables({
+    catalog: input.catalog,
+    collection,
+    ...(environment ? { environment } : {}),
+    ...(input.overrides ? { overrides: input.overrides } : {}),
+    ...(input.runtimeVariables ? { runtimeVariables: input.runtimeVariables } : {}),
+    resolveSecret: input.resolveSecret,
+    secretRevisions: {},
+    secretValues: new Set<string>(),
+  })
+  const secrets: Record<string, string> = {}
+  for (const name of input.names) {
+    const found = variables.get(name)
+    if (found?.value) secrets[name] = found.value
+  }
+  return secrets
 }
 
 /** 模板变量名称保持简单稳定，避免模板本身成为表达式执行入口。 */
@@ -203,18 +270,24 @@ export function resolveApiRequest(input: ResolveApiRequestInput): ResolveApiRequ
   if (input.environmentId && !environment) throw new Error('API_WORKBENCH_ENVIRONMENT_NOT_FOUND')
 
   const knownNames = new Set<string>()
-  for (const field of [...collection.variables, ...(environment?.variables ?? []), ...(input.overrides ?? [])]) {
+  /** 工作区级变量同样参与模板解析，必须计入已知变量名，否则 URL 用 {{baseUrl}} 会被误判为未知模板。 */
+  for (const field of [...(input.catalog.workspaceVariables ?? []), ...collection.variables, ...(environment?.variables ?? []), ...(input.overrides ?? [])]) {
     if (field.enabled && field.name) knownNames.add(field.name)
   }
   assertTemplateNamesKnown(input.request.url, knownNames)
 
   const secretRevisions: Record<string, string> = {}
   const secretValues = new Set<string>()
-  const variables = new Map<string, VariableValue>()
-  applyVariables(variables, collection.variables, `collection:${collection.id}:variable`, input.resolveSecret, secretRevisions, secretValues)
-  if (environment) applyVariables(variables, environment.variables, `environment:${environment.id}:variable`, input.resolveSecret, secretRevisions, secretValues)
-  if (input.runtimeVariables) applyVariables(variables, input.runtimeVariables, 'runtime:variable', input.resolveSecret, secretRevisions, secretValues)
-  if (input.overrides) applyVariables(variables, input.overrides, 'override:runtime:variable', input.resolveSecret, secretRevisions, secretValues)
+  const variables = mergeVariables({
+    catalog: input.catalog,
+    collection,
+    ...(environment ? { environment } : {}),
+    ...(input.overrides ? { overrides: input.overrides } : {}),
+    ...(input.runtimeVariables ? { runtimeVariables: input.runtimeVariables } : {}),
+    resolveSecret: input.resolveSecret,
+    secretRevisions,
+    secretValues,
+  })
 
   const rawUrl = interpolateUrl(input.request.url, variables)
   let url: URL

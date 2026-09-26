@@ -390,6 +390,27 @@ export interface ApiTransportResult {
   sse?: ApiSseSummary
   error?: ApiFailure
 }
+/**
+ * 一次运行的加密事实：只记算法名、变量名、实际派生值与布尔结论。
+ * 密钥值永不进入运行记录（导出快照同样只导占位符）。
+ */
+export interface ApiRunCrypto {
+  /** 本次使用的方案身份与版本，便于按 revision 回溯「当时用的是哪一版方案」。 */
+  profileId?: string
+  profileName?: string
+  profileRevision?: number
+  executed: Array<{ id: string; kind: string; algo: string }>
+  skipped: Array<{ id: string; kind: string; algo: string; reason: 'missing-secret' | 'disabled' | 'invalid-config'; keyRef?: string }>
+  /** 因缺密钥或配置不完整而未签名/未加密：状态条必须显式标注「明文发出」。 */
+  plaintextSent: boolean
+  decrypted: boolean
+  /** 实际使用的 timestamp / nonce（非秘密），用于复现本次签名。 */
+  derived?: Record<string, string>
+  /** 解密失败的可分类原因；不记录密钥与明文。 */
+  failure?: { code: string; message: string }
+  /** 被加密前的请求正文，便于对照「实际发出的密文 ↔ 变形前明文」。 */
+  bodyBeforeTransform?: string
+}
 /** 运行记录；getRun 的默认返回是脱敏投影。 */
 export interface ApiRun {
   id: string; workspaceId: string; sessionId: string; source: 'manual' | 'agent'
@@ -403,6 +424,8 @@ export interface ApiRun {
   extracted?: ApiExtractionOutcome[]
   /** 本次运行所跑的测试用例；未按用例跑时缺省。 */
   caseId?: string
+  /** 加密事实；未使用签名/加密方案的请求没有这个字段。 */
+  crypto?: ApiRunCrypto
 }
 /** 正文分页结果；offset 按字符计数，下一页通过 nextOffset 获取。 */
 export interface ApiBodySlice { text: string; offset: number; nextOffset: number | null; totalChars: number; truncated: boolean }

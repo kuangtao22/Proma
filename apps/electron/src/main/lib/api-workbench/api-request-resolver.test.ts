@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ApiCatalog, ApiRequestDraft } from '@proma/shared'
-import { resolveApiRequest } from './api-request-resolver'
+import { resolveApiCryptoSecrets, resolveApiRequest } from './api-request-resolver'
 
 const catalog: ApiCatalog = {
   version: 1,
@@ -184,5 +184,59 @@ describe('自动 Cookie 注入', () => {
 
     expect(result.request.url).toBe('https://example.test/users')
     expect(result.request.headers.some((header) => header.name.toLowerCase() === 'cookie')).toBe(true)
+  })
+})
+
+describe('工作区变量与加密密钥解析', () => {
+  /** 分层目录：工作区定义 base/shared，集合再用同名变量覆盖，环境只有 path。 */
+  const layered: ApiCatalog = {
+    ...catalog,
+    workspaceVariables: [
+      { id: 'w_only', name: 'onlyWorkspace', value: 'w-value', enabled: true },
+      { id: 'w_shared', name: 'shared', value: 'from-workspace', enabled: true },
+    ],
+    collections: [{
+      ...catalog.collections[0]!,
+      variables: [...catalog.collections[0]!.variables, { id: 'c_shared', name: 'shared', value: 'from-collection', enabled: true }],
+    }],
+  }
+
+  test('Given 工作区变量 When 解析 Then 参与模板且让位于集合与环境', () => {
+    const result = resolveApiRequest({
+      catalog: layered,
+      request: { ...draft(), url: '{{base}}/{{onlyWorkspace}}/{{shared}}' },
+      /** 夹具草稿的 query/body 引用环境里的 path，带上环境才是完整解析。 */
+      environmentId: 'test',
+      /** 夹具草稿的 Auth 用 {{token}}，秘密解析要给非空值，否则会按「鉴权为空」拒绝。 */
+      resolveSecret: () => ({ value: 'fixture-token', revision: '1' }),
+    })
+    /** base 由集合提供（工作区没有同名变量），shared 两边都有时集合胜出。 */
+    const resolvedUrl = new URL(result.request.url)
+    expect(resolvedUrl.host).toBe('example.test')
+    expect(resolvedUrl.pathname).toBe('/w-value/from-collection')
+  })
+
+  test('Given 只点名部分密钥 When 解析加密密钥 Then 只返回被点名的变量', () => {
+    const secrets = resolveApiCryptoSecrets({
+      catalog: layered,
+      collectionId: 'collection',
+      environmentId: 'test',
+      names: ['onlyWorkspace', 'shared', '不存在的密钥'],
+      /** 夹具环境里的 token 是秘密字段：解析密钥的用例只需要它不抛错。 */
+      resolveSecret: () => ({ value: '', revision: '1' }),
+    })
+    /** 没被点名的变量（如环境里的 path）根本不会出现在结果里。 */
+    expect(secrets).toEqual({ onlyWorkspace: 'w-value', shared: 'from-collection' })
+  })
+
+  test('Given 未登记同名变量 When 解析加密密钥 Then 该名字缺席而不是空串', () => {
+    const secrets = resolveApiCryptoSecrets({
+      catalog: layered,
+      collectionId: 'collection',
+      names: ['neverDeclared'],
+      /** 夹具环境里的 token 是秘密字段：解析密钥的用例只需要它不抛错。 */
+      resolveSecret: () => ({ value: '', revision: '1' }),
+    })
+    expect('neverDeclared' in secrets).toBe(false)
   })
 })

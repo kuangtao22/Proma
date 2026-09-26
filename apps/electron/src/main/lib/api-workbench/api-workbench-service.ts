@@ -13,6 +13,7 @@ import {
 import type {
   ApiBodySlice,
   ApiCatalog,
+  ApiCryptoOverrides,
   ApiCryptoProfile,
   ApiCryptoProfileDeleteInput,
   ApiCryptoProfileDeleteResult,
@@ -26,6 +27,7 @@ import type {
   ApiPreparedPreview,
   ApiResolvedRequest,
   ApiRun,
+  ApiRunCrypto,
   ApiRunChanged,
   ApiRunStreamChanged,
   ApiScenarioFailurePolicy,
@@ -34,6 +36,7 @@ import type {
   ApiScenarioStepOutcome,
   ApiSseEvent,
   ApiRuntimeVariable,
+  ApiRequestDraft,
   ApiCookieJarEntry,
   ApiWorkspaceVariablesSaveInput,
   ApiWorkspaceVariablesSaveResult,
@@ -51,7 +54,9 @@ import type { ApiPickedFileMeta } from './api-file-store'
 import { composeMultipartBody } from './api-multipart'
 import type { ApiMultipartPlanPart } from './api-multipart'
 import { redactApiBody, redactApiRequest } from './api-redaction'
-import { resolveApiRequest } from './api-request-resolver'
+import { resolveApiCryptoSecrets, resolveApiRequest } from './api-request-resolver'
+import { applyRequestSteps, applyResponseSteps } from './api-crypto-plan'
+import type { ApiCryptoRequestOutcome } from './api-crypto-plan'
 import type { ApiWorkbenchStore } from './api-workbench-store'
 import { createEmptyApiBody } from './api-workbench-store'
 
@@ -151,6 +156,8 @@ export interface ApiWorkbenchServiceOptions {
 interface PreparedRecord {
   context: ApiWorkbenchContext
   preview: ApiPreparedPreview
+  /** 冻结的编辑草稿：发送阶段重解析加密密钥时还要用到集合与环境归属。 */
+  draft: ApiRequestDraft
   rawRequest: ApiResolvedRequest
   /**
    * multipart 的待发计划：文本字段已解析，文件部分只有引用与元数据。
@@ -164,11 +171,29 @@ interface PreparedRecord {
   extractions: NonNullable<ReturnType<typeof parseApiRequestDraft>['extractions']>
   /** 本次请求是否开启自动 Cookie：决定运行终态是否写入 jar。 */
   useCookieJar: boolean
+  /**
+   * 准备阶段冻结的加密方案：批准卡上列的步骤就是执行时用的那一版。
+   * 密钥值**不在**这里——发送前才按作用域链重新解析，因此「批准后用户才填密钥」也能生效。
+   */
+  crypto?: FrozenCryptoPlan
   secretValues: string[]
   origin: string
   runId?: string
   requestId?: string
   artifacts?: { directory: string; keyBase64: string }
+}
+
+/** 冻结的加密方案：方案内容 + 执行时解析密钥所需的作用域信息。 */
+interface FrozenCryptoPlan {
+  profile: ApiCryptoProfile
+  overrides?: ApiCryptoOverrides
+  environmentId?: string
+  /** 与请求解析同源的作用域输入：用例覆盖 + 单次覆盖。 */
+  variableOverrides?: ApiField[]
+  /** 展示阶段允许的占位运行时变量（流程后续步骤用），发送时同样传入以保持作用域一致。 */
+  deferredRuntimeVariables?: ApiField[]
+  /** 方案引用的密钥变量名（keyRef / ivRef 去重）。 */
+  names: string[]
 }
 
 interface ScheduledTask {
@@ -248,6 +273,48 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolvePromise: ((value: T) => void) | undefined
   const promise = new Promise<T>((resolve) => { resolvePromise = resolve })
   return { promise, resolve: (value) => resolvePromise?.(value) }
+}
+
+/** 终态投影去掉变形前明文：它可能是一整份请求正文，内存投影只需要算法与结论。 */
+function stripRunCryptoHeavy(crypto: ApiRunCrypto): ApiRunCrypto {
+  const { bodyBeforeTransform: _ignored, ...rest } = crypto
+  void _ignored
+  return rest
+}
+
+/** 请求侧事实转成运行记录字段；只搬运算法名、变量名与派生值。 */
+function runCryptoFromRequest(profile: ApiCryptoProfile, outcome: ApiCryptoRequestOutcome): ApiRunCrypto {
+  return {
+    profileId: profile.id, profileName: profile.name, profileRevision: profile.revision,
+    executed: outcome.executed, skipped: outcome.skipped,
+    plaintextSent: outcome.plaintextSent,
+    decrypted: false,
+    ...(Object.keys(outcome.derived).length === 0 ? {} : { derived: outcome.derived }),
+    ...(outcome.bodyBeforeTransform === undefined ? {} : { bodyBeforeTransform: outcome.bodyBeforeTransform }),
+  }
+}
+
+/**
+ * 把编排结果写回已解析请求。
+ * 查询串只在真的变化时才重建 URL：否则重新编码会无谓改动原始地址（服务端可能校验原始编码）。
+ */
+function rebaseApiRequest(request: ApiResolvedRequest, original: URL, outcome: ApiCryptoRequestOutcome): ApiResolvedRequest {
+  const originalQuery = [...original.searchParams.entries()]
+  const queryChanged = outcome.query.length !== originalQuery.length
+    || outcome.query.some((row, index) => row.name !== originalQuery[index]?.[0] || row.value !== originalQuery[index]?.[1])
+  const headersUnchanged = outcome.headers.length === request.headers.length
+    && outcome.headers.every((row, index) => row.name === request.headers[index]?.name && row.value === request.headers[index]?.value)
+  /** 原有请求头的来源标记（用户 / 生成）要保留，否则界面会看不出哪些头是自动加的。 */
+  const headers = headersUnchanged
+    ? request.headers
+    : outcome.headers.map((row) => request.headers.find((header) => header.name === row.name && header.value === row.value) ?? { name: row.name, value: row.value })
+  let url = request.url
+  if (queryChanged) {
+    const next = new URL(request.url)
+    next.search = outcome.query.length === 0 ? '' : '?' + outcome.query.map(({ name, value }) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`).join('&')
+    url = next.toString()
+  }
+  return { ...request, url, headers, body: outcome.body }
 }
 
 /** 常见敏感响应头必须在公开逐跳记录中遮罩。 */
@@ -428,11 +495,25 @@ export class ApiWorkbenchService {
     })
     let origin: string
     try { origin = new URL(resolved.request.url).origin } catch { throw new Error('API_WORKBENCH_URL_INVALID') }
+    /**
+     * 加密方案在准备阶段冻结：批准卡上列的步骤与 revision 就是执行时用的那一版。
+     * 密钥值不在这里读——留到真正派发时再解析，用户可以在批准之后才填密钥。
+     */
+    const crypto = this.freezeCryptoPlan(catalog, request, {
+      ...(effectiveEnvironmentId ? { environmentId: effectiveEnvironmentId } : {}),
+      ...((testCase?.overrides?.length || input.overrides?.length) ? { variableOverrides: [...(testCase?.overrides ?? []), ...(input.overrides ?? [])] } : {}),
+      ...(input.deferredRuntimeVariables?.length
+        ? { deferredRuntimeVariables: input.deferredRuntimeVariables.map((item) => ({ id: `deferred_${item.name}`, name: item.name, value: item.value, enabled: true })) }
+        : {}),
+      binaryBody: multipart !== undefined,
+    })
     this.prepared.set(preparedId, {
       context: { ...context },
       ...(requestId ? { requestId } : {}),
       preview,
+      draft: request,
       rawRequest,
+      ...(crypto ? { crypto } : {}),
       ...(multipart ? { multipart } : {}),
       assertions: (testCase?.assertions ?? request.assertions).map((assertion) => ({ ...assertion })),
       ...(testCase ? { caseId: testCase.id } : {}),
@@ -479,7 +560,18 @@ export class ApiWorkbenchService {
      * 因此「批准前不碰文件内容」是时序保证，而不是约定。
      */
     const dispatch = this.composeAttachments(prepared)
-    prepared.rawRequest = dispatch.request
+    /** 加密与签名在派发前才执行：时间戳贴近真实发送时刻，密钥也在这时才读取。 */
+    const crypto = this.applyRequestCrypto(context, prepared, dispatch.request)
+    prepared.rawRequest = crypto.request
+    /**
+     * 记录里保存的请求是**实际发出的形态**（含签名头与密文正文）的脱敏投影：
+     * 否则记录会看起来像「发了一条未签名的明文请求」，与事实不符。
+     * 变形前明文由 crypto.bodyBeforeTransform 保留，两者可对照。
+     */
+    /** 没有加密方案时沿用准备阶段的预览；有方案时才换成「实际发出的形态」，并先剥掉二进制正文。 */
+    const sentProjection = prepared.crypto === undefined
+      ? prepared.preview.request
+      : redactApiRequest(requestForRecord(crypto.request), prepared.secretValues)
     const runId = parseApiId(this.uuid())
     const queued = parseApiRun({
       id: runId,
@@ -494,12 +586,14 @@ export class ApiWorkbenchService {
       createdAt: this.now(),
       state: 'queued',
       /** 记录里的附件摘要（含 sha256）在这一刻才有，因此按派发结果补进公开投影。 */
-      request: dispatch.attachments ? { ...prepared.preview.request, attachments: dispatch.attachments } : prepared.preview.request,
+      request: dispatch.attachments ? { ...sentProjection, attachments: dispatch.attachments } : sentProjection,
       hops: [],
       body: createEmptyApiBody(),
       assertions: [],
       recording: 'memory-only',
       pinned: false,
+      /** 请求侧的加密事实随 queued 一并落盘；解密结论在响应回来后补写。 */
+      ...(crypto.facts ? { crypto: crypto.facts } : {}),
     })
     /** 落盘的是脱敏可留存的投影：二进制正文（bodyBase64）不进记录。 */
     const created = this.store.createRun(queued, requestForRecord(prepared.rawRequest), prepared.secretValues)
@@ -1009,6 +1103,102 @@ export class ApiWorkbenchService {
   }
 
   /**
+   * 冻结请求选中的加密方案。
+   * 方案缺失直接拒绝：用户既然显式选了安全方案，就不能因为方案被删而静默按明文发出。
+   */
+  private freezeCryptoPlan(catalog: ApiCatalog, request: ApiRequestDraft, options: {
+    environmentId?: string
+    variableOverrides?: ApiField[]
+    deferredRuntimeVariables?: ApiField[]
+    /** 该请求是 multipart（二进制正文）：P1 的加密步骤只支持文本正文。 */
+    binaryBody: boolean
+  }): FrozenCryptoPlan | undefined {
+    if (request.selectedProfileId === undefined) return undefined
+    const profile = (catalog.cryptoProfiles ?? []).find((item) => item.id === request.selectedProfileId)
+    if (!profile) throw new Error('API_WORKBENCH_CRYPTO_PROFILE_NOT_FOUND')
+    if (options.binaryBody && profile.requestSteps.some((step) => step.enabled && step.kind === 'encrypt')) {
+      throw new Error('API_WORKBENCH_CRYPTO_BINARY_BODY_UNSUPPORTED: 加密步骤只支持文本正文，multipart 请求请改用签名')
+    }
+    /**
+     * 要解析的密钥变量名：方案步骤引用的 + 接口级覆盖项替换后的名字。
+     * 漏掉覆盖项会让「本接口改用另一把密钥」永远解析不到值，被误判成缺密钥。
+     */
+    const names = [...new Set([
+      ...[...profile.requestSteps, ...profile.responseSteps].flatMap((step) => [step.keyRef, step.ivRef]),
+      ...Object.values(request.cryptoOverrides?.keyRefs ?? {}),
+    ].filter((name): name is string => name !== undefined))]
+    return {
+      profile,
+      ...(request.cryptoOverrides ? { overrides: request.cryptoOverrides } : {}),
+      ...(options.environmentId ? { environmentId: options.environmentId } : {}),
+      ...(options.variableOverrides ? { variableOverrides: options.variableOverrides } : {}),
+      ...(options.deferredRuntimeVariables ? { deferredRuntimeVariables: options.deferredRuntimeVariables } : {}),
+      names,
+    }
+  }
+
+  /** 按同一条作用域链解析方案引用的密钥；只读被显式点名的变量。 */
+  private cryptoSecrets(context: ApiWorkbenchContext, plan: FrozenCryptoPlan, draft: ApiRequestDraft): Record<string, string> {
+    return resolveApiCryptoSecrets({
+      catalog: this.store.getCatalog(context.workspaceId),
+      collectionId: draft.collectionId,
+      ...(plan.environmentId ? { environmentId: plan.environmentId } : {}),
+      ...(plan.variableOverrides ? { overrides: plan.variableOverrides } : {}),
+      runtimeVariables: [...this.runtimeVariableFields(context.workspaceId), ...(plan.deferredRuntimeVariables ?? [])],
+      names: plan.names,
+      resolveSecret: ({ ref, owner }) => this.store.resolveSecret(context.workspaceId, ref, owner),
+    })
+  }
+
+  /**
+   * 执行请求侧的签名与加密。
+   * 只在派发路径调用：时间戳/nonce 必须贴近真实发送时刻，密钥也在这一刻才被读取。
+   */
+  private applyRequestCrypto(context: ApiWorkbenchContext, prepared: PreparedRecord, request: ApiResolvedRequest): { request: ApiResolvedRequest; facts?: ApiRunCrypto } {
+    const plan = prepared.crypto
+    if (!plan) return { request }
+    if (request.bodyBase64 !== undefined && plan.profile.requestSteps.some((step) => step.enabled && step.kind === 'encrypt')) {
+      throw new Error('API_WORKBENCH_CRYPTO_BINARY_BODY_UNSUPPORTED: 加密步骤只支持文本正文，multipart 请求请改用签名')
+    }
+    const url = new URL(request.url)
+    const outcome = applyRequestSteps({
+      profile: plan.profile,
+      secrets: this.cryptoSecrets(context, plan, prepared.draft),
+      ...(plan.overrides ? { overrides: plan.overrides } : {}),
+      request: {
+        method: request.method,
+        path: url.pathname,
+        query: [...url.searchParams.entries()].map(([name, value]) => ({ name, value })),
+        headers: request.headers.map(({ name, value }) => ({ name, value })),
+        body: request.body,
+      },
+    })
+    return { request: rebaseApiRequest(request, url, outcome), facts: runCryptoFromRequest(plan.profile, outcome) }
+  }
+
+  /**
+   * 执行响应侧解密，返回解密后的正文与事实。
+   * 解密必须在断言与提取之前完成：它们读的是解密后的原始正文，而不是密文。
+   */
+  private applyResponseCrypto(task: ScheduledTask, result: ApiTransportResult): ReturnType<typeof applyResponseSteps> | undefined {
+    const plan = task.prepared.crypto
+    if (!plan) return undefined
+    /** 正文不完整时直接判失败：截断的密文解出来只会是噪声，还会把原因误报成「密钥不对」。 */
+    if (!result.body.complete || result.body.previewTruncated) {
+      return {
+        body: result.body.preview, decrypted: false, executed: [], skipped: [],
+        failure: { code: 'API_CRYPTO_DECRYPT_FAILED', message: '正文不完整或超出预览范围，无法解密' },
+      }
+    }
+    return applyResponseSteps({
+      profile: plan.profile,
+      secrets: this.cryptoSecrets(task.prepared.context, plan, task.prepared.draft),
+      ...(plan.overrides ? { overrides: plan.overrides } : {}),
+      responseBody: result.body.preview,
+    })
+  }
+
+  /**
    * 按待发计划读取附件并合成待发正文。
    *
    * 只有真正派发时才会调用：读取前由文件仓库复核 inode 与时间戳，文件被换掉即拒绝。
@@ -1062,14 +1252,20 @@ export class ApiWorkbenchService {
         ...(task.prepared.artifacts ? { artifacts: task.prepared.artifacts } : {}),
         onEvent: (events) => this.appendStreamEvents(task, this.redactStreamEvents(events, task.prepared.secretValues)),
       })
+      /**
+       * 响应先解密，再交给断言与提取：它们必须读解密后的原始正文。
+       * 记录里保存的也是解密后的正文预览；解密失败时保留密文原文并附上可分类原因。
+       */
+      const cryptoResponse = this.applyResponseCrypto(task, result)
+      const effectiveResult = cryptoResponse === undefined ? result : { ...result, body: { ...result.body, preview: cryptoResponse.body } }
       /** 只有开启自动 Cookie 的请求才写 jar：关闭的请求不产生任何 cookie 副作用。 */
       this.recordCookies(task, result)
       let recordingFailed = result.error?.code === 'API_ARTIFACT_UNAVAILABLE'
       try { this.store.saveRawDetails(task.prepared.context.workspaceId, runId, requestForRecord(task.prepared.rawRequest), result.hops) }
       catch { recordingFailed = true }
-      const publicResult = redactTransportResult(result, task.prepared.rawRequest, task.prepared.secretValues)
+      const publicResult = redactTransportResult(effectiveResult, task.prepared.rawRequest, task.prepared.secretValues)
       const state = result.state
-      const assertionResults = evaluateApiAssertions(task.prepared.assertions, result, {
+      const assertionResults = evaluateApiAssertions(task.prepared.assertions, effectiveResult, {
         events: task.sseEvents, droppedEvents: task.sseDropped,
       }).map((assertion) => ({
         ...assertion,
@@ -1086,7 +1282,18 @@ export class ApiWorkbenchService {
         body: publicResult.body,
         assertions: assertionResults,
         /** 提取必须读原始响应：公开投影里的敏感 JSON 字段已经被遮罩成 [REDACTED]。 */
-        extracted: this.recordExtractions(task, result, result.state === 'completed'),
+        extracted: this.recordExtractions(task, effectiveResult, result.state === 'completed'),
+        /** 解密结论与失败原因补写进同一个 crypto 字段。 */
+        ...(run.crypto === undefined || cryptoResponse === undefined ? {} : {
+          crypto: {
+            ...run.crypto,
+            /** 响应侧事实并入记录：解密步骤跑了什么、跳过了什么同样要能看到。 */
+            executed: [...run.crypto.executed, ...cryptoResponse.executed],
+            skipped: [...run.crypto.skipped, ...cryptoResponse.skipped],
+            decrypted: cryptoResponse.decrypted,
+            ...(cryptoResponse.failure ? { failure: cryptoResponse.failure } : {}),
+          },
+        }),
         ...(publicResult.sse
           ? { sse: { ...publicResult.sse, events: task.sseEvents, droppedEvents: task.sseDropped } }
           : {}),
@@ -1175,6 +1382,8 @@ export class ApiWorkbenchService {
     return parseApiRun({ ...run, request: { ...run.request, headers: [], body: '' },
       hops: run.hops.length ? [{ ...run.hops.at(-1)!, requestHeaders: [], responseHeaders: [], trailers: [] }] : [],
       body: { ...run.body, preview: '', previewTruncated: run.body.preview.length > 0 || run.body.previewTruncated }, assertions: [],
+      /** 终态投影同样丢掉变形前明文，避免常驻内存里留一份请求正文。 */
+      ...(run.crypto ? { crypto: stripRunCryptoHeavy(run.crypto) } : {}),
       /** 常驻内存的终态投影只保留事件计数，明细仍按需从 Store 读取。 */
       ...(run.sse ? { sse: { ...run.sse, events: [] } } : {}) })
   }

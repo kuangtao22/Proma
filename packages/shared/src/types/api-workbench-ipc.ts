@@ -1,5 +1,5 @@
 import { API_LIMITS, apiInteger, apiRecord, parseApiCatalog, parseApiCryptoProfile, parseApiFields, parseApiId, parseApiRequestDraft, parseApiTarget } from './api-workbench'
-import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiCryptoProfile, ApiCryptoProfileSaveInput, ApiCryptoProfileDeleteInput, ApiCryptoProfileDeleteResult, ApiWorkspaceVariablesSaveInput, ApiWorkspaceVariablesSaveResult, ApiCryptoReferenceQuery, ApiCryptoReferences, ApiPreparedPreview, ApiRun, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview, ApiPrepareScenarioInput, ApiScenarioPreparedInput, ApiScenarioRunInput } from './api-workbench'
+import type { ApiWorkbenchApi, ApiTarget, ApiSaveCatalogInput, ApiPrepareInput, ApiSendInput, ApiRunInput, ApiReadBodyInput, ApiListRunsInput, ApiPinRunInput, ApiCatalog, ApiCryptoProfile, ApiCryptoProfileSaveInput, ApiCryptoProfileDeleteInput, ApiCryptoProfileDeleteResult, ApiWorkspaceVariablesSaveInput, ApiWorkspaceVariablesSaveResult, ApiCryptoReferenceQuery, ApiCryptoReferences, ApiPreparedPreview, ApiRun, ApiRunCrypto, ApiBodySlice, ApiResolvedRequest, ApiHeader, ApiTimings, ApiHttpHop, ApiBodyInfo, ApiFailure, ApiRunChanged, ApiRunStreamChanged, ApiSseEvent, ApiSseStream, ApiExtractionOutcome, ApiRuntimeVariable, ApiCookieJarEntry, ApiPickedFile, ApiConnectionInfo, ApiScenarioRun, ApiScenarioStepOutcome, ApiScenarioPreparedPreview, ApiScenarioStepPreview, ApiPrepareScenarioInput, ApiScenarioPreparedInput, ApiScenarioRunInput } from './api-workbench'
 
 /** IPC 命令的输入映射，拒绝用户自行声明 workspace。 */
 export interface ApiCommandInputs { getCatalog: ApiTarget; saveCatalog: ApiSaveCatalogInput; saveCryptoProfile: ApiCryptoProfileSaveInput; deleteCryptoProfile: ApiCryptoProfileDeleteInput; saveWorkspaceVariables: ApiWorkspaceVariablesSaveInput; getCryptoReferences: ApiCryptoReferenceQuery; prepare: ApiPrepareInput; send: ApiSendInput; cancel: ApiSendInput; listRuns: ApiListRunsInput; getRun: ApiRunInput; readBody: ApiReadBodyInput; pinRun: ApiPinRunInput; getRuntimeVariables: ApiTarget; clearRuntimeVariables: ApiTarget; getCookieJar: ApiTarget; clearCookieJar: ApiTarget; pickApiFiles: ApiTarget; prepareScenario: ApiPrepareScenarioInput; runScenario: ApiScenarioPreparedInput; cancelScenario: ApiScenarioPreparedInput; listScenarioRuns: ApiListRunsInput; getScenarioRun: ApiScenarioRunInput }
@@ -164,9 +164,49 @@ function bodyInfo(value: unknown): ApiBodyInfo {
 }
 /** 分类错误只能携带有界消息。 */
 function failure(value: unknown): ApiFailure { const record = apiRecord(value, ['code', 'phase', 'message']); return { code: str(record.code, 'code', 128), phase: str(record.phase, 'phase', 128), message: str(record.message, 'message', 4096) } }
+/** 加密步骤事实：只允许身份、类型与算法名，任何取值字段都会被 apiRecord 拒绝。 */
+function cryptoStepFact(value: unknown): { id: string; kind: string; algo: string } {
+  const record = apiRecord(value, ['id', 'kind', 'algo'])
+  return { id: parseApiId(record.id), kind: str(record.kind, 'crypto.kind', 32), algo: str(record.algo, 'crypto.algo', 64) }
+}
+/** 加密步骤的跳过事实：reason 与可选的密钥变量名。 */
+function cryptoSkipFact(value: unknown): ApiRunCrypto['skipped'][number] {
+  const record = apiRecord(value, ['id', 'kind', 'algo', 'reason', 'keyRef'])
+  return {
+    ...cryptoStepFact({ id: record.id, kind: record.kind, algo: record.algo }),
+    reason: one(record.reason, ['missing-secret', 'disabled', 'invalid-config'] as const),
+    ...(record.keyRef === undefined ? {} : { keyRef: parseApiId(record.keyRef) }),
+  }
+}
+/** 派生占位符取值：非秘密的时间戳与随机串，仍然按有界字符串接收。 */
+function cryptoDerived(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return bad('crypto.derived')
+  const entries = Object.entries(value as Record<string, unknown>)
+  if (entries.length > 8) return bad('crypto.derived')
+  const derived: Record<string, string> = {}
+  for (const [key, item] of entries) derived[str(key, 'crypto.derived.key', 32)] = str(item, 'crypto.derived.value', 128)
+  return derived
+}
+/** 解析一次运行的加密事实；密钥值与明文都不在这条通道上。 */
+function runCrypto(value: unknown): ApiRunCrypto {
+  const record = apiRecord(value, ['profileId', 'profileName', 'profileRevision', 'executed', 'skipped', 'plaintextSent', 'decrypted', 'derived', 'failure', 'bodyBeforeTransform'])
+  const cryptoFailure = record.failure === undefined ? undefined : apiRecord(record.failure, ['code', 'message'])
+  return {
+    ...(record.profileId === undefined ? {} : { profileId: parseApiId(record.profileId) }),
+    ...(record.profileName === undefined ? {} : { profileName: str(record.profileName, 'crypto.profileName', 128) }),
+    ...(record.profileRevision === undefined ? {} : { profileRevision: apiInteger(record.profileRevision, 0, Number.MAX_SAFE_INTEGER, 'crypto.profileRevision') }),
+    executed: list(record.executed, cryptoStepFact, API_LIMITS.maxCryptoSteps),
+    skipped: list(record.skipped, cryptoSkipFact, API_LIMITS.maxCryptoSteps),
+    plaintextSent: bool(record.plaintextSent),
+    decrypted: bool(record.decrypted),
+    ...(record.derived === undefined ? {} : { derived: cryptoDerived(record.derived) }),
+    ...(cryptoFailure === undefined ? {} : { failure: { code: str(cryptoFailure.code, 'crypto.failure.code', 128), message: str(cryptoFailure.message, 'crypto.failure.message', 4096) } }),
+    ...(record.bodyBeforeTransform === undefined ? {} : { bodyBeforeTransform: str(record.bodyBeforeTransform, 'crypto.bodyBeforeTransform', API_LIMITS.requestBytes) }),
+  }
+}
 /** 严格验证运行公开结果，原始密钥不能混进 DTO。 */
 export function parseApiRun(value: unknown): ApiRun {
-  const record = apiRecord(value, ['id', 'workspaceId', 'sessionId', 'source', 'requestName', 'requestId', 'environmentId', 'catalogRevision', 'createdAt', 'finishedAt', 'state', 'request', 'hops', 'body', 'assertions', 'error', 'recording', 'pinned', 'sse', 'extracted', 'caseId'])
+  const record = apiRecord(value, ['id', 'workspaceId', 'sessionId', 'source', 'requestName', 'requestId', 'environmentId', 'catalogRevision', 'createdAt', 'finishedAt', 'state', 'request', 'hops', 'body', 'assertions', 'error', 'recording', 'pinned', 'sse', 'extracted', 'caseId', 'crypto'])
   return {
     id: parseApiId(record.id), workspaceId: parseApiId(record.workspaceId), sessionId: parseApiId(record.sessionId), source: one(record.source, ['manual', 'agent']), requestName: str(record.requestName, 'requestName', 128),
     ...(record.requestId === undefined ? {} : { requestId: parseApiId(record.requestId) }), ...(record.environmentId === undefined ? {} : { environmentId: parseApiId(record.environmentId) }),
@@ -177,6 +217,7 @@ export function parseApiRun(value: unknown): ApiRun {
     ...(record.sse === undefined ? {} : { sse: sseStream(record.sse) }),
     ...(record.extracted === undefined ? {} : { extracted: list(record.extracted, extractionOutcome, API_LIMITS.maxExtractions) }),
     ...(record.caseId === undefined ? {} : { caseId: parseApiId(record.caseId) }),
+    ...(record.crypto === undefined ? {} : { crypto: runCrypto(record.crypto) }),
   }
 }
 /** 解析场景步骤投影；index 必须连续，界面据此逐行展示执行顺序。 */

@@ -46,12 +46,20 @@ function classifyCryptoFailure(error: unknown, algo: string, fallback: ApiCrypto
   if (error instanceof ApiCryptoError) return error
   const detail = error instanceof Error ? error.message : String(error)
   if (/digest method not supported|unknown cipher|unknown digest|unknown hash/i.test(detail)) {
-    return new ApiCryptoError('API_CRYPTO_UNSUPPORTED_ALGO', `当前运行时无法执行算法 ${algo}（${detail}）`)
+    return new ApiCryptoError('API_CRYPTO_UNSUPPORTED_ALGO', `当前运行时无法执行算法 ${algo}`)
   }
   if (/invalid key length|invalid iv length|invalid initialization vector/i.test(detail)) {
-    return new ApiCryptoError('API_CRYPTO_KEY_MISMATCH', `密钥或 IV 长度与 ${algo} 不匹配（${detail}）`)
+    return new ApiCryptoError('API_CRYPTO_KEY_MISMATCH', `${algo} 的密钥或 IV 长度不对`)
   }
-  return new ApiCryptoError(fallback, `${algo} 执行失败（${detail}）`)
+  /**
+   * 解密失败只给可分类原因，不回显 OpenSSL 原文：
+   * `error:1e000065:...:BAD_DECRYPT` 这类文本对用户没有意义，还会把排查方向带偏。
+   */
+  /** Bun 与 Node 的文案不同：`BAD_DECRYPT` 与 `bad decrypt` 都要认出来。 */
+  if (/bad[_ ]?decrypt|wrong final block length|unable to authenticate/i.test(detail)) {
+    return new ApiCryptoError('API_CRYPTO_DECRYPT_FAILED', `解密失败：密钥或 IV 不匹配，或响应不是 ${algo} 加密的密文`)
+  }
+  return new ApiCryptoError(fallback, `${algo} 执行失败`)
 }
 
 /** 二进制结果按目标编码输出；raw 只适用于文本算法，按 UTF-8 还原。 */
