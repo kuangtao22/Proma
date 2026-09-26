@@ -600,16 +600,8 @@ export const agentSidePanelOpenAtomFamily = atomFamily((sessionId: string) => at
   },
 ))
 
+/** 新 Agent 会话的右侧面板基线宽度；不继承旧版全局或其他会话的宽布局。 */
 const DEFAULT_AGENT_SIDE_PANEL_WIDTH = 460
-
-/**
- * 旧版全局宽度只作为尚未保存新布局的 Session 的初始基线，避免升级后尺寸回退。
- * 新布局写入后不再与其他 Session 共享。
- */
-const legacyAgentSidePanelWidthAtom = atomWithStorage<number>(
-  'proma-agent-workspace-width',
-  DEFAULT_AGENT_SIDE_PANEL_WIDTH,
-)
 
 export interface AgentSidePanelLayout {
   width: number
@@ -665,14 +657,14 @@ export const agentSidePanelLayoutMapAtom = atomWithStorage<Record<string, AgentS
 /** 指定 Agent Session 的右侧工作区布局。 */
 export const agentSidePanelLayoutAtomFamily = atomFamily((sessionId: string) => atom(
   (get) => get(agentSidePanelLayoutMapAtom)[sessionId] ?? {
-    width: get(legacyAgentSidePanelWidthAtom),
+    width: DEFAULT_AGENT_SIDE_PANEL_WIDTH,
     hasOpenedWideWorkspace: false,
     widePanelWidthOverride: null,
   },
   (get, set, update: AgentSidePanelLayout | ((previous: AgentSidePanelLayout) => AgentSidePanelLayout)) => {
     set(agentSidePanelLayoutMapAtom, (previous) => {
       const current = previous[sessionId] ?? {
-        width: get(legacyAgentSidePanelWidthAtom),
+        width: DEFAULT_AGENT_SIDE_PANEL_WIDTH,
         hasOpenedWideWorkspace: false,
         widePanelWidthOverride: null,
       }
@@ -1150,8 +1142,12 @@ export const revealChangedWorkspaceComponentAtom = atom(
     ))
 
     const activeTab = get(agentDiffPanelTabAtom).get(sessionId)
-    const preservesUserFocus = get(agentSidePanelOpenAtomFamily(sessionId))
-      && isUserPriorityWorkspaceComponentTab(activeTab)
+    const panelOpen = get(agentSidePanelOpenAtomFamily(sessionId))
+    // MCP 的受控配置成功后必须让 Tab 可见，但配置结果不应打断用户正在阅读
+    // 文件、变更或其他工作区内容。右侧已打开时仅添加 Tab；尚未打开时才以 MCP 打开。
+    if (component === 'mcp' && panelOpen) return
+
+    const preservesUserFocus = panelOpen && isUserPriorityWorkspaceComponentTab(activeTab)
     if (preservesUserFocus) return
 
     set(agentSidePanelOpenAtomFamily(sessionId), true)

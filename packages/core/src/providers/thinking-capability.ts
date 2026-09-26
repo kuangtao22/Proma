@@ -77,6 +77,9 @@ export function detectThinkingCapability(
       ...(typeof effort === 'string' ? { effort } : {}),
     }
   }
+  if (encoding?.kind === 'deepseek-output-effort') {
+    return { mode: 'effort-based-max', disableStrategy: 'explicit-disabled' }
+  }
 
   // DeepSeek v4 系列（按模型 ID 识别，不依赖 providerType）：
   // effort-based-max 模式会在思考关闭时显式发 `{type:'disabled'}`，这是 DeepSeek v4 的硬要求
