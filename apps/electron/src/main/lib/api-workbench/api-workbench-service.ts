@@ -416,23 +416,23 @@ export class ApiWorkbenchService {
   }
 
   /** 保存签名/加密方案（公共配置）；方案 revision 由 Store 维护。 */
-  async saveCryptoProfile(workspaceId: string, input: ApiCryptoProfileSaveInput): Promise<ApiCryptoProfile> {
-    return this.store.saveCryptoProfile(parseApiId(workspaceId), input.profile, input.expectedRevision)
+  async saveCryptoProfile(workspaceId: string, profile: ApiCryptoProfile, expectedRevision: number | null): Promise<ApiCryptoProfile> {
+    return this.store.saveCryptoProfile(parseApiId(workspaceId), profile, expectedRevision)
   }
 
   /** 删除方案；仍被请求引用时默认拒绝并返回引用条数。 */
-  async deleteCryptoProfile(workspaceId: string, input: ApiCryptoProfileDeleteInput): Promise<ApiCryptoProfileDeleteResult> {
-    return this.store.deleteCryptoProfile(parseApiId(workspaceId), parseApiId(input.id), input.force ?? false)
+  async deleteCryptoProfile(workspaceId: string, id: string, force: boolean): Promise<ApiCryptoProfileDeleteResult> {
+    return this.store.deleteCryptoProfile(parseApiId(workspaceId), parseApiId(id), force)
   }
 
   /** 批量写工作区变量；返回值只含引用与名称，秘密明文不出主进程。 */
-  async saveWorkspaceVariables(workspaceId: string, input: ApiWorkspaceVariablesSaveInput): Promise<ApiWorkspaceVariablesSaveResult> {
-    return { variables: this.store.saveWorkspaceVariables(parseApiId(workspaceId), input.variables) }
+  async saveWorkspaceVariables(workspaceId: string, variables: ApiField[]): Promise<ApiWorkspaceVariablesSaveResult> {
+    return { variables: this.store.saveWorkspaceVariables(parseApiId(workspaceId), variables) }
   }
 
   /** 变量/方案引用检查：删除确认与「改了会影响谁」共用。 */
-  async getCryptoReferences(workspaceId: string, input: ApiCryptoReferenceQuery): Promise<ApiCryptoReferences> {
-    return this.store.inspectCryptoReferences(parseApiId(workspaceId), input.kind, input.name)
+  async getCryptoReferences(workspaceId: string, kind: 'variable' | 'profile', name: string): Promise<ApiCryptoReferences> {
+    return this.store.inspectCryptoReferences(parseApiId(workspaceId), kind, name)
   }
 
   /**

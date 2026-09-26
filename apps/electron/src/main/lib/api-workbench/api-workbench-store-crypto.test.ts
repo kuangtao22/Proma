@@ -150,4 +150,20 @@ describe('方案与工作区变量存储', () => {
       expect(() => store.revealVariable('workspace', { scope: 'workspace', fieldId: 'nope' })).toThrow('API_WORKBENCH_VARIABLE_NOT_FOUND')
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
+
+  test('已声明但没填值的秘密变量可以保存：界面显示待填写而不是报错', () => {
+    const root = mkdtempSync(join(tmpdir(), 'api-crypto-store-'))
+    try {
+      const store = new ApiWorkbenchStore(root, { safeStorage, now: () => 10, uuid: () => 'secret_ref' })
+      /** Agent 只声明名字与类型：值必须是空串，且不能被当成「已配置」。 */
+      const saved = store.saveWorkspaceVariables('workspace', [{ id: 'v1', name: 'appSecret', value: '', enabled: true, secret: true }])
+      expect(saved[0]).toMatchObject({ name: 'appSecret', value: '', secret: true })
+      expect(saved[0]?.secretRef).toBeUndefined()
+      /** 没有引用，所以揭示通道只能拿回空值——这正好等价于「缺密钥」。 */
+      expect(store.revealVariable('workspace', { scope: 'workspace', fieldId: 'v1' })).toEqual({ name: 'appSecret', value: '' })
+      const raw = readFileSync(join(root, 'api-workbench', 'workspaces', 'workspace', 'catalog.json'), 'utf8')
+      expect(raw).toContain('appSecret')
+      expect(raw).not.toContain('secret_ref')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
 })

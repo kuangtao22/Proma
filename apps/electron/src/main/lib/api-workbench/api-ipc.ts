@@ -39,10 +39,10 @@ export function registerApiWorkbenchIpc(dependencies: ApiIpcDependencies): { dis
       case 'getCatalog': result = await service.getCatalog(context.workspaceId); break
       case 'saveCatalog': result = await write(() => service.saveCatalog(context.workspaceId, command.input.expectedRevision, command.input.catalog)); break
       /** 公共配置写入与目录写入共用同一条迁移写租约。 */
-      case 'saveCryptoProfile': result = await write(() => service.saveCryptoProfile(context.workspaceId, command.input)); break
-      case 'deleteCryptoProfile': result = await write(() => service.deleteCryptoProfile(context.workspaceId, command.input)); break
-      case 'saveWorkspaceVariables': result = await write(() => service.saveWorkspaceVariables(context.workspaceId, command.input)); break
-      case 'getCryptoReferences': result = await service.getCryptoReferences(context.workspaceId, command.input); break
+      case 'saveCryptoProfile': result = await write(() => service.saveCryptoProfile(context.workspaceId, command.input.profile, command.input.expectedRevision)); break
+      case 'deleteCryptoProfile': result = await write(() => service.deleteCryptoProfile(context.workspaceId, command.input.id, command.input.force ?? false)); break
+      case 'saveWorkspaceVariables': result = await write(() => service.saveWorkspaceVariables(context.workspaceId, command.input.variables)); break
+      case 'getCryptoReferences': result = await service.getCryptoReferences(context.workspaceId, command.input.kind, command.input.name); break
       /** 明文揭示是读命令：不写盘，但要过会话与窗口复核（assertCurrent 在返回前执行）。 */
       case 'revealVariable': result = await service.revealVariable(context.workspaceId, command.input); break
       case 'prepare': result = await service.prepare(context, command.input); break

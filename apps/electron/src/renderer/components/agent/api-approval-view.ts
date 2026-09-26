@@ -32,7 +32,7 @@ export interface ApiApprovalFileLine {
 
 /** 审批卡要展示的接口视图；caseDiff 为空表示这次没有用例改动。 */
 export interface ApiWorkbenchApprovalView {
-  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save' | 'api-environment-save' | 'api-request-updates' | 'api-base-url-extract'
+  kind: 'api-send' | 'api-save' | 'api-scenario-run' | 'api-scenario-save' | 'api-environment-save' | 'api-request-updates' | 'api-base-url-extract' | 'api-crypto-profile' | 'api-variable-declare' | 'api-crypto-bind'
   title: string
   lines: string[]
   /** 本次要读取并上传的文件；为空表示没有附件（普通请求或保存审批）。 */
@@ -260,6 +260,91 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
       caseDiff: [],
     }
   }
+  /** 声明变量：只声明名字与类型，卡上明确写「值由人填」。 */
+  if (toolName === 'api_declare_variables') {
+    const pending = record(toolInput.variableDeclare)
+    if (!pending) return null
+    const variables = Array.isArray(pending.variables) ? pending.variables.flatMap((item) => {
+      const entry = record(item)
+      const name = entry ? string(entry.name) : undefined
+      return entry && name ? [{ name, secret: entry.secret === true, existing: entry.existing === true }] : []
+    }) : []
+    const scopeLabel = pending.scope === 'collection'
+      ? `集合「${string(pending.collectionName) ?? string(pending.collectionId) ?? '未知'}」`
+      : '工作区（跨集合共用）'
+    return {
+      kind: 'api-variable-declare',
+      title: '声明接口变量（值由你填写）',
+      lines: [
+        `作用域：${scopeLabel}`,
+        `数量：${variables.length} 个`,
+        ...variables.map((item) => `${item.name}${item.secret ? '（秘密）' : ''}${item.existing ? ' · 已存在，值保持不动' : ' · 待你填值'}`),
+        '读密钥：否 · 写密钥：否（Agent 只能声明名字与类型，密钥值只能由人填写）',
+      ],
+      files: [],
+      steps: [],
+      warnings: warnings(pending.warnings),
+      caseDiff: [],
+    }
+  }
+  /** 方案保存：卡上列出每一步的算法与密钥变量名（只有名字，没有值）。 */
+  if (toolName === 'api_save_crypto_profile') {
+    const pending = record(toolInput.cryptoProfileSave)
+    if (!pending) return null
+    const steps = Array.isArray(pending.steps) ? pending.steps.flatMap((item) => {
+      const entry = record(item)
+      if (!entry) return []
+      const index = typeof entry.index === 'number' ? entry.index : 0
+      const side = entry.side === 'response' ? '收到后' : '发送前'
+      const keyRef = string(entry.keyRef)
+      const ivRef = string(entry.ivRef)
+      const target = string(entry.target)
+      return [`${side} · ${index + 1} · ${string(entry.kind) ?? '步骤'} ${string(entry.algo) ?? ''}${keyRef ? ` · 密钥 🔒${keyRef}` : ''}${ivRef ? ` · IV 🔒${ivRef}` : ''}${target ? ` · 写入 ${target}` : ''}`]
+    }) : []
+    const keyRefs = Array.isArray(pending.keyRefs) ? pending.keyRefs.filter((item): item is string => typeof item === 'string') : []
+    const appliesTo = pending.appliesTo === 'production' ? '仅生产环境' : pending.appliesTo === 'test' ? '仅测试环境' : '所有环境'
+    return {
+      kind: 'api-crypto-profile',
+      title: '保存签名/加密方案',
+      lines: [
+        `方案：${string(pending.profileName) ?? '未命名'}（${appliesTo}）`,
+        `步骤：${steps.length} 步，按数组顺序执行`,
+        ...steps,
+        `将读取的密钥变量名：${keyRefs.length > 0 ? keyRefs.map((name) => `🔒${name}`).join('、') : '无'}`,
+        '读密钥：否 · 写密钥：否（密钥值只在主进程内使用，界面与记录都不出现）',
+      ],
+      files: [],
+      steps: [],
+      warnings: warnings(pending.warnings),
+      caseDiff: [],
+    }
+  }
+  /** 方案绑定：逐行列出「哪条接口从什么方案改成什么方案」。 */
+  if (toolName === 'api_bind_crypto_profile') {
+    const pending = record(toolInput.cryptoBind)
+    if (!pending) return null
+    const bindings = Array.isArray(pending.bindings) ? pending.bindings.flatMap((item) => {
+      const entry = record(item)
+      const requestName = entry ? string(entry.requestName) : undefined
+      const profileName = entry ? string(entry.profileName) : undefined
+      if (!entry || !requestName || !profileName) return []
+      const before = string(entry.before)
+      return [`${requestName}：${before ? `${before} → ` : '未绑定 → '}${profileName}`]
+    }) : []
+    return {
+      kind: 'api-crypto-bind',
+      title: '给接口绑定加密方案',
+      lines: [
+        `数量：${bindings.length} 条（只改选方案，不改 URL、正文与断言）`,
+        ...bindings,
+        '发送加密请求时需要另一次审批，那次才会读取密钥',
+      ],
+      files: [],
+      steps: [],
+      warnings: warnings(pending.warnings),
+      caseDiff: [],
+    }
+  }
   if (toolName !== 'api_send_request' && toolName !== 'api_save_request') return null
   const preview = record(toolInput.preview)
   if (!preview) return null
@@ -280,6 +365,17 @@ export function describeApiWorkbenchApproval(toolName: string, toolInput: Record
     const assertionCount = send && typeof send.assertionCount === 'number' ? send.assertionCount : 0
     lines.push(`环境：${environmentId ?? '未选择'}`)
     lines.push(caseName || caseId ? `用例：${caseName ?? caseId}（${assertionCount} 条断言）` : `断言：请求自身默认断言 ${assertionCount} 条`)
+    /** 发送形态：用哪套方案、缺哪些密钥，缺了会明文发出——这一行不能省。 */
+    const shape = record(toolInput.sendShape)
+    if (shape) {
+      const profileName = string(shape.profileName) ?? '（未知方案）'
+      const shapeSteps = Array.isArray(shape.steps) ? shape.steps.filter((item): item is string => typeof item === 'string') : []
+      const missing = Array.isArray(shape.missing) ? shape.missing.filter((item): item is string => typeof item === 'string') : []
+      lines.push(`发送形态：${shapeSteps.length > 0 ? shapeSteps.join(' → ') : '无步骤'} · 方案「${profileName}」`)
+      if (missing.length > 0) lines.push(`⚠ 缺少密钥变量：${missing.join('、')} —— 对应步骤会被跳过，本次按明文发出`)
+    } else {
+      lines.push('发送形态：不签名不加密（原始内容直接发出）')
+    }
     return { kind: 'api-send', title: '发送接口请求', lines, files, steps: [], warnings: warnings(preview.warnings), caseDiff: [] }
   }
 

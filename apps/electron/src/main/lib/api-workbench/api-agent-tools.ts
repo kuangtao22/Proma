@@ -4,7 +4,7 @@ import { boundApiAgentResult } from './api-agent-facade'
 import type { ApiAgentFacade } from './api-agent-facade'
 
 /** 精确工具名集合用于权限分派，禁止前缀放行未知能力。 */
-export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario', 'api_save_environment', 'api_update_requests', 'api_extract_base_url'] as const
+export const API_AGENT_TOOL_NAMES = ['api_list', 'api_get_request', 'api_prepare_request', 'api_send_request', 'api_inspect_run', 'api_save_request', 'api_prepare_scenario', 'api_run_scenario', 'api_save_scenario', 'api_save_environment', 'api_update_requests', 'api_extract_base_url', 'api_declare_variables', 'api_save_crypto_profile', 'api_bind_crypto_profile'] as const
 /** Pi SDK 在此只需要工具定义工厂，不引入另一套 Agent runtime。 */
 type ApiToolSdk = Pick<typeof import('@earendil-works/pi-coding-agent'), 'defineTool'>
 /** 将有界工具结果写入文本与 details；响应始终视作数据，不能成为指令。 */
@@ -64,6 +64,23 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
       from: Type.Union(['json', 'header', 'sse-last-data'].map((item) => Type.Literal(item))),
       path: Type.String(), secret: Type.Boolean(),
     }, { additionalProperties: false }))),
+  }, { additionalProperties: false })
+  /**
+   * 加密方案的一个步骤：算法 + 密钥**变量名**。
+   * 模型永远不能在这里写密钥值——keyRef / ivRef 只是变量名，值只在主进程与界面之间流转。
+   */
+  const cryptoStep = Type.Object({
+    id: Type.Optional(caseId),
+    kind: Type.Union(['derive', 'sign', 'encrypt', 'decrypt'].map((item) => Type.Literal(item))),
+    enabled: Type.Optional(Type.Boolean()),
+    algo: Type.String({ minLength: 1, maxLength: 64 }),
+    keyRef: Type.Optional(Type.String({ maxLength: 128 })),
+    ivRef: Type.Optional(Type.String({ maxLength: 128 })),
+    template: Type.Optional(Type.String({ maxLength: 8192 })),
+    source: Type.Optional(Type.Union(['body', 'query', 'response-body', 'response-field'].map((item) => Type.Literal(item)))),
+    target: Type.Optional(Type.Object({ in: Type.Union(['header', 'query', 'body'].map((item) => Type.Literal(item))), name: Type.String({ maxLength: 256 }) }, { additionalProperties: false })),
+    encoding: Type.Optional(Type.Union(['hex', 'base64', 'raw'].map((item) => Type.Literal(item)))),
+    onFailure: Type.Optional(Type.Union([Type.Literal('stop'), Type.Literal('continue')])),
   }, { additionalProperties: false })
   return [
     sdk.defineTool({ name: 'api_list', label: '列出接口', description: 'List saved API requests and available environments in this session project. Does not contact servers.', parameters: Type.Object({ cursor: Type.Optional(Type.Integer()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })) }, { additionalProperties: false }), async execute(_id, input) { return result(await facade.list(input)) } }),
@@ -144,6 +161,53 @@ export function buildApiAgentTools(sdk: ApiToolSdk, facade: ApiAgentFacade): Too
         expectedRevision: Type.Integer({ minimum: 0 }),
       }, { additionalProperties: false }),
       async execute(_id, input) { return result(await facade.extractBaseUrl(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_declare_variables',
+      label: '声明接口变量',
+      description: 'Declare variable NAMES on the workspace (shared across all collections) or on one collection, with a separate configuration-write approval. You can only declare name/secret/enabled — you can never write a secret value: do not pass any value, the host stores an empty declaration marked 待填写 and the human fills it in the 公共配置 panel. Variables that already exist with the same name are left completely untouched (their values are never overwritten by you). Use this to introduce appSecret / aesKey / aesIv before binding a crypto profile, then tell the human which names need values. Use the catalog revision from api_list as expectedRevision.',
+      parameters: Type.Object({
+        scope: Type.Union([Type.Literal('workspace'), Type.Literal('collection')]),
+        /** scope=collection 时必填；workspace 级变量跨集合共用。 */
+        collectionId: Type.Optional(id),
+        variables: Type.Array(Type.Object({
+          name: Type.String({ minLength: 1, maxLength: 128 }),
+          /** 秘密变量的值只由人填写；这里只标记它是不是秘密。 */
+          secret: Type.Optional(Type.Boolean()),
+          enabled: Type.Optional(Type.Boolean()),
+        }, { additionalProperties: false }), { minItems: 1, maxItems: 32 }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.declareVariables(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_save_crypto_profile',
+      label: '保存签名/加密方案',
+      description: 'Create or replace a signing/encryption profile with a separate configuration-write approval. A profile is a SHARED asset: requests only choose it, so configure it once and bind it with api_bind_crypto_profile. Steps run in array order and order is meaningful: a sign step before the encrypt step signs the plaintext, one after it signs the ciphertext — both patterns exist in real APIs. Allowed algorithms: derive=timestamp-nonce; sign=MD5/SHA1/SHA256/HMAC-SHA1/HMAC-SHA256/SM3; encrypt/decrypt=AES-128-CBC/AES-256-CBC/AES-128-GCM/SM4-CBC. Reference keys by VARIABLE NAME only (keyRef/ivRef) and never put key material in a profile. A sign step needs template + target; encrypt/decrypt act on the whole body and need ivRef. Missing or unfilled keys never block a send: that step is skipped and the run is marked 明文发出. GCM tag placement is P2, so GCM steps are skipped for now. Template placeholders: {{method}} {{path}} {{query}} {{query.sorted}} {{timestamp}} {{nonce}} {{body.raw}} {{body.sha256}} {{body.md5}}. Use the catalog revision from api_list as expectedRevision.',
+      parameters: Type.Object({
+        profileId: Type.Optional(id),
+        /** 缺省为工作区级方案；给出集合 id 则只在该集合内可选。 */
+        collectionId: Type.Optional(id),
+        profile: Type.Object({
+          name: Type.String({ minLength: 1, maxLength: 128 }),
+          description: Type.Optional(Type.String({ maxLength: 4096 })),
+          appliesTo: Type.Optional(Type.Union([Type.Literal('all'), Type.Literal('test'), Type.Literal('production')])),
+          requestSteps: Type.Array(cryptoStep, { maxItems: 12 }),
+          responseSteps: Type.Array(cryptoStep, { maxItems: 12 }),
+        }, { additionalProperties: false }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.saveCryptoProfile(input)) },
+    }),
+    sdk.defineTool({
+      name: 'api_bind_crypto_profile',
+      label: '给接口绑定加密方案',
+      description: 'Bind one crypto profile to existing requests with ONE approval (up to 50 requests per call). The approval card lists every request with the profile it used before, so call it in a few batches instead of one request at a time. It only changes which profile each request chooses — never its URL, body, headers or assertions. A request whose profile was deleted refuses to send until it is re-bound, so re-bind before deleting or replacing a profile.',
+      parameters: Type.Object({
+        bindings: Type.Array(Type.Object({ requestId: id, profileId: id }, { additionalProperties: false }), { minItems: 1, maxItems: 50 }),
+        expectedRevision: Type.Integer({ minimum: 0 }),
+      }, { additionalProperties: false }),
+      async execute(_id, input) { return result(await facade.bindCryptoProfile(input)) },
     }),
   ]
 }

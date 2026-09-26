@@ -24,6 +24,8 @@ describe('接口工作台审批卡视图', () => {
       '请求名称：登录',
       '环境：env_test',
       '用例：人工写的越权（1 条断言）',
+      /** 发送形态是固定行：没配加密也要明确写「不签名不加密」，不能留白让人猜。 */
+      '发送形态：不签名不加密（原始内容直接发出）',
     ])
     expect(view?.files).toEqual([])
     expect(view?.caseDiff).toEqual([])
@@ -77,7 +79,7 @@ describe('接口工作台审批卡视图', () => {
       send: { assertionCount: 2 },
     })
 
-    expect(view?.lines).toEqual(['GET https://example.test/users', '环境：未选择', '断言：请求自身默认断言 2 条'])
+    expect(view?.lines).toEqual(['GET https://example.test/users', '环境：未选择', '断言：请求自身默认断言 2 条', '发送形态：不签名不加密（原始内容直接发出）'])
   })
 
   test('Given 保存含用例改动 When 解析 Then 逐条列出新增、修改与删除', () => {
@@ -277,5 +279,56 @@ describe('接口工作台审批卡视图', () => {
       '将改写 126 条请求：URL 变成 {{baseUrl}}/...',
       '这些请求会同时绑定到该环境（换环境只改一处）',
     ])
+  })
+
+  test('Given 声明变量审批 When 解析 Then 写明值由人填且已存在的保持不动', () => {
+    const view = describeApiWorkbenchApproval('api_declare_variables', {
+      variableDeclare: {
+        expectedRevision: 7, scope: 'workspace',
+        variables: [{ name: 'appSecret', secret: true, enabled: true, existing: false }, { name: 'baseUrl', secret: false, enabled: true, existing: true }],
+        warnings: ['秘密变量的值不会被 Agent 写入：声明完成后请由人在公共配置里填写'],
+      },
+    })
+
+    expect(view?.kind).toBe('api-variable-declare')
+    expect(view?.title).toBe('声明接口变量（值由你填写）')
+    expect(view?.lines).toContain('appSecret（秘密） · 待你填值')
+    expect(view?.lines).toContain('baseUrl · 已存在，值保持不动')
+    expect(view?.lines).toContain('读密钥：否 · 写密钥：否（Agent 只能声明名字与类型，密钥值只能由人填写）')
+    expect(view?.warnings).toHaveLength(1)
+  })
+
+  test('Given 保存加密方案审批 When 解析 Then 逐步行列出算法与密钥变量名且没有值', () => {
+    const view = describeApiWorkbenchApproval('api_save_crypto_profile', {
+      cryptoProfileSave: {
+        expectedRevision: 7, profileId: 'profile_backend', profileName: '车本本-后台签名', appliesTo: 'all',
+        steps: [
+          { index: 0, side: 'request', kind: 'derive', algo: 'timestamp-nonce', target: 'header:X-Timestamp' },
+          { index: 1, side: 'request', kind: 'sign', algo: 'HMAC-SHA256', keyRef: 'appSecret', target: 'header:X-Sign' },
+          { index: 0, side: 'response', kind: 'decrypt', algo: 'AES-128-CBC', keyRef: 'aesKey', ivRef: 'aesIv' },
+        ],
+        keyRefs: ['appSecret', 'aesKey', 'aesIv'],
+        warnings: ['方案引用的密钥变量还没声明：aesKey、aesIv'],
+      },
+    })
+
+    expect(view?.kind).toBe('api-crypto-profile')
+    expect(view?.lines[0]).toBe('方案：车本本-后台签名（所有环境）')
+    expect(view?.lines).toContain('发送前 · 2 · sign HMAC-SHA256 · 密钥 🔒appSecret · 写入 header:X-Sign')
+    expect(view?.lines).toContain('收到后 · 1 · decrypt AES-128-CBC · 密钥 🔒aesKey · IV 🔒aesIv')
+    expect(view?.lines).toContain('将读取的密钥变量名：🔒appSecret、🔒aesKey、🔒aesIv')
+    /** 卡上出现「写密钥：否」，避免用户以为批准等于把密钥交给模型。 */
+    expect(view?.lines.some((line) => line.includes('读密钥：否 · 写密钥：否'))).toBe(true)
+  })
+
+  test('Given 发送审批带发送形态 When 缺密钥 Then 明确写出会明文发出', () => {
+    const view = describeApiWorkbenchApproval('api_send_request', {
+      preview: { requestName: '保存 AI 能力', environmentId: 'env_test', request: { method: 'POST', url: 'https://example.test/x' }, warnings: [] },
+      send: { assertionCount: 2 },
+      sendShape: { profileName: '后台加密', steps: ['派生 timestamp-nonce', '加密 AES-128-CBC'], missing: ['aesKey', 'aesIv'] },
+    })
+
+    expect(view?.lines).toContain('发送形态：派生 timestamp-nonce → 加密 AES-128-CBC · 方案「后台加密」')
+    expect(view?.lines).toContain('⚠ 缺少密钥变量：aesKey、aesIv —— 对应步骤会被跳过，本次按明文发出')
   })
 })

@@ -637,7 +637,14 @@ export class ApiWorkbenchStore {
         }
         return { value: '', secret: true, secretRef: value.secretRef }
       }
-      if (!value.value) throw new Error('API_WORKBENCH_SECRET_EMPTY')
+      /**
+       * 值为空且没有引用：这是「已声明但还没填」的状态。
+       *
+       * Agent 只能声明变量名（密钥值必须由人填），所以这种状态必须能保存下来：
+       * 保留 `{value:'', secret:true}`，界面显示「待填写」，执行时按缺密钥跳过该步骤。
+       * 不能在这里抛错，否则「Agent 声明 + 人来填」这条分工根本走不通。
+       */
+      if (!value.value) return { value: '', secret: true }
       const previous = byOwner.get(owner)
       const ref = parseApiId(this.dependencies.uuid())
       if (byRef.has(ref)) throw new Error('API_WORKBENCH_SECRET_ID_COLLISION')
