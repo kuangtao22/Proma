@@ -19,7 +19,7 @@ import { TRANSIENT_NETWORK_PATTERN, isMalformedResponseError } from './error-pat
 const FRIENDLY_ERROR_MESSAGES: Array<{ pattern: RegExp; message: string }> = [
   {
     pattern: /not logged in|please run \/login/i,
-    message: '请检查是否选择了正确的 Proma 供应渠道和模型',
+    message: '请检查是否选择了正确的 DutyDeck 供应渠道和模型',
   },
   {
     pattern: /validation error/i,
@@ -275,7 +275,7 @@ export function mapAgentErrorToTypedError(
 
   // “未选择正确渠道/模型”场景：友好化后的文案已固定，无法登录多半是渠道或模型配置有误，
   // 引导用户直接重新选择模型，而非跳转设置页面
-  const isInvalidChannelOrModel = /请检查是否选择了正确的 Proma 供应渠道和模型/.test(mapped.message)
+  const isInvalidChannelOrModel = /请检查是否选择了正确的 DutyDeck 供应渠道和模型/.test(mapped.message)
 
   return {
     code: mapped.code,

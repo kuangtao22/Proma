@@ -15,7 +15,7 @@ const DEFAULT_WIDTH = 1180
 const DEFAULT_HEIGHT = 820
 const MIN_WIDTH = 760
 const MIN_HEIGHT = 560
-const PLANNING_WINDOW_TITLE = 'Proma · 规划中心'
+const PLANNING_WINDOW_TITLE = 'DutyDeck · 规划中心'
 
 let planningWindow: BrowserWindow | null = null
 

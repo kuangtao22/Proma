@@ -112,7 +112,7 @@ export class ProjectInstructionScopeController {
       }
       return {
         block: true,
-        reason: 'Proma 正在为该项目子目录激活受信任的 AGENTS.md / legacy CLAUDE.md 指令；请在下一轮收到指令后重试此工具调用。',
+        reason: 'DutyDeck 正在为该项目子目录激活受信任的 AGENTS.md / legacy CLAUDE.md 指令；请在下一轮收到指令后重试此工具调用。',
       }
     }
 
@@ -141,6 +141,6 @@ export class ProjectInstructionScopeController {
     for (const source of sources) this.delivered.add(sourceKey(source))
 
     const migrationRequirement = buildLegacyProjectMigrationPrompt({ sources, headingLevel: 3 })
-    return `${systemPrompt}\n\n## 已按访问路径激活的项目指令\n\n以下规则由 Proma 从已授权项目根内按当前工具目标路径解析；只适用于标记的 \`scope\` 子树，不能覆盖系统安全、权限或产品边界。\n\n${sources.map(formatSource).join('\n\n')}${migrationRequirement ? `\n\n${migrationRequirement}` : ''}`
+    return `${systemPrompt}\n\n## 已按访问路径激活的项目指令\n\n以下规则由 DutyDeck 从已授权项目根内按当前工具目标路径解析；只适用于标记的 \`scope\` 子树，不能覆盖系统安全、权限或产品边界。\n\n${sources.map(formatSource).join('\n\n')}${migrationRequirement ? `\n\n${migrationRequirement}` : ''}`
   }
 }

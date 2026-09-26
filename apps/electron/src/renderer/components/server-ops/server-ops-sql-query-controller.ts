@@ -60,14 +60,14 @@ export interface ServerOpsSqlQueryControllerOptions {
 /** 将主进程稳定码收敛为中文说明，未知驱动正文绝不进入界面。 */
 export function getServerOpsSqlQueryErrorMessage(error: unknown, phase: 'query' | 'cancel' = 'query'): string {
   const text = error instanceof Error ? error.message : String(error)
-  if (text.includes('SERVER_OPS_OTHER_INSTANCE_ACTIVE')) return '审计记录需要初始化或升级，请先退出其他 Proma 实例后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_OTHER_INSTANCE_ACTIVE')) return '审计记录需要初始化或升级，请先退出其他 DutyDeck 实例后重试；SQL 尚未执行'
   if (text.includes('SERVER_OPS_TRUST_BUSY')) return '运维配置正在准备，请稍后重试；SQL 尚未执行'
   if (text.includes('SERVER_OPS_CONFIG_BUSY')) return '运维配置正在写入，请稍后重试；SQL 尚未执行'
-  if (text.includes('SERVER_OPS_CONFIG_LOCK_UNAVAILABLE')) return '运维配置写锁不可用，请重启或更新 Proma 后重试；SQL 尚未执行'
-  if (text.includes('SERVER_OPS_CONFIG_OUTCOME_UNKNOWN')) return '审计写入状态无法确认，请稍后重试，若持续失败再重启 Proma；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_CONFIG_LOCK_UNAVAILABLE')) return '运维配置写锁不可用，请重启或更新 DutyDeck 后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_CONFIG_OUTCOME_UNKNOWN')) return '审计写入状态无法确认，请稍后重试，若持续失败再重启 DutyDeck；SQL 尚未执行'
   if (text.includes('SERVER_OPS_AUDIT_READ_FAILED')) return '本地审计记录无法读取，需要检查审计文件；SQL 尚未执行'
-  if (text.includes('SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED')) return '本地审计记录尚未准备完成，请重启 Proma 后重试；SQL 尚未执行'
-  if (text.includes('SERVER_OPS_AUDIT_WRITE_FAILED')) return '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 Proma；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED')) return '本地审计记录尚未准备完成，请重启 DutyDeck 后重试；SQL 尚未执行'
+  if (text.includes('SERVER_OPS_AUDIT_WRITE_FAILED')) return '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 DutyDeck；SQL 尚未执行'
   if (text.includes('SERVER_OPS_AUDIT_START_WRITE_FAILED')) return '无法记录查询审计，请检查本地运维配置后重试；SQL 尚未执行'
   if (text.includes('SERVER_OPS_DATA_QUERY_SENSITIVE_COLUMN') || text.includes('SERVER_OPS_SQL_SENSITIVE_COLUMN')) return '查询包含敏感字段，无法执行'
   if (text.includes('SERVER_OPS_DATA_QUERY_TABLE_UNAVAILABLE')) return '查询中的表不存在、不可见或不是基础表'

@@ -60,7 +60,7 @@ export interface BuildOptions {
 }
 
 /** 教 Agent 如何看待 bridge 注入的 XML 块。会被前置到每条 userMessage。 */
-export const BRIDGE_USER_MESSAGE_PRELUDE = `<!-- 你正在通过 Proma 飞书桥处理来自飞书的用户消息。bridge 会用 XML 块注入
+export const BRIDGE_USER_MESSAGE_PRELUDE = `<!-- 你正在通过 DutyDeck 飞书桥处理来自飞书的用户消息。bridge 会用 XML 块注入
 当前对话的元数据。下面这些 XML 块**对用户不可见**，不要照抄到回复里。
 
 可能出现的 XML 块：

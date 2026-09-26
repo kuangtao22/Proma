@@ -18,7 +18,7 @@ test('Given session-cleaner 默认 Skill When 校验发布合同 Then 版本与 
     .map((line) => line.trim())
     .filter((line) => line.startsWith('proma session ') && line !== 'proma session "$@"')
 
-  expect(skill).toMatch(/^version: 2\.0\.1$/m)
+  expect(skill).toMatch(/^version: 2\.0\.2$/m)
   expect(skill).toContain('"$PROMA_CLI" session "$@"')
   expect(skill).toContain('仅当 `PROMA_CLI` 缺失时')
   expect(skill).not.toContain('优先直接 `proma session')

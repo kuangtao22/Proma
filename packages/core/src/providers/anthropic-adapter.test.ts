@@ -32,24 +32,24 @@ describe('AnthropicAdapter headers', () => {
     expect(request.headers['User-Agent']).toBeUndefined()
   })
 
-  test('xiaomi token plan keeps bearer authentication with Proma User-Agent', () => {
+  test('xiaomi token plan keeps bearer authentication with DutyDeck User-Agent', () => {
     setPromaVersion('9.9.9')
 
     const request = buildRequest('xiaomi-token-plan')
 
     expect(request.headers.Authorization).toBe('Bearer test-key')
-    expect(request.headers['User-Agent']).toBe('Proma/9.9.9 (+https://github.com/ErlichLiu/Proma)')
+    expect(request.headers['User-Agent']).toBe('DutyDeck/9.9.9 (+https://github.com/ErlichLiu/Proma)')
     expect(request.headers['api-key']).toBeUndefined()
   })
 
-  test('qwen token plan uses the complete Anthropic endpoint with bearer authentication and Proma User-Agent', () => {
+  test('qwen token plan uses the complete Anthropic endpoint with bearer authentication and DutyDeck User-Agent', () => {
     setPromaVersion('9.9.9')
 
     const request = buildRequest('qwen-token-plan')
 
     expect(request.url).toBe('https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages')
     expect(request.headers.Authorization).toBe('Bearer test-key')
-    expect(request.headers['User-Agent']).toBe('Proma/9.9.9 (+https://github.com/ErlichLiu/Proma)')
+    expect(request.headers['User-Agent']).toBe('DutyDeck/9.9.9 (+https://github.com/ErlichLiu/Proma)')
     expect(request.headers['x-api-key']).toBeUndefined()
   })
 
@@ -62,7 +62,7 @@ describe('AnthropicAdapter headers', () => {
     )
 
     expect(request.headers.Authorization).toBe('Bearer model-key')
-    expect(request.headers['User-Agent']).toBe('Proma/9.9.9 (+https://github.com/ErlichLiu/Proma)')
+    expect(request.headers['User-Agent']).toBe('DutyDeck/9.9.9 (+https://github.com/ErlichLiu/Proma)')
     expect(request.headers['api-key']).toBeUndefined()
   })
 })

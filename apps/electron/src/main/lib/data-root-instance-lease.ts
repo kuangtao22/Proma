@@ -225,7 +225,7 @@ export class DataRootInstanceLeaseRegistry {
       const activeClaims = await Promise.all(chain.claims.map(({ record }) => (
         this.probeLiveness(record.endpoint, record.ownerToken)
       )))
-      if (activeClaims.some(Boolean)) throw new Error('另一个 Proma 实例正在准备数据根迁移')
+      if (activeClaims.some(Boolean)) throw new Error('另一个 DutyDeck 实例正在准备数据根迁移')
       /** 当前快照链尾对应的确定性后继是所有 contender 的唯一竞争目标。 */
       const claimPath = chain.nextClaimPath
       try {
@@ -480,7 +480,7 @@ function readIntentChain(registryDir: string): IntentChainSnapshot {
 /** 提供 crash 链耗尽后的明确人工恢复路径，同时保持默认 fail closed。 */
 function createIntentChainRecoveryError(registryDir: string): Error {
   return new Error(
-    `迁移 intent claim 链过长。请完全退出所有 Proma 实例，备份后删除 ${registryDir}，再重新启动 Proma`,
+    `迁移 intent claim 链过长。请完全退出所有 DutyDeck 实例，备份后删除 ${registryDir}，再重新启动 DutyDeck`,
   )
 }
 

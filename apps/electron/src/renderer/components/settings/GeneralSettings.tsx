@@ -75,8 +75,6 @@ export function GeneralSettings(): React.ReactElement {
   const [nameInput, setNameInput] = React.useState(userProfile.userName)
   const [showEmojiPicker, setShowEmojiPicker] = React.useState(false)
   const [archiveAfterDays, setArchiveAfterDays] = React.useState<number>(7)
-  /** Git/PR 推广标识：默认开启 */
-  const [gitAttributionEnabled, setGitAttributionEnabled] = React.useState(true)
   const [agentIslandEnabled, setAgentIslandEnabled] = React.useState(true)
   const isMac = React.useMemo(() => detectIsMac(), [])
   const isWindows = React.useMemo(() => detectIsWindows(), [])
@@ -86,7 +84,6 @@ export function GeneralSettings(): React.ReactElement {
   React.useEffect(() => {
     window.electronAPI.getSettings().then((settings) => {
       setArchiveAfterDays(settings.archiveAfterDays ?? 7)
-      setGitAttributionEnabled(settings.gitAttributionEnabled ?? true)
       setAgentIslandEnabled(settings.agentIsland?.enabled ?? true)
     }).catch(console.error)
   }, [])
@@ -100,17 +97,6 @@ export function GeneralSettings(): React.ReactElement {
       await updateProductivityTools(next)
     } catch {
       setProductivityTools(previous)
-    }
-  }
-
-  /** 更新 Git/PR 推广标识开关 */
-  const handleGitAttributionChange = async (checked: boolean): Promise<void> => {
-    setGitAttributionEnabled(checked)
-    try {
-      await window.electronAPI.updateSettings({ gitAttributionEnabled: checked })
-    } catch (error) {
-      console.error('[通用设置] 更新 Git/PR 标识失败:', error)
-      setGitAttributionEnabled(!checked)
     }
   }
 
@@ -345,7 +331,7 @@ export function GeneralSettings(): React.ReactElement {
               <Volume2 className="mt-0.5 size-3.5 shrink-0" />
               <div className="min-w-0">
                 <p>音效与卡片插画来自 UI SFX，采用 CC0 公共领域许可。</p>
-                <p className="mt-0.5">Proma 非常喜欢这个音效库，并特别还原了一部分 UI SFX 的设计风格，推荐大家访问和使用他们的产品。</p>
+                <p className="mt-0.5">DutyDeck 非常喜欢这个音效库，并特别还原了一部分 UI SFX 的设计风格，推荐大家访问和使用他们的产品。</p>
               </div>
             </div>
             <a
@@ -423,14 +409,6 @@ export function GeneralSettings(): React.ReactElement {
               }}
             />
           )}
-          <SettingsToggle
-            label="Git/PR 标识"
-            description="Agent 代你提交 commit 或创建 PR 时，附加 Made-with: Proma 与官网链接，便于推广；可随时关闭"
-            checked={gitAttributionEnabled}
-            onCheckedChange={(checked) => {
-              void handleGitAttributionChange(checked)
-            }}
-          />
         </SettingsCard>
       </SettingsSection>
 

@@ -369,12 +369,6 @@ export interface AppSettings {
   autoCleanupTempOnStart?: boolean
   /** 自动清理 N 天前已归档会话的 SDK 数据（0 = 禁用，默认 0） */
   autoCleanupArchivedDays?: number
-  /**
-   * Agent 代创建 git commit / PR 时是否附加 Proma 推广标识。
-   * 默认 true：commit trailer `Made-with: Proma`，PR body 末尾含 https://proma.cool 与 https://github.com/proma-ai/Proma。
-   * 关闭后不注入任何 Proma 归因，并覆盖 Claude SDK 默认 Co-Authored-By。
-   */
-  gitAttributionEnabled?: boolean
   /** macOS 原生 Agent 灵动岛偏好。 */
   agentIsland?: AgentIslandSettings
   /** 主窗口状态（大小、位置、是否最大化） */

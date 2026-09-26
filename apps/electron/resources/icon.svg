@@ -1,40 +1,13 @@
-<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <!--
-    macOS Big Sur+ 图标规范:
-    - 画布: 1024x1024
-    - 圆角矩形: 824x824 居中 (边距 100px)
-    - 圆角: 185px (~22.5%)
-  -->
-
-  <!-- 变换：将原 800x800 内容缩放到 824x824 并居中 -->
-  <g transform="translate(100, 100) scale(1.03)">
-    <!-- macOS 风格圆角背景 -->
-    <rect width="800" height="800" rx="180" ry="180" fill="#000000"/>
-
-    <!-- 从近到远逐渐缩小、透明的条纹 - 营造纵深感 -->
-    <g>
-      <!-- 第一层 - 最近，最实 -->
-      <rect x="150" y="350" width="90" height="400" rx="15" fill="#FFFFFF" opacity="1"/>
-
-      <!-- 第二层 - 渐远 -->
-      <rect x="270" y="320" width="80" height="360" rx="13" fill="#F0F0F0" opacity="0.85"
-            transform="rotate(-3 310 500)"/>
-
-      <!-- 第三层 - 更远 -->
-      <rect x="380" y="290" width="70" height="320" rx="11" fill="#E0E0E0" opacity="0.7"
-            transform="rotate(-6 415 450)"/>
-
-      <!-- 第四层 - 渐隐 -->
-      <rect x="480" y="260" width="60" height="280" rx="9" fill="#D0D0D0" opacity="0.55"
-            transform="rotate(-9 510 400)"/>
-
-      <!-- 第五层 - 远端 -->
-      <rect x="570" y="230" width="50" height="240" rx="7" fill="#C0C0C0" opacity="0.4"
-            transform="rotate(-12 595 350)"/>
-
-      <!-- 第六层 - 几乎消失 -->
-      <rect x="650" y="200" width="40" height="200" rx="5" fill="#B0B0B0" opacity="0.25"
-            transform="rotate(-15 670 300)"/>
-    </g>
-  </g>
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 由 scripts/generate-brand-icons.ts 生成，请勿手改：几何来自 brand-glyph-contour.ts 的描图数据。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="glyph" gradientUnits="userSpaceOnUse" x1="232.0" y1="228.4" x2="792.0" y2="795.6">
+      <stop offset="0" stop-color="#F1F1F1" stop-opacity="0"/>
+      <stop offset="0.75" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="224" fill="#151515"/>
+  <path fill-rule="evenodd" fill="url(#glyph)" d="M236.9 228.6 L232.0 238.7 L232.4 682.1 L236.9 685.0 L356.0 686.4 L357.8 690.8 L357.8 789.3 L360.5 793.8 L366.7 795.7 L563.7 795.6 L604.0 790.7 L626.4 785.6 L662.2 773.0 L702.5 749.2 L729.3 726.5 L760.7 686.8 L774.5 659.5 L784.6 632.6 L792.0 583.4 L790.0 543.1 L778.6 497.1 L760.7 458.0 L742.8 433.5 L720.4 409.4 L680.1 379.8 L676.2 382.0 L676.2 386.4 L682.5 408.8 L687.4 449.1 L686.8 480.4 L681.1 511.8 L669.1 547.6 L657.7 570.0 L639.8 597.0 L615.7 623.7 L586.1 647.0 L563.7 659.7 L536.8 671.6 L514.5 678.2 L478.7 684.1 L362.3 683.4 L359.4 677.4 L359.0 650.5 L359.0 359.6 L362.3 352.7 L590.6 353.3 L621.9 358.7 L666.7 374.5 L671.1 374.7 L671.5 368.5 L646.3 323.8 L609.5 283.5 L568.2 255.5 L523.4 237.2 L469.7 228.6 Z"/>
 </svg>

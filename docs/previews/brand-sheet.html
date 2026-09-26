@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DutyDeck 品牌检查表</title>
+    <style>
+      /*
+       * 品牌检查表：把图标放进真实尺寸与使用场景里看。
+       * 只是本地预览页，不参与打包，也不被应用加载。
+       */
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 40px;
+        background: #0b0d10;
+        color: #f1f5f9;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
+      h2 { margin: 40px 0 14px; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; color: rgba(241,245,249,.75); }
+      p.note { margin: 0 0 8px; font-size: 12px; line-height: 1.7; color: rgba(241,245,249,.5); }
+      .row { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+      .item { text-align: center; }
+      .item figcaption { margin-top: 10px; font-size: 11px; color: rgba(241,245,249,.45); }
+      figure { margin: 0; }
+      .light { display: flex; align-items: flex-end; gap: 28px; padding: 22px; border-radius: 14px; background: #eef1f3; }
+      .light figcaption { color: rgba(15,18,22,.55); }
+      .tray-dark, .tray-light { display: flex; align-items: center; gap: 22px; padding: 16px 22px; border-radius: 12px; }
+      .tray-dark { background: #101418; border: 1px solid #1e2429; }
+      .tray-light { background: #f4f6f8; }
+      .tray-light img { }
+      .zoom { image-rendering: auto; }
+      iframe { width: 360px; height: 232px; border: 1px solid #232a30; border-radius: 12px; background: #000; }
+      code { font-size: 11px; color: rgba(241,245,249,.45); }
+    </style>
+  </head>
+  <body>
+    <h1>DutyDeck 品牌检查表</h1>
+    <p class="note">
+      下面所有尺寸都是 1:1 真实像素（不放大），用来判断缩小后还认不认得出来。图标源文件与生成逻辑在
+      <code>apps/electron/scripts/generate-brand-icons.ts</code>，PNG 与 SVG 同源。
+    </p>
+
+    <h2>应用图标（深色底，Dock 常用尺寸）</h2>
+    <section class="row">
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="256" height="256" alt="256" />
+        <figcaption>256 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="128" height="128" alt="128" />
+        <figcaption>128 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="64" height="64" alt="64" />
+        <figcaption>64 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="32" height="32" alt="32" />
+        <figcaption>32 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="16" height="16" alt="16" />
+        <figcaption>16 px</figcaption>
+      </figure>
+    </section>
+
+    <h2>应用图标（浅色底）</h2>
+    <section class="light">
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="128" height="128" alt="128 light" />
+        <figcaption>128 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="64" height="64" alt="64 light" />
+        <figcaption>64 px</figcaption>
+      </figure>
+      <figure class="item">
+        <img src="../../apps/electron/resources/icon.png" width="32" height="32" alt="32 light" />
+        <figcaption>32 px</figcaption>
+      </figure>
+    </section>
+
+    <h2>托盘标记（22pt 模板图标，菜单栏会按深浅自动反色）</h2>
+    <section class="row">
+      <div class="tray-dark">
+        <img src="../../apps/electron/resources/dutydeck-logos/iconTemplate.png" width="22" height="22" alt="托盘" />
+        <img class="zoom" src="../../apps/electron/resources/dutydeck-logos/iconTemplate@3x.png" width="66" height="66" alt="托盘放大" />
+        <figcaption>深色菜单栏 ｜ 1:1 与 3× 放大</figcaption>
+      </div>
+      <div class="tray-light">
+        <img src="../../apps/electron/resources/dutydeck-logos/iconTemplate.png" width="22" height="22" alt="托盘浅色" style="filter: invert(1)" />
+        <figcaption>浅色菜单栏（invert 模拟反色）</figcaption>
+      </div>
+    </section>
+
+    <h2>启动页（真实页面，可交互）</h2>
+    <iframe src="../../apps/electron/resources/startup-splash/index.html" title="启动页预览"></iframe>
+  </body>
+</html>

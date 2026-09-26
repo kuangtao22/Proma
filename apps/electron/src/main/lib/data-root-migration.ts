@@ -480,7 +480,7 @@ export class DataRootMigrationCoordinator {
       try {
         this.rebaseOwnedPaths({ sourceRoot: migration.sourceRoot, targetRoot: migration.targetRoot })
       } catch (error) {
-        throw this.persistFailure(migration.id, '更新 Proma-owned 路径失败', 'REBASE_FAILED', error)
+        throw this.persistFailure(migration.id, '更新 DutyDeck-owned 路径失败', 'REBASE_FAILED', error)
       }
       this.throwIfCancelled(token)
       migration = this.transition(migration, 'switching', onProgress)
@@ -791,7 +791,7 @@ export class DataRootMigrationCoordinator {
     try {
       const initial = readMigrationLock(this.lockPath)
       if (!initial || this.isPidRunning(initial.pid)) {
-        throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个 Proma 实例正在使用数据根迁移')
+        throw new DataRootMigrationError('MIGRATION_LOCKED', '另一个 DutyDeck 实例正在使用数据根迁移')
       }
       const confirmed = readMigrationLock(this.lockPath)
       if (!confirmed || confirmed.ownerToken !== initial.ownerToken || this.isPidRunning(confirmed.pid)) {

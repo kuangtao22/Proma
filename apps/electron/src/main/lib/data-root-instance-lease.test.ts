@@ -203,7 +203,7 @@ describe('DataRootInstanceLeaseRegistry', () => {
     const activeGuard = await ownerC.acquireMigrationGuard()
     const contender = createRegistry(homeDir, 'd-owner', 404, harness)
 
-    await expect(contender.acquireMigrationGuard()).rejects.toThrow('另一个 Proma 实例正在准备数据根迁移')
+    await expect(contender.acquireMigrationGuard()).rejects.toThrow('另一个 DutyDeck 实例正在准备数据根迁移')
     activeGuard.release()
   })
 
@@ -303,6 +303,6 @@ describe('DataRootInstanceLeaseRegistry', () => {
     const contender = createRegistry(homeDir, 'overflow-owner', 999, harness)
 
     await expect(contender.acquireMigrationGuard())
-      .rejects.toThrow('完全退出所有 Proma 实例')
+      .rejects.toThrow('完全退出所有 DutyDeck 实例')
   })
 })

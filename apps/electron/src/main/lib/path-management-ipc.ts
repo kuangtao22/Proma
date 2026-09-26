@@ -421,7 +421,7 @@ export function registerPathManagementIpcHandlers(
             relaunchNow()
           } else if (guardReleaseError !== null) {
             const message = guardReleaseError instanceof Error ? guardReleaseError.message : String(guardReleaseError)
-            throw new Error(`迁移计划未创建，但迁移 intent 清理失败；请完全退出所有 Proma 实例后重试。原因: ${message}`)
+            throw new Error(`迁移计划未创建，但迁移 intent 清理失败；请完全退出所有 DutyDeck 实例后重试。原因: ${message}`)
           }
         }
       } catch (error) {
@@ -849,7 +849,7 @@ function getDefaultCoordinator(locator: DataRootLocator): DataRootMigrationCoord
 async function assertMigrationCanStart(options: RegisterPathManagementIpcOptions): Promise<void> {
   if (options.hasActiveTasks?.() === true) throw new Error('仍有 Agent、Automation 或接口请求正在运行，无法迁移数据根')
   if (await options.hasOtherPromaInstance?.() === true) {
-    throw new Error('另一个 Proma 实例正在使用数据根，无法迁移')
+    throw new Error('另一个 DutyDeck 实例正在使用数据根，无法迁移')
   }
 }
 
@@ -948,7 +948,7 @@ function inspectRecoveryCandidate(root: string): DataRootRecoverySelection['kind
   } finally {
     directory.closeSync()
   }
-  throw new Error('所选目录不是可识别的 Proma 数据根，也不是空目录；请选择已有应用数据目录或新建空文件夹')
+  throw new Error('所选目录不是可识别的 DutyDeck 数据根，也不是空目录；请选择已有应用数据目录或新建空文件夹')
 }
 
 /**

@@ -43,7 +43,6 @@ export function getSettings(): AppSettings {
       visionRelay: { enabled: false },
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
-      gitAttributionEnabled: true,
       productivityTools: normalizeProductivityToolsSettings(undefined),
     }
   }
@@ -85,7 +84,6 @@ export function getSettings(): AppSettings {
         : undefined,
       agentThinking: settings.agentThinking ?? { type: 'adaptive' },
       // 缺省 true：老配置文件未写该字段时保持推广默认开启
-      gitAttributionEnabled: settings.gitAttributionEnabled ?? true,
       // 缺省全部开启：老配置文件不会因升级意外隐藏生产力工具。
       productivityTools: normalizeProductivityToolsSettings(data.productivityTools),
       // 仅保留 macOS 原生 Island 开关；清理旧非原生 surface 的持久化残留字段。
@@ -104,7 +102,6 @@ export function getSettings(): AppSettings {
       visionRelay: { enabled: false },
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
-      gitAttributionEnabled: true,
       productivityTools: normalizeProductivityToolsSettings(undefined),
     }
   }

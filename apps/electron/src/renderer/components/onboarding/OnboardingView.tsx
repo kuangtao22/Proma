@@ -19,7 +19,6 @@ import { useEffect, useRef, useState } from 'react'
 import { ChevronRight, ChevronLeft, ChevronsRight, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CURRENT_ONBOARDING_VERSION } from '../../../types'
-import hopperSeasideWhiteHouse from '@/assets/onboarding/hopper-seaside-white-house.png'
 import guideVisual from '@/assets/onboarding/guide-visual.png'
 import guideAgentExample from '@/assets/onboarding/guide-agent-example.png'
 import guideChatExample from '@/assets/onboarding/guide-chat-example.png'
@@ -27,14 +26,25 @@ import guideAutomation from '@/assets/onboarding/guide-automation.png'
 import guideMemory from '@/assets/onboarding/guide-memory.png'
 import guideSideAnswer from '@/assets/onboarding/guide-side-answer.png'
 import guideSubagent from '@/assets/onboarding/guide-subagent.png'
-import promaMarkWhite from '@/assets/onboarding/proma-mark-white.svg'
+import dutydeckMarkWhite from '@/assets/onboarding/dutydeck-mark-white.png'
 import { AutomationGuideExamples } from './AutomationGuideExamples'
 import { FileGuideExamples } from './FileGuideExamples'
+import { SelfBuiltModulesPage } from './SelfBuiltModulesPage'
 import { MemoryGuideExamples } from './MemoryGuideExamples'
 import { SubagentGuideExamples } from './SubagentGuideExamples'
 import { FAQ_GROUPS } from './faq-content'
 
-type OnboardingStep = 'welcome' | 'guide' | 'files' | 'project' | 'automation' | 'memory' | 'sideanswer' | 'subagent' | 'faq'
+type OnboardingStep =
+  | 'welcome'
+  | 'guide'
+  | 'files'
+  | 'project'
+  | 'automation'
+  | 'memory'
+  | 'sideanswer'
+  | 'subagent'
+  | 'modules'
+  | 'faq'
 
 interface OnboardingViewProps {
   onComplete: () => void
@@ -135,7 +145,7 @@ function Magnifier({ imageSrc, anchorX, anchorY, imgRect, offsetX = 0, imageOffs
         top: cy - RADIUS,
         width: DIAMETER,
         height: DIAMETER,
-        backgroundColor: '#eef4ea',
+        backgroundColor: '#eef0f1',
         clipPath: `circle(${RADIUS}px at ${RADIUS}px ${RADIUS}px)`,
         overflow: 'hidden',
         filter: 'drop-shadow(0 4px 12px rgba(0,0,0,0.25))',
@@ -158,12 +168,12 @@ function Magnifier({ imageSrc, anchorX, anchorY, imgRect, offsetX = 0, imageOffs
       />
       {/* 圆圈边框 */}
       <div
-        className="absolute inset-0 rounded-full border-[3px] border-[#1b3f2d]"
+        className="absolute inset-0 rounded-full border-[3px] border-[#151515]"
         style={{ clipPath: `circle(${RADIUS}px at ${RADIUS}px ${RADIUS}px)` }}
       />
       {/* 放大镜把手装饰（可选） */}
       <div
-        className="absolute bottom-[-6px] right-[-6px] h-8 w-8 rounded-full border-[4px] border-[#1b3f2d]"
+        className="absolute bottom-[-6px] right-[-6px] h-8 w-8 rounded-full border-[4px] border-[#151515]"
         style={{
           clipPath: 'none',
           background: 'transparent',
@@ -179,9 +189,9 @@ function Magnifier({ imageSrc, anchorX, anchorY, imgRect, offsetX = 0, imageOffs
 /** 章节标记：标题上方，左侧为线条与圆点，右侧为章节文字。 */
 function ChapterMarker({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-6 flex w-full max-w-lg self-start items-center justify-end gap-4 text-sm font-medium tracking-[0.08em] text-[#1b3f2d]">
-      <span className="relative h-px flex-1 bg-[#1b3f2d]/25">
-        <span className="absolute left-0 top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-[#1b3f2d]" />
+    <div className="mb-6 flex w-full max-w-lg self-start items-center justify-end gap-4 text-sm font-medium tracking-[0.08em] text-[#151515]">
+      <span className="relative h-px flex-1 bg-[#151515]/25">
+        <span className="absolute left-0 top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-[#151515]" />
       </span>
       <span className="shrink-0 whitespace-nowrap">{children}</span>
     </div>
@@ -190,7 +200,7 @@ function ChapterMarker({ children }: { children: React.ReactNode }) {
 
 function GuideNavigation({ nextLabel, onNext, onBack }: { nextLabel: string; onNext: () => void; onBack?: () => void }) {
   return (
-    <div className="flex w-full items-center justify-between border-t border-[#1b3f2d]/20 pt-6">
+    <div className="flex w-full items-center justify-between border-t border-[#151515]/20 pt-6">
       {onBack ? (
         <Button variant="ghost" size="sm" onClick={onBack} className="text-neutral-500">
           <ChevronLeft className="mr-1 h-4 w-4" />
@@ -201,7 +211,7 @@ function GuideNavigation({ nextLabel, onNext, onBack }: { nextLabel: string; onN
       )}
       <button
         onClick={onNext}
-        className="flex h-14 items-center justify-center gap-1.5 rounded-md bg-[#1b3f2d] px-9 text-base font-medium text-white shadow-[0_8px_18px_rgba(27,63,45,0.14)] transition-all hover:bg-[#27513a] active:translate-y-0.5 active:shadow-none"
+        className="flex h-14 items-center justify-center gap-1.5 rounded-md bg-[#151515] px-9 text-base font-medium text-white shadow-[0_8px_18px_rgba(21,21,21,0.14)] transition-all hover:bg-[#2e2e2e] active:translate-y-0.5 active:shadow-none"
       >
         {nextLabel}
         <ChevronRight className="h-4 w-4" />
@@ -252,17 +262,17 @@ function GuideFeatureStep({ anchor, title, highlight, paragraphs, nextLabel, onN
       <div ref={containerRef} className="relative flex h-full w-[calc(58%+80px)] shrink-0 items-center justify-center overflow-visible p-6">
         {/* 左侧截图的四角定位标记，仅作为视觉边界，不参与图片布局。 */}
         <div aria-hidden="true" className="pointer-events-none absolute inset-x-6 top-[10%] bottom-[10%] z-0">
-          <span className="absolute left-0 top-0 h-7 w-7 border-l-2 border-t-2 border-[#1b3f2d]/70" />
-          <span className="absolute right-0 top-0 h-7 w-7 border-r-2 border-t-2 border-[#1b3f2d]/70" />
-          <span className="absolute bottom-0 left-0 h-7 w-7 border-b-2 border-l-2 border-[#1b3f2d]/70" />
-          <span className="absolute bottom-0 right-0 h-7 w-7 border-b-2 border-r-2 border-[#1b3f2d]/70" />
+          <span className="absolute left-0 top-0 h-7 w-7 border-l-2 border-t-2 border-[#151515]/70" />
+          <span className="absolute right-0 top-0 h-7 w-7 border-r-2 border-t-2 border-[#151515]/70" />
+          <span className="absolute bottom-0 left-0 h-7 w-7 border-b-2 border-l-2 border-[#151515]/70" />
+          <span className="absolute bottom-0 right-0 h-7 w-7 border-b-2 border-r-2 border-[#151515]/70" />
         </div>
 
         <img
           ref={imgRef}
           src={imageSrc}
-          alt="Proma 界面"
-          className="max-h-full max-w-full rounded-lg border border-[#d7ddd5] bg-[#f6f8f3] object-contain shadow-[0_14px_30px_rgba(27,63,45,0.12)]"
+          alt="DutyDeck 界面"
+          className="max-h-full max-w-full rounded-lg border border-[#d8d8d8] bg-[#f4f5f6] object-contain shadow-[0_14px_30px_rgba(21,21,21,0.12)]"
           style={imageRightCrop > 0 ? { clipPath: `inset(0 ${imageRightCrop}px 0 0)` } : undefined}
         />
 
@@ -291,28 +301,28 @@ function GuideFeatureStep({ anchor, title, highlight, paragraphs, nextLabel, onN
               cx={imgRect.x + anchor.x * imgRect.w}
               cy={imgRect.y + anchor.y * imgRect.h}
               r="14"
-              fill="#1b3f2d"
+              fill="#151515"
               opacity="0.18"
             />
             <circle
               cx={imgRect.x + anchor.x * imgRect.w}
               cy={imgRect.y + anchor.y * imgRect.h}
               r="6"
-              fill="#1b3f2d"
+              fill="#151515"
             />
             {arrowMode === 'curve' ? (
               <>
                 {/* 曲线：锚点 → 图片右缘向右延长 */}
                 <path
                   d={`M ${imgRect.x + anchor.x * imgRect.w + 14} ${imgRect.y + anchor.y * imgRect.h} C ${imgRect.x + imgRect.w * 0.45} ${imgRect.y + anchor.y * imgRect.h}, ${imgRect.x + imgRect.w * 0.55} ${imgRect.y + imgRect.h * 0.18}, ${imgRect.x + imgRect.w + 30} ${imgRect.y + imgRect.h * 0.16}`}
-                  stroke="#1b3f2d"
+                  stroke="#151515"
                   strokeWidth="4"
                   strokeLinecap="round"
                 />
                 {/* 箭头头部（向右延长后保持在容器内） */}
                 <polygon
                   points={`${imgRect.x + imgRect.w + 30},${imgRect.y + imgRect.h * 0.16 - 9} ${imgRect.x + imgRect.w + 42},${imgRect.y + imgRect.h * 0.16} ${imgRect.x + imgRect.w + 30},${imgRect.y + imgRect.h * 0.16 + 9}`}
-                  fill="#1b3f2d"
+                  fill="#151515"
                 />
               </>
             ) : (
@@ -323,14 +333,14 @@ function GuideFeatureStep({ anchor, title, highlight, paragraphs, nextLabel, onN
                   y1={imgRect.y + anchor.y * imgRect.h}
                   x2={imgRect.x + imgRect.w + 30}
                   y2={imgRect.y + anchor.y * imgRect.h}
-                  stroke="#1b3f2d"
+                  stroke="#151515"
                   strokeWidth="4"
                   strokeLinecap="round"
                 />
                 {/* 直线箭头头部 */}
                 <polygon
                   points={`${imgRect.x + imgRect.w + 30},${imgRect.y + anchor.y * imgRect.h - 9} ${imgRect.x + imgRect.w + 42},${imgRect.y + anchor.y * imgRect.h} ${imgRect.x + imgRect.w + 30},${imgRect.y + anchor.y * imgRect.h + 9}`}
-                  fill="#1b3f2d"
+                  fill="#151515"
                 />
               </>
             )}
@@ -361,11 +371,11 @@ function GuideFeatureStep({ anchor, title, highlight, paragraphs, nextLabel, onN
 
         {/* 无导航的首屏：用一行文字承接阅读动线，说明下方还有内容。 */}
         {!showNavigation && onScrollHint && (
-          <div className="mt-12 w-full max-w-lg border-t border-[#1b3f2d]/20 pt-5">
+          <div className="mt-12 w-full max-w-lg border-t border-[#151515]/20 pt-5">
             <button
               type="button"
               onClick={onScrollHint}
-              className="text-left text-sm leading-6 text-neutral-500 transition-colors hover:text-[#1b3f2d]"
+              className="text-left text-sm leading-6 text-neutral-500 transition-colors hover:text-[#151515]"
             >
               继续向下滚动，查看这一步的真实示例
             </button>
@@ -432,7 +442,7 @@ function AgentChatGuidePage({ onNext, onBack }: { onNext: () => void; onBack: ()
         highlight: '入门篇 · 第 1 步',
         title: 'Agent 和 Chat 模式的区别',
         paragraphs: [
-          <>左边栏顶部是 Proma 的<b className="font-medium text-neutral-900">模式切换</b>：Agent 与 Chat。</>,
+          <>左边栏顶部是 DutyDeck 的<b className="font-medium text-neutral-900">模式切换</b>：Agent 与 Chat。</>,
           <>
             <b className="font-medium text-neutral-900">Chat</b> 是一问一答的对话——快速提问、不涉及任何对电脑的操作，
             核心偏向满足好奇心和完成简单的文字工作。
@@ -449,38 +459,38 @@ function AgentChatGuidePage({ onNext, onBack }: { onNext: () => void; onBack: ()
     >
       <section className="-mt-[150px] pb-16 pt-6 md:pb-20 md:pt-10">
         <div className="space-y-16 md:space-y-20">
-          <article className="grid gap-10 border-t border-[#1b3f2d]/15 pt-10 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-center">
-            <figure className="overflow-hidden rounded-lg bg-[#f6f8f3] shadow-[0_14px_30px_rgba(27,63,45,0.12)]">
+          <article className="grid gap-10 border-t border-[#151515]/15 pt-10 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-center">
+            <figure className="overflow-hidden rounded-lg bg-[#f4f5f6] shadow-[0_14px_30px_rgba(21,21,21,0.12)]">
               <img src={guideChatExample} alt="Chat 解释 RAG 搜索原理的示例" className="block h-auto w-full" />
             </figure>
             <div>
-              <div className="text-xs font-medium uppercase tracking-[0.18em] text-[#1b3f2d]">示例 01 · Chat</div>
+              <div className="text-xs font-medium uppercase tracking-[0.18em] text-[#151515]">示例 01 · Chat</div>
               <h3 className="mt-3 text-2xl font-medium text-neutral-900 md:text-3xl">快速厘清一个概念用 Chat</h3>
               <p className="mt-4 text-base leading-[1.7] text-neutral-600 md:text-lg">
                 AI 最常见的场景，随意询问一件事，得到简单快速的解释。Chat 专注对话和文字回答，不会有任何产出。
               </p>
-              <div className="mt-5 border-l-2 border-[#1b3f2d]/35 pl-4">
-                <div className="text-base font-medium leading-7 text-[#1b3f2d]">你可以这样说</div>
+              <div className="mt-5 border-l-2 border-[#151515]/35 pl-4">
+                <div className="text-base font-medium leading-7 text-[#151515]">你可以这样说</div>
                 <p className="mt-1 text-base leading-7 text-neutral-500">“用通俗的话帮我解释一下 RAG 的搜索原理。”</p>
               </div>
             </div>
           </article>
 
-          <article className="grid gap-10 border-t border-[#1b3f2d]/15 pt-10 lg:grid-cols-[22rem_minmax(0,1fr)] lg:items-center">
+          <article className="grid gap-10 border-t border-[#151515]/15 pt-10 lg:grid-cols-[22rem_minmax(0,1fr)] lg:items-center">
             <div className="lg:order-1">
-              <div className="text-xs font-medium uppercase tracking-[0.18em] text-[#1b3f2d]">示例 02 · Agent</div>
+              <div className="text-xs font-medium uppercase tracking-[0.18em] text-[#151515]">示例 02 · Agent</div>
               <h3 className="mt-3 text-2xl font-medium text-neutral-900 md:text-3xl">
                 复杂<b className="font-medium text-neutral-900">调研/写代码/做PPT</b>等需要产出成果时用 Agent
               </h3>
               <p className="mt-4 text-base leading-[1.7] text-neutral-600 md:text-lg">
                 例如，请它研究一个概念或者行业并将结论做成 PPT/文档。Agent 会拆解任务、调用工具、持续推进，再把成果保留在当前工作区。
               </p>
-              <div className="mt-5 border-l-2 border-[#1b3f2d]/35 pl-4">
-                <div className="text-base font-medium leading-7 text-[#1b3f2d]">这样告诉 Agent</div>
+              <div className="mt-5 border-l-2 border-[#151515]/35 pl-4">
+                <div className="text-base font-medium leading-7 text-[#151515]">这样告诉 Agent</div>
                 <p className="mt-1 text-base leading-7 text-neutral-500">“帮我研究一下什么是 RAG，然后把研究结果写成一个文件/PPT放到会话文件里。”</p>
               </div>
             </div>
-            <figure className="overflow-hidden rounded-lg bg-[#f6f8f3] shadow-[0_14px_30px_rgba(27,63,45,0.12)] lg:order-2">
+            <figure className="overflow-hidden rounded-lg bg-[#f4f5f6] shadow-[0_14px_30px_rgba(21,21,21,0.12)] lg:order-2">
               <img src={guideAgentExample} alt="Agent 研究 RAG 并写入会话文件的示例" className="block h-auto w-full" />
             </figure>
           </article>
@@ -516,9 +526,9 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
             <button
               key={group.topic}
               onClick={() => scrollToGroup(group.topic)}
-              className="flex w-full items-center gap-2 rounded-sm px-3 py-2 text-left text-sm text-neutral-600 transition-colors hover:bg-[#1b3f2d]/5 hover:text-[#1b3f2d]"
+              className="flex w-full items-center gap-2 rounded-sm px-3 py-2 text-left text-sm text-neutral-600 transition-colors hover:bg-[#151515]/5 hover:text-[#151515]"
             >
-              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#1b3f2d]/40" />
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#151515]/40" />
               {group.topic}
             </button>
           ))}
@@ -531,7 +541,7 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
           {highlight && <ChapterMarker>{highlight}</ChapterMarker>}
           <div className="flex items-baseline gap-3">
             <h2 className="text-3xl font-light tracking-tight text-neutral-900 md:text-4xl">常见问题</h2>
-            <span className="text-2xl font-light tracking-[0.3em] text-[#1b3f2d]/60 md:text-3xl">FAQ</span>
+            <span className="text-2xl font-light tracking-[0.3em] text-[#151515]/60 md:text-3xl">FAQ</span>
           </div>
           <p className="mt-3 text-base leading-relaxed text-neutral-500">
             常见问题已经全部展开，方便你快速浏览和搜索。点击左侧目录可跳转到对应主题。
@@ -541,7 +551,7 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
             {FAQ_GROUPS.map((group, groupIndex) => (
               <section key={group.topic} aria-labelledby={`faq-${group.topic}`}>
                 <div className="flex items-end gap-3 border-b border-neutral-300 pb-3">
-                  <span className="text-xs font-medium tracking-[0.16em] text-[#1b3f2d]">
+                  <span className="text-xs font-medium tracking-[0.16em] text-[#151515]">
                     {String(groupIndex + 1).padStart(2, '0')}
                   </span>
                   <h3 id={`faq-${group.topic}`} className="text-lg font-medium text-neutral-900">
@@ -551,8 +561,8 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
 
                 <div className="divide-y divide-neutral-200/80">
                   {group.items.map((item) => (
-                    <article key={item.q} className="border-l-2 border-[#1b3f2d]/25 py-4 pl-4">
-                      <h4 className="text-sm font-semibold tracking-wide text-[#1b3f2d]">{item.q}</h4>
+                    <article key={item.q} className="border-l-2 border-[#151515]/25 py-4 pl-4">
+                      <h4 className="text-sm font-semibold tracking-wide text-[#151515]">{item.q}</h4>
                       <p className="mt-2 max-w-3xl text-[15px] leading-7 text-neutral-600">{item.a}</p>
                     </article>
                 ))}
@@ -561,7 +571,7 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
           ))}
         </div>
 
-        <div className="mt-12 flex w-full items-center justify-between border-t border-[#1b3f2d]/20 pt-6">
+        <div className="mt-12 flex w-full items-center justify-between border-t border-[#151515]/20 pt-6">
           {onBack ? (
             <Button variant="ghost" size="sm" onClick={onBack} className="text-neutral-500">
               <ChevronLeft className="mr-1 h-4 w-4" />
@@ -572,7 +582,7 @@ function FaqPage({ nextLabel, onNext, onBack, highlight }: { nextLabel: string; 
           )}
           <button
             onClick={onNext}
-            className="flex h-14 items-center justify-center gap-1.5 rounded-md bg-[#1b3f2d] px-9 text-base font-medium text-white shadow-[0_8px_18px_rgba(27,63,45,0.14)] transition-all hover:bg-[#27513a] active:translate-y-0.5 active:shadow-none"
+            className="flex h-14 items-center justify-center gap-1.5 rounded-md bg-[#151515] px-9 text-base font-medium text-white shadow-[0_8px_18px_rgba(21,21,21,0.14)] transition-all hover:bg-[#2e2e2e] active:translate-y-0.5 active:shadow-none"
           >
             {nextLabel}
             <ChevronRight className="h-4 w-4" />
@@ -593,6 +603,7 @@ const STEP_LABELS: Array<{ step: Exclude<OnboardingStep, 'welcome'>; label: stri
   { step: 'automation', label: '自动任务' },
   { step: 'memory', label: '记忆' },
   { step: 'sideanswer', label: '侧边回答' },
+  { step: 'modules', label: '自研模块' },
   { step: 'faq', label: 'FAQ' },
 ]
 
@@ -619,7 +630,7 @@ function ProgressMap({ current }: { current: Exclude<OnboardingStep, 'welcome'> 
                 <span
                   className={`text-[11px] leading-tight tracking-[0.04em] md:text-sm ${
                     isCurrent
-                      ? 'font-medium text-[#1b3f2d]'
+                      ? 'font-medium text-[#151515]'
                       : done
                         ? 'text-neutral-500'
                         : 'text-neutral-400'
@@ -633,16 +644,16 @@ function ProgressMap({ current }: { current: Exclude<OnboardingStep, 'welcome'> 
                       index === 0
                         ? 'bg-transparent'
                         : done || isCurrent
-                          ? 'bg-[#1b3f2d]/50'
+                          ? 'bg-[#151515]/50'
                           : 'bg-neutral-200'
                     }`}
                   />
                   <div
                     className={`mx-1.5 h-2.5 w-2.5 shrink-0 rounded-full transition-colors duration-300 ${
                       isCurrent
-                        ? 'bg-[#1b3f2d] ring-4 ring-[#1b3f2d]/15'
+                        ? 'bg-[#151515] ring-4 ring-[#151515]/15'
                         : done
-                          ? 'bg-[#1b3f2d]/70'
+                          ? 'bg-[#151515]/70'
                           : 'bg-neutral-300'
                     }`}
                   />
@@ -651,7 +662,7 @@ function ProgressMap({ current }: { current: Exclude<OnboardingStep, 'welcome'> 
                       index === visibleSteps.length - 1
                         ? 'bg-transparent'
                         : index < activeIdx
-                          ? 'bg-[#1b3f2d]/50'
+                          ? 'bg-[#151515]/50'
                           : 'bg-neutral-200'
                     }`}
                   />
@@ -669,7 +680,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
   const [step, setStep] = useState<OnboardingStep>(initialStep)
   const [flash, setFlash] = useState(false)
   const [fading, setFading] = useState(false)
-  const [faqBackStep, setFaqBackStep] = useState<'subagent' | 'sideanswer'>('sideanswer')
+  const [faqBackStep, setFaqBackStep] = useState<'subagent' | 'sideanswer' | 'modules'>('sideanswer')
   const handleFinish = async () => {
     await window.electronAPI.updateSettings({
       onboardingCompleted: true,
@@ -703,7 +714,11 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
   const handleNextFromAutomation = () => transitionTo('memory')
   const handleNextFromMemory = () => transitionTo('sideanswer')
   const handleNextFromSideAnswer = () => {
-    setFaqBackStep('sideanswer')
+    transitionTo('modules')
+  }
+  /** 自研模块页 → FAQ：记住来路，FAQ 的返回按钮要能回到这里。 */
+  const handleNextFromModules = () => {
+    setFaqBackStep('modules')
     transitionTo('faq')
   }
   const handleNextFromSubagent = () => transitionTo('automation')
@@ -722,32 +737,33 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
 
       {/* ===== 左侧：画作（仅欢迎页显示，引导页清屏） ===== */}
       {step === 'welcome' && (
-        <div className="relative h-56 shrink-0 overflow-hidden bg-[#d9e0e4] md:h-auto md:w-[calc(58%+100px)]">
-          <img
-            src={hopperSeasideWhiteHouse}
-            alt="海边的白色小屋画作"
-            className="absolute inset-0 h-full w-full object-cover object-center"
+        <div className="relative h-56 shrink-0 overflow-hidden bg-[#0b0d10] md:h-auto md:w-[calc(58%+100px)]">
+          {/* 与原生启动页同一套 ink 渐变；不再使用上游插画（其著作权在部分地区仍未过期） */}
+          <div
+            className="absolute inset-0"
+            style={{
+              background:
+                'radial-gradient(680px 460px at 62% 30%, rgba(255,255,255,0.08), transparent 66%), linear-gradient(168deg, #0e1418 0%, #0b0d10 60%, #0a0c0f 100%)',
+            }}
           />
-          {/* 光感渐变遮罩 */}
-          <div className="absolute inset-0 bg-gradient-to-t from-black/55 via-black/5 to-black/15 md:bg-gradient-to-tr md:from-black/60 md:via-transparent md:to-black/20" />
 
           {/* 左上角品牌 */}
           <div className="absolute left-6 top-6 flex items-center gap-3 md:left-10 md:top-8">
             <img
-              src={promaMarkWhite}
-              alt="Proma"
-              className="h-8 w-8 object-contain drop-shadow-[0_1px_2px_rgba(0,0,0,0.35)]"
+              src={dutydeckMarkWhite}
+              alt="DutyDeck"
+              className="h-8 w-8 object-contain"
             />
-            <span className="text-lg font-light tracking-wide text-white">Proma</span>
+            <span className="text-lg font-semibold tracking-[-0.01em] text-white">DutyDeck</span>
           </div>
 
-          {/* 左下角标语（呼应画作气质） */}
+          {/* 左下角定位语：与启动页、锁标构图保持同一句 */}
           <div className="absolute bottom-6 left-6 right-6 md:bottom-10 md:left-10 md:right-10">
-            <p className="text-lg font-light leading-snug text-white md:text-2xl">
-              让协作自然发生，让想法流动成形。
+            <p className="text-lg font-semibold leading-snug text-white md:text-2xl">
+              本地优先的工程工作台
             </p>
-            <p className="mt-2 text-[11px] uppercase tracking-[0.3em] text-white/70 md:text-xs">
-              FOR PROFESSIONALS
+            <p className="mt-2 text-[11px] uppercase tracking-[0.3em] text-white/55 md:text-xs">
+              画布 · 运维 · 接口 · Agent
             </p>
           </div>
 
@@ -771,14 +787,14 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
           <div className="w-full max-w-xl px-6 py-10 md:px-10">
             {/* 状态徽章 */}
             <div className="mb-6 flex items-center gap-2.5">
-              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#26583d] text-white">
+              <span className="flex h-6 w-6 items-center justify-center rounded-full bg-[#151515] text-white">
                 <Check size={13} strokeWidth={3} />
               </span>
               <span className="text-sm font-medium text-neutral-500">准备就绪</span>
             </div>
 
             <h1 className="text-3xl font-light tracking-tight text-neutral-900 md:text-4xl">
-              欢迎使用 Proma
+              欢迎使用 DutyDeck
             </h1>
             <p className="mt-3 text-base leading-relaxed text-neutral-500 md:text-lg">
               为专业用户打造的通用 Agent
@@ -788,7 +804,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
             <div className="mt-8">
               <button
                 onClick={handleEnterGuide}
-                className="flex h-12 w-full items-center justify-center gap-1.5 rounded-sm bg-[#1b3f2d] text-base font-medium text-white transition-all hover:bg-[#27513a] active:translate-y-0.5 active:shadow-none"
+                className="flex h-12 w-full items-center justify-center gap-1.5 rounded-sm bg-[#151515] text-base font-medium text-white transition-all hover:bg-[#2e2e2e] active:translate-y-0.5 active:shadow-none"
               >
                 进入引导界面
                 <ChevronRight className="h-4 w-4" />
@@ -827,7 +843,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
             onNext={handleNextFromFiles}
             onBack={() => transitionTo('project')}
           >
-            <section className="border-t border-[#1b3f2d]/20 py-16 md:py-20">
+            <section className="border-t border-[#151515]/20 py-16 md:py-20">
               <FileGuideExamples />
             </section>
           </GuideExamplesPage>
@@ -901,7 +917,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
               title: '自动任务功能',
               paragraphs: [
                 <>
-                  打开<b className="font-medium text-neutral-900">自动任务</b>，你可以让 Proma 定时自动执行一件事。
+                  打开<b className="font-medium text-neutral-900">自动任务</b>，你可以让 DutyDeck 定时自动执行一件事。
                   在任务描述里用自然语言写清楚「做什么、什么时候做」，再配置频率与模型，
                   <b className="font-medium text-neutral-900">无人值守</b>也能完成。
                   你也可以用自然语言直接让 Agent 帮你创建自动任务。
@@ -912,7 +928,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
             onNext={handleNextFromAutomation}
             onBack={() => transitionTo('subagent')}
           >
-            <section className="border-t border-[#1b3f2d]/20 py-16 md:py-20">
+            <section className="border-t border-[#151515]/20 py-16 md:py-20">
               <AutomationGuideExamples />
             </section>
           </GuideExamplesPage>
@@ -936,7 +952,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
             onNext={handleNextFromMemory}
             onBack={() => transitionTo('automation')}
           >
-            <section className="border-t border-[#1b3f2d]/20 py-16 md:py-20">
+            <section className="border-t border-[#151515]/20 py-16 md:py-20">
               <MemoryGuideExamples />
             </section>
           </GuideExamplesPage>
@@ -965,10 +981,19 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
 
         {step === 'faq' && (
           <FaqPage
-            highlight="进阶指南 · 第 5 步"
+            highlight="进阶指南 · 第 6 步"
             nextLabel="开始使用"
             onNext={handleNextFromFaq}
             onBack={() => transitionTo(faqBackStep)}
+          />
+        )}
+
+        {step === 'modules' && (
+          <SelfBuiltModulesPage
+            highlight="进阶指南 · 第 5 步"
+            nextLabel="常见问题"
+            onNext={handleNextFromModules}
+            onBack={() => transitionTo('sideanswer')}
           />
         )}
 
@@ -979,7 +1004,7 @@ export function OnboardingView({ onComplete, initialStep = 'welcome' }: Onboardi
       {step === 'subagent' && (
         <button
           onClick={handleJumpToFaq}
-          className="absolute bottom-5 right-[30px] z-30 flex h-8 items-center gap-1 px-2 text-sm text-neutral-500 transition-colors hover:text-[#1b3f2d]"
+          className="absolute bottom-5 right-[30px] z-30 flex h-8 items-center gap-1 px-2 text-sm text-neutral-500 transition-colors hover:text-[#151515]"
         >
           跳到 FAQ
           <ChevronsRight className="h-4 w-4" />

@@ -48,7 +48,7 @@ export function WorkspaceMemoryWindowApp(): React.ReactElement {
     textRef.current = text
   }, [dirty, selectedPath, text])
   React.useEffect(() => {
-    document.title = 'Proma · 工作区记忆'
+    document.title = 'DutyDeck · 工作区记忆'
   }, [])
   React.useEffect(() => {
     void window.electronAPI.markWorkspaceMemoryWindowReady(workspaceSlug).catch(() => {})

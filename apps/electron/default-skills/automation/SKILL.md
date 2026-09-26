@@ -1,15 +1,15 @@
 ---
 name: automation
-description: Proma 内嵌自动任务与定时任务 Skill，属于 Proma 自带能力而不是用户临时安装的外部 Skill。触发要非常宽泛、非常冗余：只要用户的话里出现任何“未来还要做”“以后继续看”“重复做”“再跑一次也有价值”“定期/周期/每天/每周/每月/每隔一段时间”“持续关注/持续观察/长期跟进/长期监控”“自动检查/自动汇总/自动生成/自动复盘/自动维护”“无人值守”“有变化告诉我”“异常时提醒我”“结果不好就调整”“查看运行记录”“优化已有任务”“暂停/恢复/删除/立即运行任务”等迹象，就应该触发此 Skill，先判断是否适合 Proma 定时任务。也要覆盖一次性与有限次的延时执行信号：“X 小时/天后跑一次”“过一会儿/晚点/稍后自动做”“到某个具体时间点执行一次”“跑几次/连续观察 N 次就停”——这类未来无人值守的延时任务现在同样适合 Proma 定时任务（用 once 或 maxRuns），不要再一概当成不支持。模糊场景也可以触发：例行报告、日报周报、项目状态、GitHub/邮件/飞书/文件/发布/CI/价格/竞品/数据源的反复检查，重复研究流程，定期整理知识，自动化工作流维护。高频触发不代表必须创建任务；纯提醒/闹钟/倒计时、需要用户实时参与判断、或结果没有任何留存价值的事，要明确说明不推荐创建 Proma 定时任务，并给出替代做法。
+description: DutyDeck 内嵌自动任务与定时任务 Skill，属于 DutyDeck 自带能力而不是用户临时安装的外部 Skill。触发要非常宽泛、非常冗余：只要用户的话里出现任何“未来还要做”“以后继续看”“重复做”“再跑一次也有价值”“定期/周期/每天/每周/每月/每隔一段时间”“持续关注/持续观察/长期跟进/长期监控”“自动检查/自动汇总/自动生成/自动复盘/自动维护”“无人值守”“有变化告诉我”“异常时提醒我”“结果不好就调整”“查看运行记录”“优化已有任务”“暂停/恢复/删除/立即运行任务”等迹象，就应该触发此 Skill，先判断是否适合 DutyDeck 定时任务。也要覆盖一次性与有限次的延时执行信号：“X 小时/天后跑一次”“过一会儿/晚点/稍后自动做”“到某个具体时间点执行一次”“跑几次/连续观察 N 次就停”——这类未来无人值守的延时任务现在同样适合 DutyDeck 定时任务（用 once 或 maxRuns），不要再一概当成不支持。模糊场景也可以触发：例行报告、日报周报、项目状态、GitHub/邮件/飞书/文件/发布/CI/价格/竞品/数据源的反复检查，重复研究流程，定期整理知识，自动化工作流维护。高频触发不代表必须创建任务；纯提醒/闹钟/倒计时、需要用户实时参与判断、或结果没有任何留存价值的事，要明确说明不推荐创建 DutyDeck 定时任务，并给出替代做法。
 group: proma
-version: "1.0.14"
+version: "1.0.15"
 ---
 
-# Proma Automation
+# DutyDeck Automation
 
-你负责帮助用户判断、创建和维护 Proma 的定时任务（Automation）。这是 Proma 内嵌 Skill，会随 Proma 一起分发到默认 Skills 和 Proma 工作区 Skills 中，不依赖用户额外安装。定时任务适合**无人值守、有稳定价值**的工作：既包括长期反复的周期任务，也包括「未来某个时间点 / 跑有限几次」的延时任务（用 `once` 或 `maxRuns`）。真正不适合的是纯提醒闹钟、需要用户实时参与判断、或结果没有任何留存价值的事。
+你负责帮助用户判断、创建和维护 DutyDeck 的定时任务（Automation）。这是 DutyDeck 内嵌 Skill，会随 DutyDeck 一起分发到默认 Skills 和 DutyDeck 工作区 Skills 中，不依赖用户额外安装。定时任务适合**无人值守、有稳定价值**的工作：既包括长期反复的周期任务，也包括「未来某个时间点 / 跑有限几次」的延时任务（用 `once` 或 `maxRuns`）。真正不适合的是纯提醒闹钟、需要用户实时参与判断、或结果没有任何留存价值的事。
 
-Proma 已提供内置 `automation` MCP 工具。你必须通过这些工具操作定时任务，不要使用 `TaskCreate`、`CronCreate`、Bash `cron`、系统日历或隐藏注释协议来创建 Proma 定时任务。
+DutyDeck 已提供内置 `automation` MCP 工具。你必须通过这些工具操作定时任务，不要使用 `TaskCreate`、`CronCreate`、Bash `cron`、系统日历或隐藏注释协议来创建 DutyDeck 定时任务。
 
 ## 触发策略
 
@@ -24,7 +24,7 @@ Proma 已提供内置 `automation` MCP 工具。你必须通过这些工具操�
 - 自动化信号：自动跑、无人值守、后台执行、到点执行、帮我维护。
 - 维护信号：查看任务、运行记录、效果不好、修改频率、暂停、恢复、删除、立即运行。
 
-触发本 Skill 只是进入判断流程，不代表一定创建 Proma 定时任务。你要主动区分“适合长期自动化”和“只适合当前执行一次”。
+触发本 Skill 只是进入判断流程，不代表一定创建 DutyDeck 定时任务。你要主动区分“适合长期自动化”和“只适合当前执行一次”。
 
 ## 先判断是否值得创建
 
@@ -67,7 +67,7 @@ Proma 已提供内置 `automation` MCP 工具。你必须通过这些工具操�
 ### 在其他工作区创建任务
 
 - `create_automation.workspaceId` 是可选的**目标工作区 ID**；不传则仍使用当前会话工作区。用户说“在 B 工作区设置”时，先调用 `list_workspaces`，按名称或 slug 找到目标，再传返回的精确 ID；不要猜 UUID、用路径代替 ID 或为了查 ID 读取其他工作区的配置文件。
-- `list_workspaces` 只返回 id、name、slug、isCurrent 和 projectRootStatus。`managed` 表示 Proma 托管项目；`available` 表示本地项目根可用。`missing`、`not_directory`、`unavailable` 时先告知用户目标根不可用，不要声称任务能正常运行。名称有歧义时先请用户确认，不静默选择同名项目。
+- `list_workspaces` 只返回 id、name、slug、isCurrent 和 projectRootStatus。`managed` 表示 DutyDeck 托管项目；`available` 表示本地项目根可用。`missing`、`not_directory`、`unavailable` 时先告知用户目标根不可用，不要声称任务能正常运行。名称有歧义时先请用户确认，不静默选择同名项目。
 - 跨工作区创建前仍调用 `list_automations`，按返回的 workspaceId 检查**目标工作区**是否已有同目标任务；该工具仍返回全局列表。
 - A 会话创建到 B 后，任务归属和自动运行会话都在 B；运行时加载 B 的项目文件、工作区规则、Skills、MCP 和附加目录。渠道与模型继续继承 A 的创建会话，sourceSessionId 保留来源追踪，**不会复制 A 的会话历史或附加目录**。cwd 按 B 的自动会话规则解析，不保证等于项目根目录；prompt 引用路径时使用 B 的路径或运行时注入的项目根，不能沿用 A 的绝对路径。
 - 创建结果中的 workspaceId、workspaceName、workspaceSlug 用于核对归属，向用户明确报告目标工作区。目标不存在或被删除时重新查询，不回退当前工作区。
@@ -224,7 +224,7 @@ Automation 的调度规则由多个独立维度组合而成，不要把每个维
 
 - `list_automations`：查看已有任务，避免重复创建，也用于了解启用/暂停状态。
 - `get_automation`：查看单个任务详情和运行记录；自动任务执行中可省略 `id` 读取当前任务。
-- `create_automation`：创建新的 Proma 定时任务，只用于确认值得长期反复执行的场景。
+- `create_automation`：创建新的 DutyDeck 定时任务，只用于确认值得长期反复执行的场景。
 - `update_automation`：修改任意字段——`name`、`prompt`、`scheduleType`/`intervalMinutes`/`activeWindowStart`/`activeWindowEnd`/`activeWeekdays`/`timeOfDay`/`dayOfWeek`/`dayOfMonth`/`scheduledAt`（频率和时间约束）、`maxRuns`（运行次数上限）、`permissionMode`（权限模式）、`sessionMode`（会话模式）、`active`（启用/暂停）。`activeWeekdays` 传空数组或 null 表示取消星期限制；`activeWindowStart` 与 `activeWindowEnd` 必须成对传入，传 null 清除窗口。切换 `scheduleType` 时，只传**目标模式**需要的字段：系统会自动清理旧模式不适用的 `timeOfDay`、`dayOfWeek`、`dayOfMonth`、`scheduledAt` 与 interval 窗口字段，禁止为了通过校验填入无关占位值。`maxRuns: null` 明确表示清除上限、长期运行，绝不能用极大的数字伪装“不限次”。调度相关字段变化时会自动重算下次运行时间；改 `maxRuns` 会重置已执行次数计数；把 `active` 从 false 改回 true 会重置运行配额（已完成的任务可借此再跑一轮）。**改 `maxRuns` 想让停用/已完成任务继续跑时，必须连带处理启用状态，见下文「调整 maxRuns 时连带判断启用状态」。** 自动任务执行中可省略 `id` 更新当前任务。
 - `delete_automation`：删除任务。除非用户明确要求，否则删除前要确认。
 - `run_automation_now`：用户要求立即验证，或你刚修改任务后需要试跑时使用。自动任务执行中不要触发自身重入。
@@ -262,5 +262,5 @@ Automation 的调度规则由多个独立维度组合而成，不要把每个维
 - 创建、修改、暂停、删除后，用自然语言告诉用户具体结果。
 - 创建新任务后，提醒用户：可以点击左上角的「自动任务」入口，找到刚创建的任务，设置任务执行时使用的模型（不同模型在成本和能力上有差异，建议根据任务复杂度选择合适的模型）。
 - 不要暴露内部工具调用 JSON。
-- 如果不推荐定时任务，要明确说“不建议创建 Proma 定时任务”，并说明更适合的处理方式。
+- 如果不推荐定时任务，要明确说“不建议创建 DutyDeck 定时任务”，并说明更适合的处理方式。
 - 对长期反复任务，主动建议用户后续可以从侧边栏的定时任务入口查看运行记录和调整配置。

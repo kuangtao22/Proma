@@ -13,7 +13,7 @@ test('Given 运维工具可用 When 构建提示词 Then 数据库修改只交�
   const context = {
     sessionId: 'ops-session', permissionMode: 'bypassPermissions' as const,
     dependencies: { resolveWorkspaceContext: () => ({ workspaceRoot: '/tmp/workspace', projectRoot: '/tmp/project', isLocalProject: true }),
-      getUserName: () => '测试用户', isGitAttributionEnabled: () => false },
+      getUserName: () => '测试用户' },
   }
   const prompt = buildSystemPrompt({ ...context, serverOpsAvailable: true })
   expect(prompt).toContain('ops_database_change_context')
@@ -69,7 +69,6 @@ test('Given 自定义数据根 When 构建系统提示词 Then 工作区 AGENTS 
     dependencies: {
       resolveWorkspaceContext,
       getUserName: () => '测试用户',
-      isGitAttributionEnabled: () => true,
     },
   })
 
@@ -90,7 +89,6 @@ test('Given 用户提出画布视觉需求 When 构建系统提示词 Then Agent
         isLocalProject: true,
       }),
       getUserName: () => '测试用户',
-      isGitAttributionEnabled: () => false,
     },
   })
 
@@ -114,7 +112,6 @@ test('Given 用户已给出具体目标后追问能否执行 When 构建系统�
         isLocalProject: true,
       }),
       getUserName: () => '测试用户',
-      isGitAttributionEnabled: () => false,
     },
   })
 

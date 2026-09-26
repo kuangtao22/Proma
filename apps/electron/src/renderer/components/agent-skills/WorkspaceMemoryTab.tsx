@@ -461,7 +461,7 @@ export function WorkspaceMemoryTab({ workspaceSlug, sessionId, search, embedded 
           <div className="min-w-0">
             <div className="text-sm font-medium text-foreground">建立项目地图与协作画像</div>
             <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              点击即授权 Agent 基于可验证证据维护项目根与 Proma 工作区的 AGENTS.md；随后在真实协作中逐步校准你的偏好。不会扫描历史会话。
+              点击即授权 Agent 基于可验证证据维护项目根与 DutyDeck 工作区的 AGENTS.md；随后在真实协作中逐步校准你的偏好。不会扫描历史会话。
             </div>
           </div>
           <Button onClick={handleBootstrapKnowledge} disabled={bootstrapping}>
@@ -527,7 +527,7 @@ export function WorkspaceMemoryTab({ workspaceSlug, sessionId, search, embedded 
                 active={selected?.kind === 'agents'}
                 icon={<FileText size={14} />}
                 label="AGENTS.md"
-                meta="Proma 工作区项目指令"
+                meta="DutyDeck 工作区项目指令"
                 onClick={() => void openAgents(summary)}
                 onReveal={() => window.electronAPI.showItemInFolder(summary.agentsMd.path, { workspaceSlug })}
               />

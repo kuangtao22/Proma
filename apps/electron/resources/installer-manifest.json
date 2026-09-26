@@ -1,0 +1,48 @@
+{
+  "installers": [
+    {
+      "id": "git-for-windows",
+      "platform": "win32",
+      "arch": "x64",
+      "version": "2.47.1",
+      "downloadUrl": "",
+      "fallbackUrl": "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-64-bit.exe",
+      "sha256": "25527923debc06515b3016f2d6bca0820656e8281a23be2f43bfb658bd5dda70",
+      "sizeBytes": 69109976,
+      "filename": "Git-2.47.1-64-bit.exe"
+    },
+    {
+      "id": "git-for-windows",
+      "platform": "win32",
+      "arch": "arm64",
+      "version": "2.47.1",
+      "downloadUrl": "",
+      "fallbackUrl": "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/Git-2.47.1-arm64.exe",
+      "sha256": "63950d69998ca184b0ade0389a0e0b50e62f4a1ea8da9752449193c9dcda569f",
+      "sizeBytes": 67168280,
+      "filename": "Git-2.47.1-arm64.exe"
+    },
+    {
+      "id": "nodejs",
+      "platform": "win32",
+      "arch": "x64",
+      "version": "22.13.1",
+      "downloadUrl": "",
+      "fallbackUrl": "https://nodejs.org/dist/v22.13.1/node-v22.13.1-x64.msi",
+      "sha256": "821566022dc3b262ac2f76598ee4f46003a6edafe5dadb84e5fbc7daaa1a78c7",
+      "sizeBytes": 30867456,
+      "filename": "node-v22.13.1-x64.msi"
+    },
+    {
+      "id": "nodejs",
+      "platform": "win32",
+      "arch": "arm64",
+      "version": "22.13.1",
+      "downloadUrl": "",
+      "fallbackUrl": "https://nodejs.org/dist/v22.13.1/node-v22.13.1-arm64.msi",
+      "sha256": "be127be1d98cad94c56f46245d0f2de89934d300028694456861a6d5ac558bf3",
+      "sizeBytes": 27312128,
+      "filename": "node-v22.13.1-arm64.msi"
+    }
+  ]
+}

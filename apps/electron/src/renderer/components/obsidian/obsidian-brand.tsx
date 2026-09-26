@@ -1,7 +1,7 @@
 import * as React from 'react'
 
 export const OBSIDIAN_NAME = 'Obsidian'
-export const PROMA_MANAGED_VAULT_LABEL = 'Proma Vault'
+export const PROMA_MANAGED_VAULT_LABEL = 'DutyDeck Vault'
 
 export interface ObsidianIconProps extends React.SVGProps<SVGSVGElement> {
   size?: number | string

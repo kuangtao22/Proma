@@ -1,6 +1,6 @@
-# Proma Ubuntu / Linux 第一版支持说明
+# DutyDeck Ubuntu / Linux 第一版支持说明
 
-Proma 第一版 Linux 发布目标是 **Ubuntu 22.04 x86_64**，提供：
+DutyDeck 第一版 Linux 发布目标是 **Ubuntu 22.04 x86_64**，提供：
 
 - `.deb`：Ubuntu/Debian 原生安装包，优先推荐；
 - `AppImage`：便携运行包，适用于不希望安装系统包的用户。
@@ -9,18 +9,18 @@ Proma 第一版 Linux 发布目标是 **Ubuntu 22.04 x86_64**，提供：
 
 ## 下载与安装
 
-从 [GitHub Releases](https://github.com/proma-ai/Proma/releases) 下载对应版本：
+从 [GitHub Releases](https://github.com/kuangtao22/Proma/releases) 下载对应版本：
 
 ```bash
 # deb：推荐
-sudo apt install ./proma_<版本>_amd64.deb
+sudo apt install ./dutydeck_<版本>_amd64.deb
 
 # AppImage：便携运行
-chmod +x ./Proma-<版本>.AppImage
-./Proma-<版本>.AppImage
+chmod +x ./DutyDeck-<版本>.AppImage
+./DutyDeck-<版本>.AppImage
 ```
 
-`.deb` 安装后可以从应用菜单启动 Proma。AppImage 建议放在用户有写权限的本地目录；从只读目录、网络盘或部分企业挂载目录运行时，应用内更新可能不可用。
+`.deb` 安装后可以从应用菜单启动 DutyDeck。AppImage 建议放在用户有写权限的本地目录；从只读目录、网络盘或部分企业挂载目录运行时，应用内更新可能不可用。
 
 ## 系统范围
 
@@ -38,19 +38,19 @@ Ubuntu 22.04 与 24.04 的系统包名称不同，不要直接复用其他版本
 
 ## Chromium sandbox
 
-Proma 不在 Linux 全局关闭 Chromium sandbox。
+DutyDeck 不在 Linux 全局关闭 Chromium sandbox。
 
-- `.deb` 安装后脚本会尝试将 `/opt/Proma/chrome-sandbox` 设置为 `root:root` 和 `4755`，以启用 SUID sandbox；
+- `.deb` 安装后脚本会尝试将 `/opt/DutyDeck/chrome-sandbox` 设置为 `root:root` 和 `4755`，以启用 SUID sandbox；
 - AppImage 使用 `--no-sandbox`，这是因为 AppImage 挂载文件系统无法可靠提供 SUID sandbox；
 - 如果 `.deb` 位于 `nosuid` 文件系统，或安装脚本无法设置权限，应用可能无法启动或需要用户显式排查；不建议把 `--no-sandbox` 作为长期默认解决方案。
 
-AppImage 的隔离能力低于正确配置的 `.deb`。Proma 内嵌浏览器处理不可信网页时，优先使用 `.deb` 版本。
+AppImage 的隔离能力低于正确配置的 `.deb`。DutyDeck 内嵌浏览器处理不可信网页时，优先使用 `.deb` 版本。
 
 ## 更新
 
 - AppImage：GitHub Release 提供 `latest-linux.yml` 时，electron-updater 可检查并下载新 AppImage；原文件必须位于可写目录；
 - `.deb`：第一版以重新下载并通过 apt 安装新版为主，后续再提供签名 APT repository；
-- 更新前 Proma 会等待正在运行的 Agent 结束，避免中断任务和写入会话。
+- 更新前 DutyDeck 会等待正在运行的 Agent 结束，避免中断任务和写入会话。
 
 ## 数据位置
 
@@ -66,9 +66,9 @@ AppImage 的隔离能力低于正确配置的 `.deb`。Proma 内嵌浏览器处�
 ~/.proma-dev/
 ```
 
-会话、工作区、配置和 Skills 使用 JSON/JSONL 文件保存。迁移前请退出 Proma，并备份对应目录。
+会话、工作区、配置和 Skills 使用 JSON/JSONL 文件保存。迁移前请退出 DutyDeck，并备份对应目录。
 
-Linux 下 `safeStorage` 依赖 GNOME Keyring、KWallet 或其他 Secret Service 实现。无可用系统密钥环时，不建议在共享机器上保存 API Key；请先配置桌面密钥环并重新启动 Proma。
+Linux 下 `safeStorage` 依赖 GNOME Keyring、KWallet 或其他 Secret Service 实现。无可用系统密钥环时，不建议在共享机器上保存 API Key；请先配置桌面密钥环并重新启动 DutyDeck。
 
 ## 第一版验收边界
 

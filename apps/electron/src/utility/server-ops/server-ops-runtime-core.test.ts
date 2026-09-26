@@ -214,7 +214,7 @@ describe('服务器运维 SSH runtime 核心', () => {
     /** 下一批必须携带固定丢弃标记并保持 UTF-8 字节边界。 */
     const second = takeRuntimeLogOutput(state)
     expect(second?.sequence).toBe(1)
-    expect(second?.data).toContain('[Proma：日志输出过快，已丢弃 ')
+    expect(second?.data).toContain('[DutyDeck：日志输出过快，已丢弃 ')
     expect(Buffer.byteLength(second?.data ?? '')).toBeLessThanOrEqual(32 * 1_024)
     expect(second?.data.includes('\ufffd')).toBe(false)
     expect(state.pendingBytes).toBe(0)

@@ -996,7 +996,7 @@ describe('路径管理 IPC', () => {
     const handler = handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.START_DATA_ROOT_MIGRATION)
     if (!handler) throw new Error('未注册创建迁移计划通道')
     const selection = await authorizeMigrationSelection(handlers)
-    await expect(handler(expectedEvent, selection)).rejects.toThrow('请完全退出所有 Proma 实例后重试')
+    await expect(handler(expectedEvent, selection)).rejects.toThrow('请完全退出所有 DutyDeck 实例后重试')
     expect(calls).toEqual(['create-plan', 'release-intent'])
   })
 
@@ -1349,7 +1349,7 @@ describe('路径管理 IPC', () => {
       .toThrow('确认')
     pickedRoot = ordinaryRoot
     await expect(handlers.get(PATH_MANAGEMENT_IPC_CHANNELS.PICK_DATA_ROOT)?.(expectedEvent))
-      .rejects.toThrow('所选目录不是可识别的 Proma 数据根')
+      .rejects.toThrow('所选目录不是可识别的 DutyDeck 数据根')
     expect(new DataRootLocator({ homeDir }).inspect().locatorFile).toMatchObject({ activeRoot: offlineRoot })
   })
 

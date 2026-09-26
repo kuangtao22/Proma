@@ -214,7 +214,7 @@ export function errorMessage(error: unknown, fallback: string): string {
     API_WORKBENCH_FILE_TOO_LARGE: '文件超过单次上传上限（20 MiB）',
     API_WORKBENCH_FILE_LIMIT: '本次请求可携带的文件数量已达上限（16 个）',
     API_WORKBENCH_MULTIPART_TOO_LARGE: '附件与字段合计超过单次请求正文上限（20 MiB）',
-    API_WORKBENCH_SHUTTING_DOWN: '应用正在退出或需要重启客户端：请重启 Proma 后重试',
+    API_WORKBENCH_SHUTTING_DOWN: '应用正在退出或需要重启客户端：请重启 DutyDeck 后重试',
     API_WORKBENCH_SCENARIO_PREPARED_NOT_FOUND: '这条流程的准备工作已失效，请重新点运行',
     API_WORKBENCH_SCENARIO_PREPARED_STALE: '目录在这条流程准备之后被改动过，请重新点运行',
     API_WORKBENCH_SCENARIO_PREPARED_EXPIRED: '这条流程的准备已过期，请重新点运行',
@@ -928,7 +928,7 @@ function BodyEditor({ body, onChange, onPickFiles }: {
           <SelectItem value="none">none</SelectItem><SelectItem value="json">JSON</SelectItem><SelectItem value="text">Text</SelectItem><SelectItem value="urlencoded">x-www-form-urlencoded</SelectItem><SelectItem value="multipart">multipart/form-data</SelectItem>
         </SelectContent>
       </Select>
-      {(body.kind === 'json' || body.kind === 'text') && <Textarea value={body.text} onChange={(event) => onChange({ ...body, text: event.target.value })} className="min-h-40 resize-y font-mono text-xs" placeholder={body.kind === 'json' ? '{\n  "name": "Proma"\n}' : '请求正文'} />}
+      {(body.kind === 'json' || body.kind === 'text') && <Textarea value={body.text} onChange={(event) => onChange({ ...body, text: event.target.value })} className="min-h-40 resize-y font-mono text-xs" placeholder={body.kind === 'json' ? '{\n  "name": "DutyDeck"\n}' : '请求正文'} />}
       {body.kind === 'urlencoded' && <FieldRows rows={body.fields} allowSecrets onChange={(fields) => onChange({ ...body, fields })} namePlaceholder="字段" />}
       {body.kind === 'multipart' && (
         <div className="space-y-3">

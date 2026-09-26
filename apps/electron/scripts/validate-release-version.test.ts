@@ -13,7 +13,7 @@ describe('发布版本前置校验', () => {
       version: '0.17.42-bone.5',
       upstreamVersion: '0.17.42',
       boneBuild: '5',
-      releaseTitle: 'Proma 0.17.42 · Bone 5',
+      releaseTitle: 'DutyDeck 0.17.42 · Bone 5',
     })
   })
 

@@ -268,10 +268,10 @@ test('正式安装包名称包含完整版本、平台和架构', () => {
   const config = readElectronBuilderConfig()
   expect(readFileSync(resolve(import.meta.dir, '../electron-builder.yml'), 'utf8').match(/^linux:$/gm)).toHaveLength(1)
   expect(config.appId).toBe('com.bone.proma.app')
-  expect(config.productName).toBe('Proma')
-  expect(config.mac?.artifactName).toBe('Proma-${version}-macos-${arch}.${ext}')
-  expect(config.win?.artifactName).toBe('Proma-${version}-windows-${arch}.${ext}')
-  expect(config.linux?.artifactName).toBe('Proma-${version}-linux-${arch}.${ext}')
+  expect(config.productName).toBe('DutyDeck')
+  expect(config.mac?.artifactName).toBe('DutyDeck-${version}-macos-${arch}.${ext}')
+  expect(config.win?.artifactName).toBe('DutyDeck-${version}-windows-${arch}.${ext}')
+  expect(config.linux?.artifactName).toBe('DutyDeck-${version}-linux-${arch}.${ext}')
 })
 
 test('稳定目录 helper 进入三平台资源并纳入 macOS 签名', () => {

@@ -24,7 +24,7 @@ import {
   prepareNormalDataRoot,
 } from './data-root-marker'
 
-describe('Proma 数据根 marker', () => {
+describe('DutyDeck 数据根 marker', () => {
   /** 每个测试独立的用户 home。 */
   let homeDir: string
 
@@ -96,7 +96,7 @@ describe('Proma 数据根 marker', () => {
     const locator = new DataRootLocator({ homeDir })
     locator.write({ version: 1, activeRoot })
 
-    expect(() => prepareNormalDataRoot(locator, locator.inspect())).toThrow('不是可识别的 Proma 数据根')
+    expect(() => prepareNormalDataRoot(locator, locator.inspect())).toThrow('不是可识别的 DutyDeck 数据根')
     expect(existsSync(join(activeRoot, PROMA_DATA_ROOT_MARKER_FILE))).toBe(false)
   })
 
@@ -143,7 +143,7 @@ describe('Proma 数据根 marker', () => {
     )
 
     expect(inspectPromaDataRootIdentity(root)).toBeNull()
-    expect(() => ensurePromaDataRootMarker(root)).toThrow('不是可识别的 Proma 数据根')
+    expect(() => ensurePromaDataRootMarker(root)).toThrow('不是可识别的 DutyDeck 数据根')
     expect(existsSync(join(root, PROMA_DATA_ROOT_MARKER_FILE))).toBe(false)
   })
 

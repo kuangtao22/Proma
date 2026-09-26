@@ -237,7 +237,7 @@ function prepareDefinition(prompt: ComfyPrompt, objectInfo: ComfyObjectInfo): { 
     if (contract?.safeOutputPrefixInput) {
       /** 不安全或空前缀统一收敛到应用专属相对目录。 */
       const current = node.inputs[contract.safeOutputPrefixInput]
-      if (!isSafeOutputPrefix(current ?? null)) node.inputs[contract.safeOutputPrefixInput] = 'Proma'
+      if (!isSafeOutputPrefix(current ?? null)) node.inputs[contract.safeOutputPrefixInput] = 'DutyDeck'
     }
   }
   /** 资源常量清洗后重新提取真实字段，防止为 Loader 创建普通文本绑定。 */

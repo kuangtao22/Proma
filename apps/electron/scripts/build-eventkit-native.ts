@@ -33,7 +33,7 @@ rmSync(resolve(appDir, 'resources/eventkit/macos-eventkit-helper'), { force: tru
 execFileSync('xcrun', ['clang++', '-O2', '-std=c++17', '-DNAPI_VERSION=8', '-fobjc-arc', '-bundle', '-undefined', 'dynamic_lookup', '-framework', 'EventKit', '-framework', 'Foundation', '-I', napiHeaders, '-I', nodeApiHeaders, source, '-o', output], { stdio: 'inherit' })
 chmodSync(output, 0o755)
 
-// 开发态的 responsible process 是 Electron.app，不是最终 Proma.app。为它注入相同 usage strings
+// 开发态的 responsible process 是 Electron.app，不是最终 DutyDeck.app。为它注入相同 usage strings
 // 并重新 ad-hoc 签名，避免 bun run dev 下 TCC 因缺少 Info.plist 键而静默拒绝/不显示弹窗。
 if (existsSync(devElectronInfo)) {
   execFileSync('plutil', ['-replace', 'NSCalendarsFullAccessUsageDescription', '-string', 'Proma 需要访问你选择的日历，以显示、创建和同步日程。', devElectronInfo])

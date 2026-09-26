@@ -5,7 +5,7 @@
 export function buildPromaBrowserUserAgent(defaultUserAgent: string, promaVersion: string): string {
   const base = defaultUserAgent
     .replace(/\s+Electron\/[^\s]+/gi, '')
-    .replace(/\s+Proma\/[^\s]+/gi, '')
+    .replace(/\s+DutyDeck\/[^\s]+/gi, '')
     .trim()
-  return `${base} Proma/${promaVersion}`
+  return `${base} DutyDeck/${promaVersion}`
 }

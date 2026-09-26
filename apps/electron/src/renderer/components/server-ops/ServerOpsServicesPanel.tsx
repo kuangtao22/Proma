@@ -798,7 +798,7 @@ export function ServerOpsServicesPanelView({
                 {hostDescription && <span>连接：{hostDescription}</span>}
                 <span>服务：{pendingAction?.unitId}</span>
                 <span>动作：{pendingActionMeta?.label}</span>
-                <span className="pt-1">该操作会修改远程服务状态。Proma 不会自动使用 sudo，也不会处理远程密码提示。</span>
+                <span className="pt-1">该操作会修改远程服务状态。DutyDeck 不会自动使用 sudo，也不会处理远程密码提示。</span>
               </span>
             </AlertDialogDescription>
           </AlertDialogHeader>

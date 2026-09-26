@@ -48,5 +48,5 @@ export function createBoneReleaseTitle(version: string): string {
   /** 用于生成人类可读标题的 Bone 发布信息。 */
   const release = parseBoneReleaseVersion(version)
   if (!release) throw new Error(`应用版本 ${version} 不是合法的 Bone 发布版本`)
-  return `Proma ${release.upstreamVersion} · Bone ${release.boneBuild}`
+  return `DutyDeck ${release.upstreamVersion} · Bone ${release.boneBuild}`
 }

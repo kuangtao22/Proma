@@ -272,7 +272,7 @@ export function LanBridgeSettings(): React.ReactElement {
       {/* 服务状态 */}
       <SettingsSection
         title="局域网 Bridge"
-        description="在局域网内暴露 WebSocket 接口，允许第三方客户端接入 Proma"
+        description="在局域网内暴露 WebSocket 接口，允许第三方客户端接入 DutyDeck"
       >
         <SettingsCard>
           <SettingsRow label="服务状态">
@@ -312,7 +312,7 @@ export function LanBridgeSettings(): React.ReactElement {
       {isRunning && (
         <SettingsSection
           title="扫码配对"
-          description="手机连接同一局域网后扫码，一次授权即可进入 Proma"
+          description="手机连接同一局域网后扫码，一次授权即可进入 DutyDeck"
           action={(
             <Tooltip>
               <TooltipTrigger asChild>
@@ -339,7 +339,7 @@ export function LanBridgeSettings(): React.ReactElement {
                 ) : pairingQr ? (
                   <img
                     src={pairingQr.qrCodeData}
-                    alt="Proma 手机端一次性配对二维码"
+                    alt="DutyDeck 手机端一次性配对二维码"
                     className={`h-full w-full object-contain ${pairingCountdown?.expired ? 'opacity-25' : ''}`}
                   />
                 ) : (
@@ -643,7 +643,7 @@ export function LanBridgeSettings(): React.ReactElement {
                 <span className="font-medium text-foreground">方案二：对接 WS 协议（自研客户端）</span>
               </div>
               <p className="pl-7 text-muted-foreground">
-                任何第三方（Web UI、IDE 插件、CLI 工具等）均可通过 WebSocket 协议接入 Proma，
+                任何第三方（Web UI、IDE 插件、CLI 工具等）均可通过 WebSocket 协议接入 DutyDeck，
                 实现对话查询、Agent 交互、实时流式推送等全部能力。
               </p>
 

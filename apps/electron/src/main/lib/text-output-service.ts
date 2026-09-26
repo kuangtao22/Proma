@@ -150,11 +150,11 @@ export async function commitVoiceDictationText(
         return { mode: 'clipboard', success: false, message: '听写会话已取消，未输出文本' }
       }
       if (delivered) {
-        return { mode: 'proma-input', success: true, message: '已写入 Proma 输入框' }
+        return { mode: 'proma-input', success: true, message: '已写入 DutyDeck 输入框' }
       }
 
       clipboard.writeText(trimmed)
-      return { mode: 'clipboard', success: true, message: 'Proma 输入框未确认接收，已复制到剪贴板' }
+      return { mode: 'clipboard', success: true, message: 'DutyDeck 输入框未确认接收，已复制到剪贴板' }
     }
 
     if (outputContext.outputMode === 'auto') {

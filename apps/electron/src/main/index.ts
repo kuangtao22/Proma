@@ -4,13 +4,16 @@ import { pathToFileURL } from 'url'
 import { existsSync } from 'fs'
 import { resolveAppIdentity } from './lib/app-identity'
 
-// Dev 开发模式使用独立的 userData 目录，避免与打包版共享 Chromium SingletonLock
-// 必须在任何会读取 userData 路径的模块加载之前执行
+// 开发模式使用独立的 userData 目录，避免与打包版共享 Chromium SingletonLock；
+// 加密身份与 userData 都必须在任何会读取它们的模块加载之前固定。
 /** 当前进程应使用的正式或开发身份。 */
 const appIdentity = resolveAppIdentity(app.isPackaged, process.env.PROMA_DEV_INSTANCE)
-if (!app.isPackaged && appIdentity.userDataDirectoryName && appIdentity.safeStorageName) {
-  // ready 前固定历史内部名称，继续复用共享配置对应的 macOS Safe Storage 密钥。
+// ready 前先固定历史加密身份（@proma/electron），让 macOS Safe Storage 继续解析到
+// 同一把历史密钥；品牌展示名只在 ready 之后恢复，绝不能参与加密身份。
+if (appIdentity.safeStorageName) {
   app.setName(appIdentity.safeStorageName)
+}
+if (!app.isPackaged && appIdentity.userDataDirectoryName) {
   app.setPath('userData', join(app.getPath('appData'), appIdentity.userDataDirectoryName))
   if (process.platform === 'win32') app.setAppUserModelId(appIdentity.appId)
 }
@@ -24,8 +27,8 @@ if (!app.isPackaged && appIdentity.userDataDirectoryName && appIdentity.safeStor
 // second-instance 事件，由主实例负责显示窗口。
 if (!app.requestSingleInstanceLock()) {
   console.warn(
-    '[启动] 已有 Proma 进程持有单实例锁，本次启动将退出。\n' +
-      '  如果窗口未出现，可能旧进程已卡死。请运行 `killall Proma` 后重试。',
+    `[启动] 已有 ${appIdentity.displayName} 进程持有单实例锁，本次启动将退出。\n` +
+      `  如果窗口未出现，可能旧进程已卡死。请运行 \`killall ${appIdentity.displayName}\` 后重试。`,
   )
   app.quit()
 } else {
@@ -376,7 +379,8 @@ function createStartupSplashWindow(): void {
     frame: false,
     resizable: false,
     skipTaskbar: true,
-    backgroundColor: '#1b3f2d',
+    /** 与启动页同一底色：避免窗口出现瞬间闪出上游绿色。 */
+    backgroundColor: '#0b0d10',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -571,7 +575,7 @@ function createWindow(): void {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;')
-    const page = `<!doctype html><html><head><meta charset="utf-8"><title>Proma 无法加载</title><style>body{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:48px;color:#222;background:#fff}main{max-width:680px;margin:auto}h1{font-size:20px;font-weight:600}pre{white-space:pre-wrap;background:#f3f3f3;padding:16px;border-radius:8px}a{display:inline-block;margin-top:12px;padding:9px 14px;border-radius:6px;background:#222;color:#fff;text-decoration:none}</style></head><body><main><h1>Proma 无法加载主界面</h1><pre>${escapeHtml(reason)}</pre><a href="${escapeHtml(rendererEntryUrl)}">重新加载主界面</a></main></body></html>`
+    const page = `<!doctype html><html><head><meta charset="utf-8"><title>DutyDeck 无法加载</title><style>body{font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:48px;color:#222;background:#fff}main{max-width:680px;margin:auto}h1{font-size:20px;font-weight:600}pre{white-space:pre-wrap;background:#f3f3f3;padding:16px;border-radius:8px}a{display:inline-block;margin-top:12px;padding:9px 14px;border-radius:6px;background:#222;color:#fff;text-decoration:none}</style></head><body><main><h1>DutyDeck 无法加载主界面</h1><pre>${escapeHtml(reason)}</pre><a href="${escapeHtml(rendererEntryUrl)}">重新加载主界面</a></main></body></html>`
     mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(page)}`).catch((error) => {
       console.error('[启动] 降级错误页加载失败:', error)
       mainWindow?.show()
@@ -1079,11 +1083,11 @@ function handleBootstrapFailure(err: unknown): void {
   try {
     const message = err instanceof Error ? (err.stack ?? err.message) : String(err)
     dialog.showErrorBox(
-      'Proma 启动遇到错误',
+      'DutyDeck 启动遇到错误',
       `部分功能可能不可用：\n\n${message}\n\n` +
         `日志位置：${app.getPath('logs')}\n\n` +
         `常见原因与排查：\n` +
-        `1. 旧版 Proma 进程未退出（终端运行 killall Proma 后重试）\n` +
+        `1. 旧版 DutyDeck 进程未退出（终端运行 killall DutyDeck 后重试）\n` +
         `2. ~/.proma/ 配置损坏（重命名 ~/.proma 后重启）\n` +
         `3. 系统 Keychain 无法解密保存的凭证（删除 ~/.proma/feishu.json 等后重新登录）\n\n` +
         `如需协助请到 GitHub Issues 反馈。`,

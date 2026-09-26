@@ -1,26 +1,29 @@
-# Proma
+# DutyDeck
 
-Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agent、工作区、Skills、MCP、远程机器人和记忆能力放在同一个开源客户端里。
+<img src="./docs/assets/brand/dutydeck-icon-256.png" alt="DutyDeck" width="96" height="96" />
 
-它不是只面向闲聊的聊天框，而是一个可以长期沉淀个人工作流的 Agent 工作台：简单问题用 Chat，复杂任务交给 Agent，数据和配置尽量留在本地。
+> **本仓库是 Proma 的修改版。** DutyDeck 基于上游开源项目 [Proma](https://github.com/proma-ai/Proma)（AGPL-3.0-only）演进，由 [kuangtao22](https://github.com/kuangtao22) 独立维护，与 Proma 官方没有从属关系，也没有得到官方背书。上游基线与差异说明见[与官方 Proma 的关系](#与官方-proma-的关系)。
 
-![Proma 海报](https://img.erlich.fun/personal-blog/uPic/pb.png)
+DutyDeck 是一个本地优先的 AI 桌面工作台：把多模型 Chat、通用 Agent、画布编排、运维工作台、接口工作台、Skills、MCP 和远程机器人放进同一个客户端，数据和配置默认留在你自己的机器上。
 
-<video width="560" controls>
-  <source src="https://img.erlich.fun/personal-blog/uPic/%E7%AE%80%E5%8D%95%E4%BB%8B%E7%BB%8D%20Proma.mp4" type="video/mp4">
-</video>
+它不是只面向闲聊的聊天框，而是一个能长期沉淀工程工作流的工作台：简单问题用 Chat，复杂任务交给 Agent，服务器和数据库交给运维工作台，接口验证交给接口工作台，编排交给画布。
 
-[English README](./README.en.md) | [新手教程](./tutorial/tutorial.md) | [下载开源版](https://github.com/proma-ai/Proma/releases) | [下载商业版](https://proma.cool/download)
-
-> **最新思考 ｜ 2026 Q2–Q3**：[勇敢地解决真实的问题 — Proactive · 个人注意力 · 团队协作](./proma-thinking/proma-2026-q2-q3-thinking.md) ｜ 往期思考：[2026 Q1](./proma-thinking/proma-2026-q1-thinking.md)
+[下载 DutyDeck](https://github.com/kuangtao22/Proma/releases/latest) | [新手教程](./tutorial/tutorial.md) | [更新日志](./release-notes/bone) | [English README](./README.en.md)
 
 ## 现在能做什么
 
+- **画布**（本仓库自研）：把 Agent 任务、素材与依赖画成节点图，按真实层级与关联一键整理，用一张图推进多步骤交付。
+- **运维工作台**（本仓库自研）：SSH、MySQL、PostgreSQL、Redis 连接集中管理；默认只读、写操作只生成脚本；运行诊断、表结构浏览、SQL 工作台与查询历史都在本地完成。
+- **接口工作台**（本仓库自研）：按集合与环境组织接口，支持变量、集合级鉴权继承、加密与签名、multipart 附件、批量整理，以及由 Agent 批量执行用例并逐条确认。
+- **今日活动**（本仓库自研）：跨项目汇总今天的全部会话，按最后一次对话时间排序，含委派子会话与定时任务会话。
+
+以下能力继承自上游 Proma，并在本仓库持续维护：
+
 - **Chat 模式**：多模型对话、附件解析、图片输入、Markdown / Mermaid / KaTeX / 代码高亮、并排对话、系统提示词、上下文管理。
-- **Agent 模式**：Agent 内核已全面迁移至 Proma 内置 Pi Agent Runtime，不再依赖第三方 Agent 运行时；支持工作区隔离、权限模式、文件操作、长任务流式输出、计划确认和用户追问。
+- **Agent 模式**：Agent 内核已全面迁移至 DutyDeck 内置 Pi Agent Runtime，不再依赖第三方 Agent 运行时；支持工作区隔离、权限模式、文件操作、长任务流式输出、计划确认和用户追问。
 - **内嵌浏览器自动化**：Agent 可以直接操作内置受管浏览器——打开网页、观察页面结构、点击 / 填写控件、切换标签页，并支持打开 `localhost` 本地开发服务；站内搜索、登录后页面、动态内容和本地 HTML 预览都能交给 Agent 完成，无需手动复制粘贴。
 - **协作与任务**：复杂任务可拆分为可追踪的协作子 Agent / Task，并在消息流中展示调用过程和结果。
-- **Skills、MCP 与项目指令**：每个 Proma 项目独立配置 Skills 与 MCP Server；项目可通过 `AGENTS.md` 声明受信项目指令，旧 `CLAUDE.md` 配置自动迁移。项目文件可使用用户选择的本地项目根目录，也可使用 Proma 托管的空白项目目录。
+- **Skills、MCP 与项目指令**：每个 DutyDeck 项目独立配置 Skills 与 MCP Server；项目可通过 `AGENTS.md` 声明受信项目指令，旧 `CLAUDE.md` 配置自动迁移。项目文件可使用用户选择的本地项目根目录，也可使用 DutyDeck 托管的空白项目目录。
 - **远程机器人**：支持飞书 / Lark 机器人桥接，并已提供钉钉、微信桥接入口，用手机或群聊触发本机 Agent 工作流。
 - **记忆与工具**：Chat 和 Agent 可共享工作区记忆，记忆变更自动追踪并在界面提示刷新；支持联网搜索、内置 Chat 工具、Agent 推荐等辅助能力。
 - **本地优先**：会话、工作区、附件、配置、Skills 等默认存储在 `~/.proma/`，使用 JSON / JSONL 文件组织，不依赖本地数据库。
@@ -30,32 +33,23 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 
 ### 下载安装
 
-从 [GitHub Releases](https://github.com/proma-ai/Proma/releases) 下载开源版本，提供 macOS Apple Silicon、macOS Intel、Windows、Ubuntu/Debian x86_64 的 `.deb` 安装包和 Linux x86_64 AppImage。Linux 的安装、安全边界和支持范围见 [Linux 说明](./docs/linux.md)。
+从 [GitHub Releases](https://github.com/kuangtao22/Proma/releases) 下载 DutyDeck，提供 macOS Apple Silicon、macOS Intel、Windows、Ubuntu/Debian x86_64 的 `.deb` 安装包和 Linux x86_64 AppImage，产物名形如 `DutyDeck-<版本>-macos-arm64.dmg`、`DutyDeck-<版本>-windows-x64.exe` 与 `dutydeck_<版本>_amd64.deb`。Linux 的安装、安全边界和支持范围见 [Linux 说明](./docs/linux.md)。
 
-开源版可独立使用，并支持自行配置 AI 供应商渠道。如果你更希望使用 Proma 提供的内置模型渠道和订阅方案，也可以按需了解 [Proma 商业版](https://proma.cool/download)。两个版本面向不同的使用偏好，你可以自由选择适合自己的版本。
+DutyDeck 的模型渠道全部由你自己配置，不提供任何内置订阅通道。上游的商业版 Proma（proma.cool）与本项目无关。
 
-| 对比项 | 开源版 | 商业版 |
-| --- | --- | --- |
-| 核心桌面能力 | 完整的 Proma 桌面体验，可自由配置工作流 | 保留同样的核心桌面体验 |
-| 模型渠道 | 自行添加和管理 AI 供应商渠道与 API Key | 登录后可使用 Proma 官方内置模型渠道，也仍可自行配置第三方渠道 |
-| 模型价格 | 按所选供应商的规则和价格使用 | 精选模型提供 Proma Cloud 专属优惠，部分模型最高可低至官方参考价 2 折 |
-| Agent 安全与稳定 | 需自行评估供应商的安全、协议兼容与稳定性；使用第三方中转站时也需自行判断额外的信任与数据处理风险 | 使用 Proma Cloud 官方托管链路，提供统一的安全与稳定性保障、Agent 协议兼容和模型健康监控，减少不透明第三方中转带来的不确定性 |
-| 联网与内嵌 AI 能力 | 按需自行配置搜索、生图等服务及对应 API Key | 提供更完整的 Proma Cloud 联网与内嵌能力，包括 WebSearch，以及 GPT Image 2 生图和编辑 |
-| 对外 API 与服务 | 主要使用你自行配置的供应商 API | 可创建独立、可设额度上限的 Proma Cloud API Key，将 LLM、工具和多模态能力接入自己的应用或服务 |
-| 团队额度管理 | 需自行搭建成员、额度分配与用量管理机制 | 团队管理员可向成员分配或回收共享团队额度，支持按月自动分配，并查看成员用量与额度流水 |
-| Skills 分发与协作 | Skills 为工作区本地能力，团队内分发与共享需自行组织 | 企业版支持 Skills 的组织级分发与团队协作：管理员可将团队沉淀的 Skills 一键下发到成员，成员侧免安装直接使用，并统一管理版本、更新与使用范围 |
-| 订阅与用量 | 自行管理供应商账号、余额与用量 | 在应用内管理订阅与余额，并查看模型、Agent 和工具的用量明细 |
-| 从开源版切换 | — | 直接覆盖安装即可，继续使用已有的本地 Proma 数据 |
+### 与官方 Proma 的关系
 
-> 可用模型、价格和权益会随时间调整，以应用内当期展示为准。
+DutyDeck 是 Proma 的修改版，不是官方发行版：
 
-### 企业版与商业授权
-
-如果你的组织计划面向数百至数千名员工规模部署 Proma，可以采购企业版授权；我们也可围绕实际部署需求提供范围明确的轻量定制服务。企业版提供组织级 Skills 分发与团队协作能力，让团队沉淀的最佳实践可以一键下发、统一维护。欢迎通过微信联系：`geekthings`。
+- **许可证**：AGPL-3.0-only，与上游一致，完整条款见 [LICENSE](./LICENSE)。
+- **上游基线**：已完整合入的上游内容基线是 `v0.19.31`（2026-09-05），其后的官方版本按需挑选移植，因此功能不等同于官方最新版。
+- **版本号含义**：`0.19.53-bone.10` 是「上游版本号 + 本仓库构建号」，`-bone.<构建号>` 只标记本仓库自己的发布顺序，不代表官方迭代进度。
+- **本仓库新增**：画布、运维工作台、接口工作台、今日活动，以及围绕它们的权限确认、审计与本地加密。
+- **归属**：上游代码的版权归 Proma 作者与贡献者所有，本仓库的修改同样以 AGPL-3.0 授权给任何人。
 
 ### 首次配置
 
-1. 打开 Proma，先完成环境检查。Agent 模式依赖本机基础环境，尤其是 Git、Node.js / Bun 以及可用的 Shell。
+1. 打开 DutyDeck，先完成环境检查。Agent 模式依赖本机基础环境，尤其是 Git、Node.js / Bun 以及可用的 Shell。
 2. 进入 **设置 > 渠道**，添加至少一个 AI 供应商渠道，填写 Base URL、API Key 和模型列表。
 3. Chat 模式可以使用 OpenAI、Anthropic、Google 或 OpenAI 兼容协议的渠道。
 4. Agent 使用 Pi Runtime，可使用任意已启用的模型渠道。
@@ -86,36 +80,36 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 
 用 Chat 处理轻量但真实的分析任务：整理读者关注点、生成对比表，并把首屏文案快速定稿。
 
-![Proma Chat 快速分析](./docs/assets/screenshots/proma-chat-demo.png)
+![DutyDeck Chat 快速分析](./docs/assets/screenshots/proma-chat-demo.png)
 
 ### Agent 工作台
 
 Agent 在项目根目录与会话工作台中读取文件、推进任务、输出表格化结论，并把可复用文件保留在右侧文件面板中。
 
-![Proma Agent 工作台](./docs/assets/screenshots/proma-agent-demo.png)
+![DutyDeck Agent 工作台](./docs/assets/screenshots/proma-agent-demo.png)
 
 ### Skills
 
 每个工作区都可以沉淀专属 Skills。截图中的 `feedback-synthesis` 用于把用户反馈、访谈记录和 issue 聚合成主题、证据与优先级建议。
 
-![Proma 工作区 Skills](./docs/assets/screenshots/proma-skills-demo.png)
+![DutyDeck 工作区 Skills](./docs/assets/screenshots/proma-skills-demo.png)
 
 ### Skills & MCP
 
 同一个工作区可以管理 stdio / HTTP MCP Server，按需启用或关闭，让 Agent 在不同项目里获得不同的外部上下文。
 
-![Proma MCP 配置](./docs/assets/screenshots/proma-mcp-demo.png)
+![DutyDeck MCP 配置](./docs/assets/screenshots/proma-mcp-demo.png)
 
 ### 流式语音输入(支持全局输入)
-Proma 支持豆包的流式语音输入功能，并且支持在 Proma 内使用和 Proma 外部使用：
-- Proma 内部使用：Ctrl + ` 触发识别，再次按下结束自动输入到 Proma 内对应的输入框
-- Proma 外部使用：Ctrl + ` 触发识别，再次按下结束自动输入到当前的光标所在处，如无光标则默认写入到剪贴板
+DutyDeck 支持豆包的流式语音输入功能，并且支持在 DutyDeck 内使用和 DutyDeck 外部使用：
+- DutyDeck 内部使用：Ctrl + ` 触发识别，再次按下结束自动输入到 DutyDeck 内对应的输入框
+- DutyDeck 外部使用：Ctrl + ` 触发识别，再次按下结束自动输入到当前的光标所在处，如无光标则默认写入到剪贴板
 - 
-![Proma 语音输入](./docs/assets/screenshots/proma-typeless-input.png)
+![DutyDeck 语音输入](./docs/assets/screenshots/proma-typeless-input.png)
 
 ## Agent 运行时与模型渠道
 
-Proma 的 Agent 模式由 **Pi Agent Runtime** 单一驱动，内核来自 `@earendil-works/pi-coding-agent`、`pi-agent-core` 和 `pi-ai`，不再依赖任何第三方 Agent 运行时。已启用的 Proma 渠道会动态注册为 Pi provider，支持 OpenAI Chat Completions / Responses、Google Generative AI、Anthropic Messages 及其兼容端点。早期基于 Claude runtime 的历史会话保留为只读记录，可查看但不能继续、分叉或回退。
+DutyDeck 的 Agent 模式由 **Pi Agent Runtime** 单一驱动，内核来自 `@earendil-works/pi-coding-agent`、`pi-agent-core` 和 `pi-ai`，不再依赖任何第三方 Agent 运行时。已启用的 DutyDeck 渠道会动态注册为 Pi provider，支持 OpenAI Chat Completions / Responses、Google Generative AI、Anthropic Messages 及其兼容端点。早期基于 Claude runtime 的历史会话保留为只读记录，可查看但不能继续、分叉或回退。
 
 | 渠道类型 | Chat | Pi Agent |
 | --- | --- | --- |
@@ -144,7 +138,7 @@ Proma 的 Agent 模式由 **Pi Agent Runtime** 单一驱动，内核来自 `@ear
 
 ## 架构概览
 
-Proma 的核心通信路径是：
+DutyDeck 的核心通信路径是：
 
 ```text
 shared 类型和 IPC 常量
@@ -158,7 +152,7 @@ shared 类型和 IPC 常量
 - `agent-orchestrator.ts`：Pi Agent 编排、环境变量、事件流、错误处理。
 - `adapters/pi-agent-adapter.ts`：Pi 运行时适配与会话管理。
 - `agent-session-manager.ts`：Agent 会话索引和 JSONL 消息持久化。
-- `agent-workspace-manager.ts`：Proma 工作区、项目根目录、MCP 与 Skills 管理。
+- `agent-workspace-manager.ts`：DutyDeck 工作区、项目根目录、MCP 与 Skills 管理。
 - `browser-controller.ts`：内置受管浏览器控制、跨会话视图隔离与本地预览。
 - `agent-memory-refresh-service.ts`：工作区记忆变更追踪与刷新。
 - `chat-service.ts`：Chat 流式调用、Provider Adapter、工具活动。
@@ -199,20 +193,10 @@ Pi 运行时在主进程中作为 esbuild external 依赖运行。`apps/electron
 - 影响包行为时递增对应 package 的 patch 版本。
 - 能用测试覆盖的行为尽量补上测试，尤其是共享逻辑、IPC 契约和持久化格式。
 
-## 作者
+## 作者与维护
 
-- 个人网站：[erlich.fun](https://erlich.fun)
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=proma-ai%2Fproma&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=proma-ai/proma&type=date&theme=dark&legend=top-left&sealed_token=0cHFGjNPPe5hd2uxpF1cy35N2kYGSIEnTvyIbHlGjkrrtH9rnKcBMkqA8wDWltJIlPRKFZoYyPjXItri9HhQXE1TM1rwdIe91fqTqXVcPwK6OMzGEJ9yNw" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=proma-ai/proma&type=date&legend=top-left&sealed_token=0cHFGjNPPe5hd2uxpF1cy35N2kYGSIEnTvyIbHlGjkrrtH9rnKcBMkqA8wDWltJIlPRKFZoYyPjXItri9HhQXE1TM1rwdIe91fqTqXVcPwK6OMzGEJ9yNw" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=proma-ai/proma&type=date&legend=top-left&sealed_token=0cHFGjNPPe5hd2uxpF1cy35N2kYGSIEnTvyIbHlGjkrrtH9rnKcBMkqA8wDWltJIlPRKFZoYyPjXItri9HhQXE1TM1rwdIe91fqTqXVcPwK6OMzGEJ9yNw" />
- </picture>
-</a>
-
+- 上游 Proma 作者：[erlich.fun](https://erlich.fun)
+- DutyDeck 维护者：[kuangtao22](https://github.com/kuangtao22)
 
 ## 致谢
 
@@ -221,12 +205,12 @@ Pi 运行时在主进程中作为 esbuild external 依赖运行。`apps/electron
 
 ## 许可证
 
-Proma 社区版采用 [GNU Affero General Public License v3.0（AGPL-3.0）](./LICENSE) 开源，完整条款见根目录 `LICENSE` 文件。
+DutyDeck 采用 [GNU Affero General Public License v3.0（AGPL-3.0-only）](./LICENSE) 开源。本仓库的 `LICENSE` 与上游 Proma 逐字节一致，不附加任何额外限制。
 
-**个人 / 非商业使用**：自由使用、修改、分发，仅需遵守 AGPL-3.0 条款。
+**你可以**：自由使用、修改、分发 DutyDeck 及其衍生作品，也可以商业使用。前提是遵守 AGPL-3.0——以源代码或修改后的形式分发，以及通过网络对外提供服务时，都要公开完整的对应源码，衍生作品必须继续以 AGPL-3.0 授权。
 
-**商业使用**：在完全遵守 AGPL-3.0 条款的前提下允许进行商业使用，包括但不限于：以源代码或修改后的形式分发软件、通过网络对外提供服务时必须公开完整修改源码（含网络交互层）、衍生作品须以 AGPL-3.0 继续授权。
+**永久开源承诺**：DutyDeck 的每一个发布版本都以 AGPL-3.0 在公开仓库释出，任意历史版本都能取得对应源码。本仓库不收集、也不接受把贡献重新授权为专有许可的权利——包括维护者在内，没有任何人能把这套代码闭源。
 
-**商业授权（豁免 AGPL-3.0 义务）**：如果你希望将 Proma 集成到闭源产品、对外提供 SaaS 服务但不想公开衍生代码，或有其他无法满足 AGPL-3.0 条款的商业场景，请通过邮件联系获取商业许可：[erlichliu@gmail.com](mailto:erlichliu@gmail.com)。
+**商业授权豁免**：本项目不提供、也无权提供 AGPL 商业豁免。需要闭源集成请自行遵守 AGPL-3.0，或向拥有版权的上游 Proma 申请其商业许可。
 
-向本项目提交 Pull Request 即视为同意将贡献以 AGPL-3.0 及未来商业许可形式授权给项目维护者。
+向 DutyDeck 提交 Pull Request 即表示你同意你的贡献以 AGPL-3.0-only 授权给任何人；本项目不要求你转让版权。

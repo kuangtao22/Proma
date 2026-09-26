@@ -41,7 +41,7 @@ function buildSessionCliAccessGuide(
   /** CLI 通过 Agent 运行环境中的 PROMA_CONFIG_DIR 继承活动根，命令不重复平台路径。 */
   const command = (args: string): string => `${cli} session ${args}`
   return [
-    `优先使用 session-cleaner skill（${skillName}）读取当前会话历史；它是 Proma CLI 的薄封装，会把 Agent JSONL 清洗为干净对话。`,
+    `优先使用 session-cleaner skill（${skillName}）读取当前会话历史；它是 DutyDeck CLI 的薄封装，会把 Agent JSONL 清洗为干净对话。`,
     `可用 CLI 命令前缀: ${cli}`,
     `建议流程:`,
     `1. ${command(`info ${sessionId}`)}`,
@@ -63,7 +63,7 @@ function buildCurrentSessionHistoryInstruction(
 
 function buildReferencedSessionsHistoryInstruction(workspaceSlug?: string): string {
   const skillName = getSessionCleanerSkillName(workspaceSlug)
-  return `需要这些会话的上下文时，优先使用 session-cleaner skill（${skillName}）或 Proma CLI 读取清洗后的会话历史。按 info → outline/search → export 的顺序渐进式读取；不要假设会话内容，也不要直接 Read 原始 .jsonl 历史文件。`
+  return `需要这些会话的上下文时，优先使用 session-cleaner skill（${skillName}）或 DutyDeck CLI 读取清洗后的会话历史。按 info → outline/search → export 的顺序渐进式读取；不要假设会话内容，也不要直接 Read 原始 .jsonl 历史文件。`
 }
 
 /**

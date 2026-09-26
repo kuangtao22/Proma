@@ -1,15 +1,15 @@
 ---
 name: agent-collaboration
-description: Proma 协作子 Agent Skill。当需要并行探索多个方向（多样性探索）、对抗性审查验证已有方案、或多个长耗时独立任务需要真实可见的子会话时触发。用于判断是否以及如何调用 Proma 内置 collaboration 工具创建协作子会话。简单搜索、短调研、单文件修改、一次性代码审查由父会话直接使用普通工具完成。
+description: DutyDeck 协作子 Agent Skill。当需要并行探索多个方向（多样性探索）、对抗性审查验证已有方案、或多个长耗时独立任务需要真实可见的子会话时触发。用于判断是否以及如何调用 DutyDeck 内置 collaboration 工具创建协作子会话。简单搜索、短调研、单文件修改、一次性代码审查由父会话直接使用普通工具完成。
 group: proma
-version: "1.2.0"
+version: "1.2.1"
 ---
 
-# Proma Agent Collaboration
+# DutyDeck Agent Collaboration
 
-你负责判断何时把复杂任务交给 Workflow / Skill 工作流，或拆给真实可见的 Proma 协作子 Agent 会话。
+你负责判断何时把复杂任务交给 Workflow / Skill 工作流，或拆给真实可见的 DutyDeck 协作子 Agent 会话。
 
-Proma 已提供内置 `collaboration` MCP 工具。你必须通过这些工具创建、等待、查看和停止协作子会话，不要用 Bash、脚本或直接修改 `~/.proma/agent-sessions.json` 的方式创建会话。
+DutyDeck 已提供内置 `collaboration` MCP 工具。你必须通过这些工具创建、等待、查看和停止协作子会话，不要用 Bash、脚本或直接修改 `~/.proma/agent-sessions.json` 的方式创建会话。
 
 可用工具：
 
@@ -44,7 +44,7 @@ Proma 已提供内置 `collaboration` MCP 工具。你必须通过这些工具�
 - 只需要快速返回结论，不需要前端实时可见、独立上下文或长期追溯。
 - 子任务强依赖父会话当前上下文，拆出去会增加同步成本。
 
-### 用 Proma 协作编排
+### 用 DutyDeck 协作编排
 
 适合调用 `collaboration.delegate_agent` 创建真实可见子会话：
 
@@ -70,7 +70,7 @@ Proma 已提供内置 `collaboration` MCP 工具。你必须通过这些工具�
 - 每个子任务必须独立、自包含、可完成。
 - 委派说明里写清楚目标、范围、禁止事项、预期输出。
 - 如需让不同子会话使用同一渠道下的不同模型，先调用 `list_available_agent_models` 查看可用模型，再为 `delegate_agent` 或 `delegate_agents.items[]` 传 `modelId`；不传则继承父会话当前模型。
-- 如需控制计算成本或任务深度，为 `delegate_agent` 或每个 `delegate_agents.items[]` 传 `thinkingLevel`。不传时保持 Proma 新会话默认值；模型不支持请求档位时，运行时会归一化为该模型可用的最近档位。
+- 如需控制计算成本或任务深度，为 `delegate_agent` 或每个 `delegate_agents.items[]` 传 `thinkingLevel`。不传时保持 DutyDeck 新会话默认值；模型不支持请求档位时，运行时会归一化为该模型可用的最近档位。
 - 修改已存在子会话的强度时调用 `set_delegation_thinking_level`。该操作只影响下一轮/续跑，不会重启或篡改正在执行的当前 turn。
 - 权限模式不要高于父会话；高风险修改优先让子会话只调研或审查。
 - 子会话不能继续创建子会话。
@@ -143,7 +143,7 @@ Proma 已提供内置 `collaboration` MCP 工具。你必须通过这些工具�
 示例：
 
 ```text
-父任务：实现 Proma 协作子 Agent 能力。
+父任务：实现 DutyDeck 协作子 Agent 能力。
 子任务：只调研当前前端如何展示自动任务来源会话，找出最小 UI 复用点。
 范围：apps/electron/src/renderer/components/app-shell、components/tabs、atoms/agent-atoms。
 约束：不要修改文件，只返回建议。
@@ -167,7 +167,7 @@ When Agent 判断任务步骤强依赖、需要阶段确认。
 
 Then Agent 应使用 Workflow / Skill 工作流或普通计划推进，不调用 `collaboration.delegate_agent`。
 
-### Scenario 2：独立并行任务应使用 Proma 协作编排
+### Scenario 2：独立并行任务应使用 DutyDeck 协作编排
 
 Given 用户说：“帮我并行开几个 Agent，一个看主进程实现，一个看前端展示，一个看测试缺口，最后汇总。”
 
@@ -181,7 +181,7 @@ Given 用户说：“快速帮我找一下创建 Agent 会话的函数在哪里�
 
 When Agent 判断任务是短搜索、只需要一个结论。
 
-Then Agent 应使用普通搜索或读文件工具，不创建真实 Proma 子会话。
+Then Agent 应使用普通搜索或读文件工具，不创建真实 DutyDeck 子会话。
 
 ### Scenario 4：大批量分片应批量创建并部分收敛
 

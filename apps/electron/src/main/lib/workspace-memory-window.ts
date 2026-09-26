@@ -8,7 +8,7 @@ const DEFAULT_WIDTH = 980
 const DEFAULT_HEIGHT = 720
 const MIN_WIDTH = 680
 const MIN_HEIGHT = 480
-const MEMORY_WINDOW_TITLE = 'Proma · 工作区记忆'
+const MEMORY_WINDOW_TITLE = 'DutyDeck · 工作区记忆'
 
 const windowsByWorkspace = new Map<string, BrowserWindow>()
 const approvedCloseWindows = new WeakSet<BrowserWindow>()

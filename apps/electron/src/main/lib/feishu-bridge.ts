@@ -1137,14 +1137,14 @@ class FeishuBridge {
     }
 
     if (!workspaceId) {
-      await this.sendMessage(chatId, '请先在 Proma 设置中创建项目。')
+      await this.sendMessage(chatId, '请先在 DutyDeck 设置中创建项目。')
       return
     }
 
     // 渠道/模型：Bot 配置 > 应用设置
     const channelId = this.botConfig.defaultChannelId ?? appSettings.agentChannelId
     if (!channelId) {
-      await this.sendMessage(chatId, '请先在 Proma Agent 设置中选择渠道。')
+      await this.sendMessage(chatId, '请先在 DutyDeck Agent 设置中选择渠道。')
       return
     }
 
@@ -1560,7 +1560,7 @@ class FeishuBridge {
     if (channels.length === 0) {
       await this.sendMessage(
         chatId,
-        '暂无可用渠道。请先在 Proma 设置中配置并启用渠道（需填入 API Key 且至少启用一个模型）。',
+        '暂无可用渠道。请先在 DutyDeck 设置中配置并启用渠道（需填入 API Key 且至少启用一个模型）。',
       )
       return
     }
@@ -1618,7 +1618,7 @@ class FeishuBridge {
       await this.createNewSession(msgCtx)
       targetBinding = this.getValidBinding(chatId)
       if (!targetBinding) {
-        await this.sendMessage(chatId, '请先发送一条消息创建会话，或在 Proma 设置中选择 Agent 渠道。')
+        await this.sendMessage(chatId, '请先发送一条消息创建会话，或在 DutyDeck 设置中选择 Agent 渠道。')
         return
       }
     }
@@ -1658,7 +1658,7 @@ class FeishuBridge {
     const session = getAgentSessionMeta(binding.sessionId)
     if (!session || !isAgentSessionUserVisible(session) || !session.workspaceId) {
       console.error(`[飞书 Bridge] 绑定会话缺少有效项目: sessionId=${binding.sessionId}`)
-      await this.sendCardMessage(chatId, buildErrorCard('当前会话项目不可用，请在 Proma 中重新选择会话。'))
+      await this.sendCardMessage(chatId, buildErrorCard('当前会话项目不可用，请在 DutyDeck 中重新选择会话。'))
       return
     }
     if (binding.workspaceId !== session.workspaceId) {
@@ -1815,7 +1815,7 @@ class FeishuBridge {
       || authoritativeSession.workspaceId !== requestedWorkspaceId
       || authoritativeBinding.workspaceId !== authoritativeSession.workspaceId
     ) {
-      const errorMessage = '当前会话项目不可用，请在 Proma 中重新选择会话。'
+      const errorMessage = '当前会话项目不可用，请在 DutyDeck 中重新选择会话。'
       this.invalidateSession(requestedSessionId, chatId)
       await this.sendCardMessage(chatId, buildErrorCard(errorMessage))
       return

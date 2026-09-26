@@ -29,6 +29,6 @@ describe('Bone 发布版本', () => {
   })
 
   test('Given Bone 版本 When 生成标题 Then 同时显示官方版本和构建号', () => {
-    expect(createBoneReleaseTitle('0.17.42-bone.5')).toBe('Proma 0.17.42 · Bone 5')
+    expect(createBoneReleaseTitle('0.17.42-bone.5')).toBe('DutyDeck 0.17.42 · Bone 5')
   })
 })

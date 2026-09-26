@@ -31,22 +31,22 @@ import { copyTextToClipboard } from '@/lib/clipboard'
 import { SettingsCard, SettingsRow, SettingsSection } from './primitives'
 import { WorkspacePathList } from './WorkspacePathList'
 
-const ARCHIVE_MIGRATION_PROMPT = `请帮我创建一个可迁移的 Proma 数据压缩包。
+const ARCHIVE_MIGRATION_PROMPT = `请帮我创建一个可迁移的 DutyDeck 数据压缩包。
 
-Proma 的本地数据通常存放在 ~/.proma。请按以下步骤处理：
+DutyDeck 的本地数据通常存放在 ~/.proma。请按以下步骤处理：
 
-1. 先确认当前 Proma 数据文件夹的位置、计划生成的 ZIP 路径，以及压缩包是否可能包含会话记录、工作区配置和本地文件。
+1. 先确认当前 DutyDeck 数据文件夹的位置、计划生成的 ZIP 路径，以及压缩包是否可能包含会话记录、工作区配置和本地文件。
 2. 在开始压缩前向我展示范围并征得确认；不要删除、移动或修改原始数据文件夹。
 3. 将完整的 .proma 数据文件夹压缩为一个 ZIP 文件，并告诉我生成路径和文件大小。
-4. 提醒我将 ZIP 通过可信方式传输到新设备，并在新设备的 Proma 对话中附上该 ZIP，执行恢复、项目路径分配和索引重建。
+4. 提醒我将 ZIP 通过可信方式传输到新设备，并在新设备的 DutyDeck 对话中附上该 ZIP，执行恢复、项目路径分配和索引重建。
 5. 不要尝试导出系统钥匙串、OAuth 登录或其他系统级凭据；这些内容需要在新设备上重新登录或配置。`
 
-const RESTORE_MIGRATION_PROMPT = `我正在恢复来自另一台设备的 Proma 数据，并已附上旧设备 .proma 文件夹的 ZIP 压缩包。
+const RESTORE_MIGRATION_PROMPT = `我正在恢复来自另一台设备的 DutyDeck 数据，并已附上旧设备 .proma 文件夹的 ZIP 压缩包。
 
 请按以下步骤处理：
 
-1. 先检查 ZIP 的内容，并说明将要写入的此设备 Proma 数据目录以及可能覆盖的文件；在任何覆盖前征得我的确认，并为现有数据创建可恢复备份。
-2. 将压缩包解压到此设备的 Proma 数据目录，按当前版本的数据结构完成必要迁移。
+1. 先检查 ZIP 的内容，并说明将要写入的此设备 DutyDeck 数据目录以及可能覆盖的文件；在任何覆盖前征得我的确认，并为现有数据创建可恢复备份。
+2. 将压缩包解压到此设备的 DutyDeck 数据目录，按当前版本的数据结构完成必要迁移。
 3. 为每个恢复的工作区核对对应的本地项目目录；旧设备路径不可用时，询问我如何重新分配或跳过。
 4. 重建会话、工作区和本地文件索引，检查恢复的数据是否能正常读取。
 5. 完成后说明恢复的会话、工作区和需要重新绑定的本地项目；不要尝试恢复系统钥匙串、API Key 或 OAuth 登录，缺失的凭据请提示我重新配置。`
@@ -85,7 +85,7 @@ export function createPathManagementSettingsView(
     }
   }
   if (state.availability !== 'available' || state.activeRoot === null) {
-    return { kind: 'blocked', migrationBlocked: true, statusLabel: '当前数据位置不可用，请重启 Proma 进入恢复流程' }
+    return { kind: 'blocked', migrationBlocked: true, statusLabel: '当前数据位置不可用，请重启 DutyDeck 进入恢复流程' }
   }
   return { kind: 'ready', migrationBlocked: false, statusLabel: '当前数据位置可用' }
 }
@@ -338,8 +338,8 @@ export function createPathManagementProgressRefreshController(
 
 /** 返回已知数据根设备类型对应的断连或性能提醒。 */
 export function getDataRootDeviceRisk(deviceType: PathManagementState['deviceType']): string | null {
-  if (deviceType === 'network') return '网络数据位置断连时 Proma 将无法启动，访问性能也取决于网络质量。'
-  if (deviceType === 'removable') return '可移动设备拔出后 Proma 将无法启动，设备性能会影响会话与附件读写。'
+  if (deviceType === 'network') return '网络数据位置断连时 DutyDeck 将无法启动，访问性能也取决于网络质量。'
+  if (deviceType === 'removable') return '可移动设备拔出后 DutyDeck 将无法启动，设备性能会影响会话与附件读写。'
   return null
 }
 
@@ -401,7 +401,7 @@ export function DataRootLocationSection({
     : formatBytes(state.availableBytes)
   return (
     <SettingsSection
-      title="Proma 数据位置"
+      title="DutyDeck 数据位置"
       description="会话、附件、Skills、配置和运行数据统一存放在此位置。"
       action={onMigrate ? (
         <Button disabled={isBusy || view.migrationBlocked} onClick={onMigrate} className="gap-2">
@@ -486,7 +486,7 @@ export function CrossDeviceMigrationSection(): React.ReactElement {
       >
         <ol className="space-y-2 text-sm leading-6 text-muted-foreground">
           <li>1. 在当前设备将完整的 .proma 数据文件夹压缩为 ZIP。</li>
-          <li>2. 通过可信方式将 ZIP 传输到新设备，并附到 Proma 对话。</li>
+          <li>2. 通过可信方式将 ZIP 传输到新设备，并附到 DutyDeck 对话。</li>
           <li>3. 在新设备恢复数据、重新分配项目目录并重建索引。</li>
         </ol>
       </SettingsSection>
@@ -507,8 +507,8 @@ export function CrossDeviceMigrationSection(): React.ReactElement {
         </div>
       </SettingsSection>
       <SettingsSection
-        title="新设备：恢复 Proma 数据"
-        description="附上 ZIP 后，将提示词粘贴到 Proma 对话完成恢复。"
+        title="新设备：恢复 DutyDeck 数据"
+        description="附上 ZIP 后，将提示词粘贴到 DutyDeck 对话完成恢复。"
       >
         <div className="relative rounded-lg border border-border/60 bg-muted/30 p-4 pr-12">
           <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-6 text-muted-foreground">{RESTORE_MIGRATION_PROMPT}</pre>
@@ -777,9 +777,9 @@ export function PathManagementSettings(): React.ReactElement {
       <Dialog open={uiState.selectedTarget !== null} onOpenChange={handleDialogOpenChange}>
         <DialogContent className="max-w-xl rounded-lg" aria-describedby="data-root-migration-description">
           <DialogHeader>
-            <DialogTitle>确认迁移 Proma 数据位置</DialogTitle>
+            <DialogTitle>确认迁移 DutyDeck 数据位置</DialogTitle>
             <DialogDescription id="data-root-migration-description">
-              Proma 将创建迁移计划并重启。复制和校验成功后才会切换数据位置，源目录始终保留。
+              DutyDeck 将创建迁移计划并重启。复制和校验成功后才会切换数据位置，源目录始终保留。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 text-sm">

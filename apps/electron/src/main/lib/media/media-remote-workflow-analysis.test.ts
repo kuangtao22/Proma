@@ -60,7 +60,7 @@ describe('远端 ComfyUI 工作流分析', () => {
         outputs: [{ name: 'FLOAT', type: 'FLOAT', links: [10] }], widgets_values: 4 },
       { id: 2, type: 'FloatToImage', inputs: [{ name: 'value', type: 'FLOAT', link: 10 }],
         outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [11] }], widgets_values: [] },
-      { id: 3, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 11 }], outputs: [], widgets_values: ['Proma'] },
+      { id: 3, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 11 }], outputs: [], widgets_values: ['DutyDeck'] },
     ], links: [[10, 132, 0, 2, 0, 'FLOAT'], [11, 2, 0, 3, 0, 'IMAGE']] }), schema)
     expect(result.convertible).toBeTrue()
     expect(result.definition?.prompt['132']?.inputs.value).toBe(4)
@@ -82,7 +82,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     for (const outputs of [[], [{ name: 'IMAGE', type: 'IMAGE', links: [] }]]) {
       const result = analyzeRemoteWorkflow(remote('ui', { nodes: [
         { id: 1, type: 'LoadImage', outputs, widgets_values: ['private.png'] },
-        { id: 2, type: 'SaveImage', inputs: [{ name: 'images', link: 10 }], widgets_values: ['Proma'] },
+        { id: 2, type: 'SaveImage', inputs: [{ name: 'images', link: 10 }], widgets_values: ['DutyDeck'] },
       ], links: [[10, 1, 0, 2, 0, 'IMAGE']] }), objectInfo)
       expect(result.convertible).toBeFalse()
       expect(result.issues).toContainEqual(expect.objectContaining({ code: 'UI_LINK_INVALID', nodeId: '1' }))
@@ -98,7 +98,7 @@ describe('远端 ComfyUI 工作流分析', () => {
         { id: 1, type: 'LoadImage', inputs: [], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [10] }], widgets_values: ['private.png'] },
         { id: 100, type: 'subgraph-resize', inputs: [{ name: 'image', link: 10 }, { name: 'width', widget: { name: 'width' }, link: null }],
           outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [11] }], widgets_values: [1024] },
-        { id: 200, type: 'SaveImage', inputs: [{ name: 'images', link: 11 }], widgets_values: ['Proma'] },
+        { id: 200, type: 'SaveImage', inputs: [{ name: 'images', link: 11 }], widgets_values: ['DutyDeck'] },
       ], links: [[10, 1, 0, 100, 0, 'IMAGE'], [11, 100, 0, 200, 0, 'IMAGE']],
       definitions: { subgraphs: [{ id: 'subgraph-resize', inputNode: { id: -10 }, outputNode: { id: -20 },
         inputs: [{ id: 'image', name: 'image', type: 'IMAGE', linkIds: [101] }, { id: 'width', name: 'width', type: 'INT', linkIds: [102] }],
@@ -124,7 +124,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     }
     const result = analyzeRemoteWorkflow(remote('ui', { nodes: [
       { id: 1, type: 'Dimensions', widgets_values: [1920, 1080] },
-      { id: 2, type: 'SaveImage', inputs: [{ name: 'images', link: 1 }], widgets_values: ['Proma'] },
+      { id: 2, type: 'SaveImage', inputs: [{ name: 'images', link: 1 }], widgets_values: ['DutyDeck'] },
     ], links: [[1, 1, 0, 2, 0, 'IMAGE']] }), schema)
     expect(result.issues).toEqual([])
     expect(result.definition?.prompt['1']?.inputs).toEqual({ width: 1920, height: 1080 })
@@ -143,7 +143,7 @@ describe('远端 ComfyUI 工作流分析', () => {
         { id: 2, type: 'PrimitiveInt', inputs: [], widgets_values: [1024, 'fixed'] },
         { id: 3, type: 'InstalledResize', inputs: [{ name: 'image', link: 1 },
           { name: 'width', widget: { name: 'width' }, link: 2 }], widgets_values: [640, 480] },
-        { id: 4, type: 'SaveImage', inputs: [{ name: 'images', link: 3 }], widgets_values: ['Proma'] },
+        { id: 4, type: 'SaveImage', inputs: [{ name: 'images', link: 3 }], widgets_values: ['DutyDeck'] },
         { id: 5, type: 'MarkdownNote', inputs: [], outputs: [], widgets_values: ['仅用于说明'] },
       ],
       links: [[1, 1, 0, 3, 0, 'IMAGE'], [2, 2, 0, 3, 1, 'INT'], [3, 3, 0, 4, 0, 'IMAGE']],
@@ -167,7 +167,7 @@ describe('远端 ComfyUI 工作流分析', () => {
       { id: 2, type: 'PrimitiveInt', inputs: [], widgets_values: [1024] },
       { id: 3, type: 'DynamicResize', inputs: [{ name: 'image', link: 1 },
         { name: 'mode.width', widget: { name: 'mode.width' }, link: 2 }], widgets_values: ['dimensions', 640, 480, 25] },
-      { id: 4, type: 'SaveImage', inputs: [{ name: 'images', link: 3 }], widgets_values: ['Proma'] },
+      { id: 4, type: 'SaveImage', inputs: [{ name: 'images', link: 3 }], widgets_values: ['DutyDeck'] },
     ], links: [[1, 1, 0, 3, 0, 'IMAGE'], [2, 2, 0, 3, 1, 'INT'], [3, 3, 0, 4, 0, 'IMAGE']] }), schema)
     expect(result.issues).toEqual([])
     expect(result.definition?.prompt['3']?.inputs).toEqual({ image: ['1', 0], mode: 'dimensions',
@@ -185,7 +185,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     }
     const result = analyzeRemoteWorkflow(remote('api', {
       '1': { class_type: 'KSampler', inputs: { seed: 42 } },
-      '2': { class_type: 'SaveImage', inputs: { images: ['1', 0], filename_prefix: 'Proma' } },
+      '2': { class_type: 'SaveImage', inputs: { images: ['1', 0], filename_prefix: 'DutyDeck' } },
     }), schema)
     expect(result.issues).toEqual([])
     expect(result.definition?.bindings[0]?.field?.max).toBe(Number.MAX_SAFE_INTEGER)
@@ -213,7 +213,7 @@ describe('远端 ComfyUI 工作流分析', () => {
 
     expect(result.convertible).toBeTrue()
     expect(result.definition?.prompt['1']?.inputs).toEqual({ image: '' })
-    expect(result.definition?.prompt['3']?.inputs.filename_prefix).toBe('Proma')
+    expect(result.definition?.prompt['3']?.inputs.filename_prefix).toBe('DutyDeck')
     expect(result.definition?.bindings).toEqual(expect.arrayContaining([
       expect.objectContaining({ key: '1.image', kind: 'image', nodeId: '1', input: 'image', loader: 'LoadImage' }),
       expect.objectContaining({ key: '2.width', kind: 'number', field: expect.objectContaining({ controlType: 'width', required: false, min: 1, max: 8192 }) }),
@@ -249,7 +249,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     const result = analyzeRemoteWorkflow(remote('ui', {
       nodes: [
         { id: 1, type: 'KSampler', inputs: [], outputs: [{ name: 'IMAGE', type: 'IMAGE', links: [1] }], widgets_values: [42, 'randomize'] },
-        { id: 2, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 1 }], outputs: [], widgets_values: ['Proma'] },
+        { id: 2, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 1 }], outputs: [], widgets_values: ['DutyDeck'] },
       ],
       links: [[1, 1, 0, 2, 0, 'IMAGE']],
     }), objectInfo)
@@ -300,7 +300,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     const invalidLink = analyzeRemoteWorkflow(remote('ui', {
       nodes: [
         { id: 1, type: 'KSampler', inputs: [], outputs: [], widgets_values: [1, 'fixed'] },
-        { id: 1, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 99 }], outputs: [], widgets_values: ['Proma'] },
+        { id: 1, type: 'SaveImage', inputs: [{ name: 'images', type: 'IMAGE', link: 99 }], outputs: [], widgets_values: ['DutyDeck'] },
       ],
       links: [[99, 404, 0, 1, 0, 'IMAGE']],
     }), objectInfo)
@@ -316,7 +316,7 @@ describe('远端 ComfyUI 工作流分析', () => {
         { id: 2, type: 'SaveImage', inputs: [
           { name: 'mystery', type: 'IMAGE', link: 10 },
           { name: 'mystery', type: 'IMAGE', link: null },
-        ], outputs: [], widgets_values: ['Proma'] },
+        ], outputs: [], widgets_values: ['DutyDeck'] },
       ],
       links: [[10, 1, 0, 2, 0, 'IMAGE']],
     }), objectInfo)
@@ -345,7 +345,7 @@ describe('远端 ComfyUI 工作流分析', () => {
     const result = analyzeRemoteWorkflow(remote('api', {
       '1': { class_type: 'LoadImage', inputs: { image: 'private.png' }, _meta: { title: '首帧输入' } },
       '2': { class_type: 'InstalledCustom', inputs: { image: ['1', 0], prompt: '保留给 Agent 识别的提示词' }, _meta: { title: '风格化首帧' } },
-      '3': { class_type: 'SaveImage', inputs: { images: ['2', 0], filename_prefix: 'Proma' } },
+      '3': { class_type: 'SaveImage', inputs: { images: ['2', 0], filename_prefix: 'DutyDeck' } },
     }), schema)
 
     expect(result.convertible).toBeTrue()

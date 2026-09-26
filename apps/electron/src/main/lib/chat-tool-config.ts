@@ -1,9 +1,9 @@
 /**
  * Chat 工具配置服务
  *
- * 管理 ~/.proma/chat-tools.json 的读写。
- * 存储工具开关状态和非记忆工具的凭据。
- * 记忆凭据保留在 memory.json（Chat + Agent 共用）。
+ * 管理 ~/.proma/chat-tools.json 的读写：工具开关状态与工具凭据。
+ * 注意：记忆不是 Chat 工具——协作记忆由 Agent 模式经工作区 `memory/` 承载，
+ * 因此这里不再保留历史遗留的 `memory` 开关（它没有任何消费者）。
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
@@ -13,7 +13,6 @@ import type { ChatToolsFileConfig, ChatToolState, ChatToolMeta } from '@proma/sh
 /** 默认配置 */
 const DEFAULT_CONFIG: ChatToolsFileConfig = {
   toolStates: {
-    memory: { enabled: true },
     'agent-mode-recommend': { enabled: true },
     'web-search': { enabled: false },
     'nano-banana': { enabled: false },

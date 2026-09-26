@@ -159,7 +159,7 @@ async function registerClient(registrationEndpoint: string, redirectUri: string)
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
-      client_name: 'Proma',
+      client_name: 'DutyDeck',
       application_type: 'native',
       redirect_uris: [redirectUri],
       grant_types: ['authorization_code', 'refresh_token'],
@@ -201,8 +201,8 @@ async function startCallbackServer(state: string): Promise<{ redirectUri: string
 
     response.writeHead(stateMatches && code ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' })
     response.end(stateMatches && code
-      ? '<!doctype html><title>Proma</title><p>授权完成，可以关闭此页面并返回 Proma。</p>'
-      : '<!doctype html><title>Proma</title><p>授权未完成，请返回 Proma 重试。</p>')
+      ? '<!doctype html><title>DutyDeck</title><p>授权完成，可以关闭此页面并返回 DutyDeck。</p>'
+      : '<!doctype html><title>DutyDeck</title><p>授权未完成，请返回 DutyDeck 重试。</p>')
 
     closeServer(server)
     if (!stateMatches) rejectCode(new Error('OAuth state 校验失败，已拒绝回调'))

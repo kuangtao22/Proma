@@ -2390,7 +2390,7 @@ export function ServerOpsWorkspace({ viewScope = 'default', paneActive = true }:
           <AlertDialogHeader>
             <AlertDialogTitle>确认服务器指纹</AlertDialogTitle>
             <AlertDialogDescription>
-              这是 Proma 第一次连接“{selectedHost?.name ?? '该服务器'}”。请与服务器管理员提供的指纹核对，确认前不会发送登录凭据。
+              这是 DutyDeck 第一次连接“{selectedHost?.name ?? '该服务器'}”。请与服务器管理员提供的指纹核对，确认前不会发送登录凭据。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="space-y-2 border-y border-border py-3 text-xs">

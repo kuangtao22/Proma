@@ -215,7 +215,7 @@ export class TerminalRuntimeClient {
     const { runtimeProcess, lifecycle } = await startUtilityProcessWithRetry(
       () => {
         /** fork 返回时立刻监听 spawn/exit，覆盖 await 前的取消窗口。 */
-        const runtimeProcess = utilityProcess.fork(entryPath, [], { serviceName: 'Proma Terminal Runtime' })
+        const runtimeProcess = utilityProcess.fork(entryPath, [], { serviceName: 'DutyDeck Terminal Runtime' })
         /** 当前进程的唯一生命周期追踪对象。 */
         const createdLifecycle = createUtilityProcessLifecycle(runtimeProcess)
         this.runtimeProcess = runtimeProcess

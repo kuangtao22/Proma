@@ -564,13 +564,13 @@ function vaultSummary(config: VaultConfig): VaultSummary {
 
 function configureVaultAt(rootPath: string, configPath: string, options: { inboxPath?: string; allowAgentWrites?: boolean } = {}): VaultSummary {
   const root = assertVaultRoot(rootPath)
-  const inboxPath = options.inboxPath?.trim() || 'Proma Inbox'
+  const inboxPath = options.inboxPath?.trim() || 'DutyDeck Inbox'
   const normalizedInboxPath = normalizeRelativeMarkdownPath(join(inboxPath, 'placeholder.md')).replace(/\/placeholder\.md$/, '')
   const managedRootPath = resolveDefaultVaultDir(dirname(configPath))
   const isManagedRoot = existsSync(managedRootPath) && root === realpathSync(managedRootPath)
   const config: VaultConfig = {
     rootPath: root,
-    displayName: isManagedRoot ? 'Proma Vault' : basename(root) || 'Vault',
+    displayName: isManagedRoot ? 'DutyDeck Vault' : basename(root) || 'Vault',
     inboxPath: normalizedInboxPath,
     allowAgentWrites: options.allowAgentWrites === true,
     configuredAt: Date.now(),
@@ -585,7 +585,7 @@ export function configureVault(rootPath: string, options: { inboxPath?: string; 
 
 
 export function selectDefaultVault(): VaultSummary {
-  return configureVault(getDefaultVaultDir(), { inboxPath: 'Proma Inbox', allowAgentWrites: false })
+  return configureVault(getDefaultVaultDir(), { inboxPath: 'DutyDeck Inbox', allowAgentWrites: false })
 }
 
 
@@ -630,7 +630,7 @@ export function discoverVaultCandidates(): VaultCandidate[] {
     managedRoot = null
   }
   const candidates: VaultCandidate[] = managedRoot
-    ? [{ path: managedRoot, displayName: 'Proma Vault', isObsidianVault: existsSync(join(managedRoot, '.obsidian')), isPromaManaged: true }]
+    ? [{ path: managedRoot, displayName: 'DutyDeck Vault', isObsidianVault: existsSync(join(managedRoot, '.obsidian')), isPromaManaged: true }]
     : []
   return [...candidates, ...discoverObsidianVaultCandidates()]
 }

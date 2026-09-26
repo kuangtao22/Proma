@@ -73,7 +73,7 @@ export function ApiImportDialog({ open, onOpenChange, onImportDrafts, onImportSn
       <DialogContent className="max-h-[80vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>导入接口</DialogTitle>
-          <DialogDescription>粘贴浏览器「Copy as cURL」内容或 Proma 集合快照 JSON。不会执行 shell 命令，也不会读取本机文件。</DialogDescription>
+          <DialogDescription>粘贴浏览器「Copy as cURL」内容或 DutyDeck 集合快照 JSON。不会执行 shell 命令，也不会读取本机文件。</DialogDescription>
         </DialogHeader>
         <Textarea
           value={text}

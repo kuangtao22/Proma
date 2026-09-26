@@ -321,7 +321,7 @@ export function createServerOpsConfigTransaction(
     if (acquired.status === 'busy') {
       throw new ServerOpsConfigTransactionError(
         'SERVER_OPS_CONFIG_BUSY',
-        'SERVER_OPS_CONFIG_BUSY: 另一个 Proma 实例正在更新服务器配置',
+        'SERVER_OPS_CONFIG_BUSY: 另一个 DutyDeck 实例正在更新服务器配置',
       )
     }
 

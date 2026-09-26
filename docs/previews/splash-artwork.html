@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DutyDeck 启动页备选（保留原插画）</title>
+    <style>
+      /*
+       * 备选方案预览：保留原插画背景，只收紧字重与层级。
+       * 仅用于对比预览，不是应用实际加载的启动页。
+       * 注意：该插画在中国/欧盟等「作者终身 + 70 年」地区仍受著作权保护。
+       */
+      * { box-sizing: border-box; }
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+      body {
+        background: #0b0d10;
+        color: #fff;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .artwork, .shade { position: fixed; inset: 0; }
+      .artwork { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+      .shade {
+        background:
+          radial-gradient(680px 460px at 50% 42%, rgba(0, 0, 0, 0.28), rgba(0, 0, 0, 0.78) 78%),
+          linear-gradient(180deg, rgba(0, 0, 0, 0.35), rgba(0, 0, 0, 0.82));
+      }
+      .content {
+        position: relative;
+        z-index: 1;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 40px 32px;
+        text-align: center;
+      }
+      .brand { display: flex; align-items: center; gap: 14px; }
+      .brand img { width: 44px; height: 44px; filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.6)); }
+      .brand span { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+      .slogan { margin: 16px 0 0; max-width: 320px; font-size: 13px; line-height: 1.7; color: rgba(255, 255, 255, 0.72); }
+      .progress { width: 132px; height: 3px; margin-top: 34px; border-radius: 999px; overflow: hidden; background: rgba(255, 255, 255, 0.2); }
+      .progress::after { content: ""; display: block; width: 42%; height: 100%; border-radius: 999px; background: #f1f5f9; animation: slide 1.5s cubic-bezier(0.45, 0, 0.25, 1) infinite; }
+      .status { margin: 14px 0 0; font-size: 12px; letter-spacing: 0.24em; color: rgba(255, 255, 255, 0.55); }
+      @keyframes slide { 0% { transform: translateX(-105%); } 100% { transform: translateX(240%); } }
+      @media (prefers-reduced-motion: reduce) { .progress::after { animation: none; width: 60%; } }
+    </style>
+  </head>
+  <body>
+    <img class="artwork" src="../../apps/electron/resources/startup-splash/artwork.jpg" alt="" />
+    <div class="shade"></div>
+    <main class="content">
+      <div class="brand"><img src="../../apps/electron/resources/startup-splash/dutydeck-mark-white.png" alt="" /><span>DutyDeck</span></div>
+      <p class="slogan">本地优先的工程工作台 · 画布 · 运维 · 接口 · Agent</p>
+      <div class="progress"></div>
+      <p class="status">正在启动</p>
+    </main>
+  </body>
+</html>

@@ -171,7 +171,7 @@ const DEFAULT_RUNTIME_CLIENT_DEPENDENCIES: ServerOpsRuntimeClientDependencies = 
     /** Electron 仅在真正启动 SSH runtime 时加载。 */
     const { utilityProcess } = require('electron') as typeof import('electron')
     /** 将 Electron 事件签名收窄为客户端实际使用的两个事件。 */
-    const child = utilityProcess.fork(entryPath, [], { serviceName: 'Proma Server Ops Runtime' })
+    const child = utilityProcess.fork(entryPath, [], { serviceName: 'DutyDeck Server Ops Runtime' })
     return {
       kill: () => child.kill(),
       postMessage: (message, transfer) => {

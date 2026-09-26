@@ -2,7 +2,7 @@
  * AboutSettings - 关于页面
  *
  * 显示应用版本号等基本信息，以及版本检测状态。
- * 检测到新版本后引导用户去 Proma 官方下载页手动下载。
+ * 检测到新版本后引导用户去本项目的 Release 下载页手动下载。
  */
 
 import * as React from 'react'
@@ -22,7 +22,11 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { ReleaseNotesViewer } from './ReleaseNotesViewer'
 import { VersionHistory } from './VersionHistory'
-import { PROMA_DOWNLOAD_URL, PROMA_RELEASE_REPOSITORY } from '../../../shared/release-config'
+import {
+  PROMA_DOWNLOAD_URL,
+  PROMA_RELEASE_REPOSITORY,
+  UPSTREAM_CONTENT_BASELINE,
+} from '../../../shared/release-config'
 import { createAppVersionDisplay } from '@/lib/app-version-display'
 
 /** 从 package.json 构建时由 Vite define 注入 */
@@ -482,14 +486,17 @@ function ShellEnvironmentCard(): React.ReactElement | null {
 export function AboutSettings(): React.ReactElement {
   return (
     <SettingsSection
-      title="关于 Proma"
-      description="集成通用 AI Agent 的下一代人工智能软件"
+      title="关于 DutyDeck"
+      description="本地优先的工程工作台 · 基于 Proma 的修改版"
     >
       <SettingsCard>
-        <SettingsRow label="官方版本">
+        <SettingsRow label="上游版本号">
           <span className="text-sm text-muted-foreground font-mono">
             {APP_VERSION_DISPLAY.upstreamVersion}
           </span>
+        </SettingsRow>
+        <SettingsRow label="上游内容基线">
+          <span className="text-sm text-muted-foreground font-mono">{UPSTREAM_CONTENT_BASELINE}</span>
         </SettingsRow>
         {APP_VERSION_DISPLAY.boneBuild !== null && (
           <SettingsRow label="Bone 构建">
@@ -503,7 +510,7 @@ export function AboutSettings(): React.ReactElement {
         </SettingsRow>
         <SettingsRow
           label="开源协议"
-          description="社区版基于 AGPL-3.0 开源，商业授权请联系 erlichliu@gmail.com"
+          description="AGPL-3.0-only 开源，与上游一致。本项目是 Proma 的修改版，不提供、也无权提供商业授权豁免。"
         >
           <a
             href="https://www.gnu.org/licenses/agpl-3.0.html"

@@ -604,7 +604,7 @@ describe('PathManagementSettings', () => {
     /** 静态 HTML 锁定路径、元数据和安全操作文案。 */
     const html = renderToStaticMarkup(<DataRootLocationSection state={createState()} />)
 
-    expect(html).toContain('Proma 数据位置')
+    expect(html).toContain('DutyDeck 数据位置')
     expect(html).toContain('/Users/example/.proma')
     expect(html).toContain('/Volumes/Backup/Proma')
     expect(html).toContain('打开当前路径')
@@ -620,7 +620,7 @@ describe('PathManagementSettings', () => {
 
     expect(html).toContain('当前设备：创建迁移压缩包')
     expect(html).toContain('复制创建压缩包提示词')
-    expect(html).toContain('新设备：恢复 Proma 数据')
+    expect(html).toContain('新设备：恢复 DutyDeck 数据')
     expect(html).toContain('复制恢复数据提示词')
   })
 

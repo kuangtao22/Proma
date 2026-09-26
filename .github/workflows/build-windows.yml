@@ -104,5 +104,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Proma-win-x64
+          name: DutyDeck-win-x64
           path: apps/electron/out/*.exe

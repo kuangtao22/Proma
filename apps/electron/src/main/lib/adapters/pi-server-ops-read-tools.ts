@@ -63,7 +63,7 @@ export function buildServerOpsReadTools(sdk: PiSdk, facade: ServerOpsAgentReadFa
     }),
     sdk.defineTool({
       name: 'ops_data_test', label: '测试数据连接',
-      description: `Test one saved MySQL/PostgreSQL/SQLite source or authorized Redis source using the connection retained by Proma.${UNTRUSTED_EVIDENCE}`,
+      description: `Test one saved MySQL/PostgreSQL/SQLite source or authorized Redis source using the connection retained by DutyDeck.${UNTRUSTED_EVIDENCE}`,
       parameters: Type.Object({ sourceId: Type.String() }, { additionalProperties: false }),
       async execute(_id, params, signal) { return jsonToolResult(await facade.dataProbe(params as { sourceId: string }, signal)) },
     }),

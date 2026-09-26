@@ -140,7 +140,7 @@ describe('服务器信任管理', () => {
 
   test('Given 信任操作失败 When 映射错误 Then 只展示稳定错误码对应文案', () => {
     expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_ACCESS_DENIED: secret'))).toBe('当前窗口无权管理服务器信任')
-    expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_OTHER_INSTANCE_ACTIVE'))).toBe('请先关闭其他 Proma 实例，再变更服务器信任')
+    expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_OTHER_INSTANCE_ACTIVE'))).toBe('请先关闭其他 DutyDeck 实例，再变更服务器信任')
     expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_CONFIG_BUSY'))).toBe('服务器配置正忙，请稍后重试')
     expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_TRUST_BUSY'))).toBe('服务器信任操作正忙，请稍后重试')
     expect(getServerOpsTrustErrorMessage(new Error('SERVER_OPS_TRUST_CANDIDATE_EXPIRED'))).toBe('本次确认已过期，请重新准备')

@@ -210,7 +210,7 @@ export async function detectBunRuntime(): Promise<BunRuntimeStatus> {
     }
   }
 
-  console.log('[Bun 检测] 未找到 Bun（可选，不影响 Proma 核心功能）')
+  console.log('[Bun 检测] 未找到 Bun（可选，不影响 DutyDeck 核心功能）')
   return {
     available: false,
     path: null,

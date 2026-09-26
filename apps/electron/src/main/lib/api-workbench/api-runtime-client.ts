@@ -61,7 +61,7 @@ function failedResult(code: string, phase: string, message: string, state: ApiTr
 const DEFAULT_DEPENDENCIES: ApiRuntimeClientDependencies = {
   createProcess: (entryPath) => {
     const { utilityProcess } = require('electron') as typeof import('electron')
-    const child = utilityProcess.fork(entryPath, [], { serviceName: 'Proma API Workbench Runtime' })
+    const child = utilityProcess.fork(entryPath, [], { serviceName: 'DutyDeck API Workbench Runtime' })
     return {
       get pid() { return child.pid },
       postMessage: (message) => child.postMessage(message), kill: () => child.kill(),

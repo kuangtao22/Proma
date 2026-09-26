@@ -50,7 +50,7 @@ describe('PostgreSQL adapter 会话合同', () => {
       expect(parameters.options).toContain('default_transaction_read_only=on')
       expect(parameters.options).toContain('standard_conforming_strings=on')
       expect(parameters.sslnegotiation).toBe('postgres')
-      expect(parameters.application_name).toBe('Proma Server Ops')
+      expect(parameters.application_name).toBe('DutyDeck Server Ops')
       expect(parameters.client_encoding).toBe('UTF8')
       expect(parameters.replication).toBe('false')
       expect(parameters.ssl).toBe(false)

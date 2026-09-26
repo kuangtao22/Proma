@@ -52,7 +52,7 @@ export interface ServerOpsTrustController {
 /** 允许 Renderer 展示的稳定信任错误文案。 */
 const SERVER_OPS_TRUST_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   SERVER_OPS_ACCESS_DENIED: '当前窗口无权管理服务器信任',
-  SERVER_OPS_OTHER_INSTANCE_ACTIVE: '请先关闭其他 Proma 实例，再变更服务器信任',
+  SERVER_OPS_OTHER_INSTANCE_ACTIVE: '请先关闭其他 DutyDeck 实例，再变更服务器信任',
   SERVER_OPS_CONFIG_BUSY: '服务器配置正忙，请稍后重试',
   SERVER_OPS_TRUST_BUSY: '服务器信任操作正忙，请稍后重试',
   SERVER_OPS_TRUST_CANDIDATE_EXPIRED: '本次确认已过期，请重新准备',

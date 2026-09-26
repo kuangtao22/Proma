@@ -1,6 +1,6 @@
 # Windows 发布操作记录
 
-更新日期：2026-09-07。适用于 Proma Bone 的 Windows x64 发布。
+更新日期：2026-09-07。适用于 DutyDeck Bone 的 Windows x64 发布。
 
 最省返工的路径是：版本与发布说明准备好后固定提交，在 Windows runner 上完成独立预检，再给同一提交打正式标签。保留行为测试，把冷编译的时间预算单独管理，避免用正式发布反复试错。
 
@@ -25,7 +25,7 @@ WINDOWS_RUN_ID='<本次 run ID>'
 gh run watch "$WINDOWS_RUN_ID" --repo kuangtao22/Proma --interval 30 --exit-status
 ```
 
-预检通过要求：原生测试、资源准备、打包和 `Proma-win-x64` 产物上传全部成功；记录跳过用例及原因。当前独立工作流只上传 `.exe`，更新 YAML 和其他平台产物仍须在正式 Release 验收。
+预检通过要求：原生测试、资源准备、打包和 `DutyDeck-win-x64` 产物上传全部成功；记录跳过用例及原因。当前独立工作流只上传 `.exe`，更新 YAML 和其他平台产物仍须在正式 Release 验收。
 
 预检后只要待发布源码、依赖、打包配置或版本发生变化，就重新固定提交并验证。正式标签严格等于 `v${apps/electron/package.json.version}`，且指向通过预检的提交。预检可提前发现问题，正式 Release 仍需成功完成自身的构建。
 

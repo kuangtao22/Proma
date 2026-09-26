@@ -104,7 +104,7 @@ export function getSlackBotById(botId: string): SlackBotConfig | undefined {
 
 export function saveSlackBotConfig(input: SlackBotConfigInput): SlackBotConfig {
   const config = readRawConfig()
-  const name = input.name.trim() || 'Proma'
+  const name = input.name.trim() || 'DutyDeck'
   if (CHINESE_CHARACTER_PATTERN.test(name)) {
     throw new Error('Slack App 名称不能包含中文，请使用英文名称')
   }

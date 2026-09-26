@@ -60,7 +60,7 @@ function MemoryFilesExampleImage() {
 
   return (
     <div ref={frameRef} className="relative min-w-0">
-      <figure className="m-0 overflow-hidden rounded-lg bg-[#f6f8f3] shadow-[0_14px_30px_rgba(27,63,45,0.12)]">
+      <figure className="m-0 overflow-hidden rounded-lg bg-[#f4f5f6] shadow-[0_14px_30px_rgba(21,21,21,0.12)]">
         <img
           src={memoryFilesExample}
           alt="项目记忆页面中显示记忆文件和自动记忆条目的示例"
@@ -78,7 +78,7 @@ function MemoryFilesExampleImage() {
             top: focusY - radius,
             width: magnifierDiameter,
             height: magnifierDiameter,
-            backgroundColor: '#eef4ea',
+            backgroundColor: '#eef0f1',
             clipPath: `circle(${radius}px at ${radius}px ${radius}px)`,
             overflow: 'hidden',
             filter: 'drop-shadow(0 4px 12px rgba(0,0,0,0.25))',
@@ -99,11 +99,11 @@ function MemoryFilesExampleImage() {
             }}
           />
           <div
-            className="absolute inset-0 rounded-full border-[3px] border-[#1b3f2d]"
+            className="absolute inset-0 rounded-full border-[3px] border-[#151515]"
             style={{ clipPath: `circle(${radius}px at ${radius}px ${radius}px)` }}
           />
           <div
-            className="absolute bottom-[-6px] right-[-6px] h-8 w-8 rounded-full border-[4px] border-[#1b3f2d]"
+            className="absolute bottom-[-6px] right-[-6px] h-8 w-8 rounded-full border-[4px] border-[#151515]"
             style={{
               background: 'transparent',
               borderRightColor: 'transparent',
@@ -122,13 +122,13 @@ export function MemoryGuideExamples() {
   return (
     <>
       <div className="max-w-2xl">
-        <div className="text-xs font-medium uppercase tracking-[0.2em] text-[#1b3f2d]">真实示例</div>
+        <div className="text-xs font-medium uppercase tracking-[0.2em] text-[#151515]">真实示例</div>
         <h2 className="mt-4 text-3xl font-light tracking-tight text-neutral-900 md:text-4xl">复用已验证的经验</h2>
       </div>
 
       <div className="mt-14 space-y-16 md:mt-16 md:space-y-20">
-        <article className="grid gap-10 border-t border-[#1b3f2d]/15 pt-10 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-center">
-          <figure className="min-w-0 overflow-hidden rounded-lg bg-[#f6f8f3] shadow-[0_14px_30px_rgba(27,63,45,0.12)]">
+        <article className="grid gap-10 border-t border-[#151515]/15 pt-10 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-center">
+          <figure className="min-w-0 overflow-hidden rounded-lg bg-[#f4f5f6] shadow-[0_14px_30px_rgba(21,21,21,0.12)]">
             <img
               src={memoryGenerateExample}
               alt="在协作知识页面为项目建立项目地图与协作画像的示例"
@@ -143,7 +143,7 @@ export function MemoryGuideExamples() {
           </div>
         </article>
 
-        <article className="grid gap-10 border-t border-[#1b3f2d]/15 pt-10 lg:grid-cols-[22rem_minmax(0,1fr)] lg:items-center">
+        <article className="grid gap-10 border-t border-[#151515]/15 pt-10 lg:grid-cols-[22rem_minmax(0,1fr)] lg:items-center">
           <div className="min-w-0 lg:order-1">
             <h3 className="mt-3 text-2xl font-medium text-neutral-900 md:text-3xl">
               Agent 整理好的<b className="font-medium text-neutral-900">偏好和记忆可以随时编辑</b>

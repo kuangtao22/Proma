@@ -148,32 +148,32 @@ const remoteMcp = (url: string): McpServerEntry => ({ type: 'http', url, enabled
 const stdioMcp = (command: string, args: string[]): McpServerEntry => ({ type: 'stdio', command, args, enabled: false })
 
 const MCP_CONNECTION_ACCEPTANCE_INSTRUCTION = `
-最终完成形态：只有当该 MCP 已写入当前 Proma workspace 的 MCP 配置、处于启用状态，并完成真实 SDK handshake 与 listTools 验证成功后，才能显示为「已连接」或称可用；届时才可以通过 # 调用。仅在当前会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 Proma MCP 已连接，必须如实说明未完成的条件。`
+最终完成形态：只有当该 MCP 已写入当前 DutyDeck workspace 的 MCP 配置、处于启用状态，并完成真实 SDK handshake 与 listTools 验证成功后，才能显示为「已连接」或称可用；届时才可以通过 # 调用。仅在当前会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 DutyDeck MCP 已连接，必须如实说明未完成的条件。`
 
 const CLI_CONNECTION_ACCEPTANCE_INSTRUCTION = `
-最终完成形态：只有当对应官方 CLI 已完成真实认证验证，且已在当前 Proma workspace 的目录中被允许/启用后，才能显示为「已连接」。只在当前会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 Proma CLI 已连接；不要猜测或伪造 CLI 状态。`
+最终完成形态：只有当对应官方 CLI 已完成真实认证验证，且已在当前 DutyDeck workspace 的目录中被允许/启用后，才能显示为「已连接」。只在当前会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 DutyDeck CLI 已连接；不要猜测或伪造 CLI 状态。`
 
 const GUIDED_CONNECTION_ACCEPTANCE_INSTRUCTION = `
-完成状态必须按实际接入类型如实报告：若最终接入 MCP，只有它已写入当前 Proma workspace 的 MCP 配置、启用，并完成真实 SDK handshake 与 listTools 验证后，才能显示为「已连接」并可通过 # 调用；若最终接入 CLI，只有官方 CLI 已真实认证且已在当前 Proma workspace 的目录中被允许/启用后，才能显示为「已连接」。仅在会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 Proma MCP/CLI 已连接。`
+完成状态必须按实际接入类型如实报告：若最终接入 MCP，只有它已写入当前 DutyDeck workspace 的 MCP 配置、启用，并完成真实 SDK handshake 与 listTools 验证后，才能显示为「已连接」并可通过 # 调用；若最终接入 CLI，只有官方 CLI 已真实认证且已在当前 DutyDeck workspace 的目录中被允许/启用后，才能显示为「已连接」。仅在会话环境、OpenClaw/mcporter、临时 shell 中可用，或只安装了 Skill，都不等于 DutyDeck MCP/CLI 已连接。`
 
 export const MCP_CREDENTIAL_SETUP_INSTRUCTION = `
 
-如果配置需要 API Key、Access Token、授权码或其他必须由用户手动获取的内容：请使用 Proma 内置浏览器打开对应的官方获取或授权页面，先让我自行完成登录、注册、申请权限或授权。不要代替我输入密码、验证码，也不要读取或导出 Cookie、浏览器登录态或其他凭据。页面成功显示需要配置的凭据后，请让我将该凭据直接发送到当前 Agent 对话；收到后仅将其用于本次配置，绝不在回复、日志、AGENTS.md、mcp.json 或其他普通项目文件中回显或保存，并优先使用 Proma/系统提供的安全凭据存储。${MCP_CONNECTION_ACCEPTANCE_INSTRUCTION}`
+如果配置需要 API Key、Access Token、授权码或其他必须由用户手动获取的内容：请使用 DutyDeck 内置浏览器打开对应的官方获取或授权页面，先让我自行完成登录、注册、申请权限或授权。不要代替我输入密码、验证码，也不要读取或导出 Cookie、浏览器登录态或其他凭据。页面成功显示需要配置的凭据后，请让我将该凭据直接发送到当前 Agent 对话；收到后仅将其用于本次配置，绝不在回复、日志、AGENTS.md、mcp.json 或其他普通项目文件中回显或保存，并优先使用 DutyDeck/系统提供的安全凭据存储。${MCP_CONNECTION_ACCEPTANCE_INSTRUCTION}`
 
 const cliSetupPrompt = (name: string, setupUrl: string, settingsPath = `设置 → 远程连接 → 配置${name}`): string => `请帮我配置「${name}」。
 
-请优先在当前 Proma 的「${settingsPath}」中完成配置，不要只给我一个网页链接，也不要自动把我切到外部网页。
+请优先在当前 DutyDeck 的「${settingsPath}」中完成配置，不要只给我一个网页链接，也不要自动把我切到外部网页。
 
 官方入口：${setupUrl}
 
 执行要求：
 1. 先核验官方安装命令、认证方式、权限范围与当前环境要求；不要使用第三方安装包或猜测命令。
-2. 能通过终端或当前 Proma 设置完成的步骤直接执行；需要用户登录、授权或确认时，在对应步骤停下来让我操作。
+2. 能通过终端或当前 DutyDeck 设置完成的步骤直接执行；需要用户登录、授权或确认时，在对应步骤停下来让我操作。
 3. CLI 的 token、cookie、OAuth code 和其他敏感信息交给 CLI 自己的安全存储，不写入工作区 mcp.json、AGENTS.md、日志或普通项目文件。
 4. 完成后使用官方 CLI 的 status/check 命令验证；不要把 CLI 伪装成 MCP 服务器。
 5. 如果官方能力或权限不足，说明已核验事实和下一步，不要只返回链接。${CLI_CONNECTION_ACCEPTANCE_INSTRUCTION}`
 
-const providerSetupPrompt = (name: string, setupUrl: string, authentication: string): string => `请帮我为当前 Proma 工作区配置「${name}」。
+const providerSetupPrompt = (name: string, setupUrl: string, authentication: string): string => `请帮我为当前 DutyDeck 工作区配置「${name}」。
 
 官方入口：${setupUrl}
 认证方式线索：${authentication}
@@ -181,7 +181,7 @@ const providerSetupPrompt = (name: string, setupUrl: string, authentication: str
 执行要求：
 1. 先通过公开官方文档核验 MCP server URL、transport、所需 scope/权限和认证字段；不要猜测或使用非官方 endpoint。
 2. 若可得到可用 MCP 配置，将非敏感 transport 配置写入当前工作区的 mcp.json；不要覆盖已有同名服务器。
-3. 不要把 API Key、AppSecret、Cookie、OAuth code 或 access token 写入 mcp.json、AGENTS.md、日志或普通项目文件。需要用户在 Proma 设置中输入敏感值时，明确说明字段名与来源页面。
+3. 不要把 API Key、AppSecret、Cookie、OAuth code 或 access token 写入 mcp.json、AGENTS.md、日志或普通项目文件。需要用户在 DutyDeck 设置中输入敏感值时，明确说明字段名与来源页面。
 4. 若官方接入要求企业应用审核、管理员授权、桌面客户端登录或没有公开的 MCP 合约，停止在安全步骤处，说明已核验的事实、缺失条件和用户需要完成的操作。
 5. 完成后测试 MCP 连接；仅在测试成功时启用。${MCP_CREDENTIAL_SETUP_INSTRUCTION}${GUIDED_CONNECTION_ACCEPTANCE_INSTRUCTION}`
 
@@ -193,23 +193,23 @@ export function buildCatalogMcpGuidePrompt(integration: CatalogMcpIntegration): 
 MCP URL：${mcpUrl}
 
 执行要求：
-1. 这是尚未实现 Proma 内置 OAuth 的远程 MCP；不要打开手动 MCP 编辑抽屉，也不要只给我一个网页链接。
+1. 这是尚未实现 DutyDeck 内置 OAuth 的远程 MCP；不要打开手动 MCP 编辑抽屉，也不要只给我一个网页链接。
 2. 先按官方文档核验认证、scope、权限和当前客户端兼容性。
-3. 需要用户登录或授权时，使用 Proma 内置浏览器打开官方页面，让用户自行完成登录、授权或获取凭据；不要代替用户输入密码、验证码，也不要读取或导出 Cookie、浏览器登录态或其他凭据。
-4. 用户从官方页面取得 API Key、Access Token、授权码或其他必要配置值后，请让用户发送到当前 Agent 对话，再继续完成配置；只将其用于本次配置，优先写入 Proma/系统安全凭据存储，不要在回复、日志、AGENTS.md、mcp.json 或其他普通项目文件中回显或保存。
+3. 需要用户登录或授权时，使用 DutyDeck 内置浏览器打开官方页面，让用户自行完成登录、授权或获取凭据；不要代替用户输入密码、验证码，也不要读取或导出 Cookie、浏览器登录态或其他凭据。
+4. 用户从官方页面取得 API Key、Access Token、授权码或其他必要配置值后，请让用户发送到当前 Agent 对话，再继续完成配置；只将其用于本次配置，优先写入 DutyDeck/系统安全凭据存储，不要在回复、日志、AGENTS.md、mcp.json 或其他普通项目文件中回显或保存。
 5. 只有完成官方认证和实际连接验证后，才写入非敏感 transport 配置并启用。${MCP_CREDENTIAL_SETUP_INSTRUCTION}`
 }
 
 const tongdaxinVipPrompt = `请帮我配置和使用「通达信」。
 
-第一步：使用 Proma 内置浏览器打开 https://vip.tdx.com.cn/site/app/pc-mall/main.html#/page_product_mcp；不要打开手动 MCP 编辑弹窗，也不要切换到外部浏览器。
+第一步：使用 DutyDeck 内置浏览器打开 https://vip.tdx.com.cn/site/app/pc-mall/main.html#/page_product_mcp；不要打开手动 MCP 编辑弹窗，也不要切换到外部浏览器。
 
 用户操作：请引导我在该网站完成注册或登录。登录完成后，基于页面和官方公开文档继续指导我找到可用的正式产品、授权入口或 MCP/Agent 接入方式。
 
 执行要求：
 1. 不要尝试读取、导出或要求我粘贴 Cookie、密码、验证码、token 或其他登录态。
 2. 先核验是否存在通达信官方 MCP、CLI 或 API 契约，以及对应的权限、套餐和账户要求；不要猜测 endpoint 或安装命令。
-3. 能在当前 Proma 环境完成的非敏感步骤直接执行；需要我的确认、付费订阅、实名或额外授权时清楚说明并停下。
+3. 能在当前 DutyDeck 环境完成的非敏感步骤直接执行；需要我的确认、付费订阅、实名或额外授权时清楚说明并停下。
 4. 不要把敏感信息写入 mcp.json、AGENTS.md、日志或普通项目文件。
 5. 完成后说明已验证的接入状态、可使用能力与后续操作。${MCP_CREDENTIAL_SETUP_INSTRUCTION}${GUIDED_CONNECTION_ACCEPTANCE_INSTRUCTION}`
 
@@ -310,7 +310,7 @@ export const MCP_INTEGRATION_CATALOG: CatalogIntegration[] = [
     credential: {
       label: 'Exa API Key',
       placeholder: '粘贴 Exa API Key',
-      helpText: '仅需填写 API Key。Proma 会加密保存到系统 Keychain，并通过 x-api-key 请求头连接 Exa 官方远程 MCP。',
+      helpText: '仅需填写 API Key。DutyDeck 会加密保存到系统 Keychain，并通过 x-api-key 请求头连接 Exa 官方远程 MCP。',
       acquisitionUrl: 'https://dashboard.exa.ai/api-keys',
       acquisitionLabel: '打开 Exa API Console',
       headerName: 'x-api-key',
@@ -327,7 +327,7 @@ export const MCP_INTEGRATION_CATALOG: CatalogIntegration[] = [
     credential: {
       label: 'Brave Search API Key',
       placeholder: '粘贴 Brave Search API Key',
-      helpText: '仅需填写 API Key。Proma 会加密保存到系统 Keychain，并仅在启动 Brave MCP 时作为 BRAVE_API_KEY 注入。',
+      helpText: '仅需填写 API Key。DutyDeck 会加密保存到系统 Keychain，并仅在启动 Brave MCP 时作为 BRAVE_API_KEY 注入。',
       acquisitionUrl: 'https://api-dashboard.search.brave.com/app/keys',
       acquisitionLabel: '打开 Brave Search API Console',
       headerName: '',
@@ -345,7 +345,7 @@ export const MCP_INTEGRATION_CATALOG: CatalogIntegration[] = [
     credential: {
       label: 'Tavily API Key',
       placeholder: '粘贴 Tavily API Key',
-      helpText: '仅需填写 API Key。Proma 会加密保存到系统 Keychain，并通过 Authorization 请求头连接 Tavily 官方远程 MCP。',
+      helpText: '仅需填写 API Key。DutyDeck 会加密保存到系统 Keychain，并通过 Authorization 请求头连接 Tavily 官方远程 MCP。',
       acquisitionUrl: 'https://app.tavily.com/home',
       acquisitionLabel: '打开 Tavily API Console',
       headerName: 'Authorization',
@@ -363,7 +363,7 @@ export const MCP_INTEGRATION_CATALOG: CatalogIntegration[] = [
     credential: {
       label: 'MCP Token',
       placeholder: '粘贴当前腾讯文档空间的 MCP Token',
-      helpText: '在当前空间右上角「≡ → 使用 MCP → 获取 MCP token」复制。Proma 将原样作为 Authorization 请求头保存到系统 Keychain，不会添加 Bearer 前缀。',
+      helpText: '在当前空间右上角「≡ → 使用 MCP → 获取 MCP token」复制。DutyDeck 将原样作为 Authorization 请求头保存到系统 Keychain，不会添加 Bearer 前缀。',
       acquisitionUrl: 'https://docs.qq.com/open/document/mcp/get-token',
       acquisitionLabel: '打开腾讯文档官方 Token 获取说明',
       headerName: 'Authorization',

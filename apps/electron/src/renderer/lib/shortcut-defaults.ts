@@ -80,7 +80,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'zoom-in',
     name: '放大界面',
-    description: '提高 Proma 界面的缩放比例',
+    description: '提高 DutyDeck 界面的缩放比例',
     defaultMac: 'Cmd+Plus',
     defaultWin: 'Ctrl+Plus',
     category: 'app',
@@ -89,7 +89,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'zoom-out',
     name: '缩小界面',
-    description: '降低 Proma 界面的缩放比例',
+    description: '降低 DutyDeck 界面的缩放比例',
     defaultMac: 'Cmd+Minus',
     defaultWin: 'Ctrl+Minus',
     category: 'app',
@@ -98,7 +98,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'reset-zoom',
     name: '重置界面缩放',
-    description: '恢复 Proma 界面的默认缩放比例',
+    description: '恢复 DutyDeck 界面的默认缩放比例',
     defaultMac: 'Cmd+0',
     defaultWin: 'Ctrl+0',
     category: 'app',
@@ -212,7 +212,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'show-main-window',
     name: '显示主窗口',
-    description: '显示并聚焦 Proma 主窗口',
+    description: '显示并聚焦 DutyDeck 主窗口',
     defaultMac: 'Cmd+Shift+P',
     defaultWin: 'Ctrl+Shift+P',
     category: 'global',

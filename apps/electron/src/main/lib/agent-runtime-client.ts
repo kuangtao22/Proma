@@ -241,7 +241,7 @@ export class AgentRuntimeClient {
       () => {
         /** 当前启动尝试创建的 utility process。 */
         const child = utilityProcess.fork(this.entryPath, [], {
-          serviceName: 'Proma Runtime',
+          serviceName: 'DutyDeck Runtime',
           env: { ...process.env, ...this.env, PROMA_AGENT_SESSION_ID: this.sessionId },
         })
         runtimeLifecycle = createUtilityProcessLifecycle(child, { exitTimeoutMs: this.startupTimeoutMs })

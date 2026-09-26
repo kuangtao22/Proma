@@ -11,7 +11,7 @@ export function PlanningWindowApp(): React.ReactElement {
   const automationFormOpen = useAtomValue(automationFormAtom).open
 
   useEffect(() => {
-    document.title = 'Proma · 规划中心'
+    document.title = 'DutyDeck · 规划中心'
   }, [])
 
   return (

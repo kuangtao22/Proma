@@ -15,7 +15,7 @@ export function configurePlanningQuickEntries(actions: PlanningQuickEntryActions
     app.dock.setMenu(Menu.buildFromTemplate([
       { label: '打开任务/日程', click: actions.showPlanningWindow },
       { type: 'separator' },
-      { label: '打开 Proma', click: actions.showMainWindow },
+      { label: '打开 DutyDeck', click: actions.showMainWindow },
     ]))
   }
 
@@ -27,7 +27,7 @@ export function configurePlanningQuickEntries(actions: PlanningQuickEntryActions
         iconPath: process.execPath,
         iconIndex: 0,
         title: '任务/日程',
-        description: '打开 Proma 的任务、日程与定时任务中心',
+        description: '打开 DutyDeck 的任务、日程与定时任务中心',
       },
     ])
   }

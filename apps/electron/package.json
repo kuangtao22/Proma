@@ -1,7 +1,7 @@
 {
   "name": "@proma/electron",
   "version": "0.19.53-bone.10",
-  "description": "Proma，为专业用户设计的 Agent - Electron App",
+  "description": "DutyDeck，为专业用户设计的 Agent - Electron App",
   "homepage": "https://github.com/kuangtao22/Proma",
   "main": "dist/main.cjs",
   "author": {
@@ -47,7 +47,7 @@
     "package:prepare:win": "bun run build && bun run build:mobile && bun run rebuild:node-pty && bun install --frozen-lockfile --os=win32 --cpu=x64 && bun run sync:runtime-deps --target-platform=win32 --target-arch=x64",
     "start": "bun run build && bunx electron .",
     "typecheck": "tsc --noEmit",
-    "generate:icons": "cd resources && ./generate-icons.sh",
+    "generate:icons": "bun run scripts/generate-brand-icons.ts",
     "builder": "bunx electron-builder@25.1.8",
     "pack": "bun run package:prepare && bun run builder --dir",
     "dist": "bun run package:prepare && bun run builder",

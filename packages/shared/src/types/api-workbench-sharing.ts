@@ -139,7 +139,7 @@ export function parseApiCatalogSnapshot(text: string): ApiCatalogSnapshot {
   if (Object.keys(record).some((key) => !['kind', 'version', 'exportedAt', 'catalog'].includes(key))) {
     return invalidImport('包含未知字段')
   }
-  if (record.kind !== API_CATALOG_SNAPSHOT_KIND) return invalidImport('不是 Proma 接口集合快照')
+  if (record.kind !== API_CATALOG_SNAPSHOT_KIND) return invalidImport('不是 DutyDeck 接口集合快照')
   if (record.version !== 1) return invalidImport('快照版本不受支持')
   const exportedAt = record.exportedAt
   if (typeof exportedAt !== 'number' || !Number.isSafeInteger(exportedAt) || exportedAt < 0) {

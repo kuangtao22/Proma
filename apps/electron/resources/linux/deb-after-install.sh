@@ -6,14 +6,14 @@
 # 不会将应用静默降级为 --no-sandbox。
 set -eu
 
-APP_DIR="/opt/Proma"
+APP_DIR="/opt/DutyDeck"
 SANDBOX="$APP_DIR/chrome-sandbox"
 
 if [ -f "$SANDBOX" ]; then
   chown root:root "$SANDBOX"
   chmod 4755 "$SANDBOX"
 else
-  echo "[Proma] 未找到 chrome-sandbox：$SANDBOX" >&2
+  echo "[DutyDeck] 未找到 chrome-sandbox：$SANDBOX" >&2
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then

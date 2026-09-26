@@ -113,7 +113,7 @@ export function ServerOpsConnectDialog({
           )}
           {host?.authMethod === 'ssh-agent' && (
             <div className="rounded-lg bg-muted/40 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
-              将使用系统 SSH Agent 中已加载的密钥。Proma 不读取或保存私钥。
+              将使用系统 SSH Agent 中已加载的密钥。DutyDeck 不读取或保存私钥。
             </div>
           )}
           {host?.authMethod !== 'ssh-agent' && (

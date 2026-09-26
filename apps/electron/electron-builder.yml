@@ -2,7 +2,7 @@
 # 文档: https://www.electron.build/configuration/configuration
 
 appId: com.bone.proma.app
-productName: Proma
+productName: DutyDeck
 copyright: Copyright © 2024-2026 Erlich Liu
 
 # Bone 使用预发布 SemVer，但所有构建仍发布到统一更新频道。
@@ -92,7 +92,12 @@ extraResources:
     to: default-skills
     filter:
       - "**/*"
-  # Proma 品牌 Logo 素材（品牌素材下载功能使用）
+  # 托盘图标（DutyDeck 品牌标记，Template 图标）
+  - from: resources/dutydeck-logos
+    to: dutydeck-logos
+    filter:
+      - "**/*"
+  # 上游 Proma 品牌 Logo 素材（Dock 图标变体与机器人头像功能仍在使用，待替换）
   - from: resources/proma-logos
     to: proma-logos
     filter:
@@ -115,14 +120,14 @@ extraResources:
 # macOS 配置
 # ============================================
 mac:
-  artifactName: "Proma-${version}-macos-${arch}.${ext}"
+  artifactName: "DutyDeck-${version}-macos-${arch}.${ext}"
   category: public.app-category.developer-tools
   icon: resources/icon.icns
   # Swift/AppKit 原生灵动岛宿主；须显式标记为需签名的额外二进制。
   extraResources:
     - from: resources/agent-island/macos-agent-island-helper
       to: agent-island/macos-agent-island-helper
-    # EventKit N-API bridge 在 Electron main 进程内执行，确保 TCC 归属 Proma.app。
+    # EventKit N-API bridge 在 Electron main 进程内执行，确保 TCC 归属 DutyDeck.app。
     - from: resources/eventkit/macos-eventkit.node
       to: eventkit/macos-eventkit.node
   binaries:
@@ -136,9 +141,9 @@ mac:
   entitlements: resources/entitlements.mac.plist
   entitlementsInherit: resources/entitlements.mac.plist
   extendInfo:
-    NSMicrophoneUsageDescription: "Proma 需要访问麦克风，用于将你的语音实时转写为文本。"
-    NSCalendarsFullAccessUsageDescription: "Proma 需要访问你的日历，以显示、创建和同步你选择的日程。"
-    NSRemindersFullAccessUsageDescription: "Proma 需要访问你的提醒事项，以同步 Todo 和你选择的列表。"
+    NSMicrophoneUsageDescription: "DutyDeck 需要访问麦克风，用于将你的语音实时转写为文本。"
+    NSCalendarsFullAccessUsageDescription: "DutyDeck 需要访问你的日历，以显示、创建和同步你选择的日程。"
+    NSRemindersFullAccessUsageDescription: "DutyDeck 需要访问你的提醒事项，以同步 Todo 和你选择的列表。"
   # 架构由 CLI 参数控制（CI 矩阵分别传 --arm64 / --x64），
   # 每个 runner 只构建其宿主架构对应的产物，与 bun 按 os/cpu 装好的
   # 每个 runner 只构建其宿主架构对应的产物。
@@ -163,7 +168,7 @@ dmg:
 # Windows 配置
 # ============================================
 win:
-  artifactName: "Proma-${version}-windows-${arch}.${ext}"
+  artifactName: "DutyDeck-${version}-windows-${arch}.${ext}"
   icon: resources/icon.ico
   target:
     - target: nsis
@@ -183,14 +188,14 @@ nsis:
 # Linux 配置（Ubuntu/Debian x86_64）
 # ============================================
 linux:
-  artifactName: "Proma-${version}-linux-${arch}.${ext}"
+  artifactName: "DutyDeck-${version}-linux-${arch}.${ext}"
   icon: resources/icon.png
-  executableName: proma
+  executableName: dutydeck
   desktop:
-    StartupWMClass: proma
+    StartupWMClass: dutydeck
   category: Development
   synopsis: 本地优先的 AI 桌面 Agent
-  description: Proma 把多模型 Chat、通用 Agent、工作区、Skills、MCP 与记忆能力放进同一个开源客户端，数据和配置默认留在本地（~/.proma/）。
+  description: DutyDeck 把多模型 Chat、通用 Agent、工作区、Skills、MCP 与记忆能力放进同一个开源客户端，数据和配置默认留在本地（~/.proma/）。
   maintainer: ErlichLiu <erlichliu@gmail.com>
   target:
     - target: AppImage
@@ -202,13 +207,13 @@ linux:
 
 # electron-builder 25 对 AppImage 默认使用 --no-sandbox，这是 AppImage
 # 挂载文件系统无法可靠提供 SUID sandbox 的已知限制。deb 不继承该参数，
-# 而是通过 afterInstall 尝试配置 /opt/Proma/chrome-sandbox。
+# 而是通过 afterInstall 尝试配置 /opt/DutyDeck/chrome-sandbox。
 appImage:
   executableArgs:
     - --no-sandbox
 
 deb:
-  packageName: proma
+  packageName: dutydeck
   afterInstall: resources/linux/deb-after-install.sh
   # 以 Ubuntu 22.04 为首个支持目标；显式声明，避免 electron-builder 的历史默认
   # 依赖（如已废弃的 gconf2/libappindicator1）进入新包。
@@ -227,7 +232,7 @@ deb:
     - libxkbcommon0
     - libxrandr2
     - libxss1
-  artifactName: proma_${version}_${arch}.${ext}
+  artifactName: dutydeck_${version}_${arch}.${ext}
 
 # ============================================
 # 发布配置

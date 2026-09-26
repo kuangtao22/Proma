@@ -105,7 +105,7 @@ const SHORTCUTS_TAB: TabItem = {
 };
 const ONBOARDING_TAB: TabItem = {
   id: "onboarding",
-  label: "Proma 新手引导",
+  label: "DutyDeck 新手引导",
   icon: <GraduationCap size={16} />,
 };
 const VOICE_INPUT_TAB: TabItem = {

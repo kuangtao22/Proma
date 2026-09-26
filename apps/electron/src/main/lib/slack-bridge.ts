@@ -176,7 +176,7 @@ export class SlackBridge {
       await this.expireInteraction(interaction.requestId, 'Slack Bot 已停止或重启')
     }
     for (const run of activeRuns) {
-      const text = '⚠️ Slack Bot 已停止或重启，本次任务已取消。请重新 @mention Proma 发起任务。'
+      const text = '⚠️ Slack Bot 已停止或重启，本次任务已取消。请重新 @mention DutyDeck 发起任务。'
       const clientMessageId = run.responseTs ? undefined : randomUUID()
       this.deliveryStore.update(run.eventId, {
         status: 'final-ready',
@@ -260,7 +260,7 @@ export class SlackBridge {
       const message = redactSensitiveLogText(error instanceof Error ? error.message : String(error))
       console.error(`[Slack Bridge/${this.botConfig.name}] 接收消息失败:`, redactSensitiveLogValue(error))
       this.deliveryStore.update(incoming.eventId, { status: 'failed', errorMessage: message })
-      void this.sendPlain(incoming.channelId, incoming.threadTs ?? incoming.ts, `⚠️ Proma 无法启动此任务：${message}`)
+      void this.sendPlain(incoming.channelId, incoming.threadTs ?? incoming.ts, `⚠️ DutyDeck 无法启动此任务：${message}`)
     })
   }
 
@@ -320,12 +320,12 @@ export class SlackBridge {
         permissionModeOverride: 'plan',
       }, {
         source: 'slack',
-        onError: (error) => { void this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${error}`) },
+        onError: (error) => { void this.finalizeRun(binding.sessionId, `⚠️ DutyDeck 运行失败：${error}`) },
         onComplete: () => { void this.finalizeRun(binding.sessionId) },
         onTitleUpdated: () => {},
       })
     } catch (error) {
-      await this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${redactSensitiveLogText(error instanceof Error ? error.message : String(error))}`)
+      await this.finalizeRun(binding.sessionId, `⚠️ DutyDeck 运行失败：${redactSensitiveLogText(error instanceof Error ? error.message : String(error))}`)
     }
   }
 
@@ -337,7 +337,7 @@ export class SlackBridge {
         || (payload.event.type === 'external_run_started' && payload.event.source !== 'slack'))) {
       if (this.botConfig.homeChannelId) {
         const session = getAgentSessionMeta(sessionId)
-        this.homeRuns.set(sessionId, { sessionId, title: session?.title ?? `Proma 会话 ${sessionId.slice(0, 8)}` })
+        this.homeRuns.set(sessionId, { sessionId, title: session?.title ?? `DutyDeck 会话 ${sessionId.slice(0, 8)}` })
       }
       return
     }
@@ -410,7 +410,7 @@ export class SlackBridge {
     run.finalized = true
     if (run.updateTimer) clearTimeout(run.updateTimer)
 
-    const text = forcedText ?? (run.finalText.trim() || run.partialText.trim() || 'Proma 已完成，但没有可显示的文本结果。')
+    const text = forcedText ?? (run.finalText.trim() || run.partialText.trim() || 'DutyDeck 已完成，但没有可显示的文本结果。')
     const clientMessageId = run.responseTs ? undefined : randomUUID()
     this.deliveryStore.update(run.eventId, {
       status: 'final-ready',
@@ -465,7 +465,7 @@ export class SlackBridge {
   }
 
   private async recoverPendingDeliveries(): Promise<void> {
-    const interruption = '⚠️ Proma 在任务完成前重启，因此无法可靠恢复本次执行。请重新 @mention Proma 发起任务。'
+    const interruption = '⚠️ DutyDeck 在任务完成前重启，因此无法可靠恢复本次执行。请重新 @mention DutyDeck 发起任务。'
     for (const record of this.deliveryStore.interruptedRuns()) {
       this.deliveryStore.update(record.eventId, { status: 'final-ready', finalText: interruption })
     }
@@ -489,7 +489,7 @@ export class SlackBridge {
     })
     const rendered = buildAskUserBlocks(request)
     if (!await this.postInteractive(run.binding, rendered.text, rendered.blocks)) {
-      await this.expireInteraction(request.requestId, '无法将问题发送到 Slack，请在 Proma 桌面端继续')
+      await this.expireInteraction(request.requestId, '无法将问题发送到 Slack，请在 DutyDeck 桌面端继续')
     }
   }
 
@@ -506,7 +506,7 @@ export class SlackBridge {
     })
     const rendered = buildPlanApprovalBlocks(request)
     if (!await this.postInteractive(run.binding, rendered.text, rendered.blocks)) {
-      await this.expireInteraction(request.requestId, '无法将计划审批发送到 Slack，请在 Proma 桌面端继续')
+      await this.expireInteraction(request.requestId, '无法将计划审批发送到 Slack，请在 DutyDeck 桌面端继续')
     }
   }
 
@@ -523,7 +523,7 @@ export class SlackBridge {
     })
     const rendered = buildPermissionBlocks(request)
     if (!await this.postInteractive(run.binding, rendered.text, rendered.blocks)) {
-      await this.expireInteraction(request.requestId, '无法将授权请求发送到 Slack，请在 Proma 桌面端继续')
+      await this.expireInteraction(request.requestId, '无法将授权请求发送到 Slack，请在 DutyDeck 桌面端继续')
     }
   }
 
@@ -559,7 +559,7 @@ export class SlackBridge {
       const sessionId = permissionService.respondToPermission(requestId, 'deny', false)
       if (sessionId) agentEventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'permission_resolved', requestId, behavior: 'deny' } })
     }
-    await this.sendPlain(interaction.channelId, interaction.threadTs, `Proma 已取消等待：${reason}`)
+    await this.sendPlain(interaction.channelId, interaction.threadTs, `DutyDeck 已取消等待：${reason}`)
   }
 
   private async handleAction(body: SlackActionBody): Promise<void> {
@@ -641,7 +641,7 @@ export class SlackBridge {
     const settings = getSettings()
     const workspaceId = settings.agentWorkspaceId
     if (!workspaceId || !getAgentWorkspace(workspaceId)) {
-      throw new Error('请先在 Proma 设置中选择有效的默认项目')
+      throw new Error('请先在 DutyDeck 设置中选择有效的默认项目')
     }
     const channelIdForModel = this.botConfig.defaultChannelId ?? settings.agentChannelId ?? ''
     // 使用默认标题，让首条 Slack 消息走 Agent 编排器的统一自动命名流程，
@@ -704,7 +704,7 @@ export class SlackBridge {
       const response = await client.chat.postMessage({
         channel: binding.channelId,
         thread_ts: binding.rootThreadTs,
-        text: 'Proma 正在规划…',
+        text: 'DutyDeck 正在规划…',
       })
       return typeof response.ts === 'string' ? response.ts : undefined
     } catch (error) {
@@ -719,8 +719,8 @@ export class SlackBridge {
     if (!client || !channel) return
     // Home Channel is a status surface, not an export of private session content.
     const summary = stoppedByUser
-      ? `Proma 桌面会话已停止：${run.title}`
-      : `Proma 桌面会话已完成：${run.title}`
+      ? `DutyDeck 桌面会话已停止：${run.title}`
+      : `DutyDeck 桌面会话已完成：${run.title}`
     const rendered = renderSlackMessage(summary)
     try {
       await client.chat.postMessage({ channel, text: rendered.text, blocks: rendered.blocks as never })

@@ -14,3 +14,12 @@ export const PROMA_OFFICIAL_RELEASE_REPOSITORY = {
   repo: 'Proma',
   webUrl: 'https://github.com/proma-ai/Proma',
 } as const
+
+/**
+ * 已**完整合入**的上游内容基线（不是 package.json 里的版本号）。
+ *
+ * 版本号只表达 SemVer：本地版本可能写着 0.19.53，但完整合入的上游内容停在 0.19.31，
+ * 其后的官方改动是按需挑选移植的。合入新的官方版本时必须同步更新这个常量，
+ * 否则「关于」页会对用户给出错误的上游进度。
+ */
+export const UPSTREAM_CONTENT_BASELINE = 'v0.19.31（2026-09-05）'

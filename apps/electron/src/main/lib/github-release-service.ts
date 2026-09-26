@@ -95,7 +95,7 @@ async function fetchFromGitHub<T>(
   const response = await fetch(url, {
     headers: {
       'Accept': 'application/vnd.github+json',
-      'User-Agent': 'Proma-Desktop-App',
+      'User-Agent': 'DutyDeck-Desktop-App',
     },
   })
 

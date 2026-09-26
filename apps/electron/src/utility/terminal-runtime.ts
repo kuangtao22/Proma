@@ -188,7 +188,7 @@ function flushOutput(terminalId: string): void {
   if (terminal.inFlight) return
   if (!terminal.output && terminal.droppedOutputChars === 0) return
   const lossMarker = terminal.droppedOutputChars > 0
-    ? `\r\n\x1b[33m[Proma：终端输出过快，已丢弃 ${terminal.droppedOutputChars} 个字符]\x1b[0m\r\n`
+    ? `\r\n\x1b[33m[DutyDeck：终端输出过快，已丢弃 ${terminal.droppedOutputChars} 个字符]\x1b[0m\r\n`
     : ''
   const data = terminal.output + lossMarker
   terminal.output = ''

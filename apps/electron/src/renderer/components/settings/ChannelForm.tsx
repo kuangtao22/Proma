@@ -1013,7 +1013,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                     <CheckCircle2 size={12} className="shrink-0" />
                     <span>已登录 ChatGPT 订阅{codexCredentials?.accountId ? `（账号 ${codexCredentials.accountId.slice(0, 8)}…）` : ''}</span>
                   </div>
-                ) : <div className="text-xs text-muted-foreground">Proma 会代理 token 请求；系统浏览器授权页仍需使用可访问 OpenAI 的网络。可改用设备码并在另一台设备完成授权。</div>}
+                ) : <div className="text-xs text-muted-foreground">DutyDeck 会代理 token 请求；系统浏览器授权页仍需使用可访问 OpenAI 的网络。可改用设备码并在另一台设备完成授权。</div>}
               </div>
             ) : isXaiProvider ? (
               <div className="space-y-2">
@@ -1047,7 +1047,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                     <CheckCircle2 size={12} className="shrink-0" />
                     <span>已登录 xAI（Grok）订阅</span>
                   </div>
-                ) : <div className="text-xs text-muted-foreground">Proma 会代理设备码与 token 请求；授权页由系统浏览器打开。若浏览器无可用代理，可扫码在另一台设备完成授权。</div>}
+                ) : <div className="text-xs text-muted-foreground">DutyDeck 会代理设备码与 token 请求；授权页由系统浏览器打开。若浏览器无可用代理，可扫码在另一台设备完成授权。</div>}
               </div>
             ) : isZhipuTeamProvider ? (
               <div className="space-y-2">
@@ -1329,19 +1329,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
               <div className="space-y-2">
                 <p>该地址并非当前供应商的官方默认 Base URL。中转站可能存在篡改对话内容和模型响应，存在中间人攻击、凭据泄露与隐私风险。</p>
                 <p>其协议适配也可能导致上下文窗口、工具调用、多模态或流式内容显示异常。请仅使用你信赖的服务，并先用非敏感内容测试。</p>
-                <p>Proma 仅作为本地 Agent 执行环境：配置、会话等本地数据均存储在你的设备上，Proma 本身不会额外构成数据风险。</p>
-                <p>
-                  如你正在寻求更好的选择，欢迎使用{' '}
-                  <a
-                    href="https://proma.cool/download"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-                  >
-                    Proma 商业版
-                  </a>
-                  ：提供安全、稳定、优惠的内置模型选择，保证更好的体验，同时保留你自由配置第三方渠道的权利。
-                </p>
+                <p>DutyDeck 仅作为本地 Agent 执行环境：配置、会话等本地数据都存储在你的设备上，客户端本身不会额外引入数据风险。</p>
               </div>
             </AlertDialogDescription>
           </AlertDialogHeader>

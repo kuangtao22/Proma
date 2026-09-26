@@ -43,7 +43,7 @@ export function FaqDialog(): React.ReactElement {
           {/* 头部 */}
           <div className="flex items-center justify-between border-b border-neutral-200 px-5 py-3.5 dark:border-neutral-800">
             <div className="flex items-center gap-2.5">
-              <HelpCircle className="size-4 text-[#1b3f2d]" />
+              <HelpCircle className="size-4 text-[#151515]" />
               <h2 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">常见问题</h2>
             </div>
             <DialogPrimitive.Close asChild>
@@ -71,9 +71,9 @@ export function FaqDialog(): React.ReactElement {
                   <button
                     key={group.topic}
                     onClick={() => scrollToGroup(group.topic)}
-                    className="flex w-full items-center gap-2 rounded-sm px-2.5 py-2 text-left text-[13px] text-neutral-600 transition-colors hover:bg-[#1b3f2d]/5 hover:text-[#1b3f2d] dark:text-neutral-400 dark:hover:text-[#27513a]"
+                    className="flex w-full items-center gap-2 rounded-sm px-2.5 py-2 text-left text-[13px] text-neutral-600 transition-colors hover:bg-[#151515]/5 hover:text-[#151515] dark:text-neutral-400 dark:hover:text-[#2e2e2e]"
                   >
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#1b3f2d]/40" />
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#151515]/40" />
                     {group.topic}
                   </button>
                 ))}
@@ -96,7 +96,7 @@ export function FaqDialog(): React.ReactElement {
                     <div className="divide-y divide-neutral-100 dark:divide-neutral-800">
                       {group.items.map((item) => (
                         <article key={item.q} className="py-3">
-                          <h4 className="text-[13px] font-semibold leading-snug text-[#1b3f2d] dark:text-[#27513a]">
+                          <h4 className="text-[13px] font-semibold leading-snug text-[#151515] dark:text-[#2e2e2e]">
                             {item.q}
                           </h4>
                           <p className="mt-1.5 text-[13px] leading-6 text-neutral-600 dark:text-neutral-400">

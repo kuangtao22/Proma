@@ -112,7 +112,7 @@ export function ensurePromaDataRootMarker(root: string, verifyDirectory?: () => 
   /** 写入前的身份结果，决定直接接受、升级或拒绝。 */
   const identity = inspectPromaDataRootIdentity(root)
   if (identity === 'marker') return
-  if (identity === null) throw new Error('所选目录不是可识别的 Proma 数据根')
+  if (identity === null) throw new Error('所选目录不是可识别的 DutyDeck 数据根')
   writeAndVerifyPromaDataRootMarker(root, verifyDirectory)
 }
 
@@ -160,7 +160,7 @@ export function prepareNormalDataRoot(
     writeAndVerifyPromaDataRootMarker(activeRoot)
     return activeRoot
   }
-  throw new Error('所选目录不是可识别的 Proma 数据根')
+  throw new Error('所选目录不是可识别的 DutyDeck 数据根')
 }
 
 /** 原子写入唯一合法 marker，并通过同一 no-follow 读取链精确复验。 */
@@ -172,7 +172,7 @@ function writeAndVerifyPromaDataRootMarker(root: string, verifyDirectory?: () =>
   writeJsonFileAtomicSecure(markerPath, PROMA_DATA_ROOT_MARKER, { beforeRename: verifyDirectory })
   verifyDirectory?.()
   if (inspectPromaDataRootIdentity(root) !== 'marker') {
-    throw new Error('Proma 数据根标记写入后校验失败')
+    throw new Error('DutyDeck 数据根标记写入后校验失败')
   }
 }
 

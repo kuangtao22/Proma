@@ -87,7 +87,7 @@ export function ServerOpsCredentialFields({
     return (
       <div className="flex items-start gap-2 border-y border-border py-3 text-xs leading-5 text-muted-foreground">
         <KeyRound className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-        <span>将使用系统 SSH Agent 中已加载的密钥，Proma 不读取或保存私钥。</span>
+        <span>将使用系统 SSH Agent 中已加载的密钥，DutyDeck 不读取或保存私钥。</span>
       </div>
     )
   }

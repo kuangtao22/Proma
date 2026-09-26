@@ -30,20 +30,20 @@
         StrCpy $upgradeDisplayVersion "未知版本"
       ${EndIf}
 
-      !insertmacro MUI_HEADER_TEXT "升级现有 Proma" "确认旧版本与本次安装位置"
+      !insertmacro MUI_HEADER_TEXT "升级现有 DutyDeck" "确认旧版本与本次安装位置"
       nsDialogs::Create 1018
       Pop $0
       ${If} $0 == error
         Abort
       ${EndIf}
 
-      ${NSD_CreateLabel} 0 0 100% 24u "检测到已安装版本：Proma $upgradeDisplayVersion"
+      ${NSD_CreateLabel} 0 0 100% 24u "检测到已安装版本：DutyDeck $upgradeDisplayVersion"
       Pop $1
       ${NSD_CreateLabel} 0 28u 100% 36u "旧安装位置：$upgradeInstallLocation"
       Pop $1
       ${NSD_CreateLabel} 0 68u 100% 36u "本次安装位置：$INSTDIR"
       Pop $1
-      ${NSD_CreateLabel} 0 112u 100% 42u "继续后将先卸载旧版本，保留本地业务数据与快捷方式，再安装 Proma ${VERSION}。"
+      ${NSD_CreateLabel} 0 112u 100% 42u "继续后将先卸载旧版本，保留本地业务数据与快捷方式，再安装 DutyDeck ${VERSION}。"
       Pop $1
 
       nsDialogs::Show

@@ -219,7 +219,7 @@ export function PromaLogoSettings(): React.ReactElement {
     <>
       <SettingsSection
         title="品牌 Logo"
-        description="下载 Proma Logo 用作机器人头像，让用户一眼认出你的 AI 助手"
+        description="下载 DutyDeck Logo 用作机器人头像，让用户一眼认出你的 AI 助手"
       >
         <div className="grid grid-cols-3 gap-4">
           {LOGO_VARIANTS.map((logo) => (

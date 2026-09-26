@@ -59,7 +59,7 @@ export function VisionRelaySettings(): React.ReactElement {
           </SettingsRow>
           <SettingsRow
             label="视觉模型"
-            description="选择已有渠道中的视觉模型。Proma 继续复用该渠道加密保存的 API Key。"
+            description="选择已有渠道中的视觉模型。DutyDeck 继续复用该渠道加密保存的 API Key。"
           >
             <ModelSelector
               externalSelectedModel={selectedModel}

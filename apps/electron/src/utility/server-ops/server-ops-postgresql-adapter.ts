@@ -294,7 +294,7 @@ export function createServerOpsPostgresqlClient(
     database: input.database ?? 'postgres',
     connectionTimeoutMillis: input.connectTimeoutMs,
     query_timeout: input.connectTimeoutMs,
-    application_name: 'Proma Server Ops',
+    application_name: 'DutyDeck Server Ops',
     client_encoding: 'UTF8',
     replication: 'false',
     sslnegotiation: 'postgres',

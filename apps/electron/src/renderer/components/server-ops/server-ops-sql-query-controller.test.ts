@@ -115,14 +115,14 @@ describe('SQL 查询控制器', () => {
   test('Given 查询前审计失败 When IPC 包裹错误 Then 明确尚未执行和对应处理方式', () => {
     /** Electron 会为稳定错误码添加通道上下文，提示仍须准确分类。 */
     const cases = [
-      ['SERVER_OPS_OTHER_INSTANCE_ACTIVE', '审计记录需要初始化或升级，请先退出其他 Proma 实例后重试；SQL 尚未执行'],
+      ['SERVER_OPS_OTHER_INSTANCE_ACTIVE', '审计记录需要初始化或升级，请先退出其他 DutyDeck 实例后重试；SQL 尚未执行'],
       ['SERVER_OPS_TRUST_BUSY', '运维配置正在准备，请稍后重试；SQL 尚未执行'],
       ['SERVER_OPS_CONFIG_BUSY', '运维配置正在写入，请稍后重试；SQL 尚未执行'],
-      ['SERVER_OPS_CONFIG_LOCK_UNAVAILABLE', '运维配置写锁不可用，请重启或更新 Proma 后重试；SQL 尚未执行'],
-      ['SERVER_OPS_CONFIG_OUTCOME_UNKNOWN', '审计写入状态无法确认，请稍后重试，若持续失败再重启 Proma；SQL 尚未执行'],
+      ['SERVER_OPS_CONFIG_LOCK_UNAVAILABLE', '运维配置写锁不可用，请重启或更新 DutyDeck 后重试；SQL 尚未执行'],
+      ['SERVER_OPS_CONFIG_OUTCOME_UNKNOWN', '审计写入状态无法确认，请稍后重试，若持续失败再重启 DutyDeck；SQL 尚未执行'],
       ['SERVER_OPS_AUDIT_READ_FAILED', '本地审计记录无法读取，需要检查审计文件；SQL 尚未执行'],
-      ['SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED', '本地审计记录尚未准备完成，请重启 Proma 后重试；SQL 尚未执行'],
-      ['SERVER_OPS_AUDIT_WRITE_FAILED', '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 Proma；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_SCHEMA_NOT_PREPARED', '本地审计记录尚未准备完成，请重启 DutyDeck 后重试；SQL 尚未执行'],
+      ['SERVER_OPS_AUDIT_WRITE_FAILED', '本地审计记录写入失败，请检查磁盘空间和配置目录权限后重启 DutyDeck；SQL 尚未执行'],
       ['SERVER_OPS_AUDIT_START_WRITE_FAILED', '无法记录查询审计，请检查本地运维配置后重试；SQL 尚未执行'],
     ] as const
     for (const [code, message] of cases) {

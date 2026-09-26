@@ -231,7 +231,7 @@ describe('接口工作台 UI 集成', () => {
 
   test('Given 主进程正在退出或需要重启 When 显示错误 Then 给出可行动提示而不是裸错误码', () => {
     expect(errorMessage(new Error('API_WORKBENCH_SHUTTING_DOWN'), '加载接口目录失败'))
-      .toBe('应用正在退出或需要重启客户端：请重启 Proma 后重试')
+      .toBe('应用正在退出或需要重启客户端：请重启 DutyDeck 后重试')
     /** 拒绝类错误的可行动原因在 Host 细节里，必须原样展示。 */
     expect(errorMessage(new Error('API_ACCESS_DENIED: 这是探索子会话；Agent 出网能力只在主会话开放'), '加载接口目录失败'))
       .toBe('这是探索子会话；Agent 出网能力只在主会话开放')

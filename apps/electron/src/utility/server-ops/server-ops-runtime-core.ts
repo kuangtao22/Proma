@@ -43,7 +43,7 @@ export function takeRuntimeOutput(
   if (state.inFlight || (!state.pending && state.droppedChars === 0)) return undefined
   /** 明示输出截断且不包含远程秘密的终端提示。 */
   const lossMarker = state.droppedChars > 0
-    ? `\r\n\x1b[33m[Proma：远程终端输出过快，已丢弃 ${state.droppedChars} 个字符]\x1b[0m\r\n`
+    ? `\r\n\x1b[33m[DutyDeck：远程终端输出过快，已丢弃 ${state.droppedChars} 个字符]\x1b[0m\r\n`
     : ''
   /** 当前可发送的完整批次。 */
   const event: ServerOpsTerminalOutputEvent = {
@@ -174,7 +174,7 @@ export function takeRuntimeLogOutput(state: ServerOpsRuntimeLogOutputState): Ser
   let lossMarker = ''
   if (reportedDroppedBytes > 0) {
     for (;;) {
-      lossMarker = `[Proma：日志输出过快，已丢弃 ${reportedDroppedBytes} 字节]\n`
+      lossMarker = `[DutyDeck：日志输出过快，已丢弃 ${reportedDroppedBytes} 字节]\n`
       /** 丢弃标记后可保留的真实日志字节数。 */
       const availableBytes = Math.max(0, state.maxBatchBytes - Buffer.byteLength(lossMarker, 'utf8'))
       /** 按最新标记长度重新计算的安全日志前缀。 */

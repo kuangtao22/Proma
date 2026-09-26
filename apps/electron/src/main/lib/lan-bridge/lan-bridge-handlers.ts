@@ -21,7 +21,7 @@ import type { LanBridgeConnectedPayload } from '@proma/shared'
 /** 构造 WebSocket 建连后的协议能力声明。 */
 export function createLanBridgeConnectedPayload(serverVersion: string): LanBridgeConnectedPayload {
   return {
-    message: 'Proma LAN Bridge',
+    message: 'DutyDeck LAN Bridge',
     protocolVersion: LAN_BRIDGE_PROTOCOL_VERSION,
     minProtocolVersion: LAN_BRIDGE_MIN_PROTOCOL_VERSION,
     maxProtocolVersion: LAN_BRIDGE_MAX_PROTOCOL_VERSION,

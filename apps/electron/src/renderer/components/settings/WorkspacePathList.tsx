@@ -391,7 +391,7 @@ function WorkspacePathDescription({
   return (
     <div className="max-w-[34rem] space-y-1">
       <div className="truncate font-mono text-xs" title={workspace.sourceRoot}>{workspace.sourceRoot}</div>
-      <div className="text-xs">{workspace.availability === 'available' ? (workspace.kind === 'managed' ? 'Proma 托管' : '外部目录') : '离线'}</div>
+      <div className="text-xs">{workspace.availability === 'available' ? (workspace.kind === 'managed' ? 'DutyDeck 托管' : '外部目录') : '离线'}</div>
       {progress ? <WorkspaceProgress progress={progress} /> : null}
     </div>
   )

@@ -851,7 +851,7 @@ export async function testChannel(channelId: string): Promise<ChannelTestResult>
       case 'google':
         return await testGoogle(channel.baseUrl, apiKey, proxyUrl)
       default:
-        return { success: false, message: `不支持的供应商: ${provider}。你可能过去使用的是 Proma 商业版，请重新下载商业版覆盖安装，当前版本为开源版本。` }
+        return { success: false, message: `不支持的供应商: ${provider}。该渠道来自上游商业版，当前版本无法使用；可在「设置 > 渠道」里清理掉。` }
     }
   } catch (error) {
     return normalizeRequestError(error)

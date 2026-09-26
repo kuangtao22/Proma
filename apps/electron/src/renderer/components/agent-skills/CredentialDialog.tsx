@@ -43,7 +43,7 @@ export function CredentialDialog({ integration, onOpenChange, onSave }: Credenti
             <DialogHeader className="space-y-2 text-left">
               <DialogTitle className="text-xl font-semibold">{integration.name} 授权</DialogTitle>
               <DialogDescription className="text-[15px] leading-6">
-                输入 {integration.name} 提供的 {integration.credential.label}，Proma 会加密保存在系统 Keychain 中，并为当前工作区建立连接。
+                输入 {integration.name} 提供的 {integration.credential.label}，DutyDeck 会加密保存在系统 Keychain 中，并为当前工作区建立连接。
               </DialogDescription>
             </DialogHeader>
 

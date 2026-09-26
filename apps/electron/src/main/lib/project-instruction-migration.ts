@@ -27,7 +27,7 @@ export function buildLegacyProjectMigrationPrompt(options: LegacyMigrationPrompt
 
   return `${heading} Legacy 项目指令迁移任务
 
-Proma 已从受信任项目根加载以下 legacy \`CLAUDE.md\` 兼容来源；每一项都需要迁移到**同目录**的 \`AGENTS.md\`：\n${legacySources.map(formatSourceEntry).join('\n')}${activeAgentsSection}
+DutyDeck 已从受信任项目根加载以下 legacy \`CLAUDE.md\` 兼容来源；每一项都需要迁移到**同目录**的 \`AGENTS.md\`：\n${legacySources.map(formatSourceEntry).join('\n')}${activeAgentsSection}
 
 在修改对应 scope 内的其他项目文件前，逐个完成以下证据驱动的迁移：
 

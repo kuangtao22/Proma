@@ -19,8 +19,8 @@ export function OnboardingSettings(): React.ReactElement {
   return (
     <div className="space-y-6">
       <SettingsSection
-        title="Proma 新手引导"
-        description="重新了解 Proma 的核心工作方式"
+        title="DutyDeck 新手引导"
+        description="重新了解 DutyDeck 的核心工作方式"
       >
         <SettingsCard>
           <div className="flex items-start gap-4 px-4 py-5">
@@ -28,7 +28,7 @@ export function OnboardingSettings(): React.ReactElement {
               <GraduationCap className="size-5" />
             </div>
             <div className="min-w-0 flex-1">
-              <h2 className="text-sm font-medium text-foreground">准备好重新认识 Proma 了吗？</h2>
+              <h2 className="text-sm font-medium text-foreground">准备好重新认识 DutyDeck 了吗？</h2>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
                 引导会从 Agent 和 Chat 的区别开始，依次介绍项目、文件、子会话、自动任务、记忆、侧边回答和 FAQ。
               </p>

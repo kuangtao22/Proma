@@ -68,7 +68,7 @@ export async function validateMcpServer(
     }
   }
 
-  const client = new Client({ name: 'Proma MCP validator', version: '1.0.0' }, { capabilities: {} })
+  const client = new Client({ name: 'DutyDeck MCP validator', version: '1.0.0' }, { capabilities: {} })
   let transport: StdioClientTransport | SSEClientTransport | StreamableHTTPClientTransport | undefined
   const timeoutMs = Math.max(1, entry.timeout ?? 30) * 1000
 

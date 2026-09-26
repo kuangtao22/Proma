@@ -33,12 +33,12 @@ test('Given 导演首次接管或局部复核 When 读取规范 Then 显式审�
   expect(review).toContain('不为审核添加执行依赖')
 })
 
-test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数据包含 Proma 分组与明确触发边界', () => {
+test('Given canvas-production 默认 Skill When 校验发布合同 Then 元数据包含 DutyDeck 分组与明确触发边界', () => {
   const skill = readCanvasProductionSkill()
 
   expect(skill).toMatch(/^name: canvas-production$/m)
   expect(skill).toMatch(/^group: proma$/m)
-  expect(skill).toMatch(/^version: "1\.0\.39"$/m)
+  expect(skill).toMatch(/^version: "1\.0\.40"$/m)
   expect(skill).toContain('产品套图')
   expect(skill).toContain('漫剧分镜')
   expect(skill).toContain('交互视觉稿')
@@ -202,7 +202,7 @@ test('Given 多产物画布任务 When 读取 canvas-production Then 定义节�
   expect(skill).toContain('derives')
   expect(skill).toContain('局部更新')
   expect(skill).toContain('普通创建不要主动提供 `position`')
-  expect(skill).toContain('由 Proma 根据来源关系和真实节点尺寸紧凑排布')
+  expect(skill).toContain('由 DutyDeck 根据来源关系和真实节点尺寸紧凑排布')
   expect(skill).toContain('先建立并验证新链路')
   expect(skill).toContain('再删除旧节点')
   expect(skill).toContain('图片提示词、画幅、尺寸、模型或上下文')

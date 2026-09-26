@@ -6,12 +6,12 @@
 
 import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
-import { AlertTriangle, ExternalLink, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { AlertTriangle, Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { PROVIDER_LABELS } from '@proma/shared'
 import type { Channel } from '@proma/shared'
-import { getChannelLogo, PromaLogo } from '@/lib/model-logo'
+import { getChannelLogo } from '@/lib/model-logo'
 import { agentChannelIdAtom, agentModelIdAtom } from '@/atoms/agent-atoms'
 import { channelsAtom } from '@/atoms/chat-atoms'
 import { SettingsSection, SettingsCard, SettingsRow } from './primitives'
@@ -75,6 +75,20 @@ export function ChannelSettings(): React.ReactElement {
   React.useEffect(() => {
     agentChannelIdRef.current = agentChannelId
   }, [agentChannelId])
+
+  /**
+   * 当前版本仍支持的渠道；上游商业版遗留的供应商不在 PROVIDER_LABELS 里，无法使用。
+   * 它们不显示在列表里，只留一行提示供用户清理。
+   */
+  const visibleChannels = React.useMemo(
+    () => channels.filter((channel) => isSupportedProvider(channel.provider)),
+    [channels],
+  )
+  /** 来自不支持供应商的历史渠道（例如上游「Proma 官方」）。 */
+  const legacyChannels = React.useMemo(
+    () => channels.filter((channel) => !isSupportedProvider(channel.provider)),
+    [channels],
+  )
 
   /** 加载渠道列表 */
   const loadChannels = React.useCallback(async (): Promise<void> => {
@@ -149,6 +163,18 @@ export function ChannelSettings(): React.ReactElement {
     await loadChannels()
   }
 
+  /** 清理上游商业版遗留的、当前版本不支持的渠道。 */
+  const handleCleanupLegacyChannels = async (): Promise<void> => {
+    try {
+      for (const channel of legacyChannels) {
+        await window.electronAPI.deleteChannel(channel.id)
+      }
+      await loadChannels()
+    } catch (error) {
+      console.error('[渠道设置] 清理历史渠道失败:', error)
+    }
+  }
+
   /** 取消表单 */
   const handleFormCancel = (): void => {
     setViewMode('list')
@@ -180,9 +206,6 @@ export function ChannelSettings(): React.ReactElement {
           </Button>
         }
       >
-        <SettingsCard>
-          <PromaProviderCard />
-        </SettingsCard>
         {loadError && (
           <div
             role="alert"
@@ -205,15 +228,15 @@ export function ChannelSettings(): React.ReactElement {
         )}
         {loading ? (
           <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : channels.length === 0 && !loadError ? (
+        ) : visibleChannels.length === 0 && legacyChannels.length === 0 && !loadError ? (
           <SettingsCard divided={false}>
             <div className="text-sm text-muted-foreground py-12 text-center">
               还没有配置任何模型，点击上方"添加配置"开始
             </div>
           </SettingsCard>
-        ) : channels.length > 0 ? (
+        ) : visibleChannels.length > 0 ? (
           <SettingsCard>
-            {channels.map((channel) => (
+            {visibleChannels.map((channel) => (
               <ChannelRow
                 key={channel.id}
                 channel={channel}
@@ -227,6 +250,21 @@ export function ChannelSettings(): React.ReactElement {
             ))}
           </SettingsCard>
         ) : null}
+
+        {/* 上游商业版遗留的渠道：当前版本不支持，列表里隐藏，只留清理入口 */}
+        {legacyChannels.length > 0 && (
+          <SettingsCard divided={false}>
+            <div className="flex items-center justify-between gap-4 py-1">
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                已隐藏 {legacyChannels.length} 个来自不支持的上游服务（如「Proma 官方」「Proma 商业版」）的渠道，
+                它们在当前版本里无法使用。
+              </p>
+              <Button size="sm" variant="outline" onClick={() => void handleCleanupLegacyChannels()}>
+                清理
+              </Button>
+            </div>
+          </SettingsCard>
+        )}
       </SettingsSection>
 
       {/* 删除确认弹窗 */}
@@ -248,8 +286,12 @@ export function ChannelSettings(): React.ReactElement {
   )
 }
 
-function openPromaDownload(): void {
-  window.open('https://proma.cool/download', '_blank')
+/**
+ * 判断渠道的供应商是否仍被当前版本支持。
+ * 上游商业版遗留的供应商不在 PROVIDER_LABELS 里，保留了也无法使用。
+ */
+function isSupportedProvider(provider: string): boolean {
+  return provider in PROVIDER_LABELS
 }
 
 // ===== 渠道行子组件 =====
@@ -302,23 +344,6 @@ function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): R
           onCheckedChange={onToggle}
         />
       </div>
-    </SettingsRow>
-  )
-}
-
-// ===== Proma 官方供应商推广卡片 =====
-
-function PromaProviderCard(): React.ReactElement {
-  return (
-    <SettingsRow
-      label="Proma"
-      icon={<img src={PromaLogo} alt="Proma" className="w-8 h-8 rounded" />}
-      description="Proma 商业版｜安全、稳定、优惠的内置模型｜适用于 Chat 与 Agent"
-    >
-      <Button size="sm" variant="outline" className="gap-1.5" onClick={openPromaDownload}>
-        <ExternalLink size={13} />
-        <span>下载商业版</span>
-      </Button>
     </SettingsRow>
   )
 }

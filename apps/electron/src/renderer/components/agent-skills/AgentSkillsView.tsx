@@ -62,7 +62,7 @@ function buildSkillClassificationPrompt(input: {
     })
     .join('\n')
 
-  return `请帮我整理当前项目在 Proma 工作区中保存的 Skills 的分组。
+  return `请帮我整理当前项目在 DutyDeck 工作区中保存的 Skills 的分组。
 
 项目：${input.workspaceName || '当前项目'}
 Skills 目录：${input.skillsDir}
@@ -98,7 +98,7 @@ version: "1.0.0"
 }
 
 function buildManualMcpGuidePrompt(): string {
-  return `帮我为当前 Proma 工作区添加一个 MCP 服务器。
+  return `帮我为当前 DutyDeck 工作区添加一个 MCP 服务器。
 
 1. 先确认服务名和官方文档或 MCP 地址；信息不足时先问，不要猜测配置。
 2. 依据官方文档核验 transport、地址/命令、依赖、认证与权限；安全步骤可直接完成，登录、授权、付费或敏感凭据由我确认或操作。
@@ -401,7 +401,7 @@ export function AgentSkillsView({
   const disconnectCatalogCli = React.useCallback(async (integration: CatalogCliIntegration): Promise<void> => {
     try {
       await data.setCliIntegrationEnabled(integration.id, false)
-      toast.success(`已断开 ${integration.name}`, { description: '仅停止 Proma 使用该 CLI，不会登出或撤销第三方授权。' })
+      toast.success(`已断开 ${integration.name}`, { description: '仅停止 DutyDeck 使用该 CLI，不会登出或撤销第三方授权。' })
     } catch {
       toast.error(`无法断开 ${integration.name}`)
     }
@@ -416,7 +416,7 @@ export function AgentSkillsView({
   const handleClassifySkills = React.useCallback(async (): Promise<void> => {
     if (classifyingSkills) return
     if (!data.skillsDir) {
-      toast.error('无法定位当前项目的 Proma 工作区 Skills 目录')
+      toast.error('无法定位当前项目的 DutyDeck 工作区 Skills 目录')
       return
     }
     setClassifyingSkills(true)
@@ -802,7 +802,7 @@ function SkillsTab({
   onUpdate,
 }: SkillsTabProps): React.ReactElement {
   if (total === 0) {
-    return <EmptyState icon={<Blocks className="size-8 text-foreground/30" />} title="暂无 Skill" hint="可以在 Agent 模式下让 Proma 帮你联网查找并安装 Skill，或从其他项目导入。" />
+    return <EmptyState icon={<Blocks className="size-8 text-foreground/30" />} title="暂无 Skill" hint="可以在 Agent 模式下让 DutyDeck 帮你联网查找并安装 Skill，或从其他项目导入。" />
   }
   if (customSkills.length === 0 && builtinSkills.length === 0) {
     return <EmptyState icon={<Search className="size-8 text-foreground/30" />} title="没有匹配的 Skill" hint="试试更换搜索关键词。" />

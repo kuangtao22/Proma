@@ -306,7 +306,7 @@ export function DataRootRecoverySelectionPanel({
       <p className="mt-3 text-sm text-muted-foreground">
         {requiresEmptyConfirmation
           ? '旧聊天和配置不会自动迁移，原数据仍会保留。'
-          : '这不是迁移；Proma 将直接使用该目录中的已有数据，原位置会保留。'}
+          : '这不是迁移；DutyDeck 将直接使用该目录中的已有数据，原位置会保留。'}
       </p>
       {requiresEmptyConfirmation ? (
         <label className="mt-4 flex items-start gap-2 text-sm text-foreground">

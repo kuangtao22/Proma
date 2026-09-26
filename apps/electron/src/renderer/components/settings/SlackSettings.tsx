@@ -51,7 +51,7 @@ export function SlackSettings(): React.ReactElement {
   const addBot = React.useCallback(async () => {
     try {
       const saved = await window.electronAPI.saveSlackBotConfig({
-        name: 'Proma',
+        name: 'DutyDeck',
         enabled: false,
         botToken: '',
         appToken: '',
@@ -67,7 +67,7 @@ export function SlackSettings(): React.ReactElement {
   return <div className="space-y-8 antialiased">
     <SettingsSection
       title="Slack Bot"
-      description="通过 Socket Mode 将本机 Proma 安全地接入 Slack，无需公网回调地址。"
+      description="通过 Socket Mode 将本机 DutyDeck 安全地接入 Slack，无需公网回调地址。"
       action={<Button size="sm" variant="outline" onClick={addBot} className="active:scale-[0.96] transition-transform"><Plus className="mr-1.5 size-4" />添加 Bot</Button>}
     >
       {bots.length === 0 ? <SettingsCard divided={false}>
@@ -81,15 +81,15 @@ export function SlackSettings(): React.ReactElement {
       </div>}
     </SettingsSection>
 
-    <SettingsSection title="按顺序连接 Slack" description="完整指南见 docs/slack-bridge.md；Token 只应粘贴到本机 Proma，不要发送到聊天或提交到 Git。">
+    <SettingsSection title="按顺序连接 Slack" description="完整指南见 docs/slack-bridge.md；Token 只应粘贴到本机 DutyDeck，不要发送到聊天或提交到 Git。">
       <SettingsCard divided={false}>
         <ol className="space-y-4 px-4 py-5 text-sm text-muted-foreground">
-          <li className="flex gap-3"><Step n="1" /><span>先点击<strong className="font-medium text-foreground">添加 Bot</strong>，展开卡片后复制 Manifest。App 名称默认 <code className="rounded bg-muted px-1 py-0.5">Proma</code>，不能包含中文。</span></li>
+          <li className="flex gap-3"><Step n="1" /><span>先点击<strong className="font-medium text-foreground">添加 Bot</strong>，展开卡片后复制 Manifest。App 名称默认 <code className="rounded bg-muted px-1 py-0.5">DutyDeck</code>，不能包含中文。</span></li>
           <li className="flex gap-3"><Step n="2" /><span>打开 <Link href="https://api.slack.com/apps">Slack API</Link>，选择 <strong className="font-medium text-foreground">Create New App → From an app manifest</strong>，选择目标 workspace、粘贴 Manifest；若出现 <strong className="font-medium text-foreground">Save Changes</strong>，请保存。</span></li>
           <li className="flex gap-3"><Step n="3" /><span>在 <strong className="font-medium text-foreground">Socket Mode</strong> 确认开关已开启。点 <strong className="font-medium text-foreground">App Level Token</strong> → <strong className="font-medium text-foreground">Generate Token and Scopes</strong>，添加 <code className="rounded bg-muted px-1 py-0.5">connections:write</code>，复制 <code className="rounded bg-muted px-1 py-0.5">xapp-…</code>。</span></li>
           <li className="flex gap-3"><Step n="4" /><span>在 <strong className="font-medium text-foreground">Install App</strong> 点击 <strong className="font-medium text-foreground">Install to Workspace</strong>，由有权限的成员确认 Slack 授权，复制生成的 <code className="rounded bg-muted px-1 py-0.5">xoxb-…</code>。</span></li>
           <li className="flex gap-3"><Step n="5" /><span>将 <code className="rounded bg-muted px-1 py-0.5">xoxb-…</code> 填入 Bot Token、<code className="rounded bg-muted px-1 py-0.5">xapp-…</code> 填入 App Token。<strong className="font-medium text-foreground">测试 Token</strong> 只验证 Bot API；点击<strong className="font-medium text-foreground">保存并连接</strong>，卡片显示“已连接”才表示 Socket Mode 就绪。</span></li>
-          <li className="flex gap-3"><Step n="6" /><span>将 Bot 邀请进要使用的频道；任意成员都可用 <strong className="font-medium text-foreground">@Proma</strong> 发起任务，Proma 会始终在同一 thread 回复。此集成不接收 Slack 私信或 Slash Command。</span></li>
+          <li className="flex gap-3"><Step n="6" /><span>将 Bot 邀请进要使用的频道；任意成员都可用 <strong className="font-medium text-foreground">@Proma</strong> 发起任务，DutyDeck 会始终在同一 thread 回复。此集成不接收 Slack 私信或 Slash Command。</span></li>
         </ol>
       </SettingsCard>
     </SettingsSection>
@@ -117,7 +117,7 @@ function SlackBotCard({ bot, state, onChanged }: { bot: SlackBotSettingsConfig; 
   const hasAppToken = Boolean(bot.hasAppToken || appToken.trim())
 
   const copyManifest = React.useCallback(async () => {
-    const { json } = await window.electronAPI.getSlackManifest({ botName: name.trim() || 'Proma' })
+    const { json } = await window.electronAPI.getSlackManifest({ botName: name.trim() || 'DutyDeck' })
     await copyTextToClipboard(json)
     setManifestCopied(true)
     window.setTimeout(() => setManifestCopied(false), 1600)
@@ -181,7 +181,7 @@ function SlackBotCard({ bot, state, onChanged }: { bot: SlackBotSettingsConfig; 
       >
         <span className="flex min-w-0 items-center gap-3">
           <span className={cn('size-2 shrink-0 rounded-full', status.color)} />
-          <span className="truncate text-sm font-medium">{bot.name || 'Proma'}</span>
+          <span className="truncate text-sm font-medium">{bot.name || 'DutyDeck'}</span>
           <span className="hidden text-xs text-muted-foreground sm:inline">{status.label}</span>
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{expanded ? '收起' : '配置'}</span>
@@ -191,7 +191,7 @@ function SlackBotCard({ bot, state, onChanged }: { bot: SlackBotSettingsConfig; 
       </Button>}
     </div>
     {expanded && <div id={detailsId} className="space-y-4 border-t border-border/60 px-4 pb-5 pt-4">
-      <SettingsInput label="App 名称" description="默认 Proma，用于生成 Slack App Manifest；不能包含中文。" value={name} onChange={setName} placeholder="Proma" />
+      <SettingsInput label="App 名称" description="默认 DutyDeck，用于生成 Slack App Manifest；不能包含中文。" value={name} onChange={setName} placeholder="DutyDeck" />
       <div className="rounded-lg bg-primary/5 px-3 py-3">
         <p className="text-sm font-medium text-foreground">先创建 Slack App</p>
         <p className="mt-0.5 text-xs text-muted-foreground">复制 Manifest，粘贴到 Slack 的「Create New App → From an app manifest」后，再返回填写 Token。</p>
@@ -199,8 +199,8 @@ function SlackBotCard({ bot, state, onChanged }: { bot: SlackBotSettingsConfig; 
       </div>
       <div className="grid gap-4 md:grid-cols-2"><SettingsSecretInput label="Bot Token" value={botToken} onChange={setBotToken} placeholder={bot.hasBotToken ? '已保存；留空保留，粘贴以替换' : 'xoxb-…'} /><SettingsSecretInput label="App Token" value={appToken} onChange={setAppToken} placeholder={bot.hasAppToken ? '已保存；留空保留，粘贴以替换' : 'xapp-…'} /></div>
       {(bot.hasBotToken || bot.hasAppToken) && <p className="-mt-2 text-xs text-muted-foreground">已保存的 Token 不会回显到页面；留空会保留原凭证，重新粘贴可替换。</p>}
-      <div className="rounded-lg bg-muted/45 px-3 py-2.5 text-sm"><p className="font-medium">频道访问已开放</p><p className="mt-0.5 text-xs text-muted-foreground">工作区任意成员都可在 Bot 已加入的任意频道通过 <code>@{bot.name || 'Proma'}</code> 发起任务，并在自己发起的 thread 中处理计划与单次权限确认；仍只响应 @mention。</p></div>
-      <SettingsInput label="Home Channel ID（可选）" description="可填一个 Bot 已加入的频道 ID。Proma 在桌面端、Automation 或其他 Bridge 完成任务时会在此发送仅含标题与状态的完成通知；标题仍会对该频道成员可见。Slack 自己发起的任务仍只在原 thread 回复。留空不会影响正常使用。" value={homeChannel} onChange={setHomeChannel} placeholder="例如 C012…" />
+      <div className="rounded-lg bg-muted/45 px-3 py-2.5 text-sm"><p className="font-medium">频道访问已开放</p><p className="mt-0.5 text-xs text-muted-foreground">工作区任意成员都可在 Bot 已加入的任意频道通过 <code>@{bot.name || 'DutyDeck'}</code> 发起任务，并在自己发起的 thread 中处理计划与单次权限确认；仍只响应 @mention。</p></div>
+      <SettingsInput label="Home Channel ID（可选）" description="可填一个 Bot 已加入的频道 ID。DutyDeck 在桌面端、Automation 或其他 Bridge 完成任务时会在此发送仅含标题与状态的完成通知；标题仍会对该频道成员可见。Slack 自己发起的任务仍只在原 thread 回复。留空不会影响正常使用。" value={homeChannel} onChange={setHomeChannel} placeholder="例如 C012…" />
       <div className="flex flex-wrap items-center gap-2"><Button type="button" size="sm" variant="outline" disabled={testing || !botToken.trim()} onClick={() => void test()} className="min-h-9 active:scale-[0.96] transition-transform">{testing && <Loader2 className="mr-1 size-3.5 animate-spin" />}测试 Token</Button><Button type="button" size="sm" disabled={saving} onClick={() => void save()} className="min-h-9 active:scale-[0.96] transition-transform">{saving && <Loader2 className="mr-1 size-3.5 animate-spin" />}保存并连接</Button><AlertDialog><AlertDialogTrigger asChild><Button type="button" size="sm" variant="destructive" className="min-h-9 active:scale-[0.96] transition-transform"><Trash2 className="mr-1 size-3.5" />删除</Button></AlertDialogTrigger><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>删除 Slack Bot？</AlertDialogTitle><AlertDialogDescription>这会断开本机 Socket Mode 连接并删除已保存的 Token 配置。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction onClick={() => void remove()}>删除</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog></div>
       {testResult && <div className={cn('flex items-start gap-2 rounded-lg p-3 text-sm', testResult.success ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-red-500/10 text-red-700 dark:text-red-300')}>
         {testResult.success ? <CheckCircle2 className="mt-0.5 size-4 shrink-0" /> : <XCircle className="mt-0.5 size-4 shrink-0" />}<span>{testResult.message}</span>
