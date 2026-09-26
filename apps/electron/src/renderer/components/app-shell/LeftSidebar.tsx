@@ -55,6 +55,7 @@ import {
   agentDiffUnseenFilesAtom,
   agentNonGitFileChangesAtom,
   agentFileChangesCurrentRunAtom,
+  agentRunFileChangesAtom,
   agentDiffDataAtom,
   agentSidePanelOpenMapAtom,
   agentSidePanelOpenAtomFamily,
@@ -793,6 +794,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
   const setDiffUnseenFiles = useSetAtom(agentDiffUnseenFilesAtom)
   const setNonGitFileChanges = useSetAtom(agentNonGitFileChangesAtom)
   const setFileChangesCurrentRun = useSetAtom(agentFileChangesCurrentRunAtom)
+  const setRunFileChanges = useSetAtom(agentRunFileChangesAtom)
   const setDiffData = useSetAtom(agentDiffDataAtom)
   const setAgentSidePanelOpenMap = useSetAtom(agentSidePanelOpenMapAtom)
   const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
@@ -856,6 +858,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     setDiffUnseenFiles(deleteKey)
     setNonGitFileChanges(deleteKey)
     setFileChangesCurrentRun(deleteKey)
+    setRunFileChanges(deleteKey)
     setDiffData(deleteKey)
     setAgentSidePanelOpenMap((prev) => {
       if (!(id in prev)) return prev
@@ -905,7 +908,7 @@ export function LeftSidebar({ width, noTransition }: LeftSidebarProps): React.Re
     sessionExistsAtom.remove(id)
 
     clearPreviewCacheForSession(id)
-  }, [clearBrowserSessionState, setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, setSessionCanvasNodeReferences, store])
+  }, [clearBrowserSessionState, setConvModels, setConvContextLength, setConvThinking, setConvParallel, setConvPromptId, setPreviewPanelOpen, setPreviewFile, setPreviewFiles, setPreviewContentRefreshVersion, setPreviewResolvedPaths, setDiffPanelTab, setDiffRefreshVersion, setDiffUnseen, setDiffUnseenFiles, setNonGitFileChanges, setFileChangesCurrentRun, setRunFileChanges, setDiffData, setAgentSidePanelOpenMap, setSessionChannelMap, setSessionModelMap, setSessionPathMap, setSessionViewStateMap, setStreamingStates, setLiveMessagesMap, setSessionPendingFiles, setSessionPendingMentions, setSessionCanvasNodeReferences, store])
 
   const currentWorkspaceSlug = React.useMemo(() => {
     if (!currentWorkspaceId) return null

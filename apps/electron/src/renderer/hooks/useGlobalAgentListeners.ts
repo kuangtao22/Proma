@@ -53,6 +53,7 @@ import {
   agentSelectedWorktreeAtom,
   agentNonGitFileChangesAtom,
   agentFileChangesCurrentRunAtom,
+  agentRunFileChangesAtom,
   agentSidePanelOpenAtomFamily,
   revealChangedWorkspaceComponentAtom,
   agentSideDelegationMapAtom,
@@ -122,6 +123,7 @@ import {
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 import { detectIsWindows } from '@/lib/platform'
 import { arePathsEqual, getInactiveSessionFileChangePaths, getSessionFileChangeKind, getOwnedSessionWatcherPaths, removeSessionFileChange, upsertSessionFileChange, type SessionFileChange } from '@/lib/session-file-changes'
+import { upsertAgentRunFileChanges } from '@/lib/agent-run-file-changes'
 import { rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { doesWorkspaceChangeAffectPreview } from '@/components/diff/preview-open-path'
 import {
@@ -1235,6 +1237,48 @@ export function useGlobalAgentListeners(): void {
     }
 
     const isWindows = detectIsWindows()
+
+    /**
+     * 记录本轮运行的文件改动。
+     *
+     * run 身份沿用渲染进程生成、主进程原样回传的 startedAt；observed 只在记录首次创建时
+     * 生效，事后再补的 observed 不会覆盖，避免中途重载后错误断言「本轮无文件改动」。
+     *
+     * @param sessionId 目标会话。
+     * @param startedAt 本轮运行开始时间戳（毫秒）。
+     * @param update 本次新增的路径、跟踪标记或终态时间。
+     */
+    const trackRunFileChanges = (
+      sessionId: string,
+      startedAt: number,
+      update: { path?: string; observed?: boolean; endedAt?: number },
+    ): void => {
+      if (!Number.isFinite(startedAt)) return
+      const runId = String(startedAt)
+      store.set(agentRunFileChangesAtom, (previous) => {
+        const current = previous.get(sessionId) ?? []
+        const next = upsertAgentRunFileChanges(
+          current,
+          { runId, startedAt, ...update },
+          isWindows,
+        )
+        if (next === current) return previous
+        const map = new Map(previous)
+        map.set(sessionId, next)
+        return map
+      })
+    }
+
+    /** 关闭本轮记录：只在记录已存在时写入终态时间，不为未知运行臆造空记录。 */
+    const closeRunFileChanges = (sessionId: string, startedAt: number | undefined): void => {
+      if (startedAt == null) return
+      const runId = String(startedAt)
+      const exists = (store.get(agentRunFileChangesAtom).get(sessionId) ?? [])
+        .some((record) => record.runId === runId)
+      if (!exists) return
+      trackRunFileChanges(sessionId, startedAt, { endedAt: Date.now() })
+    }
+
     // 初始化快照与 STREAM_COMPLETE 可跨 IPC channel 乱序抵达，终态身份由
     // agentTerminalRunMarkersAtom 统一保存；下方时间戳索引保留旧事件路径的兼容处理。
     const latestTerminalRunStartedAt = new Map<string, number>()
@@ -1328,6 +1372,11 @@ export function useGlobalAgentListeners(): void {
           const sessionPath = sessionPaths.get(sessionId)
           const workspaceFilesPath = await getWorkspaceFilesPathForSession(sessionId)
           const workspaceAttachments = await getWorkspaceAttachmentsForSession(sessionId)
+          // 本地项目根由主进程单独监听（项目根不进入附加目录列表），必须显式纳入归属范围，
+          // 否则用户在项目根里工作时的改动永远无法落到本会话。
+          const workspaceProjectRootPath = session?.workspaceId
+            ? (store.get(agentWorkspacesAtom).find((item) => item.id === session.workspaceId)?.projectRootPath ?? null)
+            : null
           const matchingPaths = getOwnedSessionWatcherPaths(filePaths, {
             sessionExists: Boolean(session),
             sessionPath,
@@ -1335,6 +1384,7 @@ export function useGlobalAgentListeners(): void {
             sessionAttachedFiles: session?.attachedFiles ?? [],
             workspaceAttachmentsComplete: workspaceAttachments.complete,
             workspaceFilesPath,
+            workspaceProjectRootPath,
             workspaceAttachedDirectories: workspaceAttachments.directories,
             workspaceAttachedFiles: workspaceAttachments.files,
           }, isWindows)
@@ -1367,6 +1417,9 @@ export function useGlobalAgentListeners(): void {
               continue
             }
             const previewFile = await buildWrittenFilePreviewInfo(sessionId, changedPath)
+            // 真实落盘证据：无论是否 Git 仓库都记入本轮分桶，使 Bash/脚本/格式化器的
+            // 改动同样出现在底部「本轮文件改动」汇总中。
+            trackRunFileChanges(sessionId, Number(runId), { path: changedPath })
             if (previewFile.previewOnly) {
               store.set(agentNonGitFileChangesAtom, (prev) => {
                 const map = new Map(prev)
@@ -1421,6 +1474,9 @@ export function useGlobalAgentListeners(): void {
               store.get(agentTerminalRunMarkersAtom).get(snapshot.sessionId),
             )
           })
+          // 重载后才接管的运行已经错过本轮早期改动，只能标记为「未完整跟踪」，
+          // 避免之后用「本轮无文件改动」把遗漏写成结论。
+          trackRunFileChanges(snapshot.sessionId, snapshot.startedAt, { observed: false })
         }
       })
     }).catch(console.error)
@@ -1714,6 +1770,8 @@ export function useGlobalAgentListeners(): void {
               map.set(sessionId, activeRunId)
               return map
             })
+            // 渲染进程从本轮最开始就在跟踪：只有这种情况才允许断言「本轮无文件改动」。
+            trackRunFileChanges(sessionId, activeRunStartedAt, { observed: true })
           }
 
           // Pi 原生重试成功后仍会沿用同一会话；仅在事件属于当前 stream run 时
@@ -1784,6 +1842,10 @@ export function useGlobalAgentListeners(): void {
               if (event.isError) continue
               // 相对路径的 cwd 由 Agent 决定，不能按 Electron cwd 错配到别的仓库；改为保守全量失效。
               const cacheInvalidationPath = writtenPath && isAbsolutePath(writtenPath) ? writtenPath : undefined
+              // 工具入参证据：覆盖不在监听根内（例如 /tmp、外部绝对路径）的写入。
+              if (writtenPath) {
+                trackRunFileChanges(sessionId, Number(entry.runId), { path: writtenPath })
+              }
               void window.electronAPI.invalidateGitDiffCache(cacheInvalidationPath).finally(() => {
                 store.set(agentDiffRefreshVersionAtom, (prev) => {
                   const m = new Map(prev); m.set(sessionId, (prev.get(sessionId) ?? 0) + 1); return m
@@ -1923,6 +1985,8 @@ export function useGlobalAgentListeners(): void {
         if (route.kind === 'canvas') {
           store.set(canvasAgentLifecycleAtom, { type: 'owner-updated', owner: route.owner })
         }
+        // 出错即本轮结束：关闭文件改动分桶，避免后续空闲期变更继续落进这一轮。
+        closeRunFileChanges(data.sessionId, data.startedAt)
         store.set(agentStreamErrorsAtom, (prev) => {
           const map = new Map(prev)
           map.set(data.sessionId, data.error)
@@ -2071,6 +2135,8 @@ export function useGlobalAgentListeners(): void {
         const backgroundTasksPending = data.backgroundTasksPending === true
         if (!backgroundTasksPending && (data.runGeneration != null || data.startedAt != null)) {
           recordAgentTerminalRun(store, data.sessionId, data)
+          // 本轮主体结束：关闭文件改动分桶。后台任务等待态不关闭，后续唤醒属于新一轮。
+          closeRunFileChanges(data.sessionId, data.startedAt)
         }
         const hasStreamError = store.get(agentStreamErrorsAtom).has(data.sessionId)
 

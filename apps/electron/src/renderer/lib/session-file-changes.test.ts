@@ -72,4 +72,42 @@ describe('getOwnedSessionWatcherPaths', () => {
       '/external/workspace-file.md',
     ])
   })
+
+  test('binds the local project root so agent edits inside the user project stay attributable', () => {
+    expect(getOwnedSessionWatcherPaths(
+      [
+        '/Users/me/Project/src/app.ts',
+        '/Users/me/Project-copy/src/app.ts',
+        '/Users/me/other/app.ts',
+      ],
+      {
+        sessionExists: true,
+        sessionPath: '/workspaces/current-session',
+        sessionAttachedDirectories: [],
+        sessionAttachedFiles: [],
+        workspaceAttachmentsComplete: true,
+        workspaceFilesPath: '/workspaces/workspace-files',
+        workspaceProjectRootPath: '/Users/me/Project',
+        workspaceAttachedDirectories: [],
+        workspaceAttachedFiles: [],
+      },
+    )).toEqual(['/Users/me/Project/src/app.ts'])
+  })
+
+  test('ignores the project root when workspace scope is unavailable', () => {
+    expect(getOwnedSessionWatcherPaths(
+      ['/Users/me/Project/src/app.ts'],
+      {
+        sessionExists: true,
+        sessionPath: '/workspaces/current-session',
+        sessionAttachedDirectories: [],
+        sessionAttachedFiles: [],
+        workspaceAttachmentsComplete: false,
+        workspaceFilesPath: '/workspaces/workspace-files',
+        workspaceProjectRootPath: '/Users/me/Project',
+        workspaceAttachedDirectories: [],
+        workspaceAttachedFiles: [],
+      },
+    )).toEqual([])
+  })
 })

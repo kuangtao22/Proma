@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils'
 import { FileTypeIcon } from '@/components/file-browser/FileTypeIcon'
 import { useOpenPreview } from '@/components/diff/preview-opener'
 import { currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
+import { getFileParentPath } from '@/lib/file-utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   ContextMenu,
@@ -29,6 +30,7 @@ import {
   isImageFilePath,
   isLocalFileReference,
   isRelativeFilePath,
+  resolveChipOpenTarget,
   stripLineCol,
 } from './file-path-chip-utils'
 
@@ -91,10 +93,16 @@ interface FilePathChipProps {
   /** 多个候选基础目录（如主 cwd + 附加目录），点击时由主进程依次解析 */
   basePaths?: string[]
   className?: string
+  /**
+   * 点击打开方式。
+   * - preview（默认）：始终打开全文预览，适合正文里的普通文件引用。
+   * - diff-preferred：Git 仓库内的绝对路径优先打开代码比对，用于「本轮文件改动」汇总。
+   */
+  openMode?: 'preview' | 'diff-preferred'
 }
 
 /** 文件路径芯片 — 可点击，触发文件预览 */
-export function FilePathChip({ filePath, basePath, basePaths, className }: FilePathChipProps): React.ReactElement {
+export function FilePathChip({ filePath, basePath, basePaths, className, openMode = 'preview' }: FilePathChipProps): React.ReactElement {
   const trimmedPath = filePath.trim()
   const { path: cleanPath, suffix: lineColSuffix } = stripLineCol(trimmedPath)
   const filename = getFileName(cleanPath)
@@ -188,12 +196,33 @@ export function FilePathChip({ filePath, basePath, basePaths, className }: FileP
     const sessionId = store.get(currentAgentSessionIdAtom)
     if (!sessionId) return
 
-    openPreview(sessionId, {
+    const resolvedBasePaths = candidateBases.length > 0 ? candidateBases : undefined
+    const dirPath = getFileParentPath(cleanPath)
+    // 只有绝对路径才能可靠定位所在目录与 Git 仓库；相对路径保持全文预览。
+    if (openMode !== 'diff-preferred' || !isAbsoluteFilePath(cleanPath) || !dirPath) {
+      openPreview(sessionId, {
+        filePath: cleanPath,
+        previewOnly: true,
+        basePaths: resolvedBasePaths,
+      })
+      return
+    }
+
+    // 仓库内文件优先给代码比对：用户点改动文件时要看的是「改了什么」，不是全文。
+    void resolveChipOpenTarget({
       filePath: cleanPath,
-      previewOnly: true,
-      basePaths: candidateBases.length > 0 ? candidateBases : undefined,
+      dirPath,
+      readGitRepoStatus: (targetDir) => window.electronAPI.getGitRepoStatus(targetDir, { sessionId }),
+    }).then((target) => {
+      openPreview(sessionId, { ...target, basePaths: resolvedBasePaths })
+    }).catch(() => {
+      openPreview(sessionId, {
+        filePath: cleanPath,
+        previewOnly: true,
+        basePaths: resolvedBasePaths,
+      })
     })
-  }, [store, openPreview, cleanPath, candidateBases])
+  }, [store, openPreview, cleanPath, candidateBases, openMode])
 
   const handleShowInFolder = React.useCallback(() => {
     const bases = candidateBases.length > 0 ? candidateBases : undefined

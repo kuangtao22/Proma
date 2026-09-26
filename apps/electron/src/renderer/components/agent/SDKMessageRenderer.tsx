@@ -56,7 +56,7 @@ import { formatMessageTime } from '@/components/chat/ChatMessageItem'
 import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
-import { agentSessionPendingFilesAtom, agentSessionsAtom, agentWorkspacesAtom } from '@/atoms/agent-atoms'
+import { agentRunFileChangesAtom, agentSessionPendingFilesAtom, agentSessionsAtom, agentWorkspacesAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { automationsAtom, automationFormAtom, automationToDraft } from '@/atoms/automation-atoms'
 import { openWorkspaceComponentAtom } from '@/atoms/agent-atoms'
@@ -91,6 +91,8 @@ import {
 } from '@proma/shared'
 import type { ToolActivity } from '@/atoms/agent-atoms'
 import { resolveAgentTerminalNotice } from '@/lib/agent-terminal-result'
+import { resolveAgentRunFileChanges } from '@/lib/agent-run-file-changes'
+import { detectIsWindows } from '@/lib/platform'
 
 // ===== SDKMessageRenderer Props =====
 
@@ -405,6 +407,9 @@ export interface AssistantTurnRendererProps {
 
 export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, onFork, onRewind, onCreateTodo, onRetry, onRetryInNewSession, onCompact, onRelinkProjectRoot, onRestoreProjectRoot, isStreaming, stoppedByUser, sessionModelId }: AssistantTurnRendererProps): React.ReactElement | null {
   const channels = useAtomValue(channelsAtom)
+  const runFileChangesMap = useAtomValue(agentRunFileChangesAtom)
+  /** Windows 下同一文件大小写不同不应重复成两个 chip。 */
+  const caseInsensitivePaths = React.useMemo(() => detectIsWindows(), [])
   // 收集所有 assistant 消息的内容块，保留 parent_tool_use_id 关联
   interface EnrichedBlock {
     block: SDKContentBlock
@@ -482,10 +487,20 @@ export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, 
     })
   }, [topLevelBlocks, isStreaming])
 
+  /**
+   * 本轮真实文件改动：按 turn 创建时间定位到对应的运行分桶。
+   * 命中时以监听器记录补齐 Bash/脚本等非工具写入；未命中（历史 turn 或缺失时间戳）
+   * 由汇总组件回退到工具入参路径。
+   */
+  const runFileChanges = React.useMemo(
+    () => resolveAgentRunFileChanges(runFileChangesMap.get(sessionId) ?? [], turn.createdAt),
+    [runFileChangesMap, sessionId, turn.createdAt],
+  )
+
   // 本轮「文件名 → 绝对路径」映射：与 footer chips 同源，供正文内联文件引用补全裸文件名
   const turnFileMap = React.useMemo(
-    () => buildTurnFileNameMap(turn.turnMessages),
-    [turn.turnMessages]
+    () => buildTurnFileNameMap(turn.turnMessages, runFileChanges?.paths ?? []),
+    [turn.turnMessages, runFileChanges]
   )
 
   // 如果只有错误消息
@@ -605,7 +620,13 @@ export function AssistantTurnRenderer({ turn, sessionId, allMessages, basePath, 
             inputMessage={turn.inputMessage}
             turnMessages={turn.turnMessages}
           />
-          <TurnFileChangesSummary turnMessages={turn.turnMessages} basePath={basePath} />
+          <TurnFileChangesSummary
+            turnMessages={turn.turnMessages}
+            basePath={basePath}
+            runPaths={runFileChanges?.paths}
+            runObserved={runFileChanges?.observed}
+            caseInsensitivePaths={caseInsensitivePaths}
+          />
         </>
       )}
       {/* 操作栏：流式输出完成后显示操作按钮 */}

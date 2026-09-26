@@ -15,6 +15,7 @@ import { calculateDockBadgeCount, countPendingRequests } from '@/lib/dock-badge-
 import { setBoundedSDKMessageCache } from '@/lib/agent-message-cache-budget'
 import type { AgentQueuedMessage } from '@/lib/agent-message-queue'
 import type { SessionFileChange } from '@/lib/session-file-changes'
+import type { AgentRunFileChanges } from '@/lib/agent-run-file-changes'
 import type { FilePanelDragItem } from '@/lib/file-panel-drag'
 import type { RightWorkspaceSplitState } from '@/lib/right-workspace-split'
 
@@ -1202,6 +1203,14 @@ export const agentNonGitFileChangesAtom = atom<Map<string, SessionFileChange[]>>
 
 /** 当前 session 的 Agent run ID（即渲染进程生成并传给主进程的 startedAt）。 */
 export const agentFileChangesCurrentRunAtom = atom<Map<string, string>>(new Map())
+
+/**
+ * 本轮真实文件改动记录 — 按会话保存各轮运行的分桶。
+ *
+ * 数据来自主进程文件监听器（覆盖 Bash、脚本、格式化器等非工具写入）与成功返回的
+ * 写类工具入参，供底部「本轮文件改动」汇总按 turn 定位使用。
+ */
+export const agentRunFileChangesAtom = atom<Map<string, AgentRunFileChanges[]>>(new Map())
 
 /**
  * Diff 数据缓存 — 按 session 隔离，存放上一次 IPC 拉取到的未暂存改动结果。

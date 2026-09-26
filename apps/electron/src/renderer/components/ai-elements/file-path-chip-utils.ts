@@ -124,3 +124,40 @@ export function getFilePathDisplayPath({ originalPath, resolvedPath, lineColSuff
 export function isAsyncResultCurrent(requestGeneration: number, currentGeneration: number, mounted: boolean): boolean {
   return mounted && requestGeneration === currentGeneration
 }
+
+/** chip 点击要打开的预览目标。 */
+export interface ChipOpenTarget {
+  /** 目标文件路径 */
+  filePath: string
+  /** 文件所在目录：Git 仓库发现与 diff 读取都以它为起点 */
+  dirPath: string
+  /** true = 纯文件预览；false = 代码比对；缺省表示交给下游按目录判断 */
+  previewOnly?: boolean
+}
+
+/**
+ * 解析 chip 点击应打开的预览目标。
+ *
+ * 只有「是否位于 Git 仓库内」这一件事需要主进程探测：仓库内文件用代码比对打开，
+ * 直接回答这次改了什么；仓库外文件（构建产物、外部脚本、临时文件）继续走全文预览，
+ * 避免比对视图把整个文件当成新增内容。
+ *
+ * @param input.filePath 已解析的目标文件路径。
+ * @param input.dirPath 目标文件所在目录。
+ * @param input.readGitRepoStatus 读取目录 Git 仓库状态；抛错时按非仓库降级。
+ * @returns 预览描述符（会话与基础目录由调用方补齐）。
+ */
+export async function resolveChipOpenTarget(input: {
+  filePath: string
+  dirPath: string
+  readGitRepoStatus: (dirPath: string) => Promise<{ isRepo: boolean } | null>
+}): Promise<ChipOpenTarget> {
+  const { filePath, dirPath, readGitRepoStatus } = input
+  try {
+    const status = await readGitRepoStatus(dirPath)
+    if (status?.isRepo === true) return { filePath, dirPath, previewOnly: false }
+  } catch {
+    // 探测失败按非仓库处理：全文预览一定可用，代码比对不保证可用。
+  }
+  return { filePath, dirPath, previewOnly: true }
+}

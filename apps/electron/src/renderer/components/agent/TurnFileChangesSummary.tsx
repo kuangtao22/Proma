@@ -1,8 +1,11 @@
 /**
  * TurnFileChangesSummary — Turn 底部文件改动汇总
  *
- * 在 AssistantTurnRenderer 的 MessageActions 之上，以 chip 横排展示本轮所有
- * 修改类工具调用（Edit / Write / MultiEdit / NotebookEdit）所触及的文件。
+ * 在 AssistantTurnRenderer 的 MessageActions 之上，以 chip 横排展示本轮真实改动过的文件。
+ * 路径由两部分合并而来：
+ * 1. 修改类工具调用（Edit / Write / MultiEdit / NotebookEdit）成功返回后的入参路径；
+ * 2. 主进程文件监听器归属到本轮运行的真实落盘路径 —— 覆盖 Bash、脚本、格式化器、
+ *    构建工具等非写类工具产生的改动。
  *
  * 子代理（Agent/Task）的修改也会冒泡到此处——因为 SDK 的子代理 assistant
  * 消息同样存在于 turn.turnMessages 中（通过 parent_tool_use_id 关联）。
@@ -19,6 +22,7 @@ import type {
   SDKToolResultBlock,
 } from '@proma/shared'
 import { FilePathChip } from '@/components/ai-elements/file-path-chip'
+import { groupAgentFileChangesByCategory, mergeTurnFilePaths } from '@/lib/agent-run-file-changes'
 
 const MUTATING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 
@@ -87,8 +91,12 @@ export function collectFilePaths(turnMessages: SDKMessage[], tools: Set<string> 
  * 同名不同目录的文件无法凭裸文件名区分，直接从映射中剔除，交由既有 basePaths 解析逻辑处理
  * （不比补全前更差）。
  */
-export function buildTurnFileNameMap(turnMessages: SDKMessage[]): Map<string, string> {
-  const paths = collectFilePaths(turnMessages, TOUCHED_TOOLS)
+export function buildTurnFileNameMap(
+  turnMessages: SDKMessage[],
+  extraPaths: readonly string[] = [],
+): Map<string, string> {
+  // 真实落盘路径同样参与补全：脚本/格式化器生成的文件也应能从裸文件名解析到绝对路径。
+  const paths = mergeTurnFilePaths(collectFilePaths(turnMessages, TOUCHED_TOOLS), extraPaths)
   const map = new Map<string, string>()
   const conflicted = new Set<string>()
   for (const p of paths) {
@@ -108,23 +116,62 @@ export function buildTurnFileNameMap(turnMessages: SDKMessage[]): Map<string, st
 export interface TurnFileChangesSummaryProps {
   turnMessages: SDKMessage[]
   basePath?: string
+  /** 文件监听器归属到本轮运行的真实落盘路径，用于补齐非工具写入。 */
+  runPaths?: readonly string[]
+  /** 是否从本轮开始前就已在跟踪；仅 true 时才允许断言「本轮无文件改动」。 */
+  runObserved?: boolean
+  /** 是否按大小写不敏感比较路径（Windows 为 true）。 */
+  caseInsensitivePaths?: boolean
 }
 
 export function TurnFileChangesSummary({
   turnMessages,
   basePath,
+  runPaths,
+  runObserved,
+  caseInsensitivePaths,
 }: TurnFileChangesSummaryProps): React.ReactElement | null {
-  const paths = React.useMemo(() => collectFilePaths(turnMessages), [turnMessages])
+  const paths = React.useMemo(() => mergeTurnFilePaths(
+    collectFilePaths(turnMessages),
+    runPaths ?? [],
+    caseInsensitivePaths === true,
+  ), [turnMessages, runPaths, caseInsensitivePaths])
 
-  if (paths.length === 0) return null
+  // 业务代码与构建产物混在一条横排里很难扫读，这里按分类分行展示。
+  const groups = React.useMemo(() => groupAgentFileChangesByCategory(paths), [paths])
+
+  // 无路径且无法确认本轮已被完整跟踪时保持静默：历史上早于本次运行的 turn 无从判断，
+  // 强行显示「无改动」会把遗漏写成结论。
+  if (paths.length === 0 && runObserved !== true) return null
 
   return (
     <div className="pl-[46px] mt-3">
       <div className="pt-3 border-t-2 border-dashed border-border/60">
-        <div className="flex flex-wrap gap-1.5">
-          {paths.map((filePath) => (
-            <FilePathChip key={filePath} filePath={filePath} basePath={basePath} />
-          ))}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {paths.length === 0 ? (
+            <span className="text-xs text-muted-foreground">本轮未检测到文件改动</span>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs text-muted-foreground">
+                本轮文件改动 {paths.length}
+              </span>
+              {groups.map((group) => (
+                <div key={group.category} className="flex flex-wrap items-center gap-1.5">
+                  <span className="mr-1 text-xs text-muted-foreground/70">
+                    {group.label} {group.paths.length}
+                  </span>
+                  {group.paths.map((filePath) => (
+                    <FilePathChip
+                      key={filePath}
+                      filePath={filePath}
+                      basePath={basePath}
+                      openMode="diff-preferred"
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

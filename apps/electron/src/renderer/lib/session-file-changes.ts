@@ -20,6 +20,12 @@ export interface SessionWatcherOwnershipScope {
   sessionAttachedFiles: readonly string[]
   workspaceAttachmentsComplete: boolean
   workspaceFilesPath?: string | null
+  /**
+   * 工作区绑定的本地项目根。
+   * 会话直接在项目根工作时（用户本地仓库），改动路径必须能归属到该会话，
+   * 否则监听器事件会因为没有匹配根而被整体丢弃。
+   */
+  workspaceProjectRootPath?: string | null
   workspaceAttachedDirectories: readonly string[]
   workspaceAttachedFiles: readonly string[]
 }
@@ -41,6 +47,7 @@ export function getOwnedSessionWatcherPaths(
   if (scope.workspaceAttachmentsComplete) {
     directoryRoots.push(
       scope.workspaceFilesPath ?? undefined,
+      scope.workspaceProjectRootPath ?? undefined,
       ...scope.workspaceAttachedDirectories,
     )
     attachedFiles.push(...scope.workspaceAttachedFiles)

@@ -3,6 +3,7 @@ import {
   isAbsoluteFilePath,
   isLocalFileReference,
   isRelativeFilePath,
+  resolveChipOpenTarget,
   stripLineCol,
 } from './file-path-chip-utils'
 
@@ -50,5 +51,41 @@ describe('文件路径候选判定', () => {
     expect(isLocalFileReference('~/notes/a.md')).toBe(true)
     expect(isLocalFileReference('docs/报告.md')).toBe(true)
     expect(isLocalFileReference('v1.2')).toBe(false)
+  })
+
+  test('Given 文件位于 Git 仓库 When 解析点击目标 Then 优先代码比对', async () => {
+    const target = await resolveChipOpenTarget({
+      filePath: '/repo/src/bridge.ts',
+      dirPath: '/repo/src',
+      readGitRepoStatus: async () => ({ isRepo: true }),
+    })
+
+    expect(target).toEqual({ filePath: '/repo/src/bridge.ts', dirPath: '/repo/src', previewOnly: false })
+  })
+
+  test('Given 文件不在 Git 仓库 When 解析点击目标 Then 回退全文预览', async () => {
+    const target = await resolveChipOpenTarget({
+      filePath: '/tmp/report.md',
+      dirPath: '/tmp',
+      readGitRepoStatus: async () => ({ isRepo: false }),
+    })
+
+    expect(target.previewOnly).toBe(true)
+  })
+
+  test('Given 仓库探测失败或返回空 When 解析点击目标 Then 回退全文预览而不是报错', async () => {
+    const failed = await resolveChipOpenTarget({
+      filePath: '/repo/src/bridge.ts',
+      dirPath: '/repo/src',
+      readGitRepoStatus: async () => { throw new Error('ipc failed') },
+    })
+    const missing = await resolveChipOpenTarget({
+      filePath: '/repo/src/bridge.ts',
+      dirPath: '/repo/src',
+      readGitRepoStatus: async () => null,
+    })
+
+    expect(failed.previewOnly).toBe(true)
+    expect(missing.previewOnly).toBe(true)
   })
 })

@@ -13,6 +13,7 @@ import { File as PierreFile } from '@pierre/diffs/react'
 import { toast } from 'sonner'
 import type { FilePreviewMetadata } from '@proma/shared'
 import { cn } from '@/lib/utils'
+import { getFileParentPath } from '@/lib/file-utils'
 import {
   agentDiffPanelTabAtom,
   agentDiffViewModeAtom,
@@ -251,7 +252,28 @@ interface DiffTabContentProps {
   baseRef?: string
 }
 
-export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, workspaceSkillSlug, legacySkillFilePath, onEmptyDiff, toolbarActions, baseRef }: DiffTabContentProps): React.ReactElement {
+export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly: previewOnlyProp, readOnly, basePaths, workspaceSkillSlug, legacySkillFilePath, onEmptyDiff, toolbarActions, baseRef }: DiffTabContentProps): React.ReactElement {
+  /**
+   * 面板内「改动 / 全文」切换。
+   *
+   * 初始模式仍由打开入口决定（改动列表 → 比对，文件区或 chip → 全文）；切换只改变当前
+   * 面板的渲染模式，不新增预览身份，因此在这里用局部状态承载，避免同名文件出现两个 Tab。
+   */
+  const [previewMode, setPreviewMode] = React.useState(Boolean(previewOnlyProp))
+  const previewOnly = previewMode
+  /** 用户手动切换过模式：此时不再因「无差异」自动关闭面板，改为就地给出提示。 */
+  const manualModeSwitchRef = React.useRef(false)
+  const [showNoDiffHint, setShowNoDiffHint] = React.useState(false)
+  /** 全文模式额外确认所在目录是否属于 Git 仓库：非仓库没有可比对内容，不提供切换。 */
+  const [previewModeCanCompare, setPreviewModeCanCompare] = React.useState(false)
+
+  // 外层以新身份重新打开同一文件时（例如从改动列表再点一次），跟随外层模式重置。
+  React.useEffect(() => {
+    manualModeSwitchRef.current = false
+    setShowNoDiffHint(false)
+    setPreviewMode(Boolean(previewOnlyProp))
+  }, [previewOnlyProp, filePath])
+
   const ext = getExtension(filePath)
   const isMarkdown = previewOnly && MD_EXTS.has(ext)
   const isHtml = previewOnly && HTML_EXTS.has(ext)
@@ -376,6 +398,40 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const previewWrapLabel = codeWrap
     ? '当前为自动换行，点击改为横向滚动'
     : '当前为横向滚动，点击改为自动换行'
+
+  /** 全文模式下用于探测 Git 仓库的目标目录；比对模式无需探测。 */
+  const previewModeTargetDir = React.useMemo(() => {
+    if (!previewOnly) return null
+    if (isAbsoluteFilePath(filePath)) return getFileParentPath(filePath)
+    return dirPath || null
+  }, [previewOnly, filePath, dirPath])
+
+  React.useEffect(() => {
+    if (!previewModeTargetDir) {
+      setPreviewModeCanCompare(false)
+      return
+    }
+    let cancelled = false
+    void window.electronAPI.getGitRepoStatus(previewModeTargetDir, { sessionId })
+      .then((status) => {
+        if (!cancelled) setPreviewModeCanCompare(status?.isRepo === true)
+      })
+      .catch(() => {
+        if (!cancelled) setPreviewModeCanCompare(false)
+      })
+    return () => { cancelled = true }
+  }, [previewModeTargetDir, sessionId])
+
+  /** 图片 / PDF / Office 只有预览形态，不提供「改动 / 全文」切换。 */
+  const modeSwitchTypeEligible = !isImage && !isPdf && !isOfficePreview && !isLegacyOffice
+  const canToggleContentMode = !loading && modeSwitchTypeEligible
+    && (previewOnly ? previewModeCanCompare : newContent.length > 0)
+
+  const handleToggleContentMode = React.useCallback(() => {
+    manualModeSwitchRef.current = true
+    setShowNoDiffHint(false)
+    setPreviewMode((previous) => !previous)
+  }, [])
 
   React.useEffect(() => {
     initShortcutRegistry()
@@ -995,9 +1051,16 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   React.useEffect(() => {
     if (previewOnly || isOfficePreview || loading || emptyDiffFiredRef.current) return
     if (oldContent === newContent) {
+      // 用户手动切到比对视图时面板不能因「无差异」自动关闭，否则点击后整块消失像故障。
+      if (manualModeSwitchRef.current) {
+        setShowNoDiffHint(true)
+        return
+      }
       emptyDiffFiredRef.current = true
       onEmptyDiff?.()
+      return
     }
+    setShowNoDiffHint(false)
   }, [previewOnly, isOfficePreview, loading, oldContent, newContent, onEmptyDiff])
 
   // previewOnly 模式：加载完成后若内容无法预览，弹 Toast 通知用户
@@ -1648,6 +1711,43 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
           {getPreviewPathLabel(filePath)}
         </span>
 
+        {canToggleContentMode && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={previewOnly}
+                aria-label={previewOnly ? '切换到代码比对' : '切换到全文'}
+                className="relative flex rounded-lg bg-muted p-0.5 shrink-0 cursor-pointer select-none"
+                onClick={handleToggleContentMode}
+              >
+                <div
+                  className={cn(
+                    'absolute top-0.5 bottom-0.5 w-[calc(50%-2px)] rounded-md bg-background shadow-sm transition-transform duration-200 ease-in-out',
+                    previewOnly ? 'translate-x-full' : 'translate-x-0',
+                  )}
+                />
+                <span className={cn(
+                  'relative z-[1] rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors',
+                  previewOnly ? 'text-muted-foreground' : 'text-foreground',
+                )}>
+                  改动
+                </span>
+                <span className={cn(
+                  'relative z-[1] rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors',
+                  previewOnly ? 'text-foreground' : 'text-muted-foreground',
+                )}>
+                  全文
+                </span>
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {previewOnly ? '本次改了什么（代码比对）' : '查看文件全文'}
+            </TooltipContent>
+          </Tooltip>
+        )}
+
         {previewOnly && (
           <>
             <DefaultAppOpenButton
@@ -2032,6 +2132,10 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                 <span className="text-muted-foreground">（文件为空）</span>
               </pre>
             )
+          ) : showNoDiffHint ? (
+            <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+              该文件当前没有未提交改动
+            </div>
           ) : (
             <DiffView oldContent={oldContent} newContent={newContent} filePath={filePath} viewMode={viewMode} />
           )}
